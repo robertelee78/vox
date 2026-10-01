@@ -16,7 +16,10 @@
 //! command can count the keys a node is sent, which is why a wire client plays the member. The
 //! victim trusts mallory (`vox trust add`); its consent writes her the room's first key, and she
 //! takes it. The victim's daemon is then stopped and started again, as after a reboot (it reopens
-//! the room by itself, #208), and mallory's identity connects to it again.
+//! the room by itself, #208), and mallory's identity connects to it again. One arm stops it with
+//! SIGTERM; the other **kills it with SIGKILL** once her answer has had time to reach it, as a
+//! crash or a power cut would, so the delivery must be in the store by then and not merely written
+//! out on a clean stop.
 //!
 //! **Asserted.** In [`WATCH`] after the restart, the victim sends mallory **no key**: she took it,
 //! and the node remembers. `CANNOT MEASURE` if the first key never reached her before the restart,
@@ -195,10 +198,23 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
     panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list`");
 }
 
-/// Stop a process with SIGTERM by its PID and reap it.
-fn stop(mut p: VoxProc) {
+/// How the victim's daemon goes down before it is started again.
+#[derive(Clone, Copy, Debug)]
+enum Halt {
+    /// SIGTERM: a clean stop, as `vox` is stopped from tmux or systemd.
+    Term,
+    /// SIGKILL: a crash or a power cut, with no chance to write anything on the way out.
+    Kill,
+}
+
+/// Stop a process by its PID, with SIGTERM or SIGKILL, and reap it.
+fn stop(mut p: VoxProc, halt: Halt) {
+    let signal = match halt {
+        Halt::Term => "-TERM",
+        Halt::Kill => "-KILL",
+    };
     let _ = Command::new("kill")
-        .args(["-TERM", &p.child.id().to_string()])
+        .args([signal, &p.child.id().to_string()])
         .status();
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -220,6 +236,16 @@ fn fingerprint(data: &Path) -> [u8; 32] {
 #[test]
 #[ignore = "real vox processes, production Argon2id and a real join; run in release"]
 fn a_taken_first_key_is_not_sent_again_after_a_restart() {
+    taken_first_key_after(Halt::Term);
+}
+
+#[test]
+#[ignore = "real vox processes, production Argon2id and a real join; run in release"]
+fn a_taken_first_key_is_not_sent_again_after_a_crash() {
+    taken_first_key_after(Halt::Kill);
+}
+
+fn taken_first_key_after(halt: Halt) {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let dir = |n: &str| {
@@ -282,7 +308,7 @@ fn a_taken_first_key_is_not_sent_again_after_a_restart() {
     assert!(joined, "CANNOT MEASURE: mallory could not join the room");
 
     // Mallory's node goes; her identity stays, in the profile the binary wrote.
-    stop(mallory);
+    stop(mallory, Halt::Term);
 
     let rt = Rt(Some(
         tokio::runtime::Builder::new_multi_thread()
@@ -347,7 +373,7 @@ fn a_taken_first_key_is_not_sent_again_after_a_restart() {
     // ---- the victim restarts, and mallory's identity connects again ---------------------
     drop(conn);
     drop(endpoint);
-    stop(victim);
+    stop(victim, halt);
     let _victim = daemon("victim", &victim_dir, &victim_listen, &spec, &pass_file);
     let (_endpoint, conn) = connect(&rt);
     let after = answer_as_mallory(&rt, Arc::clone(&conn), Instant::now());
@@ -357,8 +383,8 @@ fn a_taken_first_key_is_not_sent_again_after_a_restart() {
         (a.streams, a.keys.clone())
     };
     println!(
-        "[proof] before the restart mallory took {taken} key(s); in {WATCH:?} after it the victim \
-         opened {streams} stream(s) to her, {} of them with a key: {resent:?}",
+        "[proof] {halt:?}: before the restart mallory took {taken} key(s); in {WATCH:?} after it \
+         the victim opened {streams} stream(s) to her, {} of them with a key: {resent:?}",
         resent.len()
     );
     assert!(
@@ -367,8 +393,8 @@ fn a_taken_first_key_is_not_sent_again_after_a_restart() {
     );
     assert!(
         resent.is_empty(),
-        "the restarted victim sent mallory the room's key again ({} time(s), at {resent:?}) \
-         though she had taken it: it did not remember the delivery",
+        "after a {halt:?} the restarted victim sent mallory the room's key again ({} time(s), at \
+         {resent:?}) though she had taken it: it did not remember the delivery",
         resent.len()
     );
     drop(anchor.child.kill());
