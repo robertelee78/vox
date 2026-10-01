@@ -13,7 +13,7 @@
 //!
 //! # Decisions, evaluated once per round trip
 //! - **Climb 1 → 2** when the last [`CLIMB_1_ROUNDS`] rounds held at least [`CLIMB_1_LOSSES`]
-//!   losses with no queue building, no sooner than [`TIER_1_DWELL`] in tier 1. Tier 1's loss share
+//!   losses with no queue building, once tier 1's dwell is over. Tier 1's loss share
 //!   is marked as tier 2's baseline: loss that then grows with Vox's own sending is congestion.
 //! - **Climb 2 → 3** when for [`CLIMB_3_ROUNDS`] consecutive rounds and [`CLIMB_3_TIME`] the loss
 //!   share stayed at or above [`GENTLE_LOSS_CAP`], past which tier 2 cuts for every loss, with no
@@ -33,7 +33,7 @@
 //!   aggregation it measured) can raise the round trip to `window / rate` with no other flow on
 //!   the path. Measured on a 200 Mbit/s, 10.7 ms path with 1% loss and no other flow: round
 //!   minimums of 18–38 ms against a `window / rate` of up to 39 ms. So a round's minimum round trip
-//!   past [`TIER3_QUEUE_SHARE`] × `max(base, window / rate)` + [`TIER3_QUEUE_MIN`] is another
+//!   past [`TIER3_QUEUE_FACTOR`] × `max(base, window / rate)` + [`TIER3_QUEUE_MIN`] is another
 //!   flow's queue. The other tiers' test (a share of the base) read BBR's own queue as congestion
 //!   and took tier 3 out within a second, every time.
 //! - **Descend 3 → 2 when the loss is gone:** the loss share under half [`GENTLE_LOSS_CAP`] for
@@ -42,8 +42,8 @@
 //!   [`QUIET_TIME`] with no loss, no queue, and delivery at least [`HOLDING_FRACTION`] of the best
 //!   rate. Tier 2's loss baseline is cleared.
 //! - **Hysteresis and dwell.** Each climb and its descent test different things, and a descent
-//!   needs a longer stretch than a climb. Tiers 2 and 3 are left no sooner than [`DWELL_ROUNDS`]
-//!   rounds and [`DWELL_TIME`], except by a queue or a failed trial.
+//!   needs a longer stretch than a climb. Every tier is left no sooner than [`DWELL_ROUNDS`]
+//!   rounds and [`DWELL_TIME`], except tier 3 by a queue or a failed trial.
 //!
 //! An application-limited round is no evidence either way.
 //!
@@ -72,8 +72,6 @@ use super::vox_bbr::{RateSeed, VoxBbr};
 pub(crate) const CLIMB_1_ROUNDS: usize = 8;
 /// …and the losses with no queue building it needs in them.
 pub(crate) const CLIMB_1_LOSSES: u32 = 3;
-/// The least time a connection stays in tier 1.
-pub(crate) const TIER_1_DWELL: Duration = Duration::from_secs(1);
 /// Consecutive rounds at the loss cap with no queue for a climb from tier 2…
 pub(crate) const CLIMB_3_ROUNDS: u32 = 20;
 /// …spanning at least this long.
@@ -90,7 +88,7 @@ pub(crate) const BACKOFF_RESET: Duration = Duration::from_secs(300);
 pub(crate) const TIER3_QUEUE_ROUNDS: u32 = 2;
 /// In tier 3, a round's minimum round trip past this multiple of the round trip BBR can raise by
 /// itself…
-pub(crate) const TIER3_QUEUE_SHARE: f64 = 1.25;
+pub(crate) const TIER3_QUEUE_FACTOR: f64 = 1.25;
 /// …plus this, is a queue another flow is building (see the module docs).
 pub(crate) const TIER3_QUEUE_MIN: Duration = Duration::from_millis(4);
 /// A quiet round delivers at least this share of the best rate.
@@ -99,7 +97,7 @@ pub(crate) const HOLDING_FRACTION: f64 = 0.8;
 pub(crate) const QUIET_ROUNDS: u32 = 40;
 /// …spanning at least this long.
 pub(crate) const QUIET_TIME: Duration = Duration::from_secs(4);
-/// The fewest rounds tiers 2 and 3 run before they may be left…
+/// The fewest rounds every tier runs before it may be left…
 pub(crate) const DWELL_ROUNDS: u32 = 20;
 /// …and the least time.
 pub(crate) const DWELL_TIME: Duration = Duration::from_secs(2);
@@ -259,7 +257,7 @@ impl Tapered {
         ) {
             (Tier::Bbr(bbr), Some(round_min), Some(base)) => {
                 round_min
-                    >= Self::bbr_own_rtt(bbr, base).mul_f64(TIER3_QUEUE_SHARE) + TIER3_QUEUE_MIN
+                    >= Self::bbr_own_rtt(bbr, base).mul_f64(TIER3_QUEUE_FACTOR) + TIER3_QUEUE_MIN
             }
             _ => false,
         };
@@ -285,7 +283,7 @@ impl Tapered {
                 Some((TierId::Two, "the loss is gone", false))
             }
             TierId::One
-                if in_tier >= TIER_1_DWELL
+                if dwelt
                     && self.signals.losses_without_queue_in_last(CLIMB_1_ROUNDS)
                         >= CLIMB_1_LOSSES =>
             {
