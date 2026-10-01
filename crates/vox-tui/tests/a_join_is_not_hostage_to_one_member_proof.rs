@@ -353,8 +353,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     let steps = std::fs::read_to_string(&carol.err)
         .unwrap_or_default()
         .lines()
-        .filter(|l| l.contains("join got in"))
-        .last()
+        .rfind(|l| l.contains("join got in"))
         .map(str::to_owned)
         .unwrap_or_else(|| panic!("CANNOT MEASURE: carol's daemon printed no `join got in` line"));
     let step_secs = |name: &str| -> f64 {
