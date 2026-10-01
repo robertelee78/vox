@@ -47,6 +47,14 @@
 //! meanwhile. Mutation: `say_locking` not called (`app.rs`); the TUI then looks frozen for the
 //! whole wait.
 //!
+//! - **grind:** bob joins alice's room, and his node's proof-of-work grind is held long
+//!   (`VOX_TEST_SOLVE_AT_LEAST_MS`, the product's test-only floor on a joiner's grind); the room
+//!   passphrase. The join task held it across the whole grind, which no abort reached, so the lock
+//!   waited the grind out. Asserted here besides the scan: a command asked at once is answered
+//!   within [`ANSWERS`], and the lock settles within [`SETTLES`], not once the grind ends.
+//!   Mutation: the grind back inside the task (`block_in_place`, holding the passphrase); the lock
+//!   then settles only when the held grind ends, about [`GRIND_MS`] later.
+//!
 //! What is not measured here, and rests on review: that the seal's thread is given the passphrase
 //! alone (not the signer or the room key), since neither the identity's key nor a random room key
 //! is known to a test; and the zeroizing of CBOR buffers that grow (`Encoder::for_secrets`).
@@ -75,6 +83,10 @@ const DELAY_MS: &str = "15000";
 const SHOWS_UP: Duration = Duration::from_secs(60);
 /// A command asked of the node while its lock settles is answered within this.
 const ANSWERS: Duration = Duration::from_secs(5);
+/// How long a joiner's grind is held in the grind case: far past [`SETTLES`].
+const GRIND_MS: &str = "60000";
+/// A lock with nothing but a join's grind in flight settles within this.
+const SETTLES: Duration = Duration::from_secs(10);
 /// A typed `:lock` that took longer than this must have shown "locking…" while it waited.
 const SAID_LOCKING_AFTER: Duration = Duration::from_secs(2);
 /// The scanner's mask (`crates/vox-test-interpose/src/scan.rs`).
@@ -532,4 +544,150 @@ fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
     let after = scanner.scan();
     tui.stop();
     judge("reopen", "room", &before, &during, &after, took);
+}
+
+/// Read `child`'s stdout until a line matches `wanted`; the line.
+fn line_from(child: &mut Proc, what: &str, wanted: impl Fn(&str) -> bool) -> String {
+    use std::io::BufRead as _;
+    let out = child.0.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(60) {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            if wanted(&line) {
+                return line;
+            }
+        }
+    }
+    panic!("CANNOT MEASURE: {what} never printed what was waited for");
+}
+
+#[test]
+#[ignore = "real vox tui in a pty with the interposer loaded, a real join; macOS"]
+fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let (anchor_dir, alice, bob) = (
+        tmp.path().join("anchor"),
+        tmp.path().join("alice"),
+        tmp.path().join("bob"),
+    );
+    let (alice_id, identity, roompass) = (unique("alice-idp"), unique("idp"), unique("grind-rp"));
+    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    new_profile(&alice, &alice_id);
+    new_profile(&bob, &identity);
+    // An anchor, and alice hosting a room through it, all the shipped binary.
+    let mut anchor = start(
+        &anchor_dir,
+        &["node", "--listen", "127.0.0.1:0"],
+        "unused",
+        None,
+    );
+    let spec = line_from(&mut anchor, "the anchor", |l| {
+        l.contains("@/ip4/127.0.0.1/udp/")
+    })
+    .split_whitespace()
+    .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
+    .unwrap()
+    .to_owned();
+    let _alice_daemon = start(
+        &alice,
+        &["daemon", "--listen", "127.0.0.1:0", "--anchor", &spec],
+        &alice_id,
+        Some(&format!("{alice_id}\n")),
+    );
+    let t0 = Instant::now();
+    while !command(&alice, &["room", "list"], &alice_id)
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(120),
+            "CANNOT MEASURE: alice's daemon never answered"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let mut create = start(
+        &alice,
+        &["room", "create", "--name", "team"],
+        &alice_id,
+        Some(&format!("{roompass}\n")),
+    );
+    assert!(
+        create.0.wait().expect("room create").success(),
+        "CANNOT MEASURE: alice could not create the room"
+    );
+    let list = command(&alice, &["room", "list"], &alice_id)
+        .output()
+        .unwrap();
+    let prefix = String::from_utf8_lossy(&list.stdout)
+        .split_whitespace()
+        .next()
+        .expect("CANNOT MEASURE: alice's room in `vox room list`")
+        .to_owned();
+    let invite = command(&alice, &["room", "invite", &prefix], &alice_id)
+        .output()
+        .unwrap();
+    assert!(invite.status.success(), "CANNOT MEASURE: room invite");
+    let link = String::from_utf8_lossy(&invite.stdout).trim().to_owned();
+
+    // Bob's TUI, scanned, with his node's grind held long.
+    let scanner = Scanner::new(tmp.path().join("scan"), &[("room", &roompass)]);
+    let mut env = tui_env(&scanner.dir);
+    env.retain(|e| !e.starts_with("VOX_TEST_SECRET_WORK_DELAY_MS="));
+    env.push(format!("VOX_TEST_SOLVE_AT_LEAST_MS={GRIND_MS}"));
+    env.push(format!("VOX_ANCHORS={spec}"));
+    let mut tui = Tui::start(&bob, &identity, tmp.path().join("cues"), "bob", &env);
+    tui.unlocked();
+    let before = scanner.scan();
+    let mut join = start(
+        &bob,
+        &["room", "join", &link, "--name", "team"],
+        &identity,
+        Some(&format!("{roompass}\n")),
+    );
+    let during = scanner
+        .until_more("room", before.of("room"))
+        .expect("CANNOT MEASURE: the room passphrase never showed up in the TUI's memory");
+    // Into the grind: past the dial and the challenge, well short of the held grind's end.
+    std::thread::sleep(Duration::from_secs(5));
+    still_running(&mut join, "vox room join");
+    let asked = tui.ask_lock(false);
+    // **The node answers while the lock settles** (V210-71), asked at once.
+    let probe_at = Instant::now();
+    let mut probe = start(
+        &bob,
+        &["room", "create", "--name", "probe"],
+        &identity,
+        Some("a probe passphrase\n"),
+    );
+    let probe_status = probe.0.wait().expect("the probe");
+    let probe_took = probe_at.elapsed();
+    let took = tui.wait_locked(asked, false);
+    let after = scanner.scan();
+    let joined = join.0.try_wait().expect("poll");
+    println!(
+        "[proof] grind: a `vox room create` asked as the lock began answered in {probe_took:?} \
+         ({probe_status}); the lock settled {took:?} after it was asked (bound {SETTLES:?}, the \
+         held grind {GRIND_MS} ms); vox room join after the lock: {joined:?}"
+    );
+    assert!(
+        probe_took < ANSWERS,
+        "the node answered nobody while its lock settled: a command took {probe_took:?} (bound \
+         {ANSWERS:?}) — the actor waited for the lock"
+    );
+    assert!(
+        took < SETTLES,
+        "the lock waited out the join's grind: it settled {took:?} after it was asked (bound \
+         {SETTLES:?}) — the grind held the join's secrets where no abort reached them"
+    );
+    tui.stop();
+    judge("grind", "room", &before, &during, &after, took);
 }
