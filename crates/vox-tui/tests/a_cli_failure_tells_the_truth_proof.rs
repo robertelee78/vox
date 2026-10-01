@@ -14,9 +14,16 @@
 //!    greeting. Each must now exit non-zero within 30 s (the product's patience is 10 s; the
 //!    bound here is hard-coded) saying the node did not answer. The control: after SIGCONT the
 //!    same `vox status` answers, so the node, not the proof, was what went quiet.
-//! 3. **`vox room tail` exits non-zero when its node dies.** It exited 0, so a supervisor that
-//!    restarts a failed tail never restarted it. The daemon is killed with SIGKILL by its PID;
-//!    the tail must exit non-zero within 30 s, saying the node stopped.
+//! 3. **`vox room tail` exits non-zero when its node dies, even part-way through a frame.** It
+//!    exited 0, so a supervisor that restarts a failed tail never restarted it. The daemon is
+//!    killed with SIGKILL by its PID; the tail must exit non-zero within 30 s, saying the node
+//!    stopped, and never call it a "malformed control-socket message" (V210-101, #305). The kill
+//!    lands mid-frame by construction: the proof stops reading the tail's output, then posts six
+//!    messages of 60,000 characters. The tail blocks writing them to its full stdout pipe, so it
+//!    stops reading its socket, and the daemon blocks part-way through writing the next one —
+//!    each frame is larger than the socket's buffers (8 KiB each way on macOS). After the kill
+//!    the output is read again, and the tail meets a length, part of a body, then EOF. If the
+//!    tail printed all six, no frame was cut: CANNOT MEASURE.
 //! 4. **A service removal that fails names its cause**, not a hard-coded "was not offered". The
 //!    one cause a person can stage is a tag that is not offered, and its wording is asserted
 //!    here; the others (a store that failed, a node with no identity) cannot be staged through
@@ -51,7 +58,9 @@
 //! **Mutations that must turn it red**, one per claim: (1) drop the exchange failure's
 //! `why.push` in the actor's join walk — no `said:` line; (2) remove the `ANSWER_WITHIN` bound
 //! from `IpcClient::open` and `status::request` — `vox status` is still running at 30 s;
-//! (3) `Ok(None) => return Ok(())` back in `room_cli::tail` — the tail exits 0; (5)
+//! (3) `Ok(None) => return Ok(())` back in `room_cli::tail` — the tail exits 0; and
+//! `read_frame`'s EOF inside a body mapped back to `MalformedIpc("ipc read body")` — the tail says
+//! "malformed control-socket message"; (5)
 //! `IpcClient::request` without `while_answering` — the join is still running at 45 s; (6)
 //! `serve_control_socket(..)?`, a bind failure fatal again — `vox serve` exits 1 at once; (7)
 //! `IpcClient::request`'s end-of-stream mapped back to `MalformedIpc("ipc closed before reply")` —
@@ -65,6 +74,7 @@ mod watchdog;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -77,6 +87,9 @@ struct Proc {
     child: Child,
     out: Arc<Mutex<Vec<String>>>,
     err: Arc<Mutex<Vec<String>>>,
+    /// While set, nothing more of this process's stdout is read, so its pipe fills and its
+    /// writes block.
+    hold_out: Arc<AtomicBool>,
 }
 
 impl Drop for Proc {
@@ -88,11 +101,16 @@ impl Drop for Proc {
     }
 }
 
-fn collect(stream: impl Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
+fn collect(stream: impl Read + Send + 'static, hold: Arc<AtomicBool>) -> Arc<Mutex<Vec<String>>> {
     let lines = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
-        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+        let mut lines = BufReader::new(stream).lines();
+        loop {
+            while hold.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let Some(Ok(line)) = lines.next() else { break };
             sink.lock()
                 .expect("APPARATUS: harness step failed")
                 .push(line);
@@ -135,13 +153,21 @@ impl Proc {
         pipe.write_all(stdin.as_bytes())
             .expect("APPARATUS: harness: write stdin");
         drop(pipe);
-        let out = collect(child.stdout.take().expect("APPARATUS: harness: stdout"));
-        let err = collect(child.stderr.take().expect("APPARATUS: harness: stderr"));
+        let hold_out = Arc::new(AtomicBool::new(false));
+        let out = collect(
+            child.stdout.take().expect("APPARATUS: harness: stdout"),
+            Arc::clone(&hold_out),
+        );
+        let err = collect(
+            child.stderr.take().expect("APPARATUS: harness: stderr"),
+            Arc::new(AtomicBool::new(false)),
+        );
         Self {
             name,
             child,
             out,
             err,
+            hold_out,
         }
     }
 
@@ -614,12 +640,31 @@ fn a_cli_failure_tells_the_truth() {
     );
     claims += 1;
 
-    // ---- (3) the node dies under the tail ----
+    // ---- (3) the node dies under the tail, part-way through a frame ----
+    // The tail's output is no longer read, and six posts each larger than everything between the
+    // daemon and the tail's stdout can buffer are made: the tail blocks printing, and the daemon
+    // blocks inside its write of the next frame.
+    tail.hold_out.store(true, Ordering::SeqCst);
+    const BIG: usize = 6;
+    let filler = "x".repeat(60_000);
+    for i in 0..BIG {
+        let text = format!("big-{i}-{filler}");
+        let (ok, said, _) = must(
+            "vox room post (big)",
+            vox(&joiner_dir, &["room", "post", &room, &text], "", quick),
+        );
+        assert!(
+            ok,
+            "CANNOT MEASURE (3): a 60,000-character post was not made: {said}"
+        );
+    }
+    std::thread::sleep(Duration::from_secs(2));
     assert!(
         signal("KILL", pid),
         "CANNOT MEASURE (3): could not SIGKILL the daemon"
     );
     let _ = joiner.child.wait();
+    tail.hold_out.store(false, Ordering::SeqCst);
     let Some((status, took)) = tail.exit_within(bound) else {
         panic!("PRODUCT (3) the tail was still running {bound:?} after its node was killed");
     };
@@ -636,8 +681,20 @@ fn a_cli_failure_tells_the_truth() {
         "PRODUCT (3) the tail exited 0 when its node died; a supervisor would not restart it: {err}"
     );
     assert!(
+        !err.contains("malformed"),
+        "PRODUCT (3) a node that died part-way through a frame was called malformed, though what \
+         arrived was only cut short: {err}"
+    );
+    assert!(
         err.contains("the node stopped"),
         "PRODUCT (3) the tail must say its node stopped: {err}"
+    );
+    let printed = tail.stdout().iter().filter(|l| l.contains("big-")).count();
+    eprintln!("[room tail, node killed] printed {printed} of {BIG} big posts");
+    assert!(
+        printed < BIG,
+        "CANNOT MEASURE (3): the tail printed all {BIG} big posts before its node died, so no \
+         frame was cut part-way"
     );
     claims += 1;
 
