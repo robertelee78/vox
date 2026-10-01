@@ -2398,7 +2398,11 @@ impl Node {
             headless,
             anchor_logs,
         } = cfg;
-        let profile = if Profile::exists(&paths) {
+        // A headless node networks as its key file and holds no room, so it never opens the
+        // profile's vault — which a `vox node --serve trusted` profile has, to keep its trust
+        // list. Opening it here held the store the anchor's own logs need, and the anchor
+        // refused to start: "another vox already has this profile open".
+        let profile = if headless.is_none() && Profile::exists(&paths) {
             Some(Profile::open(paths.clone())?)
         } else {
             None
