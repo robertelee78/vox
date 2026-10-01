@@ -543,6 +543,7 @@ pub fn solve_until(
     let mut solutions = Vec::new();
     let mut indices = Vec::with_capacity(want);
     for (bucket, a, b) in pairs {
+        stopped()?;
         indices.clear();
         solver.expand(k - 1, bucket, a, &mut indices);
         let mid = indices.len();
