@@ -202,10 +202,13 @@ function wakeChannel(client) {
       conn.on("error", () => {})
       // Unanswered and closed: a connection that never sends its frames, or sends
       // more than any wake can be. Only this user can reach the socket, but nothing
-      // of theirs may pin a connection or its memory here.
-      conn.setTimeout(AUTH_IDLE_MS, () => {
+      // of theirs may pin a connection or its memory here. A deadline from the
+      // connect, not an idle timer, which a byte every few seconds would keep resetting.
+      const deadline = setTimeout(() => {
         if (!done) conn.destroy()
-      })
+      }, AUTH_IDLE_MS)
+      deadline.unref?.()
+      conn.on("close", () => clearTimeout(deadline))
       conn.on("data", async (chunk) => {
         if (done) return
         buf += chunk.toString()
