@@ -105,8 +105,10 @@ fn without_the_split_the_same_pair_goes_direct() {
 
 // ---- two members who dial each other through one relay at once (V210-80, #271) ----------------
 
-/// How long the relay is held frozen while both members dial.
-const FREEZE: Duration = Duration::from_secs(4);
+/// How long each frozen stage of the crossing is held, so the process let run in it is done with
+/// the one thing it has to do: the anchor sending each member the other's circuit, then each member
+/// taking it.
+const STAGE: Duration = Duration::from_millis(1500);
 /// Each reads the other within this of the release.
 const BOUND: Duration = Duration::from_secs(8);
 /// How long after the release the reads are watched for, past the 10 s a lost dial waits out, so a
@@ -238,15 +240,17 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
     d
 }
 
-fn signal(pid: u32, sig: &str) {
-    let ok = Command::new("kill")
-        .args([sig, &pid.to_string()])
-        .status()
-        .is_ok_and(|s| s.success());
-    assert!(
-        ok,
-        "CANNOT MEASURE: the harness could not send {sig} to the anchor ({pid})"
-    );
+fn signal(pids: &[u32], sig: &str) {
+    for pid in pids {
+        let ok = Command::new("kill")
+            .args([sig, &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(
+            ok,
+            "CANNOT MEASURE: the harness could not send {sig} to process {pid}"
+        );
+    }
 }
 
 /// Circuits `dir`'s node has asked a relay for to `peer` (`vox status --json` `reach.circuits`).
@@ -288,10 +292,21 @@ fn about(d: &Daemon, mark: usize, peer: &str) -> Vec<String> {
 /// **Staging, forced on every run with no switch in the product.** bob listens on `127.0.0.1` and
 /// carol on `[::1]`, so the anchor's circuit is their only path to each other. Both daemons are
 /// restarted, so neither holds a connection to the other; `vox status --json` naming no circuit
-/// between them is checked. The anchor is frozen (SIGSTOP), and bob and carol trust each other at
-/// once, which makes each dial the other; both circuit requests wait in the frozen anchor and are
-/// served together on its release, so the circuits cross. Each then asked the relay for a circuit
-/// to the other, or the run is `CANNOT MEASURE`.
+/// between them is checked. Then the crossing is ordered with SIGSTOP/SIGCONT, so it does not rest
+/// on which of two tasks the anchor happens to run first:
+///
+/// 1. The anchor is frozen, and bob and carol trust each other at once, which makes each dial the
+///    other. The run waits until each has asked the relay for a circuit to the other (`vox status
+///    --json`), or it is `CANNOT MEASURE`.
+/// 2. bob and carol are frozen and the anchor runs: it hands each the other's circuit request,
+///    which waits in the frozen member, and then waits for their answers.
+/// 3. The anchor is frozen again and bob and carol run: each takes the other's circuit (one attach
+///    each) and answers into the frozen anchor. Neither can yet hear that its own circuit is open.
+/// 4. The anchor runs: each hears its own circuit is open and attaches it second.
+///
+/// So on both ends the far end's circuit is attached first and the member's own second, which is
+/// the order in which unmapping the earlier circuit loses **both** dials. Left to the anchor, one
+/// order in two lost only one dial, the other connected, and the members read each other anyway.
 ///
 /// **Asserted, as the members see it:** each reads a post of the other's within [`BOUND`] of the
 /// release. A `PRODUCT:` red is the product's verdict; `CANNOT MEASURE` is the staging not achieved.
@@ -385,11 +400,13 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     );
     let marks = (bob.said().lines().count(), carol.said().lines().count());
 
-    // ---- the crossing: both dial while the relay between them is frozen ----
-    let anchor_pid = anchor.proc.child.id();
-    signal(anchor_pid, "-STOP");
+    // ---- the crossing, in the order that loses both dials to the defect ----
+    let anchor_pid = [anchor.proc.child.id()];
+    let members = [bob.0.id(), carol.0.id()];
+    signal(&anchor_pid, "-STOP");
     let frozen = Instant::now();
-    let (released, b, c) = std::thread::scope(|s| {
+    let (asked, released, b, c) = std::thread::scope(|s| {
+        // 1. Both dial; each request waits in the frozen anchor.
         let b = s.spawn(|| {
             vox(
                 bob_dir,
@@ -398,12 +415,34 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
             )
         });
         let c = s.spawn(|| vox(carol_dir, &["trust", "add", bob_fp, "--name", "bob"], None));
-        // Released on its own clock: a trust may wait for its dial, which waits for the anchor.
-        std::thread::sleep(FREEZE.saturating_sub(frozen.elapsed()));
-        signal(anchor_pid, "-CONT");
+        let asked = until(
+            "bob and carol ask the frozen relay for each other",
+            5,
+            || {
+                circuits_to(bob_dir, carol_fp) > before.0
+                    && circuits_to(carol_dir, bob_fp) > before.1
+            },
+        );
+        if asked {
+            // 2. The anchor hands each member the other's circuit; both wait in the members.
+            signal(&members, "-STOP");
+            signal(&anchor_pid, "-CONT");
+            std::thread::sleep(STAGE);
+            // 3. Each member takes the other's circuit; its answer waits in the anchor.
+            signal(&anchor_pid, "-STOP");
+            signal(&members, "-CONT");
+            std::thread::sleep(STAGE);
+        }
+        // 4. Each member hears its own circuit is open.
+        signal(&anchor_pid, "-CONT");
         let released = Instant::now();
-        (released, b.join().unwrap(), c.join().unwrap())
+        (asked, released, b.join().unwrap(), c.join().unwrap())
     });
+    assert!(
+        asked,
+        "CANNOT MEASURE: bob and carol did not both ask the frozen relay for a circuit to each \
+         other within 5 s, so the crossing was not staged"
+    );
     assert!(b.0, "PRODUCT: bob trusts carol: {}", b.2);
     assert!(c.0, "PRODUCT: carol trusts bob: {}", c.2);
 
@@ -441,8 +480,8 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
         about(&carol, marks.1, bob_fp),
     );
     eprintln!(
-        "[proof] relay frozen {:?}; circuits asked bob->carol {} carol->bob {}; bob reads carol \
-         at {bob_reads_carol:?}, carol reads bob at {carol_reads_bob:?} after the release",
+        "[proof] crossing staged over {:?}; circuits asked bob->carol {} carol->bob {}; bob reads \
+         carol at {bob_reads_carol:?}, carol reads bob at {carol_reads_bob:?} after the release",
         released - frozen,
         after.0,
         after.1
