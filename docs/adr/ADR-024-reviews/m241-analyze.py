@@ -13,9 +13,9 @@ Method (printed with the output):
 - Timeline: the TL lines (500 ms windows of the sink's counters); min/max over the given span.
 - Lateness: the largest "late N ms" on any TL line of the run.
 """
-import re, sys, glob, os
+import re, sys, glob, os, gzip
 
-RUNS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+RUNS = os.environ.get("RUNS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "treeB"))
 T0_MS = int(os.environ.get("T0_MS", "17000"))
 
 
@@ -30,6 +30,8 @@ def pct(xs, p):
 def run(name):
     log = os.path.join(RUNS, name + ".log")
     tr = os.path.join(RUNS, name + ".trace")
+    if not os.path.exists(tr) and os.path.exists(tr + ".gz"):
+        tr = tr + ".gz"
     out = {"name": name}
     text = open(log).read() if os.path.exists(log) else ""
     m = re.search(r"^RESULT.*$", text, re.M)
@@ -40,7 +42,7 @@ def run(name):
     qd = []
     delayq = n_l = 0
     if os.path.exists(tr):
-        for line in open(tr):
+        for line in (gzip.open(tr, "rt") if tr.endswith(".gz") else open(tr)):
             f = line.split()
             if len(f) < 3 or int(f[1]) < T0_MS:
                 continue

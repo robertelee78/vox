@@ -17,8 +17,8 @@ direction for throughput is *"as fast as possible, while still retaining our oth
 R41 is measured by `perf_r41_tunnel_throughput_proof` over emulated links: raw TCP and a Vox tunnel
 cross the same shaper.
 
-The congestion controller is Cubic: since 2026-09-25, `VoxCubic` in
-`vox-core/src/transport/congestion.rs`, quinn-proto 0.11.18's Cubic ported unchanged except that
+The congestion controller is Cubic: since 2026-09-26, `VoxCubic` in
+`crates/vox-core/src/transport/congestion.rs`, quinn-proto 0.11.18's Cubic ported unchanged except that
 HyStart++ (RFC 9406, as §4.2 specifies) ends slow start, wrapped in `IdleRestart`, which starts a
 fresh controller after the connection idles. Cubic treats every lost packet as a sign of
 congestion and cuts its sending rate. On a link that loses packets for reasons other than
@@ -49,19 +49,21 @@ raises the windows; this ADR does not concern them.
 - **noq's stack alone changes nothing** (noq Cubic ≈ quinn Cubic). There is no throughput reason to
   change the QUIC stack.
 
-**Measured again, 2026-10-01** (the M24.1 spike: release builds of the shipped binary, one run per
-row unless a row says otherwise, under the shared timing lock at a load of 55–86; how each figure is
-derived is under "Method" below). Tier 1 is now `VoxCubic`, and Vox sends 8192-byte datagrams. The
-comparison is no longer raw TCP behind a proxy, which never sees the link's loss, but a Cubic flow
-over the same lossy link ("The comparison flow" below).
+**Measured again, 2026-10-01** on **tree B**: integrate/v0.2.10 76e5c2c4, where tier 1 is `VoxCubic`
+exactly as it ships, plus a spike harness that is never committed (local commit 9a63e0ab: a
+controller chosen by environment variable, a per-loss trace, and the emulator arms). Release build,
+one run per row, under the shared timing lock at the load of a machine doing ordinary work; how each
+figure is derived is under "Method" below. Vox sends 8192-byte datagrams. The comparison is no longer
+raw TCP behind a proxy, which never sees the link's loss, but TCP's algorithm over the same link
+("The comparison flow" below).
 
-| Link (200 Mbit/s, 10 ms RTT) | Vox, today's tier 1 | Cubic flow, same link | Vox / Cubic |
+| Link | Vox, today's tier 1 | Cubic flow, same link | Vox / Cubic |
 |---|---|---|---|
-| 1% random loss | 57.3 Mbit/s | 61.7 Mbit/s | **0.93×** |
-| 1% random loss, R41 arm on the candidate branch | 61.0 Mbit/s | 60.7 Mbit/s | 1.01× |
-| 5% random loss, R41 arm on the candidate branch | 24.2 Mbit/s | 23.7 Mbit/s | 1.02× |
-| shared with the Cubic flow, 1-BDP queue | 98.8 Mbit/s | 97.4 Mbit/s | 1.01× |
-| shared with the Cubic flow, ¼-BDP queue | 38.3 Mbit/s | 38.1 Mbit/s | 1.00× |
+| 200 Mbit/s, 10 ms, 1% random loss | 63.2 Mbit/s | 61.2 Mbit/s | **1.03×** |
+| 200 Mbit/s, 10 ms, 5% random loss | 23.9 Mbit/s | 23.7 Mbit/s | **1.01×** |
+| 200 Mbit/s, 10 ms, shared, 1-BDP queue | 90.7 Mbit/s | 105.4 Mbit/s | 0.86× |
+| 200 Mbit/s, 10 ms, shared, ¼-BDP queue | 33.4 Mbit/s | 33.8 Mbit/s | 0.99× |
+| 400 Mbit/s, 2 ms, shared, 1-BDP queue | 166.0 Mbit/s | 176.8 Mbit/s | 0.94× |
 
 The 4.5% figure of 2026-09-25 is stale: with 8192-byte datagrams the same 1% loss costs far fewer
 reductions per byte. Today's Vox matches a Cubic flow on a lossy link; the decider's bar is twice it.
@@ -113,14 +115,16 @@ stack; quinn itself is not patched.
 
 ## Signals and thresholds (M24.1, measured 2026-10-01)
 
-All three tiers are to read one helper, `PathSignals` in `vox-core/src/transport/congestion.rs`, fed
+All three tiers are to read one helper, `PathSignals` in `crates/vox-core/src/transport/congestion.rs`, fed
 from quinn's `Controller` callbacks; its names below are the constants it is to define. Rounds are to
 be counted in packet numbers (a round ends when a packet sent after it began is acknowledged), and
 each acknowledgement's round-trip sample is to be its own `now - sent`.
 
 ### The comparison flow
 
-The decider asked for a fair race against TCP. A kernel TCP connection cannot see an emulated loss
+**The comparison is TCP's algorithm (Cubic), run over the same simulated link; not kernel TCP, which
+needs root to shape** (the decider, 2026-10-01, through vox: this stand-in counts as TCP for v0.2.10;
+a race against real kernel TCP on Linux CI is optional, later). A kernel TCP connection cannot see an emulated loss
 or share an emulated queue without root (dummynet or pf on macOS, netem on Linux), and Vox's agents
 never run as root. So R41's comparison is to be a **quinn-Cubic flow**: a QUIC flow under quinn's
 stock `CubicConfig` (RFC 8312), with QUIC's acknowledgement ranges for loss recovery, the tunnel's
@@ -134,13 +138,24 @@ is likely softer than "2× kernel TCP"; that has not been measured.
 
 ### Method
 
-Every derived figure here was computed by one script over the spike's run logs and per-loss traces,
-which printed its method with its output: the RESULT line of each run (means over the last two
-thirds of the run's timeline); loss share = lost bytes over lost plus acknowledged bytes, and queue
-rise = the last finished round's minimum round trip minus the windowed base, both over trace lines
-at least 17 s into the sending process (past the unshaped warm-up and the 10 s base window), with
-nearest-rank percentiles. The emulator ran at most 22 ms late in any half-second window of the
-200 Mbit/s runs, and 21–64 ms late in the 1 Gbit/s runs, whose figures are therefore smoke-grade.
+Two spike trees were measured, both never committed to the product:
+
+- **Tree B** (the figures quoted first everywhere below): integrate/v0.2.10 76e5c2c4, with tier 1 as
+  it ships, plus the spike harness (local commit 9a63e0ab).
+- **Tree A** (earlier, kept only where a row shows a mechanism tree B did not re-run, and labelled
+  "tree A"): integrate/v0.2.10 5a2c1c23 plus #294 c1 (ec52c8bd) plus ac-fix98's HyStart++ change
+  f5fc7c7f, which the decider withdrew (RFC 9406 §4.2 stands). That change only decides when slow
+  start ends, and every tree-A figure is a mean over seconds judged long after loss had ended slow
+  start; the rows are still labelled, not mixed with tree B's.
+
+Every derived figure was computed by one script (`docs/adr/ADR-024-reviews/m241-analyze.py`), over
+the run logs and per-loss traces committed in `docs/adr/ADR-024-reviews/runs/`; it prints its method
+with its output: the RESULT line of each run (means over the last two thirds of the run's timeline);
+loss share = lost bytes over lost plus acknowledged bytes, and queue rise = the last finished round's
+minimum round trip minus the windowed base, both over trace lines at least 17 s into the sending
+process (past the unshaped warm-up and the 10 s base window), with nearest-rank percentiles; the
+emulator's lateness is the largest per half-second window of the run. The tier-2 rows give the loss
+trend the loss share the tier-1 run on the same link measured, as tier 2 is to take it on entry.
 
 ### Base round trip: a 10 s windowed minimum (`BASE_RTT_WINDOW`)
 
@@ -148,40 +163,40 @@ quinn's `RttEstimator::min` is the connection's lifetime minimum; in the spike i
 connection that had first run unshaped, so every loss looked like a queue. A tunnel's connection
 outlives the network it started on, so its base must expire. **Warm-up cost, measured:** for about
 10 s after a path's round trip grows, the old base makes every loss read as congestion and Vox runs
-at tier 1's rate; in the 1%-loss run the tunnel ran 95–198 Mbit/s per half second after 10.5 s,
-against Cubic's 62. When the round trip shrinks, the base follows at once.
+at tier 1's rate; in tree A's 1%-loss run the tunnel ran 95–198 Mbit/s per half second after 10.5 s,
+against the Cubic flow's 61.4. When the round trip shrinks, the base follows at once.
 
 ### A queue is building (`QUEUE_DELAY_MIN`, `QUEUE_DELAY_SHARE`)
 
 When the last finished round's **minimum** round trip exceeds the base by at least
 **max(4 ms, 40% of the base)**. A round's minimum, not the smoothed round trip: one delayed
-acknowledgement must not read as a queue. Measured rise at each loss:
+acknowledgement must not read as a queue. Measured rise at each loss (tree B unless labelled):
 
 | Link | Controller | rise at a loss: p10 / p50 / p90 / p99 | read as a queue |
 |---|---|---|---|
-| 200 Mbit/s, 10 ms, 1% random loss | tier 2, run 1 | 0.60 / 2.19 / 4.39 / 10.38 ms | 12.0% |
-| same, repeated | tier 2, run 2 | 0.42 / 1.78 / 4.40 / 6.68 ms | 11.2% |
-| 200 Mbit/s, 10 ms, 1-BDP queue, shared | tier 1 | 3.64 / 6.64 / 8.63 / 9.13 ms | 97.0% |
-| same | tier 2 | 4.77 / 7.39 / 8.59 / 9.28 ms | 91.5% |
-| 1 Gbit/s, 2 ms, 1-BDP queue, shared | tier 2 | 0.65 / 1.40 / 1.71 / 2.18 ms | 0.3% |
+| 200 Mbit/s, 10 ms, 1% random loss | tier 1 | 0.39 / 1.14 / 3.20 / 11.76 ms | 13.7% |
+| same | tier 2 | 0.47 / 1.96 / 4.12 / 5.57 ms | 9.9% |
+| 200 Mbit/s, 10 ms, 1-BDP queue, shared | tier 1 | 3.96 / 6.44 / 8.34 / 11.76 ms | 92.9% |
+| same | tier 2 | 2.25 / 6.22 / 8.48 / 10.35 ms | 73.7% |
+| 400 Mbit/s, 2 ms, 1-BDP queue, shared | tier 2 | 0.66 / 1.46 / 1.86 / 6.68 ms | 3.1% |
 
-The test sits above the noise of a link with no queue (the 11–12% it still reads as a queue is tier
-2's own brake once it fills the link) and below what a shared queue shows at 10 ms. **It is blind
-where a full queue is shorter than its floor:** at 1 Gbit/s and 2 ms a whole bandwidth-delay product of
-queue is 2 ms of delay. There the loss signals below are the only guard, and the LAN arm proves them.
+The test sits above most of the noise of a link with no queue (the 10–14% it reads as a queue there
+is a brake on tier 2 once it fills the link) and below what a shared queue shows at 10 ms. **It is
+blind where a full queue is shorter than its floor:** at 2 ms a whole bandwidth-delay product of queue
+is 2 ms of delay. There the loss signals below are the only guard.
 
 ### Tier 2's response: no cut on a loss that is not congestion
 
 | 200 Mbit/s, 10 ms, 1% loss | Vox | Cubic flow | Vox / Cubic |
 |---|---|---|---|
-| tier 1 | 57.3 | 61.7 | 0.93× |
-| tier 2, cut to 0.85 on a no-queue loss | 63.3 | 62.7 | 1.01× |
-| tier 2, no cut (run 1 / run 2) | 169.8 / 176.7 | 61.4 / 62.0 | **2.77× / 2.85×** |
-| tier 2, no cut, with the loss trend below | 184.2 | 62.6 | **2.94×** |
+| tier 1 (tree B) | 63.2 | 61.2 | 1.03× |
+| tier 2 as designed: no cut, 5% cap, loss trend (tree B) | 191.1 | 59.9 | **3.19×** |
+| tier 2, cut to 0.85 on a no-queue loss (tree A) | 63.3 | 62.7 | 1.01× |
 
-At 8192-byte datagrams the window there is 100–130 KB, 12–16 packets; Cubic's congestion avoidance
-regrows it by about half a packet per round trip (RFC 8312's `W_est` slope, 3(1−β)/(1+β) with
-β = 0.7), and a loss arrives about every eight rounds. Any per-loss cut holds the rate down.
+At 8192-byte datagrams the window there is 100–130 KB, 12–16 packets (tree A's traces); Cubic's
+congestion avoidance regrows it by about half a packet per round trip (RFC 8312's `W_est` slope,
+3(1−β)/(1+β) with β = 0.7), and a loss arrives about every eight rounds. Any per-loss cut holds the
+rate down, which is why tier 2 is to make none.
 
 ### Two loss guards for what the queue test cannot see
 
@@ -191,55 +206,60 @@ with almost no delay:
 
 | 200 Mbit/s, 10 ms, ¼-BDP queue (62.5 KB, about 2.5 ms), shared | Vox | Cubic flow | Vox / Cubic | Vox's loss share |
 |---|---|---|---|---|
-| tier 1 | 38.3 | 38.1 | 1.00× | 3.10% |
-| tier 2, no cap | 80.9 | 15.4 | **5.26×** | 35.61% |
-| tier 2, 5% cap (40 s run / 80 s run) | 54.1 / 49.8 | 40.0 / 38.8 | **1.35× / 1.29×** | 4.34% / 4.57% |
+| tier 1 (tree B) | 33.4 | 33.8 | 0.99× | 3.90% |
+| tier 2 as designed (tree B) | 47.9 | 38.6 | **1.24×** | 4.59% |
+| tier 2 with no cap and no trend (tree A) | 80.9 | 15.4 | **5.26×** | 35.61% |
+| tier 2 with the cap, no trend, 80 s (tree A) | 49.8 | 38.8 | 1.29× | 4.57% |
 
-With the cap the Cubic flow keeps what it gets against another Cubic (38.8–40.0 against 38.1), and in
-the 80 s run every 10 s block stayed between 1.12× and 1.38×: tier 2 does not drift toward the cap.
+With the guards the Cubic flow keeps what it gets against another Cubic (38.6 against 33.8). In tree
+A's 80 s run every 10 s block stayed between 1.12× and 1.38×.
 
 **The loss trend: loss that grows with Vox's sending is congestion** (`LOSS_RISE_FACTOR` 1.5,
 `TIER2_LOSS_RISE` 0.5 points, `TREND_BYTES` 32 MiB). On entering tier 2 the loss share of tier 1's
 sending is recorded; once the share over the last 32 MiB sent passes max(1.5 × that, that + 0.5
-points), every loss is congestion. Random loss does not move with Vox's rate (0.97–1.00% of what Vox
-sent at 1% loss, in every tier); loss Vox causes does. It is the guard for a congested link whose
-queue is too short to see and whose loss stays under the cap:
+points), every loss is congestion. Random loss does not move with Vox's rate (0.96–1.03% of what Vox
+sent at 1% loss, in tier 1 and tier 2); loss Vox causes does. It is the guard for a congested link
+whose queue is too short to see and whose loss stays under the cap:
 
-| 1 Gbit/s, 2 ms, 1-BDP queue (250 KB), shared | Vox | Cubic flow | Vox / Cubic | Vox's loss share |
+| Shared link, 1-BDP queue, 2 ms | Vox | Cubic flow | Vox / Cubic | Vox's loss share |
 |---|---|---|---|---|
-| tier 1 | 448.6 | 489.7 | 0.92× | 0.39% |
-| tier 2, queue test and cap only | 641.4 | 251.0 | **2.56×** | 2.16% |
-| tier 2 with the trend over 8 rounds | 548.4 | 387.7 | 1.41× | 0.61% |
-| tier 2 with the trend over 32 MiB | 548.3 | 335.4 | **1.63×** | 0.85% |
+| 400 Mbit/s, tier 1 (tree B) | 166.0 | 176.8 | 0.94× | 1.75% |
+| 400 Mbit/s, tier 2 as designed (tree B) | 164.5 | 173.5 | **0.95×** | 2.66% |
+| 1 Gbit/s, tier 2 with no trend (tree A, emulator up to 53 ms late) | 641.4 | 251.0 | **2.56×** | 2.16% |
+| 1 Gbit/s, tier 2 with the trend over 32 MiB (tree A, up to 64 ms late) | 548.3 | 335.4 | 1.63× | 0.85% |
 
-The window is 32 MiB, about four thousand datagrams, because over 8 rounds (a couple of hundred
-packets) 1% random loss read above 1.5% by chance often enough to hold the 1%-loss arm to 1.62×.
+At 400 Mbit/s tier 2's loss share sits at the trend's trigger (2.66% against max(1.5 × 1.75%,
+1.75% + 0.5) = 2.63%): this is the fairness arm to watch. The trend is judged over 32 MiB, about four
+thousand datagrams, because over 8 rounds (a couple of hundred packets) 1% random loss read above
+1.5% by chance often enough to hold the 1%-loss arm to 1.62× (tree A).
 
 ### Tier 3: where it earns its place, and its trigger
 
-At 1% loss tier 2 alone clears the decider's 2× (2.85–2.94×). Above the cap it cannot: every loss is
-then congestion and tier 2 is Cubic.
+At 1% loss tier 2 alone clears the decider's 2× (3.19×). Above the cap it cannot: every loss is then
+congestion and tier 2 is Cubic.
 
 | 200 Mbit/s, 10 ms | Controller | Vox | Cubic flow | Vox / Cubic | Vox's loss share |
 |---|---|---|---|---|---|
-| 5% random loss | tier 2, 5% cap (run 1 / 2) | 32.0 / 35.0 | 25.1 / 24.6 | 1.27× / 1.42× | 5.07% / 5.16% |
-| 5% random loss | quinn's BBR (run 1 / 2) | 176.6 / 178.4 | 23.0 / 24.4 | **7.68× / 7.31×** | 5.04% / 5.01% |
-| 1% random loss | `VoxBbr` held in tier 3 (fix-adr024-bbr, smoke) | 195.8 | 62.5 | 3.13× | 0.8–2.2% |
-| ¼-BDP queue, shared | tier 2, 5% cap | 54.1 | 40.0 | 1.35× | 4.34% |
-| ¼-BDP queue, shared | quinn's BBR | 154.6 | 21.4 | **7.22×, unfair** | 15.70% |
+| 5% random loss | tier 1 (tree B) | 23.9 | 23.7 | 1.01× | 5.43% |
+| 5% random loss | tier 2 as designed (tree B) | 27.8 | 22.8 | 1.22× | 5.37% |
+| 5% random loss | quinn's BBR (tree B) | 179.5 | 23.3 | **7.70×** | 5.01% |
+| ¼-BDP queue, shared | tier 2 as designed (tree B) | 47.9 | 38.6 | 1.24× | 4.59% |
+| ¼-BDP queue, shared | quinn's BBR (tree B; emulator up to 138 ms late, so smoke-grade) | 162.3 | 23.3 | **6.97×, unfair** | 13.00% |
+| 1% random loss | `VoxBbr` held in tier 3 (fix-adr024-bbr, smoke; `runs/voxbbr/`) | 195.8 | 62.5 | 3.13× | — |
 
 **The signal that shows tier 3 is needed: loss at or above the cap that does not grow with the rate.**
-In tier 2 a 5%-loss Wi-Fi link and a shallow congested queue look alike (loss at the cap, no queue).
-Sending harder separates them: random loss stays flat (5.07–5.16% under tier 2, 5.01–5.04% under BBR
-at five times the rate); congestion loss climbs (4.34% to 15.70%). So tier 3 is to be entered on trial,
-judged by the same trend test with a wider margin:
+In tier 2 a 5%-loss Wi-Fi link and a shallow congested queue look alike (loss near the cap, no queue).
+Sending harder separates them: random loss stays flat (5.37% under tier 2, 5.01% under BBR at six
+times the rate); congestion loss climbs (4.59% to 13.00%). So tier 3 is to be entered on trial, judged
+by the same trend test with a wider margin:
 
-- **2 → 3 (a trial):** after tier 2's dwell, at least 20 rounds and 2 s in tier 2 with the loss share at or above the cap
-  and no queue in any of those rounds. The loss share over the last 32 MiB is recorded as the trial's
-  baseline. Tier 3 starts in BBR's steady state (ProbeBW) at the current delivery rate, round trip and
-  window, never in Startup, whose 2.885× gain would breach the trial's bound.
-- **Loss that grows leaves tier 3, at any time in it, not only during the trial:** the share over the last 32 MiB passes
-  max(1.5 × the baseline, the baseline + 3 points). That is a failed trial.
+- **2 → 3 (a trial):** after tier 2's dwell, at least 20 rounds and 2 s in tier 2 with the loss share
+  at or above the cap and no queue in any of those rounds. The loss share over the last 32 MiB is
+  recorded as the trial's baseline. Tier 3 starts in BBR's steady state (ProbeBW) at the current
+  delivery rate, round trip and window, never in Startup, whose 2.885× gain would breach the trial's
+  bound.
+- **Loss that grows leaves tier 3, at any time in it, not only during the trial:** the share over the
+  last 32 MiB passes max(1.5 × the baseline, the baseline + 3 points). That is a failed trial.
 - **Back-off after a failed trial:** tier 3 is barred for 30 s, doubled after each failed trial up to
   8 min, and reset to 30 s only after a stay in tier 3 of 5 min with no failure.
 - **A queue leaves tier 3 (rule 3):** the last round's minimum round trip at or above
@@ -256,14 +276,15 @@ judged by the same trend test with a wider margin:
 - **3 → 2 when the loss goes:** the loss share under half the cap (2.5%) for 40 rounds and 4 s, handed
   down to a `VoxCubic` seeded in congestion avoidance at the delivery rate × the base round trip.
 
-**The trial's cost, plainly.** A trial on a path that turns out to be congested takes more than its
-share from the competing flows for as long as it lasts: measured on the shallow queue, BBR took 7.22×
-the Cubic flow. The rules bound that: each failed trial lasts until the 32 MiB trend window shows the
-rise (32 MiB is about 1.5 s at the 176 Mbit/s BBR reached; up to about 3 s while the window still
-holds tier 2's rounds), followed by at least 30 s of fair sharing, doubling with every
-further failure to 8 min. So a competing flow loses its share for at most about 3 s in every 30 s, then
-in every minute, then in every 8 minutes. That is the price of reaching 7× on a Wi-Fi link that loses
-5% of its packets; R41's shallow-queue arm reports the worst 2 s window so the decider sees it.
+**The trial's cost, plainly.** A trial on a path that turns out to be congested is to take more than
+its share from the competing flows for as long as it lasts: on the shallow queue, BBR took 6.97× the
+Cubic flow. The rules bound that: each failed trial is to last until the 32 MiB trend window shows
+the rise (32 MiB is about 1.5 s at the 180 Mbit/s BBR reached; up to about 3 s while the window still
+holds tier 2's rounds), followed by at least 30 s of fair sharing, doubling with every further failure
+to 8 min. So a competing flow is to lose its share for at most about 3 s in every 30 s, then in every
+minute, then in every 8 minutes. That is the price of reaching 7× on a Wi-Fi link that loses 5% of its
+packets. ADR-024 makes no claim about any window shorter than a congested arm's whole run: the arms
+are to print the 2 s windows only as a line marked DIAGNOSTIC, never as a verdict.
 
 ### Tier 1 ↔ 2 and dwell
 
@@ -273,30 +294,32 @@ in every minute, then in every 8 minutes. That is the price of reaching 7× on a
 
 ### The changing link
 
-Tier 2 with the cap (200 Mbit/s, 10 ms; 20 s clean, 20 s at 1% loss, 20 s clean, one transfer): 197.6,
-173.8 and 197.5 Mbit/s per phase. In the second clean phase the half-second windows ran
-169.1–226.8 Mbit/s (the lowest, 169.1, 18 s after the loss ended); the first three after the loss
-ended carried 191.5, 184.6 and 198.8 Mbit/s.
+Tier 2 with the cap and no trend (tree A; 200 Mbit/s, 10 ms; 20 s clean, 20 s at 1% loss, 20 s clean,
+one transfer): 197.6, 173.8 and 197.5 Mbit/s per phase. In the second clean phase the half-second
+windows ran 169.1–226.8 Mbit/s (the lowest, 169.1, 18 s after the loss ended); the first three after
+the loss ended carried 191.5, 184.6 and 198.8 Mbit/s.
 
 ### Not proven: no claim is made for these
 
-ADR-024 makes **no claim** for the cases below; none is measured, and none is to be built for v0.2.10
-(the decider, through vox, 2026-10-01). Where the design's behaviour can be reasoned, it errs safe:
+ADR-024 makes **no claim** for the cases below: none is measured, and none is to be built for
+v0.2.10 (the decider, through vox, 2026-10-01). How the design behaves on them is **unknown**. The
+risks, stated plainly:
 
-- **Jittery links (cellular), bursty loss:** jitter that delays whole rounds reads as a queue, and a
-  burst of losses trips the cap; either way tier 2 behaves as Cubic and tier 3 is not entered. These
-  links are to gain nothing, not to be harmed. Not measured.
-- **AQM (fq_codel, CAKE):** with flow queueing the router enforces fairness itself, and CoDel's early
-  drops of the queue-builder raise Vox's own loss share, which the trend reads as congestion. Not
-  measured.
-- **Two or more competing flows, a 50 ms WAN shared link:** not measured.
+- **Jittery links (cellular):** delay that varies from round to round may read as a queue, which would
+  hold tier 2 at Cubic's behaviour; or may not, in which case its losses are treated as random.
+- **Bursty loss:** a burst can push the loss share over the cap. Loss that averages at or above the
+  cap with no queue meets tier 3's trial condition, so such a link can enter a tier-3 trial, with the
+  trial's cost to any competing flow.
+- **AQM (fq_codel, CoDel, CAKE):** early drops at a short queue may read as random loss; whether the
+  loss trend catches them, and how flow queueing changes the outcome, is unmeasured.
+- **Two or more competing flows, and a shared 50 ms WAN link:** unmeasured.
 - **Every threshold** rests on the runs above (one or two per row) at one link rate and round trip per
   case.
 
 ## Consequences
 
 ### Positive
-- Clean links keep Cubic's measured ~98% of raw. Lossy links are to reach 2.9× a Cubic flow at 1% loss
+- Clean links keep Cubic's measured ~98% of raw. Lossy links are to reach 3.2× a Cubic flow at 1% loss
   and about 7× at 5%, without paying BBR's cost where it hurts.
 - No dependency change. It stays on quinn 0.11; tier 1 and tier 3 are Vox's ports of quinn's own
   controllers, and quinn is not patched.
@@ -324,14 +347,17 @@ ADR-024 makes **no claim** for the cases below; none is measured, and none is to
   - **lossy**, 200 Mbit/s, 10 ms, at 1% and at 5% random loss: Vox carries at least **2×** the
     quinn-Cubic comparison flow on the same loss;
   - **congested**, the link shared with the comparison flow through one queue, at 200 Mbit/s, 10 ms
-    with a 1-BDP and a ¼-BDP queue, and at 1 Gbit/s, 2 ms with a 1-BDP queue, each judged over 60 s
-    so tier-3 trials run inside it, with the worst 2 s window reported: Vox's rate is between **0.5×
+    with a 1-BDP and a ¼-BDP queue, and at 400 Mbit/s, 2 ms with a 1-BDP queue (a full queue there is
+    2 ms, under the queue test's floor), each judged over 60 s
+    so tier-3 trials run inside it (the 2 s windows printed as DIAGNOSTIC only): Vox's rate is between **0.5×
     and 2×** the comparison flow's;
   - **changing**, clean → 1% loss → clean and clean → 5% loss → clean under one transfer: every second
     of each clean phase at the clean bar (90% of raw TCP on that clean link), back at it within 5 s of
     the loss ending, and the lossy phase at that loss's lossy-arm bar;
-  - the existing **1 Gbit/s LAN** arm (at least 90% of raw) is the proof that a clean LAN is not held
-    in a tier that slows it.
+  - **clean LAN-like**, 400 Mbit/s, 2 ms: every one of 30 seconds at the clean bar (90% of raw), the
+    proof that a clean link is not held in a tier that slows it. 400 Mbit/s because the userspace
+    emulator calibrates that rate on a machine doing ordinary work; R41's 1 Gbit/s LAN link often
+    cannot (calibration windows of 74–83% at load 38–66, each must reach 95%), and stays as it is.
 
   The lossy arms are to be red on today's tier 1.
 - **M24.3 — Tier 2** (loss-aware Cubic) with the queue test, the cap and the trend, proved on all arms.
