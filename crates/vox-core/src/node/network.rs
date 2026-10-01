@@ -723,13 +723,9 @@ impl NodeNet {
         match kind {
             StreamKind::Rendezvous => {
                 // Where the records came from, for a full board to share itself by
-                // (`nat::store::Source`). A relayed peer's address is this node's own mux handle,
+                // (`nat::source::Source`). A relayed peer's address is this node's own mux handle,
                 // so it is known by identity instead.
-                let source = if conn.via_circuit() {
-                    crate::nat::store::Source::Relayed(peer)
-                } else {
-                    crate::nat::store::Source::of_addr(conn.quinn().remote_address().ip())
-                };
+                let source = crate::nat::source::Source::of_conn(conn);
                 self.service.serve_stream(peer, source, send, recv).await?;
                 Ok(Inbound::ServedRendezvous { peer })
             }
