@@ -25,7 +25,8 @@
 //!   member used to; removing the service changed the stored offer and nothing else.
 //! - **A quiet session is not dropped** (RP-09). quinn's defaults are a 30 s idle timeout and
 //!   no keep-alive, so on defaults an `ssh` session through a forward dies while its person
-//!   reads.
+//!   reads. Two things keep it up today, either one enough on its own: the transport's
+//!   keep-alive and the members' periodic sync over the same connection.
 //!
 //! ## Why it is `#[ignore]`d
 //!
