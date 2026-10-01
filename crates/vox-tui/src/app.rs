@@ -152,6 +152,11 @@ pub trait TerminalIo {
     fn draw(&mut self, render: &mut dyn FnMut(&mut Frame)) -> io::Result<()>;
     /// Wait up to `timeout` for a key press (release events are filtered).
     fn poll_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>>;
+    /// [`TerminalIo::poll_key`] for a key going into a secret field (a passphrase), read so that
+    /// nothing outlives it but the field itself (see [`CrosstermIo`]'s). Defaults to `poll_key`.
+    fn poll_secret_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
+        self.poll_key(timeout)
+    }
     /// Leave the alternate screen (clearing it), purge scrollback, restore the
     /// terminal. Idempotent; also performed on drop by real backends.
     fn leave(&mut self) -> io::Result<()>;
@@ -224,6 +229,18 @@ impl TerminalIo for CrosstermIo {
         }
     }
 
+    /// **A passphrase is read past crossterm** (V210-94). crossterm reads the terminal into a
+    /// 1024-byte buffer of its own, which it keeps for the life of the process and never clears:
+    /// a passphrase typed at the unlock prompt stayed there, whole, after the node locked — and after
+    /// a typed `:lock`, all of it but the six bytes `:lock\r` overwrote. Measured through the shipped
+    /// binary. While a secret field is being typed this reads the terminal itself, one byte into one
+    /// byte of stack, wiped before it returns; crossterm reads nothing meanwhile, so its buffer never
+    /// sees a passphrase.
+    #[cfg(unix)]
+    fn poll_secret_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
+        secret_input::poll_key(timeout)
+    }
+
     fn leave(&mut self) -> io::Result<()> {
         if self.entered {
             self.entered = false;
@@ -238,6 +255,123 @@ impl Drop for CrosstermIo {
     fn drop(&mut self) {
         // Runs on every exit path, including panic unwind.
         let _ = self.leave();
+    }
+}
+
+/// Reading a key for a secret field straight from the terminal, past crossterm; see
+/// [`CrosstermIo::poll_secret_key`].
+#[cfg(unix)]
+mod secret_input {
+    use std::io::{self, IsTerminal as _, Read as _};
+    use std::time::{Duration, Instant};
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use zeroize::Zeroize as _;
+
+    /// How long the rest of a multi-byte key (an escape sequence, a UTF-8 character) may take to
+    /// arrive once its first byte has: they come in one write.
+    const REST_OF_KEY: Duration = Duration::from_millis(30);
+
+    /// The terminal crossterm reads: standard input when it is one, else `/dev/tty`.
+    fn tty() -> io::Result<std::fs::File> {
+        use std::os::fd::AsFd as _;
+        let stdin = io::stdin();
+        if stdin.is_terminal() {
+            return Ok(std::fs::File::from(stdin.as_fd().try_clone_to_owned()?));
+        }
+        std::fs::File::options().read(true).open("/dev/tty")
+    }
+
+    /// One byte within `wait`, into `b`; `false` if none came.
+    fn byte(tty: &mut std::fs::File, b: &mut [u8; 1], wait: Duration) -> io::Result<bool> {
+        use std::os::fd::AsFd as _;
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let fd = tty.as_fd();
+            let mut fds = [rustix::event::PollFd::new(
+                &fd,
+                rustix::event::PollFlags::IN,
+            )];
+            let ts = rustix::event::Timespec::try_from(left).ok();
+            match rustix::event::poll(&mut fds, ts.as_ref()) {
+                Ok(0) => return Ok(false),
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+            return match tty.read(b) {
+                Ok(1) => Ok(true),
+                Ok(_) => Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => Err(e),
+            };
+        }
+    }
+
+    /// Wait up to `timeout` for one key, decoded the way crossterm decodes the keys a prompt uses.
+    /// An escape sequence (an arrow, a function key) is read whole and ignored.
+    pub(super) fn poll_key(timeout: Duration) -> io::Result<Option<KeyEvent>> {
+        let mut tty = tty()?;
+        let mut b = [0u8; 1];
+        let key = (|| -> io::Result<Option<KeyEvent>> {
+            if !byte(&mut tty, &mut b, timeout)? {
+                return Ok(None);
+            }
+            let plain = |code| Some(KeyEvent::new(code, KeyModifiers::NONE));
+            Ok(match b[0] {
+                b'\r' | b'\n' => plain(KeyCode::Enter),
+                0x7f | 0x08 => plain(KeyCode::Backspace),
+                b'\t' => plain(KeyCode::Tab),
+                0x1b => {
+                    if !byte(&mut tty, &mut b, REST_OF_KEY)? {
+                        return Ok(plain(KeyCode::Esc));
+                    }
+                    // `ESC [ … final` or `ESC O x`: read to its final byte and drop it.
+                    if b[0] == b'[' || b[0] == b'O' {
+                        let ss3 = b[0] == b'O';
+                        while byte(&mut tty, &mut b, REST_OF_KEY)? {
+                            if ss3 || (0x40..=0x7e).contains(&b[0]) {
+                                break;
+                            }
+                        }
+                    }
+                    None
+                }
+                c @ 0x00..=0x1f => Some(KeyEvent::new(
+                    KeyCode::Char(char::from(c | 0x60)),
+                    KeyModifiers::CONTROL,
+                )),
+                lead => {
+                    // UTF-8: the lead byte says how many follow. Assembled in a stack array wiped
+                    // below, like `b`.
+                    let len = match lead {
+                        0x00..=0x7f => 1,
+                        0xc0..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        0xf0..=0xf7 => 4,
+                        _ => return Ok(None),
+                    };
+                    let mut buf = [0u8; 4];
+                    buf[0] = lead;
+                    let mut ok = true;
+                    for slot in buf.iter_mut().take(len).skip(1) {
+                        if !byte(&mut tty, &mut b, REST_OF_KEY)? {
+                            ok = false;
+                            break;
+                        }
+                        *slot = b[0];
+                    }
+                    let c = ok
+                        .then(|| std::str::from_utf8(&buf[..len]).ok()?.chars().next())
+                        .flatten();
+                    buf.zeroize();
+                    c.and_then(|c| plain(KeyCode::Char(c)))
+                }
+            })
+        })();
+        b.zeroize();
+        key
     }
 }
 
@@ -1326,7 +1460,13 @@ fn event_loop(
 
         // Poll so the render loop never blocks indefinitely (core-pushed updates
         // and the idle timer are folded in each tick).
-        let Some(key) = io.poll_key(Duration::from_millis(250))? else {
+        // A passphrase is read past the terminal library (V210-94): see `poll_secret_key`.
+        let key = if ui.typing_a_secret() {
+            io.poll_secret_key(Duration::from_millis(250))?
+        } else {
+            io.poll_key(Duration::from_millis(250))?
+        };
+        let Some(key) = key else {
             continue;
         };
         last_input = clock();
