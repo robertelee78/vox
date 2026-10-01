@@ -26,6 +26,13 @@
 //! Within [`BOUND`] of carol's return, **carol reads all [`POSTS`]** of alice's entries, and while
 //! alice and the anchor were frozen carol ended no session with alice: bob carried them.
 //!
+//! ## Apparatus clock
+//! Carol's first answer after `SIGCONT` is timed on the same clock: the first read of her room
+//! returns only once her process runs again and her control socket answers. If carol fell short
+//! and that first answer took longer than [`APPARATUS_BUDGET`], the runner, not bob, owned the
+//! window: `CANNOT MEASURE: apparatus took X`. Otherwise the red is
+//! `PRODUCT: took X (apparatus Y)`.
+//!
 //! ## Mutation
 //! `absorb_arrived` never raises `gen` (the verifier's mutant B): bob stores alice's entries, but no
 //! port of his becomes due, and nothing else asks for a session with carol until the next tick,
@@ -57,6 +64,9 @@ const MARGIN: Duration = Duration::from_secs(3);
 /// longer fits between two ticks.
 const STAGING: Duration = Duration::from_secs(6);
 const SETUP: Duration = Duration::from_secs(90);
+/// How long carol's control socket may take to first answer after `SIGCONT` before a shortfall is
+/// the runner's.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
 fn texts_of(m: &Member, room: &str) -> Vec<String> {
     let mut r = m.reader();
@@ -71,10 +81,10 @@ fn relayed_count(texts: &[String]) -> usize {
 }
 
 #[test]
-#[ignore = "real vox processes timed against the 30 s periodic request; run under the timing lock"]
+#[ignore = "real vox processes timed against the 30 s periodic request; CI runs it in release"]
 fn a_member_relays_what_it_learned() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let (anchor, spec) = sync_pair::anchor(root);
     let alice = Member::new(root, "alice");
@@ -225,17 +235,21 @@ fn a_member_relays_what_it_learned() {
     carol_d.signal("-CONT");
     let back = Instant::now();
     let mut have = 0;
+    // The apparatus: when carol's control socket first answered after SIGCONT.
+    let mut answered = None;
     while back.elapsed() < BOUND {
         have = relayed_count(&texts_of(&carol, &room));
+        answered.get_or_insert(back.elapsed());
         if have == POSTS {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     let took = back.elapsed();
+    let answered = answered.unwrap_or(took);
     println!(
         "[proof] carol reads {have}/{POSTS} of alice's entries {took:.1?} after she was continued \
-         (bound {BOUND:?})"
+         (bound {BOUND:?}); apparatus: her socket first answered {answered:.1?} after SIGCONT"
     );
     let ended = ended_with_alice() - ended_before;
     println!("[proof] sessions carol ended with alice meanwhile: {ended}");
@@ -246,9 +260,15 @@ fn a_member_relays_what_it_learned() {
         "CANNOT MEASURE: carol ended {ended} session(s) with alice, so bob was not her only source"
     );
     assert!(
+        have == POSTS || answered <= APPARATUS_BUDGET,
+        "CANNOT MEASURE: apparatus took {answered:?} (carol's socket first answered that long after \
+         SIGCONT, budget {APPARATUS_BUDGET:?}); carol read {have}/{POSTS} within {BOUND:?}"
+    );
+    assert!(
         have == POSTS,
-        "carol reads {have}/{POSTS} of alice's entries {BOUND:?} after she was continued: bob holds \
-         all {POSTS} and did not hand them on\nbob:\n{}\ncarol:\n{}",
+        "PRODUCT: took more than {took:?} (apparatus {answered:?}): carol reads {have}/{POSTS} of \
+         alice's entries {BOUND:?} after she was continued: bob holds all {POSTS} and did not hand \
+         them on\nbob:\n{}\ncarol:\n{}",
         bob.status(),
         carol_d.transcript()
     );

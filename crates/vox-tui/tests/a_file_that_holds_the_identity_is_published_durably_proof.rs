@@ -59,7 +59,7 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str]) -> (bool, String, String) {
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(Stdio::null())
         .output()
-        .expect("run vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run {}: {e}", exe.display()));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -69,7 +69,10 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str]) -> (bool, String, String) {
 
 fn ok(exe: &Path, data: &Path, argv: &[&str]) -> String {
     let (good, out, err) = vox_with(exe, data, argv);
-    assert!(good, "vox {argv:?} failed: {out}{err}");
+    assert!(
+        good,
+        "CANNOT MEASURE: staging `vox {argv:?}` failed: {out}{err}"
+    );
     out
 }
 
@@ -78,9 +81,26 @@ fn vault_of(data: &Path) -> PathBuf {
 }
 
 fn vault_version(data: &Path) -> u64 {
-    IdentityVault::from_canonical_slice(&std::fs::read(vault_of(data)).unwrap())
-        .unwrap()
+    let path = vault_of(data);
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not read {}: {e}", path.display()));
+    IdentityVault::from_canonical_slice(&bytes)
+        .unwrap_or_else(|e| panic!("PRODUCT: vox left {} undecodable: {e:?}", path.display()))
         .version
+}
+
+/// The recorder's positive control: it must have seen the process open something under `data`,
+/// or an empty log (the interposer not loaded, its log lost) would read as "not durable".
+fn recorder_saw(events: &[syscalls::Event], data: &Path, what: &str) {
+    let data = syscalls::norm(data);
+    assert!(
+        events.iter().any(|e| matches!(&e.call,
+            syscalls::Call::Open { path, .. } if syscalls::norm(path).starts_with(&data))),
+        "CANNOT MEASURE: the syscall recorder saw no open under {} for {what} ({} events): the \
+         interposer did not load or its log was lost",
+        data.display(),
+        events.len()
+    );
 }
 
 fn verdict(what: &str, result: &Result<(), String>) {
@@ -97,10 +117,10 @@ fn verdict(what: &str, result: &Result<(), String>) {
 #[ignore = "real vox with production Argon2id under DYLD_INSERT_LIBRARIES, and the v0.2.9 release; run in release"]
 fn a_file_that_holds_the_identity_is_published_durably() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a profile directory");
         d
     };
     let new = PathBuf::from(VOX);
@@ -109,6 +129,7 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     let alice = dir("alice");
     let (made, out, err, events) = recorded(&new, &alice, &["id"], None, IDENTITY);
     assert!(made, "CANNOT MEASURE: `vox id` failed: {out}{err}");
+    recorder_saw(&events, &alice, "`vox id`");
     let fresh = published_durably(&events, &vault_of(&alice));
     verdict("a new identity's vault.cbor", &fresh);
 
@@ -128,6 +149,7 @@ fn a_file_that_holds_the_identity_is_published_durably() {
         migrated && out.contains("dave") && vault_version(&carol) == 2,
         "CANNOT MEASURE: the v0.2.9 profile did not migrate: {out}{err}"
     );
+    recorder_saw(&events, &carol, "the migration");
     let migration = published_durably(&events, &vault_of(&carol));
     verdict("a v0.2.9 vault.cbor rewritten by the migration", &migration);
 
@@ -153,7 +175,13 @@ fn a_file_that_holds_the_identity_is_published_durably() {
             l.trim_start().contains("@/ip4/127.0.0.1/udp/")
         });
     }
-    let events = parse(&std::fs::read_to_string(&log).unwrap_or_default());
+    let events = parse(&std::fs::read_to_string(&log).unwrap_or_else(|e| {
+        panic!(
+            "CANNOT MEASURE: the syscall recorder's log {} could not be read: {e}",
+            log.display()
+        )
+    }));
+    recorder_saw(&events, &node, "`vox node`");
     let headless = published_durably(&events, &node.join("default/node-identity.key"));
     verdict("a headless node's node-identity.key", &headless);
 
@@ -162,17 +190,18 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     let frank_fp = ok(&old, &frank, &["id"]).trim().to_owned();
     ok(&old, &erin, &["id"]);
     ok(&old, &erin, &["trust", "add", &frank_fp, "--name", "frank"]);
-    let before = std::fs::read(vault_of(&erin)).unwrap();
+    let before = std::fs::read(vault_of(&erin)).expect("APPARATUS: read erin's v0.2.9 vault");
     // A directory where the temporary file must be created: the write cannot happen.
     let blocker = erin.join("default/vault.tmp");
-    std::fs::create_dir(&blocker).unwrap();
+    std::fs::create_dir(&blocker).expect("APPARATUS: create the blocking directory");
     std::fs::write(
         blocker.join("keep"),
         b"the vault's temporary file cannot go here",
     )
-    .unwrap();
+    .expect("APPARATUS: fill the blocking directory");
     let (wrote, out, err) = vox_with(&new, &erin, &["trust", "list"]);
-    let kept = std::fs::read(vault_of(&erin)).unwrap() == before;
+    let kept =
+        std::fs::read(vault_of(&erin)).expect("APPARATUS: read erin's vault again") == before;
     let opens = IdentityVault::from_canonical_slice(&before)
         .and_then(|v| v.unlock_signer(IDENTITY.as_bytes()))
         .is_ok();
@@ -181,10 +210,16 @@ fn a_file_that_holds_the_identity_is_published_durably() {
          kept byte for byte = {kept}; it still opens = {opens}"
     );
     assert!(
-        !wrote && kept && opens,
-        "a failed vault write lost or changed the old vault: {out}{err}"
+        !wrote,
+        "CANNOT MEASURE: the blocked vault write was not staged — the unlock succeeded with the \
+         temporary file's path occupied: {out}{err}"
     );
-    std::fs::remove_dir_all(&blocker).unwrap();
+    assert!(
+        kept && opens,
+        "PRODUCT: a failed vault write lost or changed the old vault (kept byte for byte = \
+         {kept}, still opens = {opens}): {out}{err}"
+    );
+    std::fs::remove_dir_all(&blocker).expect("APPARATUS: remove the blocking directory");
     let deadline = Instant::now() + TIMEOUT;
     let listed = loop {
         let (good, out, _) = vox_with(&new, &erin, &["trust", "list"]);
@@ -200,7 +235,7 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     );
     assert!(
         vault_version(&erin) == 2 && listed.contains("frank"),
-        "the migration did not complete once the vault could be written: {listed}"
+        "PRODUCT: the migration did not complete once the vault could be written: {listed}"
     );
 
     for (what, r) in [
@@ -209,7 +244,7 @@ fn a_file_that_holds_the_identity_is_published_durably() {
         ("a headless node's node-identity.key", headless),
     ] {
         if let Err(e) = r {
-            panic!("{what} was not published durably: {e}");
+            panic!("PRODUCT: {what} was not published durably: {e}");
         }
     }
 }

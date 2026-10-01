@@ -113,16 +113,16 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
     for v in HARNESS_VARS {
         cmd.env_remove(v);
     }
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .take()
-            .expect("stdin")
+            .expect("APPARATUS: vox stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: write vox stdin");
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -132,11 +132,11 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 
 fn member(tmp: &Path, name: &'static str) -> Member {
     let dir = tmp.join(name);
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: harness file I/O");
     let pass = tmp.join(format!("{name}.pass"));
-    std::fs::write(&pass, IDPASS).unwrap();
+    std::fs::write(&pass, IDPASS).expect("APPARATUS: harness file I/O");
     let (ok, out, err) = vox(&dir, &["id"], None);
-    assert!(ok, "{name}: vox id: {err}");
+    assert!(ok, "CANNOT MEASURE: staging: {name}'s vox id failed: {err}");
     Member {
         name,
         dir,
@@ -148,18 +148,20 @@ fn member(tmp: &Path, name: &'static str) -> Member {
 
 fn spawn_anchor(tmp: &Path) -> (Proc, String) {
     let dir = tmp.join("anchor");
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: harness file I/O");
     let out = tmp.join("anchor.out");
     let mut cmd = Command::new(VOX);
     cmd.args(["node", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", &dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(&out).expect("APPARATUS: harness file I/O"),
+        ))
         .stderr(Stdio::null());
     for v in HARNESS_VARS {
         cmd.env_remove(v);
     }
-    let anchor = Proc(cmd.spawn().expect("spawn vox node"));
+    let anchor = Proc(cmd.spawn().expect("APPARATUS: spawn vox node"));
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let text = std::fs::read_to_string(&out).unwrap_or_default();
@@ -171,7 +173,7 @@ fn spawn_anchor(tmp: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "CANNOT MEASURE: staging: the anchor never printed its spec; it printed: {text:?}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -193,17 +195,26 @@ fn start_daemon(m: &mut Member, anchor: &str, tag: &str) {
     .env("VOX_CONFIG_DIR", m.dir.join("cfg"))
     .stdin(Stdio::null())
     .stdout(Stdio::null())
-    .stderr(Stdio::from(std::fs::File::create(&err).unwrap()));
+    .stderr(Stdio::from(
+        std::fs::File::create(&err).expect("APPARATUS: harness file I/O"),
+    ));
     for v in HARNESS_VARS {
         cmd.env_remove(v);
     }
-    m.daemon = Some(Proc(cmd.spawn().expect("spawn vox daemon")));
+    m.daemon = Some(Proc(cmd.spawn().expect("APPARATUS: spawn vox daemon")));
+    // The first start is staging; the restart is what this proof is about.
+    let side = if tag == "start" {
+        "CANNOT MEASURE: staging:"
+    } else {
+        "PRODUCT:"
+    };
     let deadline = Instant::now() + Duration::from_secs(60);
     while !vox(&m.dir, &["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "{}'s daemon never answered",
-            m.name
+            "{side} {}'s daemon ({tag}) never answered on its control socket; its stderr: {:?}",
+            m.name,
+            std::fs::read_to_string(&err).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -211,7 +222,11 @@ fn start_daemon(m: &mut Member, anchor: &str, tag: &str) {
 
 fn post(m: &Member, room: &str, text: &str) {
     let (ok, _, err) = vox(&m.dir, &["room", "post", room, text], None);
-    assert!(ok, "{} posts {text:?}: {err}", m.name);
+    assert!(
+        ok,
+        "PRODUCT: {}'s vox room post {text:?} failed: {err}",
+        m.name
+    );
 }
 
 fn renders(m: &Member, room: &str, text: &str) -> bool {
@@ -254,12 +269,19 @@ struct World {
 
 /// Steps 1–3 of the staging (see the module docs).
 fn restarted_responder() -> World {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
 
     // ---- the responder is the higher fingerprint, the joiner the lower ------------------
     let x = member(tmp.path(), "alice");
     let y = member(tmp.path(), "bob");
-    let key = |m: &Member| vox_core::node::link::b32_decode(&m.fp, "fingerprint").unwrap();
+    let key = |m: &Member| {
+        vox_core::node::link::b32_decode(&m.fp, "fingerprint").unwrap_or_else(|e| {
+            panic!(
+                "CANNOT MEASURE: staging: `vox id` printed {:?}, not a fingerprint: {e}",
+                m.fp
+            )
+        })
+    };
     let (mut alice, mut bob) = if key(&x) > key(&y) { (x, y) } else { (y, x) };
     // The names follow the roles, whichever identity drew which.
     alice.name = "alice";
@@ -281,31 +303,34 @@ fn restarted_responder() -> World {
         &["room", "create", "--name", "pair"],
         Some(ROOMPASS),
     );
-    assert!(ok, "room create: {err}");
-    let (_, listed, _) = vox(&alice.dir, &["room", "list"], None);
+    assert!(ok, "CANNOT MEASURE: staging: vox room create failed: {err}");
+    let (_, listed, list_err) = vox(&alice.dir, &["room", "list"], None);
     let room = listed
         .split_whitespace()
         .next()
-        .expect("the room in `vox room list`")
+        .unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE: staging: `vox room list` names no room after create: \
+                 {listed:?} {list_err:?}"
+            )
+        })
         .to_owned();
     let (ok, link, err) = vox(&alice.dir, &["room", "invite", &room], None);
-    assert!(ok, "room invite: {err}");
+    assert!(ok, "CANNOT MEASURE: staging: vox room invite failed: {err}");
     for m in [&bob, &carol] {
-        // A join can be turned away while the host admits another joiner (a known, separate
-        // defect): retried, bounded, as `support/room.rs` does.
-        let joined = (1..=6).any(|attempt| {
-            let (ok, _, err) = vox(
-                &m.dir,
-                &["room", "join", link.trim(), "--name", "pair"],
-                Some(ROOMPASS),
-            );
-            if !ok {
-                eprintln!("[harness] {} join attempt {attempt} refused: {err}", m.name);
-                std::thread::sleep(Duration::from_secs(5));
-            }
-            ok
-        });
-        assert!(joined, "CANNOT MEASURE: {} could not join the room", m.name);
+        // One attempt: a join turned away while the host admits another joiner is a known
+        // product defect, and retrying past it would hide it.
+        let (joined, _, err) = vox(
+            &m.dir,
+            &["room", "join", link.trim(), "--name", "pair"],
+            Some(ROOMPASS),
+        );
+        assert!(
+            joined,
+            "PRODUCT: {}'s vox room join was refused (a join turned away while the host admits \
+             another joiner is a known defect): {err}",
+            m.name
+        );
     }
 
     // ---- everyone trusts everyone, after the joins -------------------------------------
@@ -321,11 +346,15 @@ fn restarted_responder() -> World {
                         "--name",
                         b.name,
                         "--identity-passphrase-file",
-                        a.pass.to_str().unwrap(),
+                        a.pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
                     ],
                     None,
                 );
-                assert!(ok, "{} trusts {}: {err}", a.name, b.name);
+                assert!(
+                    ok,
+                    "CANNOT MEASURE: staging: {}'s trust add of {} failed: {err}",
+                    a.name, b.name
+                );
             }
         }
     }
@@ -401,11 +430,15 @@ fn one_rotates(w: &World, rotator: &Member, reader: &Member, arm: &str, why: &st
             "remove",
             &w.carol.fp,
             "--identity-passphrase-file",
-            rotator.pass.to_str().unwrap(),
+            rotator.pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
         ],
         None,
     );
-    assert!(ok, "{} removes carol: {err}", rotator.name);
+    assert!(
+        ok,
+        "PRODUCT: {}'s vox trust remove of carol failed: {err}",
+        rotator.name
+    );
     let text = format!("rotated: {} says", rotator.name);
     post(rotator, &w.room, &text);
     let t0 = Instant::now();
@@ -434,7 +467,7 @@ fn one_rotates(w: &World, rotator: &Member, reader: &Member, arm: &str, why: &st
     };
     assert!(
         took.is_some(),
-        "{arm}: {} never read {}'s post under the rotated key within {}s — {why}\nalice's log \
+        "PRODUCT: {arm}: {} never read {}'s post under the rotated key within {}s — {why}\nalice's log \
          tail:\n{}\nbob's log tail:\n{}",
         reader.name,
         rotator.name,

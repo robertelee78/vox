@@ -53,14 +53,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: spawn vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: vox's stdin")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("APPARATUS: write vox's stdin");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -68,17 +68,18 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     )
 }
 
+/// A port that was free a moment ago. Another process can take it before the daemon binds it
+/// (a bind-and-release race), which [`daemon`] reports as CANNOT MEASURE, never as the product.
 fn free_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+        .and_then(|s| s.local_addr())
+        .expect("APPARATUS: find a free port")
         .port()
 }
 
 /// Start `vox daemon` for `data`, reading its passphrases from `pass_file`, and wait until it answers.
 fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) -> VoxProc {
-    let p = VoxProc::spawn(
+    let mut p = VoxProc::spawn(
         name,
         data,
         &args(&[
@@ -98,53 +99,70 @@ fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) -> V
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!(
+        "CANNOT MEASURE: {name}'s daemon never answered `vox room list` within {TIMEOUT:?} (its \
+         port 127.0.0.1:{port} may have been taken after it was found free):\n{}",
+        p.transcript()
+    );
 }
 
 /// Create room `name` on the running daemon at `data`, post `POSTS` messages, and return its
-/// full id (from the invite link) and the link.
-fn room_with_posts(data: &Path, name: &str, pass: &str) -> (String, String) {
+/// full id (from the invite link), the link, and its short id from `vox room list`.
+fn room_with_posts(data: &Path, name: &str, pass: &str) -> (String, String, String) {
     let (ok, out, err) = vox_in(data, &["room", "create", "--name", name], pass);
-    assert!(ok, "vox room create {name}: {out}{err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging `vox room create {name}` failed: {out}{err}"
+    );
     let (ok, list, err) = vox_once(data, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "CANNOT MEASURE: staging `vox room list` failed: {err}");
     let short = list
         .lines()
         .find(|l| l.contains(name))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room {name} not listed: {list}"))
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: room {name} not listed after its create: {list}")
+        })
         .to_owned();
     let (ok, link, err) = vox_once(data, &args(&["room", "invite", &short]));
-    assert!(ok, "vox room invite {name}: {err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging `vox room invite {name}` failed: {err}"
+    );
     let link = link.trim().to_owned();
     let full = link
         .strip_prefix("vox://")
         .and_then(|rest| rest.get(..52))
-        .unwrap_or_else(|| panic!("an invite link, not {link:?}"))
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: `vox room invite` printed no invite link: {link:?}")
+        })
         .to_owned();
     for n in 0..POSTS {
         let (ok, _, err) = vox_once(
             data,
             &args(&["room", "post", &short, &format!("{name} post {n}")]),
         );
-        assert!(ok, "vox room post {name} #{n}: {err}");
+        assert!(
+            ok,
+            "CANNOT MEASURE: staging `vox room post {name}` #{n} failed: {err}"
+        );
     }
-    (full, link)
+    (full, link, short)
 }
 
 #[test]
 #[ignore = "real vox processes with production Argon2id and a real join; CI runs it in release"]
 fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a profile directory");
         d
     };
     let (anchor_dir, victim_dir, xavier_dir) = (dir("anchor"), dir("victim"), dir("xavier"));
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write the passphrase file");
 
     let mut anchor = VoxProc::spawn(
         "anchor",
@@ -160,18 +178,26 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
 
     for d in [&victim_dir, &xavier_dir] {
         let (ok, _, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "CANNOT MEASURE: staging `vox id` failed: {err}");
     }
-    let (_, victim_fp, _) = vox_once(&victim_dir, &args(&["id"]));
-    let victim_id = vox_tui::tunnel_cli::parse_fingerprint(victim_fp.trim()).expect("victim fp");
+    let fingerprint = |d: &Path, who: &str| {
+        let (_, fp, err) = vox_once(d, &args(&["id"]));
+        vox_tui::tunnel_cli::parse_fingerprint(fp.trim()).unwrap_or_else(|e| {
+            panic!("CANNOT MEASURE: `vox id` printed no fingerprint for {who}: {fp:?} {err} ({e})")
+        })
+    };
+    let victim_id = fingerprint(&victim_dir, "the victim");
+    let xavier_id = vox_core::node::link::b32_encode(&fingerprint(&xavier_dir, "xavier"));
 
     // ---- the victim holds two rooms; xavier joins only alpha, through the real binary --------
     let victim_port = free_port();
     let victim = daemon("victim", &victim_dir, victim_port, &spec, &idpass);
-    let (a_full, a_link) = room_with_posts(&victim_dir, "alpha", "alpha passphrase");
-    let (b_full, _b_link) = room_with_posts(&victim_dir, "bravo", "bravo passphrase");
-    let a = vox_tui::tunnel_cli::parse_fingerprint(&a_full).expect("room alpha id");
-    let b = vox_tui::tunnel_cli::parse_fingerprint(&b_full).expect("room bravo id");
+    let (a_full, a_link, a_short) = room_with_posts(&victim_dir, "alpha", "alpha passphrase");
+    let (b_full, _b_link, _) = room_with_posts(&victim_dir, "bravo", "bravo passphrase");
+    let a = vox_tui::tunnel_cli::parse_fingerprint(&a_full)
+        .unwrap_or_else(|e| panic!("CANNOT MEASURE: room alpha's id {a_full:?}: {e}"));
+    let b = vox_tui::tunnel_cli::parse_fingerprint(&b_full)
+        .unwrap_or_else(|e| panic!("CANNOT MEASURE: room bravo's id {b_full:?}: {e}"));
 
     let xavier = daemon("xavier", &xavier_dir, free_port(), &spec, &idpass);
     let (ok, out, err) = vox_in(
@@ -179,14 +205,34 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
         &["room", "join", &a_link, "--name", "alpha"],
         "alpha passphrase",
     );
-    assert!(ok, "xavier joins alpha: {out}{err}");
-    let (_, xlist, _) = vox_once(&xavier_dir, &args(&["room", "list"]));
     assert!(
-        !xlist.contains("bravo"),
-        "xavier must not be a member of bravo: {xlist}"
+        ok,
+        "CANNOT MEASURE: staging: xavier's join of alpha failed: {out}{err}"
     );
-    // Let the victim record xavier as a member of alpha before anything else happens.
-    std::thread::sleep(Duration::from_secs(3));
+    let (listed, xlist, xerr) = vox_once(&xavier_dir, &args(&["room", "list"]));
+    assert!(
+        listed && !xlist.contains("bravo"),
+        "CANNOT MEASURE: staging: xavier must be listed in alpha only: {xlist}{xerr}"
+    );
+    // The victim must record xavier as a member of alpha before anything else happens: watched in
+    // its roster, not hoped for.
+    let deadline = Instant::now() + TIMEOUT;
+    let roster = loop {
+        let (ok, roster, err) = vox_once(&victim_dir, &args(&["room", "roster", &a_short]));
+        if ok && roster.lines().any(|l| l.trim() == xavier_id) {
+            break roster;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: staging: the victim's roster of alpha never named xavier \
+             ({xavier_id}) within {TIMEOUT:?}: {roster}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    println!(
+        "staging: the victim's roster of alpha names xavier:\n{}",
+        roster.trim()
+    );
 
     // ---- xavier's node is stopped; the victim restarts so the attacker's is a fresh connection
     drop(xavier);
@@ -196,27 +242,37 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
         &rooms,
         format!("{IDENTITY}\n{a_full} alpha passphrase\n{b_full} bravo passphrase\n"),
     )
-    .unwrap();
-    let _victim = daemon("victim", &victim_dir, victim_port, &spec, &rooms);
+    .expect("APPARATUS: write the victim's passphrase file");
+    // On the same port, so the attacker reaches the restarted victim: a port taken meanwhile
+    // reads as CANNOT MEASURE in `daemon`.
+    let mut victim = daemon("victim", &victim_dir, victim_port, &spec, &rooms);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
+        .expect("APPARATUS: tokio runtime");
     rt.block_on(async {
         let xpaths = Paths::resolve("default", Some(&xavier_dir), Some(&xavier_dir.join("cfg")))
-            .expect("xavier's paths");
+            .expect("APPARATUS: xavier's paths");
         let endpoint = raw_sync::endpoint_as_member(&xpaths, IDENTITY.as_bytes()).await;
         let conn = Arc::new(
             endpoint
                 .connect(
-                    format!("127.0.0.1:{victim_port}").parse().unwrap(),
+                    format!("127.0.0.1:{victim_port}")
+                        .parse()
+                        .expect("APPARATUS: the victim's address"),
                     victim_id,
                     raw_sync::now(),
                 )
                 .await
-                .expect("xavier's identity connects to the victim"),
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "CANNOT MEASURE: xavier's identity could not connect to the victim, so \
+                         nothing below is measured: {e}\nvictim:\n{}",
+                        victim.transcript()
+                    )
+                }),
         );
         let pushed = raw_sync::answer_victim(Arc::clone(&conn));
 
@@ -233,8 +289,9 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
         println!("control: asked for alpha as its member → {control:?}");
         assert!(
             control.hello && control.entries >= POSTS,
-            "the CONTROL failed, so a zero below would prove nothing: alpha's member was not \
-             served alpha's posts — {control:?}"
+            "CANNOT MEASURE: the CONTROL failed, so a zero below would prove nothing: alpha's \
+             member was not served alpha's posts — {control:?}\nvictim:\n{}",
+            victim.transcript()
         );
 
         // ---- the attack: bravo, as a member of alpha only --------------------------------------
@@ -249,7 +306,7 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
         assert_eq!(
             (answered, leaked),
             (0, 0),
-            "a member of alpha was served bravo: {leaked} entries over {answered} answered \
+            "PRODUCT: a member of alpha was served bravo: {leaked} entries over {answered} answered \
              sessions. A node must serve a room's log only to that room's members (PRD-001 R5)"
         );
 
@@ -270,9 +327,10 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
         .await;
         assert!(
             a_pushed.is_ok(),
-            "the push CONTROL failed: the victim never pushed alpha to its member on a fresh \
-             connection, so a zero for bravo would prove nothing — {:?}",
-            pushed.lock().unwrap()
+            "CANNOT MEASURE: the push CONTROL failed: the victim never pushed alpha to its member \
+             on a fresh connection, so a zero for bravo would prove nothing — {:?}\nvictim:\n{}",
+            pushed.lock().unwrap(),
+            victim.transcript()
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
         let got = pushed.lock().unwrap().clone();
@@ -289,7 +347,7 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
         assert_eq!(
             (b_sessions, b_entries),
             (0, 0),
-            "the victim pushed bravo to a member of alpha only (PRD-001 R5)"
+            "PRODUCT: the victim pushed bravo to a member of alpha only (PRD-001 R5)"
         );
     });
     drop(anchor);
