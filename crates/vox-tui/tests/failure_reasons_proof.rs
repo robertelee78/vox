@@ -571,6 +571,9 @@ fn every_common_failure_names_its_cause() {
         "",
     );
     forward.expect_out("the forward's bound address", |l| l.contains(" → "));
+    // Two opposite outcomes, told apart: the forward never took a connection (apparatus), or it
+    // took one and the service's echo came back — the host carried an untrusted guest's bytes
+    // to the service, which is the product's security failing, never a CANNOT MEASURE.
     let mut refused = false;
     let deadline = Instant::now() + Duration::from_secs(60);
     while !refused && Instant::now() < deadline {
@@ -579,7 +582,14 @@ fn every_common_failure_names_its_cause() {
             let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
             let _ = s.write_all(b"hello");
             let mut buf = [0u8; 16];
-            refused = !matches!(s.read(&mut buf), Ok(n) if n > 0);
+            match s.read(&mut buf) {
+                Ok(n) if n > 0 => panic!(
+                    "PRODUCT: the host carried an untrusted guest's bytes to the service (echoed \
+                     {n} bytes: {:?})",
+                    String::from_utf8_lossy(&buf[..n])
+                ),
+                _ => refused = true,
+            }
         }
         if !refused {
             std::thread::sleep(Duration::from_millis(500));
@@ -587,7 +597,7 @@ fn every_common_failure_names_its_cause() {
     }
     assert!(
         refused,
-        "CANNOT MEASURE (7): an untrusted guest's connection went through"
+        "CANNOT MEASURE (7): the guest's forward never took a connection on {local} within 60 s"
     );
     // The guest's side: main says this through `up::refusal` (PRD-001 R23), in its own words.
     let guest_said = forward.expect_err("why the connection was refused", 30, |e| {
