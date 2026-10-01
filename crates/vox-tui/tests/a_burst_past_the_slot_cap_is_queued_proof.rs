@@ -64,11 +64,21 @@ use sync_pair::{counter, failures, pct, Member};
 
 /// More rooms than the 16 outbound slots, and ten times the 4 a peer may hold.
 const ROOMS: usize = 40;
-/// Each post readable by Bob within this of its `vox room post` returning.
-const BOUND: Duration = Duration::from_secs(2);
+/// Each post readable by Bob within this of its `vox room post` returning: 2 s in a release build,
+/// where timing bounds count. A debug build seals and opens every post unoptimized, about ten times
+/// as slowly (#295: the burst's crossings p50 2.23 s, most 4.89 s, against p50 0.21 s in release),
+/// so it gets 10 s, twice its most measured — still far below the 30 s interval a skipped port waits.
+const BOUND: Duration = Duration::from_secs(if cfg!(debug_assertions) { 10 } else { 2 });
 /// The post in the late-joined room readable by Bob within this, once he has synced with Alice
-/// there: well under the 30 s `Policy` backoff the refused push used to wait out (24 s on CI).
-const LATE_BOUND: Duration = Duration::from_secs(5);
+/// there: well under the 30 s `Policy` backoff the refused push used to wait out (24 s on CI). 5 s
+/// in a release build; 15 s in a debug build (see [`BOUND`]), still half that backoff.
+const LATE_BOUND: Duration = Duration::from_secs(if cfg!(debug_assertions) { 15 } else { 5 });
+/// Which build's bounds apply, said in the log.
+const PROFILE: &str = if cfg!(debug_assertions) {
+    "debug"
+} else {
+    "release"
+};
 /// Longest Bob stays paused while the burst is posted: well inside the 5 s an outbound session's
 /// setup may take, so no session fails for the pause.
 const PAUSE_MAX: Duration = Duration::from_secs(3);
@@ -127,6 +137,9 @@ fn a_burst_past_the_slot_cap_is_queued() {
         (ROOMS.div_ceil(JOINS_AT_ONCE) + STAGE_TRIES) as u32,
         (6 + ROOMS + STAGE_TRIES) as u32,
     );
+    shown(&format!(
+        "[proof] {PROFILE} build: bounds {BOUND:?} for the burst, {LATE_BOUND:?} for the late join"
+    ));
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let alice = Member::new(root, "alice");
