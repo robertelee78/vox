@@ -13,6 +13,11 @@
 //! trust added before the join releases the key only on a later tick (F12). Adding it
 //! after the join releases the key at once, and the readiness wait keeps posting until
 //! each reader renders one — so a proof starts from a room where anyone reads anyone.
+//!
+//! **Every red here names its side** (V210-106): `PRODUCT:` quoting what `vox` said (stderr
+//! included) when it refused, failed or stayed silent; `APPARATUS:` or `CANNOT MEASURE:` naming the
+//! fault when it is this harness's or the machine's. A join is asked **once**: a join the product
+//! turns away is a product red with its reason, never retried past.
 
 #![allow(dead_code)]
 
@@ -80,17 +85,46 @@ pub struct Out {
 impl Out {
     pub fn json(&self) -> serde_json::Value {
         serde_json::from_str(self.stdout.trim())
-            .unwrap_or_else(|e| panic!("not one JSON object ({e}): {self:?}"))
+            .unwrap_or_else(|e| panic!("PRODUCT: vox printed not one JSON object ({e}): {self:?}"))
     }
     pub fn ndjson(&self) -> Vec<serde_json::Value> {
         self.stdout
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|l| {
-                serde_json::from_str(l).unwrap_or_else(|e| panic!("bad NDJSON line ({e}): {l}"))
+                serde_json::from_str(l).unwrap_or_else(|e| {
+                    panic!("PRODUCT: vox printed a bad NDJSON line ({e}): {l}\nall of it: {self:?}")
+                })
             })
             .collect()
     }
+
+    /// Assert this invocation succeeded, or a `PRODUCT:` red naming `what` and quoting it.
+    #[track_caller]
+    pub fn expect_ok(&self, what: &str) -> &Self {
+        assert!(
+            self.ok,
+            "PRODUCT: {what} failed (exit {:?}).\n$ {}\nstdout:\n{}\nstderr:\n{}",
+            self.code,
+            self.argv,
+            self.stdout.trim(),
+            self.stderr.trim()
+        );
+        self
+    }
+}
+
+/// `p` as UTF-8, for an argument; a temp path that is not is the apparatus's fault.
+fn utf8(p: &std::path::Path) -> &str {
+    p.to_str()
+        .unwrap_or_else(|| panic!("APPARATUS: the path {} is not UTF-8", p.display()))
+}
+
+/// A file's text for a red, or why it could not be read — never an empty string standing in for
+/// a transcript that was lost.
+fn read_log(p: &std::path::Path) -> String {
+    std::fs::read_to_string(p)
+        .unwrap_or_else(|e| format!("(APPARATUS: could not read {}: {e})", p.display()))
 }
 
 /// One worker: a `vox daemon` process, its identity, and the profile directories the
@@ -176,16 +210,24 @@ impl Worker {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().expect("spawn vox");
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {bin} {args:?}: {e}"));
         if let Some(input) = stdin {
-            child
+            // A `vox` that exits without reading its stdin closes the pipe: what it said and its
+            // exit status, below, are the verdict, so a refused write is reported, not fatal.
+            if let Err(e) = child
                 .stdin
                 .take()
-                .unwrap()
+                .expect("APPARATUS: a piped stdin")
                 .write_all(input.as_bytes())
-                .unwrap();
+            {
+                eprintln!("[harness] {}: stdin not taken: {e}", self.name);
+            }
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not wait for {bin} {args:?}: {e}"));
         let o = Out {
             ok: out.status.success(),
             code: out.status.code(),
@@ -233,20 +275,81 @@ impl Room {
     }
 }
 
+/// A file to send a child's output to, or an `APPARATUS:` red naming it.
+fn log_file(p: &std::path::Path) -> Stdio {
+    Stdio::from(
+        std::fs::File::create(p)
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", p.display())),
+    )
+}
+
+fn mkdir(d: &std::path::Path) {
+    std::fs::create_dir_all(d)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+}
+
+/// A poll loop's own clock: how many times it looked, and the longest one look took. A deadline
+/// that passed after fewer than [`MIN_LOOKS`] looks did not give the product its chances — the
+/// harness or the machine was too slow to ask — so it is `CANNOT MEASURE`, not a product red.
+struct Looks {
+    t0: Instant,
+    n: u32,
+    slowest: Duration,
+    last: Instant,
+}
+
+/// Fewer looks than this before a deadline means the harness, not the product, ran out of time.
+const MIN_LOOKS: u32 = 5;
+
+impl Looks {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            t0: now,
+            n: 0,
+            slowest: Duration::ZERO,
+            last: now,
+        }
+    }
+
+    /// Count one look, which ended now.
+    fn looked(&mut self) {
+        self.n += 1;
+        self.slowest = self.slowest.max(self.last.elapsed());
+        self.last = Instant::now();
+    }
+
+    /// The side a deadline that passed belongs to, and what the clock saw.
+    fn side(&self) -> (&'static str, String) {
+        let seen = format!(
+            "{} look(s) in {:?}, the slowest {:?}",
+            self.n,
+            self.t0.elapsed(),
+            self.slowest
+        );
+        if self.n < MIN_LOOKS {
+            ("CANNOT MEASURE: the harness was too slow to look", seen)
+        } else {
+            ("PRODUCT:", seen)
+        }
+    }
+}
+
 fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
     let (data, cfg) = (tmp.join("anchor/data"), tmp.join("anchor/cfg"));
-    std::fs::create_dir_all(&cfg).unwrap();
-    let out = tmp.join("anchor.out");
-    let anchor = Proc(
+    mkdir(&cfg);
+    let (out, err) = (tmp.join("anchor.out"), tmp.join("anchor.err"));
+    let mut anchor = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &data)
             .env("VOX_CONFIG_DIR", &cfg)
-            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
-            .stderr(Stdio::null())
+            .stdout(log_file(&out))
+            .stderr(log_file(&err))
             .spawn()
-            .expect("spawn vox node"),
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX} node: {e}")),
     );
+    let mut looks = Looks::new();
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let text = std::fs::read_to_string(&out).unwrap_or_default();
@@ -256,10 +359,20 @@ fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
         {
             return (anchor, spec.to_owned());
         }
-        assert!(
-            Instant::now() < deadline,
-            "the anchor never printed its spec"
-        );
+        looks.looked();
+        let exited = anchor.0.try_wait().ok().flatten();
+        if exited.is_some() || Instant::now() >= deadline {
+            let (side, seen) = looks.side();
+            let side = if exited.is_some() { "PRODUCT:" } else { side };
+            panic!(
+                "{side} the anchor (`vox node`) printed no --anchor spec in {:?} ({}; {seen}).\n\
+                 stdout:\n{}\nstderr:\n{}",
+                looks.t0.elapsed(),
+                exited.map_or_else(|| "still running".to_owned(), |s| format!("it exited: {s}")),
+                read_log(&out),
+                read_log(&err)
+            );
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -267,10 +380,12 @@ fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
 fn worker(tmp: &std::path::Path, name: &str) -> Worker {
     let data = tmp.join(name).join("data");
     let cfg = tmp.join(name).join("cfg");
-    std::fs::create_dir_all(&cfg).unwrap();
+    mkdir(&cfg);
     let pass = tmp.join(format!("{name}.pass"));
-    std::fs::write(&pass, ID_PASS).unwrap();
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
+    std::fs::write(&pass, ID_PASS)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass.display()));
+    let paths = Paths::resolve("default", Some(&data), Some(&cfg))
+        .unwrap_or_else(|e| panic!("APPARATUS: no profile paths under {}: {e}", data.display()));
     let mut w = Worker {
         name: name.to_owned(),
         data,
@@ -281,13 +396,11 @@ fn worker(tmp: &std::path::Path, name: &str) -> Worker {
         daemon: None,
     };
     // `vox id` creates the identity on first use and prints its fingerprint.
-    let o = w.vox(
-        None,
-        &["id", "--identity-passphrase-file", w.pass.to_str().unwrap()],
-    );
-    assert!(o.ok, "{name}: vox id: {o:?}");
-    let fp = vox_core::node::link::b32_decode(o.stdout.trim(), "fingerprint")
-        .unwrap_or_else(|e| panic!("{name}: vox id printed no fingerprint ({e:?}): {o:?}"));
+    let o = w.vox(None, &["id", "--identity-passphrase-file", utf8(&w.pass)]);
+    o.expect_ok(&format!("{name}'s `vox id`"));
+    let fp = vox_core::node::link::b32_decode(o.stdout.trim(), "fingerprint").unwrap_or_else(|e| {
+        panic!("PRODUCT: {name}'s `vox id` printed no fingerprint ({e:?}): {o:?}")
+    });
     w.fp = fp;
     w
 }
@@ -307,20 +420,35 @@ fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
         .env("VOX_CONFIG_DIR", &w.cfg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(std::fs::File::create(err).unwrap()))
+        .stderr(log_file(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX} daemon: {e}"));
     w.daemon = Some(Proc(child));
     let started = Instant::now();
     let deadline = started + DAEMON_START_PATIENCE;
-    while !w.vox(None, &["room", "list"]).ok {
-        assert!(
-            Instant::now() < deadline,
-            "{}'s daemon never answered in {}s; its stderr:\n{}",
-            w.name,
-            DAEMON_START_PATIENCE.as_secs(),
-            std::fs::read_to_string(err).unwrap_or_default()
-        );
+    let mut looks = Looks::new();
+    loop {
+        let o = w.vox(None, &["room", "list"]);
+        looks.looked();
+        if o.ok {
+            break;
+        }
+        let exited = w
+            .daemon
+            .as_mut()
+            .and_then(|d| d.0.try_wait().ok().flatten());
+        if exited.is_some() || Instant::now() >= deadline {
+            let (side, seen) = looks.side();
+            let side = if exited.is_some() { "PRODUCT:" } else { side };
+            panic!(
+                "{side} {}'s daemon never answered `vox room list` in {:?} \
+                 ({}; {seen}). The last answer: {o:?}\nIts stderr:\n{}",
+                w.name,
+                started.elapsed(),
+                exited.map_or_else(|| "still running".to_owned(), |s| format!("it exited: {s}")),
+                read_log(err)
+            );
+        }
         std::thread::sleep(Duration::from_millis(500));
     }
     eprintln!(
@@ -342,54 +470,50 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
     }
 
     let first = &workers[0];
-    let o = first.vox_in(
-        None,
-        &["room", "create", "--name", "mission"],
-        Some(ROOM_PASS),
-    );
-    assert!(o.ok, "room create: {o:?}");
-    let id = first
-        .vox(None, &["room", "list"])
+    first
+        .vox_in(
+            None,
+            &["room", "create", "--name", "mission"],
+            Some(ROOM_PASS),
+        )
+        .expect_ok("`vox room create`");
+    let list = first.vox(None, &["room", "list"]);
+    let id = list
+        .expect_ok("`vox room list`")
         .stdout
         .split_whitespace()
         .next()
-        .expect("the new room in `vox room list`")
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` does not list the new room: {list:?}"))
         .to_owned();
-    let link = first
-        .vox(None, &["room", "invite", &id])
+    let invite = first.vox(None, &["room", "invite", &id]);
+    let link = invite
+        .expect_ok("`vox room invite`")
         .stdout
         .trim()
         .to_owned();
     let host_err = tmp.join(format!("{}.daemon.err", workers[0].name));
     for w in &workers[1..] {
-        // A join can be turned away while the host is busy admitting another joiner — a
-        // known, separate defect. Retry, bounded, and say so in the receipt.
-        let joined = (1..=6).any(|attempt| {
-            let t = Instant::now();
-            let o = w.vox_in(
-                None,
-                &["room", "join", &link, "--name", "mission"],
-                Some(ROOM_PASS),
-            );
-            eprintln!(
-                "[harness] {} join attempt {attempt}: {} in {:.1}s",
-                w.name,
-                if o.ok { "joined" } else { "refused" },
-                t.elapsed().as_secs_f64()
-            );
-            if !o.ok {
-                // The refusing side's own report: the host daemon says why it turned the
-                // joiner away (`a join did not complete — answering …: <reason>`).
-                eprintln!(
-                    "[harness] {}'s daemon stderr:\n{}",
-                    workers[0].name,
-                    std::fs::read_to_string(&host_err).unwrap_or_default()
-                );
-                std::thread::sleep(Duration::from_secs(5));
-            }
-            o.ok
-        });
-        assert!(joined, "{} could not join the room", w.name);
+        // Asked once. A join turned away — even while the host is busy admitting another
+        // joiner — is the product's to answer for, with its reason and the host's own report
+        // (`a join did not complete — answering …: <reason>`); a retry would hide it.
+        let t = Instant::now();
+        let o = w.vox_in(
+            None,
+            &["room", "join", &link, "--name", "mission"],
+            Some(ROOM_PASS),
+        );
+        assert!(
+            o.ok,
+            "PRODUCT: {} could not join the room: `vox room join` was refused after {:?} \
+             (exit {:?}).\nstdout:\n{}\nstderr:\n{}\nthe host {}'s daemon stderr:\n{}",
+            w.name,
+            t.elapsed(),
+            o.code,
+            o.stdout.trim(),
+            o.stderr.trim(),
+            workers[0].name,
+            read_log(&host_err)
+        );
     }
 
     // Trust after the joins (see the module note), each worker trusting every other.
@@ -405,10 +529,10 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
                         "--name",
                         &b.name,
                         "--identity-passphrase-file",
-                        a.pass.to_str().unwrap(),
+                        utf8(&a.pass),
                     ],
                 );
-                assert!(o.ok, "{} trusts {}: {o:?}", a.name, b.name);
+                o.expect_ok(&format!("{}'s `vox trust add` of {}", a.name, b.name));
             }
         }
     }
@@ -424,14 +548,31 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         })
         .collect();
     let mut n = 0u32;
+    let mut looks = Looks::new();
     while !owed.is_empty() {
-        assert!(
-            Instant::now() < deadline,
-            "the room never became readable both ways: owed (author, reader) {:?}",
-            owed.iter()
-                .map(|(a, r)| (workers[*a].name.clone(), workers[*r].name.clone()))
-                .collect::<Vec<_>>()
-        );
+        if Instant::now() >= deadline {
+            let (side, seen) = looks.side();
+            let last: Vec<String> = owed
+                .iter()
+                .map(|(_, r)| {
+                    let o = workers[*r].vox(None, &["room", "read", &id]);
+                    format!(
+                        "{} reads:\n{}\n{}",
+                        workers[*r].name,
+                        o.stdout.trim(),
+                        o.stderr.trim()
+                    )
+                })
+                .collect();
+            panic!(
+                "{side} the room never became readable both ways in 120s ({seen}): members who \
+                 trust each other still owe (author, reader) {:?}.\n{}",
+                owed.iter()
+                    .map(|(a, r)| (workers[*a].name.clone(), workers[*r].name.clone()))
+                    .collect::<Vec<_>>(),
+                last.join("\n")
+            );
+        }
         n += 1;
         for (a, author) in workers.iter().enumerate() {
             if owed.iter().any(|(x, _)| *x == a) {
@@ -444,26 +585,32 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
                         &format!("harness: ready {} {n}", author.name),
                     ],
                 );
-                assert!(o.ok, "{o:?}");
+                o.expect_ok(&format!("{}'s `vox room post`", author.name));
             }
         }
         std::thread::sleep(Duration::from_secs(1));
         owed.retain(|(a, r)| {
-            let seen = workers[*r].vox(None, &["room", "read", &id]).stdout;
-            !seen.contains(&format!("harness: ready {} ", workers[*a].name))
+            let seen = workers[*r].vox(None, &["room", "read", &id]);
+            seen.expect_ok(&format!("{}'s `vox room read`", workers[*r].name));
+            !seen
+                .stdout
+                .contains(&format!("harness: ready {} ", workers[*a].name))
         });
+        looks.looked();
     }
 
     // `vox room list` prints a prefix; every `read --json` row names the room in full.
-    let rows = workers[0]
-        .vox(None, &["room", "read", &id, "--json"])
-        .ndjson();
+    let read = workers[0].vox(None, &["room", "read", &id, "--json"]);
+    let rows = read.expect_ok("`vox room read --json`").ndjson();
     let full = rows
         .first()
         .and_then(|r| r["room"].as_str())
-        .expect("a readable room names itself in full")
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: a readable room's `read --json` names no room: {read:?}")
+        })
         .to_owned();
-    let cid = vox_core::node::link::b32_decode(&full, "room id").expect("a room id");
+    let cid = vox_core::node::link::b32_decode(&full, "room id")
+        .unwrap_or_else(|e| panic!("PRODUCT: `read --json` names the room {full:?}: {e:?}"));
     Room {
         id: full,
         cid,
@@ -484,15 +631,18 @@ pub fn until(
 ) -> Out {
     let deadline = Instant::now() + TIMEOUT;
     let mut last = None;
+    let mut looks = Looks::new();
     while Instant::now() < deadline {
         let o = w.vox(session, args);
+        looks.looked();
         if ok(&o) {
             return o;
         }
         last = Some(o);
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}; last saw {last:?}");
+    let (side, seen) = looks.side();
+    panic!("{side} {what} did not happen in {TIMEOUT:?} ({seen}); the last answer: {last:?}");
 }
 
 /// A resource's entry in a `vox.room.board/1` object, if it has one.
@@ -508,7 +658,12 @@ pub fn resource<'a>(board: &'a serde_json::Value, r: &str) -> Option<&'a serde_j
 pub async fn post_raw(w: &Worker, cid: [u8; 32], text: &str) {
     let mut c = vox_core::node::ipc::IpcClient::open(&w.paths.socket_file())
         .await
-        .expect("socket");
+        .unwrap_or_else(|e| {
+            panic!(
+                "CANNOT MEASURE: the harness could not open {}'s control socket: {e}",
+                w.name
+            )
+        });
     match c
         .request(&vox_core::node::ipc::Request::Post {
             channel_id: cid,
@@ -517,6 +672,10 @@ pub async fn post_raw(w: &Worker, cid: [u8; 32], text: &str) {
         .await
     {
         Ok(vox_core::node::ipc::Frame::Ok) => {}
-        other => panic!("raw post refused: {other:?}"),
+        Ok(other) => panic!("PRODUCT: {}'s daemon refused a raw post: {other:?}", w.name),
+        Err(e) => panic!(
+            "CANNOT MEASURE: the harness's raw post to {}'s control socket failed: {e}",
+            w.name
+        ),
     }
 }

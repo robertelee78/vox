@@ -253,7 +253,9 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
     assert!(ok, "CANNOT MEASURE: alice's roster: {err}");
     let names = |fp: &str| roster.lines().any(|l| l.trim().starts_with(&fp[..26]));
     std::fs::write(cues.join("stop"), b"").unwrap();
-    let driven = driver.join().expect("the TUI driver");
+    let driven = driver
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p));
     println!(
         "[proof] bob's join answered {:?} after the lock: {}; alice's roster has {} member(s), \
          bob among them: {}; the TUI driver exited {:?} after {:?} at {:?}",
