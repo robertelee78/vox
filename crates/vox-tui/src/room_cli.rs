@@ -2158,6 +2158,14 @@ async fn collect_offer(
         .await
     {
         Ok(Frame::Bound { local }) => local,
+        // The sender was reached and is serving; this member's connection to it is full.
+        Ok(Frame::Error { reason })
+            if reason == vox_core::node::api::Fault::TunnelLimit.explain() =>
+        {
+            return Err(AppError::Usage(format!(
+                "cannot collect the offer: {reason}"
+            )))
+        }
         Ok(Frame::Error { reason }) => {
             return Err(AppError::Usage(format!(
                 "cannot reach the offer: {reason} — the sender may have stopped serving it, or \

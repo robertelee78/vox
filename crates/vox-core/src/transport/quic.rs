@@ -200,7 +200,8 @@ pub const STREAM_WINDOW: u32 = 16 << 20;
 /// unlimited connection window let one peer park 100 × 16 MiB = 1.6 GiB in this node's memory
 /// by writing into streams nobody reads.
 ///
-/// **Each running tunnel adds its own [`STREAM_WINDOW`] on top** ([`VoxConnection::carry_tunnel`]).
+/// **Each running tunnel adds its own [`STREAM_WINDOW`] on top** ([`VoxConnection::carry_tunnel`]),
+/// up to [`TUNNELS_PER_PEER`] tunnels on one connection.
 /// A tunnel whose local reader stops reading keeps a full stream window unread, and the
 /// connection's credit is shared: at a fixed two stream windows, two such tunnels held all of it,
 /// and the room's sync, pairwise keys and board records to that peer got none — a post waited out
@@ -209,6 +210,17 @@ pub const STREAM_WINDOW: u32 = 16 << 20;
 /// authorized, or opened for its own local application, are credited, so an unauthorized peer
 /// still gets exactly this.
 pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
+
+/// How many tunnels one connection — one member's, to this node — carries at once, in both
+/// directions together. A tunnel past it is refused at once, saying so (decider, 2026-10-01).
+///
+/// Without it, every tunnel a trusted member opened added a [`STREAM_WINDOW`] to what this node
+/// agreed to buffer for them, with no end: a member could hold 16 MiB of this node's memory per
+/// tunnel whose far end had stopped reading. With it, the most a member's connection can hold is
+/// [`CONNECTION_WINDOW`] plus this many stream windows (288 MiB), and every tunnel it carries is
+/// still credited a window of its own, so the room's sync never waits on them. Generous by design:
+/// past any real use, it is a bound on memory, not a quota.
+pub const TUNNELS_PER_PEER: u32 = 16;
 
 /// quinn's own path-MTU ceiling (`MtuDiscoveryConfig::default().upper_bound`): 1500-byte Ethernet
 /// less IPv6 and UDP headers. What an endpoint falls back to when its socket cannot take the
@@ -713,7 +725,7 @@ fn finish_connection(
         datagram_tx: Mutex::new(DatagramSender::new()),
         datagram_rx: Mutex::new(ReplayWindow::default()),
         datagrams_dropped: AtomicU64::new(0),
-        tunnels: Mutex::new(0),
+        tunnels: Arc::new(Mutex::new(0)),
     })
 }
 
@@ -791,21 +803,36 @@ pub struct VoxConnection {
     /// on a live connection is a replay signal worth surfacing.
     datagrams_dropped: AtomicU64,
     /// Tunnels running on this connection, each credited a stream window of its own
-    /// ([`VoxConnection::carry_tunnel`]).
-    tunnels: Mutex<u32>,
+    /// ([`VoxConnection::carry_tunnel`]). Shared with each [`TunnelCredit`], so a credit needs no
+    /// borrow of the connection.
+    tunnels: Arc<Mutex<u32>>,
 }
 
 /// A tunnel's share of its connection's receive window, held for as long as the tunnel runs
 /// (see [`CONNECTION_WINDOW`]). Dropping it gives the share back.
 #[must_use = "the credit lasts only as long as the guard is held"]
-pub struct TunnelCredit<'a>(&'a VoxConnection);
+pub struct TunnelCredit {
+    tunnels: Arc<Mutex<u32>>,
+    connection: Connection,
+}
 
-impl Drop for TunnelCredit<'_> {
+impl Drop for TunnelCredit {
     fn drop(&mut self) {
-        let mut n = lock(&self.0.tunnels);
+        let mut n = lock(&self.tunnels);
         *n = n.saturating_sub(1);
-        self.0.set_tunnel_window(*n);
+        set_tunnel_window(&self.connection, *n);
     }
+}
+
+/// Set `connection`'s receive window for `tunnels` running tunnels.
+fn set_tunnel_window(connection: &Connection, tunnels: u32) {
+    let window = u64::from(CONNECTION_WINDOW) + u64::from(tunnels) * u64::from(STREAM_WINDOW);
+    connection.set_receive_window(quinn::VarInt::from_u64(window).unwrap_or(quinn::VarInt::MAX));
+}
+
+/// Whether a connection already carrying `open` tunnels must refuse one more.
+fn at_tunnel_cap(open: u32) -> bool {
+    open >= TUNNELS_PER_PEER
 }
 
 /// The next [`VoxConnection::serial`].
@@ -816,19 +843,29 @@ impl VoxConnection {
     /// [`CONNECTION_WINDOW`], for as long as the returned guard is held — so a tunnel whose
     /// local reader has stopped cannot take the credit the room's other streams need.
     ///
+    /// [`Error::TunnelLimit`] when the connection already carries [`TUNNELS_PER_PEER`]: the
+    /// tunnel is to be refused, not carried on credit the room's sync needs.
+    ///
     /// Take it only for a tunnel this node authorized or opened for its own application: the
     /// credit is memory this node agrees to hold for that peer.
-    pub fn carry_tunnel(&self) -> TunnelCredit<'_> {
+    pub fn carry_tunnel(&self) -> Result<TunnelCredit> {
         let mut n = lock(&self.tunnels);
-        *n = n.saturating_add(1);
-        self.set_tunnel_window(*n);
-        TunnelCredit(self)
+        if at_tunnel_cap(*n) {
+            return Err(Error::TunnelLimit);
+        }
+        *n += 1;
+        set_tunnel_window(&self.connection, *n);
+        Ok(TunnelCredit {
+            tunnels: Arc::clone(&self.tunnels),
+            connection: self.connection.clone(),
+        })
     }
 
-    fn set_tunnel_window(&self, tunnels: u32) {
-        let window = u64::from(CONNECTION_WINDOW) + u64::from(tunnels) * u64::from(STREAM_WINDOW);
-        self.connection
-            .set_receive_window(quinn::VarInt::from_u64(window).unwrap_or(quinn::VarInt::MAX));
+    /// Whether this connection already carries as many tunnels as it may
+    /// ([`TUNNELS_PER_PEER`]), so another would be refused.
+    #[must_use]
+    pub fn tunnels_full(&self) -> bool {
+        at_tunnel_cap(*lock(&self.tunnels))
     }
 
     /// **A name for this connection that no other connection in this process is ever given.**

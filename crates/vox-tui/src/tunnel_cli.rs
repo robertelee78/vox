@@ -990,6 +990,7 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
         "NotAServiceRoom" => Fault::NotAServiceRoom,
         "NotOffered" => Fault::NotOffered,
         "NoSuchForward" => Fault::NoSuchForward,
+        "TunnelLimit" => Fault::TunnelLimit,
         "Internal" => Fault::Internal,
         _ => return None,
     })

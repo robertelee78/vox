@@ -164,7 +164,8 @@ pub async fn serve(
 ///
 /// `carried` is the connection the stream arrived on: an authorized tunnel is credited a
 /// receive window of its own on it for as long as it runs ([`VoxConnection::carry_tunnel`]),
-/// and a refused one is not.
+/// and a refused one is not. One past the connection's
+/// [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER) is refused.
 ///
 /// [`VoxConnection::carry_tunnel`]: crate::transport::quic::VoxConnection::carry_tunnel
 pub async fn serve_reporting(
@@ -195,7 +196,8 @@ pub async fn serve_reporting(
             if let Some(conn) = carried {
                 *credit
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(conn.carry_tunnel());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(conn.carry_tunnel()?);
             }
             if let Some(tx) = events {
                 let _ = tx.send(NodeEvent::TunnelServed {
@@ -204,6 +206,7 @@ pub async fn serve_reporting(
                     service_tag: tag.to_owned(),
                 });
             }
+            Ok(())
         },
     )
     .await;
@@ -318,10 +321,9 @@ impl Forward {
                 tokio::spawn(async move {
                     // One stream per connection, on whatever connection reaches the host now.
                     match up::open_tunnel(dialer.as_ref(), &host, &channel_id, &tag).await {
-                        // `carried` is held for the whole splice (see `up::open_tunnel`), and
-                        // credits the tunnel a receive window of its own on it.
-                        Ok((send, recv, carried)) => {
-                            let _credit = carried.carry_tunnel();
+                        // `_carried` and `_credit` are held for the whole splice (see
+                        // `up::open_tunnel`): the path, and the tunnel's receive window on it.
+                        Ok((send, recv, _carried, _credit)) => {
                             if let Err(Error::TunnelRevoked(_)) =
                                 session::splice(send, recv, app).await
                             {

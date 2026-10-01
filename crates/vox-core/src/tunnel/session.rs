@@ -261,7 +261,7 @@ pub async fn accept<F>(
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
 {
-    accept_reporting(send, recv, client_id, resolve, |_, _| {}).await
+    accept_reporting(send, recv, client_id, resolve, |_, _| Ok(())).await
 }
 
 /// [`accept`], reporting each authorized request to `served` before the local connect.
@@ -276,6 +276,10 @@ where
 /// inside the accept path, so it must not block: the intended use is to hand an event
 /// to a queue. It is informational for a live client, *not* an audit log — a durable,
 /// signed record of session establishment is ADR-013's own open item.
+///
+/// `served` may still refuse the tunnel with an error, which the dialer sees as the same
+/// uniform denial: the host's one such refusal is a connection already carrying all the tunnels
+/// it may ([`Error::TunnelLimit`]).
 pub async fn accept_reporting<F, S>(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -285,7 +289,7 @@ pub async fn accept_reporting<F, S>(
 ) -> Result<()>
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
-    S: FnOnce(&Digest32, &str),
+    S: FnOnce(&Digest32, &str) -> Result<()>,
 {
     let req = TunnelRequest::from_bytes(&read_frame(&mut recv).await?)?;
 
@@ -336,7 +340,11 @@ where
     };
     // Authorized, and not before: the host learns who reached what, and learns nothing
     // about a refusal it did not grant.
-    served(&req.channel_id, &req.service_tag);
+    if let Err(e) = served(&req.channel_id, &req.service_tag) {
+        write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
+        let _ = send.finish();
+        return Err(e);
+    }
 
     let tcp = match TcpStream::connect(target).await {
         Ok(t) => t,

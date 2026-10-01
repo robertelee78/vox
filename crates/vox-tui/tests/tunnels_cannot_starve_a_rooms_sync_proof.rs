@@ -13,6 +13,11 @@
 //!   is frozen, so it reads nothing its tunnels carry. This test asks Bob's daemon for a forward
 //!   to the offer over Bob's control socket, exactly as `vox room get` does, opens two
 //!   connections through it and writes into both until they stop taking bytes.
+//! - **Cap arm** (one member's tunnels past [`TUNNELS_PER_PEER`]): with the upload arm's two still
+//!   held, Bob opens more connections through the same forward until his connection to Alice
+//!   carries 16 tunnels, all stalled, then [`EXTRA`] more; then he runs `vox room get` of the
+//!   offer. By the decider's ruling (2026-10-01), a tunnel past the cap is refused at once, saying
+//!   why, so the room's sync keeps flowing and the memory a member can hold stays bounded.
 //!
 //! The defect (sweep F-X7): the connection's receive window was two stream windows
 //! (`CONNECTION_WINDOW = 2 × STREAM_WINDOW`, 32 MiB), so two backpressured tunnels could hold all
@@ -23,7 +28,10 @@
 //! Measured here: posts each way, timed from the post to the other side reading it on its own
 //! control socket, first with no tunnel ([`POSTS`], the control) and then, in each arm, with both
 //! tunnels backpressured ([`FROZEN_POSTS`]).
-//! Asserted: in each arm, every post is read within [`BOUND`].
+//! Asserted: in each arm, every post is read within [`BOUND`]. In the cap arm, also: Bob's
+//! `vox room get` is refused within [`REFUSED_WITHIN`], saying [`LIMIT_SAID`]; the [`EXTRA`]
+//! tunnels each take less than [`ONE_WINDOW_TAKEN`]; and Alice's daemon grows by less than
+//! [`GREW_PAST_CAP`] (from `ps`) between the cap and past it.
 //!
 //! ## Preconditions (else CANNOT MEASURE)
 //! The control posts all arrived within [`BOUND`]. In the download arm, both collectors received
@@ -31,14 +39,17 @@
 //! the window**: the writing end stopped advancing (Alice's `vox room send` stopped reading the
 //! file, or this test's writes stopped being taken) while more than the defect's whole connection
 //! window (2 × `STREAM_WINDOW`) had been written and not read. A writer that cannot advance is
-//! held by flow control, so the reading side's windows are full.
+//! held by flow control, so the reading side's windows are full. In the cap arm, both rounds of writes
+//! stopped advancing.
 //!
 //! ## Mutation
 //! Restore the old windows (`CONNECTION_WINDOW = 2 * STREAM_WINDOW`, each stream allowed the
 //! whole [`STREAM_WINDOW`](vox_core::transport::quic::STREAM_WINDOW)), and the frozen phase goes
 //! red: Alice's posts are not read by Bob within the bound. Credit only the dialing side's tunnels
 //! (no `carry_tunnel` in the host's `serve_reporting`), and the upload arm goes red: Bob's posts
-//! are not read by Alice.
+//! are not read by Alice. Take the cap away (`at_tunnel_cap` never true), and the cap arm goes
+//! red: the `vox room get` is not refused, the extra tunnels are carried, and Alice grows by
+//! about a stream window per extra tunnel.
 
 #![cfg(unix)]
 
@@ -57,7 +68,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sync_pair::{counter, failures, pct, Member, Reader, ID_PASS, VOX};
-use vox_core::transport::quic::STREAM_WINDOW;
+use vox_core::transport::quic::{STREAM_WINDOW, TUNNELS_PER_PEER};
 
 /// Posts timed each way with no tunnel (the control).
 const POSTS: usize = 10;
@@ -77,11 +88,37 @@ const POLL: Duration = Duration::from_millis(10);
 const TAKEN: u64 = 2 * STREAM_WINDOW as u64;
 /// How long the writing end may keep advancing before the arm cannot measure.
 const STALL_WITHIN: Duration = Duration::from_secs(30);
+/// Tunnels the cap arm opens past [`TUNNELS_PER_PEER`].
+const EXTRA: usize = 8;
+/// What a carried tunnel takes before it stalls, at least: half its stream window. A refused one
+/// takes only what the local socket buffers before its reset arrives.
+const ONE_WINDOW_TAKEN: u64 = STREAM_WINDOW as u64 / 2;
+/// How much alice's daemon may grow when the [`EXTRA`] tunnels are asked for: half of what they
+/// would hold if they were carried. Refused, they hold nothing.
+const GREW_PAST_CAP: u64 = EXTRA as u64 * STREAM_WINDOW as u64 / 2;
+/// How long a `vox room get` past the cap may take to be refused: it is refused before anything
+/// is dialled anew, so this is process start and one control-socket round.
+const REFUSED_WITHIN: Duration = Duration::from_secs(30);
+/// What the person is told past the cap.
+const LIMIT_SAID: &str = "16 tunnels are already open to this member";
 
 /// A child process killed by its own PID however the proof ends.
 struct Kid(Child);
 
 impl Kid {
+    /// Whether it exited successfully within `bound`; `None` if it is still running.
+    fn exited_within(&mut self, bound: Duration) -> Option<bool> {
+        let t0 = Instant::now();
+        while t0.elapsed() < bound {
+            match self.0.try_wait() {
+                Ok(Some(status)) => return Some(status.success()),
+                Ok(None) => std::thread::sleep(POLL),
+                Err(e) => panic!("APPARATUS: wait for vox: {e}"),
+            }
+        }
+        None
+    }
+
     fn signal(&self, sig: &str) {
         let ok = Command::new("kill")
             .args([sig, &self.0.id().to_string()])
@@ -120,6 +157,48 @@ fn spawn_vox(m: &Member, args: &[&str], out: &Path) -> Kid {
         .spawn()
         .expect("APPARATUS: spawn vox");
     Kid(child)
+}
+
+/// `n` connections to the forward at `bound`, each written into until it stops taking bytes,
+/// with the count each has taken.
+fn writers(bound: &str, n: usize) -> (Vec<TcpStream>, Vec<Arc<AtomicU64>>) {
+    let written: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::default()).collect();
+    let socks = written
+        .iter()
+        .map(|count| {
+            let sock = TcpStream::connect(bound).unwrap_or_else(|e| {
+                panic!("PRODUCT: Bob's daemon bound the forward at {bound} but it refuses a connection: {e}")
+            });
+            let mut w = sock
+                .try_clone()
+                .expect("APPARATUS: clone the forward socket");
+            let count = Arc::clone(count);
+            std::thread::spawn(move || {
+                let chunk = vec![0x5a_u8; 64 * 1024];
+                while let Ok(n) = w.write(&chunk) {
+                    count.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            });
+            sock
+        })
+        .collect();
+    (socks, written)
+}
+
+fn loads(counts: &[Arc<AtomicU64>]) -> Vec<u64> {
+    counts.iter().map(|c| c.load(Ordering::Relaxed)).collect()
+}
+
+/// `pid`'s resident memory in KiB, from the shipped `ps`.
+fn rss(pid: u32) -> u64 {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .expect("APPARATUS: run ps");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("APPARATUS: ps gave no resident size for {pid}: {text:?}"))
 }
 
 /// Bytes the collector has written into its download directory so far (its `.part` file).
@@ -398,27 +477,8 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         panic!("APPARATUS: Bob's control-socket read found no row naming big.bin, already read")
     });
     let bound = rb.forward(cb, host, &tag);
-    let written: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::default()).collect();
-    let socks: Vec<TcpStream> = written
-        .iter()
-        .map(|count| {
-            let sock = TcpStream::connect(&bound).unwrap_or_else(|e| {
-                panic!("PRODUCT: Bob's daemon bound the forward at {bound} but it refuses a connection: {e}")
-            });
-            let mut w = sock
-                .try_clone()
-                .expect("APPARATUS: clone the forward socket");
-            let count = Arc::clone(count);
-            std::thread::spawn(move || {
-                let chunk = vec![0x5a_u8; 64 * 1024];
-                while let Ok(n) = w.write(&chunk) {
-                    count.fetch_add(n as u64, Ordering::Relaxed);
-                }
-            });
-            sock
-        })
-        .collect();
-    let taken = stalled(|| written.iter().map(|c| c.load(Ordering::Relaxed)).collect());
+    let (socks, written) = writers(&bound, 2);
+    let taken = stalled(|| loads(&written));
     eprintln!(
         "[proof] upload arm: the writes stopped being taken at {taken:?} bytes (the window counts \
          as taken from {TAKEN} in all)"
@@ -431,12 +491,77 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
          {TAKEN} needed"
     );
     let upload = phase(&alice, &bob, &mut ra, &mut rb, ca, cb, &room, "upload");
-    for sock in &socks {
+
+    // The cap arm: Bob opens tunnels to the frozen sender until his connection to Alice carries
+    // all it may, then more.
+    let alice_pid = alice_d.pid();
+    let cap = TUNNELS_PER_PEER as usize;
+    let (more_socks, more) = writers(&bound, cap - written.len());
+    let at_cap = stalled(|| loads(&written).into_iter().chain(loads(&more)).collect());
+    let rss_at_cap = rss(alice_pid);
+    let (extra_socks, extra) = writers(&bound, EXTRA);
+    let past_cap = stalled(|| loads(&extra));
+    let rss_past_cap = rss(alice_pid);
+    eprintln!(
+        "[proof] cap arm: the first {cap} tunnels took {at_cap:?} bytes; the {EXTRA} past the cap \
+         took {past_cap:?}; alice's daemon resident {rss_at_cap} KiB at the cap, {rss_past_cap} KiB \
+         past it"
+    );
+    assert!(
+        at_cap.is_some() && past_cap.is_some(),
+        "CANNOT MEASURE: the cap arm's writes kept advancing past {STALL_WITHIN:?}: the first \
+         {cap} took {at_cap:?}, the {EXTRA} past the cap {past_cap:?}"
+    );
+    assert!(
+        at_cap.iter().flatten().all(|&b| b >= ONE_WINDOW_TAKEN),
+        "PRODUCT: Bob's connection to Alice refused a tunnel before {cap} were open (bytes \
+         each took: {at_cap:?}): a tunnel that ended earlier still counts, or the cap is lower"
+    );
+    // The person's side: a collection asked for now is refused, saying why.
+    let get_dir = root.join("get-past-cap");
+    std::fs::create_dir_all(&get_dir).expect("APPARATUS: create the download directory");
+    let get_out = root.join("get-past-cap.out");
+    let mut get = spawn_vox(
+        &bob,
+        &[
+            "room",
+            "get",
+            &room,
+            "big.bin",
+            "--out",
+            get_dir
+                .join("big.bin")
+                .to_str()
+                .expect("APPARATUS: a UTF-8 path"),
+        ],
+        &get_out,
+    );
+    let refused = get.exited_within(REFUSED_WITHIN);
+    let get_said = std::fs::read_to_string(get_out.with_extension("err")).unwrap_or_default();
+    drop(get);
+    let cap_arm = phase(&alice, &bob, &mut ra, &mut rb, ca, cb, &room, "cap");
+    for sock in socks.iter().chain(&more_socks).chain(&extra_socks) {
         let _ = sock.shutdown(Shutdown::Both);
     }
     send.signal("-CONT");
 
-    for (arm, got) in [("download", download), ("upload", upload)] {
+    assert!(
+        refused.is_some_and(|ok| !ok) && get_said.contains(LIMIT_SAID),
+        "PRODUCT: with {cap} tunnels open to Alice, Bob's `vox room get` was not refused saying \
+         {LIMIT_SAID:?} within {REFUSED_WITHIN:?}: it exited {refused:?} (None: still running) and \
+         said {get_said:?}"
+    );
+    assert!(
+        past_cap.iter().flatten().all(|&b| b < ONE_WINDOW_TAKEN),
+        "PRODUCT: tunnels past the cap of {cap} were carried: each took {past_cap:?} bytes"
+    );
+    let grew = rss_past_cap.saturating_sub(rss_at_cap) << 10;
+    assert!(
+        grew < GREW_PAST_CAP,
+        "PRODUCT: alice's daemon grew by {grew} bytes when Bob opened {EXTRA} tunnels past the cap \
+         ({rss_at_cap} KiB → {rss_past_cap} KiB): a member's tunnels are not bounded"
+    );
+    for (arm, got) in [("download", download), ("upload", upload), ("cap", cap_arm)] {
         assert!(
             got.iter().all(|m| m.is_some_and(|m| m <= BOUND)),
             "PRODUCT: {arm} arm: with two tunnels backpressured, a post was not read within {BOUND:?} \
