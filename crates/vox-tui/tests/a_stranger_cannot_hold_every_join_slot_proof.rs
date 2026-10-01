@@ -57,10 +57,16 @@
 //!    joins each **do their proof of work** and then go quiet (`VOX_TEST_STALL_AFTER_SOLVE_MS`, the
 //!    product's test-only knob beside `VOX_TEST_SOLVE_AT_LEAST_MS`, inert when unset; its daemon
 //!    says `solved, now silent` for each, and all sixteen must, else CANNOT MEASURE). A hold that
-//!    has done its work is never ended for a newcomer, so carol's first try is turned away as
-//!    busy and alice ends nothing; carol tries again every 3s, as a person told to would, and
-//!    must be in within the member's 60s admission patience plus the join bound, once those holds
-//!    have been given up on.
+//!    has done its work is never ended for a newcomer, so carol's first try must be turned away
+//!    as busy (else CANNOT MEASURE) and alice must end nothing; carol tries again every second, as
+//!    a person told to would. Her first try not turned away must come within 26s of the first hold
+//!    doing its work: the member's admission patience (20s) gives it back, where each frame's own
+//!    bound (30s) alone would not. The arithmetic is at `ADMIT_BOUND`.
+//! 7. `joins_that_did_their_work_and_send_each_frame_just_in_time_give_their_slots_back`: as 6,
+//!    but each of the stranger's joins sends every frame it still owes 15s late
+//!    (`VOX_TEST_DRIP_AFTER_SOLVE_MS`), inside the per-frame bound each time and past the
+//!    admission patience in all: only a bound on the exchange as a whole gives the slot back
+//!    within 26s.
 //!
 //! **The precondition**, before carol joins, read from alice's own stderr: the cap was reached
 //! with only the stranger's joins in flight — alice refused one of them (`already answering 16
@@ -93,11 +99,10 @@
 //! - The identity ignored: cases 1 and 2 red.
 //! - An ended join stopped without a word, or told the bare refusal: case 5 red.
 //! - A hold that has done its work ended like any other: case 6 red, alice ends one for carol.
-//! - Nothing bounding a join once its work is done — neither the admission patience nor the
-//!   per-frame one — so a join that did its work may stay quiet for ever: case 6 red, carol is
-//!   still kept out at the bound. (Removing the admission patience alone leaves each frame's own
-//!   30s bound, which frees a quiet hold by itself; what the admission patience adds is a bound on
-//!   the exchange as a whole, against a joiner that sends each frame just in time.)
+//! - No admission patience, each frame's own bound kept: cases 6 and 7 red, the first hold is
+//!   given back at 30s, not within 26s.
+//! - Nothing bounding a join once its work is done, neither the admission patience nor the
+//!   per-frame one: case 6 red, carol is never let in.
 
 #![cfg(unix)]
 
@@ -924,17 +929,32 @@ fn a_join_ended_for_another_is_told_the_member_is_busy() {
     held.clear();
 }
 
-/// The member's `ADMISSION_PATIENCE` (`node::joinstream`): how long a join may take once its proof
-/// of work has verified. Hard-coded, as the product's is.
-const ADMISSION_PATIENCE: Duration = Duration::from_secs(60);
-/// The stranger's grind in the stalled case, so its sixteen joins do their work at nearly once.
+/// The member's `ADMISSION_PATIENCE` (`node::joinstream`): how long the rest of a join may take
+/// once its proof of work has verified. Hard-coded, as the product's is.
+const ADMISSION_PATIENCE: Duration = Duration::from_secs(20);
+/// Each frame's own bound (`transport::framing::FRAME_PATIENCE`), which a join that did its work
+/// would be held to without the admission patience.
+const FRAME_PATIENCE: Duration = Duration::from_secs(30);
+/// From the first of the stranger's holds doing its work to carol's first try that is not turned
+/// away, at most. The member frees that hold at [`ADMISSION_PATIENCE`] (20s) and carol tries every
+/// [`RETRY_PAUSE`], each try turned away in about a second: about 22s. Without the admission
+/// patience the hold lasts until [`FRAME_PATIENCE`] (30s, the silent case) or until the drip's two
+/// frames are in (2 × [`DRIP_MS`] = 30s): carol's first try then comes at 30s or later. 26s sits
+/// between them with 4s on each side.
+const ADMIT_BOUND: Duration = Duration::from_secs(26);
+/// The stranger's grind in the worked cases, so its sixteen joins do their work at nearly once.
 const STALL_GRIND_MS: u64 = 15_000;
+/// The drip case's wait before each frame the stranger still owes after its work: inside the
+/// per-frame bound each time, past the admission patience in all.
+const DRIP_MS: u64 = 15_000;
 /// Between carol's tries, as a person told "try the join again shortly" would.
-const RETRY_PAUSE: Duration = Duration::from_secs(3);
+const RETRY_PAUSE: Duration = Duration::from_secs(1);
 
-#[test]
-#[ignore = "sixteen stalled joins, production Argon2id and a real anchor; CI runs it in release"]
-fn joins_that_did_their_work_and_went_quiet_give_their_slots_back() {
+/// The stranger's sixteen joins each do their proof of work and then hold their slot by `how`
+/// (a test-only knob); carol, turned away while they hold, tries again until she is not. Asserts
+/// none of those holds is ended for her, and that the first is given back within [`ADMIT_BOUND`]
+/// of doing its work.
+fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let s = stage(
@@ -944,101 +964,128 @@ fn joins_that_did_their_work_and_went_quiet_give_their_slots_back() {
         Layout::OneAddress,
         &[
             ("VOX_TEST_SOLVE_AT_LEAST_MS", STALL_GRIND_MS.to_string()),
-            ("VOX_TEST_STALL_AFTER_SOLVE_MS", NEVER_MS.to_string()),
+            how,
         ],
     );
     let mut held: Vec<Proc> = (0..SLOTS)
         .map(|room| s.strangers[0].join_in_background(&s.links[room], &format!("s{room}"), None))
         .collect();
-    // The precondition, from the stranger's own daemon: all sixteen joins sent a solution and
-    // went quiet. Alice verified each solution before answering, so all sixteen holds have done
-    // their work.
-    let stalled = || {
+    // The precondition, from the stranger's own daemon: all sixteen joins sent a solution, which
+    // alice verified before answering, so all sixteen holds have done their work.
+    let worked = || {
         std::fs::read_to_string(&s.stranger_errs[0])
             .unwrap_or_default()
-            .matches("solved, now silent")
+            .matches(said)
             .count()
     };
     let filling = Instant::now();
-    while stalled() < SLOTS {
+    let mut first_worked = None;
+    while worked() < SLOTS {
+        if first_worked.is_none() && worked() > 0 {
+            first_worked = Some(Instant::now());
+        }
         assert!(
             filling.elapsed() < FILL_PATIENCE,
-            "CANNOT MEASURE: only {} of the stranger's {SLOTS} joins did their work in {}s",
-            stalled(),
+            "CANNOT MEASURE: {case}: only {} of the stranger's {SLOTS} joins did their work in {}s",
+            worked(),
             FILL_PATIENCE.as_secs()
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    let all_worked = Instant::now();
+    let first_worked = first_worked.unwrap_or_else(Instant::now);
     eprintln!(
-        "[proof] {} stalled: all {SLOTS} of the stranger's joins did their work and went quiet \
-         after {:.1}s",
+        "[proof] {} {case}: all {SLOTS} of the stranger's joins did their work after {:.1}s, \
+         {:.1}s after the first",
         profile(),
-        filling.elapsed().as_secs_f64()
+        filling.elapsed().as_secs_f64(),
+        first_worked.elapsed().as_secs_f64()
     );
     // Carol tries, and tries again, as a person told the member is busy would.
-    let mut tries: Vec<(bool, f64, String)> = Vec::new();
-    let deadline = ADMISSION_PATIENCE + JOIN_BOUND;
-    let got_in = loop {
-        let at = all_worked.elapsed().as_secs_f64();
+    let mut tries = 0usize;
+    let admitted = loop {
+        let at = first_worked.elapsed();
         let (ok, out, err) = s.carol.vox(
             &["room", "join", &s.links[SLOTS], "--name", "real"],
             Some(ROOM_PASS),
         );
         let said = format!("{out}{err}");
+        tries += 1;
         // The first try lands while every slot is held by a join that has done its work: alice
         // must not end one of them for carol, however heavy their source.
-        if tries.is_empty() {
+        if tries == 1 {
             let (refused, ended, text) = alice_counts(&s);
             assert!(
-                at < ADMISSION_PATIENCE.as_secs_f64(),
-                "CANNOT MEASURE: carol's first try came {at:.1}s after the holds did their work, \
-                 past the admission patience"
-            );
-            assert!(
                 ended == 0,
-                "alice ended a join that had done its work to answer carol ({ended} ended, \
-                 {refused} refused):\n{text}"
+                "{case}: alice ended a join that had done its work to answer carol ({ended} \
+                 ended, {refused} refused):\n{text}"
             );
         }
-        tries.push((ok, at, said.clone()));
-        if ok {
-            break true;
+        let turned_away = said.contains("busy answering other joins");
+        if tries == 1 && !turned_away {
+            panic!(
+                "CANNOT MEASURE: {case}: carol's first try was not turned away as busy, so the \
+                 stranger's holds did not hold every slot: {said}"
+            );
+        }
+        if !turned_away {
+            assert!(
+                ok,
+                "{case}: carol's try {tries}, not turned away as busy, failed: {said}"
+            );
+            break at;
         }
         assert!(
-            said.contains("busy answering other joins") && !said.contains("passphrase is wrong"),
-            "carol, turned away while the slots were held, was not told the member was busy: \
-             {said}"
+            !said.contains("passphrase is wrong"),
+            "{case}: carol, turned away while the slots were held, was told the passphrase was \
+             wrong: {said}"
         );
-        if all_worked.elapsed() >= deadline {
-            break false;
+        if first_worked.elapsed() >= ADMIT_BOUND + FRAME_PATIENCE {
+            let (_, _, text) = alice_counts(&s);
+            panic!(
+                "{case}: joins that did their work kept carol out for {:.1}s: their slots were \
+                 never given back\n  alice's stderr:\n{text}",
+                first_worked.elapsed().as_secs_f64()
+            );
         }
         std::thread::sleep(RETRY_PAUSE);
     };
-    let took = all_worked.elapsed();
     let (refused, ended, text) = alice_counts(&s);
     let quiet = text.matches("went quiet after its proof of work").count();
     eprintln!(
-        "[proof] {} stalled: carol {} {:.1}s after the holds did their work, on try {} of {} \
-         (bound {}s); alice refused {refused} at the cap, ended {ended}, and gave up on {quiet} \
-         joins that went quiet",
+        "[proof] {} {case}: carol's first try not turned away came {:.1}s after the first hold \
+         did its work (bound {}s; admission patience {}s), on try {tries}; alice refused \
+         {refused} at the cap, ended {ended}, and gave up on {quiet} joins that went quiet",
         profile(),
-        if got_in {
-            "got in"
-        } else {
-            "was still kept out"
-        },
-        took.as_secs_f64(),
-        tries.len(),
-        tries.len(),
-        deadline.as_secs()
+        admitted.as_secs_f64(),
+        ADMIT_BOUND.as_secs(),
+        ADMISSION_PATIENCE.as_secs()
     );
     assert!(
-        got_in,
-        "sixteen joins that did their work and went quiet kept carol out for {:.1}s, past {}s: \
-         their slots were never given back\n  alice's stderr:\n{text}",
-        took.as_secs_f64(),
-        deadline.as_secs()
+        admitted < ADMIT_BOUND,
+        "{case}: a join that did its work held its slot {:.1}s, past {}s: the member's admission \
+         patience did not give it back\n  alice's stderr:\n{text}",
+        admitted.as_secs_f64(),
+        ADMIT_BOUND.as_secs()
     );
     held.clear();
+}
+
+#[test]
+#[ignore = "sixteen stalled joins, production Argon2id and a real anchor; CI runs it in release"]
+fn joins_that_did_their_work_and_went_quiet_give_their_slots_back() {
+    worked_holds(
+        "stalled",
+        ("VOX_TEST_STALL_AFTER_SOLVE_MS", NEVER_MS.to_string()),
+        "solved, now silent",
+    );
+}
+
+#[test]
+#[ignore = "sixteen dripping joins, production Argon2id and a real anchor; CI runs it in release"]
+fn joins_that_did_their_work_and_send_each_frame_just_in_time_give_their_slots_back() {
+    worked_holds(
+        "drip",
+        ("VOX_TEST_DRIP_AFTER_SOLVE_MS", DRIP_MS.to_string()),
+        "before each frame",
+    );
 }
