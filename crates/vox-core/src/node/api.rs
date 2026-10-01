@@ -858,6 +858,15 @@ pub enum NodeEvent {
         /// The local address actually bound (a requested port 0 is resolved here).
         local: std::net::SocketAddr,
     },
+    /// An address for a room was asked for and is **not** handed out (V210-96): no board it names
+    /// held the room within the wait, so it would lead nowhere. `reason` names each board and what
+    /// kept the room off it; the verb itself fails with [`Fault::BoardUnreachable`].
+    AddressWithheld {
+        /// The room.
+        channel_id: Digest32,
+        /// Board by board, why none holds the room.
+        reason: String,
+    },
     /// An invite link for a channel (public: it carries no secret).
     InviteLink {
         /// The channel.

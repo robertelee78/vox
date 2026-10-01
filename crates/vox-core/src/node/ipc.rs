@@ -174,6 +174,9 @@ const T_PUBLISH_REFUSED: u64 = 1717;
 const T_PUBLISH_CURED: u64 = 2091;
 /// `NodeEvent::ConnectionNote` (#229's diagnostics). Additive, beside `T_PUBLISH_CURED`.
 const T_CONNECTION_NOTE: u64 = 2092;
+/// `NodeEvent::AddressWithheld` (V210-96). Additive, away from the sequential range and the tags
+/// other lines use.
+const T_ADDRESS_WITHHELD: u64 = 2296;
 /// [`NodeEvent::JoinSteps`]: where a join's time went.
 const T_JOIN_STEPS: u64 = 1718;
 /// `NodeEvent::KeyNotTaken`.
@@ -958,6 +961,12 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::JoinFailed { reason } => {
             e.array(2).uint(T_JOIN_FAILED).text(reason);
         }
+        NodeEvent::AddressWithheld { channel_id, reason } => {
+            e.array(3)
+                .uint(T_ADDRESS_WITHHELD)
+                .bytes(channel_id)
+                .text(reason);
+        }
         NodeEvent::RoomNotRemembered { channel_id, why } => {
             e.array(3)
                 .uint(T_ROOM_NOT_REMEMBERED)
@@ -1233,6 +1242,13 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             why: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc room not remembered why"))?
+                .to_owned(),
+        },
+        (T_ADDRESS_WITHHELD, 3) => NodeEvent::AddressWithheld {
+            channel_id: digest(d)?,
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc address withheld"))?
                 .to_owned(),
         },
         (T_CONNECTION_NOTE, 3) => NodeEvent::ConnectionNote {
@@ -2107,9 +2123,25 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => {}
                 other => {
-                    return Frame::Error {
-                        reason: other.to_string(),
+                    // **With why** (V210-96): an address withheld because no board holds the room
+                    // names each board and what kept the room off it.
+                    let mut reason = other.to_string();
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while let Ok(Some(item)) =
+                        tokio::time::timeout_at(deadline, events.next()).await
+                    {
+                        if let EventStreamItem::Event(NodeEvent::AddressWithheld {
+                            channel_id: c,
+                            reason: why,
+                        }) = item
+                        {
+                            if c == channel_id {
+                                reason.push_str(&format!("\nsaid: {why}"));
+                                break;
+                            }
+                        }
                     }
+                    return Frame::Error { reason };
                 }
             }
             match tokio::time::timeout(std::time::Duration::from_secs(10), async {

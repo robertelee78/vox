@@ -124,6 +124,9 @@ impl LiveCore {
                 NodeEvent::InviteLink { url, .. } => {
                     self.notice = Some(format!("invite link: {url}"));
                 }
+                NodeEvent::AddressWithheld { reason, .. } => {
+                    self.notice = Some(format!("no invite link: {reason}"));
+                }
                 NodeEvent::Joined { responder, .. } => {
                     self.notice = Some(format!("joined via {}", self.member_name(&responder)));
                 }

@@ -559,9 +559,23 @@ pub async fn serve(
         .find(|id| !before.contains(id))
         .ok_or_else(|| AppError::Usage("the room was not created".into()))?;
 
+    // Answered once the room is on a board the address names (V210-96): printed before, a guest
+    // who joined at once was told the board had nothing for the room.
     let out = node.apply(NodeCommand::Invite { channel_id }).await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot mint an address: {out}")));
+        // With why, which the node says board by board.
+        let mut why = String::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), node.next_event()).await
+        {
+            if let NodeEvent::AddressWithheld { reason, .. } = ev {
+                why = format!("\n       {reason}");
+                break;
+            }
+        }
+        return Err(AppError::Usage(format!(
+            "cannot mint an address: {out}{why}"
+        )));
     }
     let url = loop {
         match node.next_event().await {
@@ -731,6 +745,9 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         }
         NodeEvent::JoinFailed { reason } => {
             eprintln!("vox: a join did not complete — {reason}");
+        }
+        NodeEvent::AddressWithheld { reason, .. } => {
+            eprintln!("vox: the address was not handed out — {reason}");
         }
         NodeEvent::RoomNotRemembered { channel_id, why } => {
             eprintln!(
