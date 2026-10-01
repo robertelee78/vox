@@ -1,0 +1,1274 @@
+//! V210-72 (#263) — **the control socket, passphrases and shared files cannot leak to another
+//! local user or process**, driven through the shipped `vox` binary.
+//!
+//! Seven findings from the v0.2.10 defect sweep, one claim each:
+//!
+//! 1. **A file offer is withdrawn however `vox room send` ends.** It was withdrawn only on
+//!    Ctrl-C: a SIGTERM, a SIGHUP or a SIGKILL left the service registered, so a member's dial
+//!    was carried to a port nobody served any more — or to whatever took that port next.
+//!    Staged: alice offers a file, the offer is killed with each signal, bob asks for it, and
+//!    alice's own daemon says why it refused bob. "no such service is offered in that room" is
+//!    the withdrawn offer; "the local service did not accept the connection" is the leaked one.
+//!    And **two offers of the same file are two offers**: their tags were the content's, so
+//!    ending one withdrew the other while it still ran. Staged: two `room send`s of one file,
+//!    the first ended by SIGTERM, and bob collects the file whole by the second's tag. And a
+//!    get **by name** is not hidden by a newer offer that has ended: a third offer is announced
+//!    and ended, and `vox room get twin.bin` still collects the file through the second. The
+//!    fallback is only ever the same file from the same member: a newer `twin.bin` with other
+//!    content is offered and ended, and the get by name must fail, leave nothing, and name only
+//!    the live offers of that name, each by its exact tag; every suggested command is run and
+//!    must collect the right bytes. The verifier's arms (v1, v2) add a third member, carol:
+//!    alice's newest offer ends while bob's copy of the same file runs, carol's get by name
+//!    fails rather than taking another member's offer, and the refusal names bob's copy as the
+//!    same file with a command that collects it.
+//! 2. **An offer is never persisted.** It was: a daemon that stopped while an offer ran came
+//!    back offering its port. Staged: alice's daemon is stopped with an offer live, and
+//!    `vox service list` reads alice's store; a `vox service add` afterwards is the control
+//!    that the listing shows a persisted service at all.
+//! 3. **A get's forward is withdrawn however `vox room get` ends.** An interrupted get left
+//!    bob's daemon listening on the forward's port. Staged: alice's offer is stopped (SIGSTOP)
+//!    so the transfer stalls; the get is killed with each signal while bob's daemon listens on
+//!    its forward (`lsof`), and the port must close.
+//! 4. **The control socket's fallback is private to its user** (Linux put it in `/tmp` under a
+//!    predictable name). A profile path over the socket-address limit puts the socket in
+//!    `<tmp>/vox-<uid>/`, which is `0700` — tightened if it was left wider — with the socket
+//!    `0600`; nothing lands in `<tmp>` itself; and a `vox-<uid>` that is a symlink is refused,
+//!    so the daemon does not start and the directory it points at is untouched.
+//! 5. **A client refuses a socket that is not its user's own.** Another uid cannot be staged
+//!    without privileges, so the stand-in is a symlink planted where a profile's socket goes,
+//!    pointing at another profile's live socket: `vox room list` must refuse it, never list the
+//!    other profile's rooms. The kernel peer-credential check on both ends (a different uid)
+//!    rests on code review.
+//! 6. **One accept error does not end the control socket.** A daemon under `ulimit -n 64` is
+//!    given connections until it cannot accept one (a connection that is never greeted); they
+//!    are closed, and `vox room list` must answer within 20 s. It ended the accept loop for
+//!    good, so every client after was told nothing was listening.
+//! 7. **`vox shell-setup` keeps an rc file's symlink and mode.** It replaced a symlinked
+//!    `.zshrc` with a plain file, and wrote `0644` over a `0600` rc.
+//! 8. **A room passphrase is never taken from argv or the environment.** `--passphrase` and
+//!    `VOX_ROOM_PASSPHRASE` are refused with the replacement named; `--passphrase-file` is not.
+//!
+//! "Created 0600 from the start" (the socket is bound under a staging name, chmod'ed, then
+//! renamed into place) has no observable window a proof can stage reliably; it rests on code
+//! review, and the directory being `0700` is what (4) asserts.
+//!
+//! Mutations, each red for its own reason: (1) the daemon not releasing what a closed
+//! connection held, an offer's tag being its content's alone, a get trying only the newest
+//! matching offer, and a get falling back to a different file of that name (the twin cases); (2) an offer over the control socket persisted; (3) the
+//! same as (1), for the forward; (4) the old flat `<tmp>/vox-<hex>.sock` fallback; (5) the
+//! client's owner check removed; (6) the accept loop returning on its first error; (7) the rc
+//! written `0644` over the path; (8) `--passphrase` accepted.
+
+#![cfg(unix)]
+
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
+
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const VOX: &str = env!("CARGO_BIN_EXE_vox");
+const ID_PASS: &str = "identity passphrase";
+const ROOM_PASS: &str = "channel passphrase";
+
+/// A long-running child with its output drained into a string; killed and reaped however the
+/// test ends.
+struct Running(Child, Arc<Mutex<String>>);
+
+impl Running {
+    fn said(&self) -> String {
+        self.1.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+    /// Wait up to `within` for it to exit; its success, or `None` if it is still running.
+    fn exited_within(&mut self, within: Duration) -> Option<bool> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Ok(Some(status)) = self.0.try_wait() {
+                return Some(status.success());
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    /// Wait up to `within` for a line containing `what`, and return the whole output.
+    fn wait_for(&self, what: &str, within: Duration) -> String {
+        let deadline = Instant::now() + within;
+        loop {
+            let said = self.said();
+            if said.contains(what) {
+                return said;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE: {what:?} was never said; said:\n{said}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn drain(stream: Option<impl std::io::Read + Send + 'static>, into: &Arc<Mutex<String>>) {
+    let Some(mut stream) = stream else { return };
+    let sink = Arc::clone(into);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if let Ok(mut s) = sink.lock() {
+                        s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Send `sig` (a `kill -s` name) to `pid`, one of this test's own children.
+fn signal(pid: u32, sig: &str) {
+    let ok = Command::new("kill")
+        .args(["-s", sig, &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok, "CANNOT MEASURE: kill -s {sig} {pid} failed");
+}
+
+/// This user's uid, as the filesystem records it.
+fn my_uid(tmp: &Path) -> u32 {
+    std::fs::metadata(tmp).unwrap().uid()
+}
+
+/// One profile: its data and config directories, its identity passphrase file, and the extra
+/// environment every `vox` it runs gets.
+struct Profile {
+    data: PathBuf,
+    cfg: PathBuf,
+    pass: PathBuf,
+    env: Vec<(String, String)>,
+}
+
+impl Profile {
+    fn new(root: &Path, env: &[(&str, &str)]) -> Self {
+        let data = root.join("data");
+        let cfg = root.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let pass = root.join("id.pass");
+        std::fs::write(&pass, ID_PASS).unwrap();
+        Self {
+            data,
+            cfg,
+            pass,
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(VOX);
+        c.args(args)
+            .env("VOX_DATA_DIR", &self.data)
+            .env("VOX_CONFIG_DIR", &self.cfg)
+            .env_remove("VOX_ROOM")
+            .env_remove("VOX_ROOM_PASSPHRASE")
+            .env_remove("VOX_ANCHORS");
+        for (k, v) in &self.env {
+            c.env(k, v);
+        }
+        c
+    }
+
+    /// Run `vox args` to completion with `stdin`, bounded by `within`: (ok, stdout, stderr).
+    fn run(&self, args: &[&str], stdin: &str, within: Duration) -> (bool, String, String) {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vox");
+        let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
+        let (out, err) = (
+            Arc::new(Mutex::new(String::new())),
+            Arc::new(Mutex::new(String::new())),
+        );
+        drain(child.stdout.take(), &out);
+        drain(child.stderr.take(), &err);
+        let mut running = Running(child, Arc::new(Mutex::new(String::new())));
+        let ended = running.exited_within(within);
+        std::thread::sleep(Duration::from_millis(100));
+        let (out, err) = (out.lock().unwrap().clone(), err.lock().unwrap().clone());
+        match ended {
+            Some(ok) => (ok, out, err),
+            None => (
+                false,
+                out,
+                format!("{err}\n[proof] vox {args:?} did not finish within {within:?}; killed"),
+            ),
+        }
+    }
+
+    fn vox(&self, args: &[&str]) -> (bool, String, String) {
+        self.run(args, "", Duration::from_secs(120))
+    }
+
+    fn spawn(&self, args: &[&str]) -> Running {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vox");
+        let said = Arc::new(Mutex::new(String::new()));
+        drain(child.stdout.take(), &said);
+        drain(child.stderr.take(), &said);
+        Running(child, said)
+    }
+
+    fn id(&self) -> String {
+        let (ok, out, err) = self.vox(&["id", "--identity-passphrase-file", self.p()]);
+        assert!(ok, "vox id: {err}");
+        out.trim().to_owned()
+    }
+
+    fn p(&self) -> &str {
+        self.pass.to_str().unwrap()
+    }
+
+    /// A real `vox daemon`, and the control socket it says it serves.
+    fn daemon(&self, anchor: Option<&str>) -> (Running, PathBuf) {
+        let mut args = vec![
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            self.p(),
+        ];
+        if let Some(spec) = anchor {
+            args.extend(["--anchor", spec]);
+        }
+        let d = self.spawn(&args);
+        let said = d.wait_for("vox daemon: control socket ", Duration::from_secs(120));
+        let sock = said
+            .lines()
+            .find_map(|l| l.strip_prefix("vox daemon: control socket "))
+            .map(|s| PathBuf::from(s.trim()))
+            .unwrap();
+        (d, sock)
+    }
+}
+
+/// A real `vox node` anchor on loopback, and its `--anchor` spec.
+fn anchor(root: &Path) -> (Running, String) {
+    let p = Profile::new(root, &[]);
+    let node = p.spawn(&["node", "--listen", "127.0.0.1:0"]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(spec) = node
+            .said()
+            .split_whitespace()
+            .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
+        {
+            return (node, spec.to_owned());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: the anchor printed no spec"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Poll `vox args` until its stdout satisfies `ok`, for up to 60 s.
+fn until(who: &Profile, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let (_, out, err) = who.vox(args);
+        if ok(&out) {
+            return;
+        }
+        last = format!("stdout={out:?} stderr={err:?}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!("CANNOT MEASURE: timed out waiting for {what}; last saw {last}");
+}
+
+/// Run, as `who`, every `vox room get …` a refusal suggests (each in backticks), into `dir`, and
+/// return how many collected exactly `want`. Panics on one that does not: a suggested command
+/// that fails is the defect.
+fn run_suggestions(who: &Profile, said: &str, dir: &Path, want: &[u8]) -> usize {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut ran = 0usize;
+    for (i, cmd) in said.split('`').skip(1).step_by(2).enumerate() {
+        let Some(args) = cmd.strip_prefix("vox ") else {
+            continue;
+        };
+        let mut args: Vec<&str> = args.split_whitespace().collect();
+        if args.first() != Some(&"room") {
+            continue;
+        }
+        let out = dir.join(format!("{i}.bin"));
+        args.extend(["--out", out.to_str().unwrap()]);
+        let (ok, stdout, stderr) = who.vox(&args);
+        let got = std::fs::read(&out).ok();
+        assert!(
+            ok && got.as_deref() == Some(want),
+            "the suggested `{cmd}` did not collect the named file ({} bytes): {stdout} {stderr}",
+            got.as_ref().map_or(0, Vec::len)
+        );
+        ran += 1;
+    }
+    ran
+}
+
+/// The TCP ports `pid` listens on, by `lsof`; `None` if `lsof` cannot be run.
+fn listening(pid: u32) -> Option<std::collections::BTreeSet<String>> {
+    let out = Command::new("lsof")
+        .args([
+            "-nP",
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-Fn",
+        ])
+        .output()
+        .ok()?;
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix('n'))
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+#[test]
+#[ignore = "two networked nodes and real child processes; CI runs it in release"]
+fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let (_anchor, spec) = anchor(&tmp.path().join("anchor"));
+    let alice = Profile::new(&tmp.path().join("alice"), &[]);
+    let bob = Profile::new(&tmp.path().join("bob"), &[]);
+    let (alice_fp, bob_fp) = (alice.id(), bob.id());
+    let (alice_daemon, _) = alice.daemon(Some(&spec));
+    let (bob_daemon, _) = bob.daemon(Some(&spec));
+    for (who, peer, name) in [(&alice, &bob_fp, "bob"), (&bob, &alice_fp, "alice")] {
+        let (ok, _, err) = who.vox(&[
+            "trust",
+            "add",
+            peer,
+            "--name",
+            name,
+            "--identity-passphrase-file",
+            who.p(),
+        ]);
+        assert!(ok, "trust {name}: {err}");
+    }
+    let (ok, _, err) = alice.run(
+        &["room", "create", "--name", "mission"],
+        ROOM_PASS,
+        Duration::from_secs(120),
+    );
+    assert!(ok, "room create: {err}");
+    let label = alice.vox(&["room", "list"]).1;
+    let label = label.split_whitespace().next().expect("a room").to_owned();
+    let (ok, link, err) = alice.vox(&["room", "invite", &label]);
+    assert!(ok, "room invite: {err}");
+    let link = link.trim().to_owned();
+    let room = link
+        .strip_prefix("vox://")
+        .and_then(|l| l.split('?').next())
+        .expect("an invite naming the room")
+        .to_owned();
+    let mut joined = String::new();
+    for _ in 0..6 {
+        let (ok, _, err) = bob.run(
+            &["room", "join", &link, "--name", "mission"],
+            ROOM_PASS,
+            Duration::from_secs(120),
+        );
+        if ok {
+            joined.clear();
+            break;
+        }
+        joined = err;
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    assert!(
+        joined.is_empty(),
+        "CANNOT MEASURE: bob never joined: {joined}"
+    );
+    for (who, other, word) in [(&alice, &bob, "warm-bob"), (&bob, &alice, "warm-alice")] {
+        let (ok, _, err) = other.vox(&["room", "post", &room, word]);
+        assert!(ok, "post: {err}");
+        until(
+            who,
+            "each to read the other",
+            &["room", "read", &room],
+            |o| o.contains(word),
+        );
+    }
+
+    // ---- (1) an offer ended by SIGTERM, SIGHUP or SIGKILL is withdrawn ----
+    let mut withdrawn = 0usize;
+    for (i, sig) in ["TERM", "HUP", "KILL"].into_iter().enumerate() {
+        let name = format!("offer-{sig}.bin");
+        let file = tmp.path().join(&name);
+        std::fs::write(&file, vec![i as u8 + 1; 4096]).unwrap();
+        let mut send = alice.spawn(&["room", "send", &room, file.to_str().unwrap()]);
+        send.wait_for("vox: offering", Duration::from_secs(60));
+        until(
+            &bob,
+            "the offer to reach bob",
+            &["room", "read", &room],
+            |o| o.contains(&name),
+        );
+        signal(send.pid(), sig);
+        assert!(
+            send.exited_within(Duration::from_secs(10)).is_some(),
+            "CANNOT MEASURE: `vox room send` did not end on SIG{sig}"
+        );
+        let mark = alice_daemon.said().len();
+        let out = tmp.path().join(format!("got-{sig}.bin"));
+        let (ok, stdout, stderr) =
+            bob.vox(&["room", "get", &room, &name, "--out", out.to_str().unwrap()]);
+        assert!(
+            !ok,
+            "a withdrawn offer must not be collected: {stdout} {stderr}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let why = loop {
+            let said = alice_daemon.said()[mark..].to_owned();
+            if said.contains("no such service is offered in that room")
+                || said.contains("did not accept the connection")
+            {
+                break said;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE: alice's daemon never said why it refused bob after SIG{sig}; \
+                 bob's get said: {stdout} {stderr}\nalice's daemon since:\n{said}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        eprintln!(
+            "[proof] SIG{sig} of `room send`: alice's daemon said: {}",
+            why.trim()
+        );
+        assert!(
+            why.contains("no such service is offered in that room")
+                && !why.contains("did not accept the connection"),
+            "`vox room send` ended by SIG{sig} left its offer registered: alice's daemon \
+             carried bob's dial to a port nobody serves:\n{why}"
+        );
+        withdrawn += 1;
+    }
+    eprintln!("[proof] offers withdrawn after SIGTERM/SIGHUP/SIGKILL: {withdrawn} of 3");
+
+    // ---- (1b) two offers of the same file: ending one leaves the other serving ----
+    let twin = tmp.path().join("twin.bin");
+    let twin_bytes: Vec<u8> = (0..65_536u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(&twin, &twin_bytes).unwrap();
+    let mut first = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let first_said = first.wait_for("vox: offering", Duration::from_secs(60));
+    // Collected by the second offer's own tag, so the get asks for exactly the offer that is
+    // still running.
+    until(
+        &bob,
+        "the first twin offer to reach bob",
+        &["room", "read", &room],
+        |o| o.contains("twin.bin"),
+    );
+    let mut second = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let second_said = second.wait_for("vox: offering", Duration::from_secs(60));
+    let tag_of = |said: &str| {
+        said.split_whitespace()
+            .find(|w| w.starts_with("file-"))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (t1, t2) = (tag_of(&first_said), tag_of(&second_said));
+    eprintln!("[proof] twin offers of one file: tags {t1} and {t2}");
+    until(
+        &bob,
+        "the second twin offer to reach bob",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&t2),
+    );
+    signal(first.pid(), "TERM");
+    assert!(
+        first.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: the first twin offer did not end on SIGTERM"
+    );
+    let got = tmp.path().join("twin-got.bin");
+    let (ok, stdout, stderr) =
+        bob.vox(&["room", "get", &room, &t2, "--out", got.to_str().unwrap()]);
+    let collected = std::fs::read(&got).ok();
+    eprintln!(
+        "[proof] get after the first twin ended: ok={ok}, {} bytes of 65536",
+        collected.as_ref().map_or(0, Vec::len)
+    );
+    assert!(
+        ok && collected.as_deref() == Some(&twin_bytes[..]),
+        "ending one offer of a file withdrew another offer of the same file that was still \
+         running (tags {t1} and {t2}): {stdout} {stderr}"
+    );
+
+    // ---- (1c) a get by name is not hidden by a newer offer that has ended ----
+    let mut third = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let t3 = tag_of(&third.wait_for("vox: offering", Duration::from_secs(60)));
+    until(
+        &bob,
+        "the third twin offer to reach bob",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&t3),
+    );
+    signal(third.pid(), "TERM");
+    assert!(
+        third.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: the newest twin offer did not end on SIGTERM"
+    );
+    let by_name = tmp.path().join("twin-by-name.bin");
+    let (ok, stdout, stderr) = bob.vox(&[
+        "room",
+        "get",
+        &room,
+        "twin.bin",
+        "--out",
+        by_name.to_str().unwrap(),
+    ]);
+    let collected = std::fs::read(&by_name).ok();
+    eprintln!(
+        "[proof] get by name with the newest offer ({t3}) ended and an older one ({t2}) live: \
+         ok={ok}, {} bytes of 65536; said: {}",
+        collected.as_ref().map_or(0, Vec::len),
+        stderr.trim()
+    );
+    assert!(
+        ok && collected.as_deref() == Some(&twin_bytes[..]),
+        "a get by name failed on the newest offer, which had ended, although an older offer of \
+         the same file was still served: {stdout} {stderr}"
+    );
+
+    // ---- (1d) the negative control: a different file of the same name is never the fallback ----
+    // A newer `twin.bin` with other content is offered and ended. The only live offer by that
+    // name is then the older one, which is a different file: the get by name must fail, leave
+    // nothing behind, and say how to ask for the other file exactly.
+    let other_dir = tmp.path().join("other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let other_twin = other_dir.join("twin.bin");
+    std::fs::write(&other_twin, vec![0x5au8; 65_536]).unwrap();
+    let mut different = alice.spawn(&["room", "send", &room, other_twin.to_str().unwrap()]);
+    let t4 = tag_of(&different.wait_for("vox: offering", Duration::from_secs(60)));
+    assert!(
+        t4.len() > 21 && t4[..21] != t2[..21],
+        "CANNOT MEASURE: the different twin has the same content hash ({t4} vs {t2})"
+    );
+    until(
+        &bob,
+        "the different twin offer to reach bob",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&t4),
+    );
+    signal(different.pid(), "TERM");
+    assert!(
+        different.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: the different twin offer did not end on SIGTERM"
+    );
+    let wrong = tmp.path().join("twin-wrong.bin");
+    let (ok, stdout, stderr) = bob.vox(&[
+        "room",
+        "get",
+        &room,
+        "twin.bin",
+        "--out",
+        wrong.to_str().unwrap(),
+    ]);
+    let left = std::fs::read(&wrong).ok();
+    eprintln!(
+        "[proof] get by name with the newest ({t4}, other content) ended and only {t2} live: \
+         ok={ok}, file left: {} bytes; said: {}",
+        left.as_ref().map_or(0, Vec::len),
+        stderr.trim()
+    );
+    assert!(
+        !ok && left.is_none(),
+        "a get by name fell back to a DIFFERENT file that only shares the name \
+         ({} bytes collected): {stdout} {stderr}",
+        left.as_ref().map_or(0, Vec::len)
+    );
+    assert!(
+        stderr.contains("a different file also matches")
+            && stderr.contains(&format!("vox room get {room} {t2}")),
+        "the refusal must say a different file matches, and name its live offer exactly: {stderr}"
+    );
+    for dead in [&t1, &t3, &t4] {
+        assert!(
+            !stderr.contains(dead.as_str()) || stderr.contains(&format!("the offer {dead} of")),
+            "the refusal suggests an offer that has ended ({dead}): {stderr}"
+        );
+    }
+    let ran = run_suggestions(&bob, &stderr, &tmp.path().join("sugg-1d"), &twin_bytes);
+    eprintln!("[proof] (1d) suggested commands run and collected the right bytes: {ran}");
+    assert!(
+        ran >= 1,
+        "CANNOT MEASURE: (1d) suggested no command: {stderr}"
+    );
+
+    // ---- (verifier v1) the command the refusal suggests collects exactly the named file ----
+    let sug = t2[5..21].to_owned();
+    let exact = tmp.path().join("twin-exact.bin");
+    let (ok, _o, se) = bob.vox(&["room", "get", &room, &sug, "--out", exact.to_str().unwrap()]);
+    let got = std::fs::read(&exact).ok();
+    eprintln!(
+        "[verifier] v1 suggested `vox room get <room> {sug}`: ok={ok}, {} bytes, equals A: {}; said: {}",
+        got.as_ref().map_or(0, Vec::len),
+        got.as_deref() == Some(&twin_bytes[..]),
+        se.trim()
+    );
+    let v1 = ok && got.as_deref() == Some(&twin_bytes[..]);
+
+    // ---- (verifier v2) a same-sha offer from ANOTHER member is not the fallback; carol collects ----
+    signal(second.pid(), "TERM");
+    assert!(
+        second.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: second did not end"
+    );
+    let carol = Profile::new(&tmp.path().join("carol"), &[]);
+    let carol_fp = carol.id();
+    let (_carol_daemon, _) = carol.daemon(Some(&spec));
+    for (who, peer, name) in [
+        (&alice, &carol_fp, "carol"),
+        (&bob, &carol_fp, "carol"),
+        (&carol, &alice_fp, "alice"),
+        (&carol, &bob_fp, "bob"),
+    ] {
+        let (ok, _, err) = who.vox(&[
+            "trust",
+            "add",
+            peer,
+            "--name",
+            name,
+            "--identity-passphrase-file",
+            who.p(),
+        ]);
+        assert!(ok, "trust {name}: {err}");
+    }
+    let mut cj = String::from("never tried");
+    for _ in 0..6 {
+        let (ok, _, err) = carol.run(
+            &["room", "join", &link, "--name", "mission"],
+            ROOM_PASS,
+            Duration::from_secs(120),
+        );
+        if ok {
+            cj.clear();
+            break;
+        }
+        cj = err;
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    assert!(cj.is_empty(), "CANNOT MEASURE: carol never joined: {cj}");
+    for (other, word) in [(&alice, "warm-c-alice"), (&bob, "warm-c-bob")] {
+        let (ok, _, err) = other.vox(&["room", "post", &room, word]);
+        assert!(ok, "post: {err}");
+        until(
+            &carol,
+            "carol to read alice and bob",
+            &["room", "read", &room],
+            |o| o.contains(word),
+        );
+    }
+    let bobs = bob.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let tb = tag_of(&bobs.wait_for("vox: offering", Duration::from_secs(60)));
+    until(
+        &carol,
+        "bob's twin offer to reach carol",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&tb),
+    );
+    // control: carol CAN collect bob's offer by its exact tag
+    let ctl = tmp.path().join("twin-ctl.bin");
+    let (okc, _o, sec) = carol.vox(&["room", "get", &room, &tb, "--out", ctl.to_str().unwrap()]);
+    eprintln!(
+        "[verifier] v2 control: carol gets bob's {tb} by tag: ok={okc}; said: {}",
+        sec.trim()
+    );
+    assert!(
+        okc && std::fs::read(&ctl).ok().as_deref() == Some(&twin_bytes[..]),
+        "CANNOT MEASURE: carol cannot collect bob's offer by tag"
+    );
+    let mut newest = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let tn = tag_of(&newest.wait_for("vox: offering", Duration::from_secs(60)));
+    until(
+        &carol,
+        "alice's newest twin to reach carol",
+        &["room", "read", &room, "--json"],
+        |o| o.contains(&tn),
+    );
+    signal(newest.pid(), "TERM");
+    assert!(
+        newest.exited_within(Duration::from_secs(10)).is_some(),
+        "CANNOT MEASURE: newest did not end"
+    );
+    let cross = tmp.path().join("twin-cross.bin");
+    let (ok2, _o, se2) = carol.vox(&[
+        "room",
+        "get",
+        &room,
+        "twin.bin",
+        "--out",
+        cross.to_str().unwrap(),
+    ]);
+    let got2 = std::fs::read(&cross).ok();
+    eprintln!(
+        "[verifier] v2 newest {tn} (alice, A) ended, bob's {tb} (A, same sha) live: ok={ok2}, file left: {} bytes; said: {}",
+        got2.as_ref().map_or(0, Vec::len),
+        se2.trim()
+    );
+    let v2 = !ok2 && got2.is_none();
+    let exact2 = tmp.path().join("twin-cross-exact.bin");
+    let (ok3, _o, se3) = carol.vox(&[
+        "room",
+        "get",
+        &room,
+        &sug,
+        "--out",
+        exact2.to_str().unwrap(),
+    ]);
+    eprintln!(
+        "[verifier] v2b the suggested sha command in that state: ok={ok3}, {} bytes; said: {}",
+        std::fs::read(&exact2).map_or(0, |b| b.len()),
+        se3.trim()
+    );
+    // Every command the v2 refusal suggests is run as carol, and must collect bob's copy.
+    assert!(
+        se2.contains("the same file is also offered by"),
+        "v2: bob's live copy of the same file must be named as the same file: {se2}"
+    );
+    assert!(
+        !se2.contains("a different file also matches"),
+        "v2: only the same file is served, yet the refusal names a different one: {se2}"
+    );
+    let ran2 = run_suggestions(&carol, &se2, &tmp.path().join("sugg-v2"), &twin_bytes);
+    eprintln!("[proof] (v2) suggested commands run and collected the right bytes: {ran2}");
+    assert!(ran2 >= 1, "CANNOT MEASURE: v2 suggested no command: {se2}");
+    drop(bobs);
+    assert!(
+        v1,
+        "v1: the suggested command did not collect exactly the named file"
+    );
+    assert!(
+        v2,
+        "v2: a same-sha offer from another member was used as the fallback"
+    );
+    drop(second);
+
+    // ---- (3) a get ended by SIGTERM, SIGHUP or SIGKILL closes its forward ----
+    let Some(_) = listening(bob_daemon.pid()) else {
+        panic!("CANNOT MEASURE: lsof cannot be run here");
+    };
+    let big = tmp.path().join("stalled.bin");
+    std::fs::write(&big, vec![7u8; 1 << 20]).unwrap();
+    let stalled = alice.spawn(&["room", "send", &room, big.to_str().unwrap()]);
+    stalled.wait_for("vox: offering", Duration::from_secs(60));
+    until(
+        &bob,
+        "the stalled offer to reach bob",
+        &["room", "read", &room],
+        |o| o.contains("stalled.bin"),
+    );
+    // Stopped, so the transfer stalls and the get is still running when it is signalled.
+    signal(stalled.pid(), "STOP");
+    let mut closed = 0usize;
+    for sig in ["TERM", "HUP", "KILL"] {
+        let before = listening(bob_daemon.pid()).unwrap();
+        let out = tmp.path().join(format!("stalled-{sig}.bin"));
+        let mut get = bob.spawn(&[
+            "room",
+            "get",
+            &room,
+            "stalled.bin",
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let forward = loop {
+            let now = listening(bob_daemon.pid()).unwrap();
+            if let Some(p) = now.difference(&before).next() {
+                break p.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE: bob's daemon never opened a forward for the get; it said: {}",
+                get.said()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            get.exited_within(Duration::ZERO).is_none(),
+            "CANNOT MEASURE: the get ended before it was signalled: {}",
+            get.said()
+        );
+        signal(get.pid(), sig);
+        assert!(
+            get.exited_within(Duration::from_secs(10)).is_some(),
+            "CANNOT MEASURE: `vox room get` did not end on SIG{sig}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let t0 = Instant::now();
+        while listening(bob_daemon.pid()).unwrap().contains(&forward) {
+            assert!(
+                Instant::now() < deadline,
+                "`vox room get` ended by SIG{sig} left bob's daemon listening on its forward \
+                 {forward} for 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!(
+            "[proof] SIG{sig} of `room get`: forward {forward} closed after {:?}",
+            t0.elapsed()
+        );
+        closed += 1;
+    }
+    signal(stalled.pid(), "CONT");
+    drop(stalled);
+    eprintln!("[proof] forwards closed after SIGTERM/SIGHUP/SIGKILL: {closed} of 3");
+
+    // ---- (2) an offer is never persisted: the daemon stops while one runs ----
+    let live = tmp.path().join("live.bin");
+    std::fs::write(&live, b"offered while the daemon stops").unwrap();
+    let live_send = alice.spawn(&["room", "send", &room, live.to_str().unwrap()]);
+    let offered = live_send.wait_for("vox: offering", Duration::from_secs(60));
+    let tag = offered
+        .split_whitespace()
+        .find(|w| w.starts_with("file-"))
+        .expect("the offer's tag")
+        .to_owned();
+    let mut alice_daemon = alice_daemon;
+    signal(alice_daemon.pid(), "TERM");
+    assert!(
+        alice_daemon
+            .exited_within(Duration::from_secs(30))
+            .is_some(),
+        "CANNOT MEASURE: alice's daemon did not stop on SIGTERM"
+    );
+    drop(live_send);
+    let room_pass = tmp.path().join("room.pass");
+    std::fs::write(&room_pass, ROOM_PASS).unwrap();
+    let list = |what: &str| {
+        let (ok, out, err) = alice.vox(&[
+            "service",
+            "list",
+            &room,
+            "--passphrase-file",
+            room_pass.to_str().unwrap(),
+            "--identity-passphrase-file",
+            alice.p(),
+            "--listen",
+            "127.0.0.1:0",
+        ]);
+        assert!(ok, "CANNOT MEASURE: vox service list ({what}): {err}");
+        eprintln!("[proof] vox service list ({what}): {}", out.trim());
+        out
+    };
+    let after = list("after the daemon stopped with an offer live");
+    // The control: the listing shows a persisted service when there is one.
+    let (ok, _, err) = alice.vox(&[
+        "service",
+        "add",
+        &room,
+        "kept",
+        "127.0.0.1:9",
+        "--passphrase-file",
+        room_pass.to_str().unwrap(),
+        "--identity-passphrase-file",
+        alice.p(),
+        "--listen",
+        "127.0.0.1:0",
+    ]);
+    assert!(ok, "CANNOT MEASURE: vox service add: {err}");
+    let control = list("control, after `vox service add kept`");
+    assert!(
+        control.contains("kept"),
+        "CANNOT MEASURE: `vox service list` does not show a persisted service: {control}"
+    );
+    assert!(
+        !after.contains(&tag) && !after.contains("file-"),
+        "an offer over the control socket was persisted: alice's store still offers {tag} \
+         after her daemon stopped:\n{after}"
+    );
+    eprintln!("[proof] offers persisted across a daemon stop: 0 (control service listed: 1)");
+}
+
+#[test]
+#[ignore = "real daemons and production Argon2id; CI runs it in release"]
+fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let uid = my_uid(tmp.path());
+    let t = tmp.path().join("t");
+    std::fs::create_dir_all(&t).unwrap();
+    let t_env = [("TMPDIR", t.to_str().unwrap())];
+    // Profile paths over the 100-byte socket budget, so the fallback is the one used.
+    let p = Profile::new(&tmp.path().join("a".repeat(90)), &t_env);
+    let q = Profile::new(&tmp.path().join("b".repeat(90)), &t_env);
+    assert!(
+        p.data.join("default").join("node.sock").as_os_str().len() > 104,
+        "CANNOT MEASURE: the profile path is short enough for the natural socket"
+    );
+    p.id();
+    q.id();
+
+    // ---- (4) the fallback directory is private, even if it was left wide open ----
+    let private = t.join(format!("vox-{uid}"));
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let (_pd, sock) = p.daemon(None);
+    eprintln!("[proof] fallback socket: {}", sock.display());
+    assert_eq!(
+        sock.parent(),
+        Some(private.as_path()),
+        "the fallback socket is not in the per-user directory {}",
+        private.display()
+    );
+    let dir_meta = std::fs::symlink_metadata(&private).unwrap();
+    let sock_meta = std::fs::symlink_metadata(&sock).unwrap();
+    eprintln!(
+        "[proof] {} mode {:o} uid {}; socket mode {:o} uid {}",
+        private.display(),
+        dir_meta.mode() & 0o7777,
+        dir_meta.uid(),
+        sock_meta.mode() & 0o7777,
+        sock_meta.uid()
+    );
+    assert!(dir_meta.is_dir() && dir_meta.mode() & 0o7777 == 0o700 && dir_meta.uid() == uid);
+    assert!(
+        sock_meta.file_type().is_socket()
+            && sock_meta.mode() & 0o7777 == 0o600
+            && sock_meta.uid() == uid
+    );
+    let in_tmp: Vec<String> = std::fs::read_dir(&t)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sock"))
+        .collect();
+    assert!(
+        in_tmp.is_empty(),
+        "a control socket landed in the shared temp directory itself: {in_tmp:?}"
+    );
+    let (ok, _, err) = p.run(
+        &["room", "create", "--name", "p-only-room"],
+        ROOM_PASS,
+        Duration::from_secs(120),
+    );
+    assert!(
+        ok,
+        "CANNOT MEASURE: room create through the fallback socket: {err}"
+    );
+    let (ok, out, err) = p.vox(&["room", "list"]);
+    assert!(
+        ok && out.contains("p-only-room"),
+        "CANNOT MEASURE: room list: {out} {err}"
+    );
+
+    // ---- (5) a client refuses what is at its socket path unless it is its own socket ----
+    let (mut qd, q_sock) = q.daemon(None);
+    signal(qd.pid(), "TERM");
+    assert!(
+        qd.exited_within(Duration::from_secs(30)).is_some(),
+        "CANNOT MEASURE: q's daemon did not stop"
+    );
+    assert!(
+        std::fs::symlink_metadata(&q_sock).is_err(),
+        "CANNOT MEASURE: q's socket was left behind"
+    );
+    std::os::unix::fs::symlink(&sock, &q_sock).unwrap();
+    let (ok, out, err) = q.vox(&["room", "list"]);
+    eprintln!("[proof] room list at a planted symlink: ok={ok} stdout={out:?} stderr={err:?}");
+    assert!(
+        !out.contains("p-only-room"),
+        "a client sent its request to a socket that is not its own and was answered with \
+         another profile's rooms: {out}"
+    );
+    assert!(
+        !ok && err.contains("not a socket owned by you") && err.contains("symlink"),
+        "a client must refuse a socket path that is not its own socket, and say so: {err}"
+    );
+    std::fs::remove_file(&q_sock).unwrap();
+
+    // ---- (4) a per-user directory that is a symlink is refused, not followed ----
+    let t3 = tmp.path().join("t3");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&t3).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, t3.join(format!("vox-{uid}"))).unwrap();
+    let q3 = Profile {
+        env: vec![("TMPDIR".into(), t3.to_str().unwrap().to_owned())],
+        ..Profile::new(&tmp.path().join("b".repeat(90)), &[])
+    };
+    let mut d3 = q3.spawn(&[
+        "daemon",
+        "--listen",
+        "127.0.0.1:0",
+        "--passphrase-file",
+        q3.p(),
+    ]);
+    let ended = d3.exited_within(Duration::from_secs(120));
+    let said = d3.said();
+    eprintln!(
+        "[proof] daemon with a symlinked vox-{uid}: ended={ended:?} said: {}",
+        said.trim()
+    );
+    let touched: Vec<_> = std::fs::read_dir(&elsewhere).unwrap().collect();
+    assert_eq!(
+        ended,
+        Some(false),
+        "the daemon started with its socket directory a symlink: {said}"
+    );
+    assert!(
+        said.contains("not a directory owned by you") && said.contains("symlink"),
+        "the refusal must say why: {said}"
+    );
+    assert!(
+        touched.is_empty() && std::fs::metadata(&elsewhere).unwrap().mode() & 0o7777 == 0o755,
+        "the directory the symlink points at was used or changed"
+    );
+    eprintln!("[proof] private dir 0700 (from 0777): 1; socket 0600: 1; sockets in <tmp>: 0; foreign socket refused: 1; symlinked dir refused: 1");
+}
+
+#[test]
+#[ignore = "a real daemon under a descriptor limit; CI runs it in release"]
+fn an_accept_error_does_not_end_the_control_socket() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let p = Profile::new(&tmp.path().join("p"), &[]);
+    p.id();
+    // `ulimit` then `exec`, so the daemon itself runs under the limit.
+    let script = "ulimit -n 64 && exec \"$0\" daemon --listen 127.0.0.1:0 --passphrase-file \"$1\"";
+    let mut c = Command::new("sh");
+    c.args(["-c", script, VOX, p.p()])
+        .env("VOX_DATA_DIR", &p.data)
+        .env("VOX_CONFIG_DIR", &p.cfg)
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ANCHORS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().expect("spawn sh");
+    let said = Arc::new(Mutex::new(String::new()));
+    drain(child.stdout.take(), &said);
+    drain(child.stderr.take(), &said);
+    let mut daemon = Running(child, said);
+    let out = daemon.wait_for("vox daemon: control socket ", Duration::from_secs(120));
+    let sock = out
+        .lines()
+        .find_map(|l| l.strip_prefix("vox daemon: control socket "))
+        .map(|s| PathBuf::from(s.trim()))
+        .unwrap();
+
+    // Connect until one is never greeted: the daemon is out of descriptors and its accept fails.
+    let mut held = Vec::new();
+    let (mut greeted, mut ungreeted, mut refused) = (0usize, 0usize, 0usize);
+    for _ in 0..120 {
+        // A refused connect after an ungreeted one is the old defect showing already: the
+        // accept loop has ended and dropped the listener. It stops the loading, not the proof.
+        let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) else {
+            refused += 1;
+            break;
+        };
+        s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut len = [0u8; 4];
+        if s.read_exact(&mut len).is_ok() {
+            greeted += 1;
+            ungreeted = 0;
+        } else {
+            ungreeted += 1;
+        }
+        held.push(s);
+        if ungreeted >= 3 {
+            break;
+        }
+    }
+    eprintln!(
+        "[proof] connections greeted before the limit: {greeted}; ungreeted (accept failed): \
+         {ungreeted}; refused: {refused}"
+    );
+    assert!(
+        ungreeted >= 1,
+        "CANNOT MEASURE: {greeted} connections were all greeted; the daemon never ran out of \
+         descriptors"
+    );
+    drop(held);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        daemon.exited_within(Duration::ZERO).is_none(),
+        "CANNOT MEASURE: the daemon died of the descriptor limit: {}",
+        daemon.said()
+    );
+    let t0 = Instant::now();
+    let (ok, out, err) = p.run(&["room", "list"], "", Duration::from_secs(20));
+    eprintln!(
+        "[proof] vox room list after the accept errors: ok={ok} in {:?}: {} {}",
+        t0.elapsed(),
+        out.trim(),
+        err.trim()
+    );
+    assert!(
+        ok,
+        "the control socket stopped answering after an accept error: {out} {err}"
+    );
+}
+
+#[test]
+fn shell_setup_keeps_the_rc_files_symlink_and_mode() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dotfiles = home.join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    let target = dotfiles.join("zshrc");
+    std::fs::write(&target, "export KEPT=1\n").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(&target, home.join(".zshrc")).unwrap();
+    // A plain rc of another shell the person uses, at a mode of their choosing.
+    std::fs::write(home.join(".bashrc"), "export ALSO=1\n").unwrap();
+    std::fs::set_permissions(home.join(".bashrc"), std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    let run = |extra: &[&str]| {
+        let out = Command::new(VOX)
+            .arg("shell-setup")
+            .args(extra)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/zsh")
+            .output()
+            .expect("shell-setup ran");
+        assert!(
+            out.status.success(),
+            "vox shell-setup {extra:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let mut kept = 0usize;
+    for (step, extra) in [("setup", &[][..]), ("remove", &["--remove"][..])] {
+        run(extra);
+        let link = std::fs::symlink_metadata(home.join(".zshrc")).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().mode() & 0o7777;
+        let bash_mode = std::fs::metadata(home.join(".bashrc")).unwrap().mode() & 0o7777;
+        let bash = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+        eprintln!(
+            "[proof] after {step}: .zshrc symlink={} target mode {mode:o}; .bashrc mode {bash_mode:o}",
+            link.file_type().is_symlink()
+        );
+        assert!(
+            link.file_type().is_symlink()
+                && std::fs::read_link(home.join(".zshrc")).unwrap() == target,
+            "{step}: the symlinked .zshrc was replaced by a plain file"
+        );
+        assert_eq!(mode, 0o600, "{step}: the rc file's mode was changed");
+        assert_eq!(bash_mode, 0o640, "{step}: .bashrc's mode was changed");
+        assert!(text.contains("export KEPT=1") && bash.contains("export ALSO=1"));
+        let wired = text.contains("vox") && bash.contains("vox");
+        assert_eq!(
+            wired,
+            step == "setup",
+            "{step}: the block was not {} through the symlink",
+            if step == "setup" {
+                "written"
+            } else {
+                "removed"
+            }
+        );
+        kept += 1;
+    }
+    eprintln!("[proof] rc symlink and modes kept across setup and remove: {kept} of 2");
+}
+
+#[test]
+fn a_room_passphrase_is_never_taken_from_argv_or_the_environment() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let p = Profile::new(&tmp.path().join("p"), &[]);
+    let room_pass = tmp.path().join("room.pass");
+    std::fs::write(&room_pass, ROOM_PASS).unwrap();
+    let base = [
+        "up",
+        "aaaa",
+        "--identity-passphrase-file",
+        p.p(),
+        "--listen",
+        "127.0.0.1:0",
+    ];
+    let within = Duration::from_secs(120);
+
+    let (ok, _, err) = p.run(
+        &[&base[..], &["--passphrase", ROOM_PASS]].concat(),
+        "",
+        within,
+    );
+    eprintln!("[proof] --passphrase: ok={ok} {}", err.trim());
+    assert!(
+        !ok && err.contains("--passphrase is refused") && err.contains("--passphrase-file"),
+        "a room passphrase on the command line must be refused, naming the replacement: {err}"
+    );
+
+    let mut with_env = Profile::new(&tmp.path().join("p"), &[]);
+    with_env
+        .env
+        .push(("VOX_ROOM_PASSPHRASE".into(), ROOM_PASS.into()));
+    let (ok, _, err) = with_env.run(&base, "", within);
+    eprintln!("[proof] VOX_ROOM_PASSPHRASE: ok={ok} {}", err.trim());
+    assert!(
+        !ok && err.contains("VOX_ROOM_PASSPHRASE is refused"),
+        "a room passphrase in the environment must be refused: {err}"
+    );
+
+    // The control: the file form gets past the passphrase to the room, which does not exist.
+    let (_, _, err) = p.run(
+        &[
+            &base[..],
+            &["--passphrase-file", room_pass.to_str().unwrap()],
+        ]
+        .concat(),
+        "",
+        within,
+    );
+    eprintln!("[proof] --passphrase-file: {}", err.trim());
+    assert!(
+        !err.contains("is refused"),
+        "CANNOT MEASURE: --passphrase-file was refused too: {err}"
+    );
+    eprintln!(
+        "[proof] room passphrase refused from argv: 1, from the environment: 1; file accepted: 1"
+    );
+}

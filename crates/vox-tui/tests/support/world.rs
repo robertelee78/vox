@@ -227,6 +227,16 @@ pub fn after_label(line: &str, label: &str) -> String {
         .to_owned()
 }
 
+/// Write the room passphrase `pass` beside the profile at `dir`, for `--passphrase-file`: a
+/// room passphrase is never taken from argv or the environment (V210-72).
+#[allow(dead_code)]
+pub fn room_pass_file(dir: &Path, pass: &str) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let at = dir.join("room-passphrase");
+    std::fs::write(&at, pass).unwrap();
+    at.to_str().unwrap().to_owned()
+}
+
 pub fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_owned()).collect()
 }
@@ -614,8 +624,8 @@ impl World {
             &args(&[
                 "connect",
                 &self.address,
-                "--passphrase",
-                &self.passphrase,
+                "--passphrase-file",
+                &self.passphrase_file(),
                 "--anchor",
                 &self.guest_anchor,
                 "--listen",
@@ -623,6 +633,14 @@ impl World {
             ]),
         );
         (ok, t0.elapsed(), out, err)
+    }
+
+    /// The room passphrase in a file, for `--passphrase-file`: a room passphrase is never
+    /// taken from argv or the environment (V210-72).
+    pub fn passphrase_file(&self) -> String {
+        let at = self.tmp.path().join("room-passphrase");
+        std::fs::write(&at, &self.passphrase).unwrap();
+        at.to_str().unwrap().to_owned()
     }
 
     /// Kill the host's `vox serve` and bring the same identity and room back as
@@ -695,8 +713,8 @@ impl World {
             &args(&[
                 "up",
                 &self.room,
-                "--passphrase",
-                &self.passphrase,
+                "--passphrase-file",
+                &self.passphrase_file(),
                 "--bind",
                 "127.0.0.1:0",
                 "--anchor",
@@ -726,8 +744,8 @@ impl World {
                 &self.host_fp,
                 &self.service_port.to_string(),
                 "127.0.0.1:0",
-                "--passphrase",
-                &self.passphrase,
+                "--passphrase-file",
+                &self.passphrase_file(),
                 "--anchor",
                 &self.guest_anchor,
                 "--listen",

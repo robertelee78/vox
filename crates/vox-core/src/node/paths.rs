@@ -124,11 +124,19 @@ impl Paths {
     /// what to do, and the feature is simply unavailable on a path they chose for
     /// unrelated reasons.
     ///
-    /// The fallback is `<tmp>/vox-<16 hex>.sock`, where the hex is a digest of the
+    /// The fallback is `<tmp>/vox-<uid>/<16 hex>.sock`, where the hex is a digest of the
     /// profile directory. **Deterministic**, so a client computes the same path the
     /// daemon bound without being told, and distinct per profile, so two nodes never
     /// collide. It is only used when the natural path does not fit, so an ordinary
     /// profile keeps the socket beside its vault where the trust boundary already is.
+    ///
+    /// **The fallback is a directory private to this user, never the shared temp
+    /// directory itself** (V210-72). It was `<tmp>/vox-<hex>.sock`, and on Linux `<tmp>` is
+    /// `/tmp`, which every local user can write: another user could bind that predictable
+    /// name first and be handed every passphrase a client sends, or plant a file there so
+    /// the daemon could not start. [`prepare_socket_dir`] creates `vox-<uid>` `0700` and
+    /// refuses one that is a symlink or belongs to someone else, and a client refuses a
+    /// socket that is not this user's ([`check_socket_owner`]).
     #[must_use]
     pub fn socket_file(&self) -> PathBuf {
         let natural = self.profile_dir.join(SOCKET_FILE);
@@ -139,13 +147,13 @@ impl Paths {
             "vox/control-socket/v1",
             self.profile_dir.as_os_str().as_encoded_bytes(),
         );
-        let mut name = String::from("vox-");
+        let mut name = String::new();
         for byte in &digest[..8] {
             use std::fmt::Write as _;
             let _ = write!(name, "{byte:02x}");
         }
         name.push_str(".sock");
-        std::env::temp_dir().join(name)
+        socket_fallback_dir().join(name)
     }
 
     /// The settings file for this profile ([`CONFIG_FILE`]).
@@ -215,11 +223,25 @@ impl Paths {
 /// directory. Ids are already base32 or uuid-shaped in practice; this is the
 /// boundary check, not a formatting step, because the session id arrives from a
 /// harness and is not ours to trust.
+///
+/// **Two ids never share a name** (V210-79). Dropping characters alone made `agent.1` and
+/// `agent1` — or any two ids alike past 96 characters, or any two made only of other
+/// characters — one file: one session's drain then advanced the other's cursor, and the
+/// other never saw what it skipped. An id that is already safe is kept as it is; any other
+/// keeps a safe prefix and adds `~` (which no safe id contains) and a digest of the whole id.
 fn sanitize(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(96)
-        .collect()
+    let safe = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    if !s.is_empty() && s.len() <= 96 && s.chars().all(safe) {
+        return s.to_owned();
+    }
+    let digest = crate::hash::domain_hash("vox/path-component/v1", s.as_bytes());
+    let mut out: String = s.chars().filter(|c| safe(*c)).take(64).collect();
+    out.push('~');
+    for b in &digest[..10] {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -263,6 +285,129 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
         detail: format!("{}: {e}", dir.display()),
     })?;
     set_mode(dir, 0o700, "chmod directory")
+}
+
+/// This user's effective uid.
+#[cfg(unix)]
+#[must_use]
+pub fn my_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// The directory a control socket goes in when the profile's own path is too long:
+/// `<tmp>/vox-<uid>` (see [`Paths::socket_file`]).
+fn socket_fallback_dir() -> PathBuf {
+    #[cfg(unix)]
+    let uid = my_uid();
+    #[cfg(not(unix))]
+    let uid = 0;
+    std::env::temp_dir().join(format!("vox-{uid}"))
+}
+
+/// Make the directory `socket` is to be bound in private to this user, before binding.
+///
+/// The fallback directory lives in the shared temp directory, where another user can get
+/// there first: it is created `0700`, and one that is a symlink, is not a directory, or
+/// belongs to another user is **refused**, never used, because whoever owns the directory
+/// can replace the socket in it. The profile's own directory is created `0700` by
+/// [`Paths::resolve`], and is checked for its owner the same way.
+///
+/// # Errors
+/// If the directory cannot be created, or is not this user's own.
+#[cfg(unix)]
+pub fn prepare_socket_dir(socket: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    let Some(dir) = socket.parent() else {
+        return Err(Error::Path {
+            op: "control socket directory",
+            detail: format!("{} has no parent directory", socket.display()),
+        });
+    };
+    let fallback = dir == socket_fallback_dir();
+    if fallback {
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(Error::Path {
+                    op: "create control socket directory",
+                    detail: format!("{}: {e}", dir.display()),
+                })
+            }
+        }
+    }
+    // In the shared temp directory a symlink is refused rather than followed: it would let
+    // whoever planted it choose which directory gets tightened and bound in.
+    let meta = if fallback {
+        std::fs::symlink_metadata(dir)
+    } else {
+        std::fs::metadata(dir)
+    }
+    .map_err(|e| Error::Path {
+        op: "control socket directory",
+        detail: format!("{}: {e}", dir.display()),
+    })?;
+    let me = my_uid();
+    if !meta.file_type().is_dir() || meta.uid() != me {
+        return Err(Error::Path {
+            op: "control socket directory",
+            detail: format!(
+                "{} is not a directory owned by you (uid {me}); it is {} owned by uid {}. \
+                 Refusing to put the control socket where another user could reach it — \
+                 remove it, or use a shorter VOX_DATA_DIR",
+                dir.display(),
+                if meta.file_type().is_symlink() {
+                    "a symlink"
+                } else if meta.file_type().is_dir() {
+                    "a directory"
+                } else {
+                    "a file"
+                },
+                meta.uid()
+            ),
+        });
+    }
+    if meta.mode() & 0o077 != 0 {
+        set_mode(dir, 0o700, "chmod control socket directory")?;
+    }
+    Ok(())
+}
+
+/// Refuse to talk to a control socket that is not this user's own.
+///
+/// A client sends the socket passphrases, so before connecting it checks that what is at
+/// `socket` is a socket, not a symlink, owned by this uid. Another user can create neither.
+///
+/// # Errors
+/// If nothing is there ([`std::io::ErrorKind::NotFound`] in the detail), or it is not this
+/// user's socket.
+#[cfg(unix)]
+pub fn check_socket_owner(socket: &Path) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let meta = std::fs::symlink_metadata(socket).map_err(|e| Error::Path {
+        op: "control socket",
+        detail: format!("{}: {e}", socket.display()),
+    })?;
+    let me = my_uid();
+    if meta.file_type().is_socket() && meta.uid() == me {
+        return Ok(());
+    }
+    Err(Error::Path {
+        op: "control socket",
+        detail: format!(
+            "{} is not a socket owned by you (uid {me}): it is {} owned by uid {}. Refusing to \
+             send it anything",
+            socket.display(),
+            if meta.file_type().is_symlink() {
+                "a symlink"
+            } else if meta.file_type().is_socket() {
+                "a socket"
+            } else {
+                "not a socket"
+            },
+            meta.uid()
+        ),
+    })
 }
 
 /// Write `bytes` to `path` atomically (temp file + rename) with mode `0600`, **durably**.

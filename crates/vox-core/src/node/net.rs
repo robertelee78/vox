@@ -488,7 +488,13 @@ impl ConnectionManager {
     pub fn existing(&self, peer: &Digest32) -> Option<Arc<VoxConnection>> {
         let conn = lock(&self.conns).get(peer).cloned()?;
         if !is_live(&conn) {
-            lock(&self.conns).remove(peer);
+            // Only if it is still the one held: the lock was let go since it was read, and a
+            // fresh connection filed for the peer in between is live and must stay (V210-80).
+            let mut map = lock(&self.conns);
+            if map.get(peer).is_some_and(|held| Arc::ptr_eq(held, &conn)) {
+                map.remove(peer);
+            }
+            drop(map);
             return self.promote_heard(peer);
         }
         if self.is_dead(&conn) {
@@ -638,14 +644,22 @@ impl ConnectionManager {
         if let Some(conn) = self.existing(&peer) {
             return Ok(conn);
         }
-        let candidates = direct_candidates(endpoints);
-        let conn = connect_direct(
-            Arc::clone(&self.endpoint),
-            &candidates,
-            peer,
-            (self.clock)(),
-        )
-        .await?;
+        self.connect_to(peer, &direct_candidates(endpoints)).await
+    }
+
+    /// [`Self::connect`] at a list of direct addresses rather than one peer's advertised
+    /// [`EndpointList`], which is bounded at eight: an anchor several rooms name is dialled at
+    /// the union of their addresses (V210-75).
+    pub async fn connect_to(
+        &self,
+        peer: Digest32,
+        candidates: &[std::net::SocketAddr],
+    ) -> Result<Arc<VoxConnection>> {
+        if let Some(conn) = self.existing(&peer) {
+            return Ok(conn);
+        }
+        let conn =
+            connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
         Ok(self.file(conn).await)
     }
 

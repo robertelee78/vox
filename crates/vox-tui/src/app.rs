@@ -91,12 +91,23 @@ impl AppError {
 /// [`ViewModel`] to render and consumes [`Command`]s the user issues. The live
 /// implementation is [`LiveCore`] (an embedded `vox-core` node); [`OfflineCore`]
 /// is the no-node shell used by tests.
+/// What the TUI's status line says while creating or unlocking the identity waits for another
+/// vox holding the profile.
+pub const WAITING_FOR_PROFILE_TUI: &str =
+    "another vox is using this profile — waiting for it to finish (it goes on by itself)";
+
 pub trait CoreHandle {
     /// The latest view model to render (may fold in pending core events).
     fn view(&mut self) -> ViewModel;
     /// Apply a user command; returns a **typed** status to surface (no free text,
     /// so the status channel cannot leak plaintext/secret detail).
     fn apply(&mut self, command: Command) -> CommandStatus;
+    /// [`CoreHandle::apply`], calling `waiting` if the command has to wait for another vox
+    /// holding the profile, so the loop can say so on screen while it waits (V210-100).
+    fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
+        let _ = waiting;
+        self.apply(command)
+    }
     /// An optional startup banner surfaced in the status line — used to state
     /// plainly when the client is running without a live node (so an offline shell
     /// is never mistaken for a connected client). `None` for a live core.
@@ -567,18 +578,48 @@ const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5)
 /// How long one wake may take before it is abandoned.
 const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Whether `text` is an envelope that could interrupt anyone at all: urgent and addressed.
+/// Checked before the node's view is copied, so the common message costs no copy.
+fn may_wake(text: &str) -> bool {
+    vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|e| e.urgent && !e.to.is_empty())
+}
+
 /// The interrupt decision for one entry that just landed in `channel_id`: wake every
 /// session registered for that room that this message both addresses and marks urgent
-/// (ADR-020 §6). Everything else waits for the session's next turn.
+/// (ADR-020 §6), while it has hops left (§9). Everything else waits for the session's
+/// next turn.
+///
+/// `view` is the node's view as the entry is judged: the room's log, for the hop budget
+/// of a reply chain, and the keyring, for the name the wake gives the author.
 async fn judge(
     paths: &vox_core::node::paths::Paths,
+    view: &vox_core::node::api::NodeView,
     channel_id: &vox_core::hash::Digest32,
-    text: &str,
+    row: &vox_core::node::api::MessageRow,
 ) {
-    let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(text) else {
+    let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
         return;
     };
+    if !envelope.urgent || envelope.to.is_empty() {
+        return;
+    }
     let room = vox_core::node::link::b32_encode(channel_id);
+    // **A message with no hops left interrupts nobody** (ADR-020 §9, V210-79): the budget
+    // is the only loop guard that provably ends an urgent reply chain. It still queues.
+    let timeline = view
+        .open_channels
+        .iter()
+        .find(|d| d.channel_id == *channel_id)
+        .map_or(&[][..], |d| d.timeline.as_slice());
+    if crate::wake::hops_left(&envelope, timeline) == 0 {
+        eprintln!(
+            "vox daemon: not interrupting anyone for {}: its hop budget is spent; it waits for \
+             the next turn",
+            &vox_core::node::link::b32_encode(&row.entry_hash)[..12]
+        );
+        return;
+    }
+    let author = crate::ident::member_name(&view.trusted, &row.author);
     for session in crate::wake::registered(paths) {
         if session.room != room || session.name.is_empty() {
             continue;
@@ -586,17 +627,35 @@ async fn judge(
         if !envelope.may_interrupt(&session.name) {
             continue;
         }
-        let text = format!(
-            "Urgent message for you in Vox room {}:\n\n{}",
+        // **Attributed and framed as the drain is** (V210-79): the wake arrives as the
+        // harness's own user message, so the bare body read as the operator speaking.
+        let text = crate::agent_hook::render_wake(
             &room[..12.min(room.len())],
-            envelope.body.trim()
+            &row.entry_hash,
+            &author,
+            &envelope.body,
         );
+        let paths = paths.clone();
         // **One wedged session must not stall every other wake.** Each is its own task,
         // bounded by a deadline: a session endpoint that accepts and never reads would
         // otherwise hold this loop — and so every later interrupt — indefinitely.
         tokio::spawn(async move {
             match tokio::time::timeout(WAKE_DEADLINE, crate::wake::wake(&session, &text)).await {
                 Ok(Ok(())) => {}
+                // A session that has ended is forgotten, so its name's later messages are
+                // not tried against it for ever.
+                Ok(Err(crate::wake::WakeError::Gone(e))) => {
+                    let forgot = crate::wake::forget(&paths, &session);
+                    eprintln!(
+                        "vox daemon: session {} is gone ({e}){}",
+                        session.session,
+                        if forgot {
+                            "; forgot its registration"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 // Reported, never fatal: an agent that cannot be interrupted still reads the
                 // message on its next turn, which is the whole point of queueing always.
                 Ok(Err(e)) => eprintln!(
@@ -755,11 +814,13 @@ pub fn run_daemon(
     };
 
     rt.block_on(async {
-        let outcome = node
-            .apply(NodeCommand::Unlock {
+        let outcome = crate::tunnel_cli::apply_saying_waits(
+            &node,
+            NodeCommand::Unlock {
                 passphrase: Secret::new(identity.as_bytes().to_vec()),
-            })
-            .await;
+            },
+        )
+        .await;
         if !outcome.is_done() {
             // **Say what to do, not which enum variant lost.** A new person is sent here
             // by `vox room list`'s "start one: vox daemon", and this is the second thing
@@ -936,16 +997,33 @@ pub fn run_daemon(
         let paths = paths.clone();
         let specs = anchor_specs.clone();
         rt.spawn(async move {
+            // What the last read skipped, so a bad line is said when it appears, not every 30 s.
+            let mut said: Vec<String> = Vec::new();
             loop {
                 tokio::time::sleep(ANCHOR_REFRESH).await;
-                let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
-                if vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file())
-                    .is_err()
-                {
+                // On a blocking thread: a name is resolved here, and a slow resolver must not
+                // hold a runtime worker (V210-75).
+                let (paths, specs) = (paths.clone(), specs.clone());
+                let Ok((set, skipped)) = tokio::task::spawn_blocking(move || {
+                    let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
+                    // A bad line is skipped, not a reason to skip every anchor (V210-75).
+                    let skipped =
+                        vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file())
+                            .unwrap_or_default();
+                    for spec in &specs {
+                        let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
+                    }
+                    (set, skipped)
+                })
+                .await
+                else {
                     continue;
-                }
-                for spec in &specs {
-                    let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
+                };
+                if skipped != said {
+                    for line in &skipped {
+                        eprintln!("vox daemon: {line}");
+                    }
+                    said = skipped;
                 }
                 if !set.is_empty() {
                     let _ = node
@@ -1039,8 +1117,10 @@ pub fn run_daemon(
                             crate::tunnel_cli::say_if_it_explains_a_failure(&ev);
                             match ev {
                                 vox_core::node::api::NodeEvent::NewEntry { channel_id, row } => {
-                                    if seen.insert(row.entry_hash) {
-                                        judge(&paths, &channel_id, &row.text).await;
+                                    // The view — every open room's timeline — is copied only
+                                    // for a message that could interrupt someone.
+                                    if seen.insert(row.entry_hash) && may_wake(&row.text) {
+                                        judge(&paths, &node.view(), &channel_id, &row).await;
                                     }
                                     false
                                 }
@@ -1053,24 +1133,19 @@ pub fn run_daemon(
                     _ = tick.tick() => true,
                 };
                 if sweep {
-                    let fresh: Vec<(vox_core::hash::Digest32, String)> = node
-                        .view()
-                        .open_channels
-                        .iter()
-                        .flat_map(|d| {
-                            d.timeline
-                                .iter()
-                                .filter(|r| !seen.contains(&r.entry_hash))
-                                .map(move |r| (d.channel_id, r.clone()))
-                        })
-                        .map(|(cid, r)| (cid, r.entry_hash, r.text))
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .filter(|(_, h, _)| seen.insert(*h))
-                        .map(|(cid, _, text)| (cid, text))
-                        .collect();
-                    for (cid, text) in fresh {
-                        judge(&paths, &cid, &text).await;
+                    let view = node.view();
+                    // Every unseen row is marked seen; only one that could interrupt
+                    // someone is copied out to be judged.
+                    let mut fresh = Vec::new();
+                    for d in &view.open_channels {
+                        for r in &d.timeline {
+                            if seen.insert(r.entry_hash) && may_wake(&r.text) {
+                                fresh.push((d.channel_id, r.clone()));
+                            }
+                        }
+                    }
+                    for (cid, row) in fresh {
+                        judge(&paths, &view, &cid, &row).await;
                     }
                 }
             }
@@ -1256,6 +1331,7 @@ fn event_loop(
     let mut was_locked: Option<bool> = None;
     loop {
         let vm = core.view();
+        ui.settle(&vm);
 
         // Onboarding / re-auth prompts: open once per transition, never on top of
         // another modal.
@@ -1268,7 +1344,7 @@ fn event_loop(
         }
         was_locked = Some(vm.locked);
 
-        io.draw(&mut |f| render(f, &vm, &ui))?;
+        io.draw(&mut |f| render(f, &vm, &mut ui))?;
 
         // Idle lock (ADR-015): lock the node after IDLE_LOCK_SECS without input.
         let now = clock();
@@ -1288,7 +1364,13 @@ fn event_loop(
             Action::Quit => return Ok(()),
             Action::Redraw => {}
             Action::Dispatch(cmd) => {
-                ui.status_message = Some(core.apply(cmd).message());
+                // **Waiting is said in the status line** (V210-100), never on stderr: stderr is
+                // this terminal, and a line written there lands inside the screen.
+                let status = core.apply_noting(cmd, &mut || {
+                    ui.status_message = Some(WAITING_FOR_PROFILE_TUI.into());
+                    let _ = io.draw(&mut |f| render(f, &vm, &mut ui));
+                });
+                ui.status_message = Some(status.message());
             }
         }
     }

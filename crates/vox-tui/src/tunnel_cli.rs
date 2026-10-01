@@ -162,6 +162,66 @@ fn profile_busy(socket: &std::path::Path) -> AppError {
     ))
 }
 
+/// Serve this profile's control socket for as long as the returned guard lives.
+///
+/// **Whatever holds a profile answers for it** (V210-83, ported from v0.3.0's #236). A one-shot
+/// verb — `serve`, `connect`, `service`, `forward`, `up` — holds the profile for as long as it
+/// runs, and served nothing: `vox status`, `vox trust add/remove` and the `vox room …` verbs were
+/// refused with `profile_busy`'s message, which named a control socket that did not exist and a
+/// remedy that did not work. `vox serve` even printed `vox trust add <fingerprint>` as the next
+/// step, which could not be done while it ran. Now the running node answers on the socket the
+/// message names, as a `vox daemon`'s does.
+///
+/// **A socket that cannot be bound is reported, not fatal** (V210-83), as in the TUI. The verb's
+/// job — hosting a service, forwarding a port — does not depend on the socket, and a path another
+/// user can occupy first (the `$TMPDIR/vox-<uid>` fallback, `/tmp` on Linux) must not be able to
+/// stop it. A socket or directory that is not this user's is never used: `bind_at` refuses it.
+pub fn serve_control_socket(
+    node: &NodeHandle,
+    socket: std::path::PathBuf,
+) -> Option<vox_core::node::ipc::IpcServer> {
+    match vox_core::node::ipc::bind_at(node.clone(), socket) {
+        Ok(server) => Some(server),
+        Err(e) => {
+            eprintln!(
+                "vox: control socket unavailable ({e}); this node runs on, but `vox trust`, \
+                 `vox room` and `vox status` will not reach it while it does"
+            );
+            None
+        }
+    }
+}
+
+/// What a CLI verb says on stderr when creating or unlocking the identity waits for another vox
+/// holding the profile (V210-100). It names no particular remedy beyond the one that is true
+/// wherever that vox runs: under a shell's job control `fg` resumes a stopped one, but a daemon
+/// under tmux or a service manager is resumed its own way.
+pub const WAITING_FOR_PROFILE: &str = "vox: waiting for another vox that is using this profile; \
+     this goes on as soon as that one is done (if that vox is stopped, e.g. with Ctrl-Z, resume it)";
+
+/// Apply `cmd` (creating or unlocking the identity), and if the node says it is waiting for
+/// another vox holding the profile, say so on stderr — once, while it waits.
+pub async fn apply_saying_waits(node: &NodeHandle, cmd: NodeCommand) -> Outcome {
+    let mut events = node.subscribe();
+    let apply = node.apply(cmd);
+    tokio::pin!(apply);
+    let mut said = false;
+    loop {
+        tokio::select! {
+            out = &mut apply => return out,
+            ev = events.next(), if !said => match ev {
+                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
+                    eprintln!("{WAITING_FOR_PROFILE}");
+                    said = true;
+                }
+                Some(_) => {}
+                // The actor is gone; the apply answers for itself.
+                None => said = true,
+            },
+        }
+    }
+}
+
 pub async fn open_profile(
     paths: Paths,
     listen: SocketAddr,
@@ -184,11 +244,24 @@ pub async fn open_profile(
     };
     let secret = Secret::new(identity_passphrase.as_bytes().to_vec());
     let out = if existed {
-        node.apply(NodeCommand::Unlock { passphrase: secret }).await
+        apply_saying_waits(&node, NodeCommand::Unlock { passphrase: secret }).await
     } else {
-        node.apply(NodeCommand::CreateIdentity { passphrase: secret })
-            .await
+        apply_saying_waits(&node, NodeCommand::CreateIdentity { passphrase: secret }).await
     };
+    // **Another vox made it first** (V210-91): there was no identity when this one looked,
+    // and there is one now, so it was created by a vox started at the same moment. Nothing
+    // was created here; saying only "already has an identity" read as a stale profile.
+    if !existed && out == Outcome::Failed(Fault::IdentityExists) {
+        return Err(AppError::Usage(
+            "another vox created this profile's identity at the same time; nothing was \
+             created here.\n\
+             \x20      Run `vox id` again to see the identity it made."
+                .into(),
+        ));
+    }
+    if out == Outcome::Failed(Fault::ProfileBusy) {
+        return Err(profile_busy(&socket));
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot open this profile's identity: {out}"
@@ -213,11 +286,16 @@ async fn open_room(
         Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&socket)),
         Err(e) => return Err(e.into()),
     };
-    let out = node
-        .apply(NodeCommand::Unlock {
+    let out = apply_saying_waits(
+        &node,
+        NodeCommand::Unlock {
             passphrase: Secret::new(identity_passphrase.as_bytes().to_vec()),
-        })
-        .await;
+        },
+    )
+    .await;
+    if out == Outcome::Failed(Fault::ProfileBusy) {
+        return Err(profile_busy(&socket));
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot unlock this profile: {out}"
@@ -252,6 +330,7 @@ pub async fn service_add(
             channel_id,
             service_tag: tag.to_owned(),
             local,
+            persist: true,
         })
         .await;
     if !out.is_done() {
@@ -281,8 +360,10 @@ pub async fn service_remove(
             service_tag: tag.to_owned(),
         })
         .await;
+    // The node's own reason, not "was not offered": a room that is not open, or a store that
+    // failed, was reported as a tag that was never there (V210-83).
     if !out.is_done() {
-        return Err(AppError::Usage(format!("{tag:?} was not offered here")));
+        return Err(AppError::Usage(format!("cannot remove {tag:?}: {out}")));
     }
     println!("vox: no longer offering {tag:?}");
     Ok(())
@@ -547,6 +628,7 @@ pub async fn serve(
                 channel_id,
                 service_tag: label.clone(),
                 local,
+                persist: true,
             })
             .await;
         if !out.is_done() {
@@ -897,6 +979,7 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::Unreachable) => {
             "the anchor answered, but no member it knows could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online, or check `vox node` on the anchor shows more than `1m` for this room"
         }
+        Some(Fault::SolveTooSlow) => Fault::SolveTooSlow.explain(),
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
         // responder, so it is the responder that says no. Leading with "the refusal is
@@ -914,27 +997,53 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         }
         // Joining a room this node already holds used to say `Failed(IdentityExists)`.
         Some(Fault::AlreadyMember) => Fault::AlreadyMember.explain(),
-        _ => "the node did not say why, which is itself worth reporting",
+        // Every other fault says what it is. They all fell to "the node did not say why" here,
+        // a claim that was false whenever the node had named one (V210-83).
+        Some(other) => other.explain(),
+        None => "the node did not say why, which is itself worth reporting",
     }
 }
 
 /// The fault named in a daemon's reply to a join (`"Failed(Refused)"`), for the verbs that reach
 /// the node over its control socket, where only the outcome's name crosses the wire. The name is
 /// the reply's first line; a failed join's steps follow it (see [`join_detail`]).
+///
+/// **Every fault, not the ones a join was expected to meet** (V210-83). It knew ten, and a join
+/// that failed for any other — the store, the node shutting down, a bug — printed the enum's name
+/// to the person: `cannot join: Failed(Storage)`.
 pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
     let first = reason.lines().next().unwrap_or_default();
     let name = first.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
     Some(match name {
+        "NoIdentity" => Fault::NoIdentity,
+        "IdentityExists" => Fault::IdentityExists,
+        "Locked" => Fault::Locked,
         "WrongPassphrase" => Fault::WrongPassphrase,
+        "UnknownChannel" => Fault::UnknownChannel,
+        "ChannelNotOpen" => Fault::ChannelNotOpen,
+        "TooLong" => Fault::TooLong,
+        "KeyringFull" => Fault::KeyringFull,
+        "Storage" => Fault::Storage,
+        "SealedUnreadable" => Fault::SealedUnreadable,
+        "ShuttingDown" => Fault::ShuttingDown,
+        "NotNetworked" => Fault::NotNetworked,
         "BadLink" => Fault::BadLink,
         "RoomNotOnBoard" => Fault::RoomNotOnBoard,
         "BoardUnreachable" => Fault::BoardUnreachable,
         "Unreachable" => Fault::Unreachable,
+        "SolveTooSlow" => Fault::SolveTooSlow,
         "Refused" => Fault::Refused,
-        "NotNetworked" => Fault::NotNetworked,
-        "Locked" => Fault::Locked,
-        "NoIdentity" => Fault::NoIdentity,
+        "NotConsented" => Fault::NotConsented,
+        "StillTrusted" => Fault::StillTrusted,
+        "NotLoopback" => Fault::NotLoopback,
+        "AddressInUse" => Fault::AddressInUse,
         "AlreadyMember" => Fault::AlreadyMember,
+        "NotAServiceRoom" => Fault::NotAServiceRoom,
+        "NotOffered" => Fault::NotOffered,
+        "NoSuchForward" => Fault::NoSuchForward,
+        "NotAdmin" => Fault::NotAdmin,
+        "RoomFromBeforeV030" => Fault::RoomFromBeforeV030,
+        "Internal" => Fault::Internal,
         _ => return None,
     })
 }
@@ -983,6 +1092,7 @@ where
     F: FnOnce(NodeHandle, Digest32) -> Fut,
     Fut: std::future::Future<Output = Result<(), AppError>>,
 {
+    let socket = target.paths.socket_file();
     let (node, channel_id) = open_room(
         target.paths,
         target.listen,
@@ -992,6 +1102,7 @@ where
         &target.room_passphrase,
     )
     .await?;
+    let _control = serve_control_socket(&node, socket);
     let handle = node.clone();
     let result = body(node, channel_id).await;
     // The verbs are one-shot; `forward` shuts the node down itself when the person
@@ -1042,12 +1153,48 @@ pub fn prompt_passphrase(what: &str) -> Result<String, AppError> {
     result.map(|()| out)
 }
 
-/// A passphrase given by flag or environment, else prompted for.
-pub fn passphrase_or_prompt(given: Option<&String>, what: &str) -> Result<String, AppError> {
-    match given {
-        Some(p) => Ok(p.clone()),
-        None => prompt_passphrase(what),
+/// The room passphrase: from `--passphrase-file`, else prompted for (a line of stdin when
+/// stdin is not a terminal).
+///
+/// **Never from argv or the environment** (V210-72). A command line is readable by every
+/// process on the machine while it runs (`ps`, `/proc/<pid>/cmdline`), and an environment
+/// by whatever runs as the user and everything the process starts. Both are refused with
+/// the replacement named, rather than ignored, so a script using them is told why and does
+/// not go on to wait at a prompt.
+pub fn room_passphrase_for(
+    given: Option<&String>,
+    file: Option<&std::path::Path>,
+) -> Result<String, AppError> {
+    if given.is_some() {
+        return Err(AppError::Usage(
+            "--passphrase is refused: a command line is world-readable while the process \
+             runs (`ps`, /proc/<pid>/cmdline), so the room passphrase would be disclosed to \
+             every process on this machine, and kept in the shell's history.\n\
+             \x20      Use --passphrase-file <path>, or omit it and be prompted."
+                .into(),
+        ));
     }
+    if std::env::var_os("VOX_ROOM_PASSPHRASE").is_some() {
+        return Err(AppError::Usage(
+            "VOX_ROOM_PASSPHRASE is refused: an environment is readable by whatever runs as \
+             you and is inherited by every process this one starts. Unset it.\n\
+             \x20      Use --passphrase-file <path>, or omit it and be prompted."
+                .into(),
+        ));
+    }
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+        let first = text.lines().next().unwrap_or_default();
+        if first.is_empty() {
+            return Err(AppError::Usage(format!(
+                "{} is empty; a room passphrase cannot be",
+                path.display()
+            )));
+        }
+        return Ok(first.to_owned());
+    }
+    prompt_passphrase("room passphrase")
 }
 
 /// `vox trust add` — decide that an identity may read this node, and reach its services.

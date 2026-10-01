@@ -16,6 +16,8 @@
 
 use std::collections::BTreeMap;
 
+use zeroize::Zeroizing;
+
 use crate::atrest::sek::Sek;
 use crate::atrest::sek::NONCE_LEN;
 use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
@@ -44,28 +46,44 @@ pub const SEGMENT_ID: u64 = 1;
 const VERSION: u64 = 1;
 
 /// Most pending consents held at once: every trusted identity in a generous number of rooms.
-/// A bound on load, so a corrupt blob cannot force an unbounded allocation.
+/// **One bound, kept on both sides**: [`PendingConsents::insert`] holds no more, and a map
+/// written before it did (V210-77) loads its first this many rather than refusing the unlock.
 const MAX_PENDING: usize = MAX_TRUSTED * 16;
 
 /// Longest SKDM kept. A real one is a few KiB (composite signing key and signature).
 const MAX_SKDM: usize = 16 * 1024;
 
 /// `(room, member) → the SKDM taken when this identity decided to consent to that member`.
+///
+/// An SKDM carries a chain key of this identity's sender key, so each is zeroized when it is
+/// dropped: when delivered, when forgotten, and when the node locks (V210-76).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PendingConsents {
-    entries: BTreeMap<(Digest32, Digest32), Vec<u8>>,
+    entries: BTreeMap<(Digest32, Digest32), Zeroizing<Vec<u8>>>,
 }
 
 impl PendingConsents {
     /// The SKDM (wire form) held for `target` in `channel_id`, if any.
     #[must_use]
     pub fn get(&self, channel_id: &Digest32, target: &Digest32) -> Option<&[u8]> {
-        self.entries.get(&(*channel_id, *target)).map(Vec::as_slice)
+        self.entries
+            .get(&(*channel_id, *target))
+            .map(|skdm| skdm.as_slice())
     }
 
-    /// Hold `skdm` (wire form) as the key to release to `target` in `channel_id`.
-    pub fn insert(&mut self, channel_id: Digest32, target: Digest32, skdm: Vec<u8>) {
-        self.entries.insert((channel_id, target), skdm);
+    /// Hold `skdm` (wire form) as the key to release to `target` in `channel_id`, unless that
+    /// would break what [`PendingConsents::load`] accepts: a key over `MAX_SKDM` bytes, or a new
+    /// entry past `MAX_PENDING`. Whether it is held.
+    #[must_use]
+    pub fn insert(&mut self, channel_id: Digest32, target: Digest32, skdm: Vec<u8>) -> bool {
+        let key = (channel_id, target);
+        if skdm.len() > MAX_SKDM
+            || (self.entries.len() >= MAX_PENDING && !self.entries.contains_key(&key))
+        {
+            return false;
+        }
+        self.entries.insert(key, Zeroizing::new(skdm));
+        true
     }
 
     /// The consent was delivered and recorded: nothing is pending for it any more.
@@ -80,15 +98,16 @@ impl PendingConsents {
         self.entries.len() != before
     }
 
-    /// Canonical CBOR body: `[version, [[room, member, skdm], ..]]`.
+    /// Canonical CBOR body: `[version, [[room, member, skdm], ..]]`. It holds every SKDM, so it
+    /// is zeroized when dropped.
     #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
         e.array(2).uint(VERSION).array(self.entries.len());
         for ((room, member), skdm) in &self.entries {
             e.array(3).bytes(room).bytes(member).bytes(skdm);
         }
-        e.finish()
+        Zeroizing::new(e.finish())
     }
 
     /// Parse a body.
@@ -101,10 +120,9 @@ impl PendingConsents {
         if d.uint().map_err(|_| bad("pending consents version"))? != VERSION {
             return Err(bad("pending consents version"));
         }
+        // Rows are read one at a time and nothing is sized from `n`, so a corrupt count
+        // allocates nothing; past the bound, rows are read and not kept.
         let n = d.array().map_err(|_| bad("pending consents len"))?;
-        if n > MAX_PENDING {
-            return Err(Error::SizeLimitExceeded("pending consents"));
-        }
         let mut entries = BTreeMap::new();
         for _ in 0..n {
             if d.array().map_err(|_| bad("pending consent row"))? != 3 {
@@ -118,7 +136,9 @@ impl PendingConsents {
             if skdm.len() > MAX_SKDM {
                 return Err(Error::SizeLimitExceeded("pending consent key"));
             }
-            entries.insert((room, member), skdm.to_vec());
+            if entries.len() < MAX_PENDING {
+                entries.insert((room, member), Zeroizing::new(skdm.to_vec()));
+            }
         }
         d.finish().map_err(|_| bad("pending consents trailing"))?;
         Ok(Self { entries })

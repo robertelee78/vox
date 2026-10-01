@@ -132,12 +132,14 @@ bytes = { version = "1", default-features = false }
 # digest are all decided in Rust; `rustls-tls` keeps it on the TLS stack vox already
 # links. `serde` parses the release record with `deny_unknown_fields` (a differently
 # shaped file can never be mistaken for a record) and `semver` compares versions
-# properly. `rustix` supplies `flock`, so two update transitions cannot race.
+# properly. `rustix` supplies `flock`, so two update transitions cannot race, and
+# `geteuid`, so the control socket is checked against its owner (V210-72), and a peeking
+# `recv` and `poll`, to tell a peer that has hung up from one that will not say who it is.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
-rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "net", "event"] }
 
 # OpenPGP v4 fingerprint of the native Ed25519 root (ADR-002 §GPG "Generate": the
 # root is OpenPGP-representable). SHA-1 is used ONLY as the RFC 4880/9580 v4

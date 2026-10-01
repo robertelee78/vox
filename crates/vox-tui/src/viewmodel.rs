@@ -141,16 +141,16 @@ pub struct ChannelView {
     pub reachability: Reachability,
 }
 
-/// Overall sync status surfaced in the status bar.
+/// Overall sync status surfaced in the status bar: what the node can say, which is how many
+/// peers it holds a connection to (V210-82). It keeps no gauge of sessions in flight or of being
+/// caught up, so the bar claims neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SyncStatus {
     /// Not connected to any peer/node.
     #[default]
     Idle,
-    /// Actively reconciling logs with a peer.
-    Syncing,
-    /// Up to date with all reachable peers.
-    Synced,
+    /// Connected to this many peers (at least one), with which rooms sync.
+    Connected(usize),
 }
 
 /// The latest-wins UI state (core→UI over a `watch`). Cloneable and free of
@@ -211,6 +211,8 @@ pub enum UiError {
     SealedUnreadable,
     /// Join proof-of-work is still being computed (Equihash delay).
     JoinPowDelay,
+    /// This device took longer to solve a join's proof of work than the member waits (V210-87).
+    JoinPowTooSlow,
     /// Join proof-of-possession / identity mismatch.
     JoinProofMismatch,
     /// No reachable peer / your node — "both must be online" for a 2-member channel.
@@ -229,6 +231,11 @@ pub enum UiError {
     NoIdentity,
     /// The profile already has an identity.
     IdentityExists,
+    /// The profile had no identity when this TUI started, and another vox created one since:
+    /// nothing was created here (V210-100, the CLI's V210-91 refusal).
+    IdentityMadeElsewhere,
+    /// Another vox holds this profile open for writing.
+    ProfileBusy,
     /// The app is locked (`:unlock`).
     Locked,
     /// The channel is not open (select it and enter its passphrase).
@@ -247,6 +254,8 @@ pub enum UiError {
     Refused,
     /// There is no consent to withdraw from that member.
     NotConsented,
+    /// A consent named a member this node has not admitted to the room yet.
+    NotAdmitted,
     /// This client is not networked, or is locked, so it cannot reach anyone.
     NotNetworked,
     /// A local address the node needs (its listen port) is already in use.
@@ -278,6 +287,9 @@ impl UiError {
                 "passphrase right, but this profile's keyring or prekeys will not open — altered, or another identity's"
             }
             UiError::JoinPowDelay => "join proof-of-work in progress…",
+            UiError::JoinPowTooSlow => {
+                "this device solved the join's proof of work too slowly for the member — try when it is less busy"
+            }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — both must be online (or run your node)",
             UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
@@ -287,12 +299,19 @@ impl UiError {
             UiError::Transport => "connection error",
             UiError::NoIdentity => "no identity yet — :init to create one",
             UiError::IdentityExists => "an identity already exists in this profile",
+            UiError::IdentityMadeElsewhere => {
+                "another vox created this profile's identity at the same time; nothing was created here — restart vox tui to unlock it"
+            }
+            UiError::ProfileBusy => {
+                "another vox holds this profile open — stop it, then try again"
+            }
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",
             UiError::KeyringFull => "your trust keyring is full (1,024) — remove one first",
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
+            UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",

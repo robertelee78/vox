@@ -343,12 +343,41 @@ pub enum Error {
     #[error("bad anchor: {0}")]
     MalformedAnchor(&'static str),
 
+    /// The anchors file names no anchor that can be used — every line of it was skipped — and
+    /// no `--anchor` was given (V210-75). A verb that needs an anchor refuses to start rather
+    /// than run with none: with every line skipped, the node would reach nobody it cannot dial
+    /// directly, and say nothing about why.
+    #[error(
+        "the anchors file {path} names no usable anchor ({skipped} line(s) skipped, said above); \
+         fix it, or give --anchor"
+    )]
+    AnchorsFileUnusable {
+        /// The anchors file.
+        path: String,
+        /// How many of its lines were skipped.
+        skipped: usize,
+    },
+
     /// The responder refused a join (ADR-016 §"Join over the network"): the coarse
     /// reason it sent on the join stream. Deliberately not a fine-grained taxonomy —
     /// a wrong passphrase already fails locally on the joiner, so the responder has
     /// no reason to confirm a guess. Carries a static reason.
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
+
+    /// This joiner's proof of work took longer than the responder waits for it, so the responder
+    /// had stopped waiting before the solution arrived (V210-87). Both sides derive the wait from
+    /// the same signed difficulty, so the joiner can say this rather than a refusal it cannot name.
+    #[error(
+        "this device took {solved_secs}s to solve the join's proof of work, and a member waits \
+         {patience_secs}s for it"
+    )]
+    JoinSolveTooSlow {
+        /// How long this side's grind took, in whole seconds.
+        solved_secs: u64,
+        /// How long the responder waits for it at the difficulty it demanded, in whole seconds.
+        patience_secs: u64,
+    },
 
     /// A peer opened a stream kind its class is not authorized to open (ADR-016
     /// §"Connections": an anchor has no channel authority, a pending joiner may
@@ -444,4 +473,41 @@ pub enum IpcHandshake {
     /// What answered did not greet at all.
     #[error("what answered on the control socket did not greet like a vox node")]
     NotHello,
+    /// The socket, or the process serving it, is not this user's: nothing is sent to it.
+    #[error("refusing the control socket: {detail}")]
+    NotYours {
+        /// What was found instead.
+        detail: String,
+    },
+    /// The node took the connection and then said nothing: it is suspended, or stuck. Waiting
+    /// on it was forever (V210-83), since a suspended process's socket still accepts.
+    #[error(
+        "the node took the connection but did not answer within {secs} s: it may be suspended \
+         (Ctrl-Z, SIGSTOP) or stuck. Resume it, or stop it and start it again"
+    )]
+    Silent {
+        /// How long it was given.
+        secs: u64,
+    },
+    /// A request was waiting, and a second connection then got no greeting: the node stopped
+    /// answering while it worked on this one (V210-83).
+    #[error(
+        "the node stopped answering while this request waited: a new connection got no greeting \
+         within {secs} s. It may be suspended (Ctrl-Z, SIGSTOP) or stuck. Resume it, or stop it \
+         and start it again"
+    )]
+    StoppedAnswering {
+        /// How long the new connection was given.
+        secs: u64,
+    },
+    /// A request was waiting, and the node still greets, but its actor answered no ping: nothing
+    /// sent to it will be answered (V210-83).
+    #[error(
+        "the node greets but has taken no command for {secs} s, so this request will not be \
+         answered: it is stuck. Stop it and start it again"
+    )]
+    Stuck {
+        /// How long the ping was given.
+        secs: u64,
+    },
 }

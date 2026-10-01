@@ -110,7 +110,15 @@ thread_local! {
 /// Bound this test process's total wall-clock time. Idempotent, so every test in a binary may
 /// call it; the budget covers the binary, not one test, because libtest runs tests in parallel
 /// threads of one process and a per-test bound would abort a healthy neighbour.
+#[allow(dead_code)] // a proof that needs a longer bound calls `arm_for` instead
 pub fn arm() {
+    arm_for(DEFAULT_BUDGET);
+}
+
+/// [`arm`], with `budget` in place of the default: for a proof whose product bounds are longer
+/// than [`DEFAULT_BUDGET`] (a debug-build join may take minutes). `VOX_TEST_WATCHDOG_SECS` still
+/// overrides it.
+pub fn arm_for(default_budget: Duration) {
     let name = std::thread::current()
         .name()
         .unwrap_or("<unnamed thread>")
@@ -129,9 +137,9 @@ pub fn arm() {
             Ok(v) => match v.parse::<u64>() {
                 Ok(0) => return,
                 Ok(secs) => Duration::from_secs(secs),
-                Err(_) => DEFAULT_BUDGET,
+                Err(_) => default_budget,
             },
-            Err(_) => DEFAULT_BUDGET,
+            Err(_) => default_budget,
         };
         let started = Instant::now();
         std::thread::Builder::new()

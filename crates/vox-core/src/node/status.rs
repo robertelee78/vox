@@ -680,12 +680,76 @@ pub struct PortCounters {
     pub last_failure: Option<String>,
     /// Results that arrived for an attempt already retired (ADR-025 D1a).
     pub stale: u64,
+    /// Entries this peer served that were refused rather than held (V210-74): without their
+    /// payload, past a position not held, or signed but unclassifiable.
+    pub refused: u64,
     /// Sessions that were due but skipped because every outbound slot was taken.
     pub skipped_at_cap: u64,
     /// Times a port waited in the outbound queue for a slot (ADR-025 D6).
     pub queued: u64,
     /// The backoff the port is in now, and its consecutive failures.
     pub backoff: Option<(BackoffKind, u32)>,
+}
+
+/// Why a publish round started (V210-68): one round per `(room, board)`, counted by what asked
+/// for it, so a count of rounds can be accounted for in full.
+///
+/// A publish asked for while a round to the same board is in flight runs once that round ends,
+/// and is counted under **what asked for it**, not as a cause of its own: "it was asked for during
+/// another round" says when it ran, not why, and a round counted that way could not be accounted
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PublishCause {
+    /// The scheduled renewal of the room's own records.
+    Renewal,
+    /// An anchor connected (or came back): it holds none of this node's records yet.
+    AnchorReturned,
+    /// A board passed on news of a record, which this node's anchors are given too.
+    BoardNews,
+    /// This node learned its public addresses, which its records must name.
+    Addresses,
+    /// A board refused one of this node's **own** records as stale, so the node republishes its
+    /// records to that board (`NetEvent::RepublishTo`).
+    AskedAgain,
+    /// A round that failed, retried.
+    Retry,
+    /// A sync that brought governance, which changes the records.
+    Governance,
+    /// A join, on either side.
+    Join,
+    /// The room was created, opened, reopened or served.
+    Opened,
+}
+
+impl PublishCause {
+    /// Every cause, in the order `vox status --json` lists them.
+    pub const ALL: [PublishCause; 9] = [
+        Self::Renewal,
+        Self::AnchorReturned,
+        Self::BoardNews,
+        Self::Addresses,
+        Self::AskedAgain,
+        Self::Retry,
+        Self::Governance,
+        Self::Join,
+        Self::Opened,
+    ];
+
+    /// The name `vox status --json` uses.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Renewal => "renewal",
+            Self::AnchorReturned => "anchor_returned",
+            Self::BoardNews => "board_news",
+            Self::Addresses => "addresses",
+            Self::AskedAgain => "asked_again",
+            Self::Retry => "retry",
+            Self::Governance => "governance",
+            Self::Join => "join",
+            Self::Opened => "opened",
+        }
+    }
 }
 
 /// Every `(room, peer)`'s counters.
@@ -696,6 +760,44 @@ pub struct SyncBook {
     /// dial that found no connection to reuse and no other reach to the same peer under way to
     /// wait on (V210-53, #232). What no person can see directly — two dials where one would do.
     ladders: BTreeMap<Digest32, u64>,
+    /// Publish rounds this node started (one per `(room, board)` round that went out): what no
+    /// person can see directly, and what a storm of rounds looks like (#179).
+    publish_rounds: u64,
+    /// The same rounds by what asked for each (V210-68).
+    publish_by_cause: BTreeMap<PublishCause, u64>,
+    /// Asks for a publish folded into one already waiting on a round in flight, by what asked:
+    /// they went out in that round and are counted under its cause, so without these a round
+    /// could be accounted for and an ask could not.
+    publish_merged: BTreeMap<PublishCause, u64>,
+    /// Scheduled renewals of a room's own records (V210-68): one per room per half of the
+    /// records' lifetime, whatever the traffic and however many boards the round then reaches.
+    renewals: u64,
+    /// Records by others that taught this node's board something and were passed on
+    /// (`NetEvent::BoardGrew`, #179): a member's routine refresh is not one.
+    board_news: u64,
+    /// The prekey ring as the running node last maintained it (V210-77), or `None` while it
+    /// holds no ring.
+    prekeys: Option<PrekeyCounts>,
+    /// Each open room's stored entries set aside when it opened (V210-74), as `author#seq: why`.
+    set_aside: BTreeMap<Digest32, Vec<String>>,
+}
+
+/// What the prekey ring holds, and what keeping it up has done since the node started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrekeyCounts {
+    /// One-time prekeys left to offer.
+    pub one_time: usize,
+    /// Consumed one-time prekeys still retained for a concurrent duplicate use.
+    pub consumed: usize,
+    /// The id of the signed prekey offered now.
+    pub signed_prekey: u64,
+    /// Signed-prekey rotations the running node made.
+    pub rotated: u64,
+    /// One-time prekeys the running node added.
+    pub refilled: u64,
+    /// Sessions the running node set up with its previous signed prekey: started just before a
+    /// rotation, completed after it.
+    pub previous_used: u64,
 }
 
 /// The book as the actor and the handles share it.
@@ -719,14 +821,71 @@ impl SyncBook {
         f(b.ports.entry((room, peer)).or_default());
     }
 
+    /// Count one scheduled renewal of a room's own records (V210-68).
+    pub fn note_renewal(book: &SharedSyncBook) {
+        book.lock().unwrap_or_else(PoisonError::into_inner).renewals += 1;
+    }
+
+    /// Count one publish round started, and what asked for it.
+    pub fn note_publish_round(book: &SharedSyncBook, cause: PublishCause) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        b.publish_rounds += 1;
+        *b.publish_by_cause.entry(cause).or_default() += 1;
+    }
+
+    /// Count one ask for a publish folded into a round already waiting to run (see
+    /// `publish_merged`).
+    pub fn note_publish_merged(book: &SharedSyncBook, cause: PublishCause) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        *b.publish_merged.entry(cause).or_default() += 1;
+    }
+
+    /// What `room` set aside when it opened (V210-74); nothing, and the room is not listed.
+    pub fn note_set_aside(book: &SharedSyncBook, room: Digest32, entries: &[String]) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.is_empty() {
+            b.set_aside.remove(&room);
+        } else {
+            b.set_aside.insert(room, entries.to_vec());
+        }
+    }
+
+    /// Count one record of news on this node's board, passed on.
+    pub fn note_board_news(book: &SharedSyncBook) {
+        book.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .board_news += 1;
+    }
+
+    /// Record the ring as it stands after a maintenance that `rotated` and added `added`, and
+    /// how many sessions it has set up with its previous signed prekey.
+    pub fn note_prekeys(
+        book: &SharedSyncBook,
+        one_time: usize,
+        consumed: usize,
+        signed_prekey: u64,
+        rotated: bool,
+        added: usize,
+        previous_used: u64,
+    ) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        let c = b.prekeys.get_or_insert_with(PrekeyCounts::default);
+        c.one_time = one_time;
+        c.consumed = consumed;
+        c.signed_prekey = signed_prekey;
+        c.rotated += u64::from(rotated);
+        c.refilled += u64::try_from(added).unwrap_or(u64::MAX);
+        c.previous_used = previous_used;
+    }
+
     /// Count one reachability ladder run to `peer`.
     pub fn note_ladder(book: &SharedSyncBook, peer: Digest32) {
         let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
         *b.ladders.entry(peer).or_default() += 1;
     }
 
-    /// The counters as `vox status --json` carries them: its `"sync"`, `"reach"` and
-    /// `"equivocations"` members, without the enclosing braces, for [`serve`] to add beside
+    /// The counters as `vox status --json` carries them: its `"sync"`, `"reach"`,
+    /// `"equivocations"`, `"publish"`, `"prekeys"` and `"set_aside"` members, without the enclosing braces, for [`serve`] to add beside
     /// [`StatusReport::to_json`]'s. `equivocations` is each `(room, author, position)` the node
     /// holds back (V210-63).
     #[must_use]
@@ -744,7 +903,7 @@ impl SyncBook {
                 s,
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
                  \"completed\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\"stale\":{},\
-                 \"skipped_at_cap\":{},\"queued\":{},\"backoff\":{}}}",
+                 \"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{}}}",
                 b32_encode(room),
                 b32_encode(peer),
                 c.opened,
@@ -757,6 +916,7 @@ impl SyncBook {
                     .as_deref()
                     .map_or_else(|| "null".to_owned(), q),
                 c.stale,
+                c.refused,
                 c.skipped_at_cap,
                 c.queued,
                 c.backoff.map_or_else(
@@ -796,6 +956,55 @@ impl SyncBook {
                 "{{\"room\":\"{}\",\"author\":\"{}\",\"position\":{position}}}",
                 b32_encode(room),
                 b32_encode(author),
+            );
+        }
+        let _ = write!(
+            s,
+            "],\"publish\":{{\"rounds\":{},\"by_cause\":{{",
+            b.publish_rounds
+        );
+        for (i, cause) in PublishCause::ALL.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let n = b.publish_by_cause.get(cause).copied().unwrap_or(0);
+            let _ = write!(s, "\"{}\":{n}", cause.name());
+        }
+        s.push_str("},\"merged\":{");
+        for (i, cause) in PublishCause::ALL.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let n = b.publish_merged.get(cause).copied().unwrap_or(0);
+            let _ = write!(s, "\"{}\":{n}", cause.name());
+        }
+        let _ = write!(
+            s,
+            "}},\"renewals\":{},\"board_news\":{}}},\"prekeys\":",
+            b.renewals, b.board_news
+        );
+        match b.prekeys {
+            Some(p) => {
+                let _ = write!(
+                    s,
+                    "{{\"one_time\":{},\"consumed\":{},\"signed_prekey\":{},\"rotated\":{},\
+                     \"refilled\":{},\"previous_used\":{}}}",
+                    p.one_time, p.consumed, p.signed_prekey, p.rotated, p.refilled, p.previous_used
+                );
+            }
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"set_aside\":[");
+        for (i, (room, entries)) in b.set_aside.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let list: Vec<String> = entries.iter().map(|e| q(e)).collect();
+            let _ = write!(
+                s,
+                "{{\"room\":\"{}\",\"entries\":[{}]}}",
+                b32_encode(room),
+                list.join(",")
             );
         }
         s.push(']');
@@ -854,13 +1063,19 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
 
 /// Ask the node at `path` for its status, as JSON.
 ///
+/// **Bounded by [`ANSWER_WITHIN`](crate::node::ipc::ANSWER_WITHIN)** (V210-83): a suspended node's
+/// socket still accepts, and `vox status` against one waited for ever.
+///
 /// # Errors
-/// If no node answers, or it refuses.
+/// If the node cannot be reached, does not answer in time, or answers something else.
 pub async fn request(path: &Path) -> Result<String> {
-    let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
-        op: "connect control socket",
-        detail: format!("{}: {e}", path.display()),
-    })?;
+    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, ask(path))
+        .await
+        .map_err(|_| crate::node::ipc::silent())?
+}
+
+async fn ask(path: &Path) -> Result<String> {
+    let mut stream = crate::node::ipc::connect_own(path).await?;
     let Some(hello) = read_frame(&mut stream).await? else {
         return Err(Error::MalformedBundle("ipc closed before hello"));
     };

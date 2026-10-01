@@ -112,6 +112,10 @@ impl Verdict {
 /// outranks a passive lapse, which outranks a void cert, which outranks having
 /// no chain at all. Deterministic, so vectors can pin it. *(2026-09-19 review:
 /// every such case previously collapsed to `NotAdmin`.)*
+///
+/// **The declaration order is that priority**, lowest first: the resolver keeps the `max` of the
+/// reasons it meets, and `Ord` is derived. `OverAttenuated` was declared last, so it outranked
+/// `Revoked` and `Expired`, the inverse of the rule above (V210-83).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum DenyReason {
@@ -119,13 +123,13 @@ pub enum DenyReason {
     NotAdmin,
     /// A chain exists but does not grant the queried capability.
     CapabilityNotHeld,
+    /// A delegation in the chain over-attenuated (granted more than its issuer
+    /// held); the chain is void.
+    OverAttenuated,
     /// The only chain(s) granting it have expired.
     Expired,
     /// The only chain(s) granting it were revoked (revocation-wins).
     Revoked,
-    /// A delegation in the chain over-attenuated (granted more than its issuer
-    /// held); the chain is void.
-    OverAttenuated,
 }
 
 /// The deterministic evaluator over a channel's governance log.

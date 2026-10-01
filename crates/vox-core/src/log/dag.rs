@@ -220,6 +220,10 @@ pub struct Dag {
     /// like a fork whose held side cannot incriminate (both are dropped and the session goes
     /// on), and a gate that can only watch for a freeze cannot tell the two apart.
     refused_below_checkpoint: u64,
+    /// Authors whose feed is closed here from a position on, because the entry they signed there
+    /// could not be classified (V210-74): nothing from that position on is taken, and it is not
+    /// asked for again. Kept in memory only; after a restart the entry is refused again on sight.
+    refused: HashMap<Digest32, u64>,
 }
 
 impl Dag {
@@ -286,6 +290,19 @@ impl Dag {
     #[must_use]
     pub fn refused_below_checkpoint(&self) -> u64 {
         self.refused_below_checkpoint
+    }
+
+    /// The position from which `author`'s feed is closed here, if it is (see [`Dag::refuse_from`]).
+    #[must_use]
+    pub fn refused_from(&self, author: &Digest32) -> Option<u64> {
+        self.refused.get(author).copied()
+    }
+
+    /// Close `author`'s feed here from `seq` on: the entry the author signed at `seq` could not be
+    /// classified, so it is never held, and nothing after it can link (V210-74).
+    pub fn refuse_from(&mut self, author: Digest32, seq: u64) {
+        let at = self.refused.entry(author).or_insert(seq);
+        *at = (*at).min(seq);
     }
 
     /// The recorded fork proof for a frozen author, if any.

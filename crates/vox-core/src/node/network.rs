@@ -106,6 +106,25 @@ impl SharedPolicy {
         *lock(&self.inner) = policy;
     }
 
+    /// Replace the membership and anchors, **keeping** the pending joiners and join responders
+    /// the policy holds at that instant — under one lock.
+    ///
+    /// Those two sets are not derived from channel state: a join task registers its responder
+    /// from its own task, and the actor forgets joiners as their joins land. A snapshot taken
+    /// under one lock and a replace under another lost whatever was registered between them,
+    /// and a responder lost that way had its sender key refused, so the room just joined could
+    /// not be read (V210-80).
+    pub fn rebuild(&self, mut policy: PeerPolicy) {
+        let mut held = lock(&self.inner);
+        for joiner in held.pending_joiners() {
+            policy.expect_joiner(joiner);
+        }
+        for responder in held.join_responders() {
+            policy.expect_join_responder(responder);
+        }
+        *held = policy;
+    }
+
     /// Expect a join from `joiner` until it is forgotten.
     pub fn expect_joiner(&self, joiner: Digest32) {
         lock(&self.inner).expect_joiner(joiner);
@@ -488,11 +507,14 @@ impl NodeNet {
     /// Best-effort by design: a node with no dialable address is not broken. It still
     /// reaches peers outbound and is reached through the ladder's later rungs, which
     /// is the ordinary case for a client inside a private network.
-    pub async fn refresh_advertised(&self) -> Vec<crate::nat::portmap::PortMapping> {
+    pub async fn refresh_advertised(
+        &self,
+        leased: &[crate::nat::portmap::PortMapping],
+    ) -> Vec<crate::nat::portmap::PortMapping> {
         let Ok(bound) = self.manager.endpoint().local_addr() else {
             return Vec::new();
         };
-        let (list, mappings) = crate::nat::reachability::advertise_endpoints(bound).await;
+        let (list, mappings) = crate::nat::reachability::advertise_endpoints(bound, leased).await;
         *lock(&self.advertised) = Some(list);
         mappings
     }
@@ -1357,7 +1379,7 @@ impl NodeNet {
             endpoints,
             seq,
             now,
-            crate::nat::store::MAX_TTL_SECS,
+            crate::nat::store::own_record_ttl_secs(),
         )?;
         let bundle = MemberBundleRecord::build(
             signer,

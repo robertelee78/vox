@@ -6,23 +6,24 @@
 //! [`ViewModel`] and maps each UI [`Command`] onto [`NodeCommand`]s, blocking the
 //! (synchronous, crossterm-owning) UI thread on the node's typed reply. UI-local
 //! state that is not the node's business lives here: which channel is on screen,
-//! unread counts (driven by the node's ordered [`NodeEvent`]s), and this
-//! device's verification marks (ADR-015: verification is a local judgement).
+//! and unread counts (driven by the node's ordered [`NodeEvent`]s).
 //!
 //! Secrets cross exactly once, inward: a [`SecretString`] from a masked prompt
 //! becomes the node's zeroizing [`Secret`] and is dropped. Every outcome maps to
 //! the closed [`CommandStatus`] / [`UiError`] set — no free text from the core.
 //!
-//! M13 is single-device: reachability is honestly `Offline`, sync `Idle`, and the
-//! verbs that need a network (join, consent) report `NotNetworked`. Revocation needs
-//! none — it rotates a local key — so it reaches the node regardless. The ADR-015
-//! visibility and block verbs report `NotAvailableYet`.
+//! Consent, reachability and sync are the node's own state, never assumed (V210-82): consent is
+//! who this identity consents to on the room's log, a room is online when the node holds a
+//! connection to another of its members, and sync says how many peers it is connected to.
+//! Verification is shown as unverified for every other member: the node exposes no safety code to
+//! compare, so there is nothing a mark could rest on, and `:verify` says it is not available. The
+//! ADR-015 visibility and block verbs report `NotAvailableYet` too.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use secrecy::{ExposeSecret, SecretString};
 use vox_core::hash::Digest32;
-use vox_core::node::actor::NodeHandle;
+use vox_core::node::actor::{EventStreamItem, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, NodeView, Outcome, Secret};
 
 use crate::app::CoreHandle;
@@ -39,8 +40,6 @@ pub struct LiveCore {
     active: Option<Digest32>,
     /// Unread counts per channel (incremented by `NewEntry` off-screen).
     unread: BTreeMap<Digest32, usize>,
-    /// Local verification marks: `(channel, member)` pairs this device verified.
-    verified: BTreeSet<(Digest32, Digest32)>,
     /// The most recent network notice to show (an invite link, a join, a consent).
     /// Public facts only — see [`ViewModel::notice`].
     notice: Option<String>,
@@ -81,7 +80,6 @@ impl LiveCore {
             rt,
             active: None,
             unread: BTreeMap::new(),
-            verified: BTreeSet::new(),
         }
     }
 
@@ -93,6 +91,36 @@ impl LiveCore {
 
     fn secret(s: &SecretString) -> Secret {
         Secret::new(s.expose_secret().as_bytes().to_vec())
+    }
+
+    /// [`LiveCore::send`] that also watches the node's events while the command runs, calling
+    /// `waiting` (on this thread, between polls) when the node says it is waiting for another vox
+    /// holding the profile.
+    fn send_noting(&self, cmd: NodeCommand, waiting: &mut dyn FnMut()) -> CommandStatus {
+        let node = &self.node;
+        let out = self.rt.block_on(async {
+            let mut events = node.subscribe();
+            let apply = node.apply(cmd);
+            tokio::pin!(apply);
+            let mut said = false;
+            loop {
+                tokio::select! {
+                    out = &mut apply => break out,
+                    ev = events.next(), if !said => match ev {
+                        Some(EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
+                            waiting();
+                            said = true;
+                        }
+                        Some(_) => {}
+                        None => said = true,
+                    },
+                }
+            }
+        });
+        match out {
+            Outcome::Done | Outcome::Bound(_) => CommandStatus::Done,
+            Outcome::Failed(f) => CommandStatus::Failed(ui_error(f)),
+        }
     }
 
     fn send(&self, cmd: NodeCommand) -> CommandStatus {
@@ -179,6 +207,21 @@ impl LiveCore {
 
     fn project(&self, nv: &NodeView) -> ViewModel {
         let me = nv.identity.as_ref().map(|i| i.fingerprint);
+        // A room is reachable when this node holds a connection to another of its members. A
+        // closed room's members are under its lock, and this node does not sync it: offline.
+        let reachability = |cid: &Digest32| {
+            let online = nv.open_channels.iter().any(|d| {
+                d.channel_id == *cid
+                    && d.members
+                        .iter()
+                        .any(|m| me != Some(*m) && nv.connected_peers.binary_search(m).is_ok())
+            });
+            if online {
+                Reachability::Online
+            } else {
+                Reachability::Offline
+            }
+        };
         let channels = nv
             .channels
             .iter()
@@ -190,8 +233,7 @@ impl LiveCore {
                     .clone()
                     .unwrap_or_else(|| format!("(locked {})", short_id(&c.channel_id))),
                 unread: self.unread.get(&c.channel_id).copied().unwrap_or(0),
-                // M13: no network — never claim otherwise.
-                reachability: Reachability::Offline,
+                reachability: reachability(&c.channel_id),
             })
             .collect();
         let active = self.active.and_then(|cid| {
@@ -213,12 +255,19 @@ impl LiveCore {
                                 } else {
                                     crate::ident::member_name(&nv.trusted, m)
                                 },
-                                verification: if is_me || self.verified.contains(&(cid, *m)) {
+                                // Nothing to compare yet (see the module doc), so nobody else
+                                // is shown verified.
+                                verification: if is_me {
                                     Verification::Verified
                                 } else {
                                     Verification::UnverifiedTofu
                                 },
-                                outbound: OutboundConsent::Granted,
+                                // Off the room's log: granted only if this identity consented.
+                                outbound: if is_me || d.consented.binary_search(m).is_ok() {
+                                    OutboundConsent::Granted
+                                } else {
+                                    OutboundConsent::Revoked
+                                },
                                 inbound: InboundVisibility::Visible,
                                 blocked: false,
                                 // Safety codes need both parties' public keys; the
@@ -255,14 +304,17 @@ impl LiveCore {
                             )
                         })
                         .collect(),
-                    reachability: Reachability::Offline,
+                    reachability: reachability(&cid),
                 })
         });
         ViewModel {
             notice: self.notice.clone(),
             channels,
             active,
-            sync: SyncStatus::Idle,
+            sync: match nv.connected_peers.len() {
+                0 => SyncStatus::Idle,
+                n => SyncStatus::Connected(n),
+            },
             locked: nv.locked,
             mlock_active: nv.mlock_active,
             has_identity: nv.identity.is_some(),
@@ -276,12 +328,13 @@ pub fn ui_error(f: Fault) -> UiError {
     match f {
         Fault::NoIdentity => UiError::NoIdentity,
         Fault::IdentityExists => UiError::IdentityExists,
+        Fault::ProfileBusy => UiError::ProfileBusy,
         Fault::Locked => UiError::Locked,
         Fault::WrongPassphrase => UiError::WrongPassphrase,
         Fault::UnknownChannel | Fault::ChannelNotOpen => UiError::ChannelNotOpen,
         Fault::TooLong => UiError::TooLong,
         Fault::KeyringFull => UiError::KeyringFull,
-        Fault::Storage => UiError::Storage,
+        Fault::Storage | Fault::IdentityFileUnwritable => UiError::Storage,
         Fault::SealedUnreadable => UiError::SealedUnreadable,
         Fault::ShuttingDown | Fault::Internal => UiError::Internal,
         // A link that will not parse is malformed input, not a network failure.
@@ -290,7 +343,9 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::Unreachable | Fault::BoardUnreachable | Fault::RoomNotOnBoard => {
             UiError::Unreachable
         }
+        Fault::SolveTooSlow => UiError::JoinPowTooSlow,
         Fault::Refused => UiError::Refused,
+        Fault::NotAdmitted => UiError::NotAdmitted,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
         Fault::AddressInUse => UiError::AddressInUse,
@@ -314,13 +369,34 @@ impl CoreHandle for LiveCore {
     }
 
     fn apply(&mut self, command: Command) -> CommandStatus {
+        self.apply_noting(command, &mut || {})
+    }
+
+    fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
         match command {
-            Command::CreateIdentity { passphrase } => self.send(NodeCommand::CreateIdentity {
-                passphrase: Self::secret(&passphrase),
-            }),
-            Command::Unlock { passphrase } => self.send(NodeCommand::Unlock {
-                passphrase: Self::secret(&passphrase),
-            }),
+            Command::CreateIdentity { passphrase } => {
+                // **Another vox made it first** (V210-100, as the CLI says since V210-91): this
+                // node holds no identity, so one that exists now was created by another vox
+                // after this one started. "Already exists" read as a stale profile.
+                let had = self.node.view().identity.is_some();
+                match self.send_noting(
+                    NodeCommand::CreateIdentity {
+                        passphrase: Self::secret(&passphrase),
+                    },
+                    waiting,
+                ) {
+                    CommandStatus::Failed(UiError::IdentityExists) if !had => {
+                        CommandStatus::Failed(UiError::IdentityMadeElsewhere)
+                    }
+                    other => other,
+                }
+            }
+            Command::Unlock { passphrase } => self.send_noting(
+                NodeCommand::Unlock {
+                    passphrase: Self::secret(&passphrase),
+                },
+                waiting,
+            ),
             Command::Lock => {
                 self.active = None;
                 self.send(NodeCommand::Lock)
@@ -355,10 +431,9 @@ impl CoreHandle for LiveCore {
             Command::SendText { channel_id, text } => {
                 self.send(NodeCommand::SendText { channel_id, text })
             }
-            Command::MarkVerified { channel_id, member } => {
-                self.verified.insert((channel_id, member));
-                CommandStatus::Done
-            }
+            // A mark needs a comparison behind it, and the node exposes no safety code to
+            // compare yet: marking a member verified on the word alone was a false claim (V210-82).
+            Command::MarkVerified { .. } => CommandStatus::Failed(UiError::NotAvailableYet),
             Command::Join {
                 local_name,
                 link,

@@ -48,6 +48,45 @@ use crate::nat::record::{MemberBundleRecord, PreJoinRecord, RendezvousRecord};
 /// `(author, channel, epoch)` — the ADR-012 refresh cap (≥ 60 s).
 pub const MIN_REFRESH_SECS: u64 = 60;
 
+/// The environment variable [`test_record_ttl`] reads. **Test-only.**
+pub const TEST_RECORD_TTL_ENV: &str = "VOX_TEST_RECORD_TTL_SECS";
+
+/// A shorter lifetime for this node's own address records, read once from
+/// [`TEST_RECORD_TTL_ENV`]. **Test-only: for proofs; nothing in a real deployment sets it.**
+///
+/// A node renews its own record at half its lifetime (V210-68, #258). At the real two hours, a
+/// proof that a node idle for several lifetimes stays findable would take a day. It only ever
+/// shortens the lifetime, clamped to [`MIN_TEST_RECORD_TTL_SECS`]..=[`MAX_TTL_SECS`], and scales
+/// the refresh floor with it ([`min_refresh_secs`]) so a renewal at half the lifetime is still
+/// past the floor. Unset, empty or unparsable is `None`: the real lifetime and floor.
+#[must_use]
+pub fn test_record_ttl() -> Option<u64> {
+    static TTL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var(TEST_RECORD_TTL_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|t| t.clamp(MIN_TEST_RECORD_TTL_SECS, MAX_TTL_SECS))
+    })
+}
+
+/// The shortest lifetime [`TEST_RECORD_TTL_ENV`] may set.
+pub const MIN_TEST_RECORD_TTL_SECS: u64 = 8;
+
+/// The lifetime this node gives its own address records: [`MAX_TTL_SECS`], or a proof's shorter
+/// one ([`test_record_ttl`]).
+#[must_use]
+pub fn own_record_ttl_secs() -> u64 {
+    test_record_ttl().unwrap_or(MAX_TTL_SECS)
+}
+
+/// The refresh floor in force: [`MIN_REFRESH_SECS`], or a quarter of a proof's shorter record
+/// lifetime ([`test_record_ttl`]), never more than the real one.
+#[must_use]
+pub fn min_refresh_secs() -> u64 {
+    test_record_ttl().map_or(MIN_REFRESH_SECS, |t| (t / 4).clamp(1, MIN_REFRESH_SECS))
+}
+
 /// Default record TTL in seconds (ADR-012 "short TTL (default 2 h)"). Applied to
 /// pre-join records, which carry no TTL field of their own.
 pub const DEFAULT_TTL_SECS: u64 = 2 * 60 * 60;
@@ -171,7 +210,7 @@ fn check_replacement(new_seq: u64, new_ts: u64, cur_seq: u64, cur_ts: u64) -> Re
 /// Whether a same-claim record arrived inside the [`MIN_REFRESH_SECS`] floor, which makes it a
 /// no-op rather than a renewal.
 fn within_refresh_floor(new_ts: u64, cur_ts: u64) -> bool {
-    new_ts < cur_ts.saturating_add(MIN_REFRESH_SECS)
+    new_ts < cur_ts.saturating_add(min_refresh_secs())
 }
 
 /// Common time-sanity checks applied to every incoming record before it can be
@@ -229,13 +268,18 @@ impl RendezvousStore {
     ///   future-dated, over-long TTL, bucket full);
     /// - [`Error::MalformedRendezvous`] if the resolved key does not match the
     ///   record's signature/author binding;
-    /// - `Ok(())` on admission (the record becomes the current one for its author).
+    /// - `Ok(learned)` on admission (the record becomes the current one for its author), where
+    ///   `learned` says whether the board **learned something**: an author it held nothing for,
+    ///   or a claim that differs from the one it held. A member's routine refresh of the claim
+    ///   the board already holds is `false`, and that is what keeps a republish from looking like
+    ///   news: every node told of news republishes, so a refresh counted as news made two members'
+    ///   boards wake each other about a hundred times a second (#179).
     pub fn accept_member(
         &mut self,
         record: RendezvousRecord,
         resolve_member: impl FnOnce(&Digest32) -> Option<CompositePublicKey>,
         now: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // 1. Member-only: resolve the author's authenticated membership key. No key
         //    for this author_id ⇒ not a channel member ⇒ rejected.
         let author_pubkey = resolve_member(&record.author_id)
@@ -256,25 +300,28 @@ impl RendezvousStore {
         let bucket = self.members.entry(bucket_key).or_default();
 
         // 4. Freshness vs the current record for this author (if any).
-        if let Some(cur) = bucket.get(&record.author_id) {
-            if same_member_claim(cur, &record)
-                && within_refresh_floor(record.timestamp, cur.timestamp)
-            {
-                return Ok(()); // already held: see `check_replacement`
+        let learned = if let Some(cur) = bucket.get(&record.author_id) {
+            let same = same_member_claim(cur, &record);
+            if same && within_refresh_floor(record.timestamp, cur.timestamp) {
+                return Ok(false); // already held: see `check_replacement`
             }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
-        } else if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
-            // New author would exceed the bucket cap: only admit if pruning expired
-            // entries frees room.
-            bucket.retain(|_, r| now < member_expiry(r));
+            !same
+        } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
-                return Err(Error::RendezvousRejected("member bucket at capacity"));
+                // New author would exceed the bucket cap: only admit if pruning expired
+                // entries frees room.
+                bucket.retain(|_, r| now < member_expiry(r));
+                if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
+                    return Err(Error::RendezvousRejected("member bucket at capacity"));
+                }
             }
-        }
+            true
+        };
 
         // 5. Admit: replace the author's current record (one current per author).
         bucket.insert(record.author_id, record);
-        Ok(())
+        Ok(learned)
     }
 
     /// Admit (or refresh) a **member bundle** record (ADR-016 M14), enforcing the
@@ -289,12 +336,14 @@ impl RendezvousStore {
     /// [`RendezvousStore::accept_member`]; the resolved key must be the bundle's
     /// root (checked by [`MemberBundleRecord::verify`]), so a member cannot
     /// publish another identity's prekeys under its own name.
+    ///
+    /// Returns `Ok(learned)` as [`RendezvousStore::accept_member`] does.
     pub fn accept_bundle(
         &mut self,
         record: MemberBundleRecord,
         resolve_member: impl FnOnce(&Digest32) -> Option<CompositePublicKey>,
         now: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // 1. Member-only.
         let author_pubkey = resolve_member(&record.author_id)
             .ok_or(Error::RendezvousRejected("author is not a channel member"))?;
@@ -315,23 +364,26 @@ impl RendezvousStore {
         let bucket = self.bundles.entry(bucket_key).or_default();
 
         // 4. Freshness vs the current bundle for this author (if any).
-        if let Some(cur) = bucket.get(&record.author_id) {
-            if same_bundle_claim(cur, &record)
-                && within_refresh_floor(record.timestamp, cur.timestamp)
-            {
-                return Ok(()); // already held: see `check_replacement`
+        let learned = if let Some(cur) = bucket.get(&record.author_id) {
+            let same = same_bundle_claim(cur, &record);
+            if same && within_refresh_floor(record.timestamp, cur.timestamp) {
+                return Ok(false); // already held: see `check_replacement`
             }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
-        } else if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
-            bucket.retain(|_, r| now < bundle_expiry(r));
+            !same
+        } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
-                return Err(Error::RendezvousRejected("bundle bucket at capacity"));
+                bucket.retain(|_, r| now < bundle_expiry(r));
+                if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
+                    return Err(Error::RendezvousRejected("bundle bucket at capacity"));
+                }
             }
-        }
+            true
+        };
 
         // 5. Admit: one current bundle per author.
         bucket.insert(record.author_id, record);
-        Ok(())
+        Ok(learned)
     }
 
     /// Admit a channel's **genesis** (ADR-007 §Genesis; M14.7b).

@@ -92,6 +92,10 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
         store.display()
     );
 
+    // The room passphrase from a file: argv and the environment are refused (V210-72).
+    let room_pass_at = tmp.path().join("room.pass");
+    std::fs::write(&room_pass_at, "x").unwrap();
+    let room_pass = room_pass_at.to_str().unwrap();
     // A syntactically whole address, so `connect` gets as far as opening the profile.
     let link = format!("vox://{fp}?a={fp}&b=/ip4/127.0.0.1/udp/1");
     let verbs: [(&str, Vec<&str>); 5] = [
@@ -104,8 +108,8 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
                 &fp,
                 "22",
                 "127.0.0.1:0",
-                "--passphrase",
-                "x",
+                "--passphrase-file",
+                room_pass,
                 "--listen",
                 "127.0.0.1:0",
             ],
@@ -115,8 +119,8 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
             vec![
                 "up",
                 "aaaa",
-                "--passphrase",
-                "x",
+                "--passphrase-file",
+                room_pass,
                 "--bind",
                 "127.0.0.1:0",
                 "--listen",
@@ -128,8 +132,8 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
             vec![
                 "connect",
                 &link,
-                "--passphrase",
-                "x",
+                "--passphrase-file",
+                room_pass,
                 "--listen",
                 "127.0.0.1:0",
             ],
@@ -142,8 +146,8 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
                 "aaaa",
                 "ssh",
                 "127.0.0.1:22",
-                "--passphrase",
-                "x",
+                "--passphrase-file",
+                room_pass,
                 "--listen",
                 "127.0.0.1:0",
             ],

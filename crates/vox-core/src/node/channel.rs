@@ -318,6 +318,16 @@ impl AuthorResolver for ChannelAuthors {
             .and_then(|p| classify_payload(p).ok())
             .unwrap_or(EntryKind::Content)
     }
+
+    fn unclassifiable(&self, entry: &Entry) -> Option<Error> {
+        let payload = entry.payload.as_deref()?;
+        match classify_payload(payload) {
+            Err(e) => Some(e),
+            Ok(EntryKind::Governance) => GovEntry::body_bound_to(entry).err(),
+            // A checkpoint's claim about its own feed is checked where it is accepted.
+            Ok(EntryKind::Content | EntryKind::Checkpoint) => None,
+        }
+    }
 }
 
 /// What one [`ChannelState::sync_over`] session did.
@@ -329,6 +339,8 @@ pub struct SyncOutcome {
     pub governance: usize,
     /// How many of those were decrypted and rendered into the timeline.
     pub rendered: usize,
+    /// Entries refused rather than held (V210-74): by sync before they were held, or after.
+    pub refused: usize,
     /// Whether every position this side asked for was filled (ADR-025 D3): `false` for a serve the
     /// peer bounded, which ends cleanly but leaves the rest owed.
     pub complete: bool,
@@ -420,6 +432,7 @@ impl SessionReport {
         out.filled_any = s.filled_any;
         out.unadmitted = s.unadmitted;
         out.frozen = s.frozen;
+        out.refused += s.refused;
         out.gen_have = s.gen_have;
         out.gen_end = s.gen_end;
         let fail = match fatal {
@@ -519,6 +532,12 @@ pub struct ChannelState {
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
+    /// Stored entries set aside when the room opened (V210-74): each as `author#seq: why`.
+    set_aside: Vec<String>,
+    /// A receiver chain advanced in memory since the chains were last written (V210-74): a decrypt
+    /// uses its message key up even when what it opened does not render, so a pass that rendered
+    /// nothing must write the chains too, or a restart could derive that key again.
+    chains_advanced: bool,
     /// Rendered rows in the room's one order ([`Dag::causal_order`]), never in the
     /// order they arrived (PRD-001 R13).
     timeline: Vec<Rendered>,
@@ -541,8 +560,12 @@ pub struct ChannelState {
     /// The anchors this channel is published to (M15.1), persisted in `SEG_ANCHORS`.
     anchors: BootstrapSet,
     /// The services this node offers in this channel (ADR-013 Bind config, M16.1),
-    /// persisted in `SEG_SERVICES`.
+    /// persisted in `SEG_SERVICES` — except those in `transient`.
     services: BTreeMap<String, SocketAddr>,
+    /// The tags in `services` that live only as long as whatever offered them (V210-72): a
+    /// `vox room send` offer, withdrawn when its process goes. Never persisted, so a node
+    /// that stops while one runs does not come back offering a port nobody serves any more.
+    transient: BTreeSet<String>,
     /// How **this node** came to be a member here (M17.6), persisted in
     /// `SEG_ADMISSION`: it created the channel, or a member witnessed its join. Needed
     /// whenever this node publishes its own bundle record, which is every time it
@@ -1238,6 +1261,8 @@ impl ChannelState {
             evaluator,
             sender,
             next_log_id: 1,
+            set_aside: Vec::new(),
+            chains_advanced: false,
             timeline: Vec::new(),
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
@@ -1246,6 +1271,7 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            transient: BTreeSet::new(),
             // This node made the channel, so the genesis names it and nothing else needs
             // to (M17.6).
             own_admission: Some(Admission::Creator),
@@ -1333,6 +1359,15 @@ impl ChannelState {
         // Rebuild the DAG: every stored entry re-passes the acceptance predicate,
         // classified by its payload so governance entries are not re-admitted as
         // content.
+        //
+        // **What a hostile peer got onto disk before V210-74 does not keep the room shut.** An entry
+        // its author signed that cannot be classified, or whose governance body does not bind to
+        // it, is set aside and reported, and still taken as a link in its author's feed so the
+        // author's later entries link. An entry held without its predecessor is retried once the
+        // rest is in, and set aside only if it still does not link: sync then fetches the missing
+        // ones again. Anything else that fails acceptance is a tampered store, and the room does
+        // not open. (A body-less entry is not set aside here, as it is in v0.2.10: in v0.3.0 it is
+        // a pruned skeleton, kept on purpose — ADR-023 decision 2.)
         let mut dag = Dag::for_room(genesis.body.created.saturating_mul(1_000));
         let mut log_ids = std::collections::HashMap::new();
         let mut next_log_id = 1u64;
@@ -1342,61 +1377,117 @@ impl ChannelState {
         // twice is harmless (`accept_skdm` keeps the live chain), and one that arrived just
         // before a crash would otherwise never be installed.
         let mut inbound_packages = Vec::new();
+        let mut set_aside = Vec::new();
+        let mut unlinked = Vec::new();
+        // For the V210-73 check below: each log row's entry, and each received message's chain
+        // position.
+        let mut log_at: BTreeMap<u64, Digest32> = BTreeMap::new();
+        let mut received: Vec<(u64, String, Digest32, Digest32, u64, u64)> = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
+            next_log_id = id.saturating_add(1);
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
             let entry = Entry::from_wire(&wire)?;
             let key = authors
                 .get(&entry.skeleton.author_id)
                 .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?
                 .clone();
+            let at = format!(
+                "{}#{}",
+                crate::node::link::b32_encode(&entry.skeleton.author_id)
+                    .chars()
+                    .take(12)
+                    .collect::<String>(),
+                entry.skeleton.seq
+            );
             // **A pruned entry is a kept entry** (ADR-023 decision 2). Retention drops a content
             // body and keeps the signed skeleton, which still verifies and still links the feed —
             // refusing it here made a room with one expired message impossible to open.
             // Governance is never pruned, so a body-less entry is content.
             let kind = match entry.payload.as_deref() {
-                Some(payload) => classify_payload(payload)?,
                 None => EntryKind::Content,
-            };
-            if kind == EntryKind::Content && entry.payload.is_some() {
-                let first_seen = match store.get_segment(channel_id, SegmentKind::Index, id)? {
-                    Some(seg) => {
-                        parse_first_seen(&open_segment(&sek, SegmentKind::Index, id, &seg)?)?
+                Some(payload) => match classify_payload(payload) {
+                    Ok(EntryKind::Governance) => {
+                        match GovEntry::from_verified_log_entry(
+                            &entry,
+                            &key,
+                            channel_id,
+                            Default::default(),
+                        ) {
+                            Ok(gov) => {
+                                gov_entries.push(gov);
+                                EntryKind::Governance
+                            }
+                            Err(e) => {
+                                set_aside.push(format!("{at}: {e}"));
+                                EntryKind::Content
+                            }
+                        }
                     }
-                    // No record: aged from now, which can only keep it longer, never shorter.
-                    None => now_secs,
-                };
-                retention.track(
-                    entry.entry_hash(),
-                    Tracked {
-                        log_id: id,
-                        first_seen,
-                        claimed: None,
-                        cache_id: None,
-                    },
-                );
-            }
-            if let Some(pkg) = entry
-                .payload
-                .as_deref()
-                .filter(|p| crate::node::keypackage::KeyPackage::is_key_package(p))
-                .and_then(|p| crate::node::keypackage::KeyPackage::from_wire(p).ok())
-            {
-                if pkg.recipient == me {
-                    inbound_packages.push(pkg);
+                    Ok(kind) => kind,
+                    Err(e) => {
+                        set_aside.push(format!("{at}: {e}"));
+                        EntryKind::Content
+                    }
+                },
+            };
+            if let Some(payload) = entry.payload.as_deref() {
+                if kind == EntryKind::Content {
+                    let first_seen = match store.get_segment(channel_id, SegmentKind::Index, id)? {
+                        Some(seg) => {
+                            parse_first_seen(&open_segment(&sek, SegmentKind::Index, id, &seg)?)?
+                        }
+                        // No record: aged from now, which can only keep it longer, never shorter.
+                        None => now_secs,
+                    };
+                    retention.track(
+                        entry.entry_hash(),
+                        Tracked {
+                            log_id: id,
+                            first_seen,
+                            claimed: None,
+                            cache_id: None,
+                        },
+                    );
+                    if let Ok(msg) = crate::group::message::GroupMessage::from_wire(payload) {
+                        received.push((
+                            id,
+                            at.clone(),
+                            entry.entry_hash(),
+                            entry.skeleton.author_id,
+                            msg.header.chain_id,
+                            msg.header.iteration,
+                        ));
+                    }
+                }
+                if let Some(pkg) = Some(payload)
+                    .filter(|p| crate::node::keypackage::KeyPackage::is_key_package(p))
+                    .and_then(|p| crate::node::keypackage::KeyPackage::from_wire(p).ok())
+                {
+                    if pkg.recipient == me {
+                        inbound_packages.push(pkg);
+                    }
                 }
             }
-            if kind == EntryKind::Governance {
-                gov_entries.push(GovEntry::from_verified_log_entry(
-                    &entry,
-                    &key,
-                    channel_id,
-                    Default::default(),
-                )?);
-            }
+            log_at.insert(id, entry.entry_hash());
             log_ids.insert(entry.entry_hash(), id);
-            dag.accept(entry, kind, &key, &admission)
-                .map_err(|_| Error::MalformedAtRest("stored entry failed acceptance"))?;
-            next_log_id = id.saturating_add(1);
+            match dag.accept(entry.clone(), kind, &key, &admission) {
+                Ok(_) => {}
+                Err(crate::log::dag::Rejected::Feed(_)) => unlinked.push((at, entry, kind, key)),
+                Err(_) => return Err(Error::MalformedAtRest("stored entry failed acceptance")),
+            }
+        }
+        // Retried until a pass links nothing more: a predecessor logged later links then.
+        loop {
+            let before = unlinked.len();
+            unlinked.retain(|(_, entry, kind, key)| {
+                dag.accept(entry.clone(), *kind, key, &admission).is_err()
+            });
+            if unlinked.len() == before {
+                break;
+            }
+        }
+        for (at, ..) in unlinked {
+            set_aside.push(format!("{at}: an earlier entry of its author is missing"));
         }
         // A stored skeleton without its signature was dropped under a checkpoint, and the
         // signed checkpoint above it was stored too. One left unchained is not ours to trust.
@@ -1435,11 +1526,26 @@ impl ChannelState {
 
         // Timeline from the sealed plaintext cache, render-gated by the DAG — and by
         // retention: a row whose body is gone is not shown, whatever the cache says.
+        //
+        // A cache row takes its id from the same counter as the log (a received message's row is
+        // the id after its entry's), so the counter resumes past the highest of **both** (V210-73).
+        // Resumed from the log alone, the first post after a restart took the id of the last
+        // received message's cache row, and its own cache row overwrote that one: the message
+        // was gone from the room at the next restart.
         let mut timeline = Vec::new();
+        let mut cache_at: BTreeMap<u64, (Digest32, Digest32)> = BTreeMap::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
+            #[cfg(feature = "mutant-sender")]
+            let old_row_ids = crate::log::sync::mutant::old_row_ids();
+            #[cfg(not(feature = "mutant-sender"))]
+            let old_row_ids = false;
+            if !old_row_ids {
+                next_log_id = next_log_id.max(id.saturating_add(1));
+            }
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
             let mut rendered = parse_cache(&row)?;
             rendered.arrival = id;
+            cache_at.insert(id, (rendered.entry_hash, rendered.author));
             if retention.get(&rendered.entry_hash).is_some() {
                 retention.rendered(&rendered.entry_hash, rendered.created_millis / 1_000, id);
                 timeline.push(rendered);
@@ -1465,6 +1571,31 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
+        // **A received message lost to the row-id collision before V210-73** is reported, since it
+        // cannot be brought back: its only plaintext was the overwritten row, and its message key
+        // was used up when it was read (forward secrecy). Two things together say which: the row
+        // after its log row holds one of this node's own posts, log and cache row both (the post
+        // that took the id), and its author's chain has already opened that message. A message not
+        // readable yet fails the second.
+        let me = sender.author_id();
+        let shown: BTreeSet<Digest32> = timeline.iter().map(|r: &Rendered| r.entry_hash).collect();
+        for (id, at, hash, author, chain, iteration) in received {
+            if author == me || shown.contains(&hash) {
+                continue;
+            }
+            let next = id.saturating_add(1);
+            let overwritten = cache_at
+                .get(&next)
+                .is_some_and(|(h, a)| *a == me && log_at.get(&next) == Some(h));
+            let opened = receivers
+                .get(&(author, chain))
+                .is_some_and(|c: &ReceiverChain| !c.holds_key_for(iteration));
+            if overwritten && opened {
+                set_aside.push(format!(
+                    "{at}: a received message lost to the row-id collision fixed in V210-73"
+                ));
+            }
+        }
         // The anchors this channel is published to (M15.1). A channel from before the
         // segment existed has none recorded, which is what it had.
         let anchors = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ANCHORS)? {
@@ -1560,6 +1691,8 @@ impl ChannelState {
             evaluator,
             sender,
             next_log_id,
+            set_aside,
+            chains_advanced: false,
             timeline,
             timeline_generation,
             log_ids,
@@ -1568,6 +1701,7 @@ impl ChannelState {
             receivers,
             anchors,
             services,
+            transient: BTreeSet::new(),
             own_admission,
             origins,
             delivered,
@@ -1659,6 +1793,7 @@ impl ChannelState {
             channel_passphrase,
             now_secs,
             (sek, wrap),
+            None,
         )
     }
 
@@ -1693,8 +1828,16 @@ impl ChannelState {
     /// which the node runs off its actor. The checks of [`ChannelState::join_checks`] are repeated
     /// here, because time passed while the seal ran.
     ///
+    /// `own_admission` is how this node was let in (the witness the responder signed, M17.6). It
+    /// is written **in the same batch** as the room: a room held without it can publish nothing
+    /// and falls off every board, and while it was a second write that could fail after the
+    /// first, a failed join left exactly that room in the profile — which then refused every
+    /// retry of the join as "already in the profile" (V210-80).
+    ///
     /// # Errors
-    /// A failed check, a segment that cannot be sealed, or a store write that fails.
+    /// A failed check, a segment that cannot be sealed, or a store write that fails. On an error
+    /// nothing of the room is written.
+    #[allow(clippy::too_many_arguments)]
     pub fn join_channel_from_sealed(
         profile: &Profile,
         genesis: &Genesis,
@@ -1703,6 +1846,7 @@ impl ChannelState {
         channel_passphrase: &[u8],
         now_secs: u64,
         sealed: (Sek, crate::atrest::SekWrap),
+        own_admission: Option<Admission>,
     ) -> Result<Self> {
         Self::join_checks(profile, genesis, channel_id, local_name)?;
         let (sek, wrap) = sealed;
@@ -1747,6 +1891,17 @@ impl ChannelState {
             SEG_ORIGINS,
             &origins.to_state(),
         )?;
+        let admission_seg = own_admission
+            .as_ref()
+            .map(|a| {
+                seal_segment(
+                    &sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_ADMISSION,
+                    &a.body_bytes(),
+                )
+            })
+            .transpose()?;
         let mut batch = profile.store().batch()?;
         batch.put_sek_wrap(channel_id, &wrap)?;
         batch.put_segment(
@@ -1773,6 +1928,9 @@ impl ChannelState {
             SEG_ORIGINS,
             &origins_seg,
         )?;
+        if let Some(seg) = &admission_seg {
+            batch.put_segment(channel_id, SegmentKind::KeyMaterial, SEG_ADMISSION, seg)?;
+        }
         batch.commit()?;
 
         let mut admission = AdmissionPolicy::new();
@@ -1795,6 +1953,8 @@ impl ChannelState {
             evaluator,
             sender,
             next_log_id: 1,
+            set_aside: Vec::new(),
+            chains_advanced: false,
             timeline: Vec::new(),
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
@@ -1803,8 +1963,9 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
-            // Set by the caller from the join witness the responder signed (M17.6).
-            own_admission: None,
+            transient: BTreeSet::new(),
+            // The join witness the responder signed (M17.6), written with the room above.
+            own_admission,
             origins,
             delivered: BTreeMap::new(),
             retention: RetentionIndex::default(),
@@ -1964,15 +2125,15 @@ impl ChannelState {
     /// like every other per-channel segment, so a restart still knows where the
     /// swarm's board is. Returns how many were new.
     pub fn add_anchors(&mut self, store: &Store, more: &BootstrapSet) -> Result<usize> {
-        let before = self.anchors.len();
-        let before_addrs: usize = self.anchors.nodes().iter().map(|n| n.endpoints.len()).sum();
+        let before = self.anchors.clone();
         // `merge_endpoints`, not `merge`: an anchor that moved is the same identity at a
         // new address, and `merge` keeps the first entry per identity and drops the rest.
         // A room would otherwise go on handing out the address its anchor had when the
         // room was made, in every invite link, for ever.
         self.anchors.merge_endpoints(more)?;
-        let after_addrs: usize = self.anchors.nodes().iter().map(|n| n.endpoints.len()).sum();
-        if self.anchors.len() == before && after_addrs == before_addrs {
+        // Compared whole, not by counting addresses: a move replaces one address with
+        // another, which leaves the count where it was (V210-75).
+        if self.anchors == before {
             return Ok(0);
         }
         let seg = seal_segment(
@@ -1990,7 +2151,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
-        Ok(self.anchors.len().saturating_sub(before))
+        Ok(self.anchors.len().saturating_sub(before.len()))
     }
 
     /// A shared handle to this channel's evaluator, for a task that must keep asking
@@ -2016,7 +2177,8 @@ impl ChannelState {
     }
 
     /// Offer `service_tag` at `local`, persisted under the channel's SEK so a restart
-    /// still serves it. Replacing an existing tag's address is allowed (that is how a
+    /// still serves it — unless `persist` is false, when it lasts only until it is removed
+    /// or this node stops. Replacing an existing tag's address is allowed (that is how a
     /// service moves); the caller must hold `bind:<tag>` in this channel, which is
     /// checked here — a host cannot offer what the log does not let it offer.
     ///
@@ -2027,6 +2189,7 @@ impl ChannelState {
         profile: &Profile,
         service_tag: &str,
         local: SocketAddr,
+        persist: bool,
     ) -> Result<bool> {
         if service_tag.is_empty() || service_tag.len() > crate::tunnel::session::MAX_SERVICE_TAG_LEN
         {
@@ -2048,6 +2211,11 @@ impl ChannelState {
             return Err(Error::SizeLimitExceeded("channel services"));
         }
         self.services.insert(service_tag.to_owned(), local);
+        if persist {
+            self.transient.remove(service_tag);
+        } else {
+            self.transient.insert(service_tag.to_owned());
+        }
         self.persist_services(store)?;
         Ok(fresh)
     }
@@ -2057,6 +2225,7 @@ impl ChannelState {
         if self.services.remove(service_tag).is_none() {
             return Ok(false);
         }
+        self.transient.remove(service_tag);
         self.persist_services(store)?;
         Ok(true)
     }
@@ -2068,36 +2237,19 @@ impl ChannelState {
         self.own_admission.as_ref()
     }
 
-    /// Record how this node came to be a member here, and persist it.
-    ///
-    /// Called once, by the join path, with the witness the responder signed. The
-    /// creator sets it at creation and never calls this.
-    pub fn set_own_admission(&mut self, store: &Store, admission: Admission) -> Result<()> {
-        let seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_ADMISSION,
-            &admission.body_bytes(),
-        )?;
-        if let Err(e) = store.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_ADMISSION,
-            &seg,
-        ) {
-            self.poisoned = true;
-            return Err(e);
-        }
-        self.own_admission = Some(admission);
-        Ok(())
-    }
-
     fn persist_services(&mut self, store: &Store) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_SERVICES,
-            &services_bytes(&self.services),
+            &services_bytes(
+                &self
+                    .services
+                    .iter()
+                    .filter(|(tag, _)| !self.transient.contains(*tag))
+                    .map(|(tag, at)| (tag.clone(), *at))
+                    .collect(),
+            ),
         )?;
         if let Err(e) = store.put_segment(
             &self.channel_id,
@@ -2385,6 +2537,10 @@ impl ChannelState {
     /// is owed too. It is recorded, and no later release to `target` starts before it.
     /// `full_history` is the approver's per-grant choice (PRD-001 R12), which the grant
     /// records as its history mode.
+    ///
+    /// **It records nothing as delivered** (V210-88): the key is `delivered` only once `target`
+    /// has taken it, which [`Self::note_delivered`] records when it says so. Returns the grant, and
+    /// whether the consent owes `target` history, the generations before the key's own.
     pub fn issue_consent(
         &mut self,
         profile: &Profile,
@@ -2393,7 +2549,7 @@ impl ChannelState {
         full_history: bool,
         entitled_from: (u64, u64),
         now_secs: u64,
-    ) -> Result<ConsentGrant> {
+    ) -> Result<(ConsentGrant, bool)> {
         let signer = profile.signer()?;
         // The grant records what this approval actually released (PRD-001 R12): the
         // approver's per-grant choice, not a room-wide default.
@@ -2410,24 +2566,56 @@ impl ChannelState {
             delivered_skdm,
             history_mode,
         )?;
-        self.append_governance(profile, &grant.to_wire(), now_secs)?;
-        // The grant is the record that `target` holds the generation it was given; the ledger
-        // is how a later rotation knows it has not yet been given the next one. The generation
-        // is the delivered key's own, not the current one: a key taken when consent was decided
-        // and delivered after a rotation is the older generation, and the rotation still owes
-        // this member the new one (V210-30).
-        self.delivered.insert(target, delivered_skdm.body.chain_id);
-        self.persist_delivered(profile.store())?;
+        // **Not `delivered` yet** (V210-88). Recorded here, in the grant's transaction, a crash
+        // after the commit and before `target` took the key left a node that believed it had
+        // delivered a key the member never held: nothing owed it again, and the member read
+        // nothing from this identity for good. Until it is taken, the consenter is owed a re-key
+        // like any other, which releases from its entitlement, committed below with the grant.
+        //
         // An entitlement already held (an earlier consent never revoked) stands: both were
         // decided, and the earlier one released what it released.
-        let from = self
-            .entitled
+        let mut entitled = self.entitled.clone();
+        let from = entitled
             .get(&target)
             .map_or(entitled_from, |e| (*e).min(entitled_from));
-        if self.entitled.insert(target, from) != Some(from) {
-            self.persist_entitled(profile.store())?;
+        entitled.insert(target, from);
+        // The generations before the key's own that the decision covers (V210-45), owed as
+        // history: in the same transaction, or a crash between the two lost them.
+        // As `owe_history`: only generations before the live one, and the oldest floor stands.
+        let floor = entitled_from.0;
+        let history_owed = floor < delivered_skdm.body.chain_id && floor < self.sender.chain_id();
+        let mut history = self.history.clone();
+        let history_changed = history_owed && history.get(&target).is_none_or(|f| *f > floor);
+        if history_changed {
+            history.insert(target, floor);
         }
-        Ok(grant)
+        // **One transaction** with the grant (V210-76). Written one after another, a crash after
+        // the grant left no `entitled` row, so the re-key it was owed released the live
+        // generation from its origin: the posts sealed before the consent.
+        let mut rows = vec![(
+            SEG_ENTITLED,
+            seal_segment(
+                &self.sek,
+                SegmentKind::KeyMaterial,
+                SEG_ENTITLED,
+                &positions_bytes(&entitled),
+            )?,
+        )];
+        if history_changed {
+            rows.push((
+                SEG_HISTORY,
+                seal_segment(
+                    &self.sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_HISTORY,
+                    &delivered_bytes(&history),
+                )?,
+            ));
+        }
+        self.append_governance_with(profile, &grant.to_wire(), now_secs, &rows)?;
+        self.entitled = entitled;
+        self.history = history;
+        Ok((grant, history_owed))
     }
 
     /// Whether this identity's sender key has reached its scheduled-rotation bound
@@ -2549,8 +2737,8 @@ impl ChannelState {
         }
     }
 
-    /// Record that `target` has been delivered generation `chain_id` of this
-    /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
+    /// Record that `target` refused generation `chain_id` of this identity's sender key, so it
+    /// is [`owed`](ChannelState::owed_rekeys) again. A later generation it did take stays recorded.
     pub fn note_undelivered(
         &mut self,
         store: &Store,
@@ -2575,11 +2763,13 @@ impl ChannelState {
     /// Record that `target` has been delivered generation `chain_id` of this
     /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
     pub fn note_delivered(&mut self, store: &Store, target: Digest32, chain_id: u64) -> Result<()> {
-        let entry = self.delivered.entry(target).or_default();
-        if *entry >= chain_id {
+        // **Generation 0 is recorded too** (V210-95). Defaulting a missing row to 0 and comparing
+        // made a taken generation-0 key look recorded already: it was held in memory and never
+        // written, so after a restart the member was owed the room's first key again.
+        if self.delivered.get(&target).is_some_and(|d| *d >= chain_id) {
             return Ok(());
         }
-        *entry = chain_id;
+        self.delivered.insert(target, chain_id);
         self.persist_delivered(store)
     }
 
@@ -2595,6 +2785,13 @@ impl ChannelState {
         MembershipView::new(&self.evaluator)
             .readers_of(&me)
             .contains(target)
+    }
+
+    /// Everyone this identity consents to reading it here, off the log like
+    /// [`has_consented`](Self::has_consented).
+    #[must_use]
+    pub fn consented(&self) -> BTreeSet<Digest32> {
+        MembershipView::new(&self.evaluator).readers_of(&self.me())
     }
 
     /// The admitted authors in `trusted` this identity has **not yet consented
@@ -3520,6 +3717,18 @@ impl ChannelState {
         payload: &[u8],
         now_secs: u64,
     ) -> Result<Digest32> {
+        self.append_governance_with(profile, payload, now_secs, &[])
+    }
+
+    /// [`Self::append_governance`], committing `rows` — sealed `KeyMaterial` segments by id — in
+    /// the same transaction as the entry, so neither is ever on disk without the other.
+    fn append_governance_with(
+        &mut self,
+        profile: &Profile,
+        payload: &[u8],
+        now_secs: u64,
+        rows: &[(u64, SealedSegment)],
+    ) -> Result<Digest32> {
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
@@ -3546,11 +3755,14 @@ impl ChannelState {
         self.dag
             .accept(entry, EntryKind::Governance, &key, &self.admission)
             .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
-        if let Err(e) =
-            profile
-                .store()
-                .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
-        {
+        let written = profile.store().batch().and_then(|mut batch| {
+            batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
+            for (row, seg) in rows {
+                batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, *row, seg)?;
+            }
+            batch.commit()
+        });
+        if let Err(e) = written {
             self.poisoned = true;
             return Err(e);
         }
@@ -3572,6 +3784,12 @@ impl ChannelState {
     /// never trusted for authority).
     fn gov_heads(&self) -> std::collections::BTreeSet<Digest32> {
         self.gov_entries.iter().map(|g| g.entry_hash).collect()
+    }
+
+    /// The stored entries set aside when this room opened (V210-74), each as `author#seq: why`.
+    #[must_use]
+    pub fn set_aside(&self) -> &[String] {
+        &self.set_aside
     }
 
     /// The resolver ADR-008 sync needs: this channel's admitted authors and the
@@ -3686,9 +3904,10 @@ impl ChannelState {
         // **One durable commit for the whole batch** (see `render_content_into`).
         //
         // Two kinds of failure, kept apart as they were when each entry committed on its own:
-        // - an entry this node refuses (an unadmitted author, bad governance) stops the pass
-        //   **without** poisoning the room: what came before it is still committed and rendered,
-        //   and the refusal is returned after that;
+        // - an entry this node refuses (bad governance) is counted and the pass goes on, **without**
+        //   poisoning the room (V210-74): the entries after it are already held, so stopping left
+        //   them in memory and not on disk, and a refusal reported as an error poisoned the room's
+        //   sync. Sync refuses what cannot be classified before it is held, so this is what is left;
         // - a failed write poisons the room, because memory has advanced past what is on disk.
         //
         // Nothing below may write through `store` while `batch` is open: a second write
@@ -3697,7 +3916,6 @@ impl ChannelState {
         let mut rendered_rows: Vec<Rendered> = Vec::new();
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let mut chains_advanced = false;
-        let mut refused: Option<Error> = None;
         let mut batch = match store.batch() {
             Ok(b) => b,
             Err(e) => {
@@ -3756,12 +3974,18 @@ impl ChannelState {
                             ));
                             let could_read = self.readable_authors();
                             self.gov_entries.push(gov);
-                            self.evaluator = Arc::new(refuse!(Self::build_evaluator(
+                            // A fold that fails takes the entry back out, or every later rebuild
+                            // failed on it too (V210-74).
+                            let built = Self::build_evaluator(
                                 &self.genesis,
                                 &self.authors,
                                 &self.gov_entries,
                                 now_secs,
-                            )));
+                            );
+                            if built.is_err() {
+                                self.gov_entries.pop();
+                            }
+                            self.evaluator = Arc::new(refuse!(built));
                             out.governance += 1;
                             // **A grant that arrives after its key makes stored messages
                             // readable** (PRD-001 R12): the authors this entry made readable are
@@ -3803,10 +4027,7 @@ impl ChannelState {
                 })();
             match step {
                 Ok(Ok(rows)) => rendered_rows.extend(rows),
-                Ok(Err(refusal)) => {
-                    refused = Some(refusal);
-                    break;
-                }
+                Ok(Err(_refusal)) => out.refused += 1,
                 Err(e) => {
                     write_failed = Some(e);
                     break;
@@ -3816,7 +4037,7 @@ impl ChannelState {
         let committed = match write_failed {
             Some(e) => Err(e),
             None => (|| -> Result<()> {
-                if chains_advanced {
+                if chains_advanced || self.chains_advanced {
                     self.queue_receivers(&mut batch)?;
                 }
                 batch.commit()
@@ -3826,6 +4047,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.chains_advanced = false;
         // Only now, after the commit: `SessionRoom::apply` reports `stored` from the generation,
         // and ADR-025 credits the peer from it, so it must count exactly the rows now durable —
         // none when the write failed (the room is poisoned above), and a refused pass's rows too.
@@ -3835,9 +4057,6 @@ impl ChannelState {
         self.place_committed(store, rendered_rows, &expired)?;
         // An entry that arrived may be a parent others named before it: rows move.
         self.settle_timeline();
-        if let Some(refusal) = refused {
-            return Err(refusal);
-        }
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         Ok(out)
@@ -3991,7 +4210,7 @@ impl ChannelState {
                 now_secs,
                 &mut expired,
             )?;
-            if rows.is_empty() && expired.is_empty() {
+            if rows.is_empty() && expired.is_empty() && !self.chains_advanced {
                 return Ok(());
             }
             self.queue_receivers(&mut batch)?;
@@ -4001,6 +4220,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.chains_advanced = false;
         let rendered = rows.len();
         self.place_committed(store, rows, &expired)?;
         Ok(rendered)
@@ -4037,7 +4257,7 @@ impl ChannelState {
             let mut batch = store.batch()?;
             rows =
                 self.backfill_into(&mut batch, author, &BTreeSet::new(), now_secs, &mut expired)?;
-            if rows.is_empty() && expired.is_empty() {
+            if rows.is_empty() && expired.is_empty() && !self.chains_advanced {
                 return Ok(());
             }
             self.queue_receivers(&mut batch)?;
@@ -4047,6 +4267,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        self.chains_advanced = false;
         let rendered = rows.len();
         self.place_committed(store, rows, &expired)?;
         Ok(rendered)
@@ -4174,6 +4395,7 @@ impl ChannelState {
             Ok(p) => Zeroizing::new(p),
             Err(_) => return Ok(None),
         };
+        self.chains_advanced = true;
         // **Skipped, not propagated** — matching the three `Ok(None)` paths above it.
         //
         // An entry this node cannot render is one entry it cannot show, and every other reason for
@@ -4465,6 +4687,23 @@ impl ChannelState {
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
+        #[cfg(feature = "mutant-sender")]
+        let payload = crate::log::sync::mutant::authored(payload);
+        #[cfg(feature = "mutant-sender")]
+        let payload = if crate::log::sync::mutant::misbound() {
+            let skdm = self.skdm_for_consent(profile)?;
+            crate::governance::membership::issue_consent_grant(
+                signer,
+                &self.channel_id,
+                self.epoch + 7,
+                me,
+                &skdm,
+                self.genesis.body.policy.history_mode,
+            )?
+            .to_wire()
+        } else {
+            payload
+        };
 
         let skeleton = self.next_skeleton(&me, &payload, now_millis);
         let entry = Entry::build_signed(signer, skeleton, payload)?;
@@ -4804,6 +5043,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 let mut out = self.out.borrow_mut();
                 out.rendered += got.rendered;
                 out.governance += got.governance;
+                out.refused += got.refused;
             }
             Err(e) => {
                 *self.fatal.borrow_mut() = Some(e);

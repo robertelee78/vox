@@ -36,7 +36,9 @@
 //! ## Lifecycle facts, measured rather than assumed (M19.1b spike)
 //!
 //! - `UnixListener::bind` yields a **0755** socket (the mode comes from the
-//!   umask), so the explicit `chmod` to `0600` is REQUIRED, not belt-and-braces.
+//!   umask), so the explicit `chmod` to `0600` is REQUIRED, not belt-and-braces. It is
+//!   done under a staging name before the socket is renamed into place, so the path a
+//!   client connects to is never there at any other mode (V210-72).
 //! - A leftover socket file from a process that died makes `bind` fail with
 //!   `AddrInUse` (errno 48), so the stale file is unlinked first — deliberately,
 //!   rather than inheriting a confusing "address in use".
@@ -184,6 +186,9 @@ const T_CONNECTION_NOTE: u64 = 2092;
 const T_JOIN_STEPS: u64 = 1718;
 /// `NodeEvent::KeyNotTaken`.
 const T_KEY_NOT_TAKEN: u64 = 1719;
+/// `NodeEvent::WaitingForProfile` (V210-100). Additive, away from the sequential range and from
+/// the tags the v0.3.0 line uses.
+const T_WAITING_FOR_PROFILE: u64 = 2100;
 /// A sync session with a peer did not complete, and why (#202).
 const T_SYNC_FAILED: u64 = 1720;
 /// [`NodeEvent::RoomNotRemembered`] (#208). Additive, and far from the other additive tags so a
@@ -250,6 +255,10 @@ const T_RETENTION: u64 = 23;
 const T_ORDER: u64 = 24;
 // Renaming a trusted identity keeps its history grant (PRD-001 R12, R20's `vox name`).
 const T_RENAME: u64 = 25;
+// **Liveness** (V210-83). Answered by the actor and changes nothing, so a client waiting on a long
+// request can tell a node at work from a suspended or stuck one. Not a protocol bump: a node that
+// does not know it answers with an error, and any answer is proof of life.
+const T_PING: u64 = 17;
 
 /// What a client sends.
 ///
@@ -302,7 +311,9 @@ pub enum Request {
         /// The last room of the previous page, or `None` for the first.
         after: Option<Digest32>,
     },
-    /// Offer a local TCP endpoint as a room-bound service (ADR-013).
+    /// Offer a local TCP endpoint as a room-bound service (ADR-013), for as long as this
+    /// connection stays open: it is withdrawn when the connection closes, however the client
+    /// ends, and never persisted (V210-72). A [`Request::Forward`] likewise.
     AddService {
         /// The room.
         channel_id: Digest32,
@@ -413,6 +424,8 @@ pub enum Request {
         /// The last fingerprint of the previous page, or `None` for the first.
         after: Option<Digest32>,
     },
+    /// Answered `Ok` by the node's actor, changing nothing: proof it is taking commands.
+    Ping,
 }
 
 impl Request {
@@ -423,6 +436,9 @@ impl Request {
         match self {
             Request::Subscribe => {
                 e.array(1).uint(T_SUBSCRIBE);
+            }
+            Request::Ping => {
+                e.array(1).uint(T_PING);
             }
             Request::Post { channel_id, text } => {
                 e.array(3).uint(T_POST).bytes(channel_id).text(text);
@@ -580,6 +596,11 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Subscribe)
+            }
+            (T_PING, 1) => {
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Ping)
             }
             (T_POST, 3) => {
                 let channel_id = digest(&mut d)?;
@@ -1000,6 +1021,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::Unlocked => {
             e.array(1).uint(T_UNLOCKED);
         }
+        NodeEvent::WaitingForProfile => {
+            e.array(1).uint(T_WAITING_FOR_PROFILE);
+        }
         NodeEvent::Locked => {
             e.array(1).uint(T_LOCKED);
         }
@@ -1336,6 +1360,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
         }
         (T_UNLOCKED, 1) => NodeEvent::Unlocked,
+        (T_WAITING_FOR_PROFILE, 1) => NodeEvent::WaitingForProfile,
         (T_LOCKED, 1) => NodeEvent::Locked,
         (T_SHUTDOWN, 1) => NodeEvent::Shutdown,
         (T_CHANNEL_OPENED, 2) => NodeEvent::ChannelOpened {
@@ -1567,47 +1592,152 @@ impl Drop for IpcServer {
     }
 }
 
+/// How long a client waits for a node to greet it, and for `vox status` to be answered. Both are
+/// served off the actor the moment they are asked, so a node that takes this long is not busy: it
+/// is suspended or stuck, and waiting longer only hides that.
+pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The error for a node that did not answer within [`ANSWER_WITHIN`].
+#[must_use]
+pub fn silent() -> Error {
+    Error::Ipc(IpcHandshake::Silent {
+        secs: ANSWER_WITHIN.as_secs(),
+    })
+}
+
+/// How long a node's actor may take to answer a [`Request::Ping`] before it is called stuck.
+///
+/// The actor reports itself busy past five seconds (`STALL_BUDGET`), and does its long work —
+/// joins, passphrase checks, dials — off itself. Twelve times that is not a busy actor.
+pub const ACTOR_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `exchange` — one request on a connection to the node at `path` — for as long as that
+/// node shows it is still answering.
+///
+/// Every [`ANSWER_WITHIN`] the exchange is still waiting, a second connection asks the node to
+/// greet (within [`ANSWER_WITHIN`]) and its actor to answer a [`Request::Ping`] (within
+/// [`ACTOR_WITHIN`]). A suspended node greets nobody; a stuck actor pings nobody back. Either
+/// fails the exchange with an error that says which, instead of the wait that never ended
+/// (V210-83). A node that is merely slow at this request answers both, and is waited for.
+async fn while_answering<T>(
+    path: &Path,
+    exchange: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::pin!(exchange);
+    loop {
+        tokio::select! {
+            // The answer wins a tie: a request answered as a check fails was answered.
+            biased;
+            out = &mut exchange => return out,
+            alive = async {
+                tokio::time::sleep(ANSWER_WITHIN).await;
+                still_answering(path).await
+            } => alive?,
+        }
+    }
+}
+
+/// Whether the node at `path` greets a new connection and its actor answers a ping, or why not.
+async fn still_answering(path: &Path) -> Result<()> {
+    let mut probe = match IpcClient::open(path).await {
+        Ok(c) => c,
+        Err(Error::Ipc(IpcHandshake::Silent { secs })) => {
+            return Err(Error::Ipc(IpcHandshake::StoppedAnswering { secs }))
+        }
+        Err(e) => return Err(e),
+    };
+    // A bare exchange, not `request`, which would check on the check.
+    let ping = async {
+        write_frame(&mut probe.stream, &Request::Ping.to_bytes()).await?;
+        read_frame(&mut probe.stream).await
+    };
+    match tokio::time::timeout(ACTOR_WITHIN, ping).await {
+        // Any answer, even an error from a node too old to know the ping, is an answer.
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Ok(None)) => Err(Error::MalformedIpc("ipc closed before reply")),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(Error::Ipc(IpcHandshake::Stuck {
+            secs: ACTOR_WITHIN.as_secs(),
+        })),
+    }
+}
+
 /// Bind the control socket at `path` and serve `handle`'s event stream to every
 /// client that connects.
 ///
+/// The directory is made private to this user first ([`prepare_socket_dir`]), and one that
+/// is not is refused: whoever owns the directory can replace the socket in it.
+///
 /// The stale socket file of a process that died is **unlinked first**: `bind`
 /// fails with `AddrInUse` otherwise (measured), and inheriting that error would
-/// report a dead predecessor as a live conflict. The socket is then chmod'd to
-/// `0600` — `bind` itself yields `0755` from the umask (also measured), so this
-/// is load-bearing, not decoration.
+/// report a dead predecessor as a live conflict. The socket is bound under a staging
+/// name and chmod'd to `0600` there — `bind` itself yields `0755` from the umask (also
+/// measured), so this is load-bearing, not decoration — and only then renamed to `path`,
+/// so `path` is never a socket at any other mode (V210-72).
+///
+/// [`prepare_socket_dir`]: crate::node::paths::prepare_socket_dir
 pub fn bind_at(handle: NodeHandle, path: PathBuf) -> Result<IpcServer> {
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| Error::Path {
-            op: "unlink stale control socket",
-            detail: format!("{}: {e}", path.display()),
-        })?;
+    crate::node::paths::prepare_socket_dir(&path)?;
+    // Never longer than `path`, so it fits wherever `path` does.
+    let staging = path.with_extension("new");
+    for stale in [&staging, &path] {
+        if std::fs::symlink_metadata(stale).is_ok() {
+            std::fs::remove_file(stale).map_err(|e| Error::Path {
+                op: "unlink stale control socket",
+                detail: format!("{}: {e}", stale.display()),
+            })?;
+        }
     }
-    let listener = UnixListener::bind(&path).map_err(|e| Error::Path {
+    let listener = UnixListener::bind(&staging).map_err(|e| Error::Path {
         op: "bind control socket",
-        detail: format!("{}: {e}", path.display()),
+        detail: format!("{}: {e}", staging.display()),
     })?;
-    #[cfg(unix)]
-    {
+    let placed = {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            Error::Path {
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::Path {
                 op: "chmod control socket",
-                detail: format!("{}: {e}", path.display()),
-            }
-        })?;
+                detail: format!("{}: {e}", staging.display()),
+            })
+            .and_then(|()| {
+                std::fs::rename(&staging, &path).map_err(|e| Error::Path {
+                    op: "place control socket",
+                    detail: format!("{}: {e}", path.display()),
+                })
+            })
+    };
+    if let Err(e) = placed {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
     }
 
+    let me = crate::node::paths::my_uid();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                // The listener is gone; nothing left to accept.
-                return;
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                // **An accept error is not the end of the socket** (V210-72). They are
+                // transient — the process or the system out of descriptors (EMFILE,
+                // ENFILE), a connection aborted before it was taken (ECONNABORTED), no
+                // buffer space — and returning here ended the control socket for good
+                // while the daemon ran on, and every client after was told nothing was
+                // listening. The pause keeps an exhausted descriptor table from being
+                // spun on; the connection waits in the backlog meanwhile.
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             };
+            // Only this user: the directory and the mode already say so, and the kernel's
+            // word for who connected is checked as well, so neither is the only guard.
+            if !stream.peer_cred().is_ok_and(|c| c.uid() == me) {
+                continue;
+            }
             // Each client gets its own task and its own subscription, so one
             // client's pace — or death — reaches no other and never the actor.
             let stream_handle = handle.clone();
             tokio::spawn(async move {
-                let _ = serve_client(stream, stream_handle).await;
+                serve_client(stream, stream_handle).await;
             });
         }
     });
@@ -1620,8 +1750,93 @@ pub fn bind(handle: NodeHandle, paths: &crate::node::paths::Paths) -> Result<Ipc
     bind_at(handle, paths.socket_file())
 }
 
-/// One client: greet, wait for `Subscribe`, then stream until either side stops.
-async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> {
+/// What a client opened over its connection and has not closed: a file offer's service,
+/// a get's forward.
+///
+/// **They last as long as the connection** (V210-72). `vox room send` and `vox room get`
+/// withdrew them only on Ctrl-C, so a SIGTERM, a SIGHUP, a closed terminal or a crash left
+/// the offer's service registered — persisted, and pointing at a port some later process
+/// could take — and the get's forward listening. The daemon sees the connection close
+/// however the process ends, so it withdraws them itself.
+#[derive(Default)]
+struct Held {
+    services: Vec<(Digest32, String)>,
+    forwards: Vec<String>,
+}
+
+impl Held {
+    /// What `request` would open or close, taken before it is served (a request is not
+    /// cloned for this: some carry passphrases).
+    fn intent(request: &Request) -> Intent {
+        match request {
+            Request::AddService {
+                channel_id,
+                service_tag,
+                ..
+            } => Intent::Offer(*channel_id, service_tag.clone()),
+            Request::RemoveService {
+                channel_id,
+                service_tag,
+            } => Intent::Withdraw(*channel_id, service_tag.clone()),
+            Request::Forward { .. } => Intent::Forward,
+            Request::StopForward { local } => Intent::StopForward(local.clone()),
+            _ => Intent::Nothing,
+        }
+    }
+
+    /// Note what `intent` did, given the node's `reply`.
+    fn note(&mut self, intent: Intent, reply: &Frame) {
+        match (intent, reply) {
+            (Intent::Offer(c, t), Frame::Ok) => self.services.push((c, t)),
+            (Intent::Withdraw(c, t), _) => self.services.retain(|(hc, ht)| !(*hc == c && *ht == t)),
+            (Intent::Forward, Frame::Bound { local }) => self.forwards.push(local.clone()),
+            (Intent::StopForward(local), _) => self.forwards.retain(|l| *l != local),
+            _ => {}
+        }
+    }
+
+    /// Withdraw everything still held.
+    async fn release(self, handle: &NodeHandle) {
+        for (channel_id, service_tag) in self.services {
+            let _ = handle
+                .apply(crate::node::api::NodeCommand::RemoveService {
+                    channel_id,
+                    service_tag,
+                })
+                .await;
+        }
+        for local in self.forwards {
+            if let Ok(local) = local.parse() {
+                let _ = handle
+                    .apply(crate::node::api::NodeCommand::StopForward { local })
+                    .await;
+            }
+        }
+    }
+}
+
+/// See [`Held::intent`].
+enum Intent {
+    Offer(Digest32, String),
+    Withdraw(Digest32, String),
+    Forward,
+    StopForward(String),
+    Nothing,
+}
+
+/// One client, until it goes, and then whatever it left open is withdrawn.
+async fn serve_client(stream: UnixStream, handle: NodeHandle) {
+    let mut held = Held::default();
+    let _ = serve_requests(stream, &handle, &mut held).await;
+    held.release(&handle).await;
+}
+
+/// Greet, serve requests, and stream once subscribed, until either side stops.
+async fn serve_requests(
+    mut stream: UnixStream,
+    handle: &NodeHandle,
+    held: &mut Held,
+) -> Result<()> {
     write_frame(
         &mut stream,
         &Frame::Hello {
@@ -1640,21 +1855,21 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
         };
         // PRD-001 R20: resolving a `.vox` name serves on; `vox up` holds the connection.
         if let Some(req) = crate::node::nameipc::NameRequest::parse(&body) {
-            if crate::node::nameipc::serve(&mut stream, &handle, req).await? {
+            if crate::node::nameipc::serve(&mut stream, handle, req).await? {
                 continue;
             }
             return Ok(());
         }
         // PRD-001 R35: `vox status`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
-            crate::node::status::serve(&mut stream, &handle).await?;
+            crate::node::status::serve(&mut stream, handle).await?;
             continue;
         }
         // Protocol 6: an app request turns the connection into an app connection for
         // the rest of its life (ADR-022 decision 7, `node::appipc`).
         if let Some(app) = crate::node::appipc::AppRequest::parse(&body) {
             return match app {
-                Ok(app) => crate::node::appipc::serve(stream, handle, app).await,
+                Ok(app) => crate::node::appipc::serve(stream, handle.clone(), app).await,
                 Err(e) => {
                     write_frame(
                         &mut stream,
@@ -1691,7 +1906,9 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) -> Result<()> 
             write_frame(&mut stream, &Frame::Ok.to_bytes()).await?;
             return pump(stream, events).await;
         }
-        let reply = serve_request(&handle, request).await;
+        let intent = Held::intent(&request);
+        let reply = serve_request(handle, request).await;
+        held.note(intent, &reply);
         write_frame(&mut stream, &reply.to_bytes()).await?;
     }
 }
@@ -1715,10 +1932,18 @@ async fn verify_operator(
         .await
     {
         crate::node::api::Outcome::Done => Ok(()),
-        _ => Err(Frame::Error {
-            reason: "the identity passphrase does not match; the trust keyring is only \
-                     editable by whoever holds it"
-                .to_owned(),
+        crate::node::api::Outcome::Failed(crate::node::api::Fault::WrongPassphrase) => {
+            Err(Frame::Error {
+                reason: "the identity passphrase does not match; the trust keyring is only \
+                         editable by whoever holds it"
+                    .to_owned(),
+            })
+        }
+        // Only a wrong passphrase is one. A node with no identity, or shutting down, or a check
+        // that failed inside, was reported as a mistyped passphrase, and the person retyped a
+        // right one (V210-83).
+        other => Err(Frame::Error {
+            reason: other.to_string(),
         }),
     }
 }
@@ -1772,6 +1997,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     match request {
         // Handled by the caller; the connection becomes a stream.
         Request::Subscribe => Frame::Ok,
+        Request::Ping => match handle.apply(crate::node::api::NodeCommand::Ping).await {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
         // The keyring, gated on the identity passphrase. The check is first and the
         // command is only issued if it passes, so a caller who cannot prove they are the
         // operator changes nothing and learns nothing.
@@ -2008,6 +2239,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     channel_id,
                     service_tag,
                     local,
+                    // Offered over this socket, it lasts as long as the client's connection
+                    // (`Held`), and so never outlives this node's run either.
+                    persist: false,
                 })
                 .await
             {
@@ -2229,6 +2463,76 @@ async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
 pub struct IpcClient {
     stream: UnixStream,
     me: Option<Digest32>,
+    /// Where the node listens, so a request that waits can check it is still answering.
+    path: PathBuf,
+}
+
+/// Connect to the control socket at `path` only if it is this user's own (V210-72).
+///
+/// A client sends the node passphrases, so it checks before connecting that `path` is a
+/// socket owned by this uid — not a symlink, not another user's — and after connecting
+/// that the process serving it runs as this uid too. Another user can satisfy neither.
+///
+/// # Errors
+/// [`IpcHandshake::Unreachable`] if nothing is there or nothing listens;
+/// [`IpcHandshake::NotYours`] if it, or what serves it, belongs to someone else.
+pub async fn connect_own(path: &Path) -> Result<UnixStream> {
+    let unreachable = |e: std::io::Error| {
+        Error::Ipc(IpcHandshake::Unreachable {
+            reason: e.to_string(),
+        })
+    };
+    std::fs::symlink_metadata(path).map_err(unreachable)?;
+    crate::node::paths::check_socket_owner(path).map_err(|e| {
+        Error::Ipc(IpcHandshake::NotYours {
+            detail: match e {
+                Error::Path { detail, .. } => detail,
+                other => other.to_string(),
+            },
+        })
+    })?;
+    let stream = UnixStream::connect(path).await.map_err(unreachable)?;
+    let me = crate::node::paths::my_uid();
+    match stream.peer_cred() {
+        Ok(c) if c.uid() == me => Ok(stream),
+        Ok(c) => Err(Error::Ipc(IpcHandshake::NotYours {
+            detail: format!(
+                "{} is served by uid {}, not by you (uid {me})",
+                path.display(),
+                c.uid()
+            ),
+        })),
+        // **A peer that has already hung up cannot be asked who it is** (V210-72): macOS's
+        // LOCAL_PEERCRED answers ENOTCONN once the server has closed, and that was reported as
+        // a refusal where the truth is "the node closed the connection before greeting". Only
+        // a peer that is provably gone falls through — nothing sent on this connection can
+        // reach anyone — and the caller then reports what it reads. A live peer that will not
+        // say who it is stays refused.
+        Err(_) if peer_is_gone(&stream) => Ok(stream),
+        Err(e) => Err(Error::Ipc(IpcHandshake::NotYours {
+            detail: format!("cannot tell who serves {}: {e}", path.display()),
+        })),
+    }
+}
+
+/// Whether the other end of `stream` has hung up: the socket reports a hang-up, or a peek
+/// finds the end of the stream. Neither consumes anything the peer sent before it went.
+fn peer_is_gone(stream: &UnixStream) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::net::{recv, RecvFlags};
+    let mut fds = [PollFd::new(stream, PollFlags::IN)];
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if poll(&mut fds, Some(&now)).is_ok() && fds[0].revents().contains(PollFlags::HUP) {
+        return true;
+    }
+    let mut byte = [0u8; 1];
+    matches!(
+        recv(stream, &mut byte, RecvFlags::PEEK | RecvFlags::DONTWAIT),
+        Ok((_, 0))
+    )
 }
 
 impl IpcClient {
@@ -2247,12 +2551,17 @@ impl IpcClient {
     /// the connection into an event stream, after which no further request can be
     /// sent on it.
     pub async fn open(path: &Path) -> Result<Self> {
-        let mut stream = UnixStream::connect(path).await.map_err(|e| {
-            Error::Ipc(IpcHandshake::Unreachable {
-                reason: e.to_string(),
-            })
-        })?;
-        let Some(hello) = read_frame(&mut stream).await? else {
+        // **Bounded** (V210-83): a node greets the moment it accepts, off its actor, and one
+        // that does not is suspended or stuck. Every verb that attaches waited for ever on it.
+        // The bound covers `connect_own` too, so the owner and peer checks (#263) stay first.
+        let (stream, hello) = tokio::time::timeout(ANSWER_WITHIN, async {
+            let mut stream = connect_own(path).await?;
+            let hello = read_frame(&mut stream).await?;
+            Ok::<_, Error>((stream, hello))
+        })
+        .await
+        .map_err(|_| silent())??;
+        let Some(hello) = hello else {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         let me = match Frame::from_bytes(&hello)? {
@@ -2265,7 +2574,11 @@ impl IpcClient {
             }
             _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
         };
-        Ok(Self { stream, me })
+        Ok(Self {
+            stream,
+            me,
+            path: path.to_owned(),
+        })
     }
 
     /// Send one request and read its answer.
@@ -2273,12 +2586,23 @@ impl IpcClient {
     /// A [`Frame::Error`] is returned as `Ok(Frame::Error { .. })`, not as an
     /// `Err`: "this room is not open" is an answer, and the connection stays
     /// usable for the next question.
+    ///
+    /// **Bounded by the node's liveness, not by a length of time** (V210-83). Only the greeting
+    /// was bounded, so a node suspended, or whose actor stuck, after it greeted left every request
+    /// waiting for ever. A join or a passphrase check may rightly take minutes, so no fixed wait
+    /// fits every request; instead, while one waits, the node is asked every [`ANSWER_WITHIN`]
+    /// whether it is still greeting and its actor still taking commands ([`ACTOR_WITHIN`]), and
+    /// the request fails, naming which, once it is not.
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
-        write_frame(&mut self.stream, &req.to_bytes()).await?;
-        let Some(body) = read_frame(&mut self.stream).await? else {
-            return Err(Error::MalformedIpc("ipc closed before reply"));
+        let Self { stream, path, .. } = self;
+        let exchange = async {
+            write_frame(stream, &req.to_bytes()).await?;
+            let Some(body) = read_frame(stream).await? else {
+                return Err(Error::MalformedIpc("ipc closed before reply"));
+            };
+            Frame::from_bytes(&body)
         };
-        Frame::from_bytes(&body)
+        while_answering(path, exchange).await
     }
 
     /// Every row after `since`, however many replies that takes — as one

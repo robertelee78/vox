@@ -16,6 +16,9 @@ use zeroize::Zeroizing;
 
 use crate::viewmodel::{Command, InboundVisibility, Verification, ViewModel};
 
+/// How many lines PageUp/PageDown scroll the timeline.
+pub const TIMELINE_PAGE: usize = 10;
+
 /// Idle time after which the app locks itself (ADR-015 §Screen security: 5 min).
 pub const IDLE_LOCK_SECS: u64 = 5 * 60;
 
@@ -214,8 +217,12 @@ pub struct UiState {
     pub mode: Mode,
     /// Selected channel index in the home list.
     pub selected_channel: usize,
-    /// Selected member index in the member pane.
-    pub selected_member: usize,
+    /// The member selected in the member pane, **by identity** (V210-82): the pane is in
+    /// fingerprint order, so a join re-sorts it, and a position would then name someone else.
+    /// `None` until the pane first has a member (see [`UiState::settle`]).
+    pub selected_member: Option<Digest32>,
+    /// How many lines the timeline is scrolled up from its newest; 0 follows new messages.
+    pub timeline_scroll: usize,
     /// A transient status/alert line shown at the bottom (e.g. the result of the
     /// last command, an error, a recovery hint). `None` when clear.
     pub status_message: Option<String>,
@@ -230,7 +237,8 @@ impl Default for UiState {
             focus: Focus::Timeline,
             mode: Mode::Normal,
             selected_channel: 0,
-            selected_member: 0,
+            selected_member: None,
+            timeline_scroll: 0,
             status_message: None,
             composer: String::new(),
         }
@@ -242,6 +250,24 @@ impl UiState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Fold the latest `vm` into the selection: an open channel's first member is selected when
+    /// nothing is, or when the member selected is no longer in the pane, so the marker the pane
+    /// draws and the member a command acts on are one member, held by identity from then on.
+    pub fn settle(&mut self, vm: &ViewModel) {
+        if self.screen != Screen::Channel {
+            return;
+        }
+        let Some(members) = vm.active.as_ref().map(|c| &c.members) else {
+            return;
+        };
+        if self
+            .selected_member
+            .is_none_or(|id| !members.iter().any(|m| m.id == id))
+        {
+            self.selected_member = members.first().map(|m| m.id);
+        }
     }
 
     /// Handle a key event against the current `vm`, returning the [`Action`].
@@ -311,6 +337,18 @@ impl UiState {
                 self.move_selection(vm, 1);
                 Action::Redraw
             }
+            KeyCode::PageUp if self.screen == Screen::Channel => {
+                self.timeline_scroll = self.timeline_scroll.saturating_add(TIMELINE_PAGE);
+                Action::Redraw
+            }
+            KeyCode::PageDown if self.screen == Screen::Channel => {
+                self.timeline_scroll = self.timeline_scroll.saturating_sub(TIMELINE_PAGE);
+                Action::Redraw
+            }
+            KeyCode::End if self.screen == Screen::Channel => {
+                self.timeline_scroll = 0;
+                Action::Redraw
+            }
             _ => Action::Redraw,
         }
     }
@@ -325,7 +363,8 @@ impl UiState {
         if summary.open {
             self.screen = Screen::Channel;
             self.focus = Focus::Timeline;
-            self.selected_member = 0;
+            self.selected_member = None;
+            self.timeline_scroll = 0;
             Action::Dispatch(Command::SelectChannel {
                 channel_id: Some(summary.channel_id),
             })
@@ -448,19 +487,41 @@ impl UiState {
         }
     }
 
+    /// Up/Down: the channel list's selection, or on a channel screen, the timeline's scroll while
+    /// it has focus and the member selection otherwise.
     fn move_selection(&mut self, vm: &ViewModel, delta: isize) {
-        let (cur, len) = match self.screen {
-            Screen::ChannelList => (&mut self.selected_channel, vm.channels.len()),
-            Screen::Channel => (
-                &mut self.selected_member,
-                vm.active.as_ref().map_or(0, |c| c.members.len()),
-            ),
-        };
-        if len == 0 {
-            return;
+        let step =
+            |cur: usize, len: usize| (cur as isize + delta).rem_euclid(len as isize) as usize;
+        match self.screen {
+            Screen::ChannelList => {
+                let len = vm.channels.len();
+                if len > 0 {
+                    self.selected_channel = step(self.selected_channel, len);
+                }
+            }
+            Screen::Channel if self.focus == Focus::Timeline => {
+                // Up scrolls toward older messages.
+                self.timeline_scroll = if delta < 0 {
+                    self.timeline_scroll.saturating_add(1)
+                } else {
+                    self.timeline_scroll.saturating_sub(1)
+                };
+            }
+            Screen::Channel => {
+                let Some(members) = vm.active.as_ref().map(|c| &c.members) else {
+                    return;
+                };
+                if members.is_empty() {
+                    return;
+                }
+                // From where the selected member is now, wherever a re-sort put it.
+                let cur = self
+                    .selected_member
+                    .and_then(|id| members.iter().position(|m| m.id == id))
+                    .unwrap_or(0);
+                self.selected_member = Some(members[step(cur, members.len())].id);
+            }
         }
-        let next = (*cur as isize + delta).rem_euclid(len as isize);
-        *cur = next as usize;
     }
 
     fn on_palette_key(&mut self, key: KeyEvent, vm: &ViewModel) -> Action {
@@ -532,13 +593,14 @@ impl UiState {
         Action::Redraw
     }
 
-    /// The fingerprint of the currently-selected member, if any.
+    /// The fingerprint of the currently-selected member, if it is still in the pane.
     #[must_use]
     pub fn selected_member_id(&self, vm: &ViewModel) -> Option<Digest32> {
+        let id = self.selected_member?;
         vm.active
             .as_ref()
-            .and_then(|c| c.members.get(self.selected_member))
-            .map(|m| m.id)
+            .filter(|c| c.members.iter().any(|m| m.id == id))
+            .map(|_| id)
     }
 
     /// The channelID of the active channel, if one is open.

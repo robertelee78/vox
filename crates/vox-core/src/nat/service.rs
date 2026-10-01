@@ -496,31 +496,35 @@ impl RendezvousService {
             .map(|f| f.tag)
             .map_err(|e| RejectReason::for_error(&e))?;
         // Set by the arms below for a member-kind record that arrived **from a peer** rather than
-        // from this node's own local publish. That is the test, and the narrower one — "the
-        // publisher is not the author" — is wrong: the case that matters most is a newcomer
-        // putting *its own* bundle on a member's board, which is publisher == author and is
-        // precisely the record that has to travel onward for anyone else to reconcile with it.
-        // A local publish is excluded because this node already mirrors its own records.
+        // from this node's own local publish, **and taught this board something**: an author it
+        // held nothing for, or a changed claim. The narrower test "the publisher is not the
+        // author" is wrong: the case that matters most is a newcomer putting *its own* bundle on a
+        // member's board, which is publisher == author and is precisely the record that has to
+        // travel onward for anyone else to reconcile with it. A local publish is excluded because
+        // this node already mirrors its own records. And a member's routine refresh of a claim this
+        // board already holds is not news (#179): every node told of news republishes, so counting
+        // a refresh made two members' boards wake each other about a hundred times a second, and
+        // each wake cost the actor 3–40 ms that a local post then queued behind.
         let mut grew: Option<Digest32> = None;
         let res = match tag {
             StructTag::RendezvousRecord => {
                 let rec =
                     RendezvousRecord::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
-                if publisher.is_some() {
-                    grew = Some(cid);
-                }
                 let mut store = lock(&self.store);
                 let key = self.known_key(&store, &cid, epoch, &author, now);
-                store.accept_member(rec, |_| key.clone(), now)
+                store
+                    .accept_member(rec, |_| key.clone(), now)
+                    .map(|learned| {
+                        if learned && publisher.is_some() {
+                            grew = Some(cid);
+                        }
+                    })
             }
             StructTag::MemberBundleRecord => {
                 let rec = MemberBundleRecord::from_wire(record)
                     .map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
-                if publisher.is_some() {
-                    grew = Some(cid);
-                }
                 let mut store = lock(&self.store);
                 let key = self
                     .known_key(&store, &cid, epoch, &author, now)
@@ -534,7 +538,13 @@ impl RendezvousService {
                             None
                         }
                     });
-                store.accept_bundle(rec, |_| key.clone(), now)
+                store
+                    .accept_bundle(rec, |_| key.clone(), now)
+                    .map(|learned| {
+                        if learned && publisher.is_some() {
+                            grew = Some(cid);
+                        }
+                    })
             }
             StructTag::PreJoinRecord => {
                 let rec =

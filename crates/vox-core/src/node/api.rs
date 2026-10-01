@@ -93,6 +93,9 @@ pub struct ChannelDetail {
     /// The room's genesis creator: the host its `.vox` name reaches (ADR-017), which is
     /// what `vox forward <name>.vox …` dials.
     pub creator: Digest32,
+    /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
+    /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
+    pub consented: Vec<Digest32>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -135,6 +138,9 @@ pub struct NodeView {
     /// is an anchor doing nothing at all, and without this nobody could see that from
     /// outside — which is how one sat wedged for an hour looking healthy.
     pub connected: usize,
+    /// Those peers, in fingerprint order: which of a room's members this node reaches now
+    /// (V210-82).
+    pub connected_peers: Vec<Digest32>,
     /// Every channel this node's **board** holds a genesis for — the channels it
     /// anchors, whether or not it is a member — in channelID order. What an anchor
     /// can say about itself: which rooms it serves and how many members it knows of
@@ -383,6 +389,9 @@ pub enum NodeCommand {
         service_tag: String,
         /// The local address the service listens on.
         local: std::net::SocketAddr,
+        /// Whether the offer outlives this node's run. `false` for an offer that lasts
+        /// only as long as the process that made it (`vox room send`, V210-72).
+        persist: bool,
     },
     /// Stop offering a service.
     RemoveService {
@@ -425,6 +434,10 @@ pub enum NodeCommand {
     },
     /// Stop the actor (locks first).
     Shutdown,
+    /// Change nothing and answer `Done`: proof that the actor is taking commands. A control
+    /// client waiting on a long request asks it, to tell a node at work from a stuck one
+    /// (V210-83).
+    Ping,
 }
 
 /// Why a command did not succeed — closed, machine-stable, redaction-safe.
@@ -451,6 +464,13 @@ pub enum Fault {
     KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
+    /// Another vox holds this profile's store open for writing, and only one at a time may.
+    /// Not [`Fault::Internal`], which is how an unlock that met one was reported (V210-100):
+    /// nothing was wrong with vox or the profile, and stopping the other one is the remedy.
+    ProfileBusy,
+    /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
+    /// which named the store when the store was fine (V210-77).
+    IdentityFileUnwritable,
     /// The identity passphrase was right, but something this identity sealed (its trust
     /// keyring, pending consents or prekey ring) will not open under it: the data was altered,
     /// or written by another identity. Not [`Fault::WrongPassphrase`], which sent a person to
@@ -485,8 +505,17 @@ pub enum Fault {
     BoardUnreachable,
     /// A peer could not be reached (no live endpoint, or the dial failed).
     Unreachable,
+    /// A member answered a join and waited for its proof of work, and this device took longer to
+    /// solve it than the member waits (V210-87). **Not [`Fault::Unreachable`]**, which is how it
+    /// was reported: the member had been reached, and had waited.
+    SolveTooSlow,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
+    /// A consent named a member this node has not admitted to the room (yet): it holds no
+    /// verified key for them, so it cannot know it would release to the right party. Not
+    /// [`Fault::UnknownChannel`], which said "no such room" about a room this node holds
+    /// (V210-78).
+    NotAdmitted,
     /// There is no consent to withdraw: the target was never consented to, or the
     /// consent has already been revoked (ADR-007 — consent is single-writer, so this
     /// is a settled fact, not a race).
@@ -520,6 +549,12 @@ pub enum Fault {
     /// The room's stored log was written by vox before v0.3.0, whose message format changed;
     /// v0.3.0 does not read it, and the room is made again (decider, 2026-09-29, #226).
     RoomFromBeforeV030,
+    /// A service removal named a tag this room does not offer. Not [`Fault::UnknownChannel`],
+    /// which said "no such room in this profile" about a room that was right there (V210-83).
+    NotOffered,
+    /// A forward was to be stopped at a local address where no forward is listening. Not
+    /// [`Fault::UnknownChannel`] either: no room was named at all (V210-83).
+    NoSuchForward,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }
@@ -559,6 +594,12 @@ impl Fault {
             Fault::Storage => {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
             }
+            Fault::ProfileBusy => {
+                "another vox holds this profile open, and only one at a time may write it\n       stop that one to run this, or use the `vox room …` verbs, which ask a running node"
+            }
+            Fault::IdentityFileUnwritable => {
+                "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
+            }
             Fault::SealedUnreadable => {
                 "the identity passphrase is right, but this profile's trust keyring, pending \
                  consents or prekey ring will not open under it\n       the store was altered, \
@@ -580,7 +621,13 @@ impl Fault {
             Fault::Unreachable => {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
             }
+            Fault::SolveTooSlow => {
+                "a member answered, but this device took longer to solve the join's proof of work than the member waits\n       your passphrase was never checked — this is not a verdict on it\n       run the join again when this device is less busy"
+            }
             Fault::Refused => "the other side refused",
+            Fault::NotAdmitted => {
+                "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
+            }
             Fault::NotConsented => {
                 "there is nothing to withdraw: that identity was never trusted or consented to, or already is not"
             }
@@ -605,6 +652,10 @@ impl Fault {
             Fault::RoomFromBeforeV030 => {
                 "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and invite its members"
             }
+            Fault::NotOffered => {
+                "that service is not offered in this room\n       check its name: it is the tag that was given to `vox service add`"
+            }
+            Fault::NoSuchForward => "no forward is listening at that local address",
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
             }
@@ -656,6 +707,12 @@ impl std::fmt::Display for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeEvent {
+    /// Creating or unlocking the identity has waited more than a second for another vox that
+    /// holds this profile's lock (it is creating the identity, or migrating a v0.2.9 profile, or
+    /// it is stopped while doing so). Sent once per wait; the command goes on when the lock is
+    /// free. Each front end says it in its own place: the CLI on stderr, the TUI in its status
+    /// line (V210-100).
+    WaitingForProfile,
     /// A new rendered entry in a channel.
     NewEntry {
         /// The channel.

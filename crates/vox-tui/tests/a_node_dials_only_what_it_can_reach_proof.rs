@@ -300,8 +300,8 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
         &args(&[
             "connect",
             &address,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &world::room_pass_file(&guest_dir, &passphrase),
             "--anchor",
             &guest_spec,
             "--listen",
@@ -326,8 +326,8 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
         &args(&[
             "up",
             &room,
-            "--passphrase",
-            &passphrase,
+            "--passphrase-file",
+            &world::room_pass_file(&guest_dir, &passphrase),
             "--bind",
             "127.0.0.1:0",
             "--anchor",

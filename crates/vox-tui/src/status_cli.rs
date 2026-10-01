@@ -63,6 +63,17 @@ fn render(v: &Value) -> String {
     );
     let empty = Vec::new();
     let arr = |k: &str| v.get(k).and_then(Value::as_array).unwrap_or(&empty);
+    // Stored entries a room set aside when it opened (V210-74): said first, whatever else there is.
+    for r in arr("set_aside") {
+        for e in r.get("entries").and_then(Value::as_array).unwrap_or(&empty) {
+            let _ = writeln!(
+                o,
+                "room {}, when it opened: {}",
+                short(s(r, "room")),
+                e.as_str().unwrap_or("?")
+            );
+        }
+    }
     let unhealthy = arr("unhealthy");
     if unhealthy.is_empty() {
         let _ = writeln!(o, "healthy: nothing needs attention");
@@ -200,7 +211,7 @@ fn render(v: &Value) -> String {
         let _ = write!(
             o,
             "  room {} peer {}: opened {} admitted {} completed {} partial {} failed {} busy-refused {} \
-             stale {} skipped {} queued {}",
+             stale {} refused {} skipped {} queued {}",
             short(s(r, "room")),
             short(s(r, "peer")),
             n(r, "opened"),
@@ -210,6 +221,7 @@ fn render(v: &Value) -> String {
             n(r, "failed"),
             n(r, "busy_refused"),
             n(r, "stale"),
+            n(r, "refused"),
             n(r, "skipped_at_cap"),
             n(r, "queued"),
         );

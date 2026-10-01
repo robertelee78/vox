@@ -438,6 +438,12 @@ pub async fn post_cmd(
         urgent: opts.urgent,
         re: opts.re.clone(),
         thread: opts.thread.clone(),
+        // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's
+        // budget less one, so an urgent reply chain ends at zero instead of looping.
+        hops: opts
+            .re
+            .as_ref()
+            .map(|re| crate::wake::reply_hops(re, &snap.rows)),
         body: body.trim_end().to_owned(),
         data,
     };
@@ -933,7 +939,22 @@ pub async fn tail(
                 true
             }
             Ok(Some(_)) => false,
-            Ok(None) => return Ok(()), // the node stopped
+            // **The node stopping is a failure, not the end of the room** (V210-83). It exited 0
+            // here, so a supervisor restarting a tail on failure never did, and a script read a
+            // stream that had silently stopped as one that had finished.
+            Ok(None) => {
+                return Err(AppError::Usage(match last {
+                    Some(h) => format!(
+                        "the node stopped, so this tail stopped with it\n       start the node \
+                         again, then resume with `vox room tail {room} --since {}`",
+                        b32_encode(&h)
+                    ),
+                    None => format!(
+                        "the node stopped, so this tail stopped with it\n       start the node \
+                         again, then run `vox room tail {room}`"
+                    ),
+                }))
+            }
             Err(e) => return Err(AppError::Usage(e.to_string())),
         };
         if reread {
@@ -1071,6 +1092,14 @@ async fn run_op(
         .outcomes
         .get(&posting.entry_hash)
         .cloned();
+    // **A claim is recorded when it is made** (V210-79), so one that lapses before this
+    // session's next drain is still reported lost there. By what the operation did, not by
+    // what the fold says now: a short ttl can already have run out by the read-back.
+    if matches!(kind, claim::CLAIM | claim::RENEW) && outcome == Some(Outcome::Applied) {
+        if let Some(resource) = draft.data.get("resource").and_then(|v| v.as_str()) {
+            crate::agent_hook::note_held(paths, &room_key, &session, resource);
+        }
+    }
     Ok(Done {
         posting,
         outcome,
@@ -1350,7 +1379,10 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
             println!("vox: no longer offering {tag:?}; its live sessions were cut");
             Ok(())
         }
-        Ok(Frame::Error { .. }) => Err(AppError::Usage(format!("{tag:?} was not offered here"))),
+        // The node's reason, as `vox service remove` without a daemon gives it (V210-83).
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("cannot remove {tag:?}: {reason}")))
+        }
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
@@ -1748,9 +1780,14 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_owned());
-    // The tag is derived from the content, so two offers of the same bytes collide
-    // harmlessly and two different files never do.
-    let tag = format!("file-{}", &sha256[..16]);
+    // The tag names the content and **this offer**: `file-<16 hex of the SHA-256>-<16 hex of
+    // randomness>`. It was the content alone, so two offers of the same file shared one
+    // service, and whichever ended first withdrew the other's while it still ran (V210-72):
+    // the daemon withdraws an offer by its tag when the connection that made it closes.
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| AppError::Usage(format!("no randomness for the offer's tag: {e}")))?;
+    let tag = format!("file-{}-{}", &sha256[..16], hex(&nonce));
 
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
@@ -1904,41 +1941,198 @@ pub async fn get_file(
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
-    // The most recent matching offer wins: re-offering a file supersedes.
-    let offer = rows
-        .iter()
-        .rev()
-        .filter_map(|r| {
-            let env = Envelope::parse(&r.text).ok()?;
-            if env.kind != FILE {
-                return None;
+    // Newest first: re-offering a file supersedes. But **an offer that has ended does not
+    // hide one that is still served** (V210-84): each offer has a tag of its own, so the newest
+    // match may be one whose `vox room send` has stopped while an older offer of the same file
+    // still runs. So the older offers are tried in turn — but only those of **the same file
+    // from the same member** as the newest match: same author, same SHA-256. A fallback to
+    // anything else would hand over a different file that only shares a name.
+    let mut offers: Vec<Offer> = Vec::new();
+    // Older matches outside that group — a different file, or the same file from another
+    // member. Never collected in its place; if the get fails, the live ones are named in the
+    // error by their exact tag, which selects exactly that offer.
+    let mut others: Vec<Offer> = Vec::new();
+    for r in rows.iter().rev() {
+        let Ok(env) = Envelope::parse(&r.text) else {
+            continue;
+        };
+        if env.kind != FILE {
+            continue;
+        }
+        let d = &env.data;
+        let field = |k: &str| d.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+        let (Some(name), Some(sha256), Some(tag), Some(size)) = (
+            field("name"),
+            field("sha256"),
+            field("tag"),
+            d.get("size").and_then(serde_json::Value::as_u64),
+        ) else {
+            continue;
+        };
+        let http = d
+            .get("http")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let matches = name == selector || sha256.starts_with(selector) || tag == selector;
+        if !matches || offers.iter().any(|o| o.author == r.author && o.tag == tag) {
+            continue;
+        }
+        let offer = Offer {
+            author: r.author,
+            name,
+            size,
+            sha256,
+            tag,
+            http,
+        };
+        match offers.first() {
+            Some(newest) if newest.author != offer.author || newest.sha256 != offer.sha256 => {
+                if others.len() < MAX_OFFERS_TRIED {
+                    others.push(offer);
+                }
+                continue;
             }
-            let d = &env.data;
-            let name = d.get("name")?.as_str()?.to_owned();
-            let sha256 = d.get("sha256")?.as_str()?.to_owned();
-            let tag = d.get("tag")?.as_str()?.to_owned();
-            let size = d.get("size")?.as_u64()?;
-            let http = d
-                .get("http")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            (name == selector || sha256.starts_with(selector) || tag == selector).then_some(Offer {
-                author: r.author,
-                name,
-                size,
-                sha256,
-                tag,
-                http,
-            })
-        })
-        .next()
-        .ok_or_else(|| {
-            AppError::Usage(format!(
-                "no offer in this room matches {selector:?} — `vox room read` shows what was \
-                 announced"
-            ))
-        })?;
+            _ => offers.push(offer),
+        }
+        // Each try that is not served costs a dial; this many is past any real case of one
+        // file offered again while an older offer of it still runs.
+        if offers.len() == MAX_OFFERS_TRIED {
+            break;
+        }
+    }
+    if offers.is_empty() {
+        return Err(AppError::Usage(format!(
+            "no offer in this room matches {selector:?} — `vox room read` shows what was \
+             announced"
+        )));
+    }
 
+    let mut first_error = None;
+    let tried = offers.len();
+    for (i, offer) in offers.iter().enumerate() {
+        let result = collect_offer(&mut client, paths, channel_id, offer, dir, out).await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if i + 1 < tried {
+                    eprintln!(
+                        "vox: the offer {} of {} was not collected ({e}); trying an older offer \
+                         of it",
+                        offer.tag, offer.name
+                    );
+                }
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    let Some(e) = first_error else {
+        return Err(AppError::Usage(format!(
+            "no offer matching {selector:?} was tried"
+        )));
+    };
+    // The other matches that are still served, newest first, one per member and file: a
+    // suggestion that names an ended offer, or that a selector would redirect to the ended
+    // newest match, is a command that fails.
+    let newest = &offers[0];
+    let mut live: Vec<&Offer> = Vec::new();
+    for o in &others {
+        if live
+            .iter()
+            .any(|l| l.author == o.author && l.sha256 == o.sha256)
+        {
+            continue;
+        }
+        if offer_is_live(&mut client, channel_id, o).await {
+            live.push(o);
+        }
+    }
+    if tried == 1 && live.is_empty() {
+        return Err(e);
+    }
+    let mut said = if tried > 1 {
+        format!(
+            "{e} (and {} older offer{} of it could not be collected either)",
+            tried - 1,
+            if tried > 2 { "s" } else { "" }
+        )
+    } else {
+        e.to_string()
+    };
+    // Say what else answers to the selector and is served, and how to ask for exactly it,
+    // rather than silently collecting it instead.
+    for o in live {
+        use std::fmt::Write as _;
+        let short = &o.sha256[..o.sha256.len().min(16)];
+        let who = crate::ident::author_id(&o.author);
+        if o.sha256 == newest.sha256 {
+            let _ = write!(
+                said,
+                "\n       the same file is also offered by {who}: `vox room get {room} {}`",
+                o.tag
+            );
+        } else {
+            let _ = write!(
+                said,
+                "\n       a different file also matches {selector:?}: {} ({} bytes, sha256 \
+                 {short}, offered by {who}) — collect exactly it with `vox room get {room} {}`",
+                o.name, o.size, o.tag
+            );
+        }
+    }
+    Err(AppError::Usage(said))
+}
+
+/// Whether `offer` is still served: forwarded to, it sends its first byte. An ended offer is
+/// refused by its host and the connection closes without one. An empty file sends nothing
+/// either way, so one is taken as served when the connection is accepted and ends cleanly.
+async fn offer_is_live(client: &mut IpcClient, channel_id: Digest32, offer: &Offer) -> bool {
+    use tokio::io::AsyncReadExt as _;
+    const PROBE: std::time::Duration = std::time::Duration::from_secs(10);
+    let Ok(Frame::Bound { local }) = client
+        .request(&Request::Forward {
+            channel_id,
+            host: offer.author,
+            service_tag: offer.tag.clone(),
+            local: "127.0.0.1:0".into(),
+        })
+        .await
+    else {
+        return false;
+    };
+    let answered = async {
+        let mut sock = tokio::net::TcpStream::connect(&local).await.ok()?;
+        // A `vox share` offer is HTTP: it answers once asked, as `receive` asks.
+        if offer.http {
+            use tokio::io::AsyncWriteExt as _;
+            let req = format!(
+                "GET /{} HTTP/1.1\r\nHost: vox\r\nConnection: close\r\n\r\n",
+                offer.name
+            );
+            sock.write_all(req.as_bytes()).await.ok()?;
+        }
+        let mut byte = [0u8; 1];
+        sock.read(&mut byte).await.ok()
+    };
+    let live = match tokio::time::timeout(PROBE, answered).await {
+        Ok(Some(n)) => n > 0 || offer.size == 0,
+        _ => false,
+    };
+    let _ = client.request(&Request::StopForward { local }).await;
+    live
+}
+
+/// The most matching offers `vox room get` tries, newest first (V210-84).
+const MAX_OFFERS_TRIED: usize = 16;
+
+/// Collect one offer: choose where it lands, forward to it, transfer, verify.
+async fn collect_offer(
+    client: &mut IpcClient,
+    paths: &Paths,
+    channel_id: Digest32,
+    offer: &Offer,
+    dir: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+) -> Result<(), AppError> {
     let dest = match out {
         Some(exact) => {
             if exact.symlink_metadata().is_ok() {
@@ -1982,7 +2176,7 @@ pub async fn get_file(
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
-    let result = collect(&bound, &dest, &offer).await;
+    let result = collect(&bound, &dest, offer).await;
     let _ = client
         .request(&Request::StopForward {
             local: bound.clone(),
