@@ -52,6 +52,26 @@
 //!   bob cannot join, or never renders alice's post.
 //! - Dial the moved anchor but publish no room to it (`NetEvent::AnchorConnected` skips
 //!   `publish_channel_to_anchor`): red at step 2 or 3 for the same reason.
+//!
+//! **V210-75 (#266): the addresses are replaced, and a bad line is skipped.** Two more cases
+//! run the same scene:
+//! - [`a_daemon_follows_an_anchor_that_had_eight_addresses`]: the file first names the anchor at
+//!   **eight** dead addresses, the most one anchor may have. A refresh used to *add* the new
+//!   address to the old ones, so the ninth did not fit, the refresh failed every 30 s, and the
+//!   anchor could not be followed at all.
+//! - [`a_bad_anchors_file_line_is_skipped_and_named`]: both versions of the file start with a
+//!   line whose host does not resolve (`.invalid`, RFC 2606). One such line used to fail the whole
+//!   file: the daemon would not start, and the refresh skipped every update. Now the daemon must
+//!   start, follow the anchor, and say `line 1 is skipped` on its stderr.
+//!
+//! In every case the invite's entry for the anchor must name **only** the real port: the dead
+//! addresses are replaced, not kept first in line to be dialled before it.
+//!
+//! **Mutations that must turn these red (V210-75).**
+//! - `BootstrapSet::merge_endpoints` appends addresses again (the union): the eight-address case
+//!   is red at step 1 (never follows), and the other two at the only-the-real-port check.
+//! - `merge_anchors_file` fails the file on a bad line again (`?`): the bad-line case is red, the
+//!   daemon does not start.
 
 #![cfg(unix)]
 
@@ -125,6 +145,27 @@ fn vox_stdin(
 #[test]
 #[ignore = "production Argon2id, a real anchor and a 30s refresh; CI runs it in release"]
 fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
+    follow(&[9], false);
+}
+
+#[test]
+#[ignore = "production Argon2id, a real anchor and a 30s refresh; CI runs it in release"]
+fn a_daemon_follows_an_anchor_that_had_eight_addresses() {
+    // Eight: the most addresses one anchor may have (`MAX_ENDPOINTS`), written out here so a
+    // changed constant does not silently change what this case measures.
+    follow(&[9, 10, 11, 12, 13, 14, 15, 16], false);
+}
+
+#[test]
+#[ignore = "production Argon2id, a real anchor and a 30s refresh; CI runs it in release"]
+fn a_bad_anchors_file_line_is_skipped_and_named() {
+    follow(&[9], true);
+}
+
+/// The scene: the daemon starts with the anchor at `dead_ports`, the file is rewritten to name
+/// its real one, and the daemon must follow. With `bad_line`, both versions of the file start with
+/// a line whose host does not resolve.
+fn follow(dead_ports: &[u16], bad_line: bool) {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
 
@@ -181,11 +222,23 @@ fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
     assert_eq!(fp.trim().len(), 52, "`vox id` prints a fingerprint: {fp:?}");
     // The same identity, a different port: reachable by nobody. This stands in for the
     // address a name used to resolve to.
-    let wrong_spec = {
-        let (id, _) = real_spec.split_once('@').expect("a well-formed spec");
-        format!("{id}@/ip4/127.0.0.1/udp/9")
+    let anchor_id = real_spec.split_once('@').expect("a well-formed spec").0;
+    let wrong_specs: Vec<String> = dead_ports
+        .iter()
+        .map(|p| format!("{anchor_id}@/ip4/127.0.0.1/udp/{p}"))
+        .collect();
+    let wrong_spec = wrong_specs.join(" ");
+    // Line 1, when asked for: a host that cannot resolve (`.invalid` never does, RFC 2606).
+    let bad = if bad_line {
+        format!("{anchor_id}@no-such-anchor.invalid:4433\n")
+    } else {
+        String::new()
     };
-    std::fs::write(anchors_file_for(&cfg), format!("{wrong_spec}\n")).unwrap();
+    std::fs::write(
+        anchors_file_for(&cfg),
+        format!("{bad}{}\n", wrong_specs.join("\n")),
+    )
+    .unwrap();
 
     // ---- the daemon starts against the address that is wrong ----
     let mut daemon = Command::new(VOX)
@@ -206,16 +259,23 @@ fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !vox(&data, &cfg, &["room", "list"]).0 {
+        let stderr = std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default();
+        // With a bad line, a daemon that will not start is the defect, not a precondition.
+        assert!(
+            !bad_line || std::time::Instant::now() < deadline,
+            "the daemon did not start with an anchors file whose line 1 names a host that does \
+             not resolve: one bad line must be skipped, not fail every anchor. Its stderr: \
+             {stderr:?}"
+        );
         assert!(
             std::time::Instant::now() < deadline,
-            "CANNOT MEASURE: the daemon never answered on its control socket; its stderr: {:?}",
-            std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default()
+            "CANNOT MEASURE: the daemon never answered on its control socket; its stderr: {stderr:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     // ---- the anchor moves: the configuration is rewritten under the running daemon ----
-    std::fs::write(anchors_file_for(&cfg), format!("{real_spec}\n")).unwrap();
+    std::fs::write(anchors_file_for(&cfg), format!("{bad}{real_spec}\n")).unwrap();
 
     // ---- it must reach the anchor without being restarted ----
     // Creating a room and getting an invite that names the anchor is the observable
@@ -246,14 +306,9 @@ fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
         .next()
         .expect("a port in the anchor spec")
         .to_owned();
-    let dead_port = wrong_spec
-        .rsplit('/')
-        .next()
-        .expect("a port in the wrong spec")
-        .to_owned();
-    assert_ne!(
-        real_port, dead_port,
-        "the two specs must differ by address, or this gate measures nothing"
+    assert!(
+        !dead_ports.iter().any(|p| p.to_string() == real_port),
+        "the specs must differ by address, or this gate measures nothing"
     );
     let started = std::time::Instant::now();
     let mut last = String::new();
@@ -297,7 +352,6 @@ fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
     // reason). Behind a home NAT that entry is what does not work; the anchor is what
     // does. So bob gets the link with every entry but the anchor's removed, which is the
     // link as a NATed joiner can use it.
-    let anchor_id = real_spec.split_once('@').expect("a well-formed spec").0;
     let (link, dropped) = only_anchor(&issued, anchor_id);
     println!(
         "[proof] invite carried {} anchor entr(ies); kept the moved anchor's, dropped {dropped}",
@@ -308,6 +362,37 @@ fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
         "CANNOT MEASURE: the stripped link does not name the anchor at its new address: \
          {link:?} (from {issued:?})"
     );
+    // **Replaced, not accumulated** (V210-75): the anchor's entry names the address it has now,
+    // and none of the ones it had. Kept, they would stay first in line to be dialled.
+    let addresses: Vec<&str> = link
+        .split('&')
+        .filter_map(|p| p.strip_prefix("b="))
+        .collect();
+    println!(
+        "[proof] the anchor's entry names {} address(es) after the move (it had {}): {addresses:?}",
+        addresses.len(),
+        dead_ports.len()
+    );
+    assert!(
+        addresses.len() == 1 && addresses[0].ends_with(&format!("/udp/{real_port}")),
+        "the invite's entry for the moved anchor must name only its new address, port \
+         {real_port}; it names {addresses:?}. The {} address(es) it had before the move were \
+         kept beside the new one rather than replaced.",
+        dead_ports.len()
+    );
+    if bad_line {
+        let stderr = std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default();
+        let named = stderr
+            .lines()
+            .filter(|l| l.contains("line 1 is skipped"))
+            .count();
+        println!("[proof] the daemon named the bad line {named} time(s) on its stderr");
+        assert!(
+            named >= 1,
+            "the daemon followed the anchor but never said which line of its anchors file it \
+             skipped (\"line 1 is skipped\"). Its stderr: {stderr:?}"
+        );
+    }
     let bob_data = tmp.path().join("bob-data");
     let bob_cfg = tmp.path().join("bob-cfg");
     std::fs::create_dir_all(&bob_cfg).unwrap();
