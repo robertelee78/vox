@@ -94,13 +94,6 @@ fn test_advertise() -> Option<EndpointList> {
     EndpointList::new(addrs).ok()
 }
 
-/// **For proofs only.** When set, this node takes every inbound join exchange and never answers it:
-/// the member a joiner reached and then heard nothing from. The V210-85 proof stages a join that
-/// waits on its host this way, because a host SIGSTOPped at the right moment races the exchange,
-/// and a release solve of about a second was the only margin. Nothing a person runs sets it; unset,
-/// nothing changes.
-pub const TEST_JOIN_UNANSWERED_ENV: &str = "VOX_TEST_JOIN_UNANSWERED";
-
 impl SharedPolicy {
     /// An empty policy (every peer is unknown).
     #[must_use]
@@ -1464,11 +1457,6 @@ impl NodeNet {
             pending_joins,
             now_secs: self.now(),
         };
-        if std::env::var_os(TEST_JOIN_UNANSWERED_ENV).is_some() {
-            // Holding both streams open, so the joiner waits for an answer, not a reset.
-            let _held = (send, recv);
-            return std::future::pending().await;
-        }
         run_responder(send, recv, peer, &cfg, store, ring, admit_before_accepting).await
     }
 
