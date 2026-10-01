@@ -15,13 +15,14 @@ What a person does, in order:
 
 The screen is read through pyte, as the person sees it. Prints, each on its own line:
 - `<tag> REGISTERED: <harness> <endpoint>` — the wake channel the session's drain recorded with
-  the daemon (`<data_dir>/<profile>/sessions/*.json`), or `<tag> REGISTERED: none`;
+  the daemon (`<data_dir>/<profile>/sessions/*.json`, those not there before it opened);
 - `<tag> OTHER: shown|absent` — whether the message addressed to carol reached the screen before
   the one addressed to bobby was posted;
 - `<tag> WAKE: shown mid-turn|shown after the turn|absent` — whether the message addressed to
   bobby reached the screen, and whether the running turn's reply had appeared yet;
-- `<tag> TURN: completed|never completed` — whether the turn that was running when the wake
-  arrived still finished: an interrupt queues into it, and must not abort it;
+- `<tag> TURN: completed|never completed` — whether the tool that was running when the wake
+  arrived still ran to its end (its output, `SLEPT-42`, reached the screen): an interrupt queues
+  into the running turn, and must not abort it;
 - `<tag> SCREEN:` and the screen, whenever anything above is not clean.
 
 Exit 0 = it ran to the end (the caller judges the lines); 2 = apparatus (pyte missing, the TUI
@@ -37,7 +38,9 @@ from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 VOX, DATA, CFG, ROOM, PROJECT, XDG, PLUGIN_LOG, TAG = sys.argv[1:9]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
 SLEEP = 45  # long enough that the wake is posted and relayed while the tool still runs
-DONE = "TURN-ONE-DONE"
+# The tool's own output, computed by the shell so the command's text cannot match it: on screen
+# only once `sleep` has run to its end, whatever the model chooses to say afterwards.
+SLEPT = "SLEPT-42"
 nonce = f"{int(time.time() * 1000) % 100000:05d}"
 OTHER = f"OTHERADDR-{nonce}"
 WAKE = f"WAKEMARK-{nonce}"
@@ -74,9 +77,10 @@ def post(to, body):
 
 
 def registered():
-    """The wake channels the daemon's profile holds: (harness, endpoint) for each session."""
+    """The wake channels the daemon's profile holds for sessions this driver did not find there:
+    (harness, endpoint) for each."""
     regs = []
-    for path in glob.glob(os.path.join(DATA, "*", "sessions", "*.json")):
+    for path in sorted(set(glob.glob(os.path.join(DATA, "*", "sessions", "*.json"))) - BEFORE):
         try:
             with open(path) as f:
                 r = json.load(f)
@@ -86,6 +90,7 @@ def registered():
     return regs
 
 
+BEFORE = set(glob.glob(os.path.join(DATA, "*", "sessions", "*.json")))  # earlier sessions
 code = 2
 tui = None
 try:
@@ -99,8 +104,8 @@ try:
     tui.pump(5)  # its prompt takes keys once it has finished starting
 
     stage("start a turn that runs a tool")
-    tui.key(f"Use the bash tool to run exactly `sleep {SLEEP}`. After it finishes, reply with "
-            f"exactly {DONE} and nothing else.", 1)
+    tui.key(f"Use the bash tool to run exactly `sleep {SLEEP}; echo SLEPT-$((6*7))`, then reply "
+            "with just OK.", 1)
     tui.key("\r", 1)
     if not tui.until(lambda: f"sleep {SLEEP}" in flat() and registered(), 90):
         print(f"{TAG} APPARATUS: the turn never started, or its drain never ran "
@@ -120,7 +125,7 @@ try:
     stage("post an urgent message addressed to bobby")
     post("bobby", f"bobby: {WAKE} please acknowledge.")
     shown = tui.until(lambda: WAKE in flat(), SLEEP + 60, step=0.25)
-    turn_done = DONE in flat().replace(f"exactly {DONE}", "")
+    turn_done = SLEPT in flat()
     took = time.time() - t_turn
     if not shown:
         print(f"{TAG} WAKE: absent")
@@ -134,7 +139,7 @@ try:
 
     stage("let the running turn finish")
     # An interrupt queues into the running turn; it must not abort it.
-    finished = tui.until(lambda: DONE in flat().replace(f"exactly {DONE}", ""), SLEEP + 90)
+    finished = tui.until(lambda: SLEPT in flat(), SLEEP + 90)
     print(f"{TAG} TURN: {'completed' if finished else 'never completed'}")
     if not finished:
         print(f"{TAG} SCREEN:\n{tui.text()}")
