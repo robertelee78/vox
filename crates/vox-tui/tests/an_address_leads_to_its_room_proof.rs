@@ -83,6 +83,9 @@ const NOTE_WITHIN: Duration = Duration::from_secs(20);
 /// How long the host may take to say the anchor took the room once it is back (arm C): its redial,
 /// the connection and the first publish round.
 const TAKEN_WITHIN: Duration = Duration::from_secs(120);
+/// The watchdog's bound on the whole binary: its four arms took 623 s in debug on 2026-10-01, which
+/// is past the default 600 s, so twice that, rounded up.
+const BUDGET: Duration = Duration::from_secs(1300);
 /// How long after the guest's first datagram reaches the closed forward it opens (arm D).
 const FORWARD_OPENS: Duration = Duration::from_secs(3);
 
@@ -219,6 +222,47 @@ fn line_within(p: &mut VoxProc, within: Duration, pred: impl Fn(&str) -> bool) -
     None
 }
 
+/// Which a red about `host` is: `PRODUCT`, unless the host was killed by a signal — which no
+/// proof sends it, so it is the watchdog, past its budget, and nothing about the claim was measured.
+fn host_verdict(host: &mut VoxProc) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+    match host.child.try_wait() {
+        Ok(Some(status)) if status.signal().is_some() => format!(
+            "APPARATUS: `vox serve` was killed by signal {:?} (the watchdog, past its budget), so \
+             nothing was measured —",
+            status.signal()
+        ),
+        _ => "PRODUCT".to_owned(),
+    }
+}
+
+/// `vox` run to completion, as [`vox_once`] does, but a run killed by a signal — which no proof
+/// sends it, so the watchdog — is an apparatus red, never read as the product refusing.
+fn vox_joined(data: &Path, args: &[String]) -> (bool, String, String) {
+    use std::os::unix::process::ExitStatusExt as _;
+    let out = std::process::Command::new(world::VOX)
+        .args(args)
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", data.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", world::IDENTITY)
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run `vox`: {e}"));
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    );
+    assert!(
+        out.status.signal().is_none(),
+        "APPARATUS: `vox {}` was killed by signal {:?} (the watchdog, past its budget), so its \
+         outcome measures nothing.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        args.first().map_or("", String::as_str),
+        out.status.signal()
+    );
+    (out.status.success(), stdout, stderr)
+}
+
 /// The passphrase `vox serve` prints right after its address.
 fn passphrase_of(host: &mut VoxProc) -> String {
     let line = line_within(host, Duration::from_secs(10), |l| {
@@ -227,7 +271,8 @@ fn passphrase_of(host: &mut VoxProc) -> String {
     after_label(
         &line.unwrap_or_else(|| {
             panic!(
-                "PRODUCT: `vox serve` printed its address and no passphrase after it. It said:\n{}",
+                "{}: `vox serve` printed its address and no passphrase after it. It said:\n{}",
+                host_verdict(host),
                 host.transcript()
             )
         }),
@@ -238,7 +283,7 @@ fn passphrase_of(host: &mut VoxProc) -> String {
 #[test]
 #[ignore = "real host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
-    watchdog::arm();
+    watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir().unwrap();
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
     let host_fp = two_identities(&guest_dir, &host_dir);
@@ -249,8 +294,9 @@ fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
     let address = after_label(
         &address.unwrap_or_else(|| {
             panic!(
-                "PRODUCT: `vox serve` with no anchor printed no address within {ROOM_WITHIN:?}; a \
+                "{}: `vox serve` with no anchor printed no address within {ROOM_WITHIN:?}; a \
                  host a guest can reach directly needs none. It said:\n{}",
+                host_verdict(&mut host),
                 host.transcript()
             )
         }),
@@ -264,7 +310,7 @@ fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
         host.transcript()
     );
     let t = Instant::now();
-    let (joined, out, err) = vox_once(
+    let (joined, out, err) = vox_joined(
         &guest_dir,
         &args(&[
             "connect",
@@ -289,7 +335,7 @@ fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
 #[test]
 #[ignore = "real anchors, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn b_anchors_that_are_down_do_not_hold_back_the_address() {
-    watchdog::arm();
+    watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir().unwrap();
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
     // Four anchors — a link's whole capacity — each started for its identity, then stopped by PID.
@@ -312,9 +358,10 @@ fn b_anchors_that_are_down_do_not_hold_back_the_address() {
     let address = after_label(
         &address.unwrap_or_else(|| {
             panic!(
-                "PRODUCT: `vox serve` printed no address while its four anchors were down, \
+                "{}: `vox serve` printed no address while its four anchors were down, \
                  although the address names the host itself, which a guest can reach. It \
                  said:\n{}",
+                host_verdict(&mut host),
                 host.transcript()
             )
         }),
@@ -341,6 +388,7 @@ fn b_anchors_that_are_down_do_not_hold_back_the_address() {
     let _ = line_within(&mut host, NOTE_WITHIN, |l| {
         l.contains("not taken") && shorts.iter().all(|s| l.contains(s.as_str()))
     });
+    let verdict = host_verdict(&mut host);
     let said = host.transcript();
     let unnamed: Vec<&String> = shorts
         .iter()
@@ -352,12 +400,12 @@ fn b_anchors_that_are_down_do_not_hold_back_the_address() {
         .collect();
     assert!(
         unnamed.is_empty(),
-        "PRODUCT: `vox serve` printed its address without saying that anchor(s) {unnamed:?} have \
+        "{verdict}: `vox serve` printed its address without saying that anchor(s) {unnamed:?} have \
          not taken the room; a guest who cannot reach the host directly must be told. It \
          said:\n{said}"
     );
     let t = Instant::now();
-    let (joined, out, err) = vox_once(
+    let (joined, out, err) = vox_joined(
         &guest_dir,
         &args(&[
             "connect",
@@ -385,7 +433,7 @@ fn b_anchors_that_are_down_do_not_hold_back_the_address() {
 #[test]
 #[ignore = "a real anchor, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
-    watchdog::arm();
+    watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir().unwrap();
     let (anchor_dir, host_dir, guest_dir) = (
         tmp.path().join("anchor"),
@@ -413,8 +461,9 @@ fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
     let address = after_label(
         &address.unwrap_or_else(|| {
             panic!(
-                "PRODUCT: `vox serve` printed no address while its anchor was down, although the \
+                "{}: `vox serve` printed no address while its anchor was down, although the \
                  address names the host itself. It said:\n{}",
+                host_verdict(&mut host),
                 host.transcript()
             )
         }),
@@ -427,8 +476,9 @@ fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
     });
     assert!(
         not_yet.is_some(),
-        "PRODUCT: `vox serve` printed its address without saying that anchor {a}, which was \
+        "{}: `vox serve` printed its address without saying that anchor {a}, which was \
          down, has not taken the room. It said:\n{}",
+        host_verdict(&mut host),
         host.transcript()
     );
     // While the anchor stays stopped, the host must not say it took the room.
@@ -447,14 +497,15 @@ fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
     let told = started.elapsed();
     assert!(
         said_taken.is_some(),
-        "PRODUCT: anchor {a} came back at +{:.2}s and `vox serve` never said it took the room \
+        "{}: anchor {a} came back at +{:.2}s and `vox serve` never said it took the room \
          within {TAKEN_WITHIN:?}. It said:\n{}",
+        host_verdict(&mut host),
         back.as_secs_f64(),
         host.transcript()
     );
     // At once, as a person told "it can be joined through the anchor now" would.
     let t = Instant::now();
-    let (joined, out, err) = vox_once(
+    let (joined, out, err) = vox_joined(
         &guest_dir,
         &args(&[
             "connect",
@@ -486,7 +537,7 @@ fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
 #[test]
 #[ignore = "real anchors, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn d_a_join_asks_every_board_the_address_names() {
-    watchdog::arm();
+    watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir().unwrap();
     let (a4_dir, a6_dir, host_dir, guest_dir) = (
         tmp.path().join("a4"),
@@ -522,8 +573,9 @@ fn d_a_join_asks_every_board_the_address_names() {
     let address = after_label(
         &address.unwrap_or_else(|| {
             panic!(
-                "PRODUCT: `vox serve` printed no address within {ROOM_WITHIN:?}, with its anchor A4 \
+                "{}: `vox serve` printed no address within {ROOM_WITHIN:?}, with its anchor A4 \
                  up the whole time. It said:\n{}",
+                host_verdict(&mut host),
                 host.transcript()
             )
         }),
@@ -549,7 +601,7 @@ fn d_a_join_asks_every_board_the_address_names() {
         "[::1]:0",
     ]);
     let guest = guest_dir.clone();
-    let join = std::thread::spawn(move || vox_once(&guest, &join_args));
+    let join = std::thread::spawn(move || vox_joined(&guest, &join_args));
     // The forward opens FORWARD_OPENS after the guest first knocks on it: its board search has
     // long since taken A6, and a dial to the host is still inside its 30 s.
     let knocked = loop {
@@ -565,9 +617,13 @@ fn d_a_join_asks_every_board_the_address_names() {
         std::thread::sleep(FORWARD_OPENS);
     }
     forward.open();
-    let (joined, out, err) = join
-        .join()
-        .unwrap_or_else(|_| panic!("APPARATUS: the thread running `vox connect` panicked"));
+    let (joined, out, err) = join.join().unwrap_or_else(|e| {
+        let said = e
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "APPARATUS: the thread running `vox connect` panicked".to_owned());
+        panic!("{said}")
+    });
     let steps: Vec<&str> = err.lines().filter(|l| l.contains("join ")).collect();
     eprintln!(
         "[proof] arm D: the guest {} the closed forward; the guest's join {} after {:.2}s; its \
