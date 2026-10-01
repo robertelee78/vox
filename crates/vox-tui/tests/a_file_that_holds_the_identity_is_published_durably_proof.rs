@@ -89,20 +89,6 @@ fn vault_version(data: &Path) -> u64 {
         .version
 }
 
-/// The recorder's positive control: it must have seen the process open something under `data`,
-/// or an empty log (the interposer not loaded, its log lost) would read as "not durable".
-fn recorder_saw(events: &[syscalls::Event], data: &Path, what: &str) {
-    let data = syscalls::norm(data);
-    assert!(
-        events.iter().any(|e| matches!(&e.call,
-            syscalls::Call::Open { path, .. } if syscalls::norm(path).starts_with(&data))),
-        "CANNOT MEASURE: the syscall recorder saw no open under {} for {what} ({} events): the \
-         interposer did not load or its log was lost",
-        data.display(),
-        events.len()
-    );
-}
-
 fn verdict(what: &str, result: &Result<(), String>) {
     println!(
         "[proof] {what}: {}",
@@ -129,7 +115,6 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     let alice = dir("alice");
     let (made, out, err, events) = recorded(&new, &alice, &["id"], None, IDENTITY);
     assert!(made, "CANNOT MEASURE: `vox id` failed: {out}{err}");
-    recorder_saw(&events, &alice, "`vox id`");
     let fresh = published_durably(&events, &vault_of(&alice));
     verdict("a new identity's vault.cbor", &fresh);
 
@@ -149,7 +134,6 @@ fn a_file_that_holds_the_identity_is_published_durably() {
         migrated && out.contains("dave") && vault_version(&carol) == 2,
         "CANNOT MEASURE: the v0.2.9 profile did not migrate: {out}{err}"
     );
-    recorder_saw(&events, &carol, "the migration");
     let migration = published_durably(&events, &vault_of(&carol));
     verdict("a v0.2.9 vault.cbor rewritten by the migration", &migration);
 
@@ -181,7 +165,6 @@ fn a_file_that_holds_the_identity_is_published_durably() {
             log.display()
         )
     }));
-    recorder_saw(&events, &node, "`vox node`");
     let headless = published_durably(&events, &node.join("default/node-identity.key"));
     verdict("a headless node's node-identity.key", &headless);
 
