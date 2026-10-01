@@ -27,10 +27,13 @@
 //! short of the members staged, too few sessions to have measured anything): the product was
 //! never measured, so the run says nothing about it.
 //!
-//! **Measured at 192 members** (release, a working machine): with the fix, p90 50 ms and 27 ms;
-//! with the room's lock held across re-verifying every record, p90 409 ms. At 128 members the
-//! mutant once measured p90 76.8 ms (verifier-262c4), inside a 100 ms bound, so the room is
+//! **Measured at 192 members** (release, a working machine): with the fix, p90 50.0, 37.7 and
+//! 27.1 ms; with the room's lock held across re-verifying every record, p90 409, 681, 135 and
+//! 121 ms. At 128 members the mutant once measured p90 76.8 ms (verifier-262c4), so the room is
 //! staged larger: the mutant's hold grows with the records it re-verifies, the fix's does not.
+//! **The bound, [`P90_BOUND`] = 75 ms,** sits 25 ms over the slowest fix sample (50.0 ms; at
+//! 128 members the fix's slowest was 51.8 ms) and 46 ms under the weakest mutant (121 ms). A
+//! 100 ms bound left the mutant 21 ms.
 //! The fix's slowest posts (221–267 ms at 192) were measured with the room's lock timed in
 //! bob's node, and no hold of it reached 26 ms, so they are not this defect, and under V210-08's
 //! 500 ms bound. It is not staged larger still: a board takes about 256 joins per two hours
@@ -61,9 +64,9 @@ const POSTS: usize = 120;
 const GAP: Duration = Duration::from_millis(250);
 /// Bob's outbound sessions while he posts, at least, for the measurement to mean anything.
 const MIN_SESSIONS: u64 = 10;
-/// Bob's posts' 90th percentile must stay under this: 27-50 ms with the fix at 192 members,
-/// 409 ms without.
-const P90_BOUND: Duration = Duration::from_millis(100);
+/// Bob's posts' 90th percentile must stay under this: 27.1-50.0 ms with the fix at 192 members,
+/// 121-681 ms without. See the module docs for the margin on each side.
+const P90_BOUND: Duration = Duration::from_millis(75);
 
 #[test]
 #[ignore = "opt-in heavy proof: stages a room of many members through the shipped binary"]
