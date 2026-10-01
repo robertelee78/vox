@@ -59,14 +59,13 @@
 //!    says `solved, now silent` for each, and all sixteen must, else CANNOT MEASURE). A hold that
 //!    has done its work is never ended for a newcomer, so carol's first try must be turned away
 //!    as busy (else CANNOT MEASURE) and alice must end nothing; carol tries again every second, as
-//!    a person told to would. Her first try not turned away must come within 26s of the first hold
-//!    doing its work: the member's admission patience (20s) gives it back, where each frame's own
-//!    bound (30s) alone would not. The arithmetic is at `ADMIT_BOUND`.
+//!    a person told to would. Her first try not turned away must come within 36s of the first hold
+//!    doing its work, so the hold must be given back at all. The arithmetic is at `ADMIT_BOUND`.
 //! 7. `joins_that_did_their_work_and_send_each_frame_just_in_time_give_their_slots_back`: as 6,
-//!    but each of the stranger's joins sends every frame it still owes 15s late
-//!    (`VOX_TEST_DRIP_AFTER_SOLVE_MS`), inside the per-frame bound each time and past the
-//!    admission patience in all: only a bound on the exchange as a whole gives the slot back
-//!    within 26s.
+//!    but each of the stranger's joins sends every frame it still owes 25s late
+//!    (`VOX_TEST_DRIP_AFTER_SOLVE_MS`), inside the per-frame bound (30s) each time and 50s in all:
+//!    only a bound on the exchange as a whole — the admission patience, 20s — gives the slot back
+//!    within 36s.
 //!
 //! **The precondition**, before carol joins, read from alice's own stderr: the cap was reached
 //! with only the stranger's joins in flight — alice refused one of them (`already answering 16
@@ -99,8 +98,9 @@
 //! - The identity ignored: cases 1 and 2 red.
 //! - An ended join stopped without a word, or told the bare refusal: case 5 red.
 //! - A hold that has done its work ended like any other: case 6 red, alice ends one for carol.
-//! - No admission patience, each frame's own bound kept: cases 6 and 7 red, the first hold is
-//!   given back at 30s, not within 26s.
+//! - No admission patience, each frame's own bound kept: case 7 red, the first hold is given back
+//!   at about 50s, not within 36s. (Case 6 stays green: each frame's own 30s bound frees a silent
+//!   hold inside 36s.)
 //! - Nothing bounding a join once its work is done, neither the admission patience nor the
 //!   per-frame one: case 6 red, carol is never let in.
 
@@ -936,17 +936,25 @@ const ADMISSION_PATIENCE: Duration = Duration::from_secs(20);
 /// would be held to without the admission patience.
 const FRAME_PATIENCE: Duration = Duration::from_secs(30);
 /// From the first of the stranger's holds doing its work to carol's first try that is not turned
-/// away, at most. The member frees that hold at [`ADMISSION_PATIENCE`] (20s) and carol tries every
-/// [`RETRY_PAUSE`], each try turned away in about a second: about 22s. Without the admission
-/// patience the hold lasts until [`FRAME_PATIENCE`] (30s, the silent case) or until the drip's two
-/// frames are in (2 × [`DRIP_MS`] = 30s): carol's first try then comes at 30s or later. 26s sits
-/// between them with 4s on each side.
-const ADMIT_BOUND: Duration = Duration::from_secs(26);
+/// away, at most.
+///
+/// - **With the admission patience** the member frees that hold at [`ADMISSION_PATIENCE`] (20s),
+///   and carol, trying every [`RETRY_PAUSE`] with each try turned away in about a second, is let
+///   in at about 22s.
+/// - **Without it**, in the drip case, the hold lasts until both frames the joiner still owes are
+///   in: 2 × [`DRIP_MS`] = 50s, each 25s wait inside [`FRAME_PATIENCE`] (30s). Carol's first try
+///   then comes at about 50s.
+///
+/// 36s sits between 22s and 50s with about 14s on each side, so retry timing under load does not
+/// decide it. In the silent case the hold would last [`FRAME_PATIENCE`] without the admission
+/// patience — 30s, inside this bound — so that case guards against **no** bound after the work
+/// (carol is never let in) and the drip case against the admission patience alone.
+const ADMIT_BOUND: Duration = Duration::from_secs(36);
 /// The stranger's grind in the worked cases, so its sixteen joins do their work at nearly once.
 const STALL_GRIND_MS: u64 = 15_000;
 /// The drip case's wait before each frame the stranger still owes after its work: inside the
-/// per-frame bound each time, past the admission patience in all.
-const DRIP_MS: u64 = 15_000;
+/// per-frame bound (30s) each time, and 50s in all, far past the admission patience (20s).
+const DRIP_MS: u64 = 25_000;
 /// Between carol's tries, as a person told "try the join again shortly" would.
 const RETRY_PAUSE: Duration = Duration::from_secs(1);
 
