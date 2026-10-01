@@ -53,12 +53,26 @@
 //! dials failed at least 3 times while it was away (else CANNOT MEASURE), and all [`MEMBERS`] are
 //! connected again within [`BACK_WITHIN`] of the anchor listening — its own count, as above.
 //!
+//! **Then a busy anchor.** Waiting is bounded (5 s), so an anchor whose every slot is held still
+//! refuses, and a refused member used to be told "signature verification failed": every failed
+//! handshake was reported as one. To stage refusals, the anchor is restarted with [`STALLED`]
+//! members' dials queued in its socket, and those members are frozen (SIGSTOP) before it goes on,
+//! as members whose machines froze mid-handshake: each attempt it takes from them holds a slot until
+//! it gives up on it (30 s). The other members are frozen while it restarts and let go a second
+//! after it goes on, so every slot is held when they dial. **Asserted:** the anchor refused some
+//! (its own report; else CANNOT MEASURE); no refused member was told of a bad signature; at least
+//! one was told the anchor is busy ([`BUSY`]); every refused member retried and was connected within
+//! [`BUSY_BACK_WITHIN`] of the anchor going on; and once the frozen members go on, all [`MEMBERS`]
+//! are connected within [`BACK_WITHIN`].
+//!
 //! Mutations (each must go red):
 //! - validated attempts past the cap refused again (`HANDSHAKES_WAITING` = 0, the old behaviour)
 //!   → red on the refusals;
 //! - the cap raised (`HANDSHAKES_IN_FLIGHT` = 100) → red on the cap;
 //! - a failed anchor dial backed off to 30 s again (`ANCHOR_UNREACHED_REDIAL_SECS` = 30) → red on
-//!   the bound after the outage.
+//!   the bound after the outage;
+//! - a refused dial reported as a bad signature again (the dial's `map_err` back to
+//!   `Error::SignatureInvalid`) → red on what the refused members were told.
 //!
 //! [`NodeEvent::HandshakesQueued`]: vox_core::node::api::NodeEvent::HandshakesQueued
 
@@ -92,6 +106,15 @@ const BACK_WITHIN: Duration = Duration::from_secs(10);
 const SETTLE: Duration = Duration::from_secs(300);
 /// What the anchor says when a burst waited for handshake slots.
 const WAITED: &str = "connection attempt(s) waited for a handshake slot";
+/// How many members are frozen mid-handshake to make the anchor busy: more than its cap.
+const STALLED: usize = 100;
+/// How long the busy anchor is held so the stalled members' dials queue in its socket.
+const STALL_QUEUED: Duration = Duration::from_secs(5);
+/// How soon after the busy anchor goes on every member it refused must be connected: the
+/// anchor's 30 s for a handshake that never finishes, then a retry and a handshake.
+const BUSY_BACK_WITHIN: Duration = Duration::from_secs(40);
+/// What a member refused by a busy anchor is told.
+const BUSY: &str = "the peer is busy";
 
 #[test]
 #[ignore = "real binaries, 300 daemons and production Argon2id; CI runs it in release"]
@@ -305,6 +328,145 @@ fn every_member_is_back_after_an_anchor_restart() {
         "{refused} attempts were refused at the cap instead of waiting for a slot: {said:#?}"
     );
 
+    // ---- a busy anchor: its slots held by members frozen mid-handshake, the rest refused --------
+    // Past a flap first, as below.
+    std::thread::sleep(Duration::from_secs(12));
+    let (stalled, refused_ones) = daemons.split_at(STALLED);
+    // The refused ones send nothing until the slots are taken: frozen before the anchor stops.
+    for d in refused_ones {
+        signal("-STOP", d);
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-INT", &anchor.child.id().to_string()])
+        .status();
+    let stopping = Instant::now();
+    while anchor.child.try_wait().ok().flatten().is_none() {
+        assert!(
+            stopping.elapsed() < Duration::from_secs(10),
+            "CANNOT MEASURE: the anchor did not stop within 10 s of SIGINT"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(anchor);
+    std::thread::sleep(DOWN);
+    let mut anchor = VoxProc::spawn(
+        "anchor (busy)",
+        &anchor_dir,
+        &args(&["node", "--listen", &listen]),
+    );
+    anchor.expect_line("the busy anchor's --anchor spec", |l| {
+        l.contains("@/ip4/127.0.0.1/udp/")
+    });
+    // Held while the stalled members' dials queue in its socket, then the stalled members are
+    // frozen: each attempt the anchor takes from them holds a handshake slot until the anchor
+    // gives up on it (30 s), as a member whose machine froze mid-handshake does.
+    let pid = anchor.child.id().to_string();
+    let _ = std::process::Command::new("kill")
+        .args(["-STOP", &pid])
+        .status();
+    std::thread::sleep(STALL_QUEUED);
+    for d in stalled {
+        signal("-STOP", d);
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-CONT", &pid])
+        .status();
+    let busy = Instant::now();
+    std::thread::sleep(Duration::from_secs(1));
+    for d in refused_ones {
+        signal("-CONT", d);
+    }
+    let want = MEMBERS - STALLED;
+    let (most, at) = wait_for_peers(&mut anchor, want, busy, Duration::from_secs(90));
+    eprintln!(
+        "[proof] busy anchor: {most}/{want} members it refused connected, the last {at:?} after it \
+         went on (bound {BUSY_BACK_WITHIN:?})"
+    );
+    let said_failed: Vec<(usize, String)> = refused_ones
+        .iter()
+        .enumerate()
+        .flat_map(|(i, d)| {
+            d.timed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(t, l)| *t >= busy && l.contains("dialling this anchor failed"))
+                .map(|(_, l)| (i, l.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let told_busy = said_failed.iter().filter(|(_, l)| l.contains(BUSY)).count();
+    let told_bad_signature: Vec<&String> = said_failed
+        .iter()
+        .map(|(_, l)| l)
+        .filter(|l| l.contains("signature"))
+        .collect();
+    let mut who: Vec<usize> = said_failed
+        .iter()
+        .filter(|(_, l)| l.contains(BUSY))
+        .map(|(i, _)| *i)
+        .collect();
+    who.dedup();
+    eprintln!(
+        "[proof] busy anchor: {} failed dial(s) said by the refused members, {told_busy} told \
+         busy ({} member(s)), {} told of a bad signature",
+        said_failed.len(),
+        who.len(),
+        told_bad_signature.len()
+    );
+    for (_, l) in said_failed.iter().take(3) {
+        eprintln!("[proof]   {l}");
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    anchor.transcript();
+    let refused: usize = anchor
+        .seen
+        .iter()
+        .filter(|l| l.contains(WAITED))
+        .map(|l| {
+            l.split("; ")
+                .nth(1)
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+        .sum();
+    eprintln!("[proof] busy anchor: it says it refused {refused} attempt(s)");
+    assert!(
+        refused > 0,
+        "CANNOT MEASURE: the busy anchor refused nobody, so no member could be told why\n{}",
+        anchor.transcript()
+    );
+    assert!(
+        told_bad_signature.is_empty(),
+        "a member refused by a busy anchor was told of a bad signature: {told_bad_signature:#?}"
+    );
+    assert!(
+        told_busy > 0,
+        "the anchor refused {refused} attempt(s) and no refused member was told it was busy: \
+         {said_failed:#?}"
+    );
+    assert!(
+        most >= want && at < BUSY_BACK_WITHIN,
+        "{most}/{want} refused members were back, the last {at:?} after the busy anchor went on, \
+         over {BUSY_BACK_WITHIN:?}: a refused member did not retry once a slot was free"
+    );
+    // The frozen members come back too.
+    for d in stalled {
+        signal("-CONT", d);
+    }
+    let thawed = Instant::now();
+    let (most, at) = wait_for_peers(&mut anchor, MEMBERS, thawed, Duration::from_secs(60));
+    eprintln!(
+        "[proof] busy anchor: {most}/{MEMBERS} members connected, the last {at:?} after the \
+         stalled ones went on (bound {BACK_WITHIN:?})"
+    );
+    assert!(
+        most >= MEMBERS && at < BACK_WITHIN,
+        "{most}/{MEMBERS} members were back, the last {at:?} after the stalled ones went on, over \
+         {BACK_WITHIN:?}"
+    );
+
     // ---- a long outage: the anchor is away OUTAGE, its port answered by another node -----------
     // Past a flap first: a connection lost within ANCHOR_FLAP_SECS (10 s) of being made is
     // backed off as a flap, which is not what this measures.
@@ -402,7 +564,8 @@ fn every_member_is_back_after_an_anchor_restart() {
             daemons[*i].name
         );
         let lines = daemons[*i].timed.lock().unwrap_or_else(|e| e.into_inner());
-        for (t, l) in lines.iter().filter(|(t, _)| *t >= away).rev().take(4).rev() {
+        let since: Vec<_> = lines.iter().filter(|(t, _)| *t >= away).collect();
+        for (t, l) in &since[since.len().saturating_sub(4)..] {
             eprintln!("[proof]     +{:?} {l}", t.duration_since(away));
         }
     }
@@ -417,6 +580,13 @@ fn every_member_is_back_after_an_anchor_restart() {
          listening again, over {BACK_WITHIN:?}: a member whose dials failed while it was away waits \
          out its backoff"
     );
+}
+
+/// Send `sig` (`-STOP` or `-CONT`) to the process `p`, by its PID.
+fn signal(sig: &str, p: &VoxProc) {
+    let _ = std::process::Command::new("kill")
+        .args([sig, &p.child.id().to_string()])
+        .status();
 }
 
 /// A `vox daemon` for the profile at `dir`, pointed at the anchor `spec`.

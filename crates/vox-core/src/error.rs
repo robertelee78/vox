@@ -262,6 +262,16 @@ pub enum Error {
     #[error("peer unreachable — {0}")]
     LadderExhausted(String),
 
+    /// A QUIC handshake failed for a reason other than authentication: the peer refused or
+    /// closed the connection, never answered, or this node's endpoint is closing.
+    ///
+    /// Every handshake failure used to be [`Self::SignatureInvalid`], so a peer that was shutting
+    /// down, or a dial nobody answered, reached the operator as "signature verification failed" —
+    /// an alarm about keys for what is a closed door (V210-81). A failure of authentication itself
+    /// still is `SignatureInvalid`.
+    #[error("the connection could not be set up: {0}")]
+    Handshake(String),
+
     /// This node could not listen on a local address it was told to use.
     ///
     /// Carried whole rather than as a `&'static str`: "quic endpoint bind" was the only thing
