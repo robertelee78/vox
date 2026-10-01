@@ -369,6 +369,11 @@ impl std::fmt::Display for SyncFailure {
             Self::Session(SessionError::ProtocolViolation) => {
                 f.write_str("sync failed: the peer served an entry that was not asked for")
             }
+            Self::Session(SessionError::DrainBudget(secs)) => write!(
+                f,
+                "sync stopped: the peer's entries did not all arrive within {secs}s; what \
+                 arrived was kept"
+            ),
             Self::Unreachable(why) | Self::Poisoned(why) => f.write_str(why),
             Self::Panicked => f.write_str("sync failed: the session panicked"),
         }
@@ -1549,6 +1554,25 @@ impl ChannelState {
         )
     }
 
+    /// [`ChannelState::build_evaluator`] for a room that already has one: the signatures `prior`
+    /// verified are not verified again (see [`Evaluator::build_reusing`]).
+    fn rebuild_evaluator(
+        genesis: &Genesis,
+        authors: &BTreeMap<Digest32, CompositePublicKey>,
+        gov_entries: &[GovEntry],
+        now_secs: u64,
+        prior: &Evaluator,
+    ) -> Result<Evaluator> {
+        Evaluator::build_reusing(
+            genesis,
+            gov_entries,
+            now_secs,
+            |id| authors.get(id).cloned(),
+            authors.keys().copied().collect(),
+            Some(prior),
+        )
+    }
+
     /// Create the local state for a channel this identity **joined** (ADR-007
     /// §"Join and per-sender consent flow", step 1) rather than created.
     ///
@@ -1911,11 +1935,12 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
-        self.evaluator = Arc::new(Self::build_evaluator(
+        self.evaluator = Arc::new(Self::rebuild_evaluator(
             &self.genesis,
             &self.authors,
             &self.gov_entries,
             now_secs,
+            &self.evaluator,
         )?);
         Ok(true)
     }
@@ -2988,11 +3013,12 @@ impl ChannelState {
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.gov_entries.push(gov);
-        self.evaluator = Arc::new(Self::build_evaluator(
+        self.evaluator = Arc::new(Self::rebuild_evaluator(
             &self.genesis,
             &self.authors,
             &self.gov_entries,
             now_secs,
+            &self.evaluator,
         )?);
         Ok(hash)
     }
@@ -3075,6 +3101,62 @@ impl ChannelState {
         }
     }
 
+    /// Rebuild the evaluator over the governance folded in since `could_read` was taken, and
+    /// render into `batch` what that made readable. `Err` is a write failure, as in
+    /// [`ChannelState::absorb_arrived`].
+    ///
+    /// `run` is how many entries at the end of `gov_entries` the pending run pushed. **A fold that
+    /// fails takes back out only what fails on its own** (V210-80): the run is folded again one
+    /// entry at a time, from the evaluator before it, and each entry whose fold fails is dropped,
+    /// or every later rebuild failed on it too. That costs a build per entry, only when a batch
+    /// failed. Returns the rows it rendered and how many entries it dropped, refused.
+    fn fold_governance_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        could_read: &BTreeSet<Digest32>,
+        rendered: &[Rendered],
+        run: usize,
+        now_secs: u64,
+    ) -> Result<(Vec<Rendered>, usize)> {
+        let mut dropped = 0usize;
+        match Self::rebuild_evaluator(
+            &self.genesis,
+            &self.authors,
+            &self.gov_entries,
+            now_secs,
+            &self.evaluator,
+        ) {
+            Ok(evaluator) => self.evaluator = Arc::new(evaluator),
+            Err(_) => {
+                let at = self.gov_entries.len().saturating_sub(run);
+                let pending: Vec<GovEntry> = self.gov_entries.drain(at..).collect();
+                for gov in pending {
+                    self.gov_entries.push(gov);
+                    match Self::rebuild_evaluator(
+                        &self.genesis,
+                        &self.authors,
+                        &self.gov_entries,
+                        now_secs,
+                        &self.evaluator,
+                    ) {
+                        Ok(evaluator) => self.evaluator = Arc::new(evaluator),
+                        Err(_) => {
+                            self.gov_entries.pop();
+                            dropped += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Into this pass's batch, never a batch of its own: a second write transaction opened
+        // while this one is open blocks forever (redb).
+        let skip: BTreeSet<Digest32> = rendered.iter().map(|r| r.entry_hash).collect();
+        Ok((
+            self.backfill_newly_readable_into(batch, could_read, &skip)?,
+            dropped,
+        ))
+    }
+
     /// Each author's head, for [`ChannelState::absorb_arrived`] to find what a sync added.
     fn heads(&self) -> BTreeMap<Digest32, u64> {
         self.authors
@@ -3136,6 +3218,17 @@ impl ChannelState {
         // D1). Counted at the row, not per `arrived` entry — a refusal before the row is queued
         // stores nothing, one after it still stores the row.
         let mut logged: u64 = 0;
+        // **The evaluator is rebuilt once per run of governance, not once per entry** (V210-71).
+        // A joiner's first sync of a room carries every consent at once, and a rebuild per entry
+        // made that sync quadratic in rebuilds of a relation that was itself cubic: minutes, under
+        // the room's lock, for a room of twenty. Governance entries are folded in as they come
+        // and the evaluator is brought up to date before the next content entry is rendered —
+        // so every entry still renders against all the governance before it — and at the end.
+        // `could_read` is who was readable before the run, for the backfill.
+        let mut gov_pending: Option<BTreeSet<Digest32>> = None;
+        // How many governance entries the pending run pushed: a fold that fails takes back out
+        // only the ones that fail on their own (V210-80's rule), never the run.
+        let mut gov_run: usize = 0;
         for (author, entry_hash, payload) in arrived {
             let step =
                 (|| -> Result<std::result::Result<Vec<Rendered>, Error>> {
@@ -3181,35 +3274,32 @@ impl ChannelState {
                         EntryKind::Content => None,
                     };
                     if let Some(gov) = gov {
-                        let could_read = self.readable_authors();
-                        self.gov_entries.push(gov);
-                        // A fold that fails takes the entry back out, or every later rebuild
-                        // failed on it too.
-                        let built = Self::build_evaluator(
-                            &self.genesis,
-                            &self.authors,
-                            &self.gov_entries,
-                            now_secs,
-                        );
-                        if built.is_err() {
-                            self.gov_entries.pop();
+                        if gov_pending.is_none() {
+                            gov_pending = Some(self.readable_authors());
                         }
-                        self.evaluator = Arc::new(refuse!(built));
+                        self.gov_entries.push(gov);
+                        gov_run += 1;
                         out.governance += 1;
-                        // Into this pass's batch, never a batch of its own: a second write
-                        // transaction opened while this one is open blocks forever (redb).
-                        let skip: BTreeSet<Digest32> =
-                            rendered_rows.iter().map(|r| r.entry_hash).collect();
-                        return Ok(Ok(self.backfill_newly_readable_into(
-                            &mut batch,
-                            &could_read,
-                            &skip,
-                        )?));
+                        return Ok(Ok(Vec::new()));
                     }
-                    Ok(Ok(self
-                        .render_content_into(&mut batch, author, entry_hash, &payload)?
-                        .into_iter()
-                        .collect()))
+                    let mut rows = match gov_pending.take() {
+                        Some(could_read) => {
+                            let (rows, dropped) = self.fold_governance_into(
+                                &mut batch,
+                                &could_read,
+                                &rendered_rows,
+                                std::mem::take(&mut gov_run),
+                                now_secs,
+                            )?;
+                            out.refused += dropped;
+                            rows
+                        }
+                        None => Vec::new(),
+                    };
+                    rows.extend(
+                        self.render_content_into(&mut batch, author, entry_hash, &payload)?,
+                    );
+                    Ok(Ok(rows))
                 })();
             match step {
                 Ok(Ok(rows)) => rendered_rows.extend(rows),
@@ -3218,6 +3308,23 @@ impl ChannelState {
                     write_failed = Some(e);
                     break;
                 }
+            }
+        }
+        // The run of governance the batch ended on, as each entry was before: even a pass that
+        // stopped at a refusal keeps the governance folded ahead of it.
+        if let (Some(could_read), None) = (gov_pending.take(), write_failed.as_ref()) {
+            match self.fold_governance_into(
+                &mut batch,
+                &could_read,
+                &rendered_rows,
+                std::mem::take(&mut gov_run),
+                now_secs,
+            ) {
+                Ok((rows, dropped)) => {
+                    out.refused += dropped;
+                    rendered_rows.extend(rows);
+                }
+                Err(e) => write_failed = Some(e),
             }
         }
         let committed = match write_failed {
@@ -3666,11 +3773,12 @@ impl ChannelState {
             Some(g) => {
                 let could_read = self.readable_authors();
                 self.gov_entries.push(g);
-                self.evaluator = Arc::new(Self::build_evaluator(
+                self.evaluator = Arc::new(Self::rebuild_evaluator(
                     &self.genesis,
                     &self.authors,
                     &self.gov_entries,
                     now_secs,
+                    &self.evaluator,
                 )?);
                 self.backfill_newly_readable(store, &could_read, now_secs)?;
                 Ok(Accepted::Governance)

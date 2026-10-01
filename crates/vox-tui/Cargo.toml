@@ -83,3 +83,25 @@ rustls.workspace = true
 # V210-85's proof stops `vox connect` at its passphrase prompts, which it shows only on a terminal:
 # the test opens a pty of its own and reads the terminal's modes back after the stop.
 rustix = { workspace = true, features = ["pty", "termios"] }
+
+# **Opt-in proofs** (decider, 2026-09-30): every claim is proven through the shipped binary from a
+# user's vantage, but a proof whose staging takes many minutes (tens of thousands of posts, a room
+# of hundreds of members, a driven terminal) is not part of every CI run or release gate. Such a
+# proof is a `[[test]]` below with `required-features = ["heavy-proofs"]`: without the feature it
+# is not even compiled, so it can neither run nor pass by accident. Run one with
+#   cargo test --release -p vox-tui --features heavy-proofs --test <name> -- --ignored
+# The feature changes no product code.
+[[test]]
+name = "opening_a_room_does_not_hold_up_a_post_proof"
+path = "tests/opening_a_room_does_not_hold_up_a_post_proof.rs"
+required-features = ["heavy-proofs"]
+
+[[test]]
+name = "a_room_of_many_members_syncs_without_holding_its_lock_proof"
+path = "tests/a_room_of_many_members_syncs_without_holding_its_lock_proof.rs"
+required-features = ["heavy-proofs"]
+
+[[test]]
+name = "a_long_room_reads_in_linear_time_proof"
+path = "tests/a_long_room_reads_in_linear_time_proof.rs"
+required-features = ["heavy-proofs"]

@@ -180,34 +180,6 @@ where
             return ExitCode::FAILURE;
         }
     };
-    // **Not `passphrase_or_prompt`.** Removing clap's `env` from the flag — so a flag
-    // could be refused while the variable still worked — left this caller reading the
-    // flag only, and the flag is now always `None`. So `VOX_IDENTITY_PASSPHRASE` stopped
-    // working for every tunnel verb (`service`, `forward`, `up`) and they
-    // answered `Failed(WrongPassphrase)`, which sends a person to check a passphrase that
-    // was never read. One helper reads the flag, the file, the variable and the prompt,
-    // in that order; every caller uses it.
-    let identity = match crate::tunnel_cli::identity_passphrase_for(
-        &paths,
-        room.identity_passphrase.clone(),
-        room.identity_passphrase_file.clone(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let room_pp = match crate::tunnel_cli::room_passphrase_for(
-        room.passphrase.as_ref(),
-        room.passphrase_file.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -219,22 +191,81 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let target = crate::tunnel_cli::RoomTarget {
-        paths,
-        listen: room.profile.listen,
-        anchors,
-        identity_passphrase: identity,
-        room: room.room.clone(),
-        room_passphrase: room_pp,
-    };
-    let outcome = rt.block_on(async move { crate::tunnel_cli::with_room(target, body).await });
-    match outcome {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            ExitCode::FAILURE
-        }
+    let listen = room.profile.listen;
+    let (outcome, stopped) = rt.block_on(async move {
+        // **The race starts before the first prompt** (V210-108), as `run_new_room_verb_with`'s
+        // does. The prompts ran before the handler was taken, so a SIGTERM or SIGHUP while
+        // `vox up` or `vox forward` waited for a passphrase took the default action: it died
+        // saying nothing, and left the terminal it was reading in raw mode, without echo. They
+        // run on a blocking thread now, inside the race, and the same listener then races the
+        // room's opening and the verb itself, so no signal falls between two listeners.
+        let stop = crate::app::stop_requested("vox");
+        tokio::pin!(stop);
+        let asking = tokio::task::spawn_blocking(move || {
+            // **Not `passphrase_or_prompt`.** Removing clap's `env` from the flag — so a flag
+            // could be refused while the variable still worked — left this caller reading the
+            // flag only, and the flag is now always `None`. So `VOX_IDENTITY_PASSPHRASE` stopped
+            // working for every tunnel verb (`service`, `forward`, `up`) and they answered
+            // `Failed(WrongPassphrase)`, which sends a person to check a passphrase that was never
+            // read. One helper reads the flag, the file, the variable and the prompt, in that
+            // order; every caller uses it.
+            let identity = crate::tunnel_cli::identity_passphrase_for(
+                &paths,
+                room.identity_passphrase.clone(),
+                room.identity_passphrase_file.clone(),
+            )?;
+            let room_pp = crate::tunnel_cli::room_passphrase_for(
+                room.passphrase.as_ref(),
+                room.passphrase_file.as_deref(),
+            )?;
+            Ok::<_, crate::app::AppError>(crate::tunnel_cli::RoomTarget {
+                paths,
+                listen,
+                anchors,
+                identity_passphrase: identity,
+                room: room.room.clone(),
+                room_passphrase: room_pp,
+            })
+        });
+        let target = tokio::select! {
+            asked = asking => match asked {
+                Ok(Ok(target)) => target,
+                Ok(Err(e)) => return (Err(e), false),
+                Err(e) => {
+                    return (
+                        Err(crate::app::AppError::Usage(format!("asking for a passphrase: {e}"))),
+                        false,
+                    )
+                }
+            },
+            signal = &mut stop => return (Err(crate::app::AppError::stopped_by(signal)), true),
+        };
+        (
+            crate::tunnel_cli::with_room(target, stop, body).await,
+            false,
+        )
+    });
+    if stopped {
+        // A prompt stopped part-way leaves the terminal in raw mode: no echo, no line editing, in
+        // the shell it hands back to.
+        let _ = crossterm::terminal::disable_raw_mode();
     }
+    let code = match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        // Its own code (a stopped client verb exits 128 + the signal's number, V210-108), and
+        // written without panicking: after a hangup stderr can be a terminal that is gone.
+        Err(e) => {
+            use std::io::Write as _;
+            let _ = writeln!(io::stderr(), "vox: {e}");
+            e.exit_code()
+        }
+    };
+    // Not a wait for the prompt it abandoned: dropping the runtime waits for its blocking
+    // threads, and one is still reading the terminal.
+    if stopped {
+        rt.shutdown_background();
+    }
+    code
 }
 
 /// The profile's control socket path, or `None` having said why there is none.
@@ -368,7 +399,16 @@ where
                 let stop = crate::app::stop_requested("vox");
                 tokio::select! {
                     signal = stop => {
-                        let why = waiting.stopped_by(signal);
+                        // **A server's stop is its normal end** (V210-108): `vox serve` says so and
+                        // exits 0, as a service manager expects of a service it stopped. A client
+                        // verb that did not finish exits 128 + the signal's number, saying why.
+                        let why = if waiting.serves() {
+                            crate::app::say(format_args!("vox: stopped by {}", signal.name()));
+                            crate::app::say(format_args!("vox: stopping"));
+                            Ok(())
+                        } else {
+                            Err(waiting.stopped_by(signal))
+                        };
                         // **Its peers are told it went** (V210-85). Stopped mid-join, it left its
                         // connections to the anchor and the host unclosed, and both counted it as
                         // connected until their idle timeout. A shutdown closes each with a
@@ -381,7 +421,7 @@ where
                             )
                             .await;
                         }
-                        (Err(why), true)
+                        (why, true)
                     }
                     done = work => (done, false),
                 }
@@ -1556,12 +1596,15 @@ pub fn run() -> ExitCode {
                 return ExitCode::FAILURE;
             };
             let a = args.clone();
-            run_new_room_verb(
+            // Raced against every stop signal from before the identity is unlocked (V210-108).
+            run_new_room_verb_with(
                 args.profile.clone(),
                 AnchorUse::Needed,
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
-                move |node, anchors| async move {
+                Some(crate::tunnel_cli::Waiting::server()),
+                || Ok(()),
+                move |node, anchors, ()| async move {
                     // Only the verbs that keep running serve the socket: `vox id` and the trust
                     // verbs share this path and are done in a moment (V210-83, #263).
                     let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
@@ -1631,104 +1674,131 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // **A stop signal ends a room verb cleanly** (V210-108): `vox room tail` runs until
+            // stopped, and Ctrl-C, SIGTERM or a closed terminal ended it on the spot, saying
+            // nothing. `vox room send` handles its own stop, because it withdraws its offer first.
+            let handles_its_own_stop = matches!(sub, RoomCmd::Send(_));
             let outcome = rt.block_on(async {
-                match &sub {
-                    RoomCmd::Post(a) => {
-                        let opts = crate::room_cli::PostOpts {
-                            kind: a.kind.clone(),
-                            work: a.work.clone(),
-                            attempt: a.attempt.clone(),
-                            to: a.to.clone(),
-                            urgent: a.urgent,
-                            re: a.re.clone(),
-                            thread: a.thread.clone(),
-                            data: a.data.clone(),
-                            coord: a.coord.opts(),
-                        };
-                        crate::room_cli::post_cmd(&paths, &a.room, a.text.as_deref(), &opts).await
-                    }
-                    RoomCmd::Read(a) => {
-                        crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit, a.json)
+                let work = async {
+                    match &sub {
+                        RoomCmd::Post(a) => {
+                            let opts = crate::room_cli::PostOpts {
+                                kind: a.kind.clone(),
+                                work: a.work.clone(),
+                                attempt: a.attempt.clone(),
+                                to: a.to.clone(),
+                                urgent: a.urgent,
+                                re: a.re.clone(),
+                                thread: a.thread.clone(),
+                                data: a.data.clone(),
+                                coord: a.coord.opts(),
+                            };
+                            crate::room_cli::post_cmd(&paths, &a.room, a.text.as_deref(), &opts)
+                                .await
+                        }
+                        RoomCmd::Read(a) => {
+                            crate::room_cli::read(
+                                &paths,
+                                &a.room,
+                                a.since.as_deref(),
+                                a.limit,
+                                a.json,
+                            )
                             .await
+                        }
+                        RoomCmd::Tail(a) => {
+                            crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
+                        }
+                        RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
+                        RoomCmd::List(_) => crate::room_cli::list(&paths).await,
+                        RoomCmd::Claim(a) => {
+                            crate::room_cli::claim_resource(
+                                &paths,
+                                &a.room,
+                                a.resource.as_deref(),
+                                a.work.as_deref(),
+                                a.ttl,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Release(a) => {
+                            crate::room_cli::release_resource(
+                                &paths,
+                                &a.room,
+                                &a.resource,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Decline(a) => {
+                            crate::room_cli::decline_resource(
+                                &paths,
+                                &a.room,
+                                &a.resource,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Renew(a) => {
+                            crate::room_cli::renew_resource(
+                                &paths,
+                                &a.room,
+                                &a.resource,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Handoff(a) => {
+                            crate::room_cli::handoff_resource(
+                                &paths,
+                                &a.room,
+                                &a.resource,
+                                &a.to,
+                                a.to_session.as_deref(),
+                                a.ttl,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Board(a) => {
+                            crate::room_cli::board(&paths, &a.room, a.json, a.session.as_deref())
+                                .await
+                        }
+                        RoomCmd::Send(a) => {
+                            crate::room_cli::send_file(&paths, &a.room, &a.path).await
+                        }
+                        RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
+                        RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
+                        RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
+                        RoomCmd::Get(a) => {
+                            crate::room_cli::get_file(
+                                &paths,
+                                &a.room,
+                                &a.file,
+                                a.dir.as_deref(),
+                                a.out.as_deref(),
+                            )
+                            .await
+                        }
                     }
-                    RoomCmd::Tail(a) => {
-                        crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
-                    }
-                    RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
-                    RoomCmd::List(_) => crate::room_cli::list(&paths).await,
-                    RoomCmd::Claim(a) => {
-                        crate::room_cli::claim_resource(
-                            &paths,
-                            &a.room,
-                            a.resource.as_deref(),
-                            a.work.as_deref(),
-                            a.ttl,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Release(a) => {
-                        crate::room_cli::release_resource(
-                            &paths,
-                            &a.room,
-                            &a.resource,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Decline(a) => {
-                        crate::room_cli::decline_resource(
-                            &paths,
-                            &a.room,
-                            &a.resource,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Renew(a) => {
-                        crate::room_cli::renew_resource(
-                            &paths,
-                            &a.room,
-                            &a.resource,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Handoff(a) => {
-                        crate::room_cli::handoff_resource(
-                            &paths,
-                            &a.room,
-                            &a.resource,
-                            &a.to,
-                            a.to_session.as_deref(),
-                            a.ttl,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Board(a) => {
-                        crate::room_cli::board(&paths, &a.room, a.json, a.session.as_deref()).await
-                    }
-                    RoomCmd::Send(a) => crate::room_cli::send_file(&paths, &a.room, &a.path).await,
-                    RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
-                    RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
-                    RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
-                    RoomCmd::Get(a) => {
-                        crate::room_cli::get_file(
-                            &paths,
-                            &a.room,
-                            &a.file,
-                            a.dir.as_deref(),
-                            a.out.as_deref(),
-                        )
-                        .await
+                };
+                if handles_its_own_stop {
+                    work.await
+                } else {
+                    let stop = crate::app::stop_requested("vox room");
+                    tokio::select! {
+                        done = work => done,
+                        signal = stop => Err(crate::app::AppError::stopped_by(signal)),
                     }
                 }
             });
             match outcome {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("vox: {e}");
+                    // Not `eprintln!`: after a hangup stderr can be a terminal that is gone.
+                    use std::io::Write as _;
+                    let _ = writeln!(io::stderr(), "vox: {e}");
                     // 3 = version refusal, 4 = operation conflict (ADR-021 §5, §6).
                     e.exit_code()
                 }
