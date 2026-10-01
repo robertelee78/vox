@@ -22,6 +22,9 @@
 //! - The gain cycle's random offset is drawn from the operating system (`getrandom`) once per
 //!   ProbeBw entry, instead of from a `rand_pcg` generator seeded the same way; Vox does not
 //!   otherwise depend on `rand`.
+//! - **The bandwidth estimator is the BBR draft's delivery-rate sampling**, not quinn's
+//!   `bw_estimation.rs`; see the comment at `BandwidthEstimation` for what quinn's did when
+//!   measured.
 //! - quinn's `#[cfg(test)]` check of the min-max filter is not carried (Vox has no in-crate tests,
 //!   ADR-018).
 //!
@@ -754,71 +757,105 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
 
-// ---- quinn-proto 0.11.18 `congestion/bbr/bw_estimation.rs` --------------------------------------
+// ---- Delivery-rate estimation (Vox's; replaces quinn's `bw_estimation.rs`) ----------------------
+//
+// quinn's estimator takes, per acknowledged packet, the smaller of the rate between the last two
+// sends and the rate between the last two acknowledgements, and feeds the max filter only samples
+// above its current maximum. Measured through the shipped binary on a 200 Mbit/s path with 1%
+// loss, its estimate climbed past the link rate and, since a lower sample never enters the filter,
+// never came down: the window it sized grew to eight bandwidth-delay products and filled the
+// bottleneck's queue within a second of every entry to tier 3.
+//
+// This is the BBR draft's delivery-rate sampling instead (draft-cheng-iccrg-delivery-rate-
+// estimation): each sent packet records how much had been delivered when it left, and when; its
+// acknowledgement yields `delivered now - delivered then` over the longer of the send and the
+// acknowledgement intervals, which an acknowledgement arriving bunched cannot shorten. Every sample
+// goes to the max filter, which ages the old maximum out over its ten rounds as the draft's does.
+
+/// The most sent-packet records kept: far more than any window holds in flight. If the
+/// acknowledgements stop for long enough to pass it, the oldest records go and their packets, if
+/// ever acknowledged, give no sample.
+const MAX_SENT_RECORDS: usize = 1 << 16;
+
+/// What the estimator remembers of one send.
+#[derive(Clone, Copy, Debug)]
+struct SentRecord {
+    sent: Instant,
+    /// Bytes delivered when it was sent…
+    delivered: u64,
+    /// …when the last of those was delivered…
+    delivered_time: Instant,
+    /// …and when the send interval it belongs to began.
+    first_sent_time: Instant,
+}
 
 #[derive(Clone, Debug, Default)]
 struct BandwidthEstimation {
-    total_acked: u64,
-    prev_total_acked: u64,
-    acked_time: Option<Instant>,
-    prev_acked_time: Option<Instant>,
-    total_sent: u64,
-    prev_total_sent: u64,
-    sent_time: Option<Instant>,
-    prev_sent_time: Option<Instant>,
+    delivered: u64,
+    delivered_time: Option<Instant>,
+    first_sent_time: Option<Instant>,
+    sent: VecDeque<SentRecord>,
     max_filter: MinMax,
     acked_at_last_window: u64,
 }
 
 impl BandwidthEstimation {
-    fn on_sent(&mut self, now: Instant, bytes: u64) {
-        self.prev_total_sent = self.total_sent;
-        self.total_sent += bytes;
-        self.prev_sent_time = self.sent_time;
-        self.sent_time = Some(now);
+    fn on_sent(&mut self, now: Instant, _bytes: u64) {
+        if self.sent.is_empty() {
+            // Nothing in flight: the next sample's intervals start here.
+            self.first_sent_time = Some(now);
+            self.delivered_time = Some(now);
+        }
+        if self.sent.len() == MAX_SENT_RECORDS {
+            self.sent.pop_front();
+        }
+        self.sent.push_back(SentRecord {
+            sent: now,
+            delivered: self.delivered,
+            delivered_time: self.delivered_time.unwrap_or(now),
+            first_sent_time: self.first_sent_time.unwrap_or(now),
+        });
     }
 
-    fn on_ack(&mut self, now: Instant, _sent: Instant, bytes: u64, round: u64, app_limited: bool) {
-        self.prev_total_acked = self.total_acked;
-        self.total_acked += bytes;
-        self.prev_acked_time = self.acked_time;
-        self.acked_time = Some(now);
-
-        let prev_sent_time = match self.prev_sent_time {
-            Some(prev_sent_time) => prev_sent_time,
-            None => return,
+    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, round: u64, app_limited: bool) {
+        self.delivered += bytes;
+        self.delivered_time = Some(now);
+        // Records are in send order. Those sent before this packet were acknowledged already, or
+        // lost, or are acknowledged out of order and give no sample; they go.
+        let at = self.sent.partition_point(|r| r.sent < sent);
+        let record = self.sent.get(at).filter(|r| r.sent == sent).copied();
+        self.sent.drain(..at);
+        let Some(record) = record else {
+            return;
         };
-
-        let send_rate = match self.sent_time {
-            Some(sent_time) if sent_time > prev_sent_time => Self::bw_from_delta(
-                self.total_sent - self.prev_total_sent,
-                sent_time - prev_sent_time,
-            )
-            .unwrap_or(0),
-            _ => u64::MAX, // will take the min of send and ack, so this is just a skip
+        // Several packets can share one send instant (one batch); keep the record for the rest.
+        if self.sent.get(1).is_none_or(|next| next.sent != sent) {
+            self.sent.pop_front();
+        }
+        self.first_sent_time = Some(record.sent);
+        let send_elapsed = record
+            .sent
+            .saturating_duration_since(record.first_sent_time);
+        let ack_elapsed = now.saturating_duration_since(record.delivered_time);
+        let Some(rate) = Self::bw_from_delta(
+            self.delivered - record.delivered,
+            send_elapsed.max(ack_elapsed),
+        ) else {
+            return;
         };
-
-        let ack_rate = match self.prev_acked_time {
-            Some(prev_acked_time) => Self::bw_from_delta(
-                self.total_acked - self.prev_total_acked,
-                now - prev_acked_time,
-            )
-            .unwrap_or(0),
-            None => 0,
-        };
-
-        let bandwidth = send_rate.min(ack_rate);
-        if !app_limited && self.max_filter.get() < bandwidth {
-            self.max_filter.update_max(round, bandwidth);
+        // An application-limited sample says less than the path can carry; it counts only when it
+        // is the highest anyway.
+        if !app_limited || rate >= self.max_filter.get() {
+            self.max_filter.update_max(round, rate);
         }
     }
 
     fn bytes_acked_this_window(&self) -> u64 {
-        self.total_acked - self.acked_at_last_window
+        self.delivered - self.acked_at_last_window
     }
 
     fn end_acks(&mut self, _current_round: u64, _app_limited: bool) {
-        self.acked_at_last_window = self.total_acked;
+        self.acked_at_last_window = self.delivered;
     }
 
     fn get_estimate(&self) -> u64 {
