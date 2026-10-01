@@ -11,7 +11,7 @@
 //! mint one. So a work-bound post from the session that holds the claim on that item
 //! carries a **seeded id** in `data.attempt` — the claim's acquisition, or the holder's
 //! latest `failed` since it. Seeding starts nothing: an attempt becomes active only on the
-//! holder's `working` (ADR-021 §3), which `tracker_rehearsal_proof` proves with a tracker.
+//! holder's `working` (ADR-021 §3).
 //! This proof covers the seeding:
 //!
 //! 1. a skill-shaped key is accepted and carried unchanged;
