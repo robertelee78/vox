@@ -91,12 +91,23 @@ impl AppError {
 /// [`ViewModel`] to render and consumes [`Command`]s the user issues. The live
 /// implementation is [`LiveCore`] (an embedded `vox-core` node); [`OfflineCore`]
 /// is the no-node shell used by tests.
+/// What the TUI's status line says while creating or unlocking the identity waits for another
+/// vox holding the profile.
+pub const WAITING_FOR_PROFILE_TUI: &str =
+    "another vox is using this profile — waiting for it to finish (it goes on by itself)";
+
 pub trait CoreHandle {
     /// The latest view model to render (may fold in pending core events).
     fn view(&mut self) -> ViewModel;
     /// Apply a user command; returns a **typed** status to surface (no free text,
     /// so the status channel cannot leak plaintext/secret detail).
     fn apply(&mut self, command: Command) -> CommandStatus;
+    /// [`CoreHandle::apply`], calling `waiting` if the command has to wait for another vox
+    /// holding the profile, so the loop can say so on screen while it waits (V210-100).
+    fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
+        let _ = waiting;
+        self.apply(command)
+    }
     /// An optional startup banner surfaced in the status line — used to state
     /// plainly when the client is running without a live node (so an offline shell
     /// is never mistaken for a connected client). `None` for a live core.
@@ -887,11 +898,13 @@ pub fn run_daemon(
     };
 
     rt.block_on(async {
-        let outcome = node
-            .apply(NodeCommand::Unlock {
+        let outcome = crate::tunnel_cli::apply_saying_waits(
+            &node,
+            NodeCommand::Unlock {
                 passphrase: Secret::new(identity.as_bytes().to_vec()),
-            })
-            .await;
+            },
+        )
+        .await;
         if !outcome.is_done() {
             // **Say what to do, not which enum variant lost.** A new person is sent here
             // by `vox room list`'s "start one: vox daemon", and this is the second thing
@@ -1419,7 +1432,13 @@ fn event_loop(
             Action::Quit => return Ok(()),
             Action::Redraw => {}
             Action::Dispatch(cmd) => {
-                ui.status_message = Some(core.apply(cmd).message());
+                // **Waiting is said in the status line** (V210-100), never on stderr: stderr is
+                // this terminal, and a line written there lands inside the screen.
+                let status = core.apply_noting(cmd, &mut || {
+                    ui.status_message = Some(WAITING_FOR_PROFILE_TUI.into());
+                    let _ = io.draw(&mut |f| render(f, &vm, &mut ui));
+                });
+                ui.status_message = Some(status.message());
             }
         }
     }

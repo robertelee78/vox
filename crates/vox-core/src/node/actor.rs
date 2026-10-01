@@ -2898,7 +2898,11 @@ impl Node {
             return Outcome::Failed(Fault::IdentityExists);
         }
         let now = self.now();
-        match Profile::create_with_profile(self.paths.clone(), passphrase, now, self.argon2) {
+        let events = self.event_tx.clone();
+        let waiting = move || {
+            let _ = events.send(NodeEvent::WaitingForProfile);
+        };
+        match Profile::create_noting(self.paths.clone(), passphrase, now, self.argon2, &waiting) {
             Ok(p) => {
                 self.profile = Some(p);
                 // A fresh identity gets its prekey ring immediately: without it the
@@ -2919,7 +2923,11 @@ impl Node {
         let Some(profile) = self.profile.as_mut() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        match profile.unlock(passphrase) {
+        let events = self.event_tx.clone();
+        let waiting = move || {
+            let _ = events.send(NodeEvent::WaitingForProfile);
+        };
+        match profile.unlock_noting(passphrase, &waiting) {
             Ok(()) => {
                 let now = self.now();
                 if let Err(e) = self.load_prekeys(now) {
