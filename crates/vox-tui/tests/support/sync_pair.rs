@@ -41,7 +41,7 @@ impl Proc {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(ok, "kill {sig} {}", self.pid());
+        assert!(ok, "APPARATUS (harness): kill {sig} {} failed", self.pid());
     }
 
     pub fn transcript(&self) -> String {
@@ -96,7 +96,7 @@ pub fn anchor(root: &Path) -> (Proc, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox node");
+        .expect("APPARATUS (harness): could not spawn vox node");
     let said = drain(&mut child);
     let p = Proc { child, said };
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -110,7 +110,7 @@ pub fn anchor(root: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "APPARATUS (staging): the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -137,7 +137,7 @@ impl Member {
             fp: String::new(),
         };
         let (ok, out, err) = m.vox(&["id"], None);
-        assert!(ok, "{name}: vox id: {err}");
+        assert!(ok, "APPARATUS (staging): {name}: vox id failed: {err}");
         m.fp = out.trim().to_owned();
         m
     }
@@ -162,11 +162,13 @@ impl Member {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS (harness): could not spawn vox");
         if let Some(s) = stdin {
             child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
         }
-        let out = child.wait_with_output().expect("vox finished");
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS (harness): could not wait for vox");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -176,7 +178,11 @@ impl Member {
 
     pub fn trust(&self, other: &Member) {
         let (ok, out, err) = self.vox(&["trust", "add", &other.fp, "--name", other.name], None);
-        assert!(ok, "{} trusts {}: {out}{err}", self.name, other.name);
+        assert!(
+            ok,
+            "APPARATUS (staging): {} could not trust {}: {out}{err}",
+            self.name, other.name
+        );
     }
 
     /// Start this member's daemon, optionally behind `anchor`, and wait until it answers.
@@ -214,14 +220,14 @@ impl Member {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox daemon");
+            .expect("APPARATUS (harness): could not spawn vox daemon");
         let said = drain(&mut child);
         let p = Proc { child, said };
         let deadline = Instant::now() + Duration::from_secs(90);
         while !self.vox(&["room", "list"], None).0 {
             assert!(
                 Instant::now() < deadline,
-                "{}'s daemon never answered:\n{}",
+                "APPARATUS (staging): {}'s daemon never answered:\n{}",
                 self.name,
                 p.transcript()
             );
@@ -233,19 +239,23 @@ impl Member {
     /// Create a room and return its id as `vox room list` prints it.
     pub fn create(&self, name: &str) -> String {
         let (ok, out, err) = self.vox(&["room", "create", "--name", name], Some(ROOM_PASS));
-        assert!(ok, "{} creates {name}: {out}{err}", self.name);
+        assert!(
+            ok,
+            "APPARATUS (staging): {} could not create {name}: {out}{err}",
+            self.name
+        );
         let (ok, list, err) = self.vox(&["room", "list"], None);
-        assert!(ok, "room list: {err}");
+        assert!(ok, "APPARATUS (staging): vox room list failed: {err}");
         list.lines()
             .find(|l| l.split_whitespace().any(|w| w == name))
             .and_then(|l| l.split_whitespace().next())
-            .unwrap_or_else(|| panic!("room {name} not listed: {list}"))
+            .unwrap_or_else(|| panic!("APPARATUS (staging): room {name} not listed: {list}"))
             .to_owned()
     }
 
     pub fn invite(&self, room: &str) -> String {
         let (ok, link, err) = self.vox(&["room", "invite", room], None);
-        assert!(ok, "invite: {err}");
+        assert!(ok, "APPARATUS (staging): vox room invite failed: {err}");
         link.trim().to_owned()
     }
 
@@ -259,12 +269,19 @@ impl Member {
             eprintln!("[receipt] {} join attempt {attempt}: {out}{err}", self.name);
             std::thread::sleep(Duration::from_secs(3));
         }
-        panic!("CANNOT MEASURE: {} never joined {name}", self.name);
+        panic!(
+            "APPARATUS (staging not achieved): {} never joined {name}",
+            self.name
+        );
     }
 
     pub fn post(&self, room: &str, text: &str) {
         let (ok, out, err) = self.vox(&["room", "post", room, text], None);
-        assert!(ok, "{} posts {text:?}: {out}{err}", self.name);
+        assert!(
+            ok,
+            "PRODUCT: {} could not post {text:?}: {out}{err}",
+            self.name
+        );
     }
 
     /// This member's sync counters, from the shipped `vox status --json`.
@@ -272,12 +289,12 @@ impl Member {
         let (ok, out, err) = self.vox(&["status", "--json"], None);
         assert!(
             ok,
-            "PRODUCT: {}: vox status --json failed: {err}",
+            "APPARATUS (measurement): {}: vox status --json failed: {err}",
             self.name
         );
         serde_json::from_str(out.trim()).unwrap_or_else(|e| {
             panic!(
-                "PRODUCT: {}: vox status --json printed what is not JSON, {out:?}: {e}",
+                "APPARATUS (measurement): {}: vox status --json printed {out:?}: {e}",
                 self.name
             )
         })
@@ -297,7 +314,7 @@ impl Member {
         .unwrap();
         let client = rt
             .block_on(IpcClient::open(&paths.socket_file()))
-            .expect("attach to the node");
+            .expect("APPARATUS (harness): could not attach to the node");
         Reader { rt, client }
     }
 }
@@ -316,25 +333,25 @@ fn carries_marker(path: &str) -> std::io::Result<bool> {
 /// The mutant sender build that `VOX_MUTANT_SENDER` names (`scripts/build-mutant-sender.sh` builds
 /// it; CI and the release gate run that before the proofs), checked before anything is measured:
 /// it carries the mutant's marker, and the shipped binary the rest of the proof runs does not.
-/// Else CANNOT MEASURE.
+/// Else an `APPARATUS (harness)` red.
 pub fn mutant_sender() -> String {
     let path = std::env::var("VOX_MUTANT_SENDER").unwrap_or_else(|_| {
         panic!(
-            "CANNOT MEASURE: VOX_MUTANT_SENDER does not name the mutant sender build \
+            "APPARATUS (harness): VOX_MUTANT_SENDER does not name the mutant sender build \
              (VOX_MUTANT_SENDER=$(scripts/build-mutant-sender.sh))"
         )
     });
     match carries_marker(&path) {
         Ok(true) => {}
         Ok(false) => panic!(
-            "CANNOT MEASURE: VOX_MUTANT_SENDER={path} is not a mutant sender build (it does not \
+            "APPARATUS (harness): VOX_MUTANT_SENDER={path} is not a mutant sender build (it does not \
              carry {MUTANT_MARKER})"
         ),
-        Err(e) => panic!("CANNOT MEASURE: VOX_MUTANT_SENDER={path}: {e}"),
+        Err(e) => panic!("APPARATUS (harness): VOX_MUTANT_SENDER={path}: {e}"),
     }
     assert!(
-        !carries_marker(VOX).expect("read the shipped binary"),
-        "the shipped binary {VOX} carries the mutant sender's marker {MUTANT_MARKER}"
+        !carries_marker(VOX).expect("APPARATUS (harness): could not read the shipped binary"),
+        "APPARATUS (harness): the shipped binary {VOX} carries the mutant sender's marker {MUTANT_MARKER}"
     );
     path
 }
@@ -391,8 +408,8 @@ impl Reader {
                 .iter()
                 .map(|(id, _, _)| *id)
                 .find(|id| vox_core::node::link::b32_encode(id).starts_with(prefix))
-                .unwrap_or_else(|| panic!("room {prefix} not on this node")),
-            other => panic!("rooms: {other:?}"),
+                .unwrap_or_else(|| panic!("APPARATUS (staging): room {prefix} not on this node")),
+            other => panic!("APPARATUS (harness): rooms: {other:?}"),
         }
     }
 
@@ -411,50 +428,6 @@ impl Reader {
     /// Whether `text` is readable in the room now.
     pub fn has(&mut self, room: vox_core::hash::Digest32, text: &str) -> bool {
         self.texts(room).iter().any(|t| t == text)
-    }
-
-    /// The author of the latest post in the room whose text contains `needle`.
-    pub fn author_of(
-        &mut self,
-        room: vox_core::hash::Digest32,
-        needle: &str,
-    ) -> Option<vox_core::hash::Digest32> {
-        match self.rt.block_on(self.client.request(&Request::Read {
-            channel_id: room,
-            since: None,
-            limit: 0,
-        })) {
-            Ok(Frame::Rows { rows }) => rows
-                .iter()
-                .rev()
-                .find(|r| r.text.contains(needle))
-                .map(|r| r.author),
-            _ => None,
-        }
-    }
-
-    /// Ask this member's daemon for a local forward to `host`'s service `tag` in the room, as
-    /// `vox room get` does. The bound local address.
-    pub fn forward(
-        &mut self,
-        room: vox_core::hash::Digest32,
-        host: vox_core::hash::Digest32,
-        tag: &str,
-    ) -> String {
-        match self.rt.block_on(self.client.request(&Request::Forward {
-            channel_id: room,
-            host,
-            service_tag: tag.to_owned(),
-            local: "127.0.0.1:0".into(),
-        })) {
-            Ok(Frame::Bound { local }) => local,
-            Ok(refused @ Frame::Error { .. }) => panic!(
-                "PRODUCT: the daemon refused the forward to {tag} (as `vox room get` would): \
-                 {refused:?}"
-            ),
-            Ok(other) => panic!("PRODUCT: unexpected reply to a forward to {tag}: {other:?}"),
-            Err(e) => panic!("APPARATUS: control-socket request failed: {e}"),
-        }
     }
 }
 

@@ -515,7 +515,15 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     let rss_at_cap = rss(alice_pid);
     // What each side's `vox status` lists now: Bob's 16 tunnels to the offer, Alice's 16 from him.
     let listed = |m: &Member, way: &str| -> (usize, String) {
-        let json = m.status();
+        // Not `Member::status`: here the listing is the claim, so a failed one is the product's.
+        let (ok, out, err) = m.vox(&["status", "--json"], None);
+        assert!(ok, "PRODUCT: {}: vox status --json failed: {err}", m.name);
+        let json: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: {}: vox status --json printed what is not JSON, {out:?}: {e}",
+                m.name
+            )
+        });
         let rows = json["tunnels"]
             .as_array()
             .map(|rows| {

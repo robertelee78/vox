@@ -1758,6 +1758,10 @@ const REMOVE_SERVICE_PATIENCE: std::time::Duration = std::time::Duration::from_s
 /// If the node cannot be reached, the room is unknown, the file cannot be read, or
 /// the node refuses to offer the service.
 pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Result<(), AppError> {
+    // Every stop signal, not Ctrl-C alone (V210-108): SIGTERM and SIGHUP ended the offer on the
+    // spot, leaving it on the node. Taken first, so a stop sent while the offer is being made is
+    // not the default action's silent death; the loop below acts on it.
+    let interrupted = crate::app::stop_requested("vox room send");
     let (sha256, size) = digest_file(path)?;
     let name = path
         .file_name()
@@ -1834,23 +1838,20 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
     // reset, never a clean close (see below).
     let (stop, stopping) = tokio::sync::watch::channel(false);
     let mut transfers = tokio::task::JoinSet::new();
-    // One stop listener (Ctrl-C, SIGTERM, SIGHUP, SIGQUIT) for the whole loop: one made per turn
-    // misses a signal that lands in the same turn as another arm (see `app::run_node`). A SIGTERM
-    // left to its default ended the process where it stood, closing every transfer in flight
-    // gracefully with no cut at all.
-    let interrupted = crate::app::stop_requested("vox room send");
+    // One stop listener for the whole loop, taken above: one made per turn misses a SIGINT that
+    // lands in the same turn as another arm (see `app::run_node`).
     tokio::pin!(interrupted);
-    loop {
+    let signal = loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((sock, _)) = accepted else { continue };
                 while transfers.try_join_next().is_some() {}
                 transfers.spawn(serve_file(path.clone(), sock, stopping.clone()));
             }
-            _ = &mut interrupted => break,
+            signal = &mut interrupted => break signal,
         }
-    }
-    println!("vox: no longer offering {tag}");
+    };
+    crate::app::say(format_args!("vox: no longer offering {tag}"));
     // Bounded: a daemon that does not answer (stopped, wedged) left this waiting for ever, and
     // a stop that only SIGKILL could end. Its sessions are reset below either way.
     let removed = tokio::time::timeout(
@@ -1876,7 +1877,7 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
         async { while transfers.join_next().await.is_some() {} },
     )
     .await;
-    Ok(())
+    Err(AppError::stopped_by(signal))
 }
 
 /// Send the file at `path` to one collector's connection, and close it cleanly only if all of

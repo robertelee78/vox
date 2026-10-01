@@ -72,8 +72,9 @@ pub struct ChannelDetail {
     pub epoch: u64,
     /// Members, in fingerprint order.
     pub members: Vec<Digest32>,
-    /// The render-gated timeline, oldest first.
-    pub timeline: Vec<MessageRow>,
+    /// The render-gated timeline, oldest first. Shared, not copied: every clone of the view — each
+    /// IPC read page takes one — used to copy every room's whole timeline (V210-71).
+    pub timeline: std::sync::Arc<[MessageRow]>,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,

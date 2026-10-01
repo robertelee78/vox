@@ -56,8 +56,14 @@ def stage(name):
             pass
 
 
+# What a debug build's `vox` adds to a driver's waits, in seconds: the measured cost of the joins
+# and unlocks it waits on, set by the Rust wrapper (`pty_driver::run_for`); 0 in a release build.
+DEBUG_EXTRA = int(os.environ.get("VOX_PTY_DEBUG_EXTRA_SECS", "0"))
+
+
 def arm(secs, tag):
-    """Bound the whole driver to `secs`; see the module docs."""
+    """Bound the whole driver to `secs`, plus DEBUG_EXTRA; see the module docs."""
+    secs += DEBUG_EXTRA
     def hung(signum, _frame):
         why = "ran past its budget" if signum == signal.SIGALRM else "was told to stop"
         print(f"{tag} HUNG at {STAGE[0]!r}: the driver {why} after {time.time() - T0:.0f}s; "
