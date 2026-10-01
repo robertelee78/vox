@@ -974,8 +974,15 @@ Both unknowns are already spiked; neither remains open.
   > (measured: OpenCode runs the wake's `chat.message` before `promptAsync` returns, so the plugin also
   > matches the prompt by its text); the drain renders an envelope's `body`. `opencode_plugin_proof`
   > reads the session as OpenCode stored it and asserts one copy of the woken message, one of a
-  > message that woke nothing, and no envelope JSON. A Claude Code wake is not covered: whether its
-  > drain runs on a socket-delivered message is unmeasured.
+  > message that woke nothing, and no envelope JSON. **A Claude Code wake had the same defect:**
+  > measured against a live Claude Code 2.1.287, a message written to its messaging socket runs
+  > `UserPromptSubmit` with that message as `prompt`, so the drain read the woken message into the
+  > same turn. The drain now recognises its own wake in the `prompt` it runs on (the wake's header for
+  > the room, the entry and every word) and skips that entry; `remote_interrupt_proof` (5) runs the
+  > hook on the wake its stand-in socket received and asserts the room read leaves it out. That spike
+  > also showed Claude Code presenting the wake as a message "from another Claude session … a
+  > teammate's request", so the wake's header now says Vox relayed it and that it is neither another
+  > session's nor the operator's words (the decider, 2026-10-01).
 
   > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, then reproduced through the real
   > `vox daemon`; fix proposed in #16.** `vox daemon`
