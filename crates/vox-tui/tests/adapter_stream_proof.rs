@@ -591,15 +591,39 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     // ---- the consumer's NODE restarts (ADR-021 F19) ----
     // The cursor only means "everything after this row" if the rows before it are still
     // before it once bob's node has restarted. bob's order is local, not canonical, and the
-    // node rebuilds it from its sealed cache on reopen. alice and bob post alternately, each
-    // post typed right after the other's, so bob takes some of alice's rows only after his
-    // own later ones: his local order differs from the canonical one, and a node that
-    // rebuilt canonically, or in any other order, is told apart from one that kept it.
+    // node rebuilds it from its sealed cache on reopen. So bob's local order is made to
+    // differ from the canonical one, without a race: bob's daemon is stopped, alice posts
+    // (her row cannot reach him), bob's `vox room post` is issued and waits on his control
+    // socket, and his daemon is continued. His post is then a row created after hers and
+    // taken in one step, while hers needs a sync session of several round trips, so bob holds
+    // his later row before her earlier one. A node that rebuilt canonically, or in any other
+    // order, is then told apart from one that kept its order.
+    let bob_pid = bob.daemon_pid().unwrap_or_else(|| {
+        panic!("CANNOT MEASURE: staging not achieved — bob's daemon has no pid")
+    });
+    let to_bob = |sig: &str| {
+        let ok = Command::new("kill")
+            .args([sig, &bob_pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(
+            ok,
+            "CANNOT MEASURE: staging not achieved — `kill {sig} {bob_pid}` failed"
+        );
+    };
     for i in 0..20 {
-        for (w, name) in [(alice, "alice"), (bob, "bob")] {
-            let o = w.vox(None, &["room", "post", &r, &format!("F19 {name} {i:02}")]);
-            assert!(o.ok, "PRODUCT: {name}'s post {i} was refused: {o:?}");
-        }
+        to_bob("-STOP");
+        let o = alice.vox(None, &["room", "post", &r, &format!("F19 alice {i:02}")]);
+        let posted = std::thread::scope(|s| {
+            let bobs = s.spawn(|| bob.vox(None, &["room", "post", &r, &format!("F19 bob {i:02}")]));
+            // Long enough for bob's request to be written to his control socket.
+            std::thread::sleep(Duration::from_millis(200));
+            to_bob("-CONT");
+            bobs.join()
+        });
+        assert!(o.ok, "PRODUCT: alice's post {i} was refused: {o:?}");
+        let o = posted.unwrap_or_else(|_| panic!("CANNOT MEASURE: bob's post {i} thread panicked"));
+        assert!(o.ok, "PRODUCT: bob's post {i} was refused: {o:?}");
     }
     until(
         bob,
