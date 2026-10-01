@@ -93,6 +93,10 @@ pub struct NodeView {
     pub identity: Option<IdentityInfo>,
     /// Whether the identity is locked (no signer in memory).
     pub locked: bool,
+    /// Whether a lock is under way: the identity is locked and refuses new work, and the node is
+    /// waiting for work that still held a secret to finish and wipe it (V210-94). `locked` turns
+    /// true when it has.
+    pub locking: bool,
     /// Whether every open channel's SEK is `mlock`ed (`true` when none are open).
     /// `false` surfaces the documented zeroize-only degradation (ADR-010/015).
     pub mlock_active: bool,
@@ -420,6 +424,10 @@ pub enum Fault {
     KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
+    /// Another vox holds this profile's store open for writing, and only one at a time may.
+    /// Not [`Fault::Internal`], which is how an unlock that met one was reported (V210-100):
+    /// nothing was wrong with vox or the profile, and stopping the other one is the remedy.
+    ProfileBusy,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -461,6 +469,10 @@ pub enum Fault {
     /// solve it than the member waits (V210-87). **Not [`Fault::Unreachable`]**, which is how it
     /// was reported: the member had been reached, and had waited.
     SolveTooSlow,
+    /// Every member that answered was already answering as many joins as it takes at once
+    /// (V210-92). **Not [`Fault::Refused`]**, which a joiner reads as a wrong passphrase: this one
+    /// was never checked.
+    MembersBusy,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
     /// A consent named a member this node has not admitted to the room (yet): it holds no
@@ -540,6 +552,9 @@ impl Fault {
             Fault::Storage => {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
             }
+            Fault::ProfileBusy => {
+                "another vox holds this profile open, and only one at a time may write it\n       stop that one to run this, or use the `vox room …` verbs, which ask a running node"
+            }
             Fault::IdentityFileUnwritable => {
                 "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
             }
@@ -566,6 +581,9 @@ impl Fault {
             }
             Fault::SolveTooSlow => {
                 "a member answered, but this device took longer to solve the join's proof of work than the member waits\n       your passphrase was never checked — this is not a verdict on it\n       run the join again when this device is less busy"
+            }
+            Fault::MembersBusy => {
+                "a member answered, but it is busy answering other joins\n       your passphrase was never checked — this is not a verdict on it\n       try the join again shortly"
             }
             Fault::Refused => "the other side refused",
             Fault::NotAdmitted => {
@@ -644,6 +662,12 @@ impl std::fmt::Display for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeEvent {
+    /// Creating or unlocking the identity has waited more than a second for another vox that
+    /// holds this profile's lock (it is creating the identity, or migrating a v0.2.9 profile, or
+    /// it is stopped while doing so). Sent once per wait; the command goes on when the lock is
+    /// free. Each front end says it in its own place: the CLI on stderr, the TUI in its status
+    /// line (V210-100).
+    WaitingForProfile,
     /// A new rendered entry in a channel.
     NewEntry {
         /// The channel.
@@ -799,6 +823,15 @@ pub enum NodeEvent {
         joined: bool,
         /// Each step and how long it took, in order.
         steps: String,
+    },
+    /// A join this node is running has begun a step: what it now waits for (V210-85).
+    ///
+    /// [`NodeEvent::JoinSteps`] arrives only once the join has ended, so a join that is stopped
+    /// before then — Ctrl-C, a service manager's SIGTERM — had nothing to say about where it was.
+    /// `vox connect` keeps the latest of these, and names it when it is stopped.
+    JoinStep {
+        /// The step, for the person: `dialling member 7r7pa7jfcfdo`.
+        step: String,
     },
     /// An upgrade off a relayed path was tried and nothing better landed, with what each rung
     /// reported.

@@ -162,6 +162,8 @@ pub struct ViewModel {
     pub sync: SyncStatus,
     /// Whether the app is locked (SEK/identity zeroized, re-auth required).
     pub locked: bool,
+    /// Whether a lock is under way and waiting for work that holds a secret (V210-94).
+    pub locking: bool,
     /// Whether `mlock` is in effect; `false` surfaces the documented zeroize-only
     /// degradation warning (ADR-015 memory-protection honesty).
     pub mlock_active: bool,
@@ -210,6 +212,8 @@ pub enum UiError {
     JoinPowDelay,
     /// This device took longer to solve a join's proof of work than the member waits (V210-87).
     JoinPowTooSlow,
+    /// Every member that answered a join was busy answering others (V210-92).
+    JoinMembersBusy,
     /// Join proof-of-possession / identity mismatch.
     JoinProofMismatch,
     /// No reachable peer / your node — "both must be online" for a 2-member channel.
@@ -228,6 +232,11 @@ pub enum UiError {
     NoIdentity,
     /// The profile already has an identity.
     IdentityExists,
+    /// The profile had no identity when this TUI started, and another vox created one since:
+    /// nothing was created here (V210-100, the CLI's V210-91 refusal).
+    IdentityMadeElsewhere,
+    /// Another vox holds this profile open for writing.
+    ProfileBusy,
     /// The app is locked (`:unlock`).
     Locked,
     /// The channel is not open (select it and enter its passphrase).
@@ -282,6 +291,9 @@ impl UiError {
             UiError::JoinPowTooSlow => {
                 "this device solved the join's proof of work too slowly for the member — try when it is less busy"
             }
+            UiError::JoinMembersBusy => {
+                "a member is busy answering other joins — try again shortly"
+            }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — both must be online (or run your node)",
             UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
@@ -291,6 +303,12 @@ impl UiError {
             UiError::Transport => "connection error",
             UiError::NoIdentity => "no identity yet — :init to create one",
             UiError::IdentityExists => "an identity already exists in this profile",
+            UiError::IdentityMadeElsewhere => {
+                "another vox created this profile's identity at the same time; nothing was created here — restart vox tui to unlock it"
+            }
+            UiError::ProfileBusy => {
+                "another vox holds this profile open — stop it, then try again"
+            }
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",

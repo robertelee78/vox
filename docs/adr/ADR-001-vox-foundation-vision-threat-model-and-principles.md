@@ -2,7 +2,7 @@
 
 **Status**: accepted (governs ADR-002..015; the M0 foundation — canonical CBOR, wire registry, suite registry — is implemented in `crates/vox-core/src/{cbor,wire,suite,hash}.rs`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — status reconciled; governs list extended to ADR-015.
+**Updated**: 2026-10-01 — anchor wording brought in line with ADR-012's restated anchor principle (an anchor only bridges hosts both behind NAT; nothing else requires one). 2026-09-19 — status reconciled; governs list extended to ADR-015.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: foundation, vision, threat-model, principles
 
@@ -43,8 +43,9 @@ the same overlay carries arbitrary byte streams (e.g. `ssh` over Vox), not just 
 
 **Cross-cutting principles (binding on all ADRs):**
 
-1. **Serverless = no *privileged* central server.** Some minimal bootstrap/rendezvous substrate
-   is provably unavoidable (see ADR-012); the requirement is that it be decentralized and
+1. **Serverless = no *privileged* central server.** A minimal bootstrap/rendezvous substrate
+   is unavoidable for hosts that are both behind NAT and cannot otherwise find each other (see
+   ADR-012), and hosts that can reach each other directly need none; the requirement is that it be decentralized and
    user-runnable — any node may serve, no Vox-operated infrastructure. "Serverless" means no
    server anyone is *forced* to trust, not "no infrastructure."
 2. **The channel is the unit of communication.** All messages are broadcast to a channel; a 1:1
@@ -138,8 +139,8 @@ receive). This is accepted as an inherent property (see ADR-008, ADR-012).
 
 ### Negative
 - No "message someone while everyone is offline" without at least one reachable peer/own node.
-- A minimal, decentralized bootstrap/rendezvous layer is unavoidable (ADR-012); strict
-  zero-infrastructure is impossible.
+- A minimal, decentralized bootstrap/rendezvous layer is unavoidable for hosts both behind NAT
+  (ADR-012); strict zero-infrastructure is impossible for them.
 - Inherits known limitations of the Sender-Keys family (weak PCS, ADR-006/ADR-007).
 - Metadata privacy / traffic-analysis resistance is an explicit non-goal today: Vox protects content
   and membership, not communication patterns. Nation-state resistance is not claimed (see the threat
