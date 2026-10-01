@@ -84,14 +84,14 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT PROVE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
     let started = Instant::now();
     let at = w.forward();
     let first = round_trip(at, b"before", Duration::from_secs(30));
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
-        "CANNOT PROVE: no echo through the forward before the anchor went: {first:?}\n{}",
+        "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
         w.fwd.as_mut().unwrap().transcript()
     );
     w.expect_still_relayed();
@@ -105,7 +105,7 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
         assert!(
             stopping.elapsed() < Duration::from_secs(10),
-            "`vox node` did not stop within 10 s of SIGINT: a clean stop was not obeyed"
+            "PRODUCT: `vox node` did not stop within 10 s of SIGINT: a clean stop was not obeyed"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -135,7 +135,7 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     );
     let carried = carried.unwrap_or_else(|| {
         panic!(
-            "the forward never carried again within {:?} of the anchor's return\n---- the forward \
+            "PRODUCT: the forward never carried again within {:?} of the anchor's return\n---- the forward \
              ----\n{said}\n---- the anchor ----\n{}\n---- the host ----\n{}",
             BACK_WITHIN + Duration::from_secs(20),
             w.anchor.proc.transcript(),
@@ -144,12 +144,12 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     });
     assert!(
         carried < BACK_WITHIN,
-        "the forward carried again only {carried:?} after its anchor was back, over {BACK_WITHIN:?}: \
+        "PRODUCT: the forward carried again only {carried:?} after its anchor was back, over {BACK_WITHIN:?}: \
          a lost anchor waited for a periodic redial\n---- the forward ----\n{said}"
     );
     assert!(
         saw_it_go,
-        "the forward did not say its anchor connection went ({GONE:?})\n{said}"
+        "PRODUCT: the forward did not say its anchor connection went ({GONE:?})\n{said}"
     );
     let anchor = anchor_id(&w);
     assert_says_stopped("the forward", &said, &anchor);
@@ -181,15 +181,15 @@ fn assert_says_stopped(who: &str, said: &str, anchor: &str) {
     );
     assert!(
         auth == 0,
-        "{who} reported a cleanly stopped anchor as {NOT_AUTH:?}\n{said}"
+        "PRODUCT: {who} reported a cleanly stopped anchor as {NOT_AUTH:?}\n{said}"
     );
     assert!(
         !its.is_empty() && its.iter().all(|l| l.contains(STOPPED)),
-        "{who} did not say its anchor stopped ({STOPPED:?}) when it was stopped cleanly\n{said}"
+        "PRODUCT: {who} did not say its anchor stopped ({STOPPED:?}) when it was stopped cleanly\n{said}"
     );
     assert!(
         others.iter().all(|l| l.contains(&through_it)),
-        "{who} said another connection went when the anchor stopped, without saying its path ran \
+        "PRODUCT: {who} said another connection went when the anchor stopped, without saying its path ran \
          through the stopped anchor ({through_it:?})\n{said}"
     );
 }
@@ -277,7 +277,7 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
     use std::os::unix::process::ExitStatusExt;
     assert!(
         status.is_some_and(|s| s.signal().is_none() && s.code() == Some(143)) && stopping,
-        "the forward did not stop cleanly on SIGTERM (exit {status:?}, said it was stopped by \
+        "PRODUCT: the forward did not stop cleanly on SIGTERM (exit {status:?}, said it was stopped by \
          SIGTERM: {stopping})\n{said}"
     );
 }
@@ -440,7 +440,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
             if signal == "KILL" {
                 "CANNOT MEASURE: "
             } else {
-                "`vox node` did not obey a stop: "
+                "PRODUCT: `vox node` did not obey a stop: "
             }
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -486,7 +486,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     let transcript = fwd.transcript();
     let after = after.unwrap_or_else(|| {
         panic!(
-            "the forward never said its anchor connection went ({GONE:?}) within {:?} of \
+            "PRODUCT: the forward never said its anchor connection went ({GONE:?}) within {:?} of \
              SIG{signal}\n---- the forward ----\n{transcript}\n---- the anchor ----\n{}",
             within + Duration::from_secs(30),
             w.anchor.proc.transcript()
@@ -494,7 +494,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     });
     assert!(
         after < within,
-        "the forward said its anchor connection went only {after:?} after SIG{signal}, over \
+        "PRODUCT: the forward said its anchor connection went only {after:?} after SIG{signal}, over \
          {within:?}\n---- the forward ----\n{transcript}"
     );
     if host_too {
@@ -517,13 +517,13 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
         let transcript = fwd.transcript();
         let host_gone = host_gone.unwrap_or_else(|| {
             panic!(
-                "the forward never said its connection to the host went, though the only path to \
+                "PRODUCT: the forward never said its connection to the host went, though the only path to \
                  it ran through the stopped anchor\n---- the forward ----\n{transcript}"
             )
         });
         assert!(
             host_gone.contains(&through),
-            "the forward said its connection to the host went, but not that its path ran \
+            "PRODUCT: the forward said its connection to the host went, but not that its path ran \
              through the stopped anchor ({through:?}): {host_gone}\n---- the forward ----\n\
              {transcript}"
         );
@@ -557,8 +557,9 @@ impl Transfer {
         use std::sync::atomic::Ordering;
         let echoed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut out = std::net::TcpStream::connect(at).expect("connect to the forward");
-        let mut back = out.try_clone().expect("clone the stream");
+        let mut out =
+            std::net::TcpStream::connect(at).expect("CANNOT MEASURE: connect to the forward");
+        let mut back = out.try_clone().expect("CANNOT MEASURE: clone the stream");
         let _ = out.set_write_timeout(Some(Duration::from_millis(200)));
         let _ = back.set_read_timeout(Some(Duration::from_millis(200)));
         let idle = |e: &std::io::Error| {
@@ -669,7 +670,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
         while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
             assert!(
                 stopping.elapsed() < Duration::from_secs(10),
-                "`vox node` did not stop within 10 s of SIGINT: a clean stop was not obeyed"
+                "PRODUCT: `vox node` did not stop within 10 s of SIGINT: a clean stop was not obeyed"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -706,7 +707,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
     );
     assert!(
         gone >= stops,
-        "the anchor was stopped {stops} times, each the moment the forward reached it, and the \
+        "PRODUCT: the anchor was stopped {stops} times, each the moment the forward reached it, and the \
          forward said it went only {gone} times\n{said}"
     );
     assert_says_stopped("the forward", &said, &anchor);
