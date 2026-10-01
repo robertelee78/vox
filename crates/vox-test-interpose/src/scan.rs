@@ -13,7 +13,11 @@
 //!    (resident or swapped out), copying it out a chunk at a
 //!    time with `mach_vm_read_overwrite` (which fails, rather than faults, on a page that went
 //!    away) into a buffer of its own that is skipped and wiped;
-//! 3. writes `result`: a line `count<TAB>label<TAB>n` per needle, then up to [`MAX_HITS`] lines
+//!    A label ending `+pieces` (V210-94) is also searched for **every [`PIECE`]-byte window** of
+//!    its needle, so a copy that something has partly overwritten is still seen: a passphrase with
+//!    its first bytes typed over by `:lock\r` was. The windows are held and compared masked too;
+//! 3. writes `result`: a line `count<TAB>label<TAB>n` per needle (and `pieces<TAB>label<TAB>n`,
+//!    every place a window of it is, for a `+pieces` needle), then up to [`MAX_HITS`] lines
 //!    `hit<TAB>label<TAB>address(hex)<TAB>user_tag<TAB>protection`, and a last line
 //!    `scanned<TAB>bytes<TAB>regions`; written to `result.tmp` and renamed, so a reader never sees
 //!    half of it. `go` is removed first, so a proof can ask again.
@@ -32,6 +36,8 @@ pub const MASK: u8 = 0xA5;
 /// (it sat right before a product copy in one run, and read back as plain text). The report is
 /// hex, so it never holds a needle's raw bytes either way.
 pub const CONTEXT_MASK: u8 = 0x3C;
+/// The window a `+pieces` needle is searched for, in bytes.
+pub const PIECE: usize = 6;
 /// Hits listed in `result`, at most; the count is always whole.
 const MAX_HITS: usize = 64;
 /// How much of a region is copied out at a time.
@@ -88,8 +94,16 @@ fn start() {
         });
 }
 
-/// The needles, still masked: `(label, masked bytes)`.
-fn needles(path: &Path) -> Vec<(String, Vec<u8>)> {
+/// One needle, still masked.
+struct Needle {
+    label: String,
+    masked: Vec<u8>,
+    /// Every [`PIECE`]-byte window of it, still masked, when its label asked for pieces.
+    pieces: Option<std::collections::HashSet<[u8; PIECE]>>,
+}
+
+/// The needles, still masked.
+fn needles(path: &Path) -> Vec<Needle> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines()
         .filter_map(|l| {
@@ -97,15 +111,34 @@ fn needles(path: &Path) -> Vec<(String, Vec<u8>)> {
             let bytes: Option<Vec<u8>> = (0..hex.len() / 2)
                 .map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
                 .collect();
-            let bytes = bytes?;
-            (!bytes.is_empty()).then(|| (label.to_owned(), bytes))
+            let masked = bytes?;
+            if masked.is_empty() {
+                return None;
+            }
+            let (label, pieces) = match label.strip_suffix("+pieces") {
+                Some(label) => (
+                    label,
+                    Some(
+                        masked
+                            .windows(PIECE)
+                            .filter_map(|w| <[u8; PIECE]>::try_from(w).ok())
+                            .collect(),
+                    ),
+                ),
+                None => (label, None),
+            };
+            Some(Needle {
+                label: label.to_owned(),
+                masked,
+                pieces,
+            })
         })
         .collect()
 }
 
 /// Scan every readable region for every needle; the report `result` holds.
-fn scan(needles: &[(String, Vec<u8>)]) -> String {
-    let longest = needles.iter().map(|(_, n)| n.len()).max().unwrap_or(1);
+fn scan(needles: &[Needle]) -> String {
+    let longest = needles.iter().map(|n| n.masked.len()).max().unwrap_or(1);
     // A buffer of its own, in its own mapping, so it can be skipped: what it holds is a copy
     // of what is being scanned.
     // SAFETY: an anonymous private mapping; checked for failure below.
@@ -119,6 +152,7 @@ fn scan(needles: &[(String, Vec<u8>)]) -> String {
     // SAFETY: no preconditions.
     let task = unsafe { task_self_trap() };
     let mut counts = vec![0usize; needles.len()];
+    let mut piece_counts = vec![0usize; needles.len()];
     let mut hits = Vec::new();
     let (mut scanned, mut regions) = (0u64, 0u64);
     let mut address: u64 = 0;
@@ -167,7 +201,19 @@ fn scan(needles: &[(String, Vec<u8>)]) -> String {
                     let got = got as usize;
                     // SAFETY: the kernel wrote `got` bytes into `buf`.
                     let chunk = unsafe { std::slice::from_raw_parts(buf, got) };
-                    for (k, (label, needle)) in needles.iter().enumerate() {
+                    for (k, n) in needles.iter().enumerate() {
+                        let (label, needle) = (&n.label, &n.masked);
+                        if let Some(set) = &n.pieces {
+                            for i in find_pieces(chunk, set) {
+                                piece_counts[k] += 1;
+                                if hits.len() < MAX_HITS {
+                                    hits.push(format!(
+                                        "hit\t{label}~piece\t{:#x}\t{user_tag}\t{protection}",
+                                        at + i as u64
+                                    ));
+                                }
+                            }
+                        }
                         for i in find_all(chunk, needle) {
                             counts[k] += 1;
                             if hits.len() < MAX_HITS {
@@ -207,8 +253,11 @@ fn scan(needles: &[(String, Vec<u8>)]) -> String {
         munmap(buf, CHUNK);
     }
     let mut out = String::new();
-    for ((label, _), n) in needles.iter().zip(&counts) {
-        out.push_str(&format!("count\t{label}\t{n}\n"));
+    for ((needle, n), p) in needles.iter().zip(&counts).zip(&piece_counts) {
+        out.push_str(&format!("count\t{}\t{n}\n", needle.label));
+        if needle.pieces.is_some() {
+            out.push_str(&format!("pieces\t{}\t{p}\n", needle.label));
+        }
     }
     for h in hits {
         out.push_str(&h);
@@ -216,6 +265,33 @@ fn scan(needles: &[(String, Vec<u8>)]) -> String {
     }
     out.push_str(&format!("scanned\t{scanned}\t{regions}\n"));
     out
+}
+
+/// Every offset in `hay` where a [`PIECE`]-byte window of a needle starts, the windows given masked
+/// in `set`. Compared masked, so no window is ever held here in the clear. A window in the overlap
+/// between two chunks is counted in both: what matters is whether any is found.
+fn find_pieces(hay: &[u8], set: &std::collections::HashSet<[u8; PIECE]>) -> Vec<usize> {
+    let mut first = [false; 256];
+    for w in set {
+        first[usize::from(w[0] ^ MASK)] = true;
+    }
+    let mut found = Vec::new();
+    if hay.len() < PIECE {
+        return found;
+    }
+    for i in 0..=hay.len() - PIECE {
+        if !first[usize::from(hay[i])] {
+            continue;
+        }
+        let mut w = [0u8; PIECE];
+        for (slot, b) in w.iter_mut().zip(&hay[i..i + PIECE]) {
+            *slot = b ^ MASK;
+        }
+        if set.contains(&w) {
+            found.push(i);
+        }
+    }
+    found
 }
 
 /// Every offset in `hay` where the unmasked `masked` needle starts.
