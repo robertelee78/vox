@@ -43,7 +43,8 @@ use world::{after_label, args, echo_service, vox_once, VoxProc};
 
 /// A `vox node` anchor on loopback, and the `--anchor` spec it prints.
 fn anchor(dir: &std::path::Path, name: &str) -> (VoxProc, String) {
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg"))
+        .expect("APPARATUS: cannot make the anchor's profile directory");
     let mut node = VoxProc::spawn(name, dir, &args(&["node", "--listen", "127.0.0.1:0"]));
     let spec = node
         .expect_line("an --anchor spec", |l| {
@@ -60,10 +61,10 @@ fn anchor(dir: &std::path::Path, name: &str) -> (VoxProc, String) {
 #[ignore = "production Argon2id and a real PoW, driving the real binary; CI runs it in release"]
 fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
     for d in [&host_dir, &guest_dir] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: cannot make a profile directory");
     }
     let (anchor_a, spec_a) = anchor(&tmp.path().join("anchor-a"), "anchor-a");
     let (_anchor_b, spec_b) = anchor(&tmp.path().join("anchor-b"), "anchor-b");
@@ -72,7 +73,7 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
 
     for dir in [&host_dir, &guest_dir] {
         let (ok, _, err) = vox_once(dir, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "CANNOT MEASURE: vox id (staging) failed: {err}");
     }
 
     // The room exists, and anchor A holds it: `vox serve` publishes before it prints the address.
@@ -102,7 +103,8 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
     );
     assert!(
         address.contains(&spec_a[..52]),
-        "the address must name anchor A, or B is not the only board the join can reach: {address}"
+        "CANNOT MEASURE: the address must name anchor A, or B is not the only board the join can \
+         reach: {address}"
     );
 
     // ---- Case 1: a mistyped room id, against boards that are up ----
@@ -113,7 +115,10 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
     // claim the address is fine.
     let wrong = mistype_room(&address);
     let wrong_room: String = wrong["vox://".len()..].chars().take(12).collect();
-    assert_ne!(wrong, address, "the mistyped address must differ");
+    assert_ne!(
+        wrong, address,
+        "APPARATUS: the proof's mistyped address must differ"
+    );
     let said = join(&guest_dir, &wrong, &passphrase, &spec_a);
     assert_names_both_causes(&said, &board_a, &wrong_room, "a mistyped room id");
 
@@ -149,7 +154,7 @@ fn join(dir: &std::path::Path, address: &str, passphrase: &str, anchor: &str) ->
     eprintln!("[test] the guest's join said:\n{said}");
     assert!(
         !ok,
-        "the join must fail: no board it can reach holds that room\n{said}"
+        "PRODUCT: the join succeeded, but no board it can reach holds that room\n{said}"
     );
     said
 }
@@ -168,21 +173,21 @@ fn mistype_room(address: &str) -> String {
 fn assert_names_both_causes(said: &str, board: &str, room: &str, case: &str) {
     assert!(
         said.contains(&format!("board {board} has nothing for room {room}")),
-        "{case}: the reason must name the board that was reached ({board}) and the room ({room}): \
+        "PRODUCT: {case}: the reason must name the board that was reached ({board}) and the room ({room}): \
          {said}"
     );
     assert!(
         said.contains("has not published the room there yet")
             && said.contains("host must be online")
             && said.contains("the room part of the address is wrong"),
-        "{case}: the advice must name both causes — not published yet, or a wrong room id: {said}"
+        "PRODUCT: {case}: the advice must name both causes — not published yet, or a wrong room id: {said}"
     );
     assert!(
         !said.contains("address is fine"),
-        "{case}: the advice claimed the address is fine, which the board cannot know: {said}"
+        "PRODUCT: {case}: the advice claimed the address is fine, which the board cannot know: {said}"
     );
     assert!(
         !said.contains("will not parse"),
-        "{case}: reported as a malformed address, which it is not: {said}"
+        "PRODUCT: {case}: reported as a malformed address, which it is not: {said}"
     );
 }

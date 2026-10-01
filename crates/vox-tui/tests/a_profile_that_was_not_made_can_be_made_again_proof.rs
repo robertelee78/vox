@@ -81,9 +81,11 @@ struct Out {
 impl Profile {
     fn new(tmp: &Path, name: &str) -> Self {
         let data = tmp.join(name);
-        std::fs::create_dir_all(data.join("cfg")).unwrap();
+        std::fs::create_dir_all(data.join("cfg"))
+            .expect("APPARATUS: cannot make the profile directory");
         let pass = tmp.join(format!("{name}.pass"));
-        std::fs::write(&pass, format!("{IDENTITY}\n")).unwrap();
+        std::fs::write(&pass, format!("{IDENTITY}\n"))
+            .expect("APPARATUS: cannot write the passphrase file");
         Self { data, pass }
     }
 
@@ -108,7 +110,7 @@ impl Profile {
             .command(args)
             .stdin(Stdio::null())
             .output()
-            .expect("run vox");
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox: {e}"));
         Out {
             ok: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -125,13 +127,18 @@ impl Profile {
                 "--listen",
                 "127.0.0.1:0",
                 "--passphrase-file",
-                self.pass.to_str().unwrap(),
+                self.pass
+                    .to_str()
+                    .expect("APPARATUS: the passphrase path is not UTF-8"),
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(&err).unwrap()))
+            .stderr(Stdio::from(
+                std::fs::File::create(&err)
+                    .expect("APPARATUS: cannot create the daemon's stderr file"),
+            ))
             .spawn()
-            .expect("spawn vox daemon"),
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox daemon: {e}")),
         );
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -163,15 +170,29 @@ impl Profile {
             })
             .unwrap_or(0)
     }
+
+    /// What is in the profile's directory, for a red that is about what was left there.
+    fn listing(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.dir())
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
 }
 
 #[test]
 #[ignore = "real binaries and production Argon2id; the release gate runs it"]
 fn a_store_that_cannot_be_opened_leaves_no_half_made_identity() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let p = Profile::new(tmp.path(), "blocked");
-    std::fs::create_dir_all(p.dir().join("store.redb")).unwrap();
+    std::fs::create_dir_all(p.dir().join("store.redb"))
+        .expect("APPARATUS: cannot stage a directory at store.redb");
 
     let mut said = Vec::new();
     let mut fingerprint = None;
@@ -190,7 +211,7 @@ fn a_store_that_cannot_be_opened_leaves_no_half_made_identity() {
         }
     }
     let fingerprint = fingerprint.unwrap_or_else(|| {
-        panic!("`vox id` over a store it could not open left no usable identity in two tries: {said:?}")
+        panic!("PRODUCT: `vox id` over a store it could not open left no usable identity in two tries: {said:?}")
     });
     let again = p.vox(&["id"]);
     eprintln!(
@@ -201,7 +222,7 @@ fn a_store_that_cannot_be_opened_leaves_no_half_made_identity() {
     );
     assert!(
         again.ok && again.stdout.trim() == fingerprint,
-        "the identity `vox id` made must open again as itself ({fingerprint}): {}{}",
+        "PRODUCT: the identity `vox id` made must open again as itself ({fingerprint}): {}{}",
         again.stdout,
         again.stderr
     );
@@ -213,7 +234,7 @@ fn a_store_that_cannot_be_opened_leaves_no_half_made_identity() {
     );
     assert!(
         answers,
-        "a daemon must unlock the identity `vox id` made: {what}"
+        "PRODUCT: a daemon must unlock the identity `vox id` made: {what}"
     );
 }
 
@@ -221,7 +242,7 @@ fn a_store_that_cannot_be_opened_leaves_no_half_made_identity() {
 #[ignore = "real binaries and production Argon2id; the release gate runs it"]
 fn an_identity_made_over_a_leftover_store_unlocks() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let p = Profile::new(tmp.path(), "leftover");
     let first = p.vox(&["id"]);
     assert!(
@@ -234,7 +255,8 @@ fn an_identity_made_over_a_leftover_store_unlocks() {
         answers,
         "CANNOT MEASURE: the first identity's daemon never answered: {what}"
     );
-    std::fs::remove_file(p.dir().join("vault.cbor")).unwrap();
+    std::fs::remove_file(p.dir().join("vault.cbor"))
+        .expect("APPARATUS: cannot remove the vault to stage a leftover store");
 
     let second = p.vox(&["id"]);
     eprintln!(
@@ -246,7 +268,7 @@ fn an_identity_made_over_a_leftover_store_unlocks() {
     );
     assert!(
         second.ok && second.stdout.trim() != first.stdout.trim(),
-        "`vox id` with no vault must make a new identity: {}{}",
+        "PRODUCT: `vox id` with no vault must make a new identity: {}{}",
         second.stdout,
         second.stderr
     );
@@ -258,20 +280,26 @@ fn an_identity_made_over_a_leftover_store_unlocks() {
     );
     assert!(
         answers,
-        "a daemon must unlock the identity made where a vault was gone: {what}"
+        "PRODUCT: a daemon must unlock the identity made where a vault was gone: {what}"
     );
-    assert_eq!(aside, 1, "the old store must be kept aside, not deleted");
+    assert_eq!(
+        aside,
+        1,
+        "PRODUCT: the old store must be kept aside once, not deleted; the profile holds {:?}",
+        p.listing()
+    );
 }
 
 #[test]
 #[ignore = "real binaries and production Argon2id; the release gate runs it"]
 fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
 
     // (a) a fresh profile: the store is written, then the vault cannot be.
     let p = Profile::new(tmp.path(), "novault");
-    std::fs::create_dir_all(p.dir().join("vault.tmp")).unwrap();
+    std::fs::create_dir_all(p.dir().join("vault.tmp"))
+        .expect("APPARATUS: cannot stage a directory at vault.tmp");
     for attempt in 1..=2 {
         let o = p.vox(&["id"]);
         let store = p.dir().join("store.redb").exists();
@@ -284,19 +312,24 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
         );
         assert!(
             !o.ok,
-            "CANNOT MEASURE: vox id made an identity with vault.tmp a directory"
+            "CANNOT MEASURE: vox id made an identity with vault.tmp a directory: {}",
+            o.stdout.trim()
         );
         assert!(
             o.stderr.contains("identity file (vault.cbor)") && !o.stderr.contains("store"),
-            "a vault that cannot be written must be named as the identity file, not the store: {}",
+            "PRODUCT: a vault that cannot be written must be named as the identity file, not the store: {}",
             o.stderr.trim()
         );
         assert!(
             !store && aside == 0,
-            "a failed `vox id` must leave nothing behind (store left {store}, kept aside {aside})"
+            "PRODUCT: a failed `vox id` must leave nothing behind (store left {store}, kept aside \
+             {aside}); it said: {}; the profile holds {:?}",
+            o.stderr.trim(),
+            p.listing()
         );
     }
-    std::fs::remove_dir(p.dir().join("vault.tmp")).unwrap();
+    std::fs::remove_dir(p.dir().join("vault.tmp"))
+        .expect("APPARATUS: cannot remove the staged vault.tmp");
     let o = p.vox(&["id"]);
     let aside = p.kept_aside();
     eprintln!(
@@ -306,7 +339,10 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
     );
     assert!(
         o.ok && aside == 0,
-        "the retry must make the identity and keep nothing aside"
+        "PRODUCT: the retry must make the identity and keep nothing aside (kept aside {aside}); \
+         it said: {}{}",
+        o.stdout.trim(),
+        o.stderr.trim()
     );
 
     // (b) a leftover store: a failed attempt puts it back where it was, untouched.
@@ -317,9 +353,12 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
         "CANNOT MEASURE: the first vox id: {}",
         first.stderr
     );
-    std::fs::remove_file(q.dir().join("vault.cbor")).unwrap();
-    let before = std::fs::read(q.dir().join("store.redb")).unwrap();
-    std::fs::create_dir_all(q.dir().join("vault.tmp")).unwrap();
+    std::fs::remove_file(q.dir().join("vault.cbor"))
+        .expect("APPARATUS: cannot remove the vault to stage a leftover store");
+    let before = std::fs::read(q.dir().join("store.redb"))
+        .expect("APPARATUS: cannot read the leftover store");
+    std::fs::create_dir_all(q.dir().join("vault.tmp"))
+        .expect("APPARATUS: cannot stage a directory at vault.tmp");
     let o = q.vox(&["id"]);
     let back = std::fs::read(q.dir().join("store.redb")).ok();
     let aside = q.kept_aside();
@@ -331,9 +370,14 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
     );
     assert!(
         !o.ok && back.as_deref() == Some(&before[..]) && aside == 0,
-        "a failed `vox id` must put the leftover store back where it was, byte for byte"
+        "PRODUCT: a failed `vox id` must put the leftover store back where it was, byte for byte \
+         (ok={}, kept aside {aside}); it said: {}; the profile holds {:?}",
+        o.ok,
+        o.stderr.trim(),
+        q.listing()
     );
-    std::fs::remove_dir(q.dir().join("vault.tmp")).unwrap();
+    std::fs::remove_dir(q.dir().join("vault.tmp"))
+        .expect("APPARATUS: cannot remove the staged vault.tmp");
     let o = q.vox(&["id"]);
     let aside = q.kept_aside();
     eprintln!(
@@ -342,7 +386,10 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
     );
     assert!(
         o.ok && aside == 1,
-        "the retry must make the identity and keep the leftover store aside, once"
+        "PRODUCT: the retry must make the identity and keep the leftover store aside, once (kept \
+         aside {aside}); it said: {}; the profile holds {:?}",
+        o.stderr.trim(),
+        q.listing()
     );
 }
 
@@ -350,7 +397,7 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
 /// success, stderr, and whether the vault's rename landed and a flush of `dir` failed after it.
 #[cfg(target_os = "macos")]
 fn id_with_the_directory_unflushable(p: &Profile) -> (bool, String, bool) {
-    let dir = std::fs::canonicalize(p.dir()).expect("the profile directory");
+    let dir = std::fs::canonicalize(p.dir()).expect("APPARATUS: no profile directory");
     let log = p.data.join(format!("interpose-{}.tsv", std::process::id()));
     let out = p
         .command(&["id"])
@@ -359,7 +406,7 @@ fn id_with_the_directory_unflushable(p: &Profile) -> (bool, String, bool) {
         .env("VOX_INTERPOSE_FAIL_DIR_SYNC", &dir)
         .stdin(Stdio::null())
         .output()
-        .expect("run vox id under the interposer");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox id under the interposer: {e}"));
     let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
     let _ = std::fs::remove_file(&log);
     let vault = dir.join("vault.cbor");
@@ -384,11 +431,11 @@ fn id_with_the_directory_unflushable(p: &Profile) -> (bool, String, bool) {
 #[ignore = "real binaries, production Argon2id and the test interposer; the release gate runs it"]
 fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
 
     // (a) a fresh profile.
     let p = Profile::new(tmp.path(), "noflush");
-    std::fs::create_dir_all(p.dir()).unwrap();
+    std::fs::create_dir_all(p.dir()).expect("APPARATUS: cannot make the profile directory");
     let (ok, said, staged) = id_with_the_directory_unflushable(&p);
     let (vault, store, aside) = (
         p.dir().join("vault.cbor").exists(),
@@ -402,16 +449,21 @@ fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
     );
     assert!(
         staged,
-        "CANNOT MEASURE: the vault's rename did not land before a failed flush of the directory"
+        "CANNOT MEASURE: the vault's rename did not land before a failed flush of the directory; \
+         vox said: {}",
+        said.trim()
     );
     assert!(
         !ok,
-        "CANNOT MEASURE: vox id succeeded with its directory unflushable"
+        "PRODUCT: vox id reported success though the flush of its directory failed after the \
+         vault landed: {}",
+        said.trim()
     );
     assert!(
         !vault && !store && aside == 0,
-        "a failed `vox id` must leave nothing behind, the vault included (vault left {vault}, \
-         store left {store}, kept aside {aside})"
+        "PRODUCT: a failed `vox id` must leave nothing behind, the vault included (vault left \
+         {vault}, store left {store}, kept aside {aside}); it said: {}",
+        said.trim()
     );
     let o = p.vox(&["id"]);
     let again = p.vox(&["id"]);
@@ -424,7 +476,7 @@ fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
     );
     assert!(
         o.ok && again.ok && again.stdout.trim() == o.stdout.trim() && answers,
-        "the next `vox id` must make an identity that opens again and a daemon unlocks: {}{} {what}",
+        "PRODUCT: the next `vox id` must make an identity that opens again and a daemon unlocks: {}{} {what}",
         o.stderr,
         again.stderr
     );
@@ -437,8 +489,10 @@ fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
         "CANNOT MEASURE: the first vox id: {}",
         first.stderr
     );
-    std::fs::remove_file(q.dir().join("vault.cbor")).unwrap();
-    let before = std::fs::read(q.dir().join("store.redb")).unwrap();
+    std::fs::remove_file(q.dir().join("vault.cbor"))
+        .expect("APPARATUS: cannot remove the vault to stage a leftover store");
+    let before = std::fs::read(q.dir().join("store.redb"))
+        .expect("APPARATUS: cannot read the leftover store");
     let (ok, said, staged) = id_with_the_directory_unflushable(&q);
     let vault = q.dir().join("vault.cbor").exists();
     let back = std::fs::read(q.dir().join("store.redb")).ok();
@@ -450,13 +504,21 @@ fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
         said.trim()
     );
     assert!(
-        staged && !ok,
-        "CANNOT MEASURE: the leftover staging did not fail after the vault's rename"
+        staged,
+        "CANNOT MEASURE: the leftover staging did not fail after the vault's rename; vox said: {}",
+        said.trim()
+    );
+    assert!(
+        !ok,
+        "PRODUCT: vox id over a leftover store reported success though the flush of its \
+         directory failed after the vault landed: {}",
+        said.trim()
     );
     assert!(
         !vault && back.as_deref() == Some(&before[..]) && aside == 0,
-        "a failed `vox id` over a leftover store must leave no vault and that store back in place \
-         (vault left {vault}, kept aside {aside})"
+        "PRODUCT: a failed `vox id` over a leftover store must leave no vault and that store back \
+         in place (vault left {vault}, kept aside {aside}); it said: {}",
+        said.trim()
     );
     let o = q.vox(&["id"]);
     let (answers, what) = q.daemon_answers();
@@ -467,7 +529,8 @@ fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
     );
     assert!(
         o.ok && answers && q.kept_aside() == 1,
-        "the next `vox id` must make an identity a daemon unlocks, the leftover kept aside once: \
+        "PRODUCT: the next `vox id` must make an identity a daemon unlocks, the leftover kept \
+         aside once: \
          {} {what}",
         o.stderr
     );

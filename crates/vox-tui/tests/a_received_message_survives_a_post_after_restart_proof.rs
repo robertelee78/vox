@@ -37,8 +37,8 @@ const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
 
-/// A `vox daemon`, killed by its own PID when dropped.
-struct Daemon(Child);
+/// A `vox daemon`, killed by its own PID when dropped, and the file its stderr goes to.
+struct Daemon(Child, std::path::PathBuf);
 
 impl Drop for Daemon {
     fn drop(&mut self) {
@@ -54,14 +54,20 @@ impl Daemon {
         let ok = Command::new("kill")
             .args(["-TERM", &pid])
             .status()
-            .expect("run kill")
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot run kill: {e}"))
             .success();
-        assert!(ok, "kill -TERM {pid} failed");
+        assert!(ok, "APPARATUS: kill -TERM {pid} did not take");
         let deadline = Instant::now() + Duration::from_secs(30);
-        while self.0.try_wait().expect("try_wait").is_none() {
+        while self
+            .0
+            .try_wait()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot poll the daemon {pid}: {e}"))
+            .is_none()
+        {
             assert!(
                 Instant::now() < deadline,
-                "the daemon did not leave within 30s of SIGTERM"
+                "PRODUCT: the daemon did not leave within 30s of SIGTERM; its stderr:\n{}",
+                std::fs::read_to_string(&self.1).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -83,17 +89,21 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox: {e}"));
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: no stdin pipe")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot write vox's stdin: {e}"));
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot wait for vox: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -104,8 +114,11 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 /// Start `vox daemon` given the identity passphrase and **nothing else**, then wait until it
 /// answers.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: cannot create the daemon's stdout file");
+    let err_at = dir.join(format!("daemon-{tag}.err"));
+    let err =
+        std::fs::File::create(&err_at).expect("APPARATUS: cannot create the daemon's stderr file");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -115,11 +128,12 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox daemon: {e}"));
+    let mut pipe = child.stdin.take().expect("APPARATUS: no daemon stdin pipe");
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the daemon's stdin: {e}"));
     drop(pipe);
-    let d = Daemon(child);
+    let d = Daemon(child, err_at);
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let (ok, _, err) = vox(dir, &["room", "list"], None);
@@ -128,7 +142,7 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         }
         assert!(
             Instant::now() < deadline,
-            "{tag}'s daemon never answered: {err}\nits stderr: {}",
+            "PRODUCT: {tag}'s daemon never answered `vox room list`: {err}\nits stderr: {}",
             std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -137,7 +151,7 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
 
 fn read(dir: &Path, room: &str) -> String {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
-    assert!(ok, "vox room read: {err}");
+    assert!(ok, "PRODUCT: vox room read failed: {err}");
     out
 }
 
@@ -154,21 +168,24 @@ fn found(read: &str, posts: &[&str]) -> Vec<String> {
 #[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
 fn a_received_message_survives_a_restart_a_post_and_a_restart() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     for d in [&alice, &bob] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: cannot make a profile directory");
     }
     let mut fps = Vec::new();
     for dir in [&alice, &bob] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "CANNOT MEASURE: vox id (staging) failed: {err}");
         fps.push(out.trim().to_owned());
     }
     for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(ok, "vox trust add {name}: {err}");
+        assert!(
+            ok,
+            "CANNOT MEASURE: vox trust add {name} (staging) failed: {err}"
+        );
     }
 
     let _a = daemon(&alice, "alice");
@@ -177,24 +194,30 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
         &["room", "create", "--name", "kept"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: vox room create (staging) failed: {err}"
+    );
     let (_, listed, _) = vox(&alice, &["room", "list"], None);
     let room: String = listed
         .split_whitespace()
         .next()
-        .expect("a room id in `room list`")
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: no room id in `vox room list`: {listed:?}"))
         .chars()
         .take(12)
         .collect();
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: vox room invite (staging) failed: {err}"
+    );
     let b = daemon(&bob, "bob-start");
     let (ok, _, err) = vox(
         &bob,
         &["room", "join", link.trim(), "--name", "kept"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room join: {err}");
+    assert!(ok, "CANNOT MEASURE: vox room join (staging) failed: {err}");
 
     // ---- alice posts; bob receives all three ------------------------------------------------
     let hers = [
@@ -204,7 +227,7 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
     ];
     for p in hers {
         let (ok, _, err) = vox(&alice, &["room", "post", &room, p], None);
-        assert!(ok, "alice posts: {err}");
+        assert!(ok, "CANNOT MEASURE: alice's post (staging) failed: {err}");
     }
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -224,7 +247,7 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
     let b = daemon(&bob, "bob-second");
     let his = "bob's first post after the restart";
     let (ok, _, err) = vox(&bob, &["room", "post", &room, his], None);
-    assert!(ok, "bob posts after the restart: {err}");
+    assert!(ok, "PRODUCT: bob's post after the restart failed: {err}");
     b.terminate();
     let _b = daemon(&bob, "bob-third");
 
@@ -239,11 +262,11 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
     assert_eq!(
         kept.len(),
         3,
-        "a message bob had received is gone after he restarted, posted and restarted: he reads \
+        "PRODUCT: a message bob had received is gone after he restarted, posted and restarted: he reads \
          {kept:?}\n{last}"
     );
     assert!(
         !found(&last, &[his]).is_empty(),
-        "bob's own post is gone after the restart: {last}"
+        "PRODUCT: bob's own post is gone after the restart: {last}"
     );
 }

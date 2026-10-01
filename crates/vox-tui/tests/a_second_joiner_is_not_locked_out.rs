@@ -30,6 +30,12 @@
 //! arrives while the host waits on it. The proof waits until the host has answered that peer
 //! before sending the second joiner, so the stall is in place, not assumed.
 //!
+//! **Which side a red is on.** A joiner left out, or one that waited on others past [`PROMPT`]
+//! by its own step line, is `PRODUCT:` and quotes what the joiners and the host said; a held
+//! handshake the host never answered, or a joiner that did not say its steps, is
+//! `CANNOT MEASURE:`; a fault of this proof's own client is `APPARATUS:`. The bound is read from
+//! the product's own step timings, which a stalled runner cannot shorten.
+//!
 //! ## Why it is `#[ignore]`d
 //!
 //! Production Argon2id on four profiles plus a real ADR-005 proof of work per join. CI runs
@@ -93,7 +99,8 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
     let second = w.tmp.path().join("second");
     let third = w.tmp.path().join("third");
     for d in [&second, &third] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", d.display()));
     }
     // A peer holds a handshake open with the host; the joiners arrive while it does.
     let answered = Arc::new(AtomicBool::new(false));
@@ -114,12 +121,12 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
     eprintln!("[test] third joiner:  joined={ok3} after {t3:?}");
     assert!(
         ok2,
-        "a second joiner straight after the first must get in (PRD-001 D8); after {t2:?}:\n\
+        "PRODUCT: a second joiner straight after the first must get in (PRD-001 D8); after {t2:?}:\n\
          stdout:\n{out2}\nstderr:\n{err2}"
     );
     assert!(
         ok3,
-        "a third joiner straight after the second must get in; after {t3:?}:\n\
+        "PRODUCT: a third joiner straight after the second must get in; after {t3:?}:\n\
          stdout:\n{out3}\nstderr:\n{err3}"
     );
     let (Some(h2), Some(h3)) = (waited_on_others(&err2), waited_on_others(&err3)) else {
@@ -138,7 +145,7 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
     let host_said = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
     assert!(
         h2 < PROMPT && h3 < PROMPT,
-        "back-to-back joiners must each wait under {PROMPT:?} on others; they waited {h2:?} and \
+        "PRODUCT: back-to-back joiners must each wait under {PROMPT:?} on others; they waited {h2:?} and \
          {h3:?} (whole joins {t2:?} and {t3:?})\n---- the second joiner ----\n{err2}\n---- the \
          third joiner ----\n{err3}\n---- the host ----\n{host_said}"
     );
@@ -147,17 +154,23 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
 /// The host's own UDP endpoint, from the room's address: the `b=` that follows `a=<host>`.
 fn host_endpoint(w: &World) -> SocketAddr {
     let at = format!("a={}&b=/ip4/127.0.0.1/udp/", w.host_fp);
-    let tail = w
-        .address
-        .split(&at)
-        .nth(1)
-        .unwrap_or_else(|| panic!("no host endpoint in the room address {}", w.address));
+    let tail = w.address.split(&at).nth(1).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: the room address `vox serve` gave names no host endpoint: {}",
+            w.address
+        )
+    });
     let port: u16 = tail
         .chars()
         .take_while(char::is_ascii_digit)
         .collect::<String>()
         .parse()
-        .expect("the host's port");
+        .unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: the room address `vox serve` gave names no host port ({e}): {}",
+                w.address
+            )
+        });
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
@@ -217,7 +230,7 @@ fn hold_a_handshake(host: SocketAddr, answered: Arc<AtomicBool>) -> std::thread:
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("runtime");
+            .expect("APPARATUS: the held handshake's runtime");
         rt.block_on(async move {
             let provider = Arc::new(vox_core::transport::provider::vox_crypto_provider());
             let schemes = provider
@@ -225,17 +238,18 @@ fn hold_a_handshake(host: SocketAddr, answered: Arc<AtomicBool>) -> std::thread:
                 .supported_schemes();
             let mut tls = rustls::ClientConfig::builder_with_provider(provider)
                 .with_protocol_versions(&[&rustls::version::TLS13])
-                .expect("TLS 1.3")
+                .expect("APPARATUS: the held handshake's TLS 1.3 configuration")
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(Holds { answered, schemes }))
                 .with_no_client_auth();
             tls.alpn_protocols = vec![vox_core::transport::provider::VOX_ALPN.to_vec()];
-            let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC TLS");
-            let endpoint =
-                quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).expect("client");
+            let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+                .expect("APPARATUS: the held handshake's QUIC TLS configuration");
+            let endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .expect("APPARATUS: the held handshake's client socket");
             let connecting = endpoint
                 .connect_with(quinn::ClientConfig::new(Arc::new(quic)), host, "vox")
-                .expect("connect");
+                .expect("APPARATUS: the held handshake could not start");
             let _ = connecting.await;
         });
     })

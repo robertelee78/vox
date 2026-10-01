@@ -33,6 +33,14 @@
 //!    silent streams were opened, and the first is still open at the victim's end — accepted
 //!    and waited on, not refused.
 //!
+//! **Which side a slow post is on.** Before the attack, one quiet `vox room post` is timed, and it
+//! must answer within [`PATIENCE`] (else CANNOT MEASURE: the node is slow with no attack, so the
+//! attack's effect cannot be told apart). A post during the attack that misses the bound is
+//! followed at once by a `vox --version` on the same timeline, the cost of starting `vox` at all.
+//! If that apparatus took more than [`APPARATUS_BUDGET`], the red is `CANNOT MEASURE: apparatus
+//! took X`; otherwise it is `PRODUCT: took X (apparatus Y, quiet Z)`. Fixture failures are
+//! `APPARATUS:`.
+//!
 //! **Mutation that must turn it red.** Put the join-request read back on the actor: in
 //! `node::actor`'s per-connection stream loop, forward `Inbound::Join` to the actor unread,
 //! and have the actor `read_join_request(..).await` before `answer_inbound_join`. Each silent
@@ -71,12 +79,14 @@ const SILENT_EVERY: Duration = Duration::from_secs(2);
 /// are open by the last one.
 const GAP: Duration = Duration::from_secs(2);
 const SETUP: Duration = Duration::from_secs(120);
+/// The most starting `vox --version` may take before a slow post is the runner's, not the node's.
+const APPARATUS_BUDGET: Duration = Duration::from_millis(2500);
 const ROOM_PASS: &str = "room passphrase";
 
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("APPARATUS: the clock is before 1970")
         .as_secs()
 }
 
@@ -91,14 +101,16 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: cannot start vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: vox has no stdin")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("APPARATUS: cannot write vox's stdin");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: cannot wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -119,17 +131,22 @@ fn vox_timed(data: &Path, argv: &[&str], cap: Duration) -> (bool, Duration, Stri
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(&out_file).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(&out_file).expect("APPARATUS: cannot create vox's output file"),
+        ))
         .stderr(Stdio::from(
             std::fs::OpenOptions::new()
                 .append(true)
                 .open(&out_file)
-                .unwrap(),
+                .expect("APPARATUS: cannot open vox's output file"),
         ))
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: cannot start vox");
     let ok = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child
+            .try_wait()
+            .expect("APPARATUS: cannot poll the vox process")
+        {
             break status.success();
         }
         if t0.elapsed() >= cap {
@@ -155,7 +172,9 @@ struct Rt(Option<tokio::runtime::Runtime>);
 impl std::ops::Deref for Rt {
     type Target = tokio::runtime::Runtime;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
+        self.0
+            .as_ref()
+            .expect("APPARATUS: the client runtime is gone")
     }
 }
 
@@ -169,9 +188,8 @@ impl Drop for Rt {
 
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+        .and_then(|s| s.local_addr())
+        .expect("APPARATUS: no free UDP port")
         .port()
 }
 
@@ -186,7 +204,9 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: the passphrase file's path is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -210,15 +230,16 @@ fn fingerprint(data: &Path) -> [u8; 32] {
 #[ignore = "real vox processes and production Argon2id; run in release"]
 fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: cannot make a profile directory");
         d
     };
     let (anchor_dir, victim_dir) = (dir("anchor"), dir("victim"));
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n"))
+        .expect("APPARATUS: cannot write the passphrase file");
 
     // ---- the victim, through the shipped binary -----------------------------------------
     let mut anchor = VoxProc::spawn(
@@ -230,7 +251,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .unwrap()
+        .expect("CANNOT MEASURE: the anchor's spec line names no address")
         .to_owned();
     let victim_id = fingerprint(&victim_dir);
     let victim_listen = format!("127.0.0.1:{}", free_udp_port());
@@ -261,7 +282,9 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
                 .map(str::to_owned)
         })
         .expect("CANNOT MEASURE: the victim's read names its room");
-    let cid = vox_core::node::link::b32_decode(&room, "room id").expect("a room id");
+    let cid = vox_core::node::link::b32_decode(&room, "room id").unwrap_or_else(|e| {
+        panic!("CANNOT MEASURE: the victim's read named room {room:?} ({e:?})")
+    });
 
     // ---- the stranger: a fresh identity and the room's name, nothing else ---------------
     let rt = Rt(Some(
@@ -269,21 +292,37 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             .worker_threads(4)
             .enable_all()
             .build()
-            .unwrap(),
+            .expect("APPARATUS: cannot build the client runtime"),
     ));
     let _enter = rt.enter();
-    let stranger = SoftwareRootSigner::from_component_seeds(&[0xA7; 32], &[0x5C; 32]).unwrap();
+    let stranger = SoftwareRootSigner::from_component_seeds(&[0xA7; 32], &[0x5C; 32])
+        .expect("APPARATUS: the stranger's identity");
     let (_endpoint, conn) = rt.block_on(async {
         let t = now();
-        let endpoint = VoxEndpoint::bind(&stranger, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = VoxEndpoint::bind(
+            &stranger,
+            "127.0.0.1:0"
+                .parse()
+                .expect("APPARATUS: a loopback address"),
+        )
+        .expect("APPARATUS: the stranger cannot bind a socket");
         let conn = endpoint
-            .connect(victim_listen.parse().unwrap(), victim_id, t)
+            .connect(
+                victim_listen
+                    .parse()
+                    .expect("APPARATUS: the victim's listen address"),
+                victim_id,
+                t,
+            )
             .await
             .expect("CANNOT MEASURE: step 1 — a valid identity must be admitted");
 
         // ---- step 3, the assertion this proof stands on ---------------------------------
-        let ring = PrekeyRing::generate(&stranger, &[0x3B; 32], t).unwrap();
-        let bundle = ring.bundle(&stranger.public_key()).unwrap();
+        let ring = PrekeyRing::generate(&stranger, &[0x3B; 32], t)
+            .expect("APPARATUS: the stranger's prekeys");
+        let bundle = ring
+            .bundle(&stranger.public_key())
+            .expect("APPARATUS: the stranger's bundle");
         let prejoin = PreJoinRecord::build(
             &stranger,
             &cid,
@@ -292,7 +331,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             1,
             t,
         )
-        .unwrap();
+        .expect("APPARATUS: the stranger's pre-join record");
         let mut rendezvous = RendezvousClient::open(&conn)
             .await
             .expect("CANNOT MEASURE: step 2 — `Unknown` may open a Rendezvous stream");
@@ -310,6 +349,19 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     });
     println!("[proof] escalation: the victim accepted the stranger's pre-join for the room");
 
+    // ---- the apparatus clock: a quiet post, before any attack ----------------------------------
+    let (ok, quiet, said) = vox_timed(
+        &victim_dir,
+        &["room", "post", &room, "a quiet post before the attack"],
+        PATIENCE * 8,
+    );
+    println!("[proof] quiet post: ok={ok} in {quiet:?}");
+    assert!(
+        ok && quiet < PATIENCE,
+        "CANNOT MEASURE: a post on the victim took {quiet:?} (ok={ok}) with no attack, over \
+         {PATIENCE:?}, so the attack's effect cannot be told apart. It said: {said}"
+    );
+
     // ---- the attack holds while a person uses the node -------------------------------------
     let silent = Arc::new(std::sync::Mutex::new(Vec::new()));
     let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -320,7 +372,10 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
                 match open_typed(&conn, StreamKind::Join).await {
                     // Kept, never written to: zero bytes after the stream's kind.
                     Ok(pair) => {
-                        silent.lock().unwrap().push(pair);
+                        silent
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(pair);
                         opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     Err(e) => eprintln!("[proof] could not open a silent stream: {e:?}"),
@@ -351,12 +406,21 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             opened.load(std::sync::atomic::Ordering::SeqCst)
         );
         took.push(t);
-        assert!(
-            ok && t < PATIENCE,
-            "post {i} of {POSTS} on the victim took {t:?} (ok={ok}; bound {PATIENCE:?}) while a \
-             stranger holding only the room's .vox name held silent Join streams open — anyone \
-             ever handed an address can stop the node. It said: {said}"
-        );
+        if !(ok && t < PATIENCE) {
+            let (_, apparatus, _) = vox_timed(&victim_dir, &["--version"], PATIENCE * 8);
+            assert!(
+                apparatus <= APPARATUS_BUDGET,
+                "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+                 {APPARATUS_BUDGET:?}) right after post {i} took {t:?}, so the runner, not the \
+                 node, may be slow. The post said: {said}"
+            );
+            panic!(
+                "PRODUCT: post {i} of {POSTS} on the victim took {t:?} (ok={ok}; bound \
+                 {PATIENCE:?}; apparatus {apparatus:?}, quiet {quiet:?}) while a stranger holding \
+                 only the room's .vox name held silent Join streams open — anyone ever handed an \
+                 address can stop the node. It said: {said}"
+            );
+        }
     }
     let (ok, t, read) = vox_timed(&victim_dir, &["room", "read", &room], PATIENCE * 8);
     let shown = (1..=POSTS)
@@ -369,16 +433,22 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     println!("[proof] read: ok={ok} in {t:?}, shows {shown}/{POSTS} posts");
     assert!(
         ok && t < PATIENCE && shown == POSTS,
-        "the victim's `vox room read` took {t:?} (ok={ok}) and showed {shown} of {POSTS} posts \
+        "PRODUCT: the victim's `vox room read` took {t:?} (ok={ok}) and showed {shown} of {POSTS} posts \
          made during the attack:\n{read}"
     );
 
     // ---- the attack was still holding ---------------------------------------------------
     attack.abort();
     let streams = opened.load(std::sync::atomic::Ordering::SeqCst);
-    let mut held = std::mem::take(&mut *silent.lock().unwrap());
+    let mut held = std::mem::take(
+        &mut *silent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     let first_still_held = rt.block_on(async {
-        let (_send, recv) = held.first_mut().expect("a silent stream");
+        let (_send, recv) = held
+            .first_mut()
+            .expect("CANNOT MEASURE: no silent stream was held");
         let mut buf = [0u8; 16];
         tokio::time::timeout(Duration::from_millis(300), recv.read(&mut buf))
             .await
@@ -400,7 +470,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     );
     println!(
         "[proof] {POSTS} posts, slowest {:?}, while {streams} silent Join streams were held",
-        took.iter().max().unwrap()
+        took.iter().max().copied().unwrap_or_default()
     );
     drop(held);
 }
