@@ -615,7 +615,14 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     };
     let hashes = |rows: &[serde_json::Value]| -> Vec<String> {
         rows.iter()
-            .map(|x| x["entry_hash"].as_str().unwrap().to_owned())
+            .map(|x| {
+                x["entry_hash"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("PRODUCT: a row of `room read --json` has no entry_hash: {x}")
+                    })
+                    .to_owned()
+            })
             .collect()
     };
     let position = |w: &Worker| -> serde_json::Value {
@@ -629,8 +636,15 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let mut canonical = held.clone();
     canonical.sort_by_key(|x| {
         (
-            x["created_millis"].as_u64().unwrap(),
-            x["entry_hash"].as_str().unwrap().to_owned(),
+            x["created_millis"].as_u64().unwrap_or_else(|| {
+                panic!("PRODUCT: a row of `room read --json` has no created_millis: {x}")
+            }),
+            x["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("PRODUCT: a row of `room read --json` has no entry_hash: {x}")
+                })
+                .to_owned(),
         )
     });
     let off_canonical = before
@@ -685,9 +699,10 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         moved.first()
     );
     let after_position = position(bob);
-    assert_eq!(
-        after_position, before_position,
-        "PRODUCT: board.position changed across a restart that posted nothing"
+    assert!(
+        after_position == before_position,
+        "PRODUCT: board.position changed across a restart that posted nothing: \
+         {before_position} before, {after_position} after"
     );
 
     // The consumer resumes from its pre-restart cursor and gets exactly what followed it.
@@ -697,8 +712,17 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         let Ok(line) = run.rx.recv_timeout(Duration::from_secs(20)) else {
             break;
         };
-        let row: serde_json::Value = serde_json::from_str(line.trim()).expect("NDJSON row");
-        resumed.push(row["entry_hash"].as_str().unwrap().to_owned());
+        let row: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
+            panic!("PRODUCT: `room tail` printed a line that is not JSON ({e}): {line:?}")
+        });
+        resumed.push(
+            row["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("PRODUCT: a row `room tail` printed has no entry_hash: {row}")
+                })
+                .to_owned(),
+        );
     }
     let _ = run.child.kill();
     let _ = run.child.wait();
@@ -709,9 +733,11 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         resumed.len(),
         followed.len()
     );
-    assert_eq!(
-        resumed, followed,
+    assert!(
+        resumed == followed,
         "PRODUCT: `tail --since` the consumer's pre-restart cursor did not resume with exactly \
-         the rows that followed it"
+         the rows that followed it: {} of {} rows, {resumed:?} against {followed:?}",
+        resumed.len(),
+        followed.len()
     );
 }
