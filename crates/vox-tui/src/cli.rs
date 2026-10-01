@@ -312,9 +312,9 @@ where
     });
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
-        // Its own code (a stopped `vox serve` exits 128 + the signal's number, V210-108), and
-        // written without panicking: after a hangup stderr can be a terminal that is gone.
         Err(e) => {
+            // Not `eprintln!`: after a hangup stderr can be a terminal that is gone, and a write
+            // that fails there must not turn the reason into a panic.
             use std::io::Write as _;
             let _ = writeln!(io::stderr(), "vox: {e}");
             e.exit_code()
