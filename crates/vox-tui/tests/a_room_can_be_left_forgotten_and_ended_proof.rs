@@ -466,10 +466,18 @@ fn tui_verb(w: &Worker, verb: &str, hold: Duration) {
         ],
     );
     eprintln!(
-        "[proof] tui: {} -> {:?}: {}",
+        "[proof] tui: {} -> {:?} in {:.1}s: {}",
         tag,
         driven.code,
+        driven.took.as_secs_f64(),
         driven.stdout.trim()
+    );
+    assert!(
+        driven.has_verdict(&tag),
+        "APPARATUS: the TUI driver for :{verb} on {} was stopped before it could say anything \
+         (stage {:?}), so nothing was measured",
+        w.name,
+        driven.stage
     );
     match driven.code {
         Some(0) => {}
