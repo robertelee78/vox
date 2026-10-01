@@ -69,6 +69,10 @@
 //! [`BUSY_BACK_WITHIN`] of the anchor going on; and once the frozen members go on, all [`MEMBERS`]
 //! are connected within [`BACK_WITHIN`].
 //!
+//! **Optional** (300 daemons, a few minutes in release): it is compiled only with the
+//! `optional-proofs` feature and blocks nothing. Run it with
+//! `cargo test --release -p vox-tui --features optional-proofs --test every_member_is_back_after_an_anchor_restart_proof -- --ignored --nocapture`.
+//!
 //! Every red says which it is: `PRODUCT:` quotes what the product said or did, `CANNOT MEASURE:`
 //! names staging that was not achieved, `APPARATUS:` names a fault of the proof's own; the
 //! watchdog says it is the watchdog.
@@ -82,7 +86,7 @@
 //!   the bound after the outage;
 //!
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "optional-proofs"))]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
