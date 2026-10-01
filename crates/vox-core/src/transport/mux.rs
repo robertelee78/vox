@@ -104,6 +104,12 @@ fn random_circuit_addr() -> Result<SocketAddr> {
     Ok(SocketAddr::new(IpAddr::V4(ip), CIRCUIT_PORT))
 }
 
+/// **Where a circuit's far end comes from**, as the node groups joins by source (V210-92): three
+/// opaque keys, coarse to fine. The node works it out when it attaches the circuit, from what the
+/// relay said and who the relay is; the transport only carries it to the connection the circuit
+/// makes (see [`crate::transport::quic::VoxConnection::circuit_origin`]).
+pub type CircuitOrigin = [Digest32; 3];
+
 /// The circuit table's canonical key: IPv4, whatever quinn presented.
 fn key(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
@@ -119,6 +125,9 @@ pub struct MuxSocket {
     /// Which relay carries each circuit, by its address, when the caller said
     /// ([`MuxSocket::attach_via`]) — for `vox status`, which names the relay.
     relays: Mutex<HashMap<SocketAddr, Digest32>>,
+    /// Where each inbound circuit's far end comes from, when the node said (see
+    /// [`CircuitOrigin`]).
+    origins: Mutex<HashMap<SocketAddr, CircuitOrigin>>,
     inbox: Mutex<Inbox>,
     /// Whether the socket underneath is IPv6, and so what family a circuit's datagrams must be
     /// handed up in (see [`Self::as_seen`]).
@@ -210,6 +219,7 @@ impl MuxSocket {
             circuits: Mutex::new(HashMap::new()),
             by_peer: Mutex::new(HashMap::new()),
             relays: Mutex::new(HashMap::new()),
+            origins: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Inbox::default()),
         })
     }
@@ -221,7 +231,11 @@ impl MuxSocket {
     /// # Errors
     /// If the OS CSPRNG is unavailable. Vox never falls back to a weaker source, and a
     /// guessable circuit address would leak which peers this node relays to.
-    pub fn attach(self: &Arc<Self>, peer: &Digest32) -> Result<CircuitPort> {
+    pub fn attach(
+        self: &Arc<Self>,
+        peer: &Digest32,
+        origin: Option<CircuitOrigin>,
+    ) -> Result<CircuitPort> {
         let (tx, rx) = mpsc::channel(CIRCUIT_QUEUE);
         let mut circuits = self.circuits();
         // Retried rather than assumed unique: 28 bits is a small space and a collision
@@ -233,9 +247,15 @@ impl MuxSocket {
             }
         };
         circuits.insert(addr, tx);
+        let mut origins = self.origins();
+        if let Some(origin) = origin {
+            origins.insert(addr, origin);
+        }
         if let Some(stale) = self.by_peer().insert(*peer, addr) {
             circuits.remove(&stale);
+            origins.remove(&stale);
         }
+        drop(origins);
         drop(circuits);
         Ok(CircuitPort {
             addr,
@@ -252,6 +272,16 @@ impl MuxSocket {
     #[must_use]
     pub fn is_circuit(&self, addr: SocketAddr) -> bool {
         self.circuits().contains_key(&key(addr))
+    }
+
+    /// Where the live circuit at `addr` comes from, if the node said when it attached it.
+    #[must_use]
+    pub fn origin_of(&self, addr: SocketAddr) -> Option<CircuitOrigin> {
+        self.origins().get(&key(addr)).copied()
+    }
+
+    fn origins(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, CircuitOrigin>> {
+        self.origins.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The address `peer`'s live circuit stands at, if it has one.
@@ -274,8 +304,13 @@ impl MuxSocket {
     ///
     /// # Errors
     /// As [`MuxSocket::attach`].
-    pub fn attach_via(self: &Arc<Self>, peer: &Digest32, relay: &Digest32) -> Result<CircuitPort> {
-        let port = self.attach(peer)?;
+    pub fn attach_via(
+        self: &Arc<Self>,
+        peer: &Digest32,
+        relay: &Digest32,
+        origin: Option<CircuitOrigin>,
+    ) -> Result<CircuitPort> {
+        let port = self.attach(peer, origin)?;
         self.relays
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -300,6 +335,7 @@ impl MuxSocket {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&addr);
         self.circuits().remove(&addr);
+        self.origins().remove(&addr);
         self.by_peer().retain(|_, a| *a != addr);
     }
 
