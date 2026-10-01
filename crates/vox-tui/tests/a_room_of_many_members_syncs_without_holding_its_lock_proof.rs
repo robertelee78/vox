@@ -15,18 +15,26 @@
 //! [`MEMBERS`] more identities that each join through their own daemon, which is then stopped.
 //! Their records stay on the boards, so every session between the host and bob carries them all.
 //!
-//! **Asserted.** With every member on the host's roster (else `CANNOT MEASURE`), the host posts
+//! **Asserted.** With every member on the host's roster (else `APPARATUS`), the host posts
 //! without pause from a thread of its own; each post is pushed to bob, and bob's node opens a
 //! session with the host to take it, an outbound session that fetches the board and admits its
 //! records under bob's room lock (the defect). Meanwhile bob posts [`POSTS`] times, [`GAP`]
-//! apart: the 90th percentile of his `vox room post` stays under [`P90_BOUND`], and at most
-//! [`MAX_SLOW`] of them take over [`SLOW`]. `CANNOT MEASURE` if bob's node opened fewer than
-//! [`MIN_SESSIONS`] sessions while it posted.
+//! apart, and **the 90th percentile of his `vox room post` stays under [`P90_BOUND`]**: what a
+//! person posting in the room feels, most of the time.
 //!
-//! **Measured** at 128 members (release, a working machine): with the fix, p50 12 ms, p90 16 ms,
-//! 0 of 60 over 200 ms (max 192 ms, 105 sessions); with the room's lock held across re-verifying
-//! every record, p50 30 ms, p90 361 ms, 14 of 60 over 200 ms (max 595 ms, 56 sessions). A single
-//! slow post is not the defect, so the bound is on the distribution, not the maximum.
+//! **Every red says which it is.** `PRODUCT:` is the bound broken: the node held its own member
+//! up. `APPARATUS:` is a staging step not achieved, named (a member that never joined, a roster
+//! short of the members staged, too few sessions to have measured anything): the product was
+//! never measured, so the run says nothing about it.
+//!
+//! **Measured at 192 members** (release, a working machine): with the fix, p90 50 ms and 27 ms;
+//! with the room's lock held across re-verifying every record, p90 409 ms. At 128 members the
+//! mutant once measured p90 76.8 ms (verifier-262c4), inside a 100 ms bound, so the room is
+//! staged larger: the mutant's hold grows with the records it re-verifies, the fix's does not.
+//! The fix's slowest posts (221–267 ms at 192) were measured with the room's lock timed in
+//! bob's node, and no hold of it reached 26 ms, so they are not this defect, and under V210-08's
+//! 500 ms bound. It is not staged larger still: a board takes about 256 joins per two hours
+//! (#297).
 //!
 //! **Mutation that must turn it red.** `admit_board_records` back to its old shape: the room's lock
 //! held across verifying every record on the board, admitted or not.
@@ -44,7 +52,7 @@ use std::time::{Duration, Instant};
 use sync_pair::{anchor, counter, Member};
 
 /// The members staged besides the host and bob.
-const MEMBERS: usize = 128;
+const MEMBERS: usize = 192;
 /// How many daemons join at once while staging.
 const BATCH: usize = 16;
 /// Bob's posts measured: enough that a lock held across the board's records shows in the tail.
@@ -53,12 +61,9 @@ const POSTS: usize = 120;
 const GAP: Duration = Duration::from_millis(250);
 /// Bob's outbound sessions while he posts, at least, for the measurement to mean anything.
 const MIN_SESSIONS: u64 = 10;
-/// Bob's posts' 90th percentile must stay under this: 16 ms with the fix, 361 ms without.
+/// Bob's posts' 90th percentile must stay under this: 27-50 ms with the fix at 192 members,
+/// 409 ms without.
 const P90_BOUND: Duration = Duration::from_millis(100);
-/// A post this slow counts as held up.
-const SLOW: Duration = Duration::from_millis(200);
-/// At most this many of bob's posts may be slow: 0 with the fix, 14 of 60 without.
-const MAX_SLOW: usize = 3;
 
 #[test]
 #[ignore = "opt-in heavy proof: stages a room of many members through the shipped binary"]
@@ -99,7 +104,7 @@ fn a_room_of_many_members_syncs_without_holding_its_lock() {
         });
     }
     let (ok, roster, err) = host.vox(&["room", "roster", &room], None);
-    assert!(ok, "CANNOT MEASURE: vox room roster: {err}");
+    assert!(ok, "APPARATUS (staging): vox room roster failed: {err}");
     let members = roster.lines().filter(|l| !l.trim().is_empty()).count();
     println!(
         "[proof] staged {MEMBERS} members in {:?}; the host's roster lists {members}",
@@ -107,8 +112,8 @@ fn a_room_of_many_members_syncs_without_holding_its_lock() {
     );
     assert!(
         members >= MEMBERS + 2,
-        "CANNOT MEASURE: the host's roster lists {members} members, not {} (host, bob and \
-         {MEMBERS})",
+        "APPARATUS (staging not achieved): the host's roster lists {members} members, not {} \
+         (host, bob and {MEMBERS})",
         MEMBERS + 2
     );
 
@@ -139,21 +144,20 @@ fn a_room_of_many_members_syncs_without_holding_its_lock() {
     println!("[proof] meanwhile the host posted {host_posts} times and bob's node opened {sessions} session(s)");
     assert!(
         sessions >= MIN_SESSIONS,
-        "CANNOT MEASURE: bob's node opened {sessions} session(s) while it posted (need \
-         {MIN_SESSIONS}): nothing ran admit_board_records"
+        "APPARATUS (precondition unmet): bob's node opened {sessions} session(s) while it posted \
+         (need {MIN_SESSIONS}): nothing ran admit_board_records, so nothing was measured"
     );
     let mut sorted = took.clone();
     sorted.sort();
     let (p50, p90, max) = (sorted[POSTS / 2], sorted[POSTS * 9 / 10], sorted[POSTS - 1]);
-    let slow = took.iter().filter(|t| **t > SLOW).count();
     println!(
         "[proof] {POSTS} bob posts in a room of {members}: p50 {p50:?}, p90 {p90:?} (bound \
-         {P90_BOUND:?}), max {max:?}, {slow} over {SLOW:?} (at most {MAX_SLOW}); all: {took:?}"
+         {P90_BOUND:?}), max {max:?}; all: {took:?}"
     );
     assert!(
-        p90 < P90_BOUND && slow <= MAX_SLOW,
-        "bob's posts in a room of {members} members: p90 {p90:?} (bound {P90_BOUND:?}), {slow} \
-         over {SLOW:?} (at most {MAX_SLOW}): his syncs hold the room's lock while they \
-         re-verify every member's board record"
+        p90 < P90_BOUND,
+        "PRODUCT: bob's posts in a room of {members} members took p90 {p90:?} (bound \
+         {P90_BOUND:?}): his syncs hold the room's lock while they re-verify every member's board \
+         record"
     );
 }
