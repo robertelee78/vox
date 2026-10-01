@@ -54,9 +54,10 @@ decider's own. Each rule names the ADR section that holds the full record.
 - **Every proof has a mutant that turns it red on its own assertion.** A CANNOT MEASURE is not a
   red and does not count as the mutant's result. Why: a green gate is not evidence, and a gate can
   assert the bug. (ADR-018 §7)
-- **No test knobs in the shipped binary.** `VOX_TEST_*` knobs are compiled out of what users
-  install: a proof that needs one builds `vox` with the cargo feature `test-knobs`, and the packaged
-  release artifact holds none (the decider, 2026-10-01; #300, V210-105).
+- **No test knobs in the shipped binary.** `VOX_TEST_*` knobs are to be compiled out of what
+  users install (#300, not merged yet): a proof that needs one is to build `vox` with the cargo
+  feature `test-knobs`, and the packaged release artifact is to hold none (the decider, 2026-10-01;
+  V210-105).
 
 ## Anchors
 
@@ -97,4 +98,7 @@ unreachable when it was reached. When an anchor is missing, say truthfully what 
 
 - Write whitelist and blacklist, in code, comments, docs and messages. Never allow-list or
   deny-list. This is a standing ruling of the decider's.
+
+## House rule
+
 - Never state planned work as done: write "is to" or "must" until it has landed.
