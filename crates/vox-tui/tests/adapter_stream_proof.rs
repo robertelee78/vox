@@ -115,6 +115,22 @@ fn start(w: &Worker, r: &str, cursor: &str, stderr: &std::path::Path) -> Run {
     Run { child, rx, paused }
 }
 
+/// Whatever path leaves the proof — a red included, above all the expected one at a frozen
+/// consumer — takes its `tail` with it: resumed (a stopped process outlives its parent as an
+/// orphan in state T), killed and reaped, by its own handle. A child already reaped is left
+/// alone, so no PID that may since have been reused is ever signalled.
+impl Drop for Run {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = Command::new("kill")
+                .args(["-CONT", &self.child.id().to_string()])
+                .status();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// Send `sig` (`-STOP`, `-CONT`) to the consumer by its PID.
 fn signal(run: &Run, sig: &str) {
     let ok = Command::new("kill")
