@@ -4,6 +4,8 @@
 built unless it says so; every requirement is written as what the product **must** do. Delivery is tracked
 in GitHub as one epic per section (issues #52–#96) and in ADR-022 / ADR-023.
 
+**Updated**: 2026-10-01 — anchor wording brought in line with ADR-012's restated anchor principle (an anchor only bridges hosts both behind NAT; nothing else requires one): principle 4.
+
 **Source**: a product-management interview with the decider on 2026-09-24, and a read-only research
 pass over `origin/main` 96c47ed (v0.2.7) the same day (ruflo `research-synthesis`,
 `vox-research/transport-legitimacy-2026-09-24`). Defects in §4 were read in code; none has yet been
@@ -25,7 +27,10 @@ friction for this audience can be fixed later.
 3. **Names are local.** Wire formats carry fingerprints. What a person sees is the name they gave a node
    in their keyring when they approved it, and the nickname they gave a room when they joined it.
    Nothing is published or global.
-4. **Anchors are dumb pipes.** An anchor does rendezvous and relay. For rooms it is not a member of, it
+4. **Anchors are dumb pipes, and only a bridge.** An anchor is needed only for hosts that are both
+   behind NAT and cannot otherwise find or reach each other; creating, serving, inviting, joining and
+   connecting never require one, and directly reachable peers connect directly (restated 2026-10-01,
+   ADR-012). An anchor does rendezvous and relay. For rooms it is not a member of, it
    stores nothing.
 5. **Say honestly what a feature guarantees.** Disappearing messages are look and feel, not a security
    property: nothing proves a client pruned.
