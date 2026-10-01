@@ -223,10 +223,13 @@ struct Ctx {
 }
 
 fn bind_socket(inner: &mut Inner, bind: &str, role: Role, ctx: &Ctx) -> SocketAddr {
-    let sock = UdpSocket::bind(bind).expect("bind an emulator socket");
+    let sock = UdpSocket::bind(bind)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not bind an emulator socket on {bind}: {e}"));
     sock.set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
-    let addr = sock.local_addr().unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: an emulator socket on {bind}: {e}"));
+    let addr = sock
+        .local_addr()
+        .unwrap_or_else(|e| panic!("APPARATUS: an emulator socket on {bind}: {e}"));
     let sock = Arc::new(sock);
     inner.sockets.insert(addr, Arc::clone(&sock));
     inner.roles.insert(addr, role);

@@ -39,9 +39,10 @@ pub fn previous_release() -> PathBuf {
         .iter()
         .find(|(t, _)| *t == triple)
         .map(|(_, h)| *h)
-        .unwrap();
+        .unwrap_or_else(|| panic!("APPARATUS: no published SHA-256 for {triple} in this proof"));
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("vox-{PREVIOUS}"));
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", dir.display()));
     let exe = dir.join(format!("vox-{triple}"));
     let digest = |p: &Path| hex(&Sha256::digest(std::fs::read(p).unwrap_or_default()));
     if !exe.is_file() || digest(&exe) != want {
@@ -59,12 +60,23 @@ pub fn previous_release() -> PathBuf {
         assert_eq!(
             digest(&part),
             want,
-            "{url} does not match its published SHA-256"
+            "CANNOT MEASURE: {url} does not match its published SHA-256 — the download, or the \
+             published artifact, is not the {PREVIOUS} this proof starts from"
         );
-        std::fs::rename(&part, &exe).unwrap();
+        std::fs::rename(&part, &exe).unwrap_or_else(|e| {
+            panic!(
+                "APPARATUS: could not move {} into place: {e}",
+                exe.display()
+            )
+        });
     }
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not make {} executable: {e}",
+            exe.display()
+        )
+    });
     exe
 }
 

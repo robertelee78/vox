@@ -99,7 +99,7 @@ pub fn recorded(
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos()
     ));
     let mut child = Command::new(exe)
@@ -118,13 +118,46 @@ pub fn recorded(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox under the interposer");
+        .unwrap_or_else(|e| {
+            panic!(
+                "APPARATUS: could not run {} under the interposer: {e}",
+                exe.display()
+            )
+        });
     if let Some(s) = stdin {
-        child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
+        // A `vox` that exits without reading its stdin closes the pipe: its exit status and what
+        // it said are the verdict, so a refused write is reported, not fatal.
+        if let Err(e) = child
+            .stdin
+            .take()
+            .expect("APPARATUS: a piped stdin")
+            .write_all(s.as_bytes())
+        {
+            eprintln!("[harness] stdin not taken: {e}");
+        }
     }
-    let out = child.wait_with_output().expect("vox finished");
-    let events = parse(&std::fs::read_to_string(&log).unwrap_or_default());
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not wait for {}: {e}", exe.display()));
+    // A log that is missing, or holds no `open` from a run that succeeded, is a recorder that
+    // recorded nothing — never "vox did nothing", which a durability proof would read as a pass.
+    let text = std::fs::read_to_string(&log).unwrap_or_else(|e| {
+        panic!(
+            "CANNOT MEASURE: the interposer wrote no log at {} ({e}); vox exited {}. Its stderr:\n{}",
+            log.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let events = parse(&text);
     let _ = std::fs::remove_file(&log);
+    assert!(
+        !out.status.success() || events.iter().any(|e| matches!(e.call, Call::Open { .. })),
+        "CANNOT MEASURE: the interposer recorded no `open` by `vox {}`, which succeeded: the \
+         recorder saw nothing, so nothing here can say what vox did ({} event(s) in all)",
+        args.join(" "),
+        events.len()
+    );
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
