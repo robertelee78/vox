@@ -21,6 +21,9 @@
 //! guest as a distinct peer address, as behind a real forward. The first datagram from each source
 //! is timestamped where it arrives, so a proof can tell when a dial *began*, even one the node
 //! started on its own before the proof asked it anything.
+//!
+//! **Every red here names its side** (V210-106), as in `world.rs`: the forward's own sockets are
+//! the apparatus, and an `APPARATUS:` red names which one failed.
 
 #![allow(dead_code)]
 
@@ -55,11 +58,15 @@ pub struct PortForward {
 impl PortForward {
     /// A forward from a fresh `[::1]` port to `host`, `open` or closed from the start.
     pub fn start(host: SocketAddr, open: bool) -> Self {
-        let public_sock = UdpSocket::bind("[::1]:0").expect("bind the forward's public socket");
-        let public = public_sock.local_addr().unwrap();
+        let public_sock = UdpSocket::bind("[::1]:0").unwrap_or_else(|e| {
+            panic!("APPARATUS: could not bind the port forward's public socket: {e}")
+        });
+        let public = public_sock
+            .local_addr()
+            .unwrap_or_else(|e| panic!("APPARATUS: the port forward's public socket: {e}"));
         public_sock
             .set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
+            .unwrap_or_else(|e| panic!("APPARATUS: the port forward's public socket: {e}"));
         let state = Arc::new(State::default());
         state.open.store(open, Ordering::SeqCst);
         let st = Arc::clone(&state);
@@ -73,16 +80,26 @@ impl PortForward {
                     Err(_) => continue,
                 };
                 let at = Instant::now();
-                st.first_seen.lock().unwrap().entry(from).or_insert(at);
+                st.first_seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(from)
+                    .or_insert(at);
                 if !st.open.load(Ordering::SeqCst) {
                     st.dropped.fetch_add(1, Ordering::SeqCst);
                     continue;
                 }
                 let sock = inside.entry(from).or_insert_with(|| {
-                    let s = UdpSocket::bind("127.0.0.1:0").expect("bind an inside socket");
-                    s.connect(host)
-                        .expect("connect the inside socket to the host");
-                    s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+                    let s = UdpSocket::bind("127.0.0.1:0").unwrap_or_else(|e| {
+                        panic!("APPARATUS: could not bind a port forward inside socket: {e}")
+                    });
+                    s.connect(host).unwrap_or_else(|e| {
+                        panic!(
+                            "APPARATUS: could not aim a port forward inside socket at {host}: {e}"
+                        )
+                    });
+                    s.set_read_timeout(Some(Duration::from_millis(50)))
+                        .unwrap_or_else(|e| panic!("APPARATUS: a port forward inside socket: {e}"));
                     let s = Arc::new(s);
                     let (back, public, st) =
                         (Arc::clone(&s), Arc::clone(&public_sock), Arc::clone(&st));
@@ -138,7 +155,11 @@ impl PortForward {
 
     /// Every guest source seen so far, with when its first datagram arrived.
     pub fn sources(&self) -> HashMap<SocketAddr, Instant> {
-        self.state.first_seen.lock().unwrap().clone()
+        self.state
+            .first_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -153,9 +174,8 @@ impl Drop for PortForward {
 /// fails to bind and says so, which is a loud failure, never a wrong measurement.
 pub fn free_v4_udp_port() -> u16 {
     UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+        .and_then(|s| s.local_addr())
+        .unwrap_or_else(|e| panic!("APPARATUS: no free UDP port on 127.0.0.1: {e}"))
         .port()
 }
 
@@ -183,31 +203,33 @@ pub struct ForwardedWorld {
 
 impl ForwardedWorld {
     pub fn new(forward_open: bool) -> Self {
-        use crate::world::{after_label, args, echo_service, vox_once, VoxProc};
-        let tmp = tempfile::tempdir().unwrap();
+        use crate::world::{
+            after_label, args, echo_service, fingerprint, mkdir, vox_once, VoxProc,
+        };
+        let tmp = crate::world::tempdir();
         let (anchor_dir, host_dir, guest_dir) = (
             tmp.path().join("anchor"),
             tmp.path().join("host"),
             tmp.path().join("guest"),
         );
         for d in [&anchor_dir, &host_dir, &guest_dir] {
-            std::fs::create_dir_all(d.join("cfg")).unwrap();
+            mkdir(&d.join("cfg"));
         }
         let anchor = crate::relay::Anchor::start(&anchor_dir);
 
-        let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-        assert!(ok, "vox id (guest): {err}");
-        let (ok, host_fp, err) = vox_once(&host_dir, &args(&["id"]));
-        assert!(ok, "vox id (host): {err}");
-        let host_fp = host_fp.trim().to_owned();
+        let guest_fp = fingerprint(&guest_dir, "guest");
+        let host_fp = fingerprint(&host_dir, "host");
         let (ok, out, err) = vox_once(
             &host_dir,
-            &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
+            &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
         );
-        assert!(ok, "trust add: {out}\n{err}");
+        assert!(
+            ok,
+            "PRODUCT (staging): the host's `vox trust add` of the guest failed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
 
         let host_port = free_v4_udp_port();
-        let host_addr: SocketAddr = format!("127.0.0.1:{host_port}").parse().unwrap();
+        let host_addr = SocketAddr::from(([127, 0, 0, 1], host_port));
         let forward = PortForward::start(host_addr, forward_open);
         let advertise = forward.public.to_string();
         let service_port = echo_service();
@@ -253,8 +275,8 @@ impl ForwardedWorld {
         let joined_in = t0.elapsed();
         assert!(
             ok,
-            "CANNOT MEASURE: the guest on [::1] could not join the host's room (after \
-             {joined_in:?}).\nstdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
+            "PRODUCT (staging): the guest on [::1] could not join the host's room: `vox connect` \
+             failed after {joined_in:?}.\nstdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
             host.transcript()
         );
         Self {
@@ -301,23 +323,35 @@ impl ForwardedWorld {
         );
         let line = up.expect_line("the proxy's bound address", |l| l.starts_with("vox up on "));
         let ready = Instant::now();
-        let bound: SocketAddr = line
-            .split_whitespace()
-            .nth(3)
-            .expect("an address in the up line")
-            .parse()
-            .expect("a socket address");
+        let bound = crate::world::address_in(&mut up, &line, 3);
         (up, bound, ready)
     }
 }
 
 /// Stop a `vox` process the way a person does — Ctrl-C, by its PID — and wait up to `within` for it
-/// to exit. A process that does not is killed by its handle when dropped.
+/// to exit. A process that does not is killed by its handle when dropped. A Ctrl-C that could not
+/// be sent is `APPARATUS:` — the process would be "still running" for a reason of the proof's own.
 pub fn interrupt(p: &mut crate::world::VoxProc, within: Duration) -> bool {
     let pid = p.child.id().to_string();
-    let _ = std::process::Command::new("kill")
+    if let Ok(Some(status)) = p.child.try_wait() {
+        eprintln!(
+            "[harness] {} had already exited ({status}) before Ctrl-C",
+            p.name
+        );
+        return true;
+    }
+    match std::process::Command::new("kill")
         .args(["-INT", &pid])
-        .status();
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => panic!(
+            "APPARATUS: `kill -INT {pid}` did not take ({}): {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => panic!("APPARATUS: could not run `kill -INT {pid}`: {e}"),
+    }
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
         if let Ok(Some(_)) = p.child.try_wait() {

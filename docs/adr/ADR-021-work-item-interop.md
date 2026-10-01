@@ -1,12 +1,13 @@
 # ADR-021: Work-item interop — the contract Vox exposes to an external work tracker
 
-**Status**: **implemented on `feat/adr021-work-interop` (PR #14), not yet merged to `main`** —
-2026-09-24, M21.1–M21.8, each proved through the shipped `vox` binary and mutation-checked; the plan below
-names the proof, its mutations and the commit for each. **M21.9 and M21.10 are decided (2026-09-24) and
-not built.** Vox holds no work state: an external tracker owns it. Open defects found while building this
-sit outside its boundary and are recorded rather than accepted — F12 in `vox-core` key distribution (half
-fixed in PR #20), F15 in the daemon's interrupt path (fix in PR #16) and F17, OpenCode delivery (fixed
-2026-10-01 for v0.2.10); F14 is retired. Statements about the tree before this change describe `main` at `96c47ed`
+**Status**: **implemented, on `main` since v0.2.9** (PR #14) — M21.1–M21.8 built 2026-09-24 and M21.9–M21.10
+2026-09-25, each proved through the shipped `vox` binary and mutation-checked; the plan below names the
+proof, its mutations and the commit for each. **2026-10-01:** mutation found proof gaps in M21.1, M21.2,
+M21.6 and M21.8 (the product passed); they are being closed for v0.2.10. Vox holds no work state: an
+external tracker owns it. Defects found while building this sit outside its boundary and are recorded
+rather than accepted — F12 in `vox-core` key distribution (fixed, on `main` since v0.2.9), F15 in the
+daemon's interrupt path (fixed, PR #16), F17, OpenCode delivery (fixed 2026-10-01 for v0.2.10), and F18–F20
+(open, v0.2.10); F14 is retired. Statements about the tree before this change describe `main` at `96c47ed`
 (v0.2.7).
 **Date**: 2026-09-23
 **Updated**: 2026-09-24 — implemented; see the revision history below.

@@ -1,7 +1,7 @@
 # ADR-020: Agent comms — a room-based messaging app on the Vox layer
 
 **Status**: **partly implemented** — 2026-09-21; the claim protocol of §5 corrected and extended by
-ADR-021, built 2026-09-24 in PR #14 (not yet on `main`). Twelve decisions; the plan below marks each
+ADR-021, built 2026-09-24 in PR #14 (on `main` since v0.2.9). Twelve decisions; the plan below marks each
 milestone `DONE` with the commit that landed it, or leaves it unmarked. Nothing here is marked done
 that has not passed a gate.
 
