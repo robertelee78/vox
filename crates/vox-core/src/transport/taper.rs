@@ -14,8 +14,9 @@
 //! # Decisions, evaluated once per round trip
 //! - **Climb 1 → 2** when the last [`CLIMB_1_ROUNDS`] rounds held at least [`CLIMB_1_LOSSES`]
 //!   losses with no queue building, once tier 1's dwell is over, and the loss share over the last
-//!   32 MiB is at least [`TIER2_ENTRY_SHARE`]. That share is marked as tier 2's baseline: loss
-//!   that then grows with Vox's own sending is congestion.
+//!   32 MiB is at least [`TIER2_ENTRY_SHARE`]. That share is marked as tier 2's baseline, which
+//!   follows the trend up until tier 2 has sent 32 MiB of its own: loss that then grows with Vox's
+//!   own sending is congestion.
 //! - **Climb 2 → 3** when the loss share over the last 32 MiB sent (`PathSignals::trend_share`)
 //!   is at or above [`GENTLE_LOSS_CAP`], past which tier 2 cuts for every loss, and no queue has
 //!   been held for [`CLIMB_3_QUEUE_ROUNDS`] rounds in a row in the last [`CLIMB_3_ROUNDS`] rounds and
@@ -90,7 +91,7 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Controller, ControllerMetrics};
 use quinn_proto::RttEstimator;
 
-use super::congestion::{PathSignals, VoxCubic, GENTLE_LOSS_CAP};
+use super::congestion::{PathSignals, VoxCubic, GENTLE_LOSS_CAP, TREND_BYTES};
 use super::vox_bbr::{RateSeed, VoxBbr};
 
 /// The rounds a climb from tier 1 looks back over…
@@ -245,6 +246,9 @@ pub(crate) struct Tapered {
     entry_share: f64,
     /// The base round trip when tier 3 was entered.
     tier3_entry_base: Option<Duration>,
+    /// Tier 2's loss baseline while it settles: bytes sent since 1 -> 2, and the baseline marked.
+    tier2_sent: u64,
+    tier2_baseline: Option<f64>,
     backoff: Tier3Backoff,
     /// Rounds without a held queue, toward a climb from tier 2.
     unqueued: Streak,
@@ -267,6 +271,8 @@ impl Tapered {
             rounds_in_tier: 0,
             entry_share: 0.0,
             tier3_entry_base: None,
+            tier2_sent: 0,
+            tier2_baseline: None,
             backoff: Tier3Backoff::default(),
             unqueued: Streak::default(),
             queued: Streak::default(),
@@ -313,6 +319,7 @@ impl Tapered {
         if self.signals.app_limited() {
             return;
         }
+        self.settle_tier2_baseline();
         let share = self.signals.loss_share();
         let queued = self.signals.queue_building();
         let tier3_queued = match (&self.tier, self.signals.round_min_rtt(), self.tier3_base()) {
@@ -371,6 +378,27 @@ impl Tapered {
         }
     }
 
+    /// Tier 2's loss baseline is the 32 MiB loss trend at 1 -> 2, but a link that turned lossy a
+    /// moment ago still has clean bytes in that window, so the trend at entry is low and still
+    /// rising. Until tier 2 has sent a whole trend window of its own, the baseline follows the trend
+    /// up (never down); from then on it holds. Measured without this: a 1% phase entered tier 2 at a
+    /// trend of about 0.5%, the window then filled to 1%, which read as risen, and tier 2 cut like
+    /// Cubic (45–60 Mbit/s at the end of the phase, 1.68x a Cubic flow on the 1% arm).
+    fn settle_tier2_baseline(&mut self) {
+        let Some(baseline) = self.tier2_baseline else {
+            return;
+        };
+        if self.tier_id == TierId::One || self.tier2_sent >= TREND_BYTES {
+            self.tier2_baseline = None;
+            return;
+        }
+        let trend = self.signals.trend_share();
+        if trend > baseline {
+            self.signals.mark_loss_baseline();
+            self.tier2_baseline = Some(trend);
+        }
+    }
+
     /// The rate a window sustains over a round trip, bytes per second.
     fn window_rate(window: u64, rtt: Duration) -> u64 {
         if rtt.is_zero() {
@@ -419,7 +447,11 @@ impl Tapered {
             cubic.set_loss_aware(to != TierId::One);
         }
         match (from, to) {
-            (TierId::One, TierId::Two) => self.signals.mark_loss_baseline(),
+            (TierId::One, TierId::Two) => {
+                self.signals.mark_loss_baseline();
+                self.tier2_sent = 0;
+                self.tier2_baseline = Some(self.signals.trend_share());
+            }
             (TierId::Two, TierId::One) => self.signals.clear_loss_baseline(),
             (_, TierId::Three) => {
                 self.entry_share = self.signals.trend_share();
@@ -459,6 +491,7 @@ impl Tapered {
 impl Controller for Tapered {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
         self.signals.on_sent(now, bytes, last_packet_number);
+        self.tier2_sent = self.tier2_sent.saturating_add(bytes);
         self.tier
             .controller_mut()
             .on_sent(now, bytes, last_packet_number);
