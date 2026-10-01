@@ -1422,6 +1422,17 @@ impl Drop for IpcServer {
 /// is suspended or stuck, and waiting longer only hides that.
 pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The error for a node that closed the connection before replying (V210-101): never "malformed",
+/// since nothing arrived to be malformed. A fresh connection, bounded, tells a node that is gone
+/// from one that ended this request itself.
+pub async fn hung_up(path: &Path) -> Error {
+    let still_running = matches!(
+        tokio::time::timeout(ANSWER_WITHIN, connect_own(path)).await,
+        Ok(Ok(_))
+    );
+    Error::Ipc(IpcHandshake::HungUp { still_running })
+}
+
 /// The error for a node that did not answer within [`ANSWER_WITHIN`].
 #[must_use]
 pub fn silent() -> Error {
@@ -1479,7 +1490,7 @@ async fn still_answering(path: &Path) -> Result<()> {
     match tokio::time::timeout(ACTOR_WITHIN, ping).await {
         // Any answer, even an error from a node too old to know the ping, is an answer.
         Ok(Ok(Some(_))) => Ok(()),
-        Ok(Ok(None)) => Err(Error::MalformedIpc("ipc closed before reply")),
+        Ok(Ok(None)) => Err(hung_up(path).await),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(Error::Ipc(IpcHandshake::Stuck {
             secs: ACTOR_WITHIN.as_secs(),
@@ -2320,7 +2331,7 @@ impl IpcClient {
         let exchange = async {
             write_frame(stream, &req.to_bytes()).await?;
             let Some(body) = read_frame(stream).await? else {
-                return Err(Error::MalformedIpc("ipc closed before reply"));
+                return Err(hung_up(path).await);
             };
             Frame::from_bytes(&body)
         };

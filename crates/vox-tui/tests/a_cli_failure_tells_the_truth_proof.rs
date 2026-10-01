@@ -31,6 +31,12 @@
 //!    CANNOT MEASURE. The control: after SIGCONT the same daemon answers `vox status`. A node
 //!    whose actor is stuck while it still greets cannot be staged through any command; that
 //!    half (the ping each check sends through the actor) rests on code review.
+//! 7. **A request whose node is killed mid-request names the hang-up** (V210-101, #305). Staged as
+//!    (5), but the joiner's daemon is killed with SIGKILL, so its connection ends rather than
+//!    going quiet. The join must exit non-zero within the proof's bound, saying the node closed
+//!    the connection before replying and is no longer running, and never call it a "malformed
+//!    control-socket message": nothing arrived to be malformed. If it says the node closed the
+//!    connection before greeting, the kill came before the request was sent: CANNOT MEASURE.
 //! 6. **A holder whose control socket cannot be bound runs on, and says why** (separate test,
 //!    `a_holder_runs_without_its_control_socket`). A profile path too long for a socket puts the
 //!    socket in `$TMPDIR/vox-<uid>`, and there a plain file stands where that directory should be
@@ -47,7 +53,9 @@
 //! from `IpcClient::open` and `status::request` — `vox status` is still running at 30 s;
 //! (3) `Ok(None) => return Ok(())` back in `room_cli::tail` — the tail exits 0; (5)
 //! `IpcClient::request` without `while_answering` — the join is still running at 45 s; (6)
-//! `serve_control_socket(..)?`, a bind failure fatal again — `vox serve` exits 1 at once.
+//! `serve_control_socket(..)?`, a bind failure fatal again — `vox serve` exits 1 at once; (7)
+//! `IpcClient::request`'s end-of-stream mapped back to `MalformedIpc("ipc closed before reply")` —
+//! the join says "malformed control-socket message".
 
 #![cfg(unix)]
 
@@ -440,6 +448,87 @@ fn a_cli_failure_tells_the_truth() {
          silence was not the suspension's: {said}"
     );
     drop(late);
+    claims += 1;
+
+    // ---- (7) a node killed mid-request: the request names the hang-up, never "malformed" ----
+    let gone_dir = dir("gone");
+    let (ok, said, _) = must("vox id (gone)", vox(&gone_dir, &["id"], "", quick));
+    assert!(ok, "CANNOT MEASURE (7): vox id (gone): {said}");
+    let mut gone = Proc::spawn(
+        "gone-daemon",
+        &gone_dir,
+        &["daemon", "--listen", "127.0.0.1:0", "--anchor", &spec],
+        &format!("{IDPASS}\n"),
+    );
+    gone.expect_out("its control socket", |l| l.contains("control socket"));
+    let gone_pid = gone.child.id();
+    // As in (5): the host is suspended, so the join is still being worked on when its own node
+    // is killed. A kill, not a suspension: the connection ends, it does not go quiet.
+    assert!(
+        signal("STOP", host_pid),
+        "CANNOT MEASURE (7): could not SIGSTOP the host"
+    );
+    let mut join = Proc::spawn(
+        "gone join",
+        &gone_dir,
+        &["room", "join", &address, "--name", "svc"],
+        &format!("{passphrase}\n"),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    if let Some(s) = join.child.try_wait().expect("wait") {
+        signal("CONT", host_pid);
+        panic!(
+            "CANNOT MEASURE (7): the join ended ({s}) before its node could be killed \
+             mid-request: {}\n{}",
+            join.stdout().join("\n"),
+            join.stderr()
+        );
+    }
+    assert!(
+        signal("KILL", gone_pid),
+        "CANNOT MEASURE (7): could not SIGKILL the joiner's daemon"
+    );
+    let _ = gone.child.wait();
+    let ended = join.exit_within(bound);
+    assert!(
+        signal("CONT", host_pid),
+        "CANNOT MEASURE (7): could not SIGCONT the host"
+    );
+    let Some((status, took)) = ended else {
+        panic!(
+            "PRODUCT (7): `vox room join` whose node was killed mid-request was still running \
+             after {bound:?}"
+        );
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let said = format!("{}\n{}", join.stdout().join("\n"), join.stderr());
+    eprintln!(
+        "[room join, node killed mid-request] exit {:?} in {:.1}s: {}",
+        status.code(),
+        took.as_secs_f64(),
+        said.trim().replace('\n', " / ")
+    );
+    assert!(
+        !said.contains("closed the connection before greeting"),
+        "CANNOT MEASURE (7): the node was gone before it greeted, so no request was in flight: \
+         {said}"
+    );
+    assert!(
+        !status.success(),
+        "PRODUCT (7): a join whose node was killed mid-request must fail: {said}"
+    );
+    assert!(
+        !said.contains("malformed"),
+        "PRODUCT (7): a node that hung up was called malformed, though nothing arrived to be \
+         malformed: {said}"
+    );
+    assert!(
+        said.contains("closed the connection before replying")
+            && said.contains("no longer running"),
+        "PRODUCT (7): the join must say its node closed the connection before replying and is no \
+         longer running: {said}"
+    );
+    drop(gone);
     claims += 1;
 
     // ---- the tail, attached and delivering before anything is done to its node ----
