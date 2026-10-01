@@ -822,6 +822,9 @@ pub async fn tail(
     let mut by_hash: std::collections::HashMap<Digest32, vox_core::node::api::MessageRow> =
         std::collections::HashMap::new();
     let mut last: Option<Digest32> = None;
+    // How far this stream has READ the node's timeline — the last row a read returned, not the
+    // last one emitted, since an own post arrives as `NewEntry` ahead of rows synced before it.
+    let mut read_to: Option<Digest32> = all.last().map(|r| r.entry_hash);
     let mut out = std::io::stdout().lock();
 
     // Index everything, emit only what follows the cursor.
@@ -870,9 +873,17 @@ pub async fn tail(
     // arrive as `NewEntry`; an entry that arrives from another member by sync is
     // announced as `Synced`, and one that becomes readable when a sender key arrives as
     // `SenderKeyReceived` — neither carries the row. So on any of them, and on
-    // `Lagged`, the room is re-read and whatever this stream has not emitted is emitted.
-    // A full re-read rather than `since <last>`, because an entry rendered late (its key
-    // arrived after it did) is not guaranteed to sit after the last one emitted.
+    // `Lagged`, the room is read from where this stream last read it, and whatever it has
+    // not emitted is emitted.
+    //
+    // **From where it last read, never the whole room** (V210-113): a whole re-read made
+    // every arriving message cost the room's history (one run: 122 re-reads of ~7.4 MB).
+    // It is complete because a node's timeline only grows at its end: an entry rendered
+    // late (its key arrived after it did) is appended when it is rendered, so it sits
+    // after every row any earlier read returned — though not necessarily after the last
+    // row *emitted*, which may be an own post that came as `NewEntry`; hence `read_to`.
+    // A reopened room rebuilds its timeline in the same order (its cache rows'); should
+    // the cursor be gone from it anyway, the room is read whole, once.
     loop {
         let reread = match stream.next().await {
             Ok(Some(Frame::Event(vox_core::node::api::NodeEvent::NewEntry {
@@ -910,7 +921,21 @@ pub async fn tail(
             Err(e) => return Err(AppError::Usage(e.to_string())),
         };
         if reread {
-            for r in coord::read_all(&mut lookup, channel_id, None).await? {
+            let rows = match lookup
+                .read_rows(channel_id, read_to)
+                .await
+                .map_err(|e| AppError::Usage(e.to_string()))?
+            {
+                Frame::Rows { rows } => rows,
+                Frame::Error { .. } if read_to.is_some() => {
+                    coord::read_all(&mut lookup, channel_id, None).await?
+                }
+                other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            };
+            if let Some(r) = rows.last() {
+                read_to = Some(r.entry_hash);
+            }
+            for r in rows {
                 deliver(r, &mut out, &mut ops, &mut last);
             }
         }
