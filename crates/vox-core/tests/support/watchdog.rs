@@ -72,9 +72,11 @@
 //! 500 s of its 600 s on one tree, and was aborted 3 runs of 3 on the next (V210-99, #295), with
 //! nothing wrong but that cost. Those costs are the product's, never weakened for a test. So a
 //! proof that pays them arms with [`arm_for_setup`], naming how many joins and unlocks its setup makes, and a debug build adds
-//! [`DEBUG_JOIN`] per join and [`DEBUG_UNLOCK`] per unlock to the budget: the most each was
-//! measured to cost a debug build on a machine doing its ordinary concurrent work. A release
-//! build's budget is unchanged.
+//! [`DEBUG_JOIN`] per join and [`DEBUG_UNLOCK`] per unlock to the budget: twice the most each was
+//! measured to cost a debug build on a machine doing its ordinary concurrent work. Twice, because
+//! the next run may be slower than any measured (a fill sized to its slowest add met a slower one
+//! on the next run), and a hang is minutes or hours over, so the headroom costs the watchdog
+//! nothing. A release build's budget is unchanged.
 //!
 //! The budget is deliberately generous: it is not a performance assertion, it is the line past
 //! which "slow" is no longer a credible explanation. Override with `VOX_TEST_WATCHDOG_SECS`,
@@ -90,21 +92,21 @@ use std::time::{Duration, Instant};
 /// Past this, a gate is hung rather than slow. The longest gate observed is ~53 s.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(600);
 
-/// The most one join cost a debug build: `vox room join` returning, its proof of work solved by the
+/// Twice the most one join cost a debug build: `vox room join` returning, its proof of work solved by the
 /// joining node, measured on the equivocation proof's staging (an anchor, five daemons, four
 /// joins in turn) on a machine doing its ordinary concurrent work, at load 10 to 77 (V210-99): 36
 /// joins over nine runs, on three builds (bb636f78, 4abf8307, and this branch) side by side, median
 /// 47.8 s, least 26.0 s, most 142.0 s. Nearly all of it is the solve, whose cost is random: it
 /// varied fivefold from one join to the next within one run.
 #[allow(dead_code)]
-pub const DEBUG_JOIN: Duration = Duration::from_millis(142_000);
+pub const DEBUG_JOIN: Duration = Duration::from_millis(2 * 142_000);
 
-/// The most one production-Argon2id unlock cost a debug build — `vox id` on a profile, measured in
+/// Twice the most one production-Argon2id unlock cost a debug build — `vox id` on a profile, measured in
 /// the same nine runs as [`DEBUG_JOIN`] (V210-99): 45 of them, median 6.5 s, most 14.1 s. The other
 /// verbs that unlock cost no more there: a daemon answering after it starts, at most 12.7 s of 45,
 /// and a `trust add`, at most 9.9 s on average over a run's 20.
 #[allow(dead_code)]
-pub const DEBUG_UNLOCK: Duration = Duration::from_millis(14_100);
+pub const DEBUG_UNLOCK: Duration = Duration::from_millis(2 * 14_100);
 
 /// What [`DEBUG_JOIN`] rests on, printed when a debug build arms for its setup.
 const DEBUG_JOIN_MEASURED: &str = "a join: 36 measured, median 47.8s, most 142.0s";
@@ -118,7 +120,7 @@ const DEBUG_UNLOCK_MEASURED: &str = "an unlock: 45 measured, median 6.5s, most 1
 static BUDGET_SECS: AtomicU64 = AtomicU64::new(DEFAULT_BUDGET.as_secs());
 
 /// What `joins` joins and `unlocks` unlocks cost this build beyond a release build's: in a
-/// release build nothing, in a debug build their measured most ([`DEBUG_JOIN`],
+/// release build nothing, in a debug build twice their measured most ([`DEBUG_JOIN`],
 /// [`DEBUG_UNLOCK`]). For a driver's own budget that waits on them, as for the watchdog's.
 #[allow(dead_code)]
 pub fn debug_cost(joins: u32, unlocks: u32) -> Duration {
@@ -137,7 +139,7 @@ pub fn arm_for_setup(joins: u32, unlocks: u32) {
     if !extra.is_zero() {
         say(&format!(
             "[watchdog] debug build: budget {}s = {}s + {joins} join(s) x {:.1}s + {unlocks} \
-             unlock(s) x {:.1}s (each the most measured: {DEBUG_JOIN_MEASURED}; \
+             unlock(s) x {:.1}s (each twice the most measured: {DEBUG_JOIN_MEASURED}; \
              {DEBUG_UNLOCK_MEASURED})\n",
             (DEFAULT_BUDGET + extra).as_secs(),
             DEFAULT_BUDGET.as_secs(),
