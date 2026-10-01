@@ -41,8 +41,10 @@
 //!   `HANDSHAKE_TIMEOUT`, so a host stuck on an earlier handshake has had time to come free):
 //!   **PRODUCT**, the host did not take a fresh handshake promptly;
 //! - the holding client's own attempt ended before any answer (an error of the staging's QUIC
-//!   client, such as a refusal of its configuration): **APPARATUS**, the hold was never in place,
-//!   naming the error.
+//!   client, such as a refusal of its configuration, or a failure to set itself up), or its thread
+//!   stopped without a word: **APPARATUS**, the hold was never in place, naming the error. Only a
+//!   wait that runs out in full is the host's (an earlier version read a client that died at once
+//!   as a host that "never answered … in 40s").
 //!
 //! ## Why it is `#[ignore]`d
 //!
@@ -146,7 +148,14 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
             "CANNOT MEASURE (APPARATUS): staging not achieved, the holding client's attempt \
              ended before the host answered it, so no handshake was held: {error}"
         ),
-        Err(_) => {
+        // Every sender gone with no word: the holding thread died before it could say why (a
+        // panic in the staging). Nothing was held, so the host was never asked.
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "CANNOT MEASURE (APPARATUS): staging not achieved, the holding client stopped after \
+             {:?} without holding a handshake or saying why, so the host was never asked",
+            sent.elapsed()
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
             let host_said = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
             panic!(
                 "PRODUCT: the host never answered a fresh handshake straight after the first \
@@ -172,7 +181,10 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
     );
     let (Some(h2), Some(h3)) = (waited_on_others(&err2), waited_on_others(&err3)) else {
         panic!(
-            "CANNOT MEASURE (APPARATUS): a joiner's line did not carry its board, dial and exchange steps\n---- the second \
+            "CANNOT MEASURE (APPARATUS): a joiner's `join got in` line did not carry its board, dial \
+             and exchange steps, so the proof cannot tell its wait on others from its own work. \
+             Both joins succeeded (asserted above), so this is not a failure a person sees: the \
+             line is the proof's measure, and a change to its format is the parser's to follow\n---- the second \
              joiner ----\n{err2}\n---- the third joiner ----\n{err3}"
         );
     };
@@ -195,17 +207,27 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
 /// The host's own UDP endpoint, from the room's address: the `b=` that follows `a=<host>`.
 fn host_endpoint(w: &World) -> SocketAddr {
     let at = format!("a={}&b=/ip4/127.0.0.1/udp/", w.host_fp);
-    let tail = w
-        .address
-        .split(&at)
-        .nth(1)
-        .unwrap_or_else(|| panic!("no host endpoint in the room address {}", w.address));
+    let tail = w.address.split(&at).nth(1).unwrap_or_else(|| {
+        panic!(
+            "CANNOT MEASURE (APPARATUS): the proof cannot find the host's UDP endpoint in the \
+                 room address `vox` printed, {}. The joins dial with that same address and are \
+                 judged on their own, so a change in its format is this parser's to follow, not a \
+                 failure a person sees",
+            w.address
+        )
+    });
     let port: u16 = tail
         .chars()
         .take_while(char::is_ascii_digit)
         .collect::<String>()
         .parse()
-        .expect("the host's port");
+        .unwrap_or_else(|e| {
+            panic!(
+                "CANNOT MEASURE (APPARATUS): the proof cannot read the host's port in the room \
+                 address `vox` printed, {}: {e}",
+                w.address
+            )
+        });
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
@@ -264,47 +286,51 @@ impl rustls::client::danger::ServerCertVerifier for Holds {
 /// cut short by the client giving up.
 fn hold_a_handshake(host: SocketAddr, events: mpsc::Sender<Hold>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        rt.block_on(async move {
-            let provider = Arc::new(vox_core::transport::provider::vox_crypto_provider());
-            let schemes = provider
-                .signature_verification_algorithms
-                .supported_schemes();
-            let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .expect("TLS 1.3")
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(Holds {
-                    answered: events.clone(),
-                    schemes,
-                }))
-                .with_no_client_auth();
-            tls.alpn_protocols = vec![vox_core::transport::provider::VOX_ALPN.to_vec()];
-            let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC TLS");
-            let endpoint =
-                quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).expect("client");
-            let mut client = quinn::ClientConfig::new(Arc::new(quic));
-            let mut transport = quinn::TransportConfig::default();
-            transport.max_idle_timeout(Some(
-                quinn::IdleTimeout::try_from(ANSWER_WAIT + Duration::from_secs(30))
-                    .expect("an idle timeout"),
-            ));
-            client.transport_config(Arc::new(transport));
-            let connecting = match endpoint.connect_with(client, host, "vox") {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = events.send(Hold::Ended(format!("connect: {e}")));
-                    return;
-                }
-            };
-            // An end after the answer is the hold running out, as designed; the receiver has
-            // moved on and ignores it.
-            if let Err(e) = connecting.await {
-                let _ = events.send(Hold::Ended(e.to_string()));
-            }
-        });
+        if let Err(why) = hold(host, &events) {
+            let _ = events.send(Hold::Ended(why));
+        }
+    })
+}
+
+/// The holding client's whole run. Every failure of its own setup (runtime, TLS, socket) is
+/// returned, never panicked, so the proof hears it as [`Hold::Ended`] and names it: a client that
+/// could not hold a handshake is the staging's fault, not the host's (RP-30's verifier).
+fn hold(host: SocketAddr, events: &mpsc::Sender<Hold>) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("the holding client's runtime: {e}"))?;
+    rt.block_on(async move {
+        let provider = Arc::new(vox_core::transport::provider::vox_crypto_provider());
+        let schemes = provider
+            .signature_verification_algorithms
+            .supported_schemes();
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| format!("the holding client's TLS 1.3: {e}"))?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Holds {
+                answered: events.clone(),
+                schemes,
+            }))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![vox_core::transport::provider::VOX_ALPN.to_vec()];
+        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+            .map_err(|e| format!("the holding client's QUIC TLS: {e}"))?;
+        let endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .map_err(|e| format!("the holding client's socket: {e}"))?;
+        let mut client = quinn::ClientConfig::new(Arc::new(quic));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(ANSWER_WAIT + Duration::from_secs(30))
+                .map_err(|e| format!("the holding client's idle timeout: {e}"))?,
+        ));
+        client.transport_config(Arc::new(transport));
+        let connecting = endpoint
+            .connect_with(client, host, "vox")
+            .map_err(|e| format!("the holding client's connect: {e}"))?;
+        // An end after the answer is the hold running out, as designed; the receiver has moved
+        // on and ignores it.
+        connecting.await.map(drop).map_err(|e| e.to_string())
     })
 }
