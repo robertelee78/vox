@@ -83,6 +83,8 @@ redb.workspace = true
 # V210-62's proof plays a peer that opens a handshake with the host and never finishes it: no vox
 # command stops mid-handshake on purpose, so the test drives a QUIC client of its own.
 quinn.workspace = true
+# R41's comparison flow (ADR-024) presents a certificate of its own.
+rcgen.workspace = true
 rustls.workspace = true
 # V210-85's proof stops `vox connect` at its passphrase prompts, which it shows only on a terminal:
 # the test opens a pty of its own and reads the terminal's modes back after the stop.
