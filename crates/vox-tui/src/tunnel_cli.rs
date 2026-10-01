@@ -902,8 +902,14 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::NotNetworked) => {
             "this node is not networked, or its identity is locked\n       nothing about the room is in question"
         }
-        Some(Fault::Locked | Fault::NoIdentity) => {
-            "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
+        // **Locked is not "no identity"** (V210-94). A join a lock cut short, or one asked of a
+        // locked node, has an identity to join as; it was told to run `vox id`, which would make
+        // a second one.
+        Some(Fault::Locked) => {
+            "this profile's identity is locked: a lock stopped the join, or it was locked already\n       unlock it (open `vox tui`, or start `vox daemon`), then run the join again"
+        }
+        Some(Fault::NoIdentity) => {
+            "this profile has no identity yet, so there is nobody to join as\n       run `vox id` to make one"
         }
         // Joining a room this node already holds used to say `Failed(IdentityExists)`.
         Some(Fault::AlreadyMember) => Fault::AlreadyMember.explain(),
