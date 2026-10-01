@@ -981,8 +981,9 @@ Both unknowns are already spiked; neither remains open.
   > the room, the entry and every word) and skips that entry; `remote_interrupt_proof` (5) runs the
   > hook on the wake its stand-in socket received and asserts the room read leaves it out. That spike
   > also showed Claude Code presenting the wake as a message "from another Claude session … a
-  > teammate's request", so the wake's header now says Vox relayed it and that it is neither another
-  > session's nor the operator's words (the decider, 2026-10-01).
+  > teammate's request", so the wake now opens by saying plainly it is a Vox room message: who sent
+  > it, in which room, relayed by Vox, and not a request from another agent session (the decider,
+  > 2026-10-01). V210-79's sentence that follows it is unchanged.
 
   > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, then reproduced through the real
   > `vox daemon`; fix proposed in #16.** `vox daemon`
