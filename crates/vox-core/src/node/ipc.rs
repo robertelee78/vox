@@ -568,42 +568,42 @@ impl Request {
             (T_TRUST, 4) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
-                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Trust {
                     target,
                     petname,
-                    identity_passphrase,
+                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
                 })
             }
             (T_UNTRUST, 3) => {
                 let target = digest(&mut d)?;
-                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Untrust {
                     target,
-                    identity_passphrase,
+                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
                 })
             }
             // The unpaged form, as for `Rooms` above.
             (T_TRUST_LIST, 2) => {
-                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::TrustList {
-                    identity_passphrase,
+                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
                     after: None,
                 })
             }
             (T_TRUST_LIST, 3) => {
-                let identity_passphrase = text(&mut d, "ipc identity passphrase")?;
+                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 let after = optional_digest(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::TrustList {
-                    identity_passphrase,
+                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
                     after,
                 })
             }
@@ -652,23 +652,23 @@ impl Request {
             (T_JOIN, 4) => {
                 let link = text(&mut d, "ipc join link")?;
                 let local_name = text(&mut d, "ipc join name")?;
-                let passphrase = text(&mut d, "ipc join passphrase")?;
+                let mut passphrase = secret_text(&mut d, "ipc join passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Join {
                     link,
                     local_name,
-                    passphrase,
+                    passphrase: std::mem::take(&mut *passphrase),
                 })
             }
             (T_CREATE, 3) => {
                 let local_name = text(&mut d, "ipc create name")?;
-                let passphrase = text(&mut d, "ipc create passphrase")?;
+                let mut passphrase = secret_text(&mut d, "ipc create passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Create {
                     local_name,
-                    passphrase,
+                    passphrase: std::mem::take(&mut *passphrase),
                 })
             }
             (T_INVITE, 2) => {
@@ -848,6 +848,13 @@ fn optional_digest(d: &mut Decoder<'_>) -> Result<Option<Digest32>> {
 /// A CBOR text string, named so a decode failure says which field it was.
 fn text(d: &mut Decoder<'_>, what: &'static str) -> Result<String> {
     Ok(d.text().map_err(|_| Error::MalformedIpc(what))?.to_owned())
+}
+
+/// A passphrase field, decoded into a buffer that is wiped when dropped (V210-94): a request that
+/// fails to decode after it is returns an error, and a plain `String` would free a copy unwiped.
+/// Moved out with [`std::mem::take`] once the whole request has decoded.
+fn secret_text(d: &mut Decoder<'_>, what: &'static str) -> Result<zeroize::Zeroizing<String>> {
+    Ok(zeroize::Zeroizing::new(text(d, what)?))
 }
 
 fn addr(d: &mut Decoder<'_>) -> Result<std::net::SocketAddr> {
@@ -1671,6 +1678,10 @@ async fn serve_requests(
         let Some(body) = read_frame(&mut stream).await? else {
             return Ok(());
         };
+        // **Wiped when done with** (V210-94): a request can carry a room or identity passphrase,
+        // and a frame freed as it was kept a copy in memory after the node locked — measured
+        // through the shipped binary, one copy of a join's passphrase after the lock.
+        let body = zeroize::Zeroizing::new(body);
         // ADR-025 S0b: `vox status --json`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
             let equivocations: Vec<(Digest32, Digest32, u64)> = handle
@@ -2311,7 +2322,8 @@ impl IpcClient {
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
         let Self { stream, path, .. } = self;
         let exchange = async {
-            write_frame(stream, &req.to_bytes()).await?;
+            // Wiped once sent: it may carry a passphrase (V210-94).
+            write_frame(stream, &zeroize::Zeroizing::new(req.to_bytes())).await?;
             let Some(body) = read_frame(stream).await? else {
                 return Err(Error::MalformedIpc("ipc closed before reply"));
             };
