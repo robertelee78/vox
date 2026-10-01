@@ -282,6 +282,8 @@ fn idle_then_join(churn: bool) {
         publish(&alice_dir, "rounds"),
     );
     let causes_before = by_cause(&alice_dir);
+    // Bob's renewals too: a board passes on another member's record only when it changed.
+    let bob_before = publish(&bob_dir, "renewals");
     let idle = Duration::from_secs(ttl * LIFETIMES);
     let idle_from = Instant::now();
     let mut restarts = 0u32;
@@ -311,7 +313,11 @@ fn idle_then_join(churn: bool) {
         })
         .filter(|(_, n)| *n > 0)
         .collect();
-    println!("[proof] alice's publish rounds while idle, by cause: {causes:?}");
+    let bob_renewed = publish(&bob_dir, "renewals").saturating_sub(bob_before);
+    println!(
+        "[proof] alice's publish rounds while idle, by cause: {causes:?}; bob renewed \
+         {bob_renewed} time(s)"
+    );
     assert_eq!(
         causes.values().sum::<u64>(),
         rounds,
@@ -414,6 +420,41 @@ fn idle_then_join(churn: bool) {
         (least..=most).contains(&renewed),
         "alice's node renewed its records {renewed} times over {LIFETIMES} idle lifetimes; \
          expected {least}..={most}"
+    );
+    // **Every round has a cause, and each cause is bounded by the design** (V210-68). While
+    // everyone is idle a round goes out only for one of three reasons:
+    // - a renewal, to each anchor connected at that moment: between one and `anchors` per renewal;
+    // - an anchor that came back empty (`anchor_returned`): at most one per return of B;
+    // - news a board passed on (`board_news`): another member's record that changed, which only
+    //   bob's renewals can bring here, to each anchor.
+    // Anything else (a retry, a round queued behind one in flight, governance, a join) is work
+    // the idle room did not ask for.
+    let anchors_n: u64 = if churn { 2 } else { 1 };
+    let count = |cause: &str| causes.get(cause).copied().unwrap_or(0);
+    let unasked: Vec<(&String, &u64)> = causes
+        .iter()
+        .filter(|(c, _)| !["renewal", "anchor_returned", "board_news"].contains(&c.as_str()))
+        .collect();
+    assert!(
+        unasked.is_empty(),
+        "alice's node published while idle for causes the idle room did not ask for: \
+         {unasked:?} (all: {causes:?})"
+    );
+    assert!(
+        (renewed..=renewed * anchors_n).contains(&count("renewal")),
+        "alice's renewal rounds {} are not one to {anchors_n} per renewal ({renewed} renewals)",
+        count("renewal")
+    );
+    assert!(
+        count("anchor_returned") <= reconnects,
+        "alice's rounds to a returned anchor {} exceed anchor B's {reconnects} return(s)",
+        count("anchor_returned")
+    );
+    assert!(
+        count("board_news") <= bob_renewed * anchors_n,
+        "alice passed on {} rounds of news while bob renewed only {bob_renewed} time(s) \
+         ({anchors_n} anchor(s))",
+        count("board_news")
     );
     drop(second);
     drop(anchor);
