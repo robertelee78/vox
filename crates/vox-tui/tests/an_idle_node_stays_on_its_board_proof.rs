@@ -95,8 +95,10 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     )
 }
 
-fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
-    let p = VoxProc::spawn(
+/// A `vox daemon` whose records live `ttl` seconds (given to this process alone, never through the
+/// test's own environment, which both arms share).
+fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, ttl: &str) -> VoxProc {
+    let p = VoxProc::spawn_env(
         name,
         data,
         &args(&[
@@ -108,6 +110,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--passphrase-file",
             pass_file.to_str().unwrap(),
         ]),
+        &[(vox_core::nat::store::TEST_RECORD_TTL_ENV, ttl)],
     );
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
@@ -181,11 +184,12 @@ fn free_port() -> u16 {
 }
 
 /// A `vox node` anchor listening on `port`, and its `--anchor` spec.
-fn anchor_on(name: &str, data: &Path, port: u16) -> (VoxProc, String) {
-    let mut p = VoxProc::spawn(
+fn anchor_on(name: &str, data: &Path, port: u16, ttl: &str) -> (VoxProc, String) {
+    let mut p = VoxProc::spawn_env(
         name,
         data,
         &args(&["node", "--listen", &format!("127.0.0.1:{port}")]),
+        &[(vox_core::nat::store::TEST_RECORD_TTL_ENV, ttl)],
     );
     let spec = p
         .expect_line("an --anchor spec", |l| {
@@ -213,10 +217,12 @@ fn stop(mut p: VoxProc) {
 /// The scene in the header; with `churn`, anchor B restarts all through the idle time.
 fn idle_then_join(churn: bool) {
     watchdog::arm();
-    // Every process this proof starts inherits it: the nodes give their records this lifetime,
-    // and the anchor's board scales its refresh floor with it.
+    // Every node this arm starts is given it: the nodes give their records this lifetime, and the
+    // anchor's board scales its refresh floor with it. **Per process, never `set_var`**: both
+    // arms run in one test process, and a process-wide variable let one arm's lifetime decide the
+    // other's (found by V210-68's verifier).
     let ttl = if churn { CHURN_TTL } else { TTL };
-    std::env::set_var(vox_core::nat::store::TEST_RECORD_TTL_ENV, ttl.to_string());
+    let ttl_s = ttl.to_string();
     let tmp = tempfile::tempdir().unwrap();
     let dir = |n: &str| {
         let d = tmp.path().join(n);
@@ -233,10 +239,10 @@ fn idle_then_join(churn: bool) {
     let idpass = tmp.path().join("idpass");
     std::fs::write(&idpass, IDENTITY).unwrap();
 
-    let (anchor, spec) = anchor_on("anchor", &anchor_dir, free_port());
+    let (anchor, spec) = anchor_on("anchor", &anchor_dir, free_port(), &ttl_s);
     // Anchor B, only with `churn`: on a port it can come back to.
     let second_port = free_port();
-    let mut second = churn.then(|| anchor_on("second", &second_dir, second_port));
+    let mut second = churn.then(|| anchor_on("second", &second_dir, second_port, &ttl_s));
     let anchors = match &second {
         Some((_, b)) => format!("{spec},{}", b),
         None => spec.clone(),
@@ -250,8 +256,8 @@ fn idle_then_join(churn: bool) {
     fp(&bob_dir);
     fp(&carol_dir);
 
-    let alice = daemon("alice", &alice_dir, &anchors, &idpass);
-    let _bob = daemon("bob", &bob_dir, &anchors, &idpass);
+    let alice = daemon("alice", &alice_dir, &anchors, &idpass, &ttl_s);
+    let _bob = daemon("bob", &bob_dir, &anchors, &idpass, &ttl_s);
     let (ok, out, err) = vox_in(
         &alice_dir,
         &["room", "create", "--name", "quiet"],
@@ -294,7 +300,7 @@ fn idle_then_join(churn: bool) {
             while idle_from.elapsed() + CHURN < idle {
                 std::thread::sleep(CHURN);
                 stop(b);
-                b = anchor_on("second", &second_dir, second_port).0;
+                b = anchor_on("second", &second_dir, second_port, &ttl_s).0;
                 restarts += 1;
             }
             std::thread::sleep(idle.saturating_sub(idle_from.elapsed()));
@@ -373,7 +379,7 @@ fn idle_then_join(churn: bool) {
         !anchor_only.contains(&format!("a={alice_fp}&b=")),
         "CANNOT MEASURE: Alice's endpoint is still in the address: {anchor_only}"
     );
-    let carol = daemon("carol", &carol_dir, &spec, &idpass);
+    let carol = daemon("carol", &carol_dir, &spec, &idpass, &ttl_s);
     let t = Instant::now();
     let (joined, out, err) = vox_in(
         &carol_dir,
@@ -412,10 +418,10 @@ fn idle_then_join(churn: bool) {
         "after {LIFETIMES} idle lifetimes the anchor's board no longer held a member's address: \
          carol's join had to wait for one — {steps}"
     );
-    // One renewal per room per half-lifetime, however many boards it reaches: about two a
-    // lifetime. At least one a lifetime, or the records would have lapsed; at most twice the
-    // schedule, or it is a storm.
-    let (least, most) = (LIFETIMES, 4 * LIFETIMES);
+    // One renewal per room per half-lifetime, however many boards it reaches: two a lifetime,
+    // give or take one for where the idle window falls against the schedule. Fewer is a node
+    // renewing late (or at a longer lifetime than it was given); more is a storm.
+    let (least, most) = (2 * LIFETIMES - 1, 2 * LIFETIMES + 1);
     assert!(
         (least..=most).contains(&renewed),
         "alice's node renewed its records {renewed} times over {LIFETIMES} idle lifetimes; \
