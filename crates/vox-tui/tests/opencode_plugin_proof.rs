@@ -346,14 +346,15 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         })
         .to_string(),
     )
-    .unwrap();
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot write the fixture's opencode.json: {e}"));
     // The credential is only *located* through the real data dir; nothing is copied.
     let _ = &auth;
 
     // Every OpenCode here runs with this run's own `TMPDIR`, where its plugin makes its wake
     // directory: (7) counts exactly this run's. Short, because a Unix socket's path is.
     let oc_tmp = tmp.path().join("t");
-    std::fs::create_dir_all(&oc_tmp).unwrap();
+    std::fs::create_dir_all(&oc_tmp)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make this run's TMPDIR {oc_tmp:?}: {e}"));
     let wake_dirs = || {
         std::fs::read_dir(&oc_tmp)
             .map(|d| {
@@ -479,10 +480,13 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             out.code
         ),
     }
+    // The driver ran to its end (exit 0), so a line it did not print is the driver's fault.
     let line = |key: &str| {
         said.lines()
             .find_map(|l| l.strip_prefix(&format!("wake {key}: ")))
-            .unwrap_or("(no line)")
+            .unwrap_or_else(|| {
+                panic!("APPARATUS: the driver exited 0 without its `wake {key}:` line: {said}")
+            })
             .to_owned()
     };
     let (registered, other, wake, turn) = (
@@ -497,21 +501,23 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     );
     assert!(
         registered.starts_with("opencode /") && registered.ends_with("wake.sock"),
-        "(1) a plain `opencode` must register as OpenCode, reachable through the plugin's wake \
+        "PRODUCT (1): a plain `opencode` must register as OpenCode, reachable through the plugin's wake \
          socket; its drain registered {registered:?}"
     );
-    assert_eq!(
-        other, "absent",
-        "(2) an urgent message addressed to someone else must not interrupt this session: {said}"
+    assert!(
+        other == "absent",
+        "PRODUCT (2): an urgent message addressed to someone else must not interrupt this \
+         session; it was {other}: {said}"
     );
     assert!(
         wake.starts_with("shown mid-turn"),
-        "(3) an urgent message addressed to this session must interrupt it while its turn runs; \
+        "PRODUCT (3): an urgent message addressed to this session must interrupt it while its turn runs; \
          it was {wake}: {said}"
     );
-    assert_eq!(
-        turn, "completed",
-        "(4) the interrupt must queue into the running turn, not abort its tool: {said}"
+    assert!(
+        turn == "completed",
+        "PRODUCT (4): the interrupt must queue into the running turn, not abort its tool; the \
+         turn {turn}: {said}"
     );
 
     // ---- each session's wake directory goes with it (F17) ----
@@ -520,7 +526,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         println!("[proof] quit by {how}: its wake directory {quit}");
         assert!(
             quit.starts_with("removed "),
-            "(5) a hand-opened `opencode` quit by {how} must take its wake directory with it; \
+            "PRODUCT (5): a hand-opened `opencode` quit by {how} must take its wake directory with it; \
              it was {quit}{}",
             plugin_diag("quits")
         );
@@ -529,7 +535,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     println!("[proof] killed with its cleanup, then another opened: its wake directory {swept}");
     assert!(
         swept.starts_with("removed "),
-        "(6) the next `opencode` opened must remove a wake directory whose OpenCode was killed \
+        "PRODUCT (6): the next `opencode` opened must remove a wake directory whose OpenCode was killed \
          with its cleanup; it was {swept}{}",
         plugin_diag("sweep")
     );
@@ -540,6 +546,6 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     );
     assert!(
         left.is_empty(),
-        "(7) no wake directory may outlive the OpenCode that made it; this run left {left:?}"
+        "PRODUCT (7): no wake directory may outlive the OpenCode that made it; this run left {left:?}"
     );
 }
