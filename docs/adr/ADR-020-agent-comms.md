@@ -937,8 +937,8 @@ Both unknowns are already spiked; neither remains open.
     folded into the running turn rather than starting one, so delivery into a running turn is `turn/steer`
     with `expectedTurnId`. (Corrected 2026-09-25, M19.12: this said `turn/start` "works mid-turn".)
   - **OpenCode** — `POST /session/:id/prompt_async`, also mid-turn; `noReply: true` appends
-    *without* waking the model. A bare `opencode` has no TCP listener, so this needs the in-process
-    plugin to relay it.
+    *without* waking the model. A bare `opencode` has no TCP listener, so the in-process plugin
+    relays it: the daemon writes to a socket the plugin owns (ADR-021 F17).
 
   The design that avoids per-harness configuration: **the drain hook registers the session's wake
   channel as a side effect**. It already runs every turn and already knows the session id; recording
@@ -961,7 +961,10 @@ Both unknowns are already spiked; neither remains open.
   > worked for a hand-opened session.** OpenCode 1.18.32 sets no `OPENCODE_SERVER_URL`, and a plain TUI
   > has no listener at the `serverUrl` its plugins are handed, so every OpenCode session registers as
   > `unknown` and cannot be woken. The gate above proves the decision, not the delivery; no test posts
-  > to `prompt_async`. Open; the mechanism is a decider question.
+  > to `prompt_async`. **Fixed 2026-10-01 for v0.2.10:** Vox's plugin owns the wake channel — a
+  > private Unix socket with a token, handed to the drain hook — and relays a wake with its in-process
+  > client's `promptAsync`; `opencode_plugin_proof` interrupts a plain, hand-opened `opencode` mid-tool
+  > through `vox daemon`.
 
   > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, then reproduced through the real
   > `vox daemon`; fix proposed in #16.** `vox daemon`
