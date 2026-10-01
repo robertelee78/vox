@@ -4,11 +4,16 @@
 Alice creates a room; Bob and Carol join it, all through real daemons. Bob trusts Alice as
 "alice" and does not trust Carol. Bob's daemon is stopped and his real `vox tui` is opened in a
 pty (pyte at 160x50). His members pane must name Alice "alice" (not her fingerprint), and Carol by
-26 characters of her fingerprint followed by "(not in keyring)", whole. Exit 0 = pass, 1 = red,
-2 = apparatus. Every process is recorded and killed by PID.
+26 characters of her fingerprint followed by "(not in keyring)", whole. Exit 0 = pass, 1 = red
+(the product's), 2 = apparatus (CANNOT MEASURE). Every process is recorded and killed by PID.
 
-Bounded throughout (`vox_pty.py`, V210-54): past its budget the driver says `HUNG at <stage>`
-with its stack, stops everything and exits red.
+Every wait is bounded by what the product allows: `vox room join` by JOIN_SECS, every other verb
+by 120 s, and a verb past its bound is a named product RED. The driver's own budget (`vox_pty.py`,
+V210-54) is sized for the debug build: past it the driver says `HUNG at <stage>` with its stack and
+exits as APPARATUS, because a verb past its own bound would have been the product's RED first, so
+every wait of the product's was still within its bound (V210-111, #307: at a 240 s budget a debug
+run was cut off mid-join while both joining daemons were on CPU in the proof of work and the room
+key's Argon2id seal, and that read as a hang).
 """
 import os, re, subprocess, sys, time
 
@@ -17,7 +22,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
-BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "240"))
+# Sized for the debug build, whose joins grind their proof of work for a minute or more each (40-58 s
+# measured at load 65, plus 5-12 s sealing the room key): two joins at JOIN_SECS each, and the rest
+# (about 150 s in debug). The Rust wrapper's bound sits above it. A release run takes about 40 s.
+BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1260"))
+# A member waits 480 s for a joiner's proof of work (V210-87) plus 5 s of slack; the rest of the
+# exchange and the seal follow it. A join that has not returned by then is past what the product
+# allows, and is a named RED.
+JOIN_SECS = 540
 SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix="vox-tui-names-")
 S = f"{SP}/tuin-{TAG}"
 subprocess.run(["rm", "-rf", S])
@@ -36,7 +48,8 @@ def env(w):
     return e
 
 def run(w, *args, stdin=None):
-    return subprocess.run([VOX, *args], env=env(w), input=stdin, capture_output=True, text=True, timeout=120)
+    secs = JOIN_SECS if args[:2] == ("room", "join") else 120
+    return subprocess.run([VOX, *args], env=env(w), input=stdin, capture_output=True, text=True, timeout=secs)
 
 def spawn(w, *args, out):
     p = subprocess.Popen([VOX, *args], env=env(w), stdin=subprocess.DEVNULL,
@@ -134,15 +147,25 @@ try:
     code = 0 if (alice_ok and not alice_fp_shown and carol_ok) else 1
     print(f"{TAG} {'PASS' if code == 0 else 'RED'}")
 except Hung as h:
+    # A verb past the product's bound for it is the RED below, raised before this; so here every
+    # wait was still within its bound, and the budget that ran out is the driver's.
     print(f"{TAG} HUNG at {h}")
+    print(f"{TAG} APPARATUS: the driver ran past its {BUDGET} s budget at {h} with no product "
+          f"wait past its bound")
+    code = 2
+except subprocess.TimeoutExpired as t:
+    # A `vox` verb that never returned is a red of the product's, named, not a driver with no verdict.
+    print(f"{TAG} RED: `vox {' '.join(t.cmd[1:3])}` did not return within {t.timeout:.0f} s")
     code = 1
 finally:
     disarm()
     stage("stopping every process")
     if tui is not None and not tui.stop():
         # A driver that cannot stop what it started has leaked it, and is how a job hangs (#240).
-        print(f"{TAG} RED: vox tui (pid {tui.pid}) outlived SIGKILL and could not be reaped")
-        code = 1
+        # No process can refuse SIGKILL: what keeps one is its pty, which is the driver's to drain.
+        # A verdict already given stands; a pass becomes CANNOT MEASURE.
+        print(f"{TAG} APPARATUS: vox tui (pid {tui.pid}) outlived SIGKILL and could not be reaped")
+        code = 2 if code == 0 else code
     for p in PROCS:
         if p.poll() is None:
             stop(p)
