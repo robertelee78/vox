@@ -5,6 +5,7 @@
 // Install:
 //   vox agent plugin opencode > ~/.config/opencode/plugin/vox.js
 //   export VOX_ROOM=<room id or unique prefix>
+//   export VOX_AGENT_NAME=<the name others address this agent by>   # to be interruptible
 //
 // This is a shim, not a second implementation. Everything that decides what an
 // agent has not yet read — attaching to the node, resolving the room, the cursor,
@@ -43,13 +44,32 @@
 //     `SHELL`, `LANG`, `TMPDIR` and `USER` fixes it. This does not affect an
 //     operator running `opencode` normally.
 //   - Touching the OpenCode client inside plugin init deadlocks the TUI — reported
-//     by ctm's own plugin, not measured here. This file never touches the client,
-//     so it is safe in the TUI as well as headless.
+//     by ctm's own plugin, not measured here. This file touches the client only
+//     when a wake arrives, which is always after init.
+//
+// ## How an urgent message reaches this session (ADR-020 §6, ADR-021 F17)
+//
+// `vox daemon` interrupts a session through whatever channel the session's drain
+// registered. A plain `opencode` has **no listener** an outside process could reach:
+// the `serverUrl` a plugin is handed is a placeholder unless OpenCode was started
+// with `--port`, and OpenCode sets no variable naming it (measured, 1.18.32). Its
+// in-process client, though, reaches the session from here. So this plugin owns
+// the channel: a Unix socket in a private directory of its own, with a random
+// token, whose path and token it passes to `vox agent hook` (and to nothing else).
+// The hook records them; the daemon writes an `auth` frame and a `prompt` frame to
+// the socket; this plugin checks the token and relays the prompt with
+// `client.session.promptAsync`. That starts a turn when the session is idle, and
+// mid-turn it is taken at the next step boundary, exactly as if typed while busy.
+// It never aborts the running turn first: an abort orphans a queued prompt.
 //
 // Every failure path is silent and injects nothing. A hook that breaks the turn it
 // rides on is worse than one that does nothing.
 
-import { appendFileSync } from "node:fs"
+import { appendFileSync, mkdtempSync, rmSync } from "node:fs"
+import { createServer } from "node:net"
+import { randomBytes, timingSafeEqual } from "node:crypto"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 /**
  * Opt-in diagnostics: `VOX_PLUGIN_LOG=/path/to/file`.
@@ -67,8 +87,93 @@ function log(line) {
   } catch {}
 }
 
-export default async function vox({ $ }) {
+/**
+ * The wake channel: a private socket that relays a prompt into a session of this
+ * OpenCode through its in-process client. `null` when it could not be opened —
+ * the session then still reads its room every turn; it just cannot be interrupted.
+ *
+ * The wire is NDJSON, the same shape Claude Code's messaging socket takes:
+ *
+ *   {"type":"auth","token":"…"}
+ *   {"type":"prompt","session":"ses_…","text":"…"}
+ *
+ * answered with one line: `{"ok":true}`, or `{"error":"…"}` with `"gone":true`
+ * when this OpenCode does not know the session.
+ */
+function wakeChannel(client) {
+  try {
+    // `mkdtemp` makes the directory 0700, so only this user can reach the socket;
+    // the token keeps every other process of theirs out as well.
+    const dir = mkdtempSync(join(tmpdir(), "vox-oc-"))
+    const path = join(dir, "wake.sock")
+    const token = randomBytes(32).toString("hex")
+    const expected = Buffer.from(token)
+    const server = createServer((conn) => {
+      let buf = ""
+      let done = false
+      const answer = (reply) => {
+        done = true
+        try {
+          conn.end(JSON.stringify(reply) + "\n")
+        } catch {}
+      }
+      conn.on("error", () => {})
+      conn.on("data", async (chunk) => {
+        if (done) return
+        buf += chunk.toString()
+        const lines = buf.split("\n")
+        if (lines.length < 3) return
+        done = true
+        try {
+          const auth = JSON.parse(lines[0])
+          const given = Buffer.from(String(auth?.token ?? ""))
+          if (
+            auth?.type !== "auth" ||
+            given.length !== expected.length ||
+            !timingSafeEqual(given, expected)
+          ) {
+            log("wake: refused a connection with the wrong token")
+            return answer({ error: "wrong token" })
+          }
+          const msg = JSON.parse(lines[1])
+          if (msg?.type !== "prompt" || !msg.session || typeof msg.text !== "string") {
+            return answer({ error: "expected a prompt frame" })
+          }
+          const res = await client.session.promptAsync({
+            path: { id: msg.session },
+            body: { parts: [{ type: "text", text: msg.text }] },
+          })
+          const status = res?.response?.status ?? 0
+          log("wake: session " + msg.session + " answered " + status)
+          if (status >= 200 && status < 300) return answer({ ok: true })
+          answer({ error: "OpenCode answered " + status, gone: status === 404 })
+        } catch (e) {
+          log("wake: threw: " + e)
+          answer({ error: String(e) })
+        }
+      })
+    })
+    server.on("error", (e) => log("wake: socket error: " + e))
+    server.listen(path)
+    // Bun's `listen` on a Unix path binds before it returns; `unref` so the socket
+    // never keeps OpenCode alive, and the directory goes with the process.
+    server.unref?.()
+    process.on("exit", () => {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {}
+    })
+    log("wake: listening at " + path)
+    return { path, token }
+  } catch (e) {
+    log("wake: could not open the wake channel: " + e)
+    return null
+  }
+}
+
+export default async function vox({ $, client }) {
   log("plugin loaded (cwd=" + process.cwd() + ")")
+  const wake = wakeChannel(client)
   return {
     // **Name the session to every shell this session runs** (ADR-021 §4, §7).
     // Claude Code and Codex put their session id in every tool's environment
@@ -107,8 +212,17 @@ export default async function vox({ $ }) {
         // `.quiet()` keeps the child's output out of OpenCode's, `.nothrow()`
         // makes a non-zero exit a value rather than an exception — `vox agent
         // hook` always exits 0, but a missing binary would otherwise throw.
+        //
+        // The wake channel goes to the hook alone, in its environment: the hook
+        // registers it, so `vox daemon` can interrupt this session (see above).
+        const env = { ...process.env }
+        if (wake) {
+          env.VOX_OPENCODE_WAKE_SOCKET = wake.path
+          env.VOX_OPENCODE_WAKE_TOKEN = wake.token
+        }
         const result =
           await $`${bin} agent hook --format text --room ${room} --session ${sessionID}`
+            .env(env)
             .quiet()
             .nothrow()
         const text = result.stdout.toString()
