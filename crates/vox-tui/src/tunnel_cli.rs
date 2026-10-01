@@ -230,6 +230,9 @@ pub async fn open_profile(
                 .into(),
         ));
     }
+    if out == Outcome::Failed(Fault::ProfileBusy) {
+        return Err(profile_busy(&socket));
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot open this profile's identity: {out}"
@@ -259,6 +262,9 @@ async fn open_room(
             passphrase: Secret::new(identity_passphrase.as_bytes().to_vec()),
         })
         .await;
+    if out == Outcome::Failed(Fault::ProfileBusy) {
+        return Err(profile_busy(&socket));
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot unlock this profile: {out}"
@@ -917,15 +923,33 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
     // what to actually do. A paragraph is not a better error message than a sentence —
     // the first version of this fix was four lines of prose and read like documentation
     // at exactly the moment somebody is stuck.
-    let advice = join_advice(match out {
+    let fault = match out {
         Outcome::Failed(fault) => Some(fault),
         Outcome::Done | Outcome::Bound(_) => None,
-    });
+    };
+    let advice = join_advice_after(fault, &said.join("; "));
 
     if said.is_empty() {
         format!("cannot join: {advice}")
     } else {
         format!("cannot join: {} — {advice}", said.join("; "))
+    }
+}
+
+/// [`join_advice`], told what the join said about itself: `said` is its reason and its steps.
+///
+/// **A member reached and then silent is not a member never reached** (V210-85). A join exchange
+/// that ran out of time ends as `Unreachable`, the fault of a member nobody could reach, and its
+/// advice — "no member it knows could be reached … ask a member to come online" — sent a person to
+/// bring online a member that had been online and reached, and then stopped answering. A join that
+/// got as far as the exchange says so in its steps (`<member>: exchange …`).
+pub(crate) fn join_advice_after(fault: Option<Fault>, said: &str) -> &'static str {
+    let reached = said.contains(": exchange: ") || said.contains(": exchange (incl. solve) ");
+    match fault {
+        Some(Fault::Unreachable) if reached => {
+            "a member was reached, but did not answer the join exchange in time\n       your passphrase was never checked — this is not a verdict on it\n       the member may have gone offline part-way, or be too busy to answer; try again while it is online"
+        }
+        other => join_advice(other),
     }
 }
 

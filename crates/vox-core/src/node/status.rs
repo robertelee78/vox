@@ -88,6 +88,67 @@ pub struct PortCounters {
     pub backoff: Option<(BackoffKind, u32)>,
 }
 
+/// Why a publish round started (V210-68): one round per `(room, board)`, counted by what asked
+/// for it, so a count of rounds can be accounted for in full.
+///
+/// A publish asked for while a round to the same board is in flight runs once that round ends,
+/// and is counted under **what asked for it**, not as a cause of its own: "it was asked for during
+/// another round" says when it ran, not why, and a round counted that way could not be accounted
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PublishCause {
+    /// The scheduled renewal of the room's own records.
+    Renewal,
+    /// An anchor connected (or came back): it holds none of this node's records yet.
+    AnchorReturned,
+    /// A board passed on news of a record, which this node's anchors are given too.
+    BoardNews,
+    /// This node learned its public addresses, which its records must name.
+    Addresses,
+    /// A board refused one of this node's **own** records as stale, so the node republishes its
+    /// records to that board (`NetEvent::RepublishTo`).
+    AskedAgain,
+    /// A round that failed, retried.
+    Retry,
+    /// A sync that brought governance, which changes the records.
+    Governance,
+    /// A join, on either side.
+    Join,
+    /// The room was created, opened, reopened or served.
+    Opened,
+}
+
+impl PublishCause {
+    /// Every cause, in the order `vox status --json` lists them.
+    pub const ALL: [PublishCause; 9] = [
+        Self::Renewal,
+        Self::AnchorReturned,
+        Self::BoardNews,
+        Self::Addresses,
+        Self::AskedAgain,
+        Self::Retry,
+        Self::Governance,
+        Self::Join,
+        Self::Opened,
+    ];
+
+    /// The name `vox status --json` uses.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Renewal => "renewal",
+            Self::AnchorReturned => "anchor_returned",
+            Self::BoardNews => "board_news",
+            Self::Addresses => "addresses",
+            Self::AskedAgain => "asked_again",
+            Self::Retry => "retry",
+            Self::Governance => "governance",
+            Self::Join => "join",
+            Self::Opened => "opened",
+        }
+    }
+}
+
 /// Every `(room, peer)`'s counters.
 #[derive(Debug, Default)]
 pub struct SyncBook {
@@ -99,6 +160,15 @@ pub struct SyncBook {
     /// Publish rounds this node started (one per `(room, board)` round that went out): what no
     /// person can see directly, and what a storm of rounds looks like (#179).
     publish_rounds: u64,
+    /// The same rounds by what asked for each (V210-68).
+    publish_by_cause: BTreeMap<PublishCause, u64>,
+    /// Asks for a publish folded into one already waiting on a round in flight, by what asked:
+    /// they went out in that round and are counted under its cause, so without these a round
+    /// could be accounted for and an ask could not.
+    publish_merged: BTreeMap<PublishCause, u64>,
+    /// Scheduled renewals of a room's own records (V210-68): one per room per half of the
+    /// records' lifetime, whatever the traffic and however many boards the round then reaches.
+    renewals: u64,
     /// Records by others that taught this node's board something and were passed on
     /// (`NetEvent::BoardGrew`, #179): a member's routine refresh is not one.
     board_news: u64,
@@ -148,11 +218,23 @@ impl SyncBook {
         f(b.ports.entry((room, peer)).or_default());
     }
 
-    /// Count one publish round started.
-    pub fn note_publish_round(book: &SharedSyncBook) {
-        book.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .publish_rounds += 1;
+    /// Count one scheduled renewal of a room's own records (V210-68).
+    pub fn note_renewal(book: &SharedSyncBook) {
+        book.lock().unwrap_or_else(PoisonError::into_inner).renewals += 1;
+    }
+
+    /// Count one publish round started, and what asked for it.
+    pub fn note_publish_round(book: &SharedSyncBook, cause: PublishCause) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        b.publish_rounds += 1;
+        *b.publish_by_cause.entry(cause).or_default() += 1;
+    }
+
+    /// Count one ask for a publish folded into a round already waiting to run (see
+    /// `publish_merged`).
+    pub fn note_publish_merged(book: &SharedSyncBook, cause: PublishCause) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        *b.publish_merged.entry(cause).or_default() += 1;
     }
 
     /// What `room` set aside when it opened (V210-74); nothing, and the room is not listed.
@@ -270,8 +352,28 @@ impl SyncBook {
         }
         let _ = write!(
             s,
-            "],\"publish\":{{\"rounds\":{},\"board_news\":{}}},\"prekeys\":",
-            b.publish_rounds, b.board_news
+            "],\"publish\":{{\"rounds\":{},\"by_cause\":{{",
+            b.publish_rounds
+        );
+        for (i, cause) in PublishCause::ALL.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let n = b.publish_by_cause.get(cause).copied().unwrap_or(0);
+            let _ = write!(s, "\"{}\":{n}", cause.name());
+        }
+        s.push_str("},\"merged\":{");
+        for (i, cause) in PublishCause::ALL.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let n = b.publish_merged.get(cause).copied().unwrap_or(0);
+            let _ = write!(s, "\"{}\":{n}", cause.name());
+        }
+        let _ = write!(
+            s,
+            "}},\"renewals\":{},\"board_news\":{}}},\"prekeys\":",
+            b.renewals, b.board_news
         );
         match b.prekeys {
             Some(p) => {

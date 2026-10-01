@@ -419,6 +419,10 @@ pub enum Fault {
     KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
+    /// Another vox holds this profile's store open for writing, and only one at a time may.
+    /// Not [`Fault::Internal`], which is how an unlock that met one was reported (V210-100):
+    /// nothing was wrong with vox or the profile, and stopping the other one is the remedy.
+    ProfileBusy,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -538,6 +542,9 @@ impl Fault {
             }
             Fault::Storage => {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
+            }
+            Fault::ProfileBusy => {
+                "another vox holds this profile open, and only one at a time may write it\n       stop that one to run this, or use the `vox room …` verbs, which ask a running node"
             }
             Fault::IdentityFileUnwritable => {
                 "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"

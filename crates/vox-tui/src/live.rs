@@ -285,6 +285,7 @@ pub fn ui_error(f: Fault) -> UiError {
     match f {
         Fault::NoIdentity => UiError::NoIdentity,
         Fault::IdentityExists => UiError::IdentityExists,
+        Fault::ProfileBusy => UiError::ProfileBusy,
         Fault::Locked => UiError::Locked,
         Fault::WrongPassphrase => UiError::WrongPassphrase,
         Fault::UnknownChannel | Fault::ChannelNotOpen => UiError::ChannelNotOpen,
@@ -326,9 +327,20 @@ impl CoreHandle for LiveCore {
 
     fn apply(&mut self, command: Command) -> CommandStatus {
         match command {
-            Command::CreateIdentity { passphrase } => self.send(NodeCommand::CreateIdentity {
-                passphrase: Self::secret(&passphrase),
-            }),
+            Command::CreateIdentity { passphrase } => {
+                // **Another vox made it first** (V210-100, as the CLI says since V210-91): this
+                // node holds no identity, so one that exists now was created by another vox
+                // after this one started. "Already exists" read as a stale profile.
+                let had = self.node.view().identity.is_some();
+                match self.send(NodeCommand::CreateIdentity {
+                    passphrase: Self::secret(&passphrase),
+                }) {
+                    CommandStatus::Failed(UiError::IdentityExists) if !had => {
+                        CommandStatus::Failed(UiError::IdentityMadeElsewhere)
+                    }
+                    other => other,
+                }
+            }
             Command::Unlock { passphrase } => self.send(NodeCommand::Unlock {
                 passphrase: Self::secret(&passphrase),
             }),
