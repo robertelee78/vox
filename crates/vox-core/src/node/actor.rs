@@ -4499,7 +4499,7 @@ impl Node {
             ctx.pow_params = pow;
         }
         let source = crate::node::joinslots::JoinSource::of(&conn);
-        let Some((slot, ended)) =
+        let Some((mut slot, ended)) =
             crate::node::joinslots::JoinSlots::take(&self.join_slots, peer, source)
         else {
             // Past the cap: **refused, not queued**, and said out loud. A silent drop here
@@ -4524,11 +4524,14 @@ impl Node {
             let _ = self.event_tx.send(NodeEvent::JoinFailed {
                 reason: format!(
                     "ended {}'s join to answer {}: all {JOINS_IN_FLIGHT} join slots were held, \
-                     {} from its address and {} by it",
+                     {}/{}/{} from its source (coarse to fine) and {} by it; it is told the \
+                     member is busy",
                     crate::node::network::short_id(ended.peer),
                     crate::node::network::short_id(peer),
                     ended.weight.0,
                     ended.weight.1,
+                    ended.weight.2,
+                    ended.weight.3,
                 ),
             });
         }
@@ -4547,8 +4550,8 @@ impl Node {
         let tx = self.net_tx.clone();
         self.reap_join_tasks();
         let admit_tx = self.net_tx.clone();
-        let serial = slot.serial();
-        let exchange = self.join_tasks.spawn(async move {
+        let signals = Some((slot.worked(), slot.take_ended()));
+        self.join_tasks.spawn(async move {
             let _slot = slot;
             let _carried = conn;
             let outcome = net
@@ -4562,6 +4565,7 @@ impl Node {
                     &store,
                     &ring,
                     pending_joins,
+                    signals,
                     // **The admission lands before the joiner is told it is in.** Awaited here, on
                     // this task, so the actor is never the thing waiting — which is the whole point
                     // of the slot. See `NetEvent::JoinAdmit`.
@@ -4595,7 +4599,6 @@ impl Node {
                 })
                 .await;
         });
-        crate::node::joinslots::JoinSlots::attach(&self.join_slots, serial, exchange);
     }
 
     /// Tell a joiner "no" without waiting for it to hear that.
@@ -8750,7 +8753,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
         Error::JoinSolveTooSlow { .. } => Fault::SolveTooSlow,
-        Error::JoinResponderBusy => Fault::MembersBusy,
+        Error::JoinResponderBusy | Error::JoinEndedForNewcomer => Fault::MembersBusy,
         Error::Path {
             op: crate::node::profile::VAULT_WRITE,
             ..

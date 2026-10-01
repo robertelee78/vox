@@ -367,12 +367,31 @@ async fn send_frame(send: &mut SendStream, frame: &JoinFrame) -> Result<()> {
     write_frame(send, &frame.to_frame()).await
 }
 
+/// What a joiner reports for a member's refusal: [`JoinReject::Busy`] — every slot held, or this
+/// join ended for one from elsewhere (V210-92) — is the member being busy and says nothing about
+/// the joiner; every other reason is the coarse refusal.
+fn rejected(r: JoinReject) -> Error {
+    match r {
+        JoinReject::Busy => Error::JoinResponderBusy,
+        r => Error::JoinRefused(r.as_str()),
+    }
+}
+
 async fn recv_frame(recv: &mut RecvStream) -> Result<JoinFrame> {
     let bytes = read_frame(recv, MAX_JOIN_FRAME)
         .await?
         .ok_or(Error::MalformedJoin("join stream closed early"))?;
     JoinFrame::from_frame(&bytes)
 }
+
+/// **How long the rest of a join may take once the joiner's proof of work has verified**
+/// (V210-92): the remaining frames are a few signatures and key agreements each way, well under a
+/// second on a slow device, so this is all round trips and margin.
+///
+/// It is what keeps a hold that has done its work from being held for ever. Such a hold is never
+/// the one ended for a newcomer (`node::joinslots`), so a stranger that paid sixteen solves and
+/// then went quiet would otherwise keep every slot; it gives them back within this instead.
+pub const ADMISSION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long one expected Equihash solve may take on a slow joiner.
 ///
@@ -575,7 +594,7 @@ pub async fn run_initiator(
         patience_secs: patience.as_secs(),
     };
     let late = solved_in + SOLVE_PATIENCE_SLACK >= patience;
-    send_frame(
+    if let Err(e) = send_frame(
         &mut send,
         &JoinFrame::Solve {
             equihash_nonce: token.equihash_nonce.clone(),
@@ -584,13 +603,24 @@ pub async fn run_initiator(
         },
     )
     .await
-    .map_err(|e| if late { too_slow() } else { e })?;
+    {
+        // A member that ended this join while it solved (V210-92) said why before it stopped
+        // reading, so the write can fail with the reason already waiting: read it, briefly.
+        if let Ok(Ok(JoinFrame::Rejected(r))) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(&mut recv)).await
+        {
+            return Err(rejected(r));
+        }
+        return Err(if late { too_slow() } else { e });
+    }
 
     // 3. SHARE.
     let peer_share = match recv_frame(&mut recv).await {
         Ok(JoinFrame::Share { share }) => share,
+        // Busy is the member's slots, never this joiner's pace (V210-92).
+        Ok(JoinFrame::Rejected(JoinReject::Busy)) => return Err(Error::JoinResponderBusy),
         Ok(JoinFrame::Rejected(_)) | Err(_) if late => return Err(too_slow()),
-        Ok(JoinFrame::Rejected(r)) => return Err(Error::JoinRefused(r.as_str())),
+        Ok(JoinFrame::Rejected(r)) => return Err(rejected(r)),
         Err(e) => return Err(e),
         Ok(_) => return Err(Error::MalformedJoin("expected share")),
     };
@@ -606,7 +636,7 @@ pub async fn run_initiator(
     .await?;
     let sealed_peer = match recv_frame(&mut recv).await? {
         JoinFrame::Proof { sealed } => sealed,
-        JoinFrame::Rejected(r) => return Err(Error::JoinRefused(r.as_str())),
+        JoinFrame::Rejected(r) => return Err(rejected(r)),
         _ => return Err(Error::MalformedJoin("expected proof")),
     };
     let peer = pending.verify_peer_sealed(&sealed_peer, &responder_fp)?;
@@ -624,7 +654,7 @@ pub async fn run_initiator(
     // 7. ACCEPTED, carrying the responder's witness to this join (M17.6).
     let witness = match recv_frame(&mut recv).await? {
         JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
-        JoinFrame::Rejected(r) => return Err(Error::JoinRefused(r.as_str())),
+        JoinFrame::Rejected(r) => return Err(rejected(r)),
         _ => return Err(Error::MalformedJoin("expected accepted")),
     };
     // Checked here, against the identity the handshake pinned, so a responder cannot
@@ -667,6 +697,9 @@ pub struct ResponderConfig<'a> {
     pub pending_joins: u32,
     /// Wall clock (for the prekey-ring consume record).
     pub now_secs: u64,
+    /// Set once the joiner's proof of work verifies, so its join slot is never the one ended for
+    /// a newcomer (V210-92, `node::joinslots`).
+    pub worked: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Read the joiner's opening `WANT` frame, so the caller can select the channel
@@ -732,13 +765,25 @@ pub async fn run_responder<F, Fut>(
     cfg: &ResponderConfig<'_>,
     store: &Store,
     ring: &tokio::sync::Mutex<PrekeyRing>,
+    ended: Option<tokio::sync::oneshot::Receiver<()>>,
     admit_before_accepting: F,
 ) -> Result<JoinOutcome>
 where
     F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let mut result = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring).await;
+    let exchange = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring);
+    // **Ended for a newcomer, and told so** (V210-92). The slot this exchange holds can be given
+    // to a joiner from a lighter source; the exchange stops where it is and the joiner hears the
+    // member is busy, not the refusal a wrong passphrase gets. A sender dropped without a word is
+    // not an ending: that branch is then off and the exchange runs on.
+    let mut result = match ended {
+        Some(ended) => tokio::select! {
+            r = exchange => r,
+            Ok(()) = ended => Err(Error::JoinEndedForNewcomer),
+        },
+        None => exchange.await,
+    };
     match &mut result {
         Ok(outcome) => {
             // **Admitted before it is told it is in.** See `admit_before_accepting`.
@@ -762,7 +807,9 @@ where
             // already complete and already witnessed, so anything else is tolerated:
             // the session still receives, and a later `Hello`/`Open` on a pairwise
             // stream can open the sending direction.
-            if let Ok(JoinFrame::Open { sealed }) = recv_frame(&mut recv).await {
+            if let Ok(Ok(JoinFrame::Open { sealed })) =
+                tokio::time::timeout(ADMISSION_PATIENCE, recv_frame(&mut recv)).await
+            {
                 let message = crate::pairwise::message::Message::from_wire(&sealed)?;
                 // An empty plaintext is the whole payload; what matters is that
                 // decrypting it steps the ratchet and yields a sending chain.
@@ -775,6 +822,7 @@ where
             let reason = match e {
                 Error::JoinPowInvalid => JoinReject::PowInvalid,
                 Error::MalformedJoin(_) | Error::Cbor(_) => JoinReject::Malformed,
+                Error::JoinEndedForNewcomer => JoinReject::Busy,
                 _ => JoinReject::Refused,
             };
             let _ = send_frame(&mut send, &JoinFrame::Rejected(reason)).await;
@@ -839,7 +887,42 @@ async fn responder_exchange(
     };
     let (responder, own_share) =
         join_accept(cfg.ctx, cfg.passphrase, &sid, &challenge, &token, cfg.root)?;
+    // The work is done and verified: from here this join's slot is not given to a newcomer, and
+    // the rest of the exchange must finish within `ADMISSION_PATIENCE`.
+    if let Some(worked) = &cfg.worked {
+        worked.store(true, std::sync::atomic::Ordering::Release);
+    }
+    tokio::time::timeout(
+        ADMISSION_PATIENCE,
+        responder_after_work(
+            send,
+            recv,
+            peer_fp,
+            cfg,
+            store,
+            ring,
+            responder,
+            own_share,
+            joiner_share,
+        ),
+    )
+    .await
+    .map_err(|_| Error::MalformedJoin("the joiner went quiet after its proof of work"))?
+}
 
+/// The exchange after the joiner's proof of work has verified: steps 3–7, bounded by the caller.
+#[allow(clippy::too_many_arguments)] // the state of one exchange, handed on whole
+async fn responder_after_work(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    peer_fp: Digest32,
+    cfg: &ResponderConfig<'_>,
+    store: &Store,
+    ring: &tokio::sync::Mutex<PrekeyRing>,
+    responder: crate::join::session::JoinResponder<'_>,
+    own_share: [u8; CPACE_SHARE_LEN],
+    joiner_share: [u8; CPACE_SHARE_LEN],
+) -> Result<JoinOutcome> {
     // 3. SHARE, then CPace completes and this side's proof is built.
     send_frame(send, &JoinFrame::Share { share: own_share }).await?;
     let (pending, bootstrap) = responder.complete_cpace(&joiner_share)?;
