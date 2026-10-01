@@ -79,15 +79,18 @@ pub struct Out {
 
 impl Out {
     pub fn json(&self) -> serde_json::Value {
-        serde_json::from_str(self.stdout.trim())
-            .unwrap_or_else(|e| panic!("not one JSON object ({e}): {self:?}"))
+        serde_json::from_str(self.stdout.trim()).unwrap_or_else(|e| {
+            panic!("PRODUCT: `vox` printed not one JSON object ({e}): {self:?}")
+        })
     }
     pub fn ndjson(&self) -> Vec<serde_json::Value> {
         self.stdout
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|l| {
-                serde_json::from_str(l).unwrap_or_else(|e| panic!("bad NDJSON line ({e}): {l}"))
+                serde_json::from_str(l).unwrap_or_else(|e| {
+                    panic!("PRODUCT: `vox` printed a bad NDJSON line ({e}): {l}")
+                })
             })
             .collect()
     }
@@ -176,7 +179,7 @@ impl Worker {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().expect("spawn vox");
+        let mut child = cmd.spawn().expect("APPARATUS: could not spawn vox");
         if let Some(input) = stdin {
             child
                 .stdin
@@ -185,7 +188,9 @@ impl Worker {
                 .write_all(input.as_bytes())
                 .unwrap();
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: could not collect vox's output");
         let o = Out {
             ok: out.status.success(),
             code: out.status.code(),
@@ -237,7 +242,7 @@ fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
             .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: could not spawn vox node"),
     );
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -250,7 +255,7 @@ fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "APPARATUS: staging not achieved — the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -277,9 +282,12 @@ fn worker(tmp: &std::path::Path, name: &str) -> Worker {
         None,
         &["id", "--identity-passphrase-file", w.pass.to_str().unwrap()],
     );
-    assert!(o.ok, "{name}: vox id: {o:?}");
+    assert!(
+        o.ok,
+        "APPARATUS: staging not achieved — {name}: vox id: {o:?}"
+    );
     let fp = vox_core::node::link::b32_decode(o.stdout.trim(), "fingerprint")
-        .unwrap_or_else(|e| panic!("{name}: vox id printed no fingerprint ({e:?}): {o:?}"));
+        .unwrap_or_else(|e| panic!("APPARATUS: staging not achieved — {name}: vox id printed no fingerprint ({e:?}): {o:?}"));
     w.fp = fp;
     w
 }
@@ -301,14 +309,14 @@ fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(err).unwrap()))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: could not spawn vox daemon");
     w.daemon = Some(Proc(child));
     let started = Instant::now();
     let deadline = started + DAEMON_START_PATIENCE;
     while !w.vox(None, &["room", "list"]).ok {
         assert!(
             Instant::now() < deadline,
-            "{}'s daemon never answered in {}s; its stderr:\n{}",
+            "APPARATUS: staging not achieved — {}'s daemon never answered in {}s; its stderr:\n{}",
             w.name,
             DAEMON_START_PATIENCE.as_secs(),
             std::fs::read_to_string(err).unwrap_or_default()
@@ -339,13 +347,13 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         &["room", "create", "--name", "mission"],
         Some(ROOM_PASS),
     );
-    assert!(o.ok, "room create: {o:?}");
+    assert!(o.ok, "APPARATUS: staging not achieved — room create: {o:?}");
     let id = first
         .vox(None, &["room", "list"])
         .stdout
         .split_whitespace()
         .next()
-        .expect("the new room in `vox room list`")
+        .expect("APPARATUS: staging not achieved — the new room in `vox room list`")
         .to_owned();
     let link = first
         .vox(None, &["room", "invite", &id])
@@ -381,7 +389,11 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
             }
             o.ok
         });
-        assert!(joined, "{} could not join the room", w.name);
+        assert!(
+            joined,
+            "APPARATUS: staging not achieved — {} could not join the room",
+            w.name
+        );
     }
 
     // Trust after the joins (see the module note), each worker trusting every other.
@@ -400,7 +412,11 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
                         a.pass.to_str().unwrap(),
                     ],
                 );
-                assert!(o.ok, "{} trusts {}: {o:?}", a.name, b.name);
+                assert!(
+                    o.ok,
+                    "APPARATUS: staging not achieved — {} trusts {}: {o:?}",
+                    a.name, b.name
+                );
             }
         }
     }
@@ -419,7 +435,7 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
     while !owed.is_empty() {
         assert!(
             Instant::now() < deadline,
-            "the room never became readable both ways: owed (author, reader) {:?}",
+            "APPARATUS: staging not achieved — the room never became readable both ways: owed (author, reader) {:?}",
             owed.iter()
                 .map(|(a, r)| (workers[*a].name.clone(), workers[*r].name.clone()))
                 .collect::<Vec<_>>()
@@ -436,7 +452,10 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
                         &format!("harness: ready {} {n}", author.name),
                     ],
                 );
-                assert!(o.ok, "{o:?}");
+                assert!(
+                    o.ok,
+                    "APPARATUS: staging not achieved — a readiness post: {o:?}"
+                );
             }
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -453,9 +472,10 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
     let full = rows
         .first()
         .and_then(|r| r["room"].as_str())
-        .expect("a readable room names itself in full")
+        .expect("APPARATUS: staging not achieved — a readable room names itself in full")
         .to_owned();
-    let cid = vox_core::node::link::b32_decode(&full, "room id").expect("a room id");
+    let cid = vox_core::node::link::b32_decode(&full, "room id")
+        .expect("APPARATUS: staging not achieved — a room id");
     Room {
         id: full,
         cid,
@@ -467,6 +487,10 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
 /// Poll a `vox` invocation until its output satisfies `ok`, or fail naming what it
 /// last said. Something posted on one node reaches another through the log, so "has
 /// it arrived yet" has no synchronous answer.
+///
+/// A timeout is a PRODUCT verdict: the room is built by then, and what is awaited is the
+/// product reaching a state. A failure to build the room is an APPARATUS one, named as
+/// staging not achieved by [`room`].
 pub fn until(
     w: &Worker,
     session: Option<&str>,
@@ -484,7 +508,10 @@ pub fn until(
         last = Some(o);
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}; last saw {last:?}");
+    panic!(
+        "PRODUCT: {what} did not happen within {}s; last saw {last:?}",
+        TIMEOUT.as_secs()
+    );
 }
 
 /// A resource's entry in a `vox.room.board/1` object, if it has one.
