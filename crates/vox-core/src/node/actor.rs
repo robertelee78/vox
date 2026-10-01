@@ -5806,6 +5806,13 @@ impl Node {
             }
         }
         if routes.is_empty() {
+            // Nothing was tried, so say so rather than leave the person to read "did not answer"
+            // about a board nobody dialled (V210-107).
+            let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                reason: "the address names only this node, and this node has no anchor: there \
+                         was no board to ask"
+                    .to_owned(),
+            });
             let _ = reply.send(Outcome::Failed(Fault::BoardUnreachable));
             return;
         }

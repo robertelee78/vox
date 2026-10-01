@@ -23,8 +23,9 @@
 //!
 //! **Asserted,** with hard-coded numbers, after bob keeps reading 45 s past the moment his
 //! required posts arrived (a late history release must be caught): bob reads **0** of posts 1–20
-//! and exactly posts 21–30. Preconditions, or `CANNOT MEASURE`: the TUI said "done" to `:close`;
-//! the row existed and was deleted; C was closed at the decision and open after; alice reads all
+//! and exactly posts 21–30. A TUI that does not close C as a person does (exits, never unlocks,
+//! never answers `:close`) is a product red; the TUI driver's own apparatus is `CANNOT MEASURE`.
+//! Preconditions, or `CANNOT MEASURE`: the row existed and was deleted; C was closed at the decision and open after; alice reads all
 //! 30 posts; bob reads post 30 (without it, 0 pre-trust posts would say nothing).
 //!
 //! **Every participant is the shipped binary.** One step is not a `vox` command, because it is the
@@ -289,8 +290,19 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     );
     println!("[proof] tui: {}", said.trim());
     assert!(
+        !said.contains("cargo APPARATUS"),
+        "CANNOT MEASURE: the TUI driver's own apparatus failed (exit {:?}): {said}",
+        out.code
+    );
+    // Closing the room is staging for this claim, but a TUI that does not do it — exits, never
+    // unlocks with the right passphrase, never answers `:close`, stops reading what is typed —
+    // is the product failing a person, not the test (V210-107's verdict on 480c6a73).
+    assert!(
         out.code == Some(0) && said.contains("cargo the TUI said done to :close"),
-        "CANNOT MEASURE: the TUI did not close room C: {said}"
+        "PRODUCT: alice's `vox tui` did not unlock, open room C and close it as a person does; \
+         the driver exited {:?} at stage {:?} and saw this screen:\n{said}",
+        out.code,
+        out.stage.as_deref().unwrap_or("(before its first stage)")
     );
 
     // ---- the attack: delete the counter while every vox process of alice's is stopped ---------

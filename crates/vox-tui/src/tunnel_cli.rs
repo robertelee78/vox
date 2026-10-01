@@ -979,13 +979,52 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
 /// advice — "no member it knows could be reached … ask a member to come online" — sent a person to
 /// bring online a member that had been online and reached, and then stopped answering. A join that
 /// got as far as the exchange says so in its steps (`<member>: exchange …`).
+///
+/// **A board that failed is named for what it was** (V210-107). `BoardUnreachable`'s one sentence
+/// said "the anchor could not be reached" when the board that failed was the room's host, and its
+/// replacement named "the room's host nor any anchor" whatever was tried. The node names each board
+/// it tried as the room's host or an anchor (`Joiner::boards_tried`), so the advice follows it: a
+/// host that did not answer is the host, an anchor is named only when one was tried, and a board
+/// that answered and then closed is not called unreachable.
 pub(crate) fn join_advice_after(fault: Option<Fault>, said: &str) -> &'static str {
     let reached = said.contains(": exchange: ") || said.contains(": exchange (incl. solve) ");
     match fault {
         Some(Fault::Unreachable) if reached => {
             "a member was reached, but did not answer the join exchange in time\n       your passphrase was never checked — this is not a verdict on it\n       the member may have gone offline part-way, or be too busy to answer; try again while it is online"
         }
+        Some(Fault::BoardUnreachable) => board_unreachable_advice(said),
         other => join_advice(other),
+    }
+}
+
+/// `BoardUnreachable`'s advice, naming the board that failed from what the node said about it.
+/// With nothing said (the reason was lost), [`join_advice`]'s, which names neither.
+fn board_unreachable_advice(said: &str) -> &'static str {
+    let host = said.contains("the room's host ");
+    let anchor = said.contains("anchor ");
+    if said.contains("then its connection closed before the room was fetched") {
+        return if host {
+            "the room's host answered, then its connection closed before the room was read, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       run the join again; if it repeats, the host is going offline or losing its connection"
+        } else {
+            "the anchor answered, then its connection closed before the room was read, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       run the join again; if it repeats, the anchor is going offline or losing its connection"
+        };
+    }
+    if said.contains("names only this node") {
+        return "the address names only this node itself, so there was no board to ask\n       check it is the address you were sent, not one this node made";
+    }
+    if !said.contains("no answer from ") {
+        return join_advice(Some(Fault::BoardUnreachable));
+    }
+    match (host, anchor) {
+        (true, false) => {
+            "the room's host did not answer, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the host is running and that this machine can reach its address"
+        }
+        (false, true) => {
+            "no anchor tried for the room answered, and the address does not name the room's host, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the anchor is running (`vox node`) and that this machine can reach it, or ask the host for an address that names the host itself"
+        }
+        _ => {
+            "neither the room's host nor any anchor tried for it answered, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the host is running and that this machine can reach its address; an anchor matters only when the host cannot be reached directly"
+        }
     }
 }
 
@@ -1026,10 +1065,11 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         // **And do not blame an anchor (V210-107).** The boards a join tries are the link's
         // entries — the room's host itself among them — and any anchors; a link from a host with
         // no anchor names only the host. This said "the anchor could not be reached" and sent the
-        // person to check `vox node`, which they may never have needed. The node names each
-        // address it tried, ahead of this advice.
+        // person to check `vox node`, which they may never have needed. When the node said which
+        // boards it tried, [`join_advice_after`] names the one that failed; this is for a join
+        // whose reason was lost, so it names neither.
         Some(Fault::BoardUnreachable) => {
-            "neither the room's host nor any anchor tried for it answered — or one answered and its connection closed before the room was fetched — so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the host is running and that this machine can reach its address (or its anchor's, if the room uses one)"
+            "no board the join tried could be read — the room's host, or an anchor if one was tried — so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the host is running and that this machine can reach its address"
         }
         Some(Fault::Unreachable) => {
             "the room's board answered, but no member it names could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online"

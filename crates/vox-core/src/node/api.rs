@@ -575,7 +575,7 @@ impl Fault {
                 "the board holds nothing for that room\n       either its host has not published it there yet (the host must be online; then try again)\n       or the room part of the address is wrong: check it against the address you were sent"
             }
             Fault::BoardUnreachable => {
-                "neither the room's host nor any anchor tried for it answered — or one answered and its connection closed before the room was fetched — so no member was asked\n       check that the host is running and that this machine can reach its address (or its anchor's, if the room uses one)"
+                "no board the join tried could be read — the room's host, or an anchor if one was tried — so no member was asked\n       check that the host is running and that this machine can reach its address"
             }
             Fault::Unreachable => {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"

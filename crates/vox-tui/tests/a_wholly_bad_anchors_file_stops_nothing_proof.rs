@@ -20,6 +20,9 @@
 //!   reached him directly, with no anchor anywhere.
 //! - bob's **`vox tui`** unlocks, opens the room and closes it (`tests/pty/tui_close_room.py`).
 //! - `vox node` with the same file keeps running and says it runs with no anchor of its own.
+//! - with alice's daemon stopped, carol (no anchors file) **`vox connect`s** with alice's address:
+//!   it fails, says the room's host did not answer and names her, and says nothing of an anchor or
+//!   `vox node` — a join that reaches no board names the board that failed (V210-107).
 //!
 //! `vox serve` is not driven here: on a host whose only address is loopback it refuses for want
 //! of a routable address or an anchor (anchor sweep C1, owned by V210-96), whatever the anchors
@@ -27,13 +30,19 @@
 //! through the one function, `ProfileArgs::anchor_set`.
 //!
 //! **Every red names its side.** A verb that exits, refuses, or says something other than what
-//! is asserted is a **product** red, quoting what it said. A step this proof needs that is not
-//! the claim (a fingerprint to write into the file, a room id to read back, the TUI driver's own
-//! apparatus) is `CANNOT MEASURE`.
+//! is asserted is a **product** red, quoting what it said — the TUI too: one that exits, never
+//! unlocks with the right passphrase, never answers `:close`, or stops reading what is typed. A
+//! step this proof needs that is not the claim (a fingerprint to write into the file, a room id
+//! to read back, the TUI driver's own apparatus: pyte missing, its staging, its own error) is
+//! `CANNOT MEASURE`.
 //!
 //! **The mutation that must turn it red:** `ProfileArgs::anchor_set` returns the
 //! `AnchorsFileUnusable` error again instead of saying it and carrying on (the V210-75 refusal).
-//! `vox id` exits 1 and prints no fingerprint: red, on the product, at the first arm.
+//! `vox id` exits 1 and prints no fingerprint: red, on the product, at the first arm. And for the
+//! "waits on" half: `vox tui` sleeping before it draws when its anchors file names no usable
+//! anchor must turn the TUI arm red as PRODUCT, not CANNOT MEASURE. And for the last arm: the
+//! `BoardUnreachable` advice saying "the anchor could not be reached … check `vox node`" again
+//! must turn it red as PRODUCT.
 
 #![cfg(unix)]
 
@@ -366,22 +375,31 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
         out.stage,
         said.trim()
     );
-    assert!(
-        !said.contains("bob RED"),
-        "PRODUCT: bob's `vox tui` with an anchors file that names no usable anchor exited before \
-         it asked to unlock:\n{said}"
-    );
+    // **A TUI that never unlocks is this claim failing, not the apparatus** (V210-107's verdict on
+    // 480c6a73). A `vox tui` that waits on an anchor that does not exist sits at its unlock with
+    // the right passphrase typed; that was reported `CANNOT MEASURE`. Only the driver's own
+    // verdicts — pyte missing, its staging, its own error — and a driver stopped from outside
+    // with no verdict are the apparatus; the TUI exiting, never unlocking, never answering
+    // `:close`, or no longer reading what is typed (`HUNG`) is the product.
     assert!(
         out.has_verdict("bob"),
-        "CANNOT MEASURE: the TUI driver was stopped before it gave a verdict, at stage {:?} \
-         (exit {:?}): {said}",
+        "CANNOT MEASURE: the TUI driver was stopped from outside before it gave a verdict, at \
+         stage {:?} (exit {:?}): {said}",
         out.stage.as_deref().unwrap_or("(before its first stage)"),
         out.code
     );
     assert!(
+        !said.contains("bob APPARATUS"),
+        "CANNOT MEASURE: the TUI driver's own apparatus failed (exit {:?}): {said}",
+        out.code
+    );
+    assert!(
         out.code == Some(0) && said.contains("bob the TUI said done to :close"),
-        "CANNOT MEASURE: bob's TUI started, but the driver did not see it open and close the \
-         room: {said}"
+        "PRODUCT: bob's `vox tui`, with an anchors file that names no usable anchor and alice \
+         directly reachable, did not unlock, open the room and close it as a person does; the \
+         driver exited {:?} at stage {:?} and saw this screen:\n{said}",
+        out.code,
+        out.stage.as_deref().unwrap_or("(before its first stage)")
     );
 
     // ---- `vox node` runs anchorless, and says so -------------------------------------------------
@@ -402,5 +420,52 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
          exited {exited:?} and said:\n{said}"
     );
     drop(node);
+
+    // ---- a join to a host that is down names the host, not an anchor ----------------------------
+    // Carol has no anchors file and no anchor, and alice's link names only alice. With alice's
+    // daemon stopped, carol's `vox connect` must fail and say that **the room's host** did not
+    // answer, naming her; it must not mention an anchor, or send carol to `vox node`, which she
+    // never needed. The words it replaced said "the anchor could not be reached" (V210-107).
     drop(alice_daemon);
+    let carol = tmp.path().join("carol");
+    std::fs::create_dir_all(carol.join("cfg")).unwrap();
+    let (ok, _, err) = vox_once(&carol, &args(&["id"]));
+    assert!(ok, "CANNOT MEASURE: carol's `vox id`: {err}");
+    let t0 = Instant::now();
+    let mut connect = Proc::spawn(
+        &carol,
+        &[
+            "connect",
+            &link,
+            "--passphrase-file",
+            &room_pass,
+            "--listen",
+            "127.0.0.1:0",
+        ],
+        "carol-connect",
+    );
+    let status = connect.exited_within(CONNECT_WITHIN);
+    let said = connect.said();
+    println!(
+        "[proof] carol's vox connect, alice stopped: exited {status:?} after {:?}: {}",
+        t0.elapsed(),
+        said.trim()
+    );
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "CANNOT MEASURE: carol's `vox connect` did not fail with the room's host stopped, so this \
+         arm did not stage a host that is down; it exited {status:?} and said:\n{said}"
+    );
+    let host = &alice_fp[..12];
+    assert!(
+        said.contains("cannot join:")
+            && said.contains("the room's host did not answer")
+            && said.contains(&format!("the room's host {host}"))
+            && !said.to_lowercase().contains("anchor")
+            && !said.contains("vox node"),
+        "PRODUCT: carol's failed join to a room whose host ({host}) is down, with no anchor \
+         anywhere, must say the room's host did not answer, name it, and not mention an anchor \
+         or `vox node`; it said:\n{said}"
+    );
+    drop(connect);
 }

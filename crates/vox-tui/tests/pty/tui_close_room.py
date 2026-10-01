@@ -9,11 +9,18 @@ The TUI runs in a pty at 160x50 and its screen is read through the `pyte` termin
 ANSI cannot be grepped, because the TUI repaints only what changed. The status line is reset with
 an unknown command (`:zzz`) first, so "done" afterwards can only be the close's answer.
 
-Exit 0 = the TUI said "done" to `:close`; 2 = apparatus (pyte missing, no unlock, no room, no
-"done"); 1 = a product red (`RED: vox tui exited before it asked to unlock`, with its screen) or
-the driver hung (`HUNG at <stage>`, with its stack: `vox_pty.py`, V210-54). The
-caller confirms the room is closed on its own, with `vox room list`. The TUI is killed by its PID,
-with bounded waits.
+Exit 0 = the TUI said "done" to `:close`. 1 = a product red, with its screen: `RED: vox tui
+exited before it asked to unlock`, `RED: the TUI never unlocked`, or `RED: no "done" after
+:close`; or `HUNG at <stage>` with the driver's stack (`vox_pty.py`, V210-54) — every wait here is
+bounded, so a driver past its budget is a TUI that stopped reading what was typed. 2 = apparatus
+only: pyte missing, the status line not reset by `:zzz` (the staging this driver needs), or the
+driver's own error. The caller confirms the room is closed on its own, with `vox room list`. The
+TUI is killed by its PID, with bounded waits.
+
+**A TUI that never unlocks is the product, not the apparatus** (V210-107). It was reported as
+`APPARATUS`, so a `vox tui` that sat waiting for an anchor that does not exist, with the right
+passphrase typed, read as a broken test. The person typed the right thing and the product did not
+do it: that is a product red, and so is a room that never answers `:close`.
 """
 import os, sys
 
@@ -50,8 +57,9 @@ try:
     tui.key(IDPASS + "\r", 1)
     # Production Argon2id: the unlock takes seconds. Unlocked, the rooms list names the room.
     if not tui.until(lambda: "unlocked" in status(), 60):
-        print(f"{TAG} APPARATUS: the TUI never unlocked:\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: the TUI never unlocked, with the right passphrase typed:\n{tui.text()}")
+        code = 1
+        sys.exit(code)
     stage("open the room")
     tui.pump(3)
     tui.key("\r", 3)  # open the room under the cursor (the profile holds one)
@@ -69,11 +77,15 @@ try:
         code = 0
         print(f"{TAG} the TUI said done to :close")
     else:
-        print(f"{TAG} APPARATUS: no \"done\" after :close; before it:\n{before}\nafter:\n{tui.text()}")
+        print(f"{TAG} RED: no \"done\" after :close; before it:\n{before}\nafter:\n{tui.text()}")
+        code = 1
     tui.key(":q\r", 1)
 except Hung as h:
     print(f"{TAG} HUNG at {h}")
     code = 1
+except Exception as e:  # the driver's own fault, not the TUI's
+    print(f"{TAG} APPARATUS: the driver failed: {e!r}")
+    code = 2
 finally:
     disarm()
     if tui is not None and not tui.stop():
