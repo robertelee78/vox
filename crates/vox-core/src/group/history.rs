@@ -177,7 +177,7 @@ impl OriginKeyStore {
     pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
         let mut keys: Vec<&(Digest32, u64, u64)> = self.records.keys().collect();
         keys.sort_unstable();
-        let mut e = Encoder::new();
+        let mut e = Encoder::for_secrets();
         e.array(2).uint(ORIGIN_STATE_VERSION).array(keys.len());
         for k in keys {
             let r = &self.records[k];
