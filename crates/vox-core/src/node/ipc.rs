@@ -1678,9 +1678,11 @@ async fn serve_requests(
         let Some(body) = read_frame(&mut stream).await? else {
             return Ok(());
         };
-        // **Wiped when done with** (V210-94): a request can carry a room or identity passphrase,
-        // and a frame freed as it was kept a copy in memory after the node locked — measured
-        // through the shipped binary, one copy of a join's passphrase after the lock.
+        // **Wiped as soon as it is decoded** (V210-94): a request can carry a room or identity
+        // passphrase, and the frame is needed for nothing past its decoding. Freed as it was, it
+        // kept a copy in memory after the node locked; held to the end of the request — which for
+        // a join is the end of the join — it was still there when the lock reported done.
+        // Measured through the shipped binary both times: one copy of a join's room passphrase.
         let body = zeroize::Zeroizing::new(body);
         // ADR-025 S0b: `vox status --json`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
@@ -1697,7 +1699,9 @@ async fn serve_requests(
             crate::node::status::serve(&mut stream, handle.sync_book(), &equivocations).await?;
             continue;
         }
-        let request = match Request::from_bytes(&body) {
+        let request = Request::from_bytes(&body);
+        drop(body);
+        let request = match request {
             Ok(r) => r,
             Err(e) => {
                 // A request this build does not understand ends the connection
