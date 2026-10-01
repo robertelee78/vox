@@ -69,9 +69,12 @@
 //! [`BUSY_BACK_WITHIN`] of the anchor going on; and once the frozen members go on, all [`MEMBERS`]
 //! are connected within [`BACK_WITHIN`].
 //!
-//! **Optional** (300 daemons, a few minutes in release): it is compiled only with the
-//! `optional-proofs` feature and blocks nothing. Run it with
+//! **Optional** (300 daemons, a few minutes in release): it runs only with the `optional-proofs`
+//! feature and blocks nothing. Run it with
 //! `cargo test --release -p vox-tui --features optional-proofs --test every_member_is_back_after_an_anchor_restart_proof -- --ignored --nocapture`.
+//! Without the feature a stand-in, `optional_proof_not_run::every_member_is_back_after_an_anchor_restart`,
+//! takes its place, so a run is never silent about it: a listing shows it, a run shows it ignored
+//! with the reason, and a run of the ignored tests prints that the proof did not run, and passes.
 //!
 //! Every red says which it is: `PRODUCT:` quotes what the product said or did, `CANNOT MEASURE:`
 //! names staging that was not achieved, `APPARATUS:` names a fault of the proof's own; the
@@ -86,7 +89,13 @@
 //!   the bound after the outage;
 //!
 
-#![cfg(all(unix, feature = "optional-proofs"))]
+#![cfg(unix)]
+// Without the feature only the stand-in below runs; the proof's code still compiles, unused.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(every_member_is_back_after_an_anchor_restart);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -124,8 +133,9 @@ const BUSY_BACK_WITHIN: Duration = Duration::from_secs(40);
 /// What a member refused by a busy anchor is told.
 const BUSY: &str = "the peer is busy";
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real binaries, 300 daemons and production Argon2id; CI runs it in release"]
+#[ignore = "real binaries, 300 daemons and production Argon2id; run by hand, never in CI"]
 fn every_member_is_back_after_an_anchor_restart() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
