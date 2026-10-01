@@ -674,6 +674,7 @@ fn finish_connection(
         datagram_rx: Mutex::new(ReplayWindow::default()),
         datagrams_dropped: AtomicU64::new(0),
         closed_here: std::sync::OnceLock::new(),
+        peer_stopped: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -750,6 +751,8 @@ pub struct VoxConnection {
     datagrams_dropped: AtomicU64,
     /// The code this end closed the connection with, if it did (see [`Self::closed_here`]).
     closed_here: std::sync::OnceLock<WireError>,
+    /// Whether the peer said it is stopping (see [`Self::peer_stopped`]).
+    peer_stopped: std::sync::atomic::AtomicBool,
 }
 
 /// The next [`VoxConnection::serial`].
@@ -909,6 +912,21 @@ impl VoxConnection {
         let _ = self.closed_here.set(err);
         self.connection
             .close(close_code(err), err.to_string().as_bytes());
+    }
+
+    /// Record that the peer said it is stopping (a [`StreamKind::Goodbye`] stream).
+    ///
+    /// [`StreamKind::Goodbye`]: crate::transport::streams::StreamKind::Goodbye
+    pub fn mark_peer_stopped(&self) {
+        self.peer_stopped.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the peer said it is stopping before this connection ended (V210-93): however it
+    /// then ended — its close, or a close of this end's, or nothing at all — it ended because
+    /// the peer stopped.
+    #[must_use]
+    pub fn peer_stopped(&self) -> bool {
+        self.peer_stopped.load(Ordering::Relaxed)
     }
 
     /// The code this end first closed the connection with, through [`Self::close`]: quinn reports

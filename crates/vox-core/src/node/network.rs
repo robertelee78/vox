@@ -282,6 +282,13 @@ pub enum Inbound {
         /// The authenticated peer.
         peer: Digest32,
     },
+    /// The peer said it is stopping (V210-93): the connection is marked and closed here, so its
+    /// loss reads as a stop whether or not the peer's own close arrives. Nothing for the actor
+    /// to do; the connection's loss is noticed like any other.
+    ServedGoodbye {
+        /// The authenticated peer.
+        peer: Digest32,
+    },
     /// A coordinator has relayed a punch session to this node: the DCUtR exchange is
     /// still to be run on these streams, and then the synchronized dial fired. The
     /// actor spawns it, because it takes seconds and must not block the coordinator's
@@ -721,6 +728,15 @@ impl NodeNet {
                 Ok(Inbound::ServedCircuit { peer })
             }
             StreamKind::Tunnel => Ok(Inbound::Tunnel { peer, send, recv }),
+            StreamKind::Goodbye => {
+                // Marked before it is closed, so whoever sees it closed sees why. Closed here
+                // rather than left for the peer's own close, which may never arrive (see
+                // `StreamKind::Goodbye`); the peer is stopping and needs nothing more from it.
+                conn.mark_peer_stopped();
+                drop((send, recv));
+                conn.close(crate::wire::WireError::ShuttingDown);
+                Ok(Inbound::ServedGoodbye { peer })
+            }
         }
     }
 

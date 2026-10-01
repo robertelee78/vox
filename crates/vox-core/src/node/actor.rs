@@ -124,6 +124,11 @@ const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
 /// They leave on the endpoint driver's next turns; this is a ceiling for one that cannot.
 const CLOSE_FLUSH: Duration = Duration::from_secs(1);
 
+/// How long stopping the network waits for its peers to confirm they heard it is stopping (see
+/// `ConnectionManager::say_goodbye`). A live peer confirms within a round trip; this is spent only
+/// on one that does not answer, and is a ceiling, not a wait.
+const GOODBYE_PATIENCE: Duration = Duration::from_millis(500);
+
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
@@ -1080,7 +1085,8 @@ fn spawn_stream_loop(
                 Ok(
                     Inbound::ServedRendezvous { .. }
                     | Inbound::ServedCoord { .. }
-                    | Inbound::ServedCircuit { .. },
+                    | Inbound::ServedCircuit { .. }
+                    | Inbound::ServedGoodbye { .. },
                 ) => failures = 0,
                 // A sync stream's preamble is read **here, on a task of its own**, and the
                 // actor is told only once the request is in hand.
@@ -3103,6 +3109,11 @@ impl Node {
             // a crash. A node that is stopping **says** it is leaving, which is what a close is for.
             // Measured on `m15_members_never_online_together`: 33.3 s in 10 of 12 runs without
             // either, 107–115 ms with this ordering alone.
+            //
+            // **Said first, while every connection still runs** (V210-93): a close cannot be relied
+            // on to arrive (see `ConnectionManager::say_goodbye`), so each peer is told this node
+            // is stopping, and each has it before the closes go.
+            let _ = net.manager().say_goodbye(GOODBYE_PATIENCE).await;
             if net.manager().close_relayed() > 0 {
                 tokio::time::sleep(RELAYED_CLOSE_LEAD).await;
             }
@@ -3760,7 +3771,10 @@ impl Node {
             }
             _ => None,
         };
+        // A peer that said it was stopping stopped, however the connection then ended: by its
+        // close, by this end's close on hearing it, or by a close that never arrived.
         let why = match (silent, conn.quinn().close_reason()) {
+            _ if conn.peer_stopped() => "the anchor stopped".to_owned(),
             (Some(s), _) => format!("it answered nothing for {}s", s.as_secs()),
             (None, Some(e)) => anchor_close_reason(&e, conn.closed_here()),
             (None, None) => "it is no longer held".to_owned(),
@@ -4832,7 +4846,8 @@ impl Node {
                     Inbound::NotYetSupported { .. }
                     | Inbound::ServedRendezvous { .. }
                     | Inbound::ServedCoord { .. }
-                    | Inbound::ServedCircuit { .. } => {}
+                    | Inbound::ServedCircuit { .. }
+                    | Inbound::ServedGoodbye { .. } => {}
                 }
             }
         }

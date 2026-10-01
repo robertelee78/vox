@@ -178,6 +178,11 @@ impl PeerPolicy {
     ///   (ADR-012: reads open, member-only writes refused there).
     #[must_use]
     pub fn allows(class: PeerClass, kind: StreamKind) -> bool {
+        // **Any peer may say it is stopping** (V210-93): it speaks only of the connection it
+        // arrives on, which the peer is about to close anyway.
+        if kind == StreamKind::Goodbye {
+            return true;
+        }
         match class {
             PeerClass::Member => true,
             PeerClass::Anchor => matches!(
@@ -1194,6 +1199,50 @@ impl ConnectionManager {
             }
         }
         n
+    }
+
+    /// **Tell every peer this node is stopping, and wait — at most `patience` — until each has
+    /// received it** (V210-93); how many confirmed it.
+    ///
+    /// Said before any connection is closed, while each still runs, because the close itself
+    /// cannot be relied on to arrive: it is one datagram, never sent again, and quinn does not
+    /// send it at all while congestion control or pacing holds back stream data still queued on
+    /// the connection (see [`StreamKind::Goodbye`]). An anchor stopped while it was still sending
+    /// to a node that had just reached it closed in silence that way, and the node reported its
+    /// clean stop as an anchor that answered nothing for 8 s. A [`StreamKind::Goodbye`] stream is
+    /// delivered like any data, and "received" is the peer's acknowledgement of it.
+    ///
+    /// Bounded, and spent only on a peer that does not answer: a stop is never held up for long
+    /// by a peer that is gone.
+    pub async fn say_goodbye(&self, patience: Duration) -> usize {
+        let peers: Vec<Arc<VoxConnection>> = lock(&self.retiring)
+            .iter()
+            .map(|(c, _)| Arc::clone(c))
+            .chain(lock(&self.conns).values().cloned())
+            .filter(|c| is_live(c))
+            .collect();
+        let mut saying = tokio::task::JoinSet::new();
+        for conn in peers {
+            saying.spawn(async move {
+                let (mut send, _recv) =
+                    crate::transport::streams::open_typed(&conn, StreamKind::Goodbye).await?;
+                let _ = send.finish();
+                // `None`: every byte of it acknowledged. A stream the peer stopped, or one on a
+                // connection that closed meanwhile, ends the wait too, uncounted.
+                let heard = matches!(send.stopped().await, Ok(None));
+                Ok::<bool, Error>(heard)
+            });
+        }
+        let mut heard = 0;
+        let _ = tokio::time::timeout(patience, async {
+            while let Some(done) = saying.join_next().await {
+                if matches!(done, Ok(Ok(true))) {
+                    heard += 1;
+                }
+            }
+        })
+        .await;
+        heard
     }
 
     /// Close every connection (node shutdown).

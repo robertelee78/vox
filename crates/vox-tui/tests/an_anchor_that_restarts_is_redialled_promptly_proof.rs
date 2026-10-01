@@ -181,13 +181,31 @@ fn assert_says_stopped(who: &str, said: &str) {
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn a_killed_anchor_is_noticed_promptly() {
-    let _ = stopped_for_good("KILL", KILLED_WITHIN);
+    let _ = stopped_for_good("KILL", KILLED_WITHIN, false);
+}
+
+/// **A clean stop is said as one even when the anchor was busy carrying for the node** (V210-93).
+/// The forward is moving a bulk echo through its circuit, so the anchor has stream data queued
+/// toward it, when the anchor is stopped (SIGINT). The anchor's CONNECTION_CLOSE waits behind that
+/// data: quinn (0.11.19 and earlier, quinn-rs/quinn#2785) holds a close back with the data, and the
+/// connection's closing period can end before it is sent, so the close never leaves. The forward
+/// must still say, within [`CLOSED_WITHIN`], that its anchor **stopped**: not that it answered
+/// nothing, 8 s or more later, or that it reset. That is what a stopping node's goodbye, said on a
+/// stream while the connection still runs, is for.
+///
+/// Mutation: the goodbye not said (the close left to carry the news alone) → red.
+#[test]
+#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+fn an_anchor_stopped_while_it_carries_a_transfer_is_said_to_have_stopped() {
+    let mut w = stopped_for_good("INT", CLOSED_WITHIN, true);
+    let said = w.fwd.as_mut().unwrap().transcript();
+    assert_says_stopped("the forward", &said);
 }
 
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
-    let mut w = stopped_for_good("TERM", CLOSED_WITHIN);
+    let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false);
     let said = w.fwd.as_mut().unwrap().transcript();
     assert_says_stopped("the forward", &said);
     // ---- and a forward stops on SIGTERM as it does on Ctrl-C -----------------------------------
@@ -222,8 +240,9 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
 }
 
 /// Stop the anchor with `signal` and leave it down; the forward must say its anchor connection is
-/// gone within `within` of the signal.
-fn stopped_for_good(signal: &str, within: Duration) -> RelayWorld {
+/// gone within `within` of the signal. With `carrying`, a bulk echo runs through the forward, and
+/// so through the anchor's circuit, from before the stop until after it.
+fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorld {
     watchdog::arm();
     let mut w = RelayWorld::new(Split::Families);
     let (ok, took, out, err) = w.join_guest();
@@ -253,7 +272,25 @@ fn stopped_for_good(signal: &str, within: Duration) -> RelayWorld {
         fwd.transcript()
     );
 
+    // ---- a transfer in flight through the anchor, if asked for -----------------------------------
+    let transfer = carrying.then(|| Transfer::start(at));
+    if let Some(t) = &transfer {
+        let flowing = t.echoed_at_least(TRANSFER_FLOWING, Duration::from_secs(30));
+        eprintln!(
+            "[proof] a transfer through the anchor: {} bytes echoed before the stop",
+            t.echoed()
+        );
+        assert!(
+            flowing,
+            "CANNOT MEASURE: the transfer through the forward never echoed {TRANSFER_FLOWING} bytes \
+             ({} did)\n{}",
+            t.echoed(),
+            w.fwd.as_mut().unwrap().transcript()
+        );
+    }
+
     // ---- the anchor is stopped, and stays down --------------------------------------------------
+    let at_stop = transfer.as_ref().map(Transfer::echoed);
     let stopped = Instant::now();
     let _ = std::process::Command::new("kill")
         .args([&format!("-{signal}"), &w.anchor.proc.child.id().to_string()])
@@ -266,6 +303,14 @@ fn stopped_for_good(signal: &str, within: Duration) -> RelayWorld {
         std::thread::sleep(Duration::from_millis(20));
     }
     let exited = stopped.elapsed();
+    if let (Some(t), Some(before)) = (&transfer, at_stop) {
+        // Still moving while the anchor was stopping: its connection to the forward had data
+        // queued when its close was made, which is the case this arm exists for.
+        eprintln!(
+            "[proof] the transfer echoed {} more bytes between the signal and the anchor's exit",
+            t.echoed().saturating_sub(before)
+        );
+    }
 
     // ---- the forward says so ---------------------------------------------------------------------
     // Watched well past the bound, so a red prints how long it did take.
@@ -308,7 +353,97 @@ fn stopped_for_good(signal: &str, within: Duration) -> RelayWorld {
         "the forward said its anchor connection went only {after:?} after SIG{signal}, over \
          {within:?}\n---- the forward ----\n{transcript}"
     );
+    drop(transfer);
     w
+}
+
+/// How many bytes a transfer must have echoed before the anchor is stopped, so it is known to be
+/// moving through the circuit.
+const TRANSFER_FLOWING: u64 = 1 << 20;
+
+/// A bulk echo through the forward: one thread writes as fast as the path takes it, another reads
+/// the echo back and counts it. Stopped when dropped.
+struct Transfer {
+    echoed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Transfer {
+    fn start(at: std::net::SocketAddr) -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let echoed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut out = std::net::TcpStream::connect(at).expect("connect to the forward");
+        let mut back = out.try_clone().expect("clone the stream");
+        let _ = out.set_write_timeout(Some(Duration::from_millis(200)));
+        let _ = back.set_read_timeout(Some(Duration::from_millis(200)));
+        let idle = |e: &std::io::Error| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        };
+        let writer = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let chunk = vec![0x5a_u8; 64 * 1024];
+                while !stop.load(Ordering::Relaxed) {
+                    match out.write(&chunk) {
+                        Ok(_) => {}
+                        Err(e) if idle(&e) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        let reader = {
+            let (stop, echoed) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&echoed));
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 64 * 1024];
+                while !stop.load(Ordering::Relaxed) {
+                    match back.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            echoed.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Err(e) if idle(&e) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Self {
+            echoed,
+            stop,
+            threads: vec![writer, reader],
+        }
+    }
+
+    fn echoed(&self) -> u64 {
+        self.echoed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn echoed_at_least(&self, bytes: u64, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while self.echoed() < bytes {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+}
+
+impl Drop for Transfer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
 }
 
 /// **A connection lost the moment it is made is still said to be gone** (V210-93), however soon
