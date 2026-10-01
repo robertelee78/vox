@@ -395,7 +395,7 @@ pub fn solve_token_until(
             return Err(Error::JoinPowInvalid);
         }
         let equihash_nonce = wagner::nonce_bytes(counter);
-        for solution in wagner::solve(params, &seed, &equihash_nonce)? {
+        for solution in wagner::solve_until(params, &seed, &equihash_nonce, stop)? {
             let dh = difficulty_hash(&seed, &equihash_nonce, &solution);
             if challenge.difficulty.is_met_by(&dh) {
                 // Cross-check with the canonical verifier before returning.

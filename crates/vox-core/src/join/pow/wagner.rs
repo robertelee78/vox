@@ -54,6 +54,7 @@
 //! are cheap (~ms).
 
 use crate::error::{Error, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::PowParams;
 
@@ -339,7 +340,7 @@ impl Solver {
     }
 
     /// Round 0: generate every leaf string and bucket it by digit 0.
-    fn fill_leaves(&mut self, base: &blake2b_simd::State) {
+    fn fill_leaves(&mut self, base: &blake2b_simd::State, stop: &AtomicBool) {
         let s_ndigits = self.s.ndigits;
         let cbl = self.s.collision_byte_length;
         let n_bytes = self.s.n as usize / 8;
@@ -348,6 +349,9 @@ impl Solver {
         let mut g: u32 = 0;
         let mut index: usize = 0;
         while index < self.s.nhashes {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             let mut st = base.clone();
             st.update(&g.to_le_bytes());
             let digest = st.finalize();
@@ -371,7 +375,7 @@ impl Solver {
     }
 
     /// One collision round: read round `round`, write round `round + 1`.
-    fn collide(&mut self, round: usize) {
+    fn collide(&mut self, round: usize, stop: &AtomicBool) {
         let s_nb = self.s.nbuckets;
         let s_ns = self.s.nslots;
         let cbl = self.s.collision_byte_length;
@@ -386,6 +390,9 @@ impl Solver {
         let mut xor = vec![0u8; stride_in - 1];
 
         for bucket in 0..s_nb {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             let cnt = usize::from(self.counts_prev[bucket]);
             if cnt < 2 {
                 continue;
@@ -425,7 +432,7 @@ impl Solver {
     /// The final round (`k-1`): pairs colliding on the rest byte of digit `k-1`
     /// **and** all of digit `k` XOR to zero — solutions. Returns `(bucket, a, b)`
     /// slot pairs in the round-`k-1` layer.
-    fn final_pairs(&mut self, round: usize) -> Vec<(usize, usize, usize)> {
+    fn final_pairs(&mut self, round: usize, stop: &AtomicBool) -> Vec<(usize, usize, usize)> {
         let s_nb = self.s.nbuckets;
         let s_ns = self.s.nslots;
         let stride_in = self.s.stride(round);
@@ -437,6 +444,9 @@ impl Solver {
         let mut out = Vec::new();
         let layer = &self.layers[round % 2];
         for bucket in 0..s_nb {
+            if stop.load(Ordering::Relaxed) {
+                return out;
+            }
             let cnt = usize::from(self.counts_prev[bucket]);
             if cnt < 2 {
                 continue;
@@ -489,19 +499,45 @@ impl Solver {
 /// See the module docs for the layout. Peak memory is fixed by the parameters
 /// (the bucket sizing above); a full bucket drops entries rather than growing.
 pub fn solve(params: PowParams, seed: &[u8], nonce: &[u8]) -> Result<Vec<Vec<u8>>> {
+    solve_until(params, seed, nonce, &AtomicBool::new(false))
+}
+
+/// [`solve`] that gives up once `stop` is set, checked at every hash batch, every bucket and every
+/// round (V210-94): a join a lock ended does not leave a thread grinding on for the rest of a
+/// solve — measured, up to 27 s of a core in a debug build and a second in release, after the
+/// lock had settled. A stopped solve is an error, never a partial answer.
+///
+/// # Errors
+/// As [`solve`]; and [`Error::JoinPowInvalid`] once stopped.
+pub fn solve_until(
+    params: PowParams,
+    seed: &[u8],
+    nonce: &[u8],
+    stop: &AtomicBool,
+) -> Result<Vec<Vec<u8>>> {
+    let stopped = || {
+        if stop.load(Ordering::Relaxed) {
+            Err(Error::JoinPowInvalid)
+        } else {
+            Ok(())
+        }
+    };
     let s = Sizes::new(params)?;
     if s.k < 3 {
         return Err(Error::JoinPowInvalid);
     }
     let base = base_state(&s, seed, nonce);
     let mut solver = Solver::new(s);
-    solver.fill_leaves(&base);
+    solver.fill_leaves(&base, stop);
+    stopped()?;
 
     let k = solver.s.k as usize;
     for round in 0..k - 1 {
-        solver.collide(round);
+        solver.collide(round, stop);
+        stopped()?;
     }
-    let pairs = solver.final_pairs(k - 1);
+    let pairs = solver.final_pairs(k - 1, stop);
+    stopped()?;
 
     let want = solver.s.solution_indices();
     let mut solutions = Vec::new();
