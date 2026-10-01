@@ -117,8 +117,9 @@ const STALL: Duration = Duration::from_secs(5);
 
 /// A process this test started that used at least this much CPU over the census's last 2 s is
 /// still working, so a budget that ran out on it is not a hang (V210-106): a debug `trust add`
-/// hashing a passphrase ran at 78%.
-const BUSY_PCT: f64 = 25.0;
+/// hashing a passphrase ran at 78%, and a release `vox serve` cut short mid-proof at 8-13%. An
+/// idle `vox` measures about 1%: only a process near 0 is stuck.
+const BUSY_PCT: f64 = 5.0;
 
 /// Twice the most one join cost a debug build: `vox room join` returning, its proof of work solved by the
 /// joining node, measured on the equivocation proof's staging (an anchor, five daemons, four
