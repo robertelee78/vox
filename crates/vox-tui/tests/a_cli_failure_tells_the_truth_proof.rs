@@ -93,7 +93,9 @@ fn collect(stream: impl Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            sink.lock().unwrap().push(line);
+            sink.lock()
+                .expect("APPARATUS: harness step failed")
+                .push(line);
         }
     });
     lines
@@ -128,12 +130,13 @@ impl Proc {
     ) -> Self {
         let mut child = command(dir, args, envs)
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(stdin.as_bytes()).expect("write stdin");
+            .unwrap_or_else(|e| panic!("APPARATUS: harness could not spawn {name}: {e}"));
+        let mut pipe = child.stdin.take().expect("APPARATUS: harness: stdin");
+        pipe.write_all(stdin.as_bytes())
+            .expect("APPARATUS: harness: write stdin");
         drop(pipe);
-        let out = collect(child.stdout.take().expect("stdout"));
-        let err = collect(child.stderr.take().expect("stderr"));
+        let out = collect(child.stdout.take().expect("APPARATUS: harness: stdout"));
+        let err = collect(child.stderr.take().expect("APPARATUS: harness: stderr"));
         Self {
             name,
             child,
@@ -143,11 +146,17 @@ impl Proc {
     }
 
     fn stdout(&self) -> Vec<String> {
-        self.out.lock().unwrap().clone()
+        self.out
+            .lock()
+            .expect("APPARATUS: harness step failed")
+            .clone()
     }
 
     fn stderr(&self) -> String {
-        self.err.lock().unwrap().join("\n")
+        self.err
+            .lock()
+            .expect("APPARATUS: harness step failed")
+            .join("\n")
     }
 
     fn expect_out(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
@@ -170,7 +179,7 @@ impl Proc {
     fn exit_within(&mut self, within: Duration) -> Option<(ExitStatus, Duration)> {
         let t0 = Instant::now();
         while t0.elapsed() < within {
-            if let Some(s) = self.child.try_wait().expect("wait") {
+            if let Some(s) = self.child.try_wait().expect("APPARATUS: harness: wait") {
                 return Some((s, t0.elapsed()));
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -225,10 +234,10 @@ fn must(what: &str, r: Option<(bool, String, Duration)>) -> (bool, String, Durat
 #[ignore = "three real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn a_cli_failure_tells_the_truth() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: harness step failed");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: harness step failed");
         d
     };
     let (anchor_dir, host_dir, joiner_dir) = (dir("anchor"), dir("host"), dir("joiner"));
@@ -241,8 +250,12 @@ fn a_cli_failure_tells_the_truth() {
     let bound = Duration::from_secs(30);
     let mut claims = 0usize;
 
-    let service = TcpListener::bind("127.0.0.1:0").unwrap();
-    let service_port = service.local_addr().unwrap().port().to_string();
+    let service = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: harness step failed");
+    let service_port = service
+        .local_addr()
+        .expect("APPARATUS: harness step failed")
+        .port()
+        .to_string();
 
     let anchor = Proc::spawn(
         "anchor",
@@ -277,7 +290,7 @@ fn a_cli_failure_tells_the_truth() {
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
             .strip_prefix(label)
-            .unwrap()
+            .expect("APPARATUS: harness step failed")
             .trim()
             .to_owned()
     };
@@ -305,7 +318,7 @@ fn a_cli_failure_tells_the_truth() {
         took.as_secs_f64(),
         said.trim().replace('\n', " / ")
     );
-    assert!(!ok, "a wrong passphrase must not join: {said}");
+    assert!(!ok, "PRODUCT (1): a wrong passphrase must not join: {said}");
     assert!(
         said.contains("refused the join"),
         "CANNOT MEASURE (1): the join was not refused by a member, so the exchange was not \
@@ -314,12 +327,12 @@ fn a_cli_failure_tells_the_truth() {
     let said_line = said.lines().find(|l| l.trim_start().starts_with("said:"));
     assert!(
         said_line.is_some_and(|l| l.contains("exchange")),
-        "(1) a join refused in the exchange must say what the member said (a `said:` line \
+        "PRODUCT (1) a join refused in the exchange must say what the member said (a `said:` line \
          naming the exchange); it said:\n{said}"
     );
     assert!(
         !said.contains("Failed("),
-        "(1) an enum token reached the person:\n{said}"
+        "PRODUCT (1) an enum token reached the person:\n{said}"
     );
     claims += 1;
 
@@ -354,11 +367,11 @@ fn a_cli_failure_tells_the_truth() {
     );
     assert!(
         !ok,
-        "(4) removing a service never offered must fail: {said}"
+        "PRODUCT (4) removing a service never offered must fail: {said}"
     );
     assert!(
         said.contains("not offered in this room") && !said.contains("Failed("),
-        "(4) the failure must name its cause: {said}"
+        "PRODUCT (4) the failure must name its cause: {said}"
     );
     claims += 1;
 
@@ -387,7 +400,7 @@ fn a_cli_failure_tells_the_truth() {
         &format!("{passphrase}\n"),
     );
     std::thread::sleep(Duration::from_secs(1));
-    if let Some(s) = join.child.try_wait().expect("wait") {
+    if let Some(s) = join.child.try_wait().expect("APPARATUS: harness: wait") {
         signal("CONT", host_pid);
         std::thread::sleep(Duration::from_millis(100));
         panic!(
@@ -409,7 +422,7 @@ fn a_cli_failure_tells_the_truth() {
     );
     let Some((status, took)) = ended else {
         panic!(
-            "(5) `vox room join` against a node suspended mid-request was still running after \
+            "PRODUCT (5) `vox room join` against a node suspended mid-request was still running after \
              {mid_bound:?}"
         );
     };
@@ -428,11 +441,11 @@ fn a_cli_failure_tells_the_truth() {
     );
     assert!(
         !status.success(),
-        "(5) a join whose node was suspended mid-request must fail: {said}"
+        "PRODUCT (5) a join whose node was suspended mid-request must fail: {said}"
     );
     assert!(
         said.contains("stopped answering while this request waited"),
-        "(5) the join must say its node stopped answering while it waited: {said}"
+        "PRODUCT (5) the join must say its node stopped answering while it waited: {said}"
     );
     let (ok, said, took) = must(
         "vox status (late, resumed)",
@@ -475,7 +488,7 @@ fn a_cli_failure_tells_the_truth() {
         &format!("{passphrase}\n"),
     );
     std::thread::sleep(Duration::from_secs(1));
-    if let Some(s) = join.child.try_wait().expect("wait") {
+    if let Some(s) = join.child.try_wait().expect("APPARATUS: harness: wait") {
         signal("CONT", host_pid);
         panic!(
             "CANNOT MEASURE (7): the join ended ({s}) before its node could be killed \
@@ -568,7 +581,9 @@ fn a_cli_failure_tells_the_truth() {
     );
     for (verb, r) in [("vox status", status), ("vox room list", list)] {
         let Some((ok, said, took)) = r else {
-            panic!("(2) `{verb}` against a suspended node was still running after {bound:?}");
+            panic!(
+                "PRODUCT (2) `{verb}` against a suspended node was still running after {bound:?}"
+            );
         };
         eprintln!(
             "[{verb}, node suspended] ok={ok} in {:.1}s: {}",
@@ -577,11 +592,11 @@ fn a_cli_failure_tells_the_truth() {
         );
         assert!(
             !ok,
-            "(2) `{verb}` against a suspended node must fail: {said}"
+            "PRODUCT (2) `{verb}` against a suspended node must fail: {said}"
         );
         assert!(
             said.contains("did not answer"),
-            "(2) `{verb}` must say the node did not answer: {said}"
+            "PRODUCT (2) `{verb}` must say the node did not answer: {said}"
         );
     }
     let (ok, said, took) = must(
@@ -606,7 +621,7 @@ fn a_cli_failure_tells_the_truth() {
     );
     let _ = joiner.child.wait();
     let Some((status, took)) = tail.exit_within(bound) else {
-        panic!("(3) the tail was still running {bound:?} after its node was killed");
+        panic!("PRODUCT (3) the tail was still running {bound:?} after its node was killed");
     };
     std::thread::sleep(Duration::from_millis(100));
     let err = tail.stderr();
@@ -618,16 +633,20 @@ fn a_cli_failure_tells_the_truth() {
     );
     assert!(
         !status.success(),
-        "(3) the tail exited 0 when its node died; a supervisor would not restart it: {err}"
+        "PRODUCT (3) the tail exited 0 when its node died; a supervisor would not restart it: {err}"
     );
     assert!(
         err.contains("the node stopped"),
-        "(3) the tail must say its node stopped: {err}"
+        "PRODUCT (3) the tail must say its node stopped: {err}"
     );
     claims += 1;
 
     eprintln!("[proof] {claims} claims held");
-    assert_eq!(claims, 5);
+    assert_eq!(
+        claims, 6,
+        "APPARATUS: {claims} claims were counted, not the 6 this test stages (1, 2, 3, 4, 5, 7): \
+         a claim was skipped or added without its count"
+    );
 }
 
 /// (6) A holder whose control socket cannot be bound runs on, and says why.
@@ -635,23 +654,30 @@ fn a_cli_failure_tells_the_truth() {
 #[ignore = "real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn a_holder_runs_without_its_control_socket() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: harness step failed");
     let quick = Duration::from_secs(90);
     // A profile path too long for a socket address, so the socket falls back to
     // `$TMPDIR/vox-<uid>`; and there, a plain file where that directory should be.
     let long = |n: &str| {
         let d = tmp.path().join(format!("{n}-{}", "p".repeat(120)));
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: harness step failed");
         d
     };
     let (host_dir, guest_dir) = (long("host"), long("guest"));
     let anchor_dir = tmp.path().join("anchor");
-    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: harness step failed");
     let blocked_tmp = tmp.path().join("t");
-    std::fs::create_dir_all(&blocked_tmp).unwrap();
-    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    std::fs::create_dir_all(&blocked_tmp).expect("APPARATUS: harness step failed");
+    let uid = String::from_utf8(
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("APPARATUS: harness step failed")
+            .stdout,
+    )
+    .expect("APPARATUS: harness step failed");
     let squat = blocked_tmp.join(format!("vox-{}", uid.trim()));
-    std::fs::write(&squat, "not a directory\n").unwrap();
+    std::fs::write(&squat, "not a directory\n").expect("APPARATUS: harness step failed");
     let tmpdir = format!("{}/", blocked_tmp.display());
     let env = [("TMPDIR", tmpdir.as_str())];
     let mut held = 0usize;
@@ -673,8 +699,12 @@ fn a_holder_runs_without_its_control_socket() {
         let (ok, said, _) = must("vox id", vox_env(d, &["id"], "", quick, &env));
         assert!(ok, "CANNOT MEASURE: vox id: {said}");
     }
-    let service = TcpListener::bind("127.0.0.1:0").unwrap();
-    let service_port = service.local_addr().unwrap().port().to_string();
+    let service = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: harness step failed");
+    let service_port = service
+        .local_addr()
+        .expect("APPARATUS: harness step failed")
+        .port()
+        .to_string();
     let mut host = Proc::spawn_env(
         "host",
         &host_dir,
@@ -695,14 +725,24 @@ fn a_holder_runs_without_its_control_socket() {
         if host.stdout().iter().any(|l| l.starts_with("passphrase")) {
             break true;
         }
-        if host.child.try_wait().expect("wait").is_some() || t0.elapsed() > quick {
+        if host
+            .child
+            .try_wait()
+            .expect("APPARATUS: harness: wait")
+            .is_some()
+            || t0.elapsed() > quick
+        {
             break false;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
     // Still serving a moment after it printed them.
     std::thread::sleep(Duration::from_secs(2));
-    let running = host.child.try_wait().expect("wait").is_none();
+    let running = host
+        .child
+        .try_wait()
+        .expect("APPARATUS: harness: wait")
+        .is_none();
     let err = host.stderr();
     eprintln!(
         "[vox serve, socket blocked] printed={printed} running={running}: {}",
@@ -710,7 +750,7 @@ fn a_holder_runs_without_its_control_socket() {
     );
     assert!(
         printed && running,
-        "(6) `vox serve` must keep serving when its control socket cannot be bound; \
+        "PRODUCT (6) `vox serve` must keep serving when its control socket cannot be bound; \
          printed={printed} running={running}; stderr:\n{err}"
     );
     let warned = |said: &str| {
@@ -720,20 +760,20 @@ fn a_holder_runs_without_its_control_socket() {
     };
     assert!(
         warned(&err),
-        "(6) `vox serve` must say the control socket is unavailable, where and why: {err}"
+        "PRODUCT (6) `vox serve` must say the control socket is unavailable, where and why: {err}"
     );
     held += 1;
 
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
             .strip_prefix(label)
-            .unwrap()
+            .expect("APPARATUS: harness step failed")
             .trim()
             .to_owned()
     };
     let (address, passphrase) = (field("address"), field("passphrase"));
     let pass_file = guest_dir.join("room-pass");
-    std::fs::write(&pass_file, format!("{passphrase}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{passphrase}\n")).expect("APPARATUS: harness step failed");
     let (ok, said, took) = must(
         "vox connect",
         vox_env(
@@ -742,7 +782,7 @@ fn a_holder_runs_without_its_control_socket() {
                 "connect",
                 &address,
                 "--passphrase-file",
-                pass_file.to_str().unwrap(),
+                pass_file.to_str().expect("APPARATUS: harness step failed"),
                 "--anchor",
                 &spec,
                 "--listen",
@@ -761,22 +801,27 @@ fn a_holder_runs_without_its_control_socket() {
     );
     assert!(
         ok && said.contains("joined."),
-        "(6) `vox connect` must join when its control socket cannot be bound: {said}"
+        "PRODUCT (6) `vox connect` must join when its control socket cannot be bound: {said}"
     );
     assert!(
         warned(&said),
-        "(6) `vox connect` must say the control socket is unavailable, where and why: {said}"
+        "PRODUCT (6) `vox connect` must say the control socket is unavailable, where and why: {said}"
     );
     held += 1;
 
     // What stood where the directory should be was never used.
     let left = std::fs::symlink_metadata(&squat).map(|m| m.file_type().is_file());
     assert!(
-        matches!(left, Ok(true)) && std::fs::read_to_string(&squat).unwrap() == "not a directory\n",
-        "(6) the file at {} was changed: {left:?}",
+        matches!(left, Ok(true))
+            && std::fs::read_to_string(&squat).expect("APPARATUS: harness step failed")
+                == "not a directory\n",
+        "PRODUCT (6) the file at {} was changed: {left:?}",
         squat.display()
     );
     drop(service);
     eprintln!("[proof] {held} holders ran without their control socket");
-    assert_eq!(held, 2);
+    assert_eq!(
+        held, 2,
+        "APPARATUS: {held} holders were counted, not the 2 this test stages (serve, connect)"
+    );
 }
