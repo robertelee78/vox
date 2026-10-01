@@ -385,15 +385,17 @@ async fn recv_frame(recv: &mut RecvStream) -> Result<JoinFrame> {
 }
 
 /// **How long the rest of a join may take once the joiner's proof of work has verified**
-/// (V210-92): the remaining frames are a few signatures and key agreements each way, well under a
-/// second on a slow device, so this is all round trips and margin.
+/// (V210-92): the remaining frames are a few signatures, key agreements and round trips each way,
+/// well under 2s even on a Raspberry-Pi-class device, so 20s is ten times that and all margin. It
+/// is tight on purpose: a hold that has done its work cannot be ended for a newcomer, so this is
+/// the only thing that frees its slot, and at the per-frame bound's 30s each it would never fire.
 ///
 /// A hold that has done its work is never the one ended for a newcomer (`node::joinslots`), so
 /// how long it may last is what this sets. Each frame is already bounded by
 /// [`FRAME_PATIENCE`](crate::transport::framing::FRAME_PATIENCE); this bounds the rest of the
 /// exchange **as a whole**, so a stranger that paid sixteen solves cannot then keep every slot by
 /// sending each remaining frame just inside the per-frame bound.
-pub const ADMISSION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+pub const ADMISSION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long one expected Equihash solve may take on a slow joiner.
 ///
