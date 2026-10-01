@@ -195,7 +195,7 @@ pub fn parse_anchor_spec(text: &str) -> Result<BootstrapNode> {
 /// ladder wants anyway — it tries them in order.
 ///
 /// # Errors
-/// [`Error::MalformedLink`] if the text is neither a multiaddr nor `host:port`, or
+/// [`Error::MalformedAnchor`] if the text is neither a multiaddr nor `host:port`, or
 /// if a name resolves to nothing.
 fn parse_anchor_addrs(text: &str) -> Result<Vec<Multiaddr>> {
     if text.starts_with('/') {
@@ -211,8 +211,8 @@ fn parse_anchor_addrs(text: &str) -> Result<Vec<Multiaddr>> {
     }
     // `host:port`, the form a person types. An IPv6 literal must be bracketed, as
     // everywhere else, and `rsplit_once` keeps that working.
-    let (host, port) = text.rsplit_once(':').ok_or(Error::MalformedLink(
-        "anchor spec: expected host:port or a multiaddr",
+    let (host, port) = text.rsplit_once(':').ok_or(Error::MalformedAnchor(
+        "expected host:port or a multiaddr after @",
     ))?;
     resolve_host(host.trim_matches(['[', ']']), port, None)
 }
@@ -240,7 +240,7 @@ fn resolve_host(host: &str, port: &str, want6: Option<bool>) -> Result<Vec<Multi
     out.sort_by_key(|a| u8::from(matches!(a, Multiaddr::Ip4(_))));
     out.dedup();
     if out.is_empty() {
-        return Err(Error::MalformedLink("that host resolved to no address"));
+        return Err(Error::MalformedAnchor("that host resolved to no address"));
     }
     Ok(out)
 }
@@ -252,16 +252,24 @@ fn resolve_host(host: &str, port: &str, want6: Option<bool>) -> Result<Vec<Multi
 /// can explain itself. A missing file is **not** an error — most profiles have none, and a node on
 /// the same machine as its own anchor gets its spec written there by `vox node`.
 ///
-/// A malformed line **is** an error, naming the line number. Silently ignoring one would mean a
-/// person fixes a typo they cannot see and wonders why their anchor is unreachable; ADR-017's whole
-/// complaint about `--anchor` was that reachability failures are hard to attribute.
+/// A line that cannot be used is **skipped and named** (V210-75): the others are merged, and
+/// what comes back is one sentence per skipped line, with its number and why, for the caller to
+/// say. Silently ignoring one would mean a person fixes a typo they cannot see and wonders why
+/// their anchor is unreachable; ADR-017's whole complaint about `--anchor` was that reachability
+/// failures are hard to attribute. Failing the whole file was worse the other way: one host that
+/// did not resolve took every anchor with it, and the error named neither the line nor the reason.
+///
+/// A host is resolved here, which blocks: an async caller runs this on a blocking thread.
+///
+/// # Errors
+/// [`Error::Path`] if the file exists and cannot be read.
 pub fn merge_anchors_file(
     set: &mut crate::nat::bootstrap::BootstrapSet,
     path: &std::path::Path,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => {
             return Err(Error::Path {
                 op: "read",
@@ -269,18 +277,18 @@ pub fn merge_anchors_file(
             })
         }
     };
+    let mut skipped = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        merge_anchor_spec(set, line).map_err(|_| {
-            // The line number is the whole point: a person edits this file by hand.
-            Error::MalformedAnchor("a line of the anchors file is not <fingerprint>@<host:port>")
-        })?;
-        let _ = i;
+        // The line number is the whole point: a person edits this file by hand.
+        if let Err(e) = merge_anchor_spec(set, line) {
+            skipped.push(format!("{} line {} is skipped: {e}", path.display(), i + 1));
+        }
     }
-    Ok(())
+    Ok(skipped)
 }
 
 /// Add an anchor spec to a set, merging its address into an anchor already named.
