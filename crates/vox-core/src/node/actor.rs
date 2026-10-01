@@ -7362,6 +7362,15 @@ impl Node {
         let token = self.next_token;
         self.next_token += 1;
         let fence = crate::transport::stream_transport::Fence::new();
+        let running = crate::node::status::Running::start(
+            &self.sync_book,
+            channel_id,
+            peer,
+            token,
+            true,
+            crate::node::status::SyncStep::Setup,
+        );
+        let stepper = running.stepper();
         port.out = Some(crate::node::ports::Attempt {
             token,
             dir: crate::node::ports::Dir::Out,
@@ -7370,6 +7379,7 @@ impl Node {
             started: std::time::Instant::now(),
             abort: None,
             fence: Arc::clone(&fence),
+            running,
         });
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| c.opened += 1);
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
@@ -7443,6 +7453,7 @@ impl Node {
                 }
                 SessionTarget::Anchored(state) => state.lock().await.epoch(),
             };
+            stepper.step(crate::node::status::SyncStep::Opening);
             // 2. Open the stream. Also a round trip. **A stream that will not open still
             //    reports**: every exit from this task sends `SyncDone`.
             let handle = tokio::runtime::Handle::current();
@@ -7463,6 +7474,7 @@ impl Node {
                         return;
                     }
                 };
+            stepper.step(crate::node::status::SyncStep::Exchanging);
             // 3. Run the session on a blocking thread, which **holds the slot** until it exits
             //    (ADR-025 D1a): an abort stops this task, not the worker, so the worker is fenced
             //    instead and the slot bounds running workers.
@@ -7524,6 +7536,14 @@ impl Node {
         let token = self.next_token;
         self.next_token += 1;
         let fence = crate::transport::stream_transport::Fence::new();
+        let running = crate::node::status::Running::start(
+            &self.sync_book,
+            channel_id,
+            peer,
+            token,
+            false,
+            crate::node::status::SyncStep::Exchanging,
+        );
         port.inbound.insert(
             token,
             crate::node::ports::Attempt {
@@ -7534,6 +7554,7 @@ impl Node {
                 started: std::time::Instant::now(),
                 abort: None,
                 fence: Arc::clone(&fence),
+                running,
             },
         );
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
