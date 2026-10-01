@@ -427,6 +427,21 @@ pub const TEST_SOLVE_AT_LEAST_ENV: &str = "VOX_TEST_SOLVE_AT_LEAST_MS";
 /// empty or unparsable is no wait.
 pub const TEST_STALL_AFTER_SOLVE_ENV: &str = "VOX_TEST_STALL_AFTER_SOLVE_MS";
 
+/// Test-only: once this joiner's proof of work is in, wait this many milliseconds before **each**
+/// frame it still owes the member (its proof, then its init) — a join that has done its work and
+/// then sends every remaining frame just inside the per-frame bound, which only the member's
+/// [`ADMISSION_PATIENCE`] limits as a whole (V210-92). It says so on stderr when it starts. **For
+/// proofs; nothing in a real deployment sets it.** Unset, empty or unparsable is no wait.
+pub const TEST_DRIP_AFTER_SOLVE_ENV: &str = "VOX_TEST_DRIP_AFTER_SOLVE_MS";
+
+/// The test-only wait of [`TEST_DRIP_AFTER_SOLVE_ENV`], before one frame the joiner owes.
+fn test_drip() -> Option<std::time::Duration> {
+    std::env::var(TEST_DRIP_AFTER_SOLVE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+}
+
 /// How close to the responder's patience a grind may finish and still count as in time. The
 /// responder started its clock when it sent the challenge, a one-way trip before this side started
 /// its own, so a grind that ended just inside the patience here may have ended just outside it
@@ -631,6 +646,11 @@ pub async fn run_initiator(
         eprintln!("vox: test: solved, now silent for {stall}ms ({TEST_STALL_AFTER_SOLVE_ENV})");
         tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
     }
+    if let Some(drip) = test_drip() {
+        eprintln!(
+            "vox: test: solved, now {drip:?} before each frame ({TEST_DRIP_AFTER_SOLVE_ENV})"
+        );
+    }
 
     // 3. SHARE.
     let peer_share = match recv_frame(&mut recv).await {
@@ -645,6 +665,9 @@ pub async fn run_initiator(
     let (pending, bootstrap) = initiator.complete_cpace(&peer_share)?;
 
     // 4/5. PROOF both ways. A wrong passphrase fails here, locally.
+    if let Some(drip) = test_drip() {
+        tokio::time::sleep(drip).await;
+    }
     send_frame(
         &mut send,
         &JoinFrame::Proof {
@@ -660,6 +683,9 @@ pub async fn run_initiator(
     let peer = pending.verify_peer_sealed(&sealed_peer, &responder_fp)?;
 
     // 6. INIT — PQXDH against the responder's verified bundle.
+    if let Some(drip) = test_drip() {
+        tokio::time::sleep(drip).await;
+    }
     let (session, init_msg) = bootstrap.bootstrap(&bundle)?;
     send_frame(
         &mut send,
