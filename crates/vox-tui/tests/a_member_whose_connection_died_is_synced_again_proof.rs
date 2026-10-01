@@ -25,6 +25,17 @@
 //! scene, for something else to dial (a key to deliver). In CI's red nothing else did, and they
 //! never synced.
 //!
+//! **The dead connection is observed, not assumed** (else CANNOT MEASURE): bob's `SIGSTOP` took
+//! (`ps` reports him stopped), he stayed frozen past the 30 s silence line on this proof's clock,
+//! and carol's own `vox status --json` shows a session to bob that failed while he was frozen. The
+//! product exposes no line or counter for the close itself, so the premise rests on those three.
+//!
+//! **Apparatus clock.** Each poll of the two members' rooms spawns two `vox room read`s, which this
+//! proof cannot subtract, so every poll's own duration is measured on the same clock as
+//! [`BACK_WITHIN`], along with when carol first answered a read after `SIGCONT`. If the slowest of
+//! those exceeds [`APPARATUS_BUDGET`] and the rows were late, the runner owned the time:
+//! `CANNOT MEASURE: apparatus took X`. Otherwise a late sync is `PRODUCT: took X (apparatus Y)`.
+//!
 //! Mutation: the scheduler's reach removed (nothing dials a member for sync) → red.
 
 #![cfg(unix)]
@@ -56,6 +67,11 @@ const POSTS: usize = 20;
 /// reason came, never.
 const BACK_WITHIN: Duration = Duration::from_secs(10);
 const SETUP: Duration = Duration::from_secs(90);
+/// `SILENCE_IS_DEATH`: a connection silent this long is dropped as dead.
+const SILENCE_LINE: Duration = Duration::from_secs(30);
+/// The slowest single poll (two `vox room read`s), or carol's first answer after `SIGCONT`, the
+/// runner may take before a late sync is the runner's, not vox's.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
 fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     let mut child = Command::new(VOX)
@@ -68,14 +84,16 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn vox {}: {e}", argv.join(" ")));
     child
         .stdin
         .take()
         .unwrap()
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .unwrap_or_else(|e| panic!("APPARATUS: write vox's stdin: {e}"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: wait for vox {}: {e}", argv.join(" ")));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -88,7 +106,35 @@ fn signal(p: &VoxProc, sig: &str) {
         .args([sig, &p.child.id().to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill {sig} {}", p.name);
+    assert!(ok, "APPARATUS: kill {sig} {} did not take", p.name);
+}
+
+/// Whether `ps` reports `p` stopped (state `T`).
+fn stopped(p: &VoxProc) -> bool {
+    Command::new("ps")
+        .args(["-o", "state=", "-p", &p.child.id().to_string()])
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim_start()
+                .starts_with('T')
+        })
+}
+
+/// `data`'s node's sync row for `peer` (a fingerprint), from the shipped `vox status --json`.
+fn port_to(data: &Path, peer: &str) -> serde_json::Value {
+    let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
+    assert!(ok, "CANNOT MEASURE: `vox status --json` failed: {err}");
+    let status: serde_json::Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|e| panic!("CANNOT MEASURE: `vox status --json` printed {out:?}: {e}"));
+    status["sync"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|r| r["peer"].as_str().is_some_and(|p| peer.starts_with(p)))
+                .cloned()
+        })
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
@@ -112,30 +158,34 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list` within {SETUP:?}");
 }
 
-/// How many of the `<tag>-NNN` rows `data`'s node reads.
-fn rows_read(data: &Path, room: &str, tag: &str) -> usize {
-    let (_, out, _) = vox_once(data, &args(&["room", "read", room]));
-    (0..POSTS)
+/// How many of the `<tag>-NNN` rows `data`'s node reads, or what `vox room read` said when it
+/// failed.
+fn rows_read(data: &Path, room: &str, tag: &str) -> Result<usize, String> {
+    let (ok, out, err) = vox_once(data, &args(&["room", "read", room]));
+    if !ok {
+        return Err(format!("`vox room read` failed: {out}{err}"));
+    }
+    Ok((0..POSTS)
         .filter(|i| out.contains(&format!("{tag}-{i:03}")))
-        .count()
+        .count())
 }
 
 #[test]
 #[ignore = "real vox processes and 45 s of freezes; CI runs it in release"]
 fn a_member_whose_connection_died_is_synced_again() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a profile dir");
         d
     };
     let (anchor_dir, bob_dir, carol_dir) = (dir("anchor"), dir("bob"), dir("carol"));
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write the passphrase file");
 
     let mut anchor = VoxProc::spawn(
         "anchor",
@@ -150,35 +200,43 @@ fn a_member_whose_connection_died_is_synced_again() {
         .to_owned();
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "CANNOT MEASURE: `vox id` failed: {err}");
         out.trim().to_owned()
     };
     let (bob_fp, carol_fp) = (fp(&bob_dir), fp(&carol_dir));
     for (d, other, name) in [(&bob_dir, &carol_fp, "carol"), (&carol_dir, &bob_fp, "bob")] {
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", other, "--name", name]));
-        assert!(ok, "vox trust add {name}: {out}{err}");
+        assert!(
+            ok,
+            "CANNOT MEASURE: `vox trust add {name}` failed: {out}{err}"
+        );
     }
     let mut carol = daemon("carol", &carol_dir, &spec, &idpass);
     let mut bob = daemon("bob", &bob_dir, &spec, &idpass);
 
     let (ok, out, err) = vox_in(&carol_dir, &["room", "create", "--name", "r"], "room pass");
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "CANNOT MEASURE: `vox room create` failed: {out}{err}");
     let (ok, list, err) = vox_once(&carol_dir, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "CANNOT MEASURE: `vox room list` failed: {err}");
     let room = list
         .lines()
         .find(|l| l.contains(" r"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: carol's `vox room list` names no room r: {list}")
+        })
         .to_owned();
     let (ok, link, err) = vox_once(&carol_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "CANNOT MEASURE: `vox room invite` failed: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
         &["room", "join", link.trim(), "--name", "r"],
         "room pass",
     );
-    assert!(ok, "bob joins: {out}{err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: bob's `vox room join` failed: {out}{err}"
+    );
 
     // ---- 1. each reads the other's latest hello ------------------------------------------------
     let deadline = Instant::now() + SETUP;
@@ -195,7 +253,7 @@ fn a_member_whose_connection_died_is_synced_again() {
                     &format!("hello from {name} r{round}"),
                 ]),
             );
-            assert!(ok, "{name} posts: {err}");
+            assert!(ok, "CANNOT MEASURE: {name}'s warm-up post failed: {err}");
         }
         let round_ends = Instant::now() + Duration::from_secs(10);
         while Instant::now() < round_ends {
@@ -219,17 +277,36 @@ fn a_member_whose_connection_died_is_synced_again() {
     }
 
     // ---- 2. bob frozen past the 30 s line; carol posts -----------------------------------------
+    let carol_to_bob_before = port_to(&carol_dir, &bob_fp)["failed"].as_u64().unwrap_or(0);
     signal(&bob, "-STOP");
     let frozen = Instant::now();
+    assert!(
+        stopped(&bob),
+        "APPARATUS: kill -STOP bob did not take: ps does not report him stopped"
+    );
     for i in 0..POSTS {
         let (ok, out, err) = vox_once(
             &carol_dir,
             &args(&["room", "post", &room, &format!("SILENT-{i:03}")]),
         );
-        assert!(ok, "carol post {i}: {out}{err}");
+        assert!(ok, "PRODUCT: carol's post {i} was refused: {out}{err}");
     }
     std::thread::sleep(FREEZE.saturating_sub(frozen.elapsed()));
-
+    // The premise: bob stopped answering carol, long enough to be dropped as dead.
+    let carol_to_bob = port_to(&carol_dir, &bob_fp);
+    let failed = carol_to_bob["failed"].as_u64().unwrap_or(0);
+    println!(
+        "[proof] carol's port to frozen bob after {:.1?}: failed {carol_to_bob_before} -> {failed}, \
+         last failure {}",
+        frozen.elapsed(),
+        carol_to_bob["last_failure"]
+    );
+    assert!(
+        failed > carol_to_bob_before,
+        "CANNOT MEASURE: no session of carol's to frozen bob failed within {:.1?}, so his \
+         connection is not shown dead (her port: {carol_to_bob})",
+        frozen.elapsed()
+    );
     // ---- 3. no anchor left; carol frozen while bob comes back and tries her -----------------
     let anchor_said = anchor.transcript();
     signal(&anchor, "-INT");
@@ -242,18 +319,32 @@ fn a_member_whose_connection_died_is_synced_again() {
         std::thread::sleep(Duration::from_millis(100));
     }
     signal(&carol, "-STOP");
+    assert!(
+        stopped(&carol),
+        "APPARATUS: kill -STOP carol did not take: ps does not report her stopped"
+    );
+    let bob_frozen = frozen.elapsed();
     signal(&bob, "-CONT");
-    println!("[proof] bob was frozen for {:.1?}", frozen.elapsed());
+    println!("[proof] bob was frozen for {bob_frozen:.1?}");
+    assert!(
+        bob_frozen > SILENCE_LINE,
+        "CANNOT MEASURE: bob was frozen only {bob_frozen:.1?}, not past the {SILENCE_LINE:?} \
+         silence line"
+    );
     let carol_frozen = Instant::now();
     for i in 0..POSTS {
         let (ok, out, err) = vox_once(
             &bob_dir,
             &args(&["room", "post", &room, &format!("RETURNED-{i:03}")]),
         );
-        assert!(ok, "bob post {i}: {out}{err}");
+        assert!(
+            ok,
+            "PRODUCT: bob's post {i} after he was continued was refused: {out}{err}"
+        );
     }
     std::thread::sleep(CAROL_FROZEN.saturating_sub(carol_frozen.elapsed()));
-    let early = rows_read(&bob_dir, &room, "SILENT");
+    let early = rows_read(&bob_dir, &room, "SILENT")
+        .unwrap_or_else(|e| panic!("PRODUCT: bob, continued, cannot read his room: {e}"));
     assert_eq!(
         early, 0,
         "CANNOT MEASURE: bob already read {early}/{POSTS} of carol's rows before they could sync"
@@ -267,9 +358,23 @@ fn a_member_whose_connection_died_is_synced_again() {
         carol_frozen.elapsed()
     );
     let (mut bob_has, mut carol_has) = (0, 0);
+    // The apparatus: each poll's own duration, and when carol first answered a read.
+    let (mut slowest, mut carol_answered, mut last_err) = (Duration::ZERO, None, None);
     while back.elapsed() < BACK_WITHIN {
-        bob_has = rows_read(&bob_dir, &room, "SILENT");
-        carol_has = rows_read(&carol_dir, &room, "RETURNED");
+        let poll = Instant::now();
+        let b = rows_read(&bob_dir, &room, "SILENT");
+        let c = rows_read(&carol_dir, &room, "RETURNED");
+        slowest = slowest.max(poll.elapsed());
+        if c.is_ok() {
+            carol_answered.get_or_insert(back.elapsed());
+        }
+        match (b, c) {
+            (Ok(b), Ok(c)) => {
+                (bob_has, carol_has) = (b, c);
+                last_err = None;
+            }
+            (Err(e), _) | (_, Err(e)) => last_err = Some(e),
+        }
         if bob_has == POSTS && carol_has == POSTS {
             break;
         }
@@ -277,19 +382,29 @@ fn a_member_whose_connection_died_is_synced_again() {
     }
     let took = back.elapsed();
     let read = bob_has.min(carol_has);
+    let apparatus = slowest.max(carol_answered.unwrap_or(took));
     println!(
         "[proof] {took:.1?} after both were back: bob reads {bob_has}/{POSTS} of carol's rows, \
-         carol reads {carol_has}/{POSTS} of bob's"
+         carol reads {carol_has}/{POSTS} of bob's; apparatus: slowest poll {slowest:.1?}, carol \
+         first answered {carol_answered:.1?} after SIGCONT"
     );
     if read < POSTS {
         println!("---- bob said ----\n{}", bob.transcript());
         println!("---- carol said ----\n{}", carol.transcript());
         println!("---- the anchor said (until stopped) ----\n{anchor_said}");
     }
-    assert_eq!(
-        read, POSTS,
-        "members whose connection was dropped as dead were not synced with each other again within \
-         {BACK_WITHIN:?}: bob reads {bob_has}/{POSTS} of carol's rows, carol {carol_has}/{POSTS} of \
-         bob's"
-    );
+    if read < POSTS {
+        assert!(
+            apparatus <= APPARATUS_BUDGET,
+            "CANNOT MEASURE: apparatus took {apparatus:?} (slowest poll {slowest:?}, carol first \
+             answered {carol_answered:?} after SIGCONT, budget {APPARATUS_BUDGET:?}); bob reads \
+             {bob_has}/{POSTS}, carol {carol_has}/{POSTS} within {BACK_WITHIN:?}"
+        );
+        panic!(
+            "PRODUCT: took more than {took:?} (apparatus {apparatus:?}): members whose connection \
+             was dropped as dead were not synced with each other again within {BACK_WITHIN:?}: bob \
+             reads {bob_has}/{POSTS} of carol's rows, carol {carol_has}/{POSTS} of bob's{}",
+            last_err.map_or_else(String::new, |e| format!("; the last read: {e}"))
+        );
+    }
 }

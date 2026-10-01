@@ -120,9 +120,10 @@ impl Proc {
     ) -> Self {
         let mut child = command(dir, args, envs)
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn {name}: {e}"));
         let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(stdin.as_bytes()).expect("write stdin");
+        pipe.write_all(stdin.as_bytes())
+            .unwrap_or_else(|e| panic!("APPARATUS: write {name}'s stdin: {e}"));
         drop(pipe);
         let out = collect(child.stdout.take().expect("stdout"));
         let err = collect(child.stderr.take().expect("stderr"));
@@ -162,7 +163,11 @@ impl Proc {
     fn exit_within(&mut self, within: Duration) -> Option<(ExitStatus, Duration)> {
         let t0 = Instant::now();
         while t0.elapsed() < within {
-            if let Some(s) = self.child.try_wait().expect("wait") {
+            if let Some(s) = self
+                .child
+                .try_wait()
+                .unwrap_or_else(|e| panic!("APPARATUS: wait for {}: {e}", self.name))
+            {
                 return Some((s, t0.elapsed()));
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -217,10 +222,10 @@ fn must(what: &str, r: Option<(bool, String, Duration)>) -> (bool, String, Durat
 #[ignore = "three real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn a_cli_failure_tells_the_truth() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a profile directory");
         d
     };
     let (anchor_dir, host_dir, joiner_dir) = (dir("anchor"), dir("host"), dir("joiner"));
@@ -231,10 +236,13 @@ fn a_cli_failure_tells_the_truth() {
     // decides CANNOT MEASURE, never a claim, so it is sized for the debug build's tail.
     let join_within = Duration::from_secs(240);
     let bound = Duration::from_secs(30);
-    let mut claims = 0usize;
 
-    let service = TcpListener::bind("127.0.0.1:0").unwrap();
-    let service_port = service.local_addr().unwrap().port().to_string();
+    let service = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the test's service");
+    let service_port = service
+        .local_addr()
+        .expect("APPARATUS: the service's address")
+        .port()
+        .to_string();
 
     let anchor = Proc::spawn(
         "anchor",
@@ -313,7 +321,6 @@ fn a_cli_failure_tells_the_truth() {
         !said.contains("Failed("),
         "(1) an enum token reached the person:\n{said}"
     );
-    claims += 1;
 
     let (ok, said, took) = must(
         "vox room join",
@@ -352,7 +359,6 @@ fn a_cli_failure_tells_the_truth() {
         said.contains("not offered in this room") && !said.contains("Failed("),
         "(4) the failure must name its cause: {said}"
     );
-    claims += 1;
 
     // ---- (5) a node suspended mid-request: the request ends, and says so ----
     let late_dir = dir("late");
@@ -379,7 +385,11 @@ fn a_cli_failure_tells_the_truth() {
         &format!("{passphrase}\n"),
     );
     std::thread::sleep(Duration::from_secs(1));
-    if let Some(s) = join.child.try_wait().expect("wait") {
+    if let Some(s) = join
+        .child
+        .try_wait()
+        .unwrap_or_else(|e| panic!("APPARATUS: wait for the late join: {e}"))
+    {
         signal("CONT", host_pid);
         std::thread::sleep(Duration::from_millis(100));
         panic!(
@@ -440,7 +450,6 @@ fn a_cli_failure_tells_the_truth() {
          silence was not the suspension's: {said}"
     );
     drop(late);
-    claims += 1;
 
     // ---- the tail, attached and delivering before anything is done to its node ----
     let tail = Proc::spawn("tail", &joiner_dir, &["room", "tail", &room], "");
@@ -450,7 +459,15 @@ fn a_cli_failure_tells_the_truth() {
     let delivering = loop {
         n += 1;
         let text = format!("tail-probe-{n}");
-        let _ = vox(&joiner_dir, &["room", "post", &room, &text], "", quick);
+        let (ok, said, _) = must(
+            "vox room post",
+            vox(&joiner_dir, &["room", "post", &room, &text], "", quick),
+        );
+        assert!(
+            ok,
+            "CANNOT MEASURE (3): the tail's probe post {text} was refused, so the tail had \
+             nothing to deliver: {said}"
+        );
         std::thread::sleep(Duration::from_millis(500));
         if tail.stdout().iter().any(|l| l.contains("tail-probe-")) {
             break true;
@@ -508,7 +525,6 @@ fn a_cli_failure_tells_the_truth() {
         "CANNOT MEASURE (2): the resumed node did not answer `vox status` either, so the \
          silence was not the suspension's: {said}"
     );
-    claims += 1;
 
     // ---- (3) the node dies under the tail ----
     assert!(
@@ -535,10 +551,8 @@ fn a_cli_failure_tells_the_truth() {
         err.contains("the node stopped"),
         "(3) the tail must say its node stopped: {err}"
     );
-    claims += 1;
 
-    eprintln!("[proof] {claims} claims held");
-    assert_eq!(claims, 5);
+    eprintln!("[proof] all 5 claims held");
 }
 
 /// (6) A holder whose control socket cannot be bound runs on, and says why.
@@ -557,15 +571,25 @@ fn a_holder_runs_without_its_control_socket() {
     };
     let (host_dir, guest_dir) = (long("host"), long("guest"));
     let anchor_dir = tmp.path().join("anchor");
-    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(anchor_dir.join("cfg"))
+        .expect("APPARATUS: create the anchor's directory");
     let blocked_tmp = tmp.path().join("t");
-    std::fs::create_dir_all(&blocked_tmp).unwrap();
-    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    std::fs::create_dir_all(&blocked_tmp).expect("APPARATUS: create the blocked TMPDIR");
+    let uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: run `id -u`: {e}"))
+        .stdout;
+    let uid = String::from_utf8(uid).expect("APPARATUS: `id -u` printed UTF-8");
     let squat = blocked_tmp.join(format!("vox-{}", uid.trim()));
-    std::fs::write(&squat, "not a directory\n").unwrap();
+    std::fs::write(&squat, "not a directory\n").unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: write the squatting file {}: {e}",
+            squat.display()
+        )
+    });
     let tmpdir = format!("{}/", blocked_tmp.display());
     let env = [("TMPDIR", tmpdir.as_str())];
-    let mut held = 0usize;
 
     let anchor = Proc::spawn(
         "anchor",
@@ -584,8 +608,12 @@ fn a_holder_runs_without_its_control_socket() {
         let (ok, said, _) = must("vox id", vox_env(d, &["id"], "", quick, &env));
         assert!(ok, "CANNOT MEASURE: vox id: {said}");
     }
-    let service = TcpListener::bind("127.0.0.1:0").unwrap();
-    let service_port = service.local_addr().unwrap().port().to_string();
+    let service = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the test's service");
+    let service_port = service
+        .local_addr()
+        .expect("APPARATUS: the service's address")
+        .port()
+        .to_string();
     let mut host = Proc::spawn_env(
         "host",
         &host_dir,
@@ -633,7 +661,6 @@ fn a_holder_runs_without_its_control_socket() {
         warned(&err),
         "(6) `vox serve` must say the control socket is unavailable, where and why: {err}"
     );
-    held += 1;
 
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
@@ -678,7 +705,6 @@ fn a_holder_runs_without_its_control_socket() {
         warned(&said),
         "(6) `vox connect` must say the control socket is unavailable, where and why: {said}"
     );
-    held += 1;
 
     // What stood where the directory should be was never used.
     let left = std::fs::symlink_metadata(&squat).map(|m| m.file_type().is_file());
@@ -688,6 +714,5 @@ fn a_holder_runs_without_its_control_socket() {
         squat.display()
     );
     drop(service);
-    eprintln!("[proof] {held} holders ran without their control socket");
-    assert_eq!(held, 2);
+    eprintln!("[proof] both holders ran without their control socket");
 }

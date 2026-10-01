@@ -52,19 +52,28 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         .enable_all()
         .build()
         .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
 
     // The cursor tail starts from: the last row before the large ones.
     let before = bob.vox(None, &["room", "read", r, "--json"]);
-    assert!(before.ok, "{before:?}");
+    assert!(
+        before.ok,
+        "CANNOT MEASURE: bob's first `vox room read --json` failed ({:?}): {}",
+        before.code, before.stderr
+    );
     let start = before
         .ndjson()
         .last()
         .and_then(|x| x["entry_hash"].as_str().map(str::to_owned))
-        .expect("the room has rows before the large ones");
+        .unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE: the room has no row before the large ones to tail from: {}",
+                before.stdout
+            )
+        });
 
     let mut sent = Vec::new();
     for i in 0..ROWS {
@@ -73,12 +82,18 @@ fn a_room_past_one_frame_of_history_reads_whole() {
     sent.push(body(ROWS, MAX_TEXT));
     for b in &sent {
         let o = alice.vox_in(Some("a1"), &["room", "post", r, "-"], Some(b));
-        assert!(o.ok, "alice posts {} bytes: {:?}", b.len(), o.code);
+        assert!(
+            o.ok,
+            "PRODUCT: alice's `vox room post` of {} bytes was refused ({:?}): {}",
+            b.len(),
+            o.code,
+            o.stderr
+        );
     }
     let total: usize = sent.iter().map(String::len).sum();
     assert!(
         total >= 1024 * 1024,
-        "at least 1 MiB of history, not {total}"
+        "APPARATUS: the staged history is under 1 MiB ({total} bytes); the proof's sizes are wrong"
     );
 
     // 1. `read --json`, on the node the rows reached by sync.
@@ -95,10 +110,10 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         .filter_map(|x| x["envelope"]["body"].as_str().map(str::to_owned))
         .filter(|b| b.starts_with("LARGE-ROOM-"))
         .collect();
-    assert_eq!(got.len(), sent.len(), "read --json returns every large row");
-    assert_eq!(
-        got, sent,
-        "read --json returns every large row in full, in order"
+    assert!(
+        got == sent,
+        "PRODUCT: `vox room read --json` must return every large row in full, in order: {}",
+        mismatch(&got, &sent)
     );
     let max_row = read
         .ndjson()
@@ -109,14 +124,16 @@ fn a_room_past_one_frame_of_history_reads_whole() {
                 .is_some_and(|b| b.starts_with(&format!("LARGE-ROOM-{ROWS:03} ")))
         })
         .and_then(|x| x["text"].as_str().map(str::len))
-        .unwrap();
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `vox room read --json` gave the largest row no `text`")
+        });
     eprintln!(
         "[proof] {} rows, {total} bytes of body; the largest row's text is {max_row} bytes",
         sent.len()
     );
     assert_eq!(
         max_row, MAX_TEXT,
-        "the largest row carries exactly MAX_TEXT_LEN and still reads back"
+        "PRODUCT: the largest row must carry exactly MAX_TEXT_LEN and still read back"
     );
 
     // 2. `tail --since`, which pages the same history before it follows.
@@ -130,8 +147,8 @@ fn a_room_past_one_frame_of_history_reads_whole() {
     for v in HARNESS_SESSION_VARS {
         cmd.env_remove(v);
     }
-    let mut child = cmd.spawn().expect("spawn tail");
-    let stdout = child.stdout.take().unwrap();
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox room tail");
+    let stdout = child.stdout.take().expect("APPARATUS: the tail's stdout");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -150,7 +167,11 @@ fn a_room_past_one_frame_of_history_reads_whole() {
             }
             continue;
         };
-        let row: serde_json::Value = serde_json::from_str(&line).expect("NDJSON row");
+        let row: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: `vox room tail --json` printed a line that is not NDJSON ({e}): {line}"
+            )
+        });
         if let Some(b) = row["envelope"]["body"].as_str() {
             if b.starts_with("LARGE-ROOM-") {
                 tailed.push(b.to_owned());
@@ -159,24 +180,53 @@ fn a_room_past_one_frame_of_history_reads_whole() {
     }
     let exited = child.try_wait().ok().flatten();
     let _ = child.kill();
-    let out = child.wait_with_output().unwrap();
+    let out = child.wait_with_output().expect("APPARATUS: reap the tail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         exited.is_none(),
-        "tail must still be running, not exit ({exited:?}): {}",
-        String::from_utf8_lossy(&out.stderr)
+        "PRODUCT: `vox room tail` must still be running, not exit ({exited:?}), after {} of {} \
+         large rows: {stderr}",
+        tailed.len(),
+        sent.len()
     );
-    assert_eq!(
-        tailed, sent,
-        "tail --since returns every large row in full, in order"
+    assert!(
+        tailed == sent,
+        "PRODUCT: `vox room tail --since` must return every large row in full, in order, \
+         within 60 s (it was still running): {}; stderr: {stderr}",
+        mismatch(&tailed, &sent)
     );
 
     // 3. `board --json` folds the whole room.
     let board = bob.vox(None, &["room", "board", r, "--json"]);
-    assert!(board.ok, "board over a large room: {board:?}");
+    assert!(
+        board.ok,
+        "PRODUCT: `vox room board --json` over a large room failed ({:?}): {}",
+        board.code, board.stderr
+    );
     assert_eq!(
         board.json()["schema"],
         "vox.room.board/1",
-        "{}",
+        "PRODUCT: `vox room board --json` printed: {}",
         board.stdout
     );
+}
+
+/// How `got` differs from `sent`: both counts, and the first row that differs (by its label and
+/// length, not its megabytes).
+fn mismatch(got: &[String], sent: &[String]) -> String {
+    let label = |b: &String| {
+        let head: String = b.chars().take(16).collect();
+        format!("{head:?}… ({} bytes)", b.len())
+    };
+    let first = got.iter().zip(sent).position(|(g, s)| g != s).map_or_else(
+        || "none of the rows both hold differ".to_owned(),
+        |i| {
+            format!(
+                "row {i} is {} where {} was posted",
+                label(&got[i]),
+                label(&sent[i])
+            )
+        },
+    );
+    format!("{} of {} rows; {first}", got.len(), sent.len())
 }

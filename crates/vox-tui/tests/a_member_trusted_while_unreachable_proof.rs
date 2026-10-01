@@ -146,7 +146,7 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
     while !d.1.lock().unwrap().contains("control socket") {
         assert!(
             Instant::now() < deadline,
-            "a daemon never served its socket:\n{}",
+            "CANNOT MEASURE: a daemon never served its control socket within 90 s:\n{}",
             d.1.lock().unwrap()
         );
         std::thread::sleep(Duration::from_millis(50));
@@ -183,9 +183,9 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
         fps.push(out.trim().to_owned());
     }
     let _alice = daemon(alice_dir, "127.0.0.1:0", &anchor.v4_spec);
-    let _bob = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec);
+    let bob_d = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec);
     let carol_spec = Split::Families.guest_spec(&anchor).to_owned();
-    let _carol = daemon(carol_dir, Split::Families.guest_listen(), &carol_spec);
+    let carol_d = daemon(carol_dir, Split::Families.guest_listen(), &carol_spec);
 
     for (i, name) in [(1usize, "bob"), (2, "carol")] {
         let (ok, _, err) = vox(alice_dir, &["trust", "add", &fps[i], "--name", name], None);
@@ -220,12 +220,12 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
         assert!(ok, "CANNOT MEASURE: a join failed: {err}");
     }
     // Both hold the room and each other's admission before carol decides anything.
-    let (ok, _, _) = vox(
+    let (ok, _, err) = vox(
         carol_dir,
         &["room", "post", &room, "CAROL-BEFORE-TRUST"],
         None,
     );
-    assert!(ok);
+    assert!(ok, "CANNOT MEASURE: carol's first post was refused: {err}");
     assert!(
         until("bob holds carol's entry (unreadable yet)", 60, || {
             vox(bob_dir, &["room", "read", &room, "--json"], None)
@@ -318,24 +318,38 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
             }
         );
     }
-    let (ok, _, _) = vox(carol_dir, &["room", "post", &room, "CAROL-AFTER"], None);
-    assert!(ok);
+    let (ok, _, err) = vox(carol_dir, &["room", "post", &room, "CAROL-AFTER"], None);
+    assert!(
+        ok,
+        "PRODUCT: carol's post after the trust was refused: {err}"
+    );
     let later = until("bob reads CAROL-AFTER", 60, || {
         reads(bob_dir, &room, "CAROL-AFTER")
     });
     eprintln!(
         "[proof] bob reads the post made while unreachable = {read}; a post made after = {later}"
     );
+    let said = || {
+        format!(
+            "\n--- bob's daemon said:\n{}\n--- carol's daemon said:\n{}",
+            bob_d.1.lock().unwrap(),
+            carol_d.1.lock().unwrap()
+        )
+    };
     assert!(
         later,
-        "CANNOT MEASURE: bob never read carol at all, even a post made after he was reached"
+        "CANNOT MEASURE: bob never read carol at all, even a post made after he was reached{}",
+        said()
     );
     assert!(
         read,
-        "a member trusted while unreachable lost the post made between the trust and reaching it"
+        "PRODUCT: a member trusted while unreachable lost the post made between the trust and \
+         reaching it{}",
+        said()
     );
     assert!(
         !reads(bob_dir, &room, "CAROL-BEFORE-TRUST"),
-        "forward-only: bob must not read what carol posted before she trusted him"
+        "PRODUCT: forward-only: bob must not read what carol posted before she trusted him{}",
+        said()
     );
 }
