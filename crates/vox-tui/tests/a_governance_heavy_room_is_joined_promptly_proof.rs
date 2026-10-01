@@ -64,13 +64,22 @@ const MIN_ENTRIES: usize = 280;
 /// less its `solve` and `seal`. Measured with the fix: 0.70 s twice (joins of 4.48 s and 2.34 s,
 /// nearly all solve and seal). With the evaluator rebuilt per entry: 8.06 s and 7.42 s, and the
 /// read alone 13–29 s after the join returned in V210-71's verifier's runs of candidate 1.
-const JOIN_BOUND: Duration = Duration::from_secs(4);
+const JOIN_BOUND: Duration = Duration::from_secs(4 * DEBUG_SCALE);
 /// From the newcomer's `vox room join` returning to its read showing the host's post. Measured:
 /// 0.25 s with the fix, 8.3 s with the evaluator rebuilt per entry, on a history of 300.
-const READ_BOUND: Duration = Duration::from_secs(4);
+const READ_BOUND: Duration = Duration::from_secs(4 * DEBUG_SCALE);
 /// Any one of the newcomer's posts while it catches up. Measured: 68 ms with the fix, 8.3 s with
 /// the evaluator rebuilt per entry.
-const POST_BOUND: Duration = Duration::from_secs(2);
+const POST_BOUND: Duration = Duration::from_secs(2 * DEBUG_SCALE);
+/// **The unoptimized build's bounds are the release bounds times this.** It does the same work
+/// about eight times slower: the join's work measured 6.42 s in debug against 0.70–0.85 s in
+/// release, and a post 4.03 s against 68 ms. Unscaled, a debug run of the fixed build failed
+/// every bound; the release bounds above are the measured ones and are unchanged.
+const DEBUG_SCALE: u64 = if cfg!(debug_assertions) { 8 } else { 1 };
+/// Staging in the unoptimized build (six joins, then 300 trust changes, each unlocking the
+/// identity with production Argon2id) took 816 s, and the whole test 1017 s: past the default
+/// watchdog, which stopped it mid-staging as `CANNOT MEASURE`. It gets this budget instead.
+const DEBUG_WATCHDOG: Duration = Duration::from_secs(2400);
 /// The cap on any one verb, so a stopped node is reported rather than waited on.
 const VERB_CAP: Duration = Duration::from_secs(120);
 /// How long the read is polled for before the verdict, so a red says how slow it was.
@@ -185,7 +194,11 @@ fn trust(data: &Path, verb: &str, fp: &str, name: &str) -> bool {
 #[test]
 #[ignore = "real vox processes, production Argon2id and hundreds of trust changes; run in release"]
 fn a_room_with_hundreds_of_consents_is_joined_promptly() {
-    watchdog::arm();
+    if cfg!(debug_assertions) {
+        watchdog::arm_for(DEBUG_WATCHDOG);
+    } else {
+        watchdog::arm();
+    }
     let tmp = tempfile::tempdir().unwrap();
     let dir = |n: &str| {
         let d = tmp.path().join(n);
