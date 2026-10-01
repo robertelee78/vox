@@ -14,21 +14,18 @@
 //! 2. a separate `vox room list` **attaches to it** and sees the room — the seam
 //!    that makes several agent sessions share one node;
 //! 3. `vox room post` through the daemon reaches the log;
-//! 4. **SIGHUP does not stop it and does not lock it.** This is the property that
-//!    distinguishes a daemon from a detached TUI, and the reason a detached TUI was
-//!    not good enough: the signal a terminal sends when it goes away, and that
-//!    service managers send on reload, must not disarm the node;
-//! 5. a wrong passphrase **fails loudly** rather than starting an unusable daemon;
-//! 6. an empty passphrase says what to do about it.
+//! 4. a wrong passphrase **fails loudly** rather than starting an unusable daemon;
+//! 5. an empty passphrase says what to do about it.
+//!
+//! What a daemon does on SIGHUP is no longer here: it used to be "survives it", and it is now a
+//! clean stop like SIGINT, SIGTERM and SIGQUIT (V210-108), proved with every other long-running
+//! verb in `an_anchor_stops_on_ctrl_c_proof`.
 //!
 //! **Every participant is the shipped binary.** The profile is made as a person makes one:
 //! `vox id`, then a `vox daemon` holding it while `vox room create` (room passphrase on
 //! stdin) makes the room, then that daemon is stopped with SIGTERM and reaped. Nothing in
 //! this process runs a node.
 //!
-//! **Mutation.** Remove the daemon's SIGHUP takeover in `run_daemon` (so SIGHUP keeps its
-//! default disposition, which terminates) and this goes red at claim 4: the post after the
-//! signal is refused with "no node is running".
 
 #![cfg(unix)]
 
@@ -166,7 +163,7 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         "it must say what is wrong: {err:?}"
     );
 
-    // ---- (5) and (6): the passphrase is checked before anything is served ----
+    // ---- (4) and (5): the passphrase is checked before anything is served ----
     let out = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", &data)
@@ -252,37 +249,7 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         "the post did not reach the log: {read:?}"
     );
 
-    // ---- (4) SIGHUP must neither stop it nor lock it ----
-    //
-    // The TUI locks on SIGHUP because a terminal going away means the operator
-    // walked off. A daemon has no terminal to lose, and a service manager sends
-    // SIGHUP to ask for a reload — locking on it would make this unusable.
-    // `kill(1)` rather than a libc binding: it is what an operator and a service
-    // manager actually do, and it needs no new dependency.
-    let signalled = Command::new("kill")
-        .args(["-HUP", &pid.to_string()])
-        .status()
-        .expect("run kill");
-    assert!(signalled.success(), "could not signal the daemon");
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let (ok, _, err) = vox(
-        &data,
-        &cfg,
-        &["room", "post", &room, "still here after SIGHUP"],
-    );
-    assert!(
-        ok,
-        "SIGHUP must not stop or lock a daemon — a locked node refuses this: {err}"
-    );
-    let (_, read, _) = vox(&data, &cfg, &["room", "read", &room]);
-    assert!(
-        read.contains("still here after SIGHUP"),
-        "the daemon stopped serving after SIGHUP: {read:?}"
-    );
-
-    println!(
-        "[proof] daemon pid {pid}: attached, posted, read back, survived SIGHUP and posted again"
-    );
+    println!("[proof] daemon pid {pid}: attached, posted and read back");
     drop(daemon);
 }
 

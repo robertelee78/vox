@@ -25,6 +25,30 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+/// **Every red names which it is** (the decider's rule 1). A step of the proof's own staging that
+/// fails — a file, a process, the release server — is `CANNOT MEASURE (harness error)` at its line;
+/// a claim `install.sh` broke is `PRODUCT:` (see [`report`]). Nothing here unwraps bare.
+trait Staged<T> {
+    /// The value, or `CANNOT MEASURE (harness error)` naming this line and what failed.
+    fn staged(self) -> T;
+}
+
+impl<T, E: std::fmt::Debug> Staged<T> for Result<T, E> {
+    #[track_caller]
+    fn staged(self) -> T {
+        let at = std::panic::Location::caller();
+        self.unwrap_or_else(|e| panic!("CANNOT MEASURE (harness error) at {at}: {e:?}"))
+    }
+}
+
+impl<T> Staged<T> for Option<T> {
+    #[track_caller]
+    fn staged(self) -> T {
+        let at = std::panic::Location::caller();
+        self.unwrap_or_else(|| panic!("CANNOT MEASURE (harness error) at {at}: nothing there"))
+    }
+}
+
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// The synthetic version served as "the release" — clearly not a real one.
 const SERVED: &str = "9.9.9";
@@ -130,7 +154,7 @@ fn serve(root: &Path) -> Result<Server, String> {
     // Both pipes are drained for the server's whole life: its request log goes to stderr, and an
     // undrained pipe would stop it mid-proof once full.
     let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    let mut stderr = child.stderr.take().staged();
     let err_log = std::sync::Arc::clone(&said);
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -140,11 +164,11 @@ fn serve(root: &Path) -> Result<Server, String> {
             }
             err_log
                 .lock()
-                .unwrap()
+                .staged()
                 .push_str(&String::from_utf8_lossy(&buf[..n]));
         }
     });
-    let stdout = child.stdout.take().expect("piped stdout");
+    let stdout = child.stdout.take().staged();
     let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
     let out_log = std::sync::Arc::clone(&said);
     std::thread::spawn(move || {
@@ -157,7 +181,7 @@ fn serve(root: &Path) -> Result<Server, String> {
             {
                 let _ = port_tx.send(port);
             }
-            out_log.lock().unwrap().push_str(&format!("{line}\n"));
+            out_log.lock().staged().push_str(&format!("{line}\n"));
         }
     });
     let started = std::time::Instant::now();
@@ -172,7 +196,7 @@ fn serve(root: &Path) -> Result<Server, String> {
             return Err(format!(
                 "python3 exited ({status}) after {:.1}s without serving; it said: {:?}",
                 started.elapsed().as_secs_f64(),
-                said.lock().unwrap()
+                said.lock().staged()
             ));
         }
         if started.elapsed() > SERVER_START {
@@ -181,7 +205,7 @@ fn serve(root: &Path) -> Result<Server, String> {
             return Err(format!(
                 "python3 did not start serving within {}s; it said: {:?}",
                 SERVER_START.as_secs(),
-                said.lock().unwrap()
+                said.lock().staged()
             ));
         }
     }
@@ -191,10 +215,10 @@ fn serve(root: &Path) -> Result<Server, String> {
 /// `download/v<version>/vox-<triple>`. `mangle` gets the last word on the record's fields.
 fn release_tree(root: &Path, channel: &str, mangle: &dyn Fn(&mut BTreeMap<&str, String>)) {
     let triple = target_triple();
-    let bin = std::fs::read(VOX).unwrap();
+    let bin = std::fs::read(VOX).staged();
     let asset_dir = root.join("releases/download").join(format!("v{SERVED}"));
-    std::fs::create_dir_all(&asset_dir).unwrap();
-    std::fs::write(asset_dir.join(format!("vox-{triple}")), &bin).unwrap();
+    std::fs::create_dir_all(&asset_dir).staged();
+    std::fs::write(asset_dir.join(format!("vox-{triple}")), &bin).staged();
 
     let mut f: BTreeMap<&str, String> = BTreeMap::new();
     f.insert("kind", "vox.standalone-release".into());
@@ -220,12 +244,12 @@ fn release_tree(root: &Path, channel: &str, mangle: &dyn Fn(&mut BTreeMap<&str, 
         .collect::<Vec<_>>()
         .join(",");
     let rec_dir = root.join("releases/latest/download");
-    std::fs::create_dir_all(&rec_dir).unwrap();
+    std::fs::create_dir_all(&rec_dir).staged();
     std::fs::write(
         rec_dir.join(format!("{channel}-{triple}.json")),
         format!("{{{body}}}\n"),
     )
-    .unwrap();
+    .staged();
 }
 
 /// Run the real `install.sh` against `server`, installing into `home/bin`.
@@ -240,9 +264,9 @@ fn run_installer_env(
     channel: &str,
     extra: &[(&str, &str)],
 ) -> (bool, String) {
-    std::fs::create_dir_all(home).unwrap();
-    let mut f = std::fs::File::create(home.join(".zshrc")).unwrap();
-    f.write_all(b"export VOX_PROOF_USER_LINE=kept\n").unwrap();
+    std::fs::create_dir_all(home).staged();
+    let mut f = std::fs::File::create(home.join(".zshrc")).staged();
+    f.write_all(b"export VOX_PROOF_USER_LINE=kept\n").staged();
     let out = Command::new("sh")
         .arg(install_sh())
         .env_clear()
@@ -255,7 +279,7 @@ fn run_installer_env(
         .env("VOX_CHANNEL", channel)
         .envs(extra.iter().copied())
         .output()
-        .expect("sh ran install.sh");
+        .staged();
     (
         out.status.success(),
         format!(
@@ -278,7 +302,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         .filter(|s| !s.is_empty())
         .collect();
 
-    let tree = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().staged();
     release_tree(tree.path(), "stable", &|_| {});
     let server = match serve(tree.path()) {
         Ok(s) => s,
@@ -291,7 +315,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
 
     // ---- the happy path, observed the way a user observes it -------------------------
     {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().staged();
         let home = tmp.path();
         let (ok, text) = run_installer(&server, home, "stable");
         let version = Command::new(home.join("bin/vox"))
@@ -353,7 +377,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         ),
     ] {
         release_tree(tree.path(), channel, mangle);
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().staged();
         let home = tmp.path();
         let (ok, text) = run_installer(&server, home, channel);
         let installed = home.join("bin/vox").exists();
@@ -370,7 +394,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
     // output of the release workflow.
     if cfg!(target_os = "macos") {
         release_tree(tree.path(), "stable", &|_| {});
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().staged();
         let home = tmp.path();
         let (ok, text) =
             run_installer_env(&server, home, "stable", &[("VOX_PROOF_APPLE_VERIFY", "1")]);
@@ -387,11 +411,11 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
     // ---- a `vox` this installer did not install is never overwritten -----------------
     {
         release_tree(tree.path(), "stable", &|_| {});
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().staged();
         let home = tmp.path();
         let bin = home.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("vox"), b"#!/bin/sh\necho mine\n").unwrap();
+        std::fs::create_dir_all(&bin).staged();
+        std::fs::write(bin.join("vox"), b"#!/bin/sh\necho mine\n").staged();
         let (ok, text) = run_installer(&server, home, "stable");
         let still = std::fs::read_to_string(bin.join("vox")).unwrap_or_default();
         claims.push(claim(
@@ -403,7 +427,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
 
     // ---- a second run over its own install keeps the one it replaced -----------------
     {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().staged();
         let home = tmp.path();
         let (ok1, _) = run_installer(&server, home, "stable");
         let (ok2, text) = run_installer(&server, home, "stable");
@@ -416,6 +440,57 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
                 previous.is_file()
             ),
         ));
+    }
+
+    // ---- a run that was cut short does not stop the next one (V210-117) ---------------
+    // What an interrupted run leaves: a read-only `.vox-candidate.partial` (a `vox update` before
+    // v0.2.10, cut short, left it 0555) and a `.vox-previous` that cannot be written to. Running
+    // the installer again is what a person does next, and it stopped at "Permission denied".
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().staged();
+        let home = tmp.path();
+        let bin = home.join("bin");
+        let (first, said_first) = run_installer(&server, home, "stable");
+        if first {
+            for leftover in [".vox-candidate.partial", ".vox-previous"] {
+                std::fs::write(bin.join(leftover), b"cut short").staged();
+                std::fs::set_permissions(
+                    bin.join(leftover),
+                    std::fs::Permissions::from_mode(0o555),
+                )
+                .staged();
+            }
+            let (ok, text) = run_installer(&server, home, "stable");
+            let version = Command::new(bin.join("vox"))
+                .arg("--version")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .unwrap_or_default();
+            let previous = std::fs::read(bin.join(".vox-previous")).unwrap_or_default();
+            // The binary the re-run replaced, not the leftover it was planted over.
+            let replaced = previous.len() > 64 && previous != b"cut short";
+            let partials: Vec<String> = std::fs::read_dir(&bin)
+                .staged()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".partial"))
+                .collect();
+            claims.push(claim(
+                "install.reruns_after_a_cut_short_run",
+                ok && version.starts_with("vox ") && replaced && partials.is_empty(),
+                format!(
+                    "over a read-only partial and .vox-previous: exit_ok={ok}, the installed vox \
+                     reports {version:?}, .vox-previous is the replaced binary={replaced}, partials left \
+                     {partials:?}, said {text:?}"
+                ),
+            ));
+        } else {
+            claims.push(blocked(
+                "install.reruns_after_a_cut_short_run",
+                format!("staging not achieved: the first install failed, said {said_first:?}"),
+            ));
+        }
     }
 
     report(&claims, &receipts, &allowed);
@@ -441,7 +516,7 @@ fn report(claims: &[Claim], receipts: &BTreeMap<String, String>, allowed: &[Stri
         .collect();
     assert!(
         failed.is_empty(),
-        "{} claim(s) failed:\n{}",
+        "PRODUCT: {} claim(s) about what install.sh did failed:\n{}",
         failed.len(),
         failed
             .iter()
@@ -451,7 +526,7 @@ fn report(claims: &[Claim], receipts: &BTreeMap<String, String>, allowed: &[Stri
     );
     assert!(
         unproven.is_empty(),
-        "{} claim(s) unproven — close the gap, or name it in VOX_PROOF_ALLOW_UNPROVEN:\n{}",
+        "CANNOT MEASURE: {} claim(s) unproven — close the gap, or name it in VOX_PROOF_ALLOW_UNPROVEN:\n{}",
         unproven.len(),
         unproven
             .iter()
