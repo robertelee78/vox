@@ -10,7 +10,8 @@ ANSI cannot be grepped, because the TUI repaints only what changed. The status l
 an unknown command (`:zzz`) first, so "done" afterwards can only be the close's answer.
 
 Exit 0 = the TUI said "done" to `:close`; 2 = apparatus (pyte missing, no unlock, no room, no
-"done"); 1 = the driver hung (`HUNG at <stage>`, with its stack: `vox_pty.py`, V210-54). The
+"done"); 1 = a product red (`RED: vox tui exited before it asked to unlock`, with its screen) or
+the driver hung (`HUNG at <stage>`, with its stack: `vox_pty.py`, V210-54). The
 caller confirms the room is closed on its own, with `vox room list`. The TUI is killed by its PID,
 with bounded waits.
 """
@@ -41,6 +42,11 @@ try:
         return "\n".join(r.rstrip() for r in tui.display()[-3:])
 
     tui.pump(3)
+    if tui.closed:
+        # Gone before it asked for anything: the product stopped, and its screen says why.
+        print(f"{TAG} RED: vox tui exited before it asked to unlock:\n{tui.text()}")
+        code = 1
+        sys.exit(code)
     tui.key(IDPASS + "\r", 1)
     # Production Argon2id: the unlock takes seconds. Unlocked, the rooms list names the room.
     if not tui.until(lambda: "unlocked" in status(), 60):

@@ -1022,11 +1022,17 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         // **And say which side was unreachable (#192).** One sentence covered both, and it said
         // "every member the board knows is offline" when the board itself had never answered: a
         // claim about members, made with no word from the board about any of them.
+        //
+        // **And do not blame an anchor (V210-107).** The boards a join tries are the link's
+        // entries — the room's host itself among them — and any anchors; a link from a host with
+        // no anchor names only the host. This said "the anchor could not be reached" and sent the
+        // person to check `vox node`, which they may never have needed. The node names each
+        // address it tried, ahead of this advice.
         Some(Fault::BoardUnreachable) => {
-            "the anchor could not be reached, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the anchor is running (`vox node`) and that this node can reach its address"
+            "neither the room's host nor any anchor tried for it answered — or one answered and its connection closed before the room was fetched — so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the host is running and that this machine can reach its address (or its anchor's, if the room uses one)"
         }
         Some(Fault::Unreachable) => {
-            "the anchor answered, but no member it knows could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online, or check `vox node` on the anchor shows more than `1m` for this room"
+            "the room's board answered, but no member it names could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online"
         }
         Some(Fault::SolveTooSlow) => Fault::SolveTooSlow.explain(),
         Some(Fault::MembersBusy) => Fault::MembersBusy.explain(),

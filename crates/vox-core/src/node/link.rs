@@ -6,8 +6,11 @@
 //! ```
 //!
 //! It carries **only** what is needed to find the swarm: the channelID, one or more
-//! anchor nodes — each its identity fingerprint followed by the multiaddrs it is
-//! reached at — and optionally a pin of the responder's identity fingerprint.
+//! places to reach the room — the inviting host itself and any anchors it uses, each
+//! its identity fingerprint followed by the multiaddrs it is reached at (the `a=` key
+//! names each, host or anchor) — and optionally a pin of the responder's identity
+//! fingerprint. An anchor is needed only to bridge hosts that cannot otherwise reach
+//! each other (ADR-012); a link from a host with none names only the host.
 //!
 //! ## Anchors are named, not just addressed
 //! ADR-011 pins the expected identity on every dial; there is no "connect to whoever
@@ -334,8 +337,9 @@ pub struct InviteLink {
     /// The channelID (ADR-005: `SHA-256(genesis)`), which the joiner checks the
     /// fetched genesis against.
     pub channel_id: Digest32,
-    /// The anchors to bootstrap from (at least one), in preference order, each with
-    /// the identity the joiner pins when it dials.
+    /// Where to reach the room (at least one entry): the inviting host itself and any
+    /// anchors it uses, in preference order, each with the identity the joiner pins when
+    /// it dials. The field keeps its wire name, `a=`.
     pub anchors: Vec<BootstrapNode>,
     /// An optional pin of the responder's identity fingerprint. When present the
     /// joiner joins through that member specifically; otherwise through any member
@@ -344,16 +348,18 @@ pub struct InviteLink {
 }
 
 impl InviteLink {
-    /// Build a link. At least one anchor is required — a link with none names no
-    /// way to reach the swarm — and at most [`MAX_LINK_ANCHORS`]; a duplicate anchor
-    /// identity is refused.
+    /// Build a link. At least one entry is required — a link with none names nowhere
+    /// to reach the room — and at most [`MAX_LINK_ANCHORS`]; a duplicate identity is
+    /// refused.
     pub fn new(
         channel_id: Digest32,
         anchors: Vec<BootstrapNode>,
         responder: Option<Digest32>,
     ) -> Result<Self> {
         if anchors.is_empty() {
-            return Err(Error::MalformedLink("invite link has no anchors"));
+            return Err(Error::MalformedLink(
+                "invite link names nowhere to reach the room",
+            ));
         }
         if anchors.len() > MAX_LINK_ANCHORS {
             return Err(Error::MalformedLink("invite link anchor count"));
@@ -465,7 +471,9 @@ impl InviteLink {
         }
         close(current.take(), &mut anchors)?;
         if anchors.is_empty() {
-            return Err(Error::MalformedLink("invite link has no anchors"));
+            return Err(Error::MalformedLink(
+                "invite link names nowhere to reach the room",
+            ));
         }
         Ok(Self {
             channel_id,
