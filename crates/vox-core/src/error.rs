@@ -345,6 +345,21 @@ pub enum Error {
     #[error("bad anchor: {0}")]
     MalformedAnchor(&'static str),
 
+    /// The anchors file names no anchor that can be used — every line of it was skipped — and
+    /// no `--anchor` was given (V210-75). A verb that needs an anchor refuses to start rather
+    /// than run with none: with every line skipped, the node would reach nobody it cannot dial
+    /// directly, and say nothing about why.
+    #[error(
+        "the anchors file {path} names no usable anchor ({skipped} line(s) skipped, said above); \
+         fix it, or give --anchor"
+    )]
+    AnchorsFileUnusable {
+        /// The anchors file.
+        path: String,
+        /// How many of its lines were skipped.
+        skipped: usize,
+    },
+
     /// The responder refused a join (ADR-016 §"Join over the network"): the coarse
     /// reason it sent on the join stream. Deliberately not a fine-grained taxonomy —
     /// a wrong passphrase already fails locally on the joiner, so the responder has
@@ -459,5 +474,36 @@ pub enum IpcHandshake {
     NotYours {
         /// What was found instead.
         detail: String,
+    },
+    /// The node took the connection and then said nothing: it is suspended, or stuck. Waiting
+    /// on it was forever (V210-83), since a suspended process's socket still accepts.
+    #[error(
+        "the node took the connection but did not answer within {secs} s: it may be suspended \
+         (Ctrl-Z, SIGSTOP) or stuck. Resume it, or stop it and start it again"
+    )]
+    Silent {
+        /// How long it was given.
+        secs: u64,
+    },
+    /// A request was waiting, and a second connection then got no greeting: the node stopped
+    /// answering while it worked on this one (V210-83).
+    #[error(
+        "the node stopped answering while this request waited: a new connection got no greeting \
+         within {secs} s. It may be suspended (Ctrl-Z, SIGSTOP) or stuck. Resume it, or stop it \
+         and start it again"
+    )]
+    StoppedAnswering {
+        /// How long the new connection was given.
+        secs: u64,
+    },
+    /// A request was waiting, and the node still greets, but its actor answered no ping: nothing
+    /// sent to it will be answered (V210-83).
+    #[error(
+        "the node greets but has taken no command for {secs} s, so this request will not be \
+         answered: it is stuck. Stop it and start it again"
+    )]
+    Stuck {
+        /// How long the ping was given.
+        secs: u64,
     },
 }

@@ -154,6 +154,7 @@ fn detail_of(ch: &ChannelState) -> ChannelDetail {
             .map(|(tag, addr)| (tag.clone(), *addr))
             .collect(),
         equivocations: ch.equivocations(),
+        consented: ch.consented().into_iter().collect(),
     }
 }
 
@@ -354,6 +355,12 @@ fn renew_at(now: u64, mappings: &[crate::nat::portmap::PortMapping]) -> Option<u
         .map(|l| now + u64::from(l.max(2) / 2))
 }
 
+/// Whether a mapping is the IPv6 pinhole (`true`) rather than the IPv4 mapping: the two address
+/// families are renewed, retried and expired independently (V210-75).
+fn mapping_is_v6(m: &crate::nat::portmap::PortMapping) -> bool {
+    m.method == crate::nat::portmap::Method::PcpV6Pinhole
+}
+
 /// Where a node's endpoint binds.
 #[derive(Clone)]
 pub enum Bind {
@@ -499,12 +506,31 @@ impl NodeConfig {
 /// for up to 30 s (CI run 36418572653: a first relayed connection in 30065 ms, 55 attempts).
 const ANCHOR_REDIAL_SECS: u64 = 30;
 
+/// The most addresses one dial of an anchor tries (V210-75): four rooms' worth of the
+/// [`MAX_ENDPOINTS`](crate::nat::multiaddr::MAX_ENDPOINTS) one room may name for it. An anchor
+/// no configuration names but several rooms share is dialled at the union of their addresses,
+/// taken a room at a time (each room's first, then each one's second, …) so every room's
+/// best address is in the first dial. Launched at the staggered-start interval (250 ms) they
+/// all start inside one per-candidate timeout (10 s). A union larger than this is walked a
+/// window at a time: each failed dial moves on to the next, so no room's address is left out
+/// for good — capping it at one room's eight, as it was, left a second room's working address
+/// undialled whenever the first room already named eight dead ones.
+const ANCHOR_DIAL_CANDIDATES: usize = 4 * crate::nat::multiaddr::MAX_ENDPOINTS;
+
 /// An anchor connection lost within this long of being made counts as a **failure** for the
 /// backoff, not as a loss to redial at once (V210-57): two live processes of one identity (a
 /// copied profile, an old binary) supersede each other at the anchor, and redialling each loss at
 /// once would make that a loop at the tick's rate. Backed off, it settles to one try per
 /// [`ANCHOR_REDIAL_SECS`].
 const ANCHOR_FLAP_SECS: u64 = 10;
+
+/// The first wait before a port-mapping renewal that got nothing back is tried again (V210-75),
+/// doubling to [`MAPPING_RETRY_MAX_SECS`]. A gateway that is restarting, or a request lost on
+/// the way, must not end renewal for the life of the node.
+const MAPPING_RETRY_SECS: u64 = 15;
+
+/// The longest wait between retries of a failed port-mapping renewal.
+const MAPPING_RETRY_MAX_SECS: u64 = 600;
 
 /// What a sync session runs against: a member's channel, or an anchor's copy.
 enum SessionTarget {
@@ -675,12 +701,19 @@ enum NetEvent {
         /// The wakeup's identity; a stale one is ignored.
         timer: u64,
     },
-    /// A sender key written to `peer` was taken: any backoff on re-sending to it ends.
+    /// A sender key written to `peer` was taken: it is recorded as delivered (V210-88), and any
+    /// backoff on re-sending to it ends.
     SkdmTaken {
         /// The room.
         channel_id: Digest32,
         /// The member that took it.
         peer: Digest32,
+        /// The generation it took.
+        chain_id: u64,
+        /// Whether it was one of the keys of the history `peer` was owed.
+        history: bool,
+        /// The [`Node::delivery_epoch`] its watcher started in.
+        epoch: u64,
     },
     /// A sender key written to `peer` was not taken (see `pairwise_stream::refused`): it is owed
     /// again, and the tick re-sends it.
@@ -695,6 +728,10 @@ enum NetEvent {
         why: String,
         /// The serial of the session the key was sealed under (V210-78).
         session: Option<u64>,
+        /// Whether it was one of the keys of the history `peer` was owed.
+        history: bool,
+        /// The [`Node::delivery_epoch`] its watcher started in.
+        epoch: u64,
     },
     /// A publish round to a board ended (see `publish_channel_to_anchor`).
     PublishDone {
@@ -1741,6 +1778,9 @@ impl Joiner {
                     Ok(c) => {
                         if let Err(e) = announce(&c, &prejoin_wire).await {
                             last_fault = fault_of(&e);
+                            // Said, as a failed dial is: a join that failed here reported no
+                            // reason at all (V210-83).
+                            why.push(format!("{short}: announce: {e}"));
                             if !worth_another_responder(last_fault) {
                                 return Err(JoinerLost {
                                     fault: last_fault,
@@ -1802,9 +1842,12 @@ impl Joiner {
                 Err(e) => {
                     last_fault = fault_of(&e);
                     // Why this member did not take us, when this side knows: its patience ran out
-                    // on our grind (V210-87). The fault alone cannot carry the two numbers.
+                    // on our grind (V210-87), which the fault alone cannot carry the numbers of;
+                    // or anything else the exchange met, which was left unsaid (V210-83).
                     if last_fault == Fault::SolveTooSlow {
                         why.push(format!("{short}: {e}"));
+                    } else {
+                        why.push(format!("{short}: exchange: {e}"));
                     }
                     if !worth_another_responder(last_fault) {
                         return Err(JoinerLost {
@@ -2052,6 +2095,12 @@ pub struct Node {
     /// anchors of each open channel. The peer policy is rebuilt from channel
     /// membership whenever channels change, and these are carried into it.
     anchor_ids: std::collections::BTreeSet<Digest32>,
+    /// Each open room's own anchors, as the room recorded them when it was created, opened or
+    /// joined: redialled after a loss like the configured set (V210-75). A room joined from an
+    /// invite often has no anchor but the one its link named, and a node that dialled that
+    /// anchor once and never again lost its board and its relay the first time the anchor
+    /// restarted. Entries for rooms no longer open are ignored and dropped at the next redial.
+    room_anchors: BTreeMap<Digest32, BootstrapSet>,
     /// An override for the ADR-005 PoW parameters a join binds. `None` means the
     /// channel's own (production `(200,9)`); tests reduce them so the debug suite
     /// does not grind, exactly as they reduce the Argon2 profile.
@@ -2079,6 +2128,10 @@ pub struct Node {
     /// starting up dialled each anchor from both its start and its first tick, and the
     /// duplicate lost a tie-break against the first on every start.
     anchor_dials: Arc<std::sync::Mutex<BTreeSet<Digest32>>>,
+    /// Per shared, unconfigured anchor whose rooms name more than [`ANCHOR_DIAL_CANDIDATES`]
+    /// addresses: where the next dial's window starts in their union (V210-75). Moved on by
+    /// each failed dial, dropped when one connects.
+    anchor_window: BTreeMap<Digest32, usize>,
     /// When each anchor's current connection was made (unix seconds), so one lost soon after is
     /// told from one lost after a while ([`ANCHOR_FLAP_SECS`]).
     anchor_connected_at: BTreeMap<Digest32, u64>,
@@ -2092,6 +2145,15 @@ pub struct Node {
     /// long-running node by itself: it is re-requested at half its lifetime, the
     /// interval RFC 6887 §11.2.1 recommends.
     renew_mappings_at: Option<u64>,
+    /// Per address family (`true` for the IPv6 pinhole, `false` for the IPv4 mapping), when the
+    /// timed lease held for it runs out (unix seconds). Until then its mapped address is still
+    /// advertised, even while its renewal is failing (V210-75).
+    mapping_expires: BTreeMap<bool, u64>,
+    /// Per address family, the wait set after the last renewal that got nothing back for it:
+    /// doubles from [`MAPPING_RETRY_SECS`] to [`MAPPING_RETRY_MAX_SECS`], and is gone once that
+    /// family is granted again (V210-75). One family's lost renewal is retried on its own clock,
+    /// not at the other's half-lifetime.
+    mapping_retry: BTreeMap<bool, u64>,
     /// ADR-025's sync ports, one per `(room, peer)`: see `node::ports`.
     ports: BTreeMap<(Digest32, Digest32), crate::node::ports::Port>,
     /// Ports waiting for an outbound slot (ADR-025 D6).
@@ -2237,6 +2299,18 @@ pub struct Node {
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
     key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
+    /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
+    /// key cut off by a crash is owed again after the restart; see [`Node::watch_delivery`].
+    keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
+    /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
+    /// whether the batch fell short (a key refused, or not all of it written). The history is
+    /// recorded as delivered only once every key of a whole batch was taken (V210-88).
+    history_in_flight: BTreeMap<(Digest32, Digest32), (u32, bool)>,
+    /// Which delivery watchers are current (V210-88): bumped when the node locks, which forgets
+    /// what is in flight. A watcher started before carries the old value, and its answer arriving
+    /// after an unlock does not count towards what is in flight now: it could otherwise complete a
+    /// new history batch before that batch's own keys were taken.
+    delivery_epoch: u64,
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012), across restarts too: see `next_record_seq`.
     record_seq: BTreeMap<Digest32, u64>,
@@ -2395,6 +2469,7 @@ impl Node {
             net_tx,
             bind,
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
+            room_anchors: BTreeMap::new(),
             anchors,
             headless,
             anchor_logs,
@@ -2406,10 +2481,13 @@ impl Node {
             port_mappings: Vec::new(),
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+            anchor_window: BTreeMap::new(),
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeSet::new(),
             sync_dials: BTreeSet::new(),
             renew_mappings_at: None,
+            mapping_expires: BTreeMap::new(),
+            mapping_retry: BTreeMap::new(),
             ports: BTreeMap::new(),
             port_queue: crate::node::ports::Queue::default(),
             slots: Arc::new(std::sync::Mutex::new(crate::node::ports::Slots::default())),
@@ -2449,6 +2527,9 @@ impl Node {
             pending_consents: Vec::new(),
             fresh_details: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
+            keys_in_flight: BTreeMap::new(),
+            history_in_flight: BTreeMap::new(),
+            delivery_epoch: 0,
             record_seq: BTreeMap::new(),
             record_ts_floor: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -2514,6 +2595,12 @@ impl Node {
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
+                    // Proof the actor is taking commands (V210-83): it changes nothing, so nothing
+                    // is published or scheduled for it.
+                    if matches!(command, NodeCommand::Ping) {
+                        let _ = reply.send(Outcome::Done);
+                        continue;
+                    }
                     // **Answered off the actor.** Checking the identity passphrase is production
                     // Argon2id, and every `vox trust add/list/remove` asks for it. Inline, it held
                     // the actor for ~0.3 s per command, and nothing on the node — posts, reads,
@@ -2821,11 +2908,11 @@ impl Node {
                 if self.forwards.remove(&local).is_some() {
                     Outcome::Done
                 } else {
-                    Outcome::Failed(Fault::UnknownChannel)
+                    Outcome::Failed(Fault::NoSuchForward)
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
-            NodeCommand::Shutdown => Outcome::Done,
+            NodeCommand::Shutdown | NodeCommand::Ping => Outcome::Done,
         }
     }
 
@@ -3000,7 +3087,7 @@ impl Node {
         // an anchor that is down must not hold up the ones that are not.
         let configured: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
         for anchor in configured {
-            self.dial_anchor(&net, anchor.id, anchor.endpoints.clone());
+            self.dial_anchor(&net, anchor.id, anchor.endpoints.direct_candidates());
         }
         // No membership refresh here: the network only starts when the identity
         // unlocks, and `lock_all` cleared every channel, so there is nothing to
@@ -3010,7 +3097,7 @@ impl Node {
         let discover = Arc::clone(&net);
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
-            let mappings = discover.refresh_advertised().await;
+            let mappings = discover.refresh_advertised(&[]).await;
             let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
         });
         spawn_accept_loop(net, self.net_tx.clone());
@@ -3051,6 +3138,8 @@ impl Node {
             }
         }
         self.renew_mappings_at = None;
+        self.mapping_expires.clear();
+        self.mapping_retry.clear();
         // Every session stops with the network (ADR-025 D1a: the node shuts down).
         self.retire_all_ports();
     }
@@ -3511,6 +3600,65 @@ impl Node {
         Ok(())
     }
 
+    /// Every anchor this node keeps a connection to, with the addresses its next dial tries:
+    /// the configured set first, then each open room's own that is not configured (V210-75).
+    /// One identity appears once: at the addresses the configured set gives it if it is there,
+    /// and otherwise at the addresses **every** room that shares it names, a room at a time and
+    /// at most [`ANCHOR_DIAL_CANDIDATES`] per dial, so one room's stale addresses for it cannot
+    /// pin the redial to where it no longer is.
+    fn kept_anchors(&self) -> Vec<(Digest32, Vec<std::net::SocketAddr>)> {
+        let mut all: Vec<(Digest32, Vec<std::net::SocketAddr>)> = self
+            .anchors
+            .nodes()
+            .iter()
+            .map(|n| (n.id, n.endpoints.direct_candidates()))
+            .collect();
+        // Each unconfigured anchor's addresses, one list per room that names it.
+        let mut shared: Vec<(Digest32, Vec<Vec<std::net::SocketAddr>>)> = Vec::new();
+        for (room, set) in &self.room_anchors {
+            if !self.channels.contains_key(room) {
+                continue;
+            }
+            for n in set.nodes() {
+                if all.iter().any(|(id, _)| *id == n.id) {
+                    continue;
+                }
+                let addrs = n.endpoints.direct_candidates();
+                match shared.iter_mut().find(|(id, _)| *id == n.id) {
+                    Some((_, rooms)) => rooms.push(addrs),
+                    None => shared.push((n.id, vec![addrs])),
+                }
+            }
+        }
+        for (id, rooms) in shared {
+            let mut union: Vec<std::net::SocketAddr> = Vec::new();
+            let deepest = rooms.iter().map(Vec::len).max().unwrap_or(0);
+            for i in 0..deepest {
+                for a in rooms.iter().filter_map(|r| r.get(i)) {
+                    if !union.contains(a) {
+                        union.push(*a);
+                    }
+                }
+            }
+            if union.len() > ANCHOR_DIAL_CANDIDATES {
+                let from = self.anchor_window.get(&id).copied().unwrap_or(0) % union.len();
+                union.rotate_left(from);
+                union.truncate(ANCHOR_DIAL_CANDIDATES);
+            }
+            all.push((id, union));
+        }
+        all
+    }
+
+    /// Whether `peer` is one of [`Self::kept_anchors`].
+    fn is_kept_anchor(&self, peer: &Digest32) -> bool {
+        self.anchors.get(peer).is_some()
+            || self
+                .room_anchors
+                .iter()
+                .any(|(room, set)| self.channels.contains_key(room) && set.get(peer).is_some())
+    }
+
     /// Dial any configured or learned anchor this node is not connected to. Runs on
     /// the tick: an anchor that restarted, or a link that dropped, is re-established on the
     /// next tick, and only one that keeps failing is backed off (V210-57).
@@ -3519,10 +3667,12 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let known: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
+        let open = &self.channels;
+        self.room_anchors.retain(|room, _| open.contains_key(room));
+        let known = self.kept_anchors();
         let up: BTreeSet<Digest32> = known
             .iter()
-            .map(|a| a.id)
+            .map(|(id, _)| *id)
             .filter(|id| net.manager().holds(id))
             .collect();
         let lost: Vec<Digest32> = self.anchors_up.difference(&up).copied().collect();
@@ -3555,8 +3705,8 @@ impl Node {
             }
         }
         self.anchors_up = up;
-        for anchor in known {
-            if anchor.id == net.local_id() || self.anchors_up.contains(&anchor.id) {
+        for (id, candidates) in known {
+            if id == net.local_id() || self.anchors_up.contains(&id) {
                 continue;
             }
             // **On the next tick, not the next half-minute** (V210-57): an anchor is this node's
@@ -3564,16 +3714,16 @@ impl Node {
             // Only an anchor that keeps failing is backed off.
             if self
                 .anchor_backoff
-                .get(&anchor.id)
+                .get(&id)
                 .is_some_and(|(at, _)| now < *at)
             {
                 continue;
             }
             // Said only for a retry: a first dial, or one right after a loss (said above), is no news.
-            let waited = self.anchor_backoff.get(&anchor.id).map_or(0, |(_, w)| *w);
-            if self.dial_anchor(&net, anchor.id, anchor.endpoints.clone()) && waited > 0 {
+            let waited = self.anchor_backoff.get(&id).map_or(0, |(_, w)| *w);
+            if self.dial_anchor(&net, id, candidates) && waited > 0 {
                 net.manager().note(
-                    anchor.id,
+                    id,
                     format!("dialling this anchor again, {waited}s after it last failed"),
                 );
             }
@@ -3587,7 +3737,7 @@ impl Node {
         &mut self,
         net: &Arc<NodeNet>,
         id: Digest32,
-        endpoints: crate::nat::multiaddr::EndpointList,
+        candidates: Vec<std::net::SocketAddr>,
     ) -> bool {
         if id == net.local_id() || net.manager().existing(&id).is_some() {
             return false;
@@ -3606,7 +3756,7 @@ impl Node {
             Arc::clone(&self.anchor_dials),
         );
         tokio::spawn(async move {
-            let dialled = net.manager().connect(id, &endpoints).await;
+            let dialled = net.manager().connect_to(id, &candidates).await;
             dials
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3636,7 +3786,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let anchors = {
+        let (anchors, own) = {
             let mut channel = shared.lock().await;
             if let Some(profile) = self.profile.as_ref() {
                 let mut add = self.anchors.clone();
@@ -3645,8 +3795,17 @@ impl Node {
                 }
                 let _ = channel.add_anchors(profile.store(), &add);
             }
-            channel.anchors().clone()
+            // A link names the member who issued it too, last; a member is reached at the
+            // addresses its board record gives, not kept like an anchor at the link's.
+            let mut own = BootstrapSet::new();
+            for n in channel.anchors().nodes() {
+                if !channel.is_author(&n.id) {
+                    let _ = own.add(n.clone());
+                }
+            }
+            (channel.anchors().clone(), own)
         };
+        self.room_anchors.insert(*channel_id, own);
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
@@ -3655,7 +3814,7 @@ impl Node {
                 continue;
             }
             self.anchor_ids.insert(anchor.id);
-            self.dial_anchor(&net, anchor.id, anchor.endpoints.clone());
+            self.dial_anchor(&net, anchor.id, anchor.endpoints.direct_candidates());
         }
     }
 
@@ -4062,8 +4221,7 @@ impl Node {
             NetEvent::AddressesDiscovered { mappings } => {
                 // Re-publish every open channel's records: the addresses in them were
                 // composed before discovery and may name only loopback.
-                self.renew_mappings_at = renew_at(self.now(), &mappings);
-                self.port_mappings = mappings;
+                self.take_mappings(&mappings);
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
                     self.publish_channel_locally(&channel_id).await;
@@ -4072,8 +4230,13 @@ impl Node {
             }
             NetEvent::ReachFailed { peer, why } => {
                 // An anchor that failed to connect waits before its next dial, doubling to
-                // `ANCHOR_REDIAL_SECS` (V210-57).
-                if self.anchors.nodes().iter().any(|a| a.id == peer) {
+                // `ANCHOR_REDIAL_SECS` (V210-57), a room's own as well as a configured one
+                // (V210-75).
+                if self.is_kept_anchor(&peer) {
+                    // A union too large for one dial tries its next window next time (V210-75).
+                    if self.anchors.get(&peer).is_none() {
+                        *self.anchor_window.entry(peer).or_insert(0) += ANCHOR_DIAL_CANDIDATES;
+                    }
                     let wait = self
                         .anchor_backoff
                         .get(&peer)
@@ -4125,6 +4288,7 @@ impl Node {
                 // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_SECS`): one
                 // superseded at once is a flap, not a success.
                 self.anchor_connected_at.insert(peer, self.now());
+                self.anchor_window.remove(&peer);
                 // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
                 // whose forward said it dialled and then nothing).
                 if let Some(net) = self.net.as_ref() {
@@ -4154,7 +4318,16 @@ impl Node {
                 chain_id,
                 why,
                 session,
+                history,
+                epoch,
             } => {
+                // A watcher from before a lock: what it answered is no longer in flight.
+                if epoch == self.delivery_epoch {
+                    self.key_landed(channel_id, peer);
+                    if history {
+                        self.history_landed(channel_id, peer, false);
+                    }
+                }
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
@@ -4341,8 +4514,33 @@ impl Node {
                     }
                 }
             }
-            NetEvent::SkdmTaken { channel_id, peer } => {
+            NetEvent::SkdmTaken {
+                channel_id,
+                peer,
+                chain_id,
+                history,
+                epoch,
+            } => {
                 self.key_backoff.remove(&(channel_id, peer));
+                // The key was taken, and is recorded so whenever it answered. What is in flight,
+                // and so a whole history batch, is counted only by a watcher of this epoch.
+                let fresh = epoch == self.delivery_epoch;
+                if fresh {
+                    self.key_landed(channel_id, peer);
+                }
+                let whole_history = fresh && history && self.history_landed(channel_id, peer, true);
+                let (Some(profile), Some(shared)) = (
+                    self.profile.as_ref(),
+                    self.channels.get(&channel_id).map(Arc::clone),
+                ) else {
+                    return;
+                };
+                // A failed write leaves the key owed, and it is sent again: never the other way.
+                let mut channel = shared.lock().await;
+                let _ = channel.note_delivered(profile.store(), peer, chain_id);
+                if whole_history {
+                    let _ = channel.note_history_delivered(profile.store(), &peer);
+                }
             }
             NetEvent::RoomStored { channel_id } => {
                 // A worker persisted entries: the room's generation moved, and its ports are
@@ -5350,17 +5548,11 @@ impl Node {
                 .as_ref()
                 .and_then(|p| p.first().copied())
                 .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
-            if let Err(e) = channel.issue_consent(profile, target, &skdm, entitled_from, now) {
-                return Outcome::Failed(fault_of(&e));
-            }
-            // The generations before the live one that the decision covers (V210-45).
-            if entitled_from.0 < skdm.body.chain_id {
-                if let Err(e) = channel.owe_history(profile.store(), target, entitled_from.0) {
-                    return Outcome::Failed(fault_of(&e));
-                }
-                true
-            } else {
-                false
+            // The generations before the live one that the decision covers (V210-45) are owed
+            // in the grant's own transaction.
+            match channel.issue_consent(profile, target, &skdm, entitled_from, now) {
+                Ok((_, history_owed)) => history_owed,
+                Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
         // The grant is on the log now, and a reader renders nothing without it: pushed at once,
@@ -5369,8 +5561,9 @@ impl Node {
         // The generation delivered is the key's own: a key taken before a rotation is the older
         // one, and a refusal must re-owe exactly that (V210-30).
         let chain_id = skdm.body.chain_id;
-        // The consent is a fact once decided; whether the key landed is learnt off the actor.
-        self.watch_delivery(sent, *channel_id, target, chain_id);
+        // The consent is a fact once decided; whether the key landed is learnt off the actor, and
+        // it is recorded as delivered only then (V210-88).
+        self.watch_delivery(sent, *channel_id, target, chain_id, false);
         if history_owed {
             // At once rather than on the tick: the connection and session are live now.
             let _ = self.deliver_rekeys_for(channel_id, asked).await;
@@ -5825,7 +6018,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return 0;
         };
-        let (owed, generation, skdm, mut history) = {
+        let (owed, skdm, mut history) = {
             let channel = shared.lock().await;
             let owed = channel.owed_rekeys();
             let history_owed = channel.owed_history();
@@ -5851,7 +6044,7 @@ impl Node {
                     skdm.insert(*target, s);
                 }
             }
-            (owed, channel.sender_generation(), skdm, history)
+            (owed, skdm, history)
         };
         let mut delivered = 0u64;
         let now_secs = self.now();
@@ -5863,6 +6056,16 @@ impl Node {
                     .key_backoff
                     .get(&(*channel_id, target))
                     .is_some_and(|(_, until)| now_secs < *until)
+            {
+                continue;
+            }
+            // **A key still in flight is not sent again** (V210-88): nothing is recorded as
+            // delivered until the member takes it, so until it answers it stays owed here. A
+            // history batch waits for the one in flight; history itself is not held back by a
+            // single key, since a consent's own key is in flight when its history is sent.
+            let pair = (*channel_id, target);
+            if self.history_in_flight.contains_key(&pair)
+                || (!history.contains_key(&target) && self.keys_in_flight.contains_key(&pair))
             {
                 continue;
             }
@@ -5886,6 +6089,7 @@ impl Node {
             };
             let mut all_sent = true;
             let mut hello_left = hello.as_ref();
+            let mut watched = 0u32;
             for key in keys {
                 let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
                     all_sent = false;
@@ -5907,31 +6111,48 @@ impl Node {
                 if hello.is_some() {
                     self.hello_delivered(channel_id, target);
                 }
-                // Each key's own generation: a refusal re-owes exactly what was refused.
-                self.watch_delivery(sent, *channel_id, target, key.body.chain_id);
+                // Each key's own generation: a refusal re-owes exactly what was refused, and it is
+                // recorded as delivered only once taken (V210-88).
+                self.watch_delivery(sent, *channel_id, target, key.body.chain_id, owes_history);
+                watched += 1;
             }
-            if !all_sent {
-                continue;
+            if owes_history && watched > 0 {
+                // Answers are handled on this actor, after this returns: none is lost.
+                self.history_in_flight.insert(pair, (watched, !all_sent));
             }
-            // Recorded only after the bytes went out, so a failed delivery stays owed.
-            let noted = {
-                let Some(profile) = self.profile.as_ref() else {
-                    return delivered;
-                };
-                let mut channel = shared.lock().await;
-                let history_noted = if owes_history {
-                    channel.note_history_delivered(profile.store(), &target)
-                } else {
-                    Ok(())
-                };
-                history_noted
-                    .and_then(|()| channel.note_delivered(profile.store(), target, generation))
-            };
-            if noted.is_ok() {
+            if all_sent {
                 delivered += 1;
             }
         }
         delivered
+    }
+
+    /// A key watched by [`Self::watch_delivery`] was answered, taken or not: one fewer in flight.
+    fn key_landed(&mut self, channel_id: Digest32, peer: Digest32) {
+        let key = (channel_id, peer);
+        if let Some(n) = self.keys_in_flight.get_mut(&key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.keys_in_flight.remove(&key);
+            }
+        }
+    }
+
+    /// A key of the history batch in flight to `peer` was answered. Returns whether that was the
+    /// last one and every key of the whole batch was taken, so the history is delivered.
+    fn history_landed(&mut self, channel_id: Digest32, peer: Digest32, taken: bool) -> bool {
+        let key = (channel_id, peer);
+        let Some((left, short)) = self.history_in_flight.get_mut(&key) else {
+            return false;
+        };
+        *left = left.saturating_sub(1);
+        *short |= !taken;
+        if *left > 0 {
+            return false;
+        }
+        let whole = !*short;
+        self.history_in_flight.remove(&key);
+        whole
     }
 
     /// **A member this node has just learned of is passed on at once**, like a local append.
@@ -5989,6 +6210,71 @@ impl Node {
         self.note_local_append(channel_id);
     }
 
+    /// Take what a discovery or a renewal was granted, **per address family** (V210-75).
+    ///
+    /// A family granted again is held anew and renewed at half its lease. A family that was held,
+    /// or was already being retried, and got nothing back this time is retried after a backoff
+    /// of its own ([`MAPPING_RETRY_SECS`] doubling to [`MAPPING_RETRY_MAX_SECS`]), and its mapping
+    /// is kept, and still advertised, until its lease runs out: the gateway most likely still
+    /// holds it, and a lost reply is not a withdrawn mapping. The next try is never later than
+    /// that lease's end, so an expired mapping stops being advertised then. A permanent grant
+    /// (lifetime zero) is never re-requested; it is deleted when the network stops.
+    ///
+    /// Both families used to come back in one list, and only an empty list was retried: one
+    /// family's lost renewal was dropped, and asked again only at the other's half-lifetime,
+    /// about when it expired.
+    fn take_mappings(&mut self, fresh: &[crate::nat::portmap::PortMapping]) {
+        let now = self.now();
+        let mut held = Vec::new();
+        let mut due: Option<u64> = None;
+        let mut sooner = |at: u64| due = Some(due.map_or(at, |d| d.min(at)));
+        for v6 in [false, true] {
+            let granted = fresh.iter().find(|m| mapping_is_v6(m) == v6).copied();
+            let had = self
+                .port_mappings
+                .iter()
+                .find(|m| mapping_is_v6(m) == v6)
+                .copied();
+            if let Some(m) = granted {
+                held.push(m);
+                self.mapping_retry.remove(&v6);
+                if m.lifetime_secs > 0 {
+                    self.mapping_expires
+                        .insert(v6, now + u64::from(m.lifetime_secs));
+                    if let Some(at) = renew_at(now, &[m]) {
+                        sooner(at);
+                    }
+                } else {
+                    self.mapping_expires.remove(&v6);
+                }
+                continue;
+            }
+            if let Some(m) = had.filter(|m| m.lifetime_secs == 0) {
+                held.push(m);
+                continue;
+            }
+            if had.is_none() && !self.mapping_retry.contains_key(&v6) {
+                continue; // never granted: no gateway for this family, nothing to keep alive
+            }
+            let wait = (self.mapping_retry.get(&v6).copied().unwrap_or(0) * 2)
+                .clamp(MAPPING_RETRY_SECS, MAPPING_RETRY_MAX_SECS);
+            self.mapping_retry.insert(v6, wait);
+            let mut at = now + wait;
+            match (had, self.mapping_expires.get(&v6).copied()) {
+                (Some(m), Some(expires)) if now < expires => {
+                    held.push(m);
+                    at = at.min(expires);
+                }
+                _ => {
+                    self.mapping_expires.remove(&v6);
+                }
+            }
+            sooner(at);
+        }
+        self.port_mappings = held;
+        self.renew_mappings_at = due;
+    }
+
     /// Re-run the ladder's publish side when the granted mappings are halfway through
     /// their lifetime, so a node that outlives a two-hour mapping stays dialable.
     ///
@@ -6010,9 +6296,24 @@ impl Node {
         };
         // Cleared now, not when the refresh returns: one renewal in flight at a time.
         self.renew_mappings_at = None;
+        // The mappings whose lease has not run out, so a family whose renewal fails this time
+        // is still advertised at its mapped address until the lease ends (V210-75).
+        let now = self.now();
+        let leased: Vec<crate::nat::portmap::PortMapping> = self
+            .port_mappings
+            .iter()
+            .filter(|m| {
+                m.lifetime_secs == 0
+                    || self
+                        .mapping_expires
+                        .get(&mapping_is_v6(m))
+                        .is_some_and(|at| now < *at)
+            })
+            .copied()
+            .collect();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
-            let mappings = net.refresh_advertised().await;
+            let mappings = net.refresh_advertised(&leased).await;
             let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
         });
     }
@@ -7309,14 +7610,22 @@ impl Node {
 
     /// Learn, off the actor, whether the key just written to `target` was taken; if it was not,
     /// `NetEvent::SkdmRefused` makes it owed again. See `pairwise_stream::refused`.
+    ///
+    /// **Taken is when it is delivered** (V210-88): `NetEvent::SkdmTaken` records generation
+    /// `chain_id` as `target`'s, and a `history` key counts towards the batch it belongs to, whose
+    /// history is recorded once all of it was taken. Until then the key is only in flight, which
+    /// is kept in memory, so a crash leaves it owed and the restarted node sends it again.
     fn watch_delivery(
-        &self,
+        &mut self,
         sent: quinn::RecvStream,
         channel_id: Digest32,
         target: Digest32,
         chain_id: u64,
+        history: bool,
     ) {
+        *self.keys_in_flight.entry((channel_id, target)).or_default() += 1;
         let session = self.session_serial.get(&(channel_id, target)).copied();
+        let epoch = self.delivery_epoch;
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let event =
@@ -7327,10 +7636,15 @@ impl Node {
                         chain_id,
                         why,
                         session,
+                        history,
+                        epoch,
                     },
                     None => NetEvent::SkdmTaken {
                         channel_id,
                         peer: target,
+                        chain_id,
+                        history,
+                        epoch,
                     },
                 };
             let _ = tx.send(event).await;
@@ -7414,7 +7728,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        if self.anchors.nodes().iter().any(|a| a.id == peer) {
+        if self.is_kept_anchor(&peer) {
             return;
         }
         if net.manager().existing(&peer).is_some() || !self.sync_dials.insert(peer) {
@@ -7736,6 +8050,11 @@ impl Node {
         // held for the join goes with the network.
         self.joining.clear();
         self.held_pairwise.clear();
+        // Keys still in flight stay owed, and are sent again after the next unlock (V210-88).
+        self.keys_in_flight.clear();
+        // And the watchers still running answer for what is no longer in flight.
+        self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
+        self.history_in_flight.clear();
         // The unlock they wait on did happen; what it reopened is locked again with the rest.
         for reply in std::mem::take(&mut self.unlock_waiters) {
             let _ = reply.send(Outcome::Done);
@@ -8237,7 +8556,7 @@ impl Node {
                 self.refresh_reachers().await;
                 Outcome::Done
             }
-            Ok(false) => Outcome::Failed(Fault::UnknownChannel),
+            Ok(false) => Outcome::Failed(Fault::NotOffered),
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
     }
@@ -8641,6 +8960,7 @@ impl Node {
             trusted: self.trust_rows(),
             relayed_peers: Vec::new(),
             connected: 0,
+            connected_peers: Vec::new(),
             relaying: 0,
         });
     }
@@ -8768,6 +9088,7 @@ impl Node {
             });
         }
         let (relayed_peers, relaying) = self.path_view();
+        let connected_peers = self.connected_peers();
         let view = NodeView {
             identity,
             locked,
@@ -8790,10 +9111,8 @@ impl Node {
             trusted: self.trust_rows(),
             relayed_peers,
             relaying,
-            connected: self
-                .net
-                .as_ref()
-                .map_or(0, |net| net.manager().peers().len()),
+            connected: connected_peers.len(),
+            connected_peers,
         };
         (view, read)
     }
@@ -8802,14 +9121,22 @@ impl Node {
     /// the connection manager holds.
     fn paths_moved(&self) -> bool {
         let (relayed_peers, relaying) = self.path_view();
-        let connected = self
-            .net
-            .as_ref()
-            .map_or(0, |net| net.manager().peers().len());
+        let connected_peers = self.connected_peers();
         let shown = self.view_tx.borrow();
         shown.relayed_peers != relayed_peers
             || shown.relaying != relaying
-            || shown.connected != connected
+            || shown.connected_peers != connected_peers
+    }
+
+    /// The peers the connection manager holds a connection to, in fingerprint order.
+    fn connected_peers(&self) -> Vec<Digest32> {
+        let mut peers = self
+            .net
+            .as_ref()
+            .map_or_else(Vec::new, |net| net.manager().peers());
+        peers.sort_unstable();
+        peers.dedup();
+        peers
     }
 
     /// Which peers are reached through a relay, and how many circuits this node carries for

@@ -138,16 +138,16 @@ pub struct ChannelView {
     pub reachability: Reachability,
 }
 
-/// Overall sync status surfaced in the status bar.
+/// Overall sync status surfaced in the status bar: what the node can say, which is how many
+/// peers it holds a connection to (V210-82). It keeps no gauge of sessions in flight or of being
+/// caught up, so the bar claims neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SyncStatus {
     /// Not connected to any peer/node.
     #[default]
     Idle,
-    /// Actively reconciling logs with a peer.
-    Syncing,
-    /// Up to date with all reachable peers.
-    Synced,
+    /// Connected to this many peers (at least one), with which rooms sync.
+    Connected(usize),
 }
 
 /// The latest-wins UI state (core→UI over a `watch`). Cloneable and free of
