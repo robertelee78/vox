@@ -524,6 +524,7 @@ pub fn run_node(
     paths: Paths,
     listen: std::net::SocketAddr,
     anchors: vox_core::nat::bootstrap::BootstrapSet,
+    serve_only: Option<std::collections::BTreeSet<vox_core::hash::Digest32>>,
 ) -> Result<(), AppError> {
     use vox_core::identity::composite::RootSigner;
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -537,6 +538,17 @@ pub fn run_node(
         .anchors(anchors)
         .headless(signer)
         .anchor_logs(true);
+    let cfg = match serve_only {
+        Some(creators) => {
+            println!(
+                "vox node: serving only rooms made by the {} identit{} this profile trusts",
+                creators.len(),
+                if creators.len() == 1 { "y" } else { "ies" }
+            );
+            cfg.serve_only(creators)
+        }
+        None => cfg,
+    };
     // Kept for the anchors file the loop below writes (M17.4); the node takes its own clone.
     let anchors_paths = paths.clone();
     let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
