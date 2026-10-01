@@ -143,9 +143,15 @@ pub const MAX_SOURCES_PER_ROOM: usize = 16;
 /// is usually given, because a host is commonly given far more than one /64: grouping less would
 /// let one machine appear as thousands of sources. Subscribers who share a /48 only share a count.
 ///
-/// A room is credited to the source that first published its genesis, and to every source that
-/// published a member address or bundle record for it — records only its members can sign, so a
-/// stranger cannot get itself credited with a room it is not in. A full board evicts from the
+/// A room is credited to a source only by a record **the peer that brought it wrote**, and only
+/// when the board **stored** it: its genesis, put by its creator when the board did not hold it
+/// yet, and a member address or bundle record, put by that member, that the board did not already
+/// hold ([`Taken::stored`]). A room's genesis and its members' records are served to anyone who
+/// asks, so anyone can bring them to a board: credited to whoever brought them, a stranger put a
+/// real room's records back from its own network and had the room evicted with its own rooms
+/// (V210-70, c4), and could do the same to a board that did not hold them yet, after a restart or
+/// on an anchor the room had not used. Only a room's members can write its records, so a stranger
+/// cannot get itself credited with a room it is not in. A full board evicts from the
 /// source credited with the most rooms, so a stranger filling it from one network, or from a few,
 /// only ever displaces its own rooms, and a real room — live or long offline — is displaced only
 /// once no source holds more. A peer reached through a relay is known by identity, which is not
@@ -175,6 +181,40 @@ impl Source {
                 }
             },
         }
+    }
+}
+
+/// **What a board did with a member address or bundle record it admitted** (see
+/// [`RendezvousStore::accept_member`]).
+///
+/// Admission alone does not say whether anything was stored: a board takes a record it already
+/// holds as a no-op rather than refuse it (see `same_member_claim`), and a room's records are
+/// served to anyone who asks. So "admitted" cannot be what credits a room to the source a record
+/// came from ([`Source`], V210-70) — a stranger could fetch a real room's records and put them back
+/// from its own network — and neither can "news" alone, which a member's routine refresh is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    /// The board already held this claim and the record arrived inside the refresh floor: a
+    /// re-send. Nothing was stored.
+    Held,
+    /// The same claim, re-signed past the refresh floor: stored, renewing the held record's
+    /// timestamp and expiry. Not news.
+    Renewed,
+    /// An author the board held nothing for, or a changed claim: stored, and news.
+    Learned,
+}
+
+impl Taken {
+    /// Whether the board **stored** the record: anything but a re-send of one it holds.
+    #[must_use]
+    pub fn stored(self) -> bool {
+        !matches!(self, Self::Held)
+    }
+
+    /// Whether the board **learned something** from it: a new author or a changed claim.
+    #[must_use]
+    pub fn learned(self) -> bool {
+        matches!(self, Self::Learned)
     }
 }
 
@@ -336,18 +376,19 @@ impl RendezvousStore {
     ///   future-dated, over-long TTL, bucket full);
     /// - [`Error::MalformedRendezvous`] if the resolved key does not match the
     ///   record's signature/author binding;
-    /// - `Ok(learned)` on admission (the record becomes the current one for its author), where
-    ///   `learned` says whether the board **learned something**: an author it held nothing for,
-    ///   or a claim that differs from the one it held. A member's routine refresh of the claim
-    ///   the board already holds is `false`, and that is what keeps a republish from looking like
-    ///   news: every node told of news republishes, so a refresh counted as news made two members'
-    ///   boards wake each other about a hundred times a second (#179).
+    /// - `Ok(taken)` on admission, where [`Taken`] says what the board did with it: nothing, for
+    ///   a record it already holds ([`Taken::Held`]); renewed the held record, for a member's
+    ///   routine refresh of the same claim ([`Taken::Renewed`]); or **learned something**, an
+    ///   author it held nothing for or a changed claim ([`Taken::Learned`]). Only the last is
+    ///   news, and that is what keeps a republish from looking like news: every node told of news
+    ///   republishes, so a refresh counted as news made two members' boards wake each other about
+    ///   a hundred times a second (#179).
     pub fn accept_member(
         &mut self,
         record: RendezvousRecord,
         resolve_member: impl FnOnce(&Digest32) -> Option<CompositePublicKey>,
         now: u64,
-    ) -> Result<bool> {
+    ) -> Result<Taken> {
         // 1. Member-only: resolve the author's authenticated membership key. No key
         //    for this author_id ⇒ not a channel member ⇒ rejected.
         let author_pubkey = resolve_member(&record.author_id)
@@ -368,13 +409,17 @@ impl RendezvousStore {
         let bucket = self.members.entry(bucket_key).or_default();
 
         // 4. Freshness vs the current record for this author (if any).
-        let learned = if let Some(cur) = bucket.get(&record.author_id) {
+        let taken = if let Some(cur) = bucket.get(&record.author_id) {
             let same = same_member_claim(cur, &record);
             if same && within_refresh_floor(record.timestamp, cur.timestamp) {
-                return Ok(false); // already held: see `check_replacement`
+                return Ok(Taken::Held); // already held: see `check_replacement`
             }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
-            !same
+            if same {
+                Taken::Renewed
+            } else {
+                Taken::Learned
+            }
         } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
                 // New author would exceed the bucket cap: only admit if pruning expired
@@ -384,12 +429,12 @@ impl RendezvousStore {
                     return Err(Error::RendezvousRejected("member bucket at capacity"));
                 }
             }
-            true
+            Taken::Learned
         };
 
         // 5. Admit: replace the author's current record (one current per author).
         bucket.insert(record.author_id, record);
-        Ok(learned)
+        Ok(taken)
     }
 
     /// Admit (or refresh) a **member bundle** record (ADR-016 M14), enforcing the
@@ -405,13 +450,13 @@ impl RendezvousStore {
     /// root (checked by [`MemberBundleRecord::verify`]), so a member cannot
     /// publish another identity's prekeys under its own name.
     ///
-    /// Returns `Ok(learned)` as [`RendezvousStore::accept_member`] does.
+    /// Returns `Ok(taken)` as [`RendezvousStore::accept_member`] does.
     pub fn accept_bundle(
         &mut self,
         record: MemberBundleRecord,
         resolve_member: impl FnOnce(&Digest32) -> Option<CompositePublicKey>,
         now: u64,
-    ) -> Result<bool> {
+    ) -> Result<Taken> {
         // 1. Member-only.
         let author_pubkey = resolve_member(&record.author_id)
             .ok_or(Error::RendezvousRejected("author is not a channel member"))?;
@@ -432,13 +477,17 @@ impl RendezvousStore {
         let bucket = self.bundles.entry(bucket_key).or_default();
 
         // 4. Freshness vs the current bundle for this author (if any).
-        let learned = if let Some(cur) = bucket.get(&record.author_id) {
+        let taken = if let Some(cur) = bucket.get(&record.author_id) {
             let same = same_bundle_claim(cur, &record);
             if same && within_refresh_floor(record.timestamp, cur.timestamp) {
-                return Ok(false); // already held: see `check_replacement`
+                return Ok(Taken::Held); // already held: see `check_replacement`
             }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
-            !same
+            if same {
+                Taken::Renewed
+            } else {
+                Taken::Learned
+            }
         } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
                 bucket.retain(|_, r| now < bundle_expiry(r));
@@ -446,12 +495,12 @@ impl RendezvousStore {
                     return Err(Error::RendezvousRejected("bundle bucket at capacity"));
                 }
             }
-            true
+            Taken::Learned
         };
 
         // 5. Admit: one current bundle per author.
         bucket.insert(record.author_id, record);
-        Ok(learned)
+        Ok(taken)
     }
 
     /// Admit a channel's **genesis** (ADR-007 §Genesis; M14.7b).

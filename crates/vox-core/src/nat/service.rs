@@ -47,7 +47,9 @@ use crate::log::sync::wire_error_for;
 use crate::nat::record::{
     MemberBundleRecord, PreJoinRecord, RendezvousRecord, MAX_PREKEY_BUNDLE_BYTES,
 };
-use crate::nat::store::{RendezvousStore, Source, MAX_AUTHORS_PER_BUCKET, MAX_PREJOIN_PER_CHANNEL};
+use crate::nat::store::{
+    RendezvousStore, Source, Taken, MAX_AUTHORS_PER_BUCKET, MAX_PREJOIN_PER_CHANNEL,
+};
 use crate::time::Clock;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::{close_code, VoxConnection};
@@ -386,6 +388,18 @@ pub struct RendezvousService {
     rooms: AnchorRooms,
 }
 
+/// Whether a member address or bundle record by `author`, admitted as `taken`, credits its room
+/// to the source it came from ([`Source`]): only when the peer that brought it **wrote** it, and
+/// only when the board **stored** it. A room's records are served to anyone who asks, and members
+/// pass one another's on, so bringing a record proves nothing about who brought it: credited to
+/// whoever brought it, a stranger fetched a real room's records, put them back from its own
+/// network, and the room was evicted with the stranger's own rooms (V210-70). A re-send of a record
+/// the board already holds stores nothing and credits nobody, whoever sends it; a member's refresh
+/// renews its record and credits its own network.
+fn credits(publisher: Option<&Digest32>, author: &Digest32, taken: Taken) -> bool {
+    taken.stored() && publisher == Some(author)
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -620,11 +634,14 @@ impl RendezvousService {
                 let mut store = lock(&self.store);
                 let key = self.known_key(&store, &cid, epoch, &author, now);
                 let res = store.accept_member(rec, |_| key.clone(), now);
-                if res.is_ok() {
+                if res
+                    .as_ref()
+                    .is_ok_and(|&taken| credits(publisher, &author, taken))
+                {
                     store.note_source(&cid, source);
                 }
-                res.map(|learned| {
-                    if learned && publisher.is_some() {
+                res.map(|taken| {
+                    if taken.learned() && publisher.is_some() {
                         grew = Some(cid);
                     }
                 })
@@ -638,11 +655,14 @@ impl RendezvousService {
                     .known_key(&store, &cid, epoch, &author, now)
                     .or_else(|| self.witnessed_key(&store, &rec, now));
                 let res = store.accept_bundle(rec, |_| key.clone(), now);
-                if res.is_ok() {
+                if res
+                    .as_ref()
+                    .is_ok_and(|&taken| credits(publisher, &author, taken))
+                {
                     store.note_source(&cid, source);
                 }
-                res.map(|learned| {
-                    if learned && publisher.is_some() {
+                res.map(|taken| {
+                    if taken.learned() && publisher.is_some() {
                         grew = Some(cid);
                     }
                 })
@@ -673,6 +693,9 @@ impl RendezvousService {
                 {
                     return Err(RejectReason::Policy);
                 }
+                // Credited only to its creator: anyone can bring a room's genesis (see `credits`).
+                let creator = genesis.body.creator_pubkey.fingerprint();
+                let source = source.filter(|_| publisher == Some(&creator));
                 store.accept_genesis(genesis, local, now, source)
             }
             _ => return Err(RejectReason::UnknownKind),
