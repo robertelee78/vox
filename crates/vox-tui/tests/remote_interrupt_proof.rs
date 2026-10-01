@@ -35,13 +35,18 @@
 //!    `UserPromptSubmit` hook for a message written to its messaging socket, with that message
 //!    as the hook's `prompt` (measured against a live Claude Code 2.1.287). So bob's hook runs
 //!    again with the wake it received as `prompt`, exactly as his harness would, and its room
-//!    read must carry the two messages that woke nothing, and not the one the wake delivered.
+//!    read must carry the two messages that woke nothing, and not the one the wake delivered;
+//! 6. urgent and addressed to **nobody**, posted the way a person does it (`vox room post
+//!    --urgent` with no `--to`) — nothing: an urgent broadcast interrupts nobody, or one agent
+//!    could stop the whole room (ADR-020 §6, the wall-of-noise failure).
 //!
 //! **Mutation.** Put the pre-F15 loop back — the daemon judges only `NewEntry`, treating
 //! `Synced`/`SenderKeyReceived` and its two-second sweep as nothing to do — and this goes red
 //! at (1): the urgent message reaches bob's node and his session is never woken. Drop the
 //! drain's reading of its own prompt (`woken_by_prompt`) and it goes red at (5), the woken
-//! message in the room read too.
+//! message in the room read too. Let an urgent broadcast interrupt every session in the room
+//! (drop the `to` check from `may_wake`, `judge` and `Envelope::may_interrupt`) and it goes red
+//! at (6): bob's session is woken by a message addressed to nobody.
 
 #![cfg(unix)]
 
@@ -211,19 +216,38 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         &room,
         r#"{"v":1,"type":"ask","to":["bob"],"body":"bob: NOT-URGENT"}"#,
     );
+    // ---- (6) urgent, addressed to nobody: nothing. Posted with the CLI's own flags, as a
+    // person marks a message urgent ----
+    let o = alice.vox_in(
+        Some("session-alice"),
+        &["room", "post", &room, "--urgent", "--type", "blocked", "-"],
+        Some("everything is on fire: URGENT-BROADCAST"),
+    );
+    assert!(
+        o.ok,
+        "PRODUCT: `vox room post --urgent` with no `--to` must post a broadcast; got {o:?}"
+    );
     // ---- (1) addressed to bob and urgent: woken ----
     post(
         alice,
         &room,
         r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WAKE-UP-FROM-ALICE"}"#,
     );
-    until(
-        bob,
-        None,
-        "the urgent message to reach bob's node",
-        &["room", "read", &room],
-        |o| o.stdout.contains("WAKE-UP-FROM-ALICE"),
-    );
+    // Both must be on bob's node before the window opens, or (6)'s silence would measure
+    // nothing.
+    let deadline = Instant::now() + support::TIMEOUT;
+    loop {
+        let read = bob.vox(None, &["room", "read", &room]).stdout;
+        if read.contains("WAKE-UP-FROM-ALICE") && read.contains("URGENT-BROADCAST") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: alice's urgent messages never reached bob's node by sync; bob \
+             read:\n{read}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     // Twenty seconds after it landed: ten sweeps of the daemon's two-second tick, and long
     // enough for a wrongly-woken or twice-woken session to show.
     let woken = collect(&inbox, Duration::from_secs(20), |_| false);
@@ -234,10 +258,11 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         .count();
     println!(
         "[proof] bob's session got {} frame(s) in 20s: {wakes} wake(s) for the urgent message, \
-         other-addressee {}, not-urgent {}",
+         other-addressee {}, not-urgent {}, urgent-broadcast {}",
         woken.len(),
         all.contains("OTHER-ADDRESSEE"),
-        all.contains("NOT-URGENT")
+        all.contains("NOT-URGENT"),
+        all.contains("URGENT-BROADCAST")
     );
     assert!(
         all.contains("WAKE-UP-FROM-ALICE"),
@@ -256,6 +281,11 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     assert!(
         !all.contains("NOT-URGENT"),
         "an addressed message that is not urgent must wait for the next turn"
+    );
+    assert!(
+        !all.contains("URGENT-BROADCAST"),
+        "PRODUCT: an urgent message addressed to nobody interrupted bob's session; an urgent \
+         broadcast must interrupt nobody. Received: {woken:?}"
     );
     assert_eq!(
         wakes, 1,
