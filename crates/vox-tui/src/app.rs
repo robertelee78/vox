@@ -850,6 +850,12 @@ async fn judge(
         return;
     }
     let author = crate::ident::member_name(&view.trusted, &row.author);
+    let room_name = view
+        .channels
+        .iter()
+        .find(|c| c.channel_id == *channel_id)
+        .and_then(|c| c.local_name.clone())
+        .unwrap_or_default();
     for session in crate::wake::registered(paths) {
         if session.room != room || session.name.is_empty() {
             continue;
@@ -861,6 +867,7 @@ async fn judge(
         // harness's own user message, so the bare body read as the operator speaking.
         let text = crate::agent_hook::render_wake(
             &room[..12.min(room.len())],
+            &room_name,
             &row.entry_hash,
             &author,
             &envelope.body,
