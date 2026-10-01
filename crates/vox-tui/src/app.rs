@@ -972,16 +972,33 @@ pub fn run_daemon(
         let paths = paths.clone();
         let specs = anchor_specs.clone();
         rt.spawn(async move {
+            // What the last read skipped, so a bad line is said when it appears, not every 30 s.
+            let mut said: Vec<String> = Vec::new();
             loop {
                 tokio::time::sleep(ANCHOR_REFRESH).await;
-                let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
-                if vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file())
-                    .is_err()
-                {
+                // On a blocking thread: a name is resolved here, and a slow resolver must not
+                // hold a runtime worker (V210-75).
+                let (paths, specs) = (paths.clone(), specs.clone());
+                let Ok((set, skipped)) = tokio::task::spawn_blocking(move || {
+                    let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
+                    // A bad line is skipped, not a reason to skip every anchor (V210-75).
+                    let skipped =
+                        vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file())
+                            .unwrap_or_default();
+                    for spec in &specs {
+                        let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
+                    }
+                    (set, skipped)
+                })
+                .await
+                else {
                     continue;
-                }
-                for spec in &specs {
-                    let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
+                };
+                if skipped != said {
+                    for line in &skipped {
+                        eprintln!("vox daemon: {line}");
+                    }
+                    said = skipped;
                 }
                 if !set.is_empty() {
                     let _ = node

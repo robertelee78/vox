@@ -345,6 +345,21 @@ pub enum Error {
     #[error("bad anchor: {0}")]
     MalformedAnchor(&'static str),
 
+    /// The anchors file names no anchor that can be used — every line of it was skipped — and
+    /// no `--anchor` was given (V210-75). A verb that needs an anchor refuses to start rather
+    /// than run with none: with every line skipped, the node would reach nobody it cannot dial
+    /// directly, and say nothing about why.
+    #[error(
+        "the anchors file {path} names no usable anchor ({skipped} line(s) skipped, said above); \
+         fix it, or give --anchor"
+    )]
+    AnchorsFileUnusable {
+        /// The anchors file.
+        path: String,
+        /// How many of its lines were skipped.
+        skipped: usize,
+    },
+
     /// The responder refused a join (ADR-016 §"Join over the network"): the coarse
     /// reason it sent on the join stream. Deliberately not a fine-grained taxonomy —
     /// a wrong passphrase already fails locally on the joiner, so the responder has
