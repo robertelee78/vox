@@ -2676,6 +2676,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "x25519-dalek",
  "x509-parser 0.16.0",
  "zeroize",
