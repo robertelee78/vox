@@ -20,7 +20,7 @@
 //! **Asserted.** `vox room read` returns every one of the [`POSTS`] messages exactly once, in
 //! order, and takes less than [`READ_BOUND`]. "In order" is what the staging fixes: the shells post
 //! at once, so the room interleaves them, but each shell posts its own messages one after another,
-//! so each shell's messages must read in the order it posted them. `CANNOT MEASURE` if fewer than [`POSTS`] posts could be staged.
+//! so each shell's messages must read in the order it posted them. `APPARATUS` (staging not achieved) if fewer than [`POSTS`] posts could be staged.
 //!
 //! **Measured, to set the bound** (release, a shared 18-core machine under other agents' load):
 //! 12,000 rows, about 188 MiB and 1,715 pages. The candidate read it in 0.69 s, and the mutant
@@ -79,7 +79,7 @@ fn vox(data: &Path, argv: &[&str], stdin: &str) -> (bool, Duration, String, Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS (harness): run vox");
     child
         .stdin
         .take()
@@ -140,7 +140,7 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     let data = tmp.path().join("alice");
     std::fs::create_dir_all(data.join("cfg")).unwrap();
     let (ok, _, _, err) = vox(&data, &["id"], "");
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
+    assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
     let _daemon = VoxProc::spawn(
@@ -158,17 +158,20 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     while !vox(&data, &["room", "list"], "").0 {
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: the daemon never answered `vox room list`"
+            "APPARATUS (precondition not met): the daemon never answered `vox room list`"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
     let (ok, _, out, err) = vox(&data, &["room", "create", "--name", "long"], ROOM_PASS);
-    assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
+    assert!(
+        ok,
+        "APPARATUS (precondition not met): room create: {out}\n{err}"
+    );
     let (_, _, list, _) = vox(&data, &["room", "list"], "");
     let room = list
         .split_whitespace()
         .next()
-        .expect("CANNOT MEASURE: the room in `vox room list`")
+        .expect("APPARATUS (precondition not met): the room in `vox room list`")
         .to_owned();
 
     // ---- staging: POSTS messages, from WRITERS shells at once ---------------------------
@@ -193,12 +196,12 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     );
     assert!(
         posted == POSTS,
-        "CANNOT MEASURE: only {posted} of {POSTS} posts were taken"
+        "APPARATUS (precondition not met): only {posted} of {POSTS} posts were taken"
     );
 
     // ---- the read -----------------------------------------------------------------------
     let (ok, took, out, err) = vox(&data, &["room", "read", &room], "");
-    assert!(ok, "vox room read failed after {took:?}: {err}");
+    assert!(ok, "PRODUCT: vox room read failed after {took:?}: {err}");
     let seen: Vec<usize> = out
         .lines()
         .filter_map(|l| {
@@ -219,13 +222,13 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     assert_eq!(
         sorted.len(),
         POSTS,
-        "`vox room read` returned {} distinct of the {POSTS} messages",
+        "PRODUCT: `vox room read` returned {} distinct of the {POSTS} messages",
         sorted.len()
     );
     assert_eq!(
         seen.len(),
         POSTS,
-        "`vox room read` returned {} rows for {POSTS} messages: some more than once",
+        "PRODUCT: `vox room read` returned {} rows for {POSTS} messages: some more than once",
         seen.len()
     );
     // Each shell posted messages `w, w + WRITERS, w + 2·WRITERS, …` one after another, so they
@@ -235,13 +238,13 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         let out_of_order = mine.windows(2).find(|p| p[0] >= p[1]);
         assert!(
             out_of_order.is_none(),
-            "`vox room read` returned shell {w}'s messages out of the order it posted them: \
+            "PRODUCT: `vox room read` returned shell {w}'s messages out of the order it posted them: \
              {out_of_order:?}"
         );
     }
     assert!(
         took < READ_BOUND,
-        "`vox room read` of a room of {POSTS} messages of {TEXT_LEN} bytes took {took:?} (bound \
+        "PRODUCT: `vox room read` of a room of {POSTS} messages of {TEXT_LEN} bytes took {took:?} (bound \
          {READ_BOUND:?}): each page copies every room's whole history"
     );
 }

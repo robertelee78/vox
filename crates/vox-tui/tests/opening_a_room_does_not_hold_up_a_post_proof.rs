@@ -28,8 +28,9 @@
 //! **Asserted:** every post that overlapped the open, from its start to the room being open,
 //! answered within [`BOUND`], V210-08's bound for a post on loopback. The bound is asserted
 //! **before** the preconditions, so a post over it is red whatever else the run shows.
-//! Preconditions, or `CANNOT MEASURE`: every post succeeded, the open took at least [`MIN_OPEN`]
-//! (else there was nothing to wait for), and at least [`MIN_DURING`] posts overlapped it.
+//! A post that failed is a `PRODUCT` red too. Preconditions, or `APPARATUS`: the open took at least
+//! [`MIN_OPEN`] (else there was nothing to wait for), and at least [`MIN_DURING`] posts overlapped
+//! it.
 //!
 //! **Mutation that must turn it red:** the open back on the actor, where `ChannelState::open`
 //! (unwrap and re-verify) is awaited inline, as before 7507d3a. A post made during the open then
@@ -93,17 +94,17 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS (harness): spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS (harness): stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS (harness): write stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS (harness): wait");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -124,8 +125,11 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("daemon stdin");
+        .expect("APPARATUS (harness): spawn vox daemon");
+    let mut pipe = child
+        .stdin
+        .take()
+        .expect("APPARATUS (harness): daemon stdin");
     pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
     drop(pipe);
     let d = Daemon(child);
@@ -133,7 +137,7 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
     while !vox(dir, &["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: {tag}'s daemon never answered: {}",
+            "APPARATUS (precondition not met): {tag}'s daemon never answered: {}",
             std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -148,12 +152,17 @@ fn create(dir: &Path, name: &str) -> String {
         &["room", "create", "--name", name],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: vox room create {name}: {err}");
+    assert!(
+        ok,
+        "APPARATUS (precondition not met): vox room create {name}: {err}"
+    );
     let (_, list, _) = vox(dir, &["room", "list"], None);
     list.lines()
         .find(|l| l.split_whitespace().any(|w| w == name))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: {name} not in room list: {list}"))
+        .unwrap_or_else(|| {
+            panic!("APPARATUS (precondition not met): {name} not in room list: {list}")
+        })
         .to_owned()
 }
 
@@ -167,7 +176,7 @@ fn drive(script: &str, args: &[&str], tag: &str) -> String {
     );
     assert!(
         out.has_verdict(tag) && out.code == Some(0),
-        "CANNOT MEASURE: the {tag} TUI driver gave no verdict, or failed (exit {:?}, stage {:?}): \
+        "APPARATUS (precondition not met): the {tag} TUI driver gave no verdict, or failed (exit {:?}, stage {:?}): \
          {said}",
         out.code,
         out.stage
@@ -183,7 +192,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
     let alice = tmp.path().join("alice");
     std::fs::create_dir_all(alice.join("cfg")).unwrap();
     let (ok, _, err) = vox(&alice, &["id"], None);
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
+    assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
     let cfg = alice.join("cfg").to_string_lossy().into_owned();
     let data = alice.to_string_lossy().into_owned();
 
@@ -197,7 +206,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
             &["room", "post", &bravo, &format!("seed {i}")],
             None,
         );
-        assert!(ok, "CANNOT MEASURE: seed post {i}: {err}");
+        assert!(ok, "APPARATUS (precondition not met): seed post {i}: {err}");
     }
     println!(
         "[proof] {SEED} posts seeded into bravo in {:?}",
@@ -214,7 +223,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
     );
     assert!(
         said.contains("close the TUI said done to :close"),
-        "CANNOT MEASURE: the TUI did not close bravo: {said}"
+        "APPARATUS (precondition not met): the TUI did not close bravo: {said}"
     );
 
     // ---- 3. room A, while B stays closed ---------------------------------------------------
@@ -224,7 +233,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
     let bravo_line = list.lines().find(|l| l.contains(&bravo)).unwrap_or("");
     assert!(
         bravo_line.contains("[closed]"),
-        "CANNOT MEASURE: bravo is not closed before the TUI opens it: {list}"
+        "APPARATUS (precondition not met): bravo is not closed before the TUI opens it: {list}"
     );
     drop(second);
 
@@ -253,7 +262,8 @@ fn a_post_answers_while_the_node_opens_another_room() {
             _ => {}
         }
     }
-    let (from, to) = window.unwrap_or_else(|| panic!("CANNOT MEASURE: no open window: {said}"));
+    let (from, to) = window
+        .unwrap_or_else(|| panic!("APPARATUS (precondition not met): no open window: {said}"));
     let took = Duration::from_secs_f64(to - from);
     // Every post that **overlapped** the open: started before it ended and finished after it
     // began. A post that started just before the open and was held for all of it is the defect at
@@ -274,24 +284,24 @@ fn a_post_answers_while_the_node_opens_another_room() {
         posts.len()
     );
     // **The bound first.** A post over it is the defect whatever else the run shows, so no
-    // precondition may turn it into a CANNOT MEASURE: under the defect the first post blocks for
+    // precondition may turn it into a APPARATUS (precondition not met): under the defect the first post blocks for
     // the whole open, and fewer posts then start during it.
     assert!(
         slowest < BOUND.as_secs_f64() * 1000.0,
-        "a post to alpha took {slowest:.1} ms (bound {BOUND:?}) while the same node opened bravo \
+        "PRODUCT: a post to alpha took {slowest:.1} ms (bound {BOUND:?}) while the same node opened bravo \
          with its passphrase: the open held the node"
     );
     assert!(
         posts.iter().all(|(_, _, ok)| *ok),
-        "CANNOT MEASURE: a post to alpha failed: {said}"
+        "PRODUCT: a post to alpha failed: {said}"
     );
     assert!(
         took >= MIN_OPEN,
-        "CANNOT MEASURE: the open took only {took:?}, under {MIN_OPEN:?}: nothing to wait on"
+        "APPARATUS (precondition not met): the open took only {took:?}, under {MIN_OPEN:?}: nothing to wait on"
     );
     assert!(
         during.len() >= MIN_DURING,
-        "CANNOT MEASURE: only {} post(s) overlapped the open",
+        "APPARATUS (precondition not met): only {} post(s) overlapped the open",
         during.len()
     );
 }

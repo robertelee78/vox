@@ -20,7 +20,7 @@
 //!
 //! **Asserted.**
 //! 1. The history exists: at least [`MIN_ENTRIES`] of the members' trust changes succeeded (each
-//!    is one governance entry). Fewer is `CANNOT MEASURE`.
+//!    is one governance entry). Fewer is `APPARATUS` (staging not achieved).
 //! 2. **The join, from the start of the attempt that got in to the newcomer reading a post the
 //!    host made after it, takes less than [`JOIN_BOUND`] of work** — its time less the two steps
 //!    that are the joiner's own CPU and nothing else: the admission puzzle (`solve`) and sealing
@@ -98,14 +98,16 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS (harness): run vox");
     child
         .stdin
         .take()
         .unwrap()
         .write_all(stdin.as_bytes())
         .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS (harness): vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -133,7 +135,7 @@ fn vox_timed(data: &Path, argv: &[&str], cap: Duration) -> (bool, Duration, Stri
                 .unwrap(),
         ))
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS (harness): run vox");
     let ok = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status.success();
@@ -174,12 +176,12 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list`");
+    panic!("APPARATUS (precondition not met): {name}'s daemon never answered `vox room list`");
 }
 
 fn fingerprint(data: &Path) -> String {
     let (ok, out, err) = vox_once(data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
+    assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
     out.trim().to_owned()
 }
 
@@ -238,15 +240,18 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         .collect();
 
     let (ok, out, err) = vox_in(&host_dir, &["room", "create", "--name", "team"], ROOM_PASS);
-    assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
+    assert!(
+        ok,
+        "APPARATUS (precondition not met): room create: {out}\n{err}"
+    );
     let (_, list, _) = vox_once(&host_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
         .next()
-        .expect("CANNOT MEASURE: the new room in `vox room list`")
+        .expect("APPARATUS (precondition not met): the new room in `vox room list`")
         .to_owned();
     let (ok, link, err) = vox_once(&host_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "CANNOT MEASURE: room invite: {err}");
+    assert!(ok, "APPARATUS (precondition not met): room invite: {err}");
     let link = link.trim().to_owned();
     // Which attempt got in, and when it started: `None` if none did.
     let attempts = |data: &Path, who: &str| {
@@ -264,14 +269,17 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let join = |data: &Path, who: &str| attempts(data, who).is_some();
     let t_setup = Instant::now();
     for (name, d, fp) in &members {
-        assert!(join(d, name), "CANNOT MEASURE: {name} could not join");
+        assert!(
+            join(d, name),
+            "APPARATUS (precondition not met): {name} could not join"
+        );
         assert!(
             trust(d, "add", &host_fp, "host"),
-            "CANNOT MEASURE: {name} could not trust the host"
+            "APPARATUS (precondition not met): {name} could not trust the host"
         );
         assert!(
             trust(&host_dir, "add", fp, name),
-            "CANNOT MEASURE: the host could not trust {name}"
+            "APPARATUS (precondition not met): the host could not trust {name}"
         );
     }
     println!(
@@ -279,7 +287,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         t_setup.elapsed()
     );
     let (ok, _, err) = vox_once(&host_dir, &args(&["room", "post", &prefix, "hello"]));
-    assert!(ok, "CANNOT MEASURE: first post: {err}");
+    assert!(ok, "APPARATUS (precondition not met): first post: {err}");
     let (_, rows, _) = vox_once(&host_dir, &args(&["room", "read", &prefix, "--json"]));
     let room = rows
         .lines()
@@ -290,7 +298,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
                 .as_str()
                 .map(str::to_owned)
         })
-        .expect("CANNOT MEASURE: the host's read names its room");
+        .expect("APPARATUS (precondition not met): the host's read names its room");
 
     // ---- the governance history: every member changes its mind, again and again --------
     let t_hist = Instant::now();
@@ -322,19 +330,19 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     );
     assert!(
         entries >= MIN_ENTRIES,
-        "CANNOT MEASURE: only {entries} of {} trust changes succeeded (need {MIN_ENTRIES})",
+        "APPARATUS (precondition not met): only {entries} of {} trust changes succeeded (need {MIN_ENTRIES})",
         MEMBERS * CYCLES * 2
     );
 
     // ---- the newcomer, trusted by the host before it joins ------------------------------
     assert!(
         trust(&host_dir, "add", &newcomer_fp, "newcomer"),
-        "CANNOT MEASURE: the host could not trust the newcomer"
+        "APPARATUS (precondition not met): the host could not trust the newcomer"
     );
     let newcomer = daemon("newcomer", &newcomer_dir, &spec, &pass_file);
     let t_join = Instant::now();
     let Some((tries, got_in_from)) = attempts(&newcomer_dir, "newcomer") else {
-        panic!("CANNOT MEASURE: the newcomer could not join");
+        panic!("APPARATUS (precondition not met): the newcomer could not join");
     };
     let joined = Instant::now();
     // The newcomer's daemon names each step of its join: `join got in — board …, solve …`.
@@ -363,11 +371,14 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let (solve, seal) = (step_secs("solve"), step_secs("seal"));
     assert!(
         solve > 0.0 && seal > 0.0,
-        "CANNOT MEASURE: the newcomer's daemon did not name its join's solve and seal: {steps:?}"
+        "APPARATUS (precondition not met): the newcomer's daemon did not name its join's solve and seal: {steps:?}"
     );
     let marker = "posted by the host after the newcomer joined";
     let (ok, _, err) = vox_once(&host_dir, &args(&["room", "post", &room, marker]));
-    assert!(ok, "CANNOT MEASURE: the host's post after the join: {err}");
+    assert!(
+        ok,
+        "APPARATUS (precondition not met): the host's post after the join: {err}"
+    );
 
     let mut posts: Vec<Duration> = Vec::new();
     let mut last_post = Instant::now() - Duration::from_secs(1);
@@ -381,7 +392,10 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
                 posts.len() + 1,
                 joined.elapsed()
             );
-            assert!(ok, "the newcomer's post failed after {t:?}: {said}");
+            assert!(
+                ok,
+                "PRODUCT: the newcomer's post failed after {t:?}: {said}"
+            );
             posts.push(t);
         }
         let (ok, _, read) = vox_timed(&newcomer_dir, &["room", "read", &room], VERB_CAP);
@@ -390,7 +404,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         }
         assert!(
             t_join.elapsed() < READ_CAP,
-            "the newcomer never read the host's post in {READ_CAP:?} after joining a room of \
+            "PRODUCT: the newcomer never read the host's post in {READ_CAP:?} after joining a room of \
              {entries} consents and revocations"
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -404,7 +418,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     );
     assert!(
         work < JOIN_BOUND,
-        "the newcomer's join and first sync took {work:?} of work (bound {JOIN_BOUND:?}; \
+        "PRODUCT: the newcomer's join and first sync took {work:?} of work (bound {JOIN_BOUND:?}; \
          {end_to_end:?} in all, less solve {solve:.2}s and seal {seal:.2}s) in a room of \
          {entries} consents and revocations: it folds the governance too slowly"
     );
@@ -415,12 +429,12 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     );
     assert!(
         read_at < READ_BOUND,
-        "the newcomer read the host's post {read_at:?} after its join returned (bound {READ_BOUND:?}) in a room \
+        "PRODUCT: the newcomer read the host's post {read_at:?} after its join returned (bound {READ_BOUND:?}) in a room \
          of {entries} consents and revocations: its first sync folds the governance too slowly"
     );
     assert!(
         slowest < POST_BOUND,
-        "a newcomer post took {slowest:?} (bound {POST_BOUND:?}) while it caught up on {entries} \
+        "PRODUCT: a newcomer post took {slowest:?} (bound {POST_BOUND:?}) while it caught up on {entries} \
          governance entries: the room's lock is held for the fold"
     );
 }
