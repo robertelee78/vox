@@ -674,12 +674,19 @@ impl VoxEndpoint {
 /// identity, or received from a peer that refused ours. Everything else — a refusal, a close, a
 /// peer that never answered, this endpoint closing — is not about keys, and saying "signature
 /// verification failed" for it sent the operator after the wrong thing.
+///
+/// A refusal is a peer that is busy (V210-86, #278): a node past its cap on handshakes refuses
+/// what it cannot take in time, and its dialler is to say so and try again shortly, not report
+/// a fault.
 fn handshake_failed(e: quinn::ConnectionError) -> Error {
     use quinn::ConnectionError as C;
     let tls = |code: quinn::TransportErrorCode| (0x100..0x200).contains(&u64::from(code));
     match e {
         C::TransportError(t) if tls(t.code) => Error::SignatureInvalid,
         C::ConnectionClosed(c) if tls(c.error_code) => Error::SignatureInvalid,
+        C::ConnectionClosed(c) if c.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED => {
+            Error::Handshake("the peer is busy: it refused the connection for now".to_owned())
+        }
         C::TimedOut => Error::Handshake("the peer did not answer".to_owned()),
         C::LocallyClosed => Error::Handshake("this node's endpoint is closing".to_owned()),
         other => Error::Handshake(other.to_string()),

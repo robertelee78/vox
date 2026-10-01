@@ -1040,18 +1040,6 @@ impl ConnectionManager {
         before - retiring.len()
     }
 
-    /// Retire `conn` as [`Self::file`] would when a better path displaces it. For proofs of
-    /// the retirement rule, which otherwise needs two real paths to the same peer.
-    #[doc(hidden)]
-    pub fn retire_for_test(&self, conn: &Arc<VoxConnection>) {
-        // Exactly what `file` does: the displaced connection leaves the per-peer map and
-        // moves to the retiring list. Leaving it in the map would keep a reference of the
-        // manager's own, which is not what "still carried" means.
-        lock(&self.conns).retain(|_, c| !Arc::ptr_eq(c, conn));
-        let at = (self.clock)().saturating_add(self.retire_grace_secs);
-        lock(&self.retiring).push((Arc::clone(conn), at));
-    }
-
     /// How many displaced connections are still within their grace.
     #[must_use]
     pub fn retiring_count(&self) -> usize {

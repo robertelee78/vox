@@ -764,6 +764,20 @@ pub fn run_node(
                                         crate::ident::author_id(&peer)
                                     );
                                 }
+                                vox_core::node::api::NodeEvent::HandshakesQueued {
+                                    waited,
+                                    most_waiting,
+                                    most_running,
+                                    refused,
+                                    longest_ms,
+                                } => {
+                                    eprintln!(
+                                        "vox node: {waited} connection attempt(s) waited for a \
+                                         handshake slot (at most {most_waiting} at once, the \
+                                         longest {longest_ms}ms) while at most {most_running} \
+                                         handshake(s) ran; {refused} refused"
+                                    );
+                                }
                                 vox_core::node::api::NodeEvent::ConnectionNote { peer, note } => {
                                     eprintln!(
                                         "vox node: connection to {} — {note}",
