@@ -500,7 +500,10 @@ fn woken_by_prompt(
     room_label: &str,
     rows: &[vox_core::node::api::MessageRow],
 ) -> Vec<Digest32> {
-    let Some(row) = prompt.trim_start().strip_prefix(wake_header(room_label).as_str()) else {
+    let Some(row) = prompt
+        .trim_start()
+        .strip_prefix(wake_header(room_label).as_str())
+    else {
         return Vec::new();
     };
     rows.iter()
