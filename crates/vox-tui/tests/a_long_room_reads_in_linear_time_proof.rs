@@ -1,5 +1,5 @@
 //! V210-71 (#262), finding 5 — **a long room is read in time proportional to its length**, through
-//! the shipped binary. **Opt-in** (`--features heavy-proofs`): its staging posts [`POSTS`] messages
+//! the shipped binary. **Opt-in** (`--features optional-proofs`): its staging posts [`POSTS`] messages
 //! of [`TEXT_LEN`] bytes, minutes of work, so it is not part of every CI run or release gate.
 //!
 //! **The defect.** A node publishes its state as one view, and every IPC `Read` page took a clone
@@ -44,7 +44,15 @@
 //! (and rebuild every room's timeline on each publish), as before V210-71: the read takes many
 //! times longer, past the bound.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_long_room_is_read_in_time_proportional_to_its_length);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -238,8 +246,9 @@ fn spread(took: &[Duration]) -> (Duration, Duration, Duration) {
     (at(0.5), at(0.95), t[t.len() - 1])
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "opt-in (heavy-proofs): a real daemon and thousands of 16 KiB posts; run in release"]
+#[ignore = "optional: a real daemon and thousands of 16 KiB posts; run in release"]
 fn a_long_room_is_read_in_time_proportional_to_its_length() {
     // Staging thousands of posts takes minutes, past the default budget: a longer one, unless the
     // runner set its own.

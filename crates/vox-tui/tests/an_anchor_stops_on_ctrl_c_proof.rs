@@ -108,11 +108,13 @@ fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
         std::fs::create_dir_all(dir.join("cfg")).unwrap();
         let mut anchor =
             VoxProc::spawn("anchor", &dir, &args(&["node", "--listen", "127.0.0.1:0"]));
-        if let Err(why) = anchor.try_expect_within(LINE_PATIENCE, "the anchors file written", |l| {
-            l.starts_with("vox node: wrote ")
-        }) {
-            panic!("CANNOT MEASURE: anchor {trial} never settled: {why}");
-        }
+        // Staging: an anchor that never writes its file in time is CANNOT MEASURE, but one that
+        // exits first is the product's red, and says so first.
+        anchor.expect_staging_within(
+            LINE_PATIENCE,
+            &format!("the anchors file written (anchor {trial})"),
+            |l| l.starts_with("vox node: wrote "),
+        );
         let pid = anchor.child.id();
         signal(pid, "-STOP");
         std::thread::sleep(DESCHEDULED);
