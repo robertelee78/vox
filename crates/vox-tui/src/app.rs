@@ -635,12 +635,14 @@ async fn judge(
             &author,
             &envelope.body,
         );
+        let entry = vox_core::node::link::b32_encode(&row.entry_hash);
         let paths = paths.clone();
         // **One wedged session must not stall every other wake.** Each is its own task,
         // bounded by a deadline: a session endpoint that accepts and never reads would
         // otherwise hold this loop — and so every later interrupt — indefinitely.
         tokio::spawn(async move {
-            match tokio::time::timeout(WAKE_DEADLINE, crate::wake::wake(&session, &text)).await {
+            let woke = crate::wake::wake(&session, &entry, &text);
+            match tokio::time::timeout(WAKE_DEADLINE, woke).await {
                 Ok(Ok(())) => {}
                 // A session that has ended is forgotten, so its name's later messages are
                 // not tried against it for ever.

@@ -62,6 +62,13 @@
 // mid-turn it is taken at the next step boundary, exactly as if typed while busy.
 // It never aborts the running turn first: an abort orphans a queued prompt.
 //
+// **A woken message is given to the model once** (V210-112). The relayed prompt is a user
+// message, so this plugin's own drain runs on it, and it re-read the same message into the same
+// prompt. The daemon's frame names the entry it carries; once OpenCode has taken the prompt, or
+// when the message being drained is that prompt itself, the drain is told (`--woken`) and does
+// not show it again. An entry is never passed while its relay is still undecided, so a relay
+// that fails cannot make the drain skip a message nobody delivered.
+//
 // Every failure path is silent and injects nothing. A hook that breaks the turn it
 // rides on is worse than one that does nothing.
 
@@ -95,12 +102,14 @@ function log(line) {
  * The wire is NDJSON, the same shape Claude Code's messaging socket takes:
  *
  *   {"type":"auth","token":"…"}
- *   {"type":"prompt","session":"ses_…","text":"…"}
+ *   {"type":"prompt","session":"ses_…","entry":"…","text":"…"}
  *
  * answered with one line: `{"ok":true}`, or `{"error":"…"}` with `"gone":true`
  * when this OpenCode does not know the session.
+ *
+ * Each relay is noted in `woken` (session id → `{ entry, text, taken }`) for the drain.
  */
-function wakeChannel(client) {
+function wakeChannel(client, woken) {
   try {
     // `mkdtemp` makes the directory 0700, so only this user can reach the socket;
     // the token keeps every other process of theirs out as well.
@@ -139,14 +148,35 @@ function wakeChannel(client) {
           if (msg?.type !== "prompt" || !msg.session || typeof msg.text !== "string") {
             return answer({ error: "expected a prompt frame" })
           }
-          const res = await client.session.promptAsync({
-            path: { id: msg.session },
-            body: { parts: [{ type: "text", text: msg.text }] },
-          })
-          const status = res?.response?.status ?? 0
-          log("wake: session " + msg.session + " answered " + status)
-          if (status >= 200 && status < 300) return answer({ ok: true })
-          answer({ error: "OpenCode answered " + status, gone: status === 404 })
+          // Noted before the relay: OpenCode may run this prompt's `chat.message` before
+          // `promptAsync` returns, and that drain must know it is the wake.
+          let relay = null
+          if (typeof msg.entry === "string" && msg.entry) {
+            relay = { entry: msg.entry, text: msg.text, taken: false }
+            woken.set(msg.session, [...(woken.get(msg.session) ?? []), relay])
+          }
+          const forget = () => {
+            if (!relay) return
+            const left = (woken.get(msg.session) ?? []).filter((w) => w !== relay)
+            woken.set(msg.session, left)
+          }
+          try {
+            const res = await client.session.promptAsync({
+              path: { id: msg.session },
+              body: { parts: [{ type: "text", text: msg.text }] },
+            })
+            const status = res?.response?.status ?? 0
+            log("wake: session " + msg.session + " answered " + status)
+            if (status >= 200 && status < 300) {
+              if (relay) relay.taken = true
+              return answer({ ok: true })
+            }
+            forget()
+            answer({ error: "OpenCode answered " + status, gone: status === 404 })
+          } catch (e) {
+            forget()
+            throw e
+          }
         } catch (e) {
           log("wake: threw: " + e)
           answer({ error: String(e) })
@@ -173,7 +203,8 @@ function wakeChannel(client) {
 
 export default async function vox({ $, client }) {
   log("plugin loaded (cwd=" + process.cwd() + ")")
-  const wake = wakeChannel(client)
+  const woken = new Map()
+  const wake = wakeChannel(client, woken)
   return {
     // **Name the session to every shell this session runs** (ADR-021 §4, §7).
     // Claude Code and Codex put their session id in every tool's environment
@@ -220,8 +251,19 @@ export default async function vox({ $, client }) {
           env.VOX_OPENCODE_WAKE_SOCKET = wake.path
           env.VOX_OPENCODE_WAKE_TOKEN = wake.token
         }
+
+        // What a wake has put in front of this session already (see above): every relay
+        // OpenCode has taken, and the one this message is, if it is a wake. Told once; a
+        // drain that fails after this only means the next one may show it again.
+        const typed = output.parts.find((p) => p.type === "text" && typeof p.text === "string")
+        const relays = woken.get(sessionID) ?? []
+        const told = relays.filter((w) => w.taken || (typed && w.text === typed.text))
+        woken.set(sessionID, relays.filter((w) => !told.includes(w)))
+        const flags = told.flatMap((w) => ["--woken", w.entry])
+        if (told.length) log("drain: woken " + told.map((w) => w.entry).join(" "))
+
         const result =
-          await $`${bin} agent hook --format text --room ${room} --session ${sessionID}`
+          await $`${bin} agent hook --format text --room ${room} --session ${sessionID} ${flags}`
             .env(env)
             .quiet()
             .nothrow()
