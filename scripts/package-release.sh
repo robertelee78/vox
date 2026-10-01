@@ -47,6 +47,15 @@ if grep -aq 'VOX-MUTANT-SENDER' "$BIN"; then
   exit 1
 fi
 
+# **No test-only knob ships** (V210-105, #300). The `VOX_TEST_*` variables the proofs stage races
+# with are compiled into `vox` only with the `test-knobs` feature, which the release jobs do not
+# enable. A knob's read carries its name, so a binary with any knob compiled in carries `VOX_TEST_`.
+if grep -aq 'VOX_TEST_' "$BIN"; then
+  printf 'package-release: %s carries test-only knobs (%s); refusing\n' "$BIN" \
+    "$(grep -ao 'VOX_TEST_[A-Z_]*' "$BIN" | sort -u | tr '\n' ' ')" >&2
+  exit 1
+fi
+
 mkdir -p dist
 cp "$BIN" "dist/$ASSET"
 chmod 0755 "dist/$ASSET"

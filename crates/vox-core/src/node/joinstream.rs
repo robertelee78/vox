@@ -388,7 +388,9 @@ const SOLVE_BUDGET_PER_EXPECTED_SOLVE: std::time::Duration = std::time::Duration
 /// Test-only: make this joiner's grind last at least this many milliseconds, as it does on a
 /// slower device. **For proofs; nothing in a real deployment sets it.** A proof cannot otherwise
 /// stage a joiner slower than the responder's patience with the release build, whose solve takes a
-/// second or two. Unset, empty or unparsable is no floor.
+/// second or two. Unset, empty or unparsable is no floor. Not compiled in without the `test-knobs`
+/// feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_SOLVE_AT_LEAST_ENV: &str = "VOX_TEST_SOLVE_AT_LEAST_MS";
 
 /// How close to the responder's patience a grind may finish and still count as in time. The
@@ -538,11 +540,14 @@ pub async fn run_initiator(
     let grinding = std::time::Instant::now();
     let grind = || {
         let ground = grind()?;
-        let floor = std::env::var(TEST_SOLVE_AT_LEAST_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
-        std::thread::sleep(floor.saturating_sub(grinding.elapsed()));
+        #[cfg(feature = "test-knobs")]
+        {
+            let floor = std::env::var(TEST_SOLVE_AT_LEAST_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
+            std::thread::sleep(floor.saturating_sub(grinding.elapsed()));
+        }
         Ok::<_, Error>(ground)
     };
     let (initiator, token, share) = if tokio::runtime::Handle::current().runtime_flavor()

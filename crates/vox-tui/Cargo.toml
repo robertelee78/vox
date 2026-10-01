@@ -54,6 +54,12 @@ rustix.workspace = true
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
 
+[features]
+# **Test-only knobs, for proofs only** (V210-105): vox-core's `test-knobs`, which compiles the
+# `VOX_TEST_*` variables into `vox`. The proofs that set one build with it and refuse, as CANNOT
+# MEASURE, a `vox` without it. No shipped build enables it.
+test-knobs = ["vox-core/test-knobs"]
+
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
 [dev-dependencies]
 # The at-rest floor proof re-derives the vault key the binary wrote, independently of

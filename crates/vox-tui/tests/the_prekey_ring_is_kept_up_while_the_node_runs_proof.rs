@@ -46,6 +46,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -292,6 +295,7 @@ fn signal(pid: u32, sig: &str) {
 #[test]
 #[ignore = "real binaries and a clock knob; the release gate runs it"]
 fn a_running_node_rotates_its_signed_prekey() {
+    test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     // The ring is made at `vox id`, on this clock: its signed prekey falls due LEAD seconds on,
@@ -335,6 +339,7 @@ fn a_running_node_rotates_its_signed_prekey() {
 #[test]
 #[ignore = "real binaries, a clock knob, production Argon2id and a PoW; the release gate runs it"]
 fn a_session_started_before_a_rotation_completes_after_it() {
+    test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let (_anchor, spec) = anchor(tmp.path());
@@ -442,6 +447,7 @@ fn a_session_started_before_a_rotation_completes_after_it() {
 #[test]
 #[ignore = "real binaries, a pool knob, production Argon2id and a PoW per join; the release gate runs it"]
 fn sessions_get_one_time_prekeys_past_the_whole_pool() {
+    test_knobs::require(&["VOX_TEST_ONE_TIME_PREKEYS"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let (_anchor, spec) = anchor(tmp.path());
