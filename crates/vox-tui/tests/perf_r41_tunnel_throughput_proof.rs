@@ -1226,7 +1226,30 @@ fn mbit(w: &[Window], f: impl Fn(&Window) -> f64) -> Vec<String> {
 
 /// An arm measured the emulator, not vox, if the emulator ran late in any window judged: the CANNOT
 /// MEASURE for that arm, or `None` when the emulator was on time.
+///
+/// Also when the emulator ran at least [`QUEUE_SIGNAL_LATENESS`] late in more than
+/// [`LATE_SECONDS_SHARE`] of the judged seconds, or in the median one: tier 2 reads a queue from a
+/// 4 ms rise in a round's minimum round trip. A round's minimum is over every packet in it, so one
+/// late release does not move it, but lateness that lasts can fake or hide it (ADR-024).
 fn late_fault(arm: &str, w: &[Window]) -> Option<String> {
+    let mut ms: Vec<Duration> = w.iter().map(|x| x.late).collect();
+    ms.sort_unstable();
+    let median = ms.get(ms.len() / 2).copied().unwrap_or_default();
+    let over = w.iter().filter(|x| x.late >= QUEUE_SIGNAL_LATENESS).count();
+    if median >= QUEUE_SIGNAL_LATENESS || over as f64 > LATE_SECONDS_SHARE * w.len() as f64 {
+        return Some(format!(
+            "CANNOT MEASURE {arm} (APPARATUS): the emulator ran at least {} ms late in {over} of {} \
+             judged seconds (median {} ms; more than {:.0}% of them, or the median, can fake or hide \
+             the 4 ms rise tier 2 reads as a queue), so this arm measured the emulator, not vox; \
+             per-second lateness {:?} ms; load: {}",
+            QUEUE_SIGNAL_LATENESS.as_millis(),
+            w.len(),
+            median.as_millis(),
+            LATE_SECONDS_SHARE * 100.0,
+            w.iter().map(|x| x.late.as_millis()).collect::<Vec<_>>(),
+            uptime()
+        ));
+    }
     let late = w.iter().map(|x| x.late).max().unwrap_or_default();
     (late > MAX_EMULATOR_LATENESS).then(|| {
         format!(
@@ -1261,6 +1284,9 @@ fn lateness(w: &[Window]) -> String {
 /// The rise in a round's minimum round trip that tier 2 reads as a queue (ADR-024,
 /// `QUEUE_DELAY_MIN`): emulator lateness at this size can fake or hide the signal.
 const QUEUE_SIGNAL_LATENESS: Duration = Duration::from_millis(4);
+/// The share of an arm's judged seconds that may run [`QUEUE_SIGNAL_LATENESS`] late before the arm
+/// measures the emulator, not vox (ADR-024; to be calibrated from the counts every arm prints).
+const LATE_SECONDS_SHARE: f64 = 0.10;
 
 /// Record an arm's CANNOT MEASURE as it happens: a product red on another arm ends the run first, and
 /// must not hide it.
