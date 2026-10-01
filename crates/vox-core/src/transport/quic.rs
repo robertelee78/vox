@@ -615,8 +615,12 @@ impl VoxEndpoint {
 
     /// Gracefully close the endpoint (all connections).
     pub fn close(&self) {
-        self.endpoint
-            .close(quinn::VarInt::from_u32(0), b"endpoint closed");
+        // A stopping node's last word to every connection it still has (V210-93): "stopped",
+        // the same as `ConnectionManager::close_all` says, never a code that reads as a fault.
+        self.endpoint.close(
+            close_code(WireError::ShuttingDown),
+            WireError::ShuttingDown.to_string().as_bytes(),
+        );
     }
 
     /// Wait until every connection of this endpoint has finished closing, which includes its
@@ -669,6 +673,7 @@ fn finish_connection(
         datagram_tx: Mutex::new(DatagramSender::new()),
         datagram_rx: Mutex::new(ReplayWindow::default()),
         datagrams_dropped: AtomicU64::new(0),
+        closed_here: std::sync::OnceLock::new(),
     })
 }
 
@@ -743,6 +748,8 @@ pub struct VoxConnection {
     /// for observability ([`VoxConnection::datagrams_dropped`]); a rising count
     /// on a live connection is a replay signal worth surfacing.
     datagrams_dropped: AtomicU64,
+    /// The code this end closed the connection with, if it did (see [`Self::closed_here`]).
+    closed_here: std::sync::OnceLock<WireError>,
 }
 
 /// The next [`VoxConnection::serial`].
@@ -893,8 +900,16 @@ impl VoxConnection {
 
     /// Close the connection with an application code + reason.
     pub fn close(&self, err: WireError) {
+        let _ = self.closed_here.set(err);
         self.connection
             .close(close_code(err), err.to_string().as_bytes());
+    }
+
+    /// The code this end first closed the connection with, through [`Self::close`]: quinn reports
+    /// a local close only as "locally closed", which says nothing about why (V210-93).
+    #[must_use]
+    pub fn closed_here(&self) -> Option<WireError> {
+        self.closed_here.get().copied()
     }
 
     /// The underlying quinn connection, for advanced callers (M11 tunnels).

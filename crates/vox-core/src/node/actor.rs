@@ -546,7 +546,10 @@ const ANCHOR_SILENCE_IS_LOSS: Duration = Duration::from_secs(8);
 
 /// Why an anchor's connection closed, as a person reads it (V210-93). A stopping node closes
 /// with [`WireError::ShuttingDown`]: that is "the anchor stopped", not a fault.
-fn anchor_close_reason(e: &quinn::ConnectionError) -> String {
+fn anchor_close_reason(
+    e: &quinn::ConnectionError,
+    closed_here: Option<crate::wire::WireError>,
+) -> String {
     match e {
         quinn::ConnectionError::ApplicationClosed(close) => {
             match u8::try_from(close.error_code.into_inner())
@@ -558,7 +561,10 @@ fn anchor_close_reason(e: &quinn::ConnectionError) -> String {
                 None => e.to_string(),
             }
         }
-        quinn::ConnectionError::LocallyClosed => "closed here".to_owned(),
+        quinn::ConnectionError::LocallyClosed => match closed_here {
+            Some(code) => format!("closed here: {code}"),
+            None => "closed here".to_owned(),
+        },
         other => other.to_string(),
     }
 }
@@ -3716,7 +3722,7 @@ impl Node {
         };
         let why = match (silent, conn.quinn().close_reason()) {
             (Some(s), _) => format!("it answered nothing for {}s", s.as_secs()),
-            (None, Some(e)) => anchor_close_reason(&e),
+            (None, Some(e)) => anchor_close_reason(&e, conn.closed_here()),
             (None, None) => "it is no longer held".to_owned(),
         };
         if lasted.is_some_and(|s| s < ANCHOR_FLAP_SECS) {
