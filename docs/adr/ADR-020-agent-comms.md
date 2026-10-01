@@ -174,6 +174,18 @@ A genesis "open room" flag was designed and **rejected**. Instead:
   whether they let me read them is their decision, made in their ring. This is ADR-007's per-direction
   rule unchanged. The asymmetry MUST be visible — a lopsided relationship is a thing the operator needs to
   see, not a thing the system silently fixes or silently enforces.
+  > **And my ring decides whom I read (decider, 2026-10-01, V210-118).** *"if agent-1 has not trusted
+  > agent-2, then agent-1 shouldn't see messages from agent-2"*; *"same for humans"*; *"we have no typed
+  > entity of agent or human -- they're both just nodes"*. Trust still runs one way per decision, and each
+  > direction is decided by its own node, but reading needs both: the author's ring releases its key, and
+  > the reader's node takes that key only if the reader's ring names the author. A key from an author not
+  > in the ring is refused on the pairwise stream (`KeyRefusal::NotTrusted`), so nothing of that author's
+  > opens on the node: not in the TUI, the CLI, or an agent's wake and drain. The member is still listed,
+  > as present and "(not in keyring)". The author's re-key round offers the key again, and a member that
+  > hands over a generation new to us is offered ours at once, so trusting the author makes its messages
+  > readable, earlier ones included, from where its consent began. Removing a key from the ring drops
+  > that author's keys in every room (a closed room drops them when it opens), so nothing it posts
+  > afterwards opens; what was already read stays read.
 - **Removing a key from the ring MUST change the lock.** Read access is a sender key already handed over,
   so removal cannot take it back — it can only stop the removed party reading what comes *next*. Removal
   therefore rotates this identity's sender key and re-keys everyone still in the ring, in **every** room

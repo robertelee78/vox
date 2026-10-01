@@ -2643,6 +2643,9 @@ pub struct Node {
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
     key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
+    /// Per `(room, member)`: a member that has just handed over a generation new to us, so is
+    /// offered ours again once its stream is answered (V210-118).
+    reoffer: BTreeSet<(Digest32, Digest32)>,
     /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
     /// key cut off by a crash is owed again after the restart; see [`Node::watch_delivery`].
     keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
@@ -2879,6 +2882,7 @@ impl Node {
             pending_consents: Vec::new(),
             fresh_details: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
+            reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
@@ -4403,6 +4407,7 @@ impl Node {
                     self.channels
                         .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
                     self.mark_decisions_on_open(&channel_id).await;
+                    self.forget_untrusted_keys(&channel_id).await;
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
                     self.publish_channel_locally(&channel_id).await;
@@ -6341,6 +6346,23 @@ impl Node {
             .mark_decisions_on_open(profile.store(), &order);
     }
 
+    /// Drop, in a room just opened, every sender key held from a member this owner does not trust
+    /// (V210-118): one stopped being trusted while the room was closed, or a key taken before this
+    /// node refused untrusted keys. Rendered messages stay; nothing more of theirs opens.
+    async fn forget_untrusted_keys(&mut self, channel_id: &Digest32) {
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return;
+        };
+        let trusted = self.trust.trusted();
+        let _ = shared
+            .lock()
+            .await
+            .forget_keys_except(profile.store(), &trusted);
+    }
+
     /// Trust `fingerprint` node-wide under `petname` (ADR-020 §3), then act on it
     /// at once so the operator does not wait a tick to see the effect.
     async fn trust_identity(&mut self, fingerprint: Digest32, petname: &str) -> Outcome {
@@ -6418,6 +6440,18 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
+        // nothing it posts from now opens on this node. A closed room drops them when it opens.
+        // What was already read stays read. A re-trust is offered its key again, as any member
+        // whose key this node does not hold.
+        let trusted = self.trust.trusted();
+        let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
+        for ch in shared {
+            let _ = ch
+                .lock()
+                .await
+                .forget_keys_except(profile.store(), &trusted);
+        }
         // Before the rotation, not after: rotation talks to the network and may be slow,
         // and the removal must bite the moment it is decided (M17.11).
         self.refresh_reachers().await;
@@ -8493,6 +8527,29 @@ impl Node {
                 let _ = send.finish();
             }
         }
+        // After the answer, never before it: the sender waits on that answer, and this goes to the
+        // network. Offered again at once, its backoff cleared, rather than up to a minute later on
+        // the tick: a member just trusted reads from the moment its owner decided (V210-118).
+        let owed: Vec<(Digest32, Digest32)> =
+            std::mem::take(&mut self.reoffer).into_iter().collect();
+        for (channel_id, member) in owed {
+            let (Some(profile), Some(shared)) = (
+                self.profile.as_ref(),
+                self.channels.get(&channel_id).map(Arc::clone),
+            ) else {
+                continue;
+            };
+            if shared
+                .lock()
+                .await
+                .reoffer(profile.store(), &member)
+                .is_err()
+            {
+                continue;
+            }
+            self.key_backoff.remove(&(channel_id, member));
+            let _ = self.deliver_rekeys_for(&channel_id, false).await;
+        }
     }
 
     /// Act on a pairwise stream whose first frame has been read: `Some(Ok)` if it carried a key
@@ -8560,20 +8617,40 @@ impl Node {
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
             return Some(Err(KeyRefusal::CannotOpen));
         };
+        // **A node reads only the members its owner trusts** (V210-118). Trust is decided by each
+        // node for itself: the author trusting us releases its key, and that alone must not make
+        // it readable here. A key from an author this owner has not trusted is refused, so nothing
+        // of theirs opens anywhere on this node; the author's re-key round offers it again, and it
+        // is taken once the owner trusts them. A locked node holds no keyring, and is refused as
+        // not accepting rather than read as trusting nobody.
+        let author = skdm.body.author_id;
+        if !self.profile.as_ref().is_some_and(Profile::is_unlocked) {
+            return Some(Err(KeyRefusal::NotAccepted));
+        }
+        if !self.trust.is_trusted(&author) {
+            return Some(Err(KeyRefusal::NotTrusted));
+        }
+        let mut fresh = false;
         let backfilled = match (
             self.profile.as_ref(),
             self.channels.get(&channel_id).map(Arc::clone),
         ) {
-            (Some(profile), Some(shared)) => shared
-                .lock()
-                .await
-                .accept_skdm(profile.store(), &skdm, now)
-                .ok(),
+            (Some(profile), Some(shared)) => {
+                let mut channel = shared.lock().await;
+                fresh = !channel.holds_generation(&author, skdm.body.chain_id);
+                channel.accept_skdm(profile.store(), &skdm, now).ok()
+            }
             _ => None,
         };
         let Some(n) = backfilled else {
             return Some(Err(KeyRefusal::NotAccepted));
         };
+        // A generation new to us: the author may have refused ours while we were untrusted, or
+        // dropped it when its owner stopped trusting us. Ours is offered again once this stream
+        // is answered (see `handle_pairwise`).
+        if fresh {
+            self.reoffer.insert((channel_id, author));
+        }
         let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
             channel_id,
             peer,
@@ -9109,6 +9186,7 @@ impl Node {
         self.channels
             .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         self.mark_decisions_on_open(&channel_id).await;
+        self.forget_untrusted_keys(&channel_id).await;
         self.adopt_channel_anchors(&channel_id, None).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&channel_id).await;
