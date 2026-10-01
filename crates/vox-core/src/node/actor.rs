@@ -56,9 +56,9 @@ struct Initiated {
     /// The hello that lets the peer accept it; `None` for a session opened on the join
     /// path, which the join protocol itself delivered.
     initial: Option<InitialMessage>,
-    /// Whether that hello has reached the peer. Until it has, every delivery over the
-    /// session carries it again — a peer cannot open anything sealed under a session it
-    /// was never offered.
+    /// Whether the peer holds that hello: it took a key sealed under the session (V210-89).
+    /// Until it has, every delivery over the session carries it again — a peer cannot open
+    /// anything sealed under a session it was never offered.
     hello_delivered: bool,
 }
 
@@ -709,6 +709,8 @@ enum NetEvent {
         peer: Digest32,
         /// The generation it took.
         chain_id: u64,
+        /// The serial of the session the key was sealed under: the peer holds it (V210-89).
+        session: Option<u64>,
         /// Whether it was one of the keys of the history `peer` was owed.
         history: bool,
         /// The [`Node::delivery_epoch`] its watcher started in.
@@ -4274,12 +4276,6 @@ impl Node {
                     self.accepted_hello.remove(&key);
                     self.reopen.remove(&key);
                     self.session_serial.remove(&key);
-                } else if session.is_some() && self.session_serial.get(&key).copied() == session {
-                    // **Any other refusal of a key sealed under the session held** (V210-89): the
-                    // peer may never have read the hello in front of it, or holds a competing
-                    // session. The retry carries the hello again, so the pair converges instead of
-                    // the peer refusing every key for good.
-                    self.offer_hello_again(&key);
                 }
                 // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
                 // from the board) is retried promptly, and one that does not stops costing a
@@ -4434,10 +4430,17 @@ impl Node {
                 channel_id,
                 peer,
                 chain_id,
+                session,
                 history,
                 epoch,
             } => {
                 self.key_backoff.remove(&(channel_id, peer));
+                // Taken under the session still held: the peer holds its hello (V210-89).
+                if session.is_some()
+                    && self.session_serial.get(&(channel_id, peer)).copied() == session
+                {
+                    self.hello_delivered(&channel_id, peer);
+                }
                 // The key was taken, and is recorded so whenever it answered. What is in flight,
                 // and so a whole history batch, is counted only by a watcher of this epoch.
                 let fresh = epoch == self.delivery_epoch;
@@ -5427,9 +5430,6 @@ impl Node {
             Ok(sent) => sent,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
-        if hello.is_some() {
-            self.hello_delivered(channel_id, target);
-        }
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(channel_id).map(Arc::clone),
@@ -6023,9 +6023,6 @@ impl Node {
                     all_sent = false;
                     break;
                 };
-                if hello.is_some() {
-                    self.hello_delivered(channel_id, target);
-                }
                 // Each key's own generation: a refusal re-owes exactly what was refused, and it is
                 // recorded as delivered only once taken (V210-88).
                 self.watch_delivery(sent, *channel_id, target, key.body.chain_id, owes_history);
@@ -7504,8 +7501,9 @@ impl Node {
             .await
             .is_ok()
             {
+                // Offered, not delivered: an `Open` is never answered, so the hello counts as
+                // held only once a key sealed under the session is taken (V210-89).
                 self.reopen.remove(&(channel_id, peer));
-                self.hello_delivered(&channel_id, peer);
             }
         }
     }
@@ -7516,32 +7514,21 @@ impl Node {
         self.session_serial.insert(key, self.last_session_serial);
     }
 
-    /// Record that the peer now holds the hello for a session this node opened.
+    /// Record that the peer now holds the hello for a session this node opened: it took a key
+    /// sealed under it, which it cannot open without the hello (V210-89).
+    ///
+    /// Written is not delivered. A hello used to count as delivered once it was written, and the
+    /// stream can be lost with its connection before the peer reads it. Measured through the real
+    /// binaries: two members who trusted each other at once dialled each other at the same
+    /// moment, each wrote its hello and key over the connection it dialled, and both streams came
+    /// back `connection lost`. Each then held its own session, counted its hello delivered, and
+    /// sent every later key without one; the peer, holding its own, refused each with "the key
+    /// did not open under the session it holds", and neither ever read the other. Counted only
+    /// once taken, every key until then carries the hello, and [`incoming_session_wins`] settles
+    /// the pair at both ends however the two opens interleaved.
     fn hello_delivered(&mut self, channel_id: &Digest32, peer: Digest32) {
         if let Some(i) = self.initiated.get_mut(&(*channel_id, peer)) {
             i.hello_delivered = true;
-        }
-    }
-
-    /// **Offer the hello for a session this node opened again** (V210-89), because something sealed
-    /// under it was not taken. `true` if there is a hello to offer.
-    ///
-    /// A hello counts as delivered once it is written, and written is not delivered: the stream
-    /// can be lost with its connection before the peer reads it. Measured through the real
-    /// binaries: two members who trusted each other at once dialled each other at the same moment,
-    /// each wrote its hello and key over the connection it dialled, and both streams came back
-    /// `connection lost`. Each then held its own session, believed its hello delivered, and sent
-    /// every later key without one; the peer, holding its own, answered each with "the key did
-    /// not open under the session it holds", and neither ever read the other. Only a peer with no
-    /// session at all was recovered (V210-78). Offered again, the hello reaches the peer and
-    /// [`incoming_session_wins`] settles the pair, whichever end it favours.
-    fn offer_hello_again(&mut self, key: &(Digest32, Digest32)) -> bool {
-        match self.initiated.get_mut(key) {
-            Some(i) if i.initial.is_some() => {
-                i.hello_delivered = false;
-                true
-            }
-            _ => false,
         }
     }
 
@@ -7580,6 +7567,7 @@ impl Node {
                         channel_id,
                         peer: target,
                         chain_id,
+                        session,
                         history,
                         epoch,
                     },
@@ -7884,13 +7872,6 @@ impl Node {
             return Some(Err(KeyRefusal::NoSession));
         };
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
-            // The two ends hold different sessions (V210-89). If the one held here is ours, the
-            // peer never took its hello, so offer it again rather than wait for the peer to do
-            // something: the rule then settles the pair, however the two opens interleaved.
-            let key = (channel_id, peer);
-            if self.offer_hello_again(&key) {
-                self.reopen.insert(key);
-            }
             return Some(Err(KeyRefusal::CannotOpen));
         };
         let backfilled = match (

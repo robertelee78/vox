@@ -27,15 +27,17 @@
 //! key over the connection it dialled. About one run in nine both streams came back `connection
 //! lost`: each member then held its own session, counted its hello delivered, and sent every
 //! later key without one, and the other refused each with "the key did not open under the session
-//! it holds" — for good (seen in the daemons' own record of the reds). The fix offers the hello
-//! again whenever a key sealed under a session this node opened is not taken, and whenever a key
-//! arrives that the session held here cannot open.
+//! it holds" — for good (seen in the daemons' own record of the reds). The fix counts a hello as
+//! delivered only once the peer has taken a key sealed under its session, never once it is
+//! written, so every key until then carries the hello again and the lower fingerprint's rule
+//! settles the pair.
 //!
 //! The second test forces that interleaving on every run: `VOX_TEST_LOSE_HELLOS=1` (a test-only
 //! knob, inert when unset) makes bob and carol each lose the first hello they receive, unread,
 //! as a stream lost with its connection is. It asserts both daemons said they lost one (else
-//! CANNOT MEASURE), and that the two still come to read each other. With the product's re-offer
-//! removed it is red on every run: each keeps its own session and neither reads the other.
+//! CANNOT MEASURE), and that the two still come to read each other. With a hello counted as
+//! delivered once written again, it is red on every run: each keeps its own session and neither
+//! reads the other.
 
 #![cfg(unix)]
 
