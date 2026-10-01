@@ -242,7 +242,8 @@ fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
     let tmp = tempfile::tempdir().unwrap();
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
     let host_fp = two_identities(&guest_dir, &host_dir);
-    // No --anchor, no --listen: as a person on a LAN runs it.
+    // No --anchor, no --listen: as a person on a LAN runs it. (`r=` always names the host as the
+    // responder; `a=` is the host named as a place to reach the room.)
     let mut host = VoxProc::spawn("host", &host_dir, &args(&["serve", "22"]));
     let address = line_within(&mut host, ROOM_WITHIN, |l| l.starts_with("address "));
     let address = after_label(
@@ -257,7 +258,7 @@ fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
     );
     let passphrase = passphrase_of(&mut host);
     assert!(
-        address.contains(&host_fp),
+        address.contains(&format!("a={host_fp}")),
         "PRODUCT: the address `vox serve` printed with no anchor does not name the host \
          ({host_fp}), so it names nowhere at all: {address}\nIt said:\n{}",
         host.transcript()
@@ -321,7 +322,7 @@ fn b_anchors_that_are_down_do_not_hold_back_the_address() {
     );
     let passphrase = passphrase_of(&mut host);
     assert!(
-        address.contains(&host_fp),
+        address.contains(&format!("a={host_fp}")),
         "PRODUCT: with four anchors, the address `vox serve` printed does not name the host \
          ({host_fp}) — only anchors, all down: {address}"
     );
@@ -569,7 +570,7 @@ fn d_a_join_asks_every_board_the_address_names() {
         .unwrap_or_else(|_| panic!("APPARATUS: the thread running `vox connect` panicked"));
     let steps: Vec<&str> = err.lines().filter(|l| l.contains("join ")).collect();
     eprintln!(
-        "[proof] arm 2: the guest {} the closed forward; the guest's join {} after {:.2}s; its \
+        "[proof] arm D: the guest {} the closed forward; the guest's join {} after {:.2}s; its \
          steps: {steps:?}; the forward carried {} bytes to the host",
         if knocked.is_some() {
             "knocked on"
