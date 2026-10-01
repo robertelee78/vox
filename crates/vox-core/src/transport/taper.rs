@@ -15,10 +15,16 @@
 //! - **Climb 1 → 2** when the last [`CLIMB_1_ROUNDS`] rounds held at least [`CLIMB_1_LOSSES`]
 //!   losses with no queue building, once tier 1's dwell is over. Tier 1's loss share
 //!   is marked as tier 2's baseline: loss that then grows with Vox's own sending is congestion.
-//! - **Climb 2 → 3** when for [`CLIMB_3_ROUNDS`] consecutive rounds and [`CLIMB_3_TIME`] the loss
-//!   share stayed at or above [`GENTLE_LOSS_CAP`], past which tier 2 cuts for every loss, with no
-//!   queue building in any of them. **The loss share is the clean-LAN guard:** a clean link loses
-//!   only when its queue overflows, well under 1% of what it sends, so it never reaches BBR.
+//! - **Climb 2 → 3** when the loss share over the last 32 MiB sent (`PathSignals::trend_share`)
+//!   is at or above [`GENTLE_LOSS_CAP`], past which tier 2 cuts for every loss, and no queue has
+//!   been held for [`CLIMB_3_QUEUE_ROUNDS`] rounds in the last [`CLIMB_3_ROUNDS`] rounds and
+//!   [`CLIMB_3_TIME`]. Not the share over the last few rounds: at 8 KB datagrams eight rounds
+//!   hold a couple of hundred packets, and on a link losing 5% at random that share read 0–14%
+//!   from one half-second to the next, so a streak of rounds at the cap never reached 20 and tier 3
+//!   was never entered (measured: 1.42x and 1.62x a Cubic flow, against BBR's 7.68x). Nor a
+//!   single round's queue: one round in the trace read 39 ms on a 10.6 ms base with nothing else
+//!   on the path. **The loss share is the clean-LAN guard:** a clean link loses only when its
+//!   queue overflows, well under 1% of what it sends, so it never reaches BBR.
 //! - **Tier 3 is on trial for its whole stay.** A shallow buffer under congestion shows the same
 //!   entry signal as random loss; they part once Vox sends harder, since random loss stays flat
 //!   with the rate and congestion loss climbs. So whenever the loss share rises past
@@ -72,10 +78,12 @@ use super::vox_bbr::{RateSeed, VoxBbr};
 pub(crate) const CLIMB_1_ROUNDS: usize = 8;
 /// …and the losses with no queue building it needs in them.
 pub(crate) const CLIMB_1_LOSSES: u32 = 3;
-/// Consecutive rounds at the loss cap with no queue for a climb from tier 2…
+/// Consecutive rounds without a held queue for a climb from tier 2…
 pub(crate) const CLIMB_3_ROUNDS: u32 = 20;
-/// …spanning at least this long.
+/// …spanning at least this long; a queue is held when it shows for this many rounds in a row.
 pub(crate) const CLIMB_3_TIME: Duration = Duration::from_secs(2);
+/// The rounds in a row a queue must show to break a climb from tier 2.
+pub(crate) const CLIMB_3_QUEUE_ROUNDS: u32 = 2;
 /// Tier 3 fails when the loss share rises this much above its share at entry (or 1.5 times it).
 pub(crate) const TIER3_LOSS_RISE: f64 = 0.03;
 /// Tier 3 is locked out this long after a first failure…
@@ -204,7 +212,10 @@ pub(crate) struct Tapered {
     /// The loss share when tier 3 was entered.
     entry_share: f64,
     backoff: Backoff,
-    at_cap: Streak,
+    /// Rounds without a held queue, toward a climb from tier 2.
+    unqueued: Streak,
+    /// Rounds in a row that showed a queue (any tier but 3).
+    queued: Streak,
     quiet: Streak,
     loss_gone: Streak,
     queue: Streak,
@@ -222,7 +233,8 @@ impl Tapered {
             rounds_in_tier: 0,
             entry_share: 0.0,
             backoff: Backoff::default(),
-            at_cap: Streak::default(),
+            unqueued: Streak::default(),
+            queued: Streak::default(),
             quiet: Streak::default(),
             loss_gone: Streak::default(),
             queue: Streak::default(),
@@ -267,7 +279,9 @@ impl Tapered {
             >= HOLDING_FRACTION * self.signals.best_rate(now) as f64;
 
         self.queue.update(now, tier3_queued);
-        self.at_cap.update(now, share >= GENTLE_LOSS_CAP && !queued);
+        self.queued.update(now, queued);
+        self.unqueued
+            .update(now, self.queued.rounds < CLIMB_3_QUEUE_ROUNDS);
         self.quiet.update(now, !queued && !lossy && holding);
         self.loss_gone.update(now, share < GENTLE_LOSS_CAP / 2.0);
 
@@ -292,7 +306,8 @@ impl Tapered {
             TierId::Two
                 if dwelt
                     && !self.backoff.locked(now)
-                    && self.at_cap.held(now, CLIMB_3_ROUNDS, CLIMB_3_TIME) =>
+                    && self.unqueued.held(now, CLIMB_3_ROUNDS, CLIMB_3_TIME)
+                    && self.signals.trend_share() >= GENTLE_LOSS_CAP =>
             {
                 Some((TierId::Three, "loss at the cap without a queue", false))
             }
@@ -350,7 +365,7 @@ impl Tapered {
         match (from, to) {
             (TierId::One, TierId::Two) => self.signals.mark_loss_baseline(),
             (TierId::Two, TierId::One) => self.signals.clear_loss_baseline(),
-            (_, TierId::Three) => self.entry_share = self.signals.loss_share(),
+            (_, TierId::Three) => self.entry_share = self.signals.trend_share(),
             _ => {}
         }
         tracing::debug!(
@@ -363,6 +378,7 @@ impl Tapered {
             rate = self.signals.delivery_rate(),
             best_rate = self.signals.best_rate(now),
             loss_share = self.signals.loss_share(),
+            trend_share = self.signals.trend_share(),
             entry_share = self.entry_share,
             min_rtt_us = min_rtt.as_micros() as u64,
             round_min_rtt_us = self.signals.round_min_rtt().map_or(0, |d| d.as_micros() as u64),
@@ -375,7 +391,8 @@ impl Tapered {
         self.tier_id = to;
         self.entered_at = now;
         self.rounds_in_tier = 0;
-        self.at_cap.reset();
+        self.unqueued.reset();
+        self.queued.reset();
         self.quiet.reset();
         self.loss_gone.reset();
         self.queue.reset();
