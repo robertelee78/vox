@@ -174,6 +174,8 @@ const T_PUBLISH_REFUSED: u64 = 1717;
 const T_PUBLISH_CURED: u64 = 2091;
 /// `NodeEvent::ConnectionNote` (#229's diagnostics). Additive, beside `T_PUBLISH_CURED`.
 const T_CONNECTION_NOTE: u64 = 2092;
+/// `NodeEvent::HandshakesQueued` (V210-86). Additive, away from the tags beside it.
+const T_HANDSHAKES_QUEUED: u64 = 2186;
 /// [`NodeEvent::JoinSteps`]: where a join's time went.
 const T_JOIN_STEPS: u64 = 1718;
 /// [`NodeEvent::JoinStep`] (V210-85): the step a join is in now. Additive, away from the other
@@ -960,6 +962,21 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::ConnectionNote { peer, note } => {
             e.array(3).uint(T_CONNECTION_NOTE).bytes(peer).text(note);
         }
+        NodeEvent::HandshakesQueued {
+            waited,
+            most_waiting,
+            most_running,
+            refused,
+            longest_ms,
+        } => {
+            e.array(6)
+                .uint(T_HANDSHAKES_QUEUED)
+                .uint(*waited as u64)
+                .uint(*most_waiting as u64)
+                .uint(*most_running as u64)
+                .uint(*refused as u64)
+                .uint(*longest_ms);
+        }
         NodeEvent::SyncFailed {
             channel_id,
             peer,
@@ -1255,6 +1272,23 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedIpc("ipc room not remembered why"))?
                 .to_owned(),
         },
+        (T_HANDSHAKES_QUEUED, 6) => {
+            let mut count = |what| {
+                d.uint()
+                    .ok()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or(Error::MalformedIpc(what))
+            };
+            NodeEvent::HandshakesQueued {
+                waited: count("ipc handshakes waited")?,
+                most_waiting: count("ipc handshakes most waiting")?,
+                most_running: count("ipc handshakes most running")?,
+                refused: count("ipc handshakes refused")?,
+                longest_ms: d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc handshakes longest"))?,
+            }
+        }
         (T_CONNECTION_NOTE, 3) => NodeEvent::ConnectionNote {
             peer: digest(d)?,
             note: d

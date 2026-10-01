@@ -871,6 +871,21 @@ pub enum NodeEvent {
         /// What happened, for the operator.
         note: String,
     },
+    /// More peers dialled this node at once than it runs handshakes for, and the ones past the
+    /// cap waited for a slot or were refused (V210-86): said once per burst, when none is left
+    /// waiting, so an operator can see a burst was absorbed, or how many were turned away.
+    HandshakesQueued {
+        /// How many attempts waited for a slot.
+        waited: usize,
+        /// The most that waited at once.
+        most_waiting: usize,
+        /// The most handshakes that ran at once meanwhile: never more than the cap.
+        most_running: usize,
+        /// How many were refused: no place left to wait, or no slot in time.
+        refused: usize,
+        /// The longest any waited, in milliseconds.
+        longest_ms: u64,
+    },
     /// A join failed, with what each responder that was tried reported.
     ///
     /// `Outcome::Failed(Fault)` is a single token with no room for a reason, so this carries the
