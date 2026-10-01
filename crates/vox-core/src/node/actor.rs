@@ -252,6 +252,10 @@ const SETUP_PATIENCE: Duration = Duration::from_secs(5);
 /// The count of joins actually in flight also feeds `Difficulty::adapted_for_load`, which raises
 /// the proof-of-work a joiner must do as the load climbs. That knob existed all along and was
 /// passed a hardcoded `0`, so it had never once adapted.
+///
+/// **Not first come, first served** (V210-92): a stranger could take every slot with joins it
+/// never finished and keep everyone else out for as long as a member waits on a proof of work.
+/// Past the cap the heaviest source gives up its newest slot; see [`crate::node::joinslots`].
 const JOINS_IN_FLIGHT: usize = 16;
 
 /// How many identity-passphrase checks may run at once.
@@ -2170,7 +2174,7 @@ pub struct Node {
     /// time.
     publish_refusal_first_seen: BTreeMap<(Digest32, String), u64>,
     /// Slots for answering inbound joins; see [`JOINS_IN_FLIGHT`].
-    join_slots: Arc<tokio::sync::Semaphore>,
+    join_slots: Arc<std::sync::Mutex<crate::node::joinslots::JoinSlots>>,
     /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
     verify_slots: Arc<tokio::sync::Semaphore>,
     /// The join exchanges running right now, both sides of them, and the room creations sealing
@@ -2454,7 +2458,7 @@ impl Node {
             discover_peers: std::collections::BTreeSet::new(),
             last_publish_refusal: BTreeMap::new(),
             publish_refusal_first_seen: BTreeMap::new(),
-            join_slots: Arc::new(tokio::sync::Semaphore::new(JOINS_IN_FLIGHT)),
+            join_slots: crate::node::joinslots::JoinSlots::new(JOINS_IN_FLIGHT),
             verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
             join_tasks: tokio::task::JoinSet::new(),
             joining: std::collections::BTreeSet::new(),
@@ -4790,7 +4794,10 @@ impl Node {
         if let Some(pow) = self.pow_params {
             ctx.pow_params = pow;
         }
-        let Ok(slot) = Arc::clone(&self.join_slots).try_acquire_owned() else {
+        let source = crate::node::joinslots::JoinSource::of(&conn);
+        let Some((mut slot, ended)) =
+            crate::node::joinslots::JoinSlots::take(&self.join_slots, peer, source)
+        else {
             // Past the cap: **refused, not queued**, and said out loud. A silent drop here
             // would leave the joiner reading a stream that never answers, which is the
             // failure shape this whole change exists to remove.
@@ -4800,9 +4807,30 @@ impl Node {
                     crate::node::network::short_id(peer)
                 ),
             });
-            Self::spawn_refuse_join(send);
+            // Told why (V210-92): a bare refusal reads to the joiner as a wrong passphrase.
+            tokio::spawn(crate::node::joinstream::refuse_join_as(
+                send,
+                crate::node::joinstream::JoinReject::Busy,
+            ));
             return;
         };
+        if let Some(ended) = ended {
+            // Said as plainly as a refusal: this is the one place a join already under way is
+            // ended by this node rather than by its joiner or its patience.
+            let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                reason: format!(
+                    "ended {}'s join to answer {}: all {JOINS_IN_FLIGHT} join slots were held, \
+                     {}/{}/{} from its source (coarse to fine) and {} by it; it is told the \
+                     member is busy",
+                    crate::node::network::short_id(ended.peer),
+                    crate::node::network::short_id(peer),
+                    ended.weight.0,
+                    ended.weight.1,
+                    ended.weight.2,
+                    ended.weight.3,
+                ),
+            });
+        }
         // Including the slot just taken, so the first joiner sees a load of 1. This is what
         // `Difficulty::adapted_for_load` is for, and it was passed a literal `0` until now — so the
         // anti-flood knob ADR-005 specifies, and ADR-016 describes as adapting "against the
@@ -4811,12 +4839,14 @@ impl Node {
         // This costs an ordinary joiner nothing: `Difficulty::ADAPT_THRESHOLD` is 4, so a load of
         // 1–3 adds zero bits and one person joining a quiet room does exactly the work it did
         // before. Past four it adds a bit per doubling of the queue, capped at `Difficulty::MAX`.
-        let pending_joins =
-            u32::try_from(JOINS_IN_FLIGHT.saturating_sub(self.join_slots.available_permits()))
-                .unwrap_or(u32::MAX);
+        let pending_joins = u32::try_from(crate::node::joinslots::JoinSlots::in_flight(
+            &self.join_slots,
+        ))
+        .unwrap_or(u32::MAX);
         let tx = self.net_tx.clone();
         self.reap_join_tasks();
         let admit_tx = self.net_tx.clone();
+        let signals = Some((slot.worked(), slot.take_ended()));
         self.join_tasks.spawn(async move {
             let _slot = slot;
             let _carried = conn;
@@ -4831,6 +4861,7 @@ impl Node {
                     &store,
                     &ring,
                     pending_joins,
+                    signals,
                     // **The admission lands before the joiner is told it is in.** Awaited here, on
                     // this task, so the actor is never the thing waiting — which is the whole point
                     // of the slot. See `NetEvent::JoinAdmit`.
@@ -9239,6 +9270,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::Unreachable(_) => Fault::Unreachable,
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
         Error::JoinSolveTooSlow { .. } => Fault::SolveTooSlow,
+        Error::JoinResponderBusy | Error::JoinEndedForNewcomer => Fault::MembersBusy,
         Error::Path {
             op: crate::node::profile::VAULT_WRITE,
             ..
