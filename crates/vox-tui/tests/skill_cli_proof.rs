@@ -46,7 +46,7 @@ fn vox(args: &[&str]) -> (bool, String) {
         .args(args)
         .env_remove("VOX_ROOM")
         .output()
-        .expect("run vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox {args:?}: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
@@ -165,14 +165,18 @@ fn extract(skill: &str) -> (Vec<Cmd>, Vec<(String, usize)>) {
 fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
     watchdog::arm();
     let (ok, skill) = vox(&["agent", "skill"]);
-    assert!(ok, "vox agent skill must print the skill: {skill}");
+    assert!(ok, "PRODUCT: vox agent skill must print the skill: {skill}");
     let (cmds, bare) = extract(&skill);
     assert!(
         cmds.len() >= 10,
-        "the extractor must find the skill's commands, or this gate proves nothing: {cmds:?}"
+        "CANNOT MEASURE: the extractor found {} of at least 10 commands in the skill, so this \
+         gate would prove nothing: {cmds:?}\nthe skill:\n{skill}",
+        cmds.len()
     );
 
-    let mut help: BTreeMap<Vec<String>, String> = BTreeMap::new();
+    // Each verb path's `--help`: `Ok` with its text, or `Err` with what vox said instead, so a
+    // red quotes the binary rather than only the skill.
+    let mut help: BTreeMap<Vec<String>, Result<String, String>> = BTreeMap::new();
     let mut problems = Vec::new();
     for c in &cmds {
         for path in &c.paths {
@@ -181,19 +185,24 @@ fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
                 args.push("--help");
                 let (ok, out) = vox(&args);
                 if ok {
-                    out
+                    Ok(out)
                 } else {
-                    String::new()
+                    Err(out)
                 }
             });
-            if h.is_empty() {
-                problems.push(format!(
-                    "`vox {}` is not a command (from: {})",
-                    path.join(" "),
-                    c.source
-                ));
-                continue;
-            }
+            let h = match h {
+                Ok(h) => h,
+                Err(said) => {
+                    problems.push(format!(
+                        "`vox {}` is not a command (from: {}); `vox {} --help` said: {}",
+                        path.join(" "),
+                        c.source,
+                        path.join(" "),
+                        said.trim()
+                    ));
+                    continue;
+                }
+            };
             for f in &c.flags {
                 if !has_flag(h, f) {
                     problems.push(format!(
@@ -209,7 +218,9 @@ fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
     // command falls back to every verb the skill names.
     assert!(
         bare.len() >= 5,
-        "the extractor must find the skill's bare flags, or this half proves nothing: {bare:?}"
+        "CANNOT MEASURE: the extractor found {} of at least 5 bare flags in the skill, so \
+         this half would prove nothing: {bare:?}",
+        bare.len()
     );
     for (f, section) in &bare {
         let local: Vec<&Vec<String>> = cmds
@@ -218,11 +229,12 @@ fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
             .flat_map(|c| c.paths.iter())
             .collect();
         let found = if local.is_empty() {
-            help.values().any(|h| has_flag(h, f))
+            help.values().flatten().any(|h| has_flag(h, f))
         } else {
-            local
-                .iter()
-                .any(|p| help.get(*p).is_some_and(|h| has_flag(h, f)))
+            local.iter().any(|p| {
+                help.get(*p)
+                    .is_some_and(|h| h.as_ref().is_ok_and(|h| has_flag(h, f)))
+            })
         };
         if !found {
             problems.push(format!(
@@ -232,7 +244,7 @@ fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
     }
     assert!(
         problems.is_empty(),
-        "the skill names what the CLI does not have:\n  {}",
+        "PRODUCT: the skill that `vox agent skill` prints names commands the CLI does not have:\n  {}",
         problems.join("\n  ")
     );
     eprintln!(

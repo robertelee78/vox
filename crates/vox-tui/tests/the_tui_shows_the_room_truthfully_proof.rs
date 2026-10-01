@@ -43,6 +43,9 @@
 //! claims ok; its
 //! apparatus failures (exit 2: `pyte` missing, a join or a precondition that did not happen, such
 //! as Dave's join not moving Carol) fail as CANNOT MEASURE, never as a pass.
+//! A driver that runs past its budget was still waiting on `vox` at its last stage, so it
+//! reads PRODUCT, unless the runner itself stalled past `STALL_BUDGET` meanwhile, which reads
+//! CANNOT MEASURE; a driver that ends with no verdict at all is APPARATUS.
 
 #![cfg(unix)]
 
@@ -52,7 +55,55 @@ mod watchdog;
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// The runner's own stalls across the driver's run: a thread that asks to sleep [`Self::TICK`]
+/// and records how much longer than that it was away. A driver past its budget while the
+/// runner itself stood still for a good part of it measured the runner, not `vox`.
+struct StallClock {
+    stop: Arc<AtomicBool>,
+    worst_ms: Arc<AtomicU64>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl StallClock {
+    const TICK: Duration = Duration::from_millis(100);
+
+    fn start() -> Self {
+        let (stop, worst_ms) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let (s, w) = (stop.clone(), worst_ms.clone());
+        let thread = std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let t = Instant::now();
+                std::thread::sleep(Self::TICK);
+                let late = t.elapsed().saturating_sub(Self::TICK);
+                w.fetch_max(late.as_millis() as u64, Ordering::Relaxed);
+            }
+        });
+        Self {
+            stop,
+            worst_ms,
+            thread,
+        }
+    }
+
+    /// The longest the runner was away past one tick.
+    fn stop(self) -> Duration {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread
+            .join()
+            .expect("APPARATUS: the stall clock's thread panicked");
+        Duration::from_millis(self.worst_ms.load(Ordering::Relaxed))
+    }
+}
+
+/// A runner stall past this, during a driver that ran out its budget, is the runner's.
+const STALL_BUDGET: Duration = Duration::from_secs(30);
 
 #[test]
 #[ignore = "real daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
@@ -64,17 +115,19 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // both. A release run takes about a minute.
     watchdog::arm_for(Duration::from_secs(1300));
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_room_truth.py");
+    let clock = StallClock::start();
     let out = pty_driver::run_within(
         script,
         &[env!("CARGO_BIN_EXE_vox"), "truth"],
         Duration::from_secs(1200),
     );
+    let stall = clock.stop();
     let said = out.stdout.clone();
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
         "{said}\n[proof] claims ok: {green} of {} (14 expected); the driver took {:?}; its last \
-         stage: {:?}",
+         stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
         out.stage
@@ -83,31 +136,47 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
         Some(0) => {
             assert!(
                 said.contains("truth PASS"),
-                "exit 0 without a PASS line: {said}"
+                "APPARATUS: the driver exited 0 without a PASS line: {said}"
             );
             assert_eq!(
                 (claims.len(), green),
                 (14, 14),
-                "a PASS must rest on all 14 claims, each ok: {said}"
+                "APPARATUS: the driver said PASS without all 14 claims ok: {said}"
             );
         }
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
         _ if !out.has_verdict("truth") => panic!(
-            "the TUI proof's driver was stopped before it gave a verdict — by its faulthandler \
-             backstop, or from outside — at stage {:?} (exit {:?}; its stack is above, on \
-             stderr): {said}",
+            "APPARATUS: the TUI proof's driver ended with no verdict — an uncaught exception, \
+             its faulthandler backstop, or a stop from outside — at stage {:?} (exit {:?}; its \
+             stack is above, on stderr): {said}",
             out.stage.as_deref().unwrap_or("(before its first stage)"),
             out.code
         ),
-        _ if said.contains("outlived SIGKILL") => {
-            panic!("the TUI proof could not stop the `vox tui` it started: {said}")
-        }
-        _ if said.contains("HUNG at") || out.code.is_none() => panic!(
-            "the TUI proof hung (its stage and stack are above, on stderr): exit {:?}: {said}",
-            out.code
+        _ if said.contains("outlived SIGKILL") => panic!(
+            "APPARATUS: the TUI proof's driver could not reap the `vox tui` it started, even \
+             after SIGKILL: {said}"
         ),
+        _ if said.contains("HUNG at") || out.code.is_none() => {
+            let stage = out.stage.as_deref().unwrap_or("(before its first stage)");
+            // Past its budget the driver was still waiting on `vox` at `stage`, unless the
+            // runner itself stood still: the stall clock says which.
+            assert!(
+                stall <= STALL_BUDGET,
+                "CANNOT MEASURE: the runner stalled {stall:?} during the driver's {:?}, which \
+                 ran past its budget at stage {stage:?} (exit {:?}): {said}",
+                out.took,
+                out.code
+            );
+            panic!(
+                "PRODUCT: the driver ran past its budget at stage {stage:?} after {:?}, waiting \
+                 on `vox` there while the runner kept time (its longest stall {stall:?}); the \
+                 stage and the driver's stack are above, on stderr: exit {:?}: {said}",
+                out.took,
+                out.code
+            )
+        }
         _ => panic!(
-            "the TUI must show the room's newest message, follow and scroll, show consent, \
+            "PRODUCT: the TUI must show the room's newest message, follow and scroll, show consent, \
              verification, reachability and sync as the node has them, and consent to the \
              member selected: \
              red claims: {:?}",

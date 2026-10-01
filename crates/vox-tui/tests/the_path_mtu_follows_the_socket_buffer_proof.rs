@@ -83,11 +83,13 @@ const NOTICE: &str = "path-MTU ceiling";
 /// Ask the OS for the buffer a Vox endpoint asks for, on the same kind of socket, and read back
 /// what it granted.
 fn granted_receive_buffer() -> usize {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a loopback UDP socket");
+    let socket =
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind a loopback UDP socket");
     let sock = socket2::SockRef::from(&socket);
     sock.set_recv_buffer_size(ASKED)
-        .expect("ask for a 4 MiB receive buffer");
-    sock.recv_buffer_size().expect("read SO_RCVBUF back")
+        .expect("APPARATUS: ask for a 4 MiB receive buffer");
+    sock.recv_buffer_size()
+        .expect("APPARATUS: read SO_RCVBUF back")
 }
 
 /// Kill `proc` by its PID and read everything it said, to EOF on both pipes.
@@ -148,24 +150,36 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
 
     let mut w = World::new(echo_service(), true);
     let guest_dir = w.guest_dir.clone();
-    let (forward, at) = w.forward("forward", &guest_dir);
+    let (mut forward, at) = w.forward("forward", &guest_dir);
     // 64 KiB: enough to fill several datagrams at either ceiling, so every endpoint has carried
-    // traffic when it is read.
+    // traffic when it is read. A forward that cannot carry it is the product failing at the very
+    // thing the ceiling is for, so it is a PRODUCT red, quoting both ends.
     let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
-    let back = round_trip(at, &payload, Duration::from_secs(120))
-        .expect("CANNOT MEASURE: the forward did not carry a connection through the world");
+    let back = match round_trip(at, &payload, Duration::from_secs(120)) {
+        Ok(back) => back,
+        Err(e) => panic!(
+            "PRODUCT: the forward did not carry a 64 KiB echo within 120 s: {e}\n\
+             vox forward said:\n{}\nvox serve said:\n{}",
+            forward.transcript(),
+            w.host.as_mut().map(|h| h.transcript()).unwrap_or_default()
+        ),
+    };
     assert!(
         back == payload,
-        "CANNOT MEASURE: the echo came back altered ({} bytes)",
-        back.len()
+        "PRODUCT: the echo came back altered ({} of {} bytes)\nvox forward said:\n{}",
+        back.len(),
+        payload.len(),
+        forward.transcript()
     );
     eprintln!("[proof] echoed {} bytes through the forward", back.len());
 
-    let host = w.host.take().expect("the world's host");
+    let host = w
+        .host
+        .take()
+        .expect("APPARATUS: the world has no host process");
     // Moved out (the temp dir stays with `w`) so it is killed last, after everything that
     // reaches through it.
     let anchor = w._anchor;
-    let mut checked = 0;
     for proc in [forward, host, anchor] {
         let name = proc.name.clone();
         let said = everything_said(proc);
@@ -179,19 +193,19 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
             assert_eq!(
                 notices.len(),
                 1,
-                "{name}: the OS granted {granted} bytes, short of {FULL_READ_BACK}, so {name} must \
+                "PRODUCT: {name}: the OS granted {granted} bytes, short of {FULL_READ_BACK}, so {name} must \
                  run the 1452 ceiling and say so once. It said:\n{}",
                 said.join("\n")
             );
             let line = notices[0].strip_prefix("! ").unwrap_or(notices[0]);
             assert!(
                 line.starts_with(&expected_notice),
-                "{name}: the notice must read {expected_notice:?}…, got {line:?}"
+                "PRODUCT: {name}: the notice must read {expected_notice:?}…, got {line:?}"
             );
         } else {
             assert!(
                 notices.is_empty(),
-                "{name}: the OS granted the full {granted} bytes, so {name} must run the 8192 \
+                "PRODUCT: {name}: the OS granted the full {granted} bytes, so {name} must run the 8192 \
                  ceiling and print no fallback notice. It printed:\n{}",
                 notices
                     .iter()
@@ -200,11 +214,9 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
                     .join("\n")
             );
         }
-        checked += 1;
     }
-    assert_eq!(checked, 3, "anchor, host and forward were each read");
     eprintln!(
-        "[proof] {checked} processes checked: the {} arm",
+        "[proof] 3 processes checked: the {} arm",
         if short {
             "short-grant (1452 notice)"
         } else {

@@ -12,7 +12,9 @@
 //! iteration before chain head". The host now releases the key at admission.
 //!
 //! Every trust edge is added before either daemon starts, and alice posts the moment
-//! bob's `vox room join` returns — the shape that failed.
+//! bob's `vox room join` returns — the shape that failed. Bob joins once, as a person would:
+//! a refused join is a PRODUCT red quoting the join and both daemons, never retried past.
+//! Staging that did not happen (an identity, trust, the anchor, a room) reads CANNOT MEASURE.
 
 #![cfg(unix)]
 
@@ -46,9 +48,9 @@ struct Member {
 impl Member {
     fn new(root: &Path, name: &'static str) -> Self {
         let (data, cfg) = (root.join(name).join("data"), root.join(name).join("cfg"));
-        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&cfg).expect("APPARATUS: create a member's config dir");
         let pass = root.join(format!("{name}.pass"));
-        std::fs::write(&pass, ID_PASS).unwrap();
+        std::fs::write(&pass, ID_PASS).expect("APPARATUS: write a member's passphrase file");
         Self {
             name,
             data,
@@ -73,11 +75,28 @@ impl Member {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn vox");
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn `vox {}`: {e}", args.join(" ")));
         if let Some(s) = stdin {
-            child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
+            child
+                .stdin
+                .take()
+                .expect("APPARATUS: the child's stdin was not piped")
+                .write_all(s.as_bytes())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "APPARATUS: could not write `vox {}`'s stdin: {e}",
+                        args.join(" ")
+                    )
+                });
         }
-        let out = child.wait_with_output().unwrap();
+        let out = child.wait_with_output().unwrap_or_else(|e| {
+            panic!(
+                "APPARATUS: could not wait for `vox {}`: {e}",
+                args.join(" ")
+            )
+        });
         let r = (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -102,7 +121,11 @@ impl Member {
             ],
             None,
         );
-        assert!(ok, "{} id: {err}", self.name);
+        assert!(
+            ok,
+            "CANNOT MEASURE: staging not achieved — {}'s `vox id` failed: {err}",
+            self.name
+        );
         out.trim().to_owned()
     }
 
@@ -121,31 +144,44 @@ impl Member {
             .env("VOX_CONFIG_DIR", &self.cfg)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(err).unwrap()))
+            .stderr(Stdio::from(
+                std::fs::File::create(err).expect("APPARATUS: create a daemon's stderr file"),
+            ))
             .spawn()
-            .expect("spawn vox daemon");
+            .expect("APPARATUS: could not spawn `vox daemon`");
+        let child = Proc(child);
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !self.vox(&["room", "list"], None).0 {
+        loop {
+            let (ok, _, said) = self.vox(&["room", "list"], None);
+            if ok {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
-                "{}'s daemon never answered",
-                self.name
+                "CANNOT MEASURE: staging not achieved — {}'s daemon never answered `vox room \
+                 list` in 60 s; the last answer: {said}\nthe daemon's stderr:\n{}",
+                self.name,
+                std::fs::read_to_string(err).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(500));
         }
-        Proc(child)
+        child
     }
 
-    fn reads(&self, room: &str, text: &str, secs: u64) -> bool {
+    /// Whether `vox room read` showed `text` within `secs`, and its last answer, so a red
+    /// quotes what the reader was shown (or why the read failed) rather than a bare `false`.
+    fn reads(&self, room: &str, text: &str, secs: u64) -> (bool, String) {
         let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut last = String::new();
         while Instant::now() < deadline {
-            let (_, out, _) = self.vox(&["room", "read", room], None);
+            let (ok, out, err) = self.vox(&["room", "read", room], None);
             if out.contains(text) {
-                return true;
+                return (true, out);
             }
+            last = if ok { out } else { format!("(failed) {err}") };
             std::thread::sleep(Duration::from_millis(500));
         }
-        false
+        (false, last)
     }
 }
 
@@ -153,20 +189,21 @@ impl Member {
 #[ignore = "a real anchor and two real daemons with production Argon2id; CI runs it in release"]
 fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let (a_data, a_cfg) = (root.join("anchor/data"), root.join("anchor/cfg"));
-    std::fs::create_dir_all(&a_cfg).unwrap();
-    let anchor_out = root.join("anchor.out");
+    std::fs::create_dir_all(&a_cfg).expect("APPARATUS: create the anchor's config dir");
+    let (anchor_out, anchor_err) = (root.join("anchor.out"), root.join("anchor.err"));
+    let file = |p: &Path| std::fs::File::create(p).expect("APPARATUS: create an anchor log file");
     let _anchor = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &a_data)
             .env("VOX_CONFIG_DIR", &a_cfg)
-            .stdout(Stdio::from(std::fs::File::create(&anchor_out).unwrap()))
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(file(&anchor_out)))
+            .stderr(Stdio::from(file(&anchor_err)))
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: could not spawn `vox node`"),
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     let spec = loop {
@@ -179,7 +216,9 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "CANNOT MEASURE: staging not achieved — the anchor printed no spec in 60 s.\n\
+             stdout:\n{text}\nstderr:\n{}",
+            std::fs::read_to_string(&anchor_err).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
     };
@@ -200,7 +239,11 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
             ],
             None,
         );
-        assert!(ok, "{} trusts {}: {err}", m.name, members[j].name);
+        assert!(
+            ok,
+            "CANNOT MEASURE: staging not achieved — {} could not trust {}: {err}",
+            m.name, members[j].name
+        );
     }
     let _daemons: Vec<Proc> = members
         .iter()
@@ -208,56 +251,66 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
         .collect();
     let [alice, bob] = &members;
 
+    let logs = || {
+        members
+            .iter()
+            .map(|m| {
+                let log = std::fs::read_to_string(root.join(format!("{}.err", m.name)));
+                format!("--- {}'s daemon ---\n{}", m.name, log.unwrap_or_default())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let (ok, _, err) = alice.vox(&["room", "create", "--name", "mission"], Some(ROOM_PASS));
-    assert!(ok, "create: {err}");
-    let room = alice
-        .vox(&["room", "list"], None)
-        .1
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging not achieved — alice's `vox room create` failed: {err}"
+    );
+    let (_, listed, _) = alice.vox(&["room", "list"], None);
+    let room = listed
         .split_whitespace()
         .next()
-        .expect("a room")
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: staging not achieved — alice's `vox room list` shows no room: {listed:?}")
+        })
         .to_owned();
-    let link = alice
-        .vox(&["room", "invite", &room], None)
-        .1
-        .trim()
-        .to_owned();
-    let mut joined = false;
-    for attempt in 1..=6 {
-        if bob
-            .vox(
-                &["room", "join", &link, "--name", "mission"],
-                Some(ROOM_PASS),
-            )
-            .0
-        {
-            joined = true;
-            eprintln!("[receipt] bob joined on attempt {attempt}");
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(5));
-    }
+    let (ok, link, err) = alice.vox(&["room", "invite", &room], None);
     assert!(
-        joined,
-        "bob never joined — the join itself failed, which is not what this proves"
+        ok,
+        "CANNOT MEASURE: staging not achieved — alice's `vox room invite` failed: {err}"
+    );
+    let link = link.trim().to_owned();
+    // One join, as a person makes it: no retry past a refusal, so a join turned away is a red
+    // of its own, with the host's own account of why.
+    let (ok, out, err) = bob.vox(
+        &["room", "join", &link, "--name", "mission"],
+        Some(ROOM_PASS),
+    );
+    assert!(
+        ok,
+        "PRODUCT: bob's `vox room join` of alice's fresh invite failed.\nstdout:\n{out}\n\
+         stderr:\n{err}\n{}",
+        logs()
     );
 
     // The moment the join returns: this is the post that used to be lost for good.
-    assert!(
-        alice
-            .vox(&["room", "post", &room, "warmup from alice"], None)
-            .0
-    );
-    assert!(bob.vox(&["room", "post", &room, "warmup from bob"], None).0);
-    let bob_reads_alice = bob.reads(&room, "warmup from alice", 60);
-    let alice_reads_bob = alice.reads(&room, "warmup from bob", 60);
+    for (who, text) in [(alice, "warmup from alice"), (bob, "warmup from bob")] {
+        let (ok, _, err) = who.vox(&["room", "post", &room, text], None);
+        assert!(
+            ok,
+            "PRODUCT: {}'s `vox room post` right after the join failed: {err}\n{}",
+            who.name,
+            logs()
+        );
+    }
+    let (bob_reads_alice, bob_saw) = bob.reads(&room, "warmup from alice", 60);
+    let (alice_reads_bob, alice_saw) = alice.reads(&room, "warmup from bob", 60);
     assert!(
         bob_reads_alice && alice_reads_bob,
-        "F12: bob reads alice = {bob_reads_alice}, alice reads bob = {alice_reads_bob}; daemon logs:\n{}",
-        members
-            .iter()
-            .map(|m| format!("--- {} ---\n{}", m.name, std::fs::read_to_string(root.join(format!("{}.err", m.name))).unwrap_or_default()))
-            .collect::<Vec<_>>()
-            .join("\n")
+        "PRODUCT: F12: bob reads alice = {bob_reads_alice}, alice reads bob = {alice_reads_bob} \
+         within 60 s.\nbob's last `vox room read`:\n{bob_saw}\nalice's last `vox room \
+         read`:\n{alice_saw}\n{}",
+        logs()
     );
 }

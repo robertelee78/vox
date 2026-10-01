@@ -29,6 +29,10 @@
 //! Each cycle's counts are read [`SETTLE`] after the fetches return and before the next restart
 //! zeroes them, so a circuit opened late is counted too.
 //!
+//! A fetch past [`FETCH_WITHIN`] is **PRODUCT** only when it is still past the bound after taking
+//! off what the runner itself stalled during it, measured on the same timeline by a thread that
+//! sleeps 10 ms at a time; otherwise it is **CANNOT MEASURE**.
+//!
 //! Mutations: every reach runs its own ladder (the coalescing removed) — red, more than one ladder
 //! and circuit; a woken reach dials again instead of taking the connection the first made — red,
 //! two ladders; a woken reach opens a second circuit outside the ladder — red, two circuits; and
@@ -42,6 +46,7 @@ mod watchdog;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,6 +62,56 @@ const FETCH_WITHIN: Duration = Duration::from_secs(5);
 /// reach might still open (the verifier's mutant D opened one 1.5 s on), and well before the next
 /// restart.
 const SETTLE: Duration = Duration::from_secs(4);
+
+/// The runner's own stalls, on the proof's timeline: a thread that sleeps [`TICK`] at a time and
+/// records how late each wake was. Time the runner lost is time no `vox` could have used either.
+struct Stalls {
+    late: Arc<Mutex<Vec<(Instant, Duration)>>>,
+    stop: Arc<AtomicBool>,
+}
+
+const TICK: Duration = Duration::from_millis(10);
+
+impl Stalls {
+    fn start() -> Self {
+        let late = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (l, s) = (Arc::clone(&late), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let before = Instant::now();
+                std::thread::sleep(TICK);
+                let woke = Instant::now();
+                let over = woke.duration_since(before).saturating_sub(TICK);
+                if over > Duration::from_millis(2) {
+                    if let Ok(mut v) = l.lock() {
+                        v.push((woke, over));
+                    }
+                }
+            }
+        });
+        Self { late, stop }
+    }
+
+    /// How long the runner stalled between `from` and `to`.
+    fn within(&self, from: Instant, to: Instant) -> Duration {
+        self.late
+            .lock()
+            .map(|v| {
+                v.iter()
+                    .filter(|(at, _)| *at >= from && *at <= to)
+                    .map(|(_, d)| *d)
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for Stalls {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
 
 struct Running(Child, Arc<Mutex<String>>);
 
@@ -116,7 +171,7 @@ impl Agent {
             .cmd(args)
             .stdin(Stdio::null())
             .output()
-            .expect("spawn vox");
+            .unwrap_or_else(|e| panic!("APPARATUS: could not run {VOX}: {e}"));
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -131,14 +186,16 @@ impl Agent {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX}: {e}"));
         child
             .stdin
             .take()
-            .unwrap()
+            .expect("APPARATUS: the child's stdin was not piped")
             .write_all(stdin.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
+            .unwrap_or_else(|e| panic!("APPARATUS: could not write vox's stdin: {e}"));
+        let out = child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not wait for vox: {e}"));
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -153,7 +210,7 @@ impl Agent {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX}: {e}"));
         let said = Arc::new(Mutex::new(String::new()));
         drain(child.stdout.take(), &said);
         drain(child.stderr.take(), &said);
@@ -162,21 +219,27 @@ impl Agent {
 
     /// Start (or restart) this member's `vox daemon`, and return once it answers.
     fn start_daemon(&mut self) -> Instant {
-        self.daemon = Some(self.spawn(&[
-            "daemon",
-            "--listen",
-            &self.listen,
-            "--anchor",
-            &self.spec,
-            "--passphrase-file",
-            self.pass.to_str().unwrap(),
-        ]));
-        let deadline = Instant::now() + Duration::from_secs(60);
+        self.daemon = Some(
+            self.spawn(&[
+                "daemon",
+                "--listen",
+                &self.listen,
+                "--anchor",
+                &self.spec,
+                "--passphrase-file",
+                self.pass
+                    .to_str()
+                    .expect("APPARATUS: a non-UTF-8 temp path"),
+            ]),
+        );
+        let started = Instant::now();
         while !self.vox(&["room", "list"]).0 {
             assert!(
-                Instant::now() < deadline,
-                "{}'s daemon never answered:\n{}",
+                started.elapsed() < Duration::from_secs(60),
+                "CANNOT MEASURE: staging not achieved — {}'s daemon never answered `vox room list` \
+                 in {:?}; it said:\n{}",
                 self.name,
+                started.elapsed(),
                 self.daemon.as_ref().map(Running::said).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(50));
@@ -188,9 +251,11 @@ impl Agent {
 fn agent(tmp: &tempfile::TempDir, name: &str, listen: &str, spec: &str) -> Agent {
     let data = tmp.path().join(name).join("data");
     let cfg = tmp.path().join(name).join("cfg");
-    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::create_dir_all(&cfg)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make {}: {e}", cfg.display()));
     let pass = tmp.path().join(format!("{name}.pass"));
-    std::fs::write(&pass, ID_PASS).unwrap();
+    std::fs::write(&pass, ID_PASS)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass.display()));
     let mut a = Agent {
         name: name.to_owned(),
         data,
@@ -200,8 +265,15 @@ fn agent(tmp: &tempfile::TempDir, name: &str, listen: &str, spec: &str) -> Agent
         spec: spec.to_owned(),
         daemon: None,
     };
-    let (ok, _, err) = a.vox(&["id", "--identity-passphrase-file", a.pass.to_str().unwrap()]);
-    assert!(ok, "{name}: vox id: {err}");
+    let (ok, _, err) = a.vox(&[
+        "id",
+        "--identity-passphrase-file",
+        &a.pass.to_string_lossy(),
+    ]);
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging not achieved — {name}'s `vox id` failed: {err}"
+    );
     a.start_daemon();
     a
 }
@@ -209,7 +281,8 @@ fn agent(tmp: &tempfile::TempDir, name: &str, listen: &str, spec: &str) -> Agent
 /// A real `vox node` anchor on the dual-stack wildcard, and its spec for an IPv4 and an IPv6 node.
 fn anchor(tmp: &tempfile::TempDir) -> (Running, String, String) {
     let dir = tmp.path().join("anchor");
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make {}: {e}", dir.display()));
     let a = Agent {
         name: "anchor".into(),
         data: dir.join("data"),
@@ -231,12 +304,15 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec:\n{said}"
+            "CANNOT MEASURE: staging not achieved — the anchor never printed its spec in 60 s:\n\
+             {said}"
         );
         std::thread::sleep(Duration::from_millis(100));
     };
-    let (fp, addr) = spec.split_once('@').expect("fp@addr");
-    let port = addr.rsplit('/').next().expect("a port");
+    let Some((fp, addr)) = spec.split_once('@') else {
+        panic!("CANNOT MEASURE: the anchor's spec is not `fingerprint@address`: {spec}");
+    };
+    let port = addr.rsplit('/').next().unwrap_or_default();
     (
         node,
         format!("{fp}@/ip4/127.0.0.1/udp/{port}"),
@@ -244,28 +320,30 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String, String) {
     )
 }
 
-/// The latest circuit count the anchor printed.
-fn circuits(anchor: &Running) -> usize {
-    anchor
-        .said()
-        .lines()
-        .rev()
-        .find_map(|l| {
-            let rest = l.split("vox node: ").nth(1)?;
-            let (_, after) = rest.split_once(" peer(s) connected, ")?;
-            after.split_whitespace().next()?.parse().ok()
-        })
-        .unwrap_or(0)
+/// The latest circuit count the anchor printed, or `None` if it printed no status line to read
+/// one from — which is not zero circuits.
+fn circuits(anchor: &Running) -> Option<usize> {
+    anchor.said().lines().rev().find_map(|l| {
+        let rest = l.split("vox node: ").nth(1)?;
+        let (_, after) = rest.split_once(" peer(s) connected, ")?;
+        after.split_whitespace().next()?.parse().ok()
+    })
 }
 
 fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let started = Instant::now();
     loop {
-        let (_, out, _) = who.vox(args);
+        let (_, out, err) = who.vox(args);
         if ok(&out) {
             return;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "CANNOT MEASURE: staging not achieved — no {what} in {:?}; `vox {}` last said:\n\
+             {out}{err}",
+            started.elapsed(),
+            args.join(" ")
+        );
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -275,15 +353,19 @@ fn fetch(
     bob: &Agent,
     room: &str,
     home: PathBuf,
-) -> std::thread::JoinHandle<(bool, Duration, String)> {
+) -> std::thread::JoinHandle<(bool, Instant, Duration, String)> {
     let mut c = bob.cmd(&["room", "get", room, "artifact.bin"]);
-    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&home)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make {}: {e}", home.display()));
     c.env("HOME", &home).stdin(Stdio::null());
     std::thread::spawn(move || {
         let started = Instant::now();
-        let out = c.output().expect("spawn vox room get");
+        let out = c
+            .output()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not run {VOX} room get: {e}"));
         (
             out.status.success(),
+            started,
             started.elapsed(),
             format!(
                 "{}{}",
@@ -298,16 +380,20 @@ fn fetch(
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn two_fetches_at_once_share_one_dial() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temporary directory");
     let source = tmp.path().join("artifact.bin");
-    std::fs::write(&source, vec![7u8; 100_000]).unwrap();
+    std::fs::write(&source, vec![7u8; 100_000])
+        .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", source.display()));
 
     let (anchor, v4, v6) = anchor(&tmp);
     let alice = agent(&tmp, "alice", "127.0.0.1:0", &v4);
     let mut bob = agent(&tmp, "bob", "[::1]:0", &v6);
     let fp = |a: &Agent| {
         let (ok, out, err) = a.vox(&["id"]);
-        assert!(ok, "vox id: {err}");
+        assert!(
+            ok,
+            "CANNOT MEASURE: staging not achieved — `vox id` failed: {err}"
+        );
         out.trim().to_owned()
     };
     let (alice_fp, bob_fp) = (fp(&alice), fp(&bob));
@@ -319,41 +405,45 @@ fn two_fetches_at_once_share_one_dial() {
             "--name",
             name,
             "--identity-passphrase-file",
-            who.pass.to_str().unwrap(),
+            &who.pass.to_string_lossy(),
         ]);
-        assert!(ok, "trust {name}: {err}");
+        assert!(
+            ok,
+            "CANNOT MEASURE: staging not achieved — trusting {name} failed: {err}"
+        );
     }
     let (ok, _, err) = alice.vox_with(&["room", "create", "--name", "mission"], ROOM_PASS);
-    assert!(ok, "vox room create: {err}");
-    let label = alice
-        .vox(&["room", "list"])
-        .1
-        .split_whitespace()
-        .next()
-        .expect("a room")
-        .to_owned();
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging not achieved — `vox room create` failed: {err}"
+    );
+    let (_, list, err) = alice.vox(&["room", "list"]);
+    let Some(label) = list.split_whitespace().next().map(str::to_owned) else {
+        panic!("CANNOT MEASURE: staging not achieved — `vox room list` names no room: {list}{err}");
+    };
     let (ok, link, err) = alice.vox(&["room", "invite", &label]);
-    assert!(ok, "vox room invite: {err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging not achieved — `vox room invite` failed: {err}"
+    );
     let link = link.trim().to_owned();
-    let room = link
+    let Some(room) = link
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
-        .expect("an invite link naming the room")
-        .to_owned();
-    let mut joined = false;
-    for _ in 0..6 {
-        if bob
-            .vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS)
-            .0
-        {
-            joined = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(5));
-    }
-    assert!(joined, "CANNOT PROVE: bob never joined over the relay");
+        .map(str::to_owned)
+    else {
+        panic!("CANNOT MEASURE: `vox room invite` printed no `vox://` link: {link}");
+    };
+    // One join, no retry: a join that fails is a defect in joining, which is not what this proves,
+    // and retrying would hide it.
+    let (ok, out, err) = bob.vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS);
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging not achieved — bob's `vox room join` over the relay failed: \
+         {out}{err}"
+    );
 
-    let _offer = alice.spawn(&["room", "send", &room, source.to_str().unwrap()]);
+    let _offer = alice.spawn(&["room", "send", &room, &source.to_string_lossy()]);
     until(
         &bob,
         "the offer to reach bob",
@@ -366,6 +456,8 @@ fn two_fetches_at_once_share_one_dial() {
     let mut extra_circuits: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut left_listening: Vec<String> = Vec::new();
+    let mut unmeasured: Vec<String> = Vec::new();
+    let stalls = Stalls::start();
     for cycle in 0..CYCLES {
         // A fresh daemon for bob: no connection to alice to reuse.
         drop(bob.daemon.take());
@@ -373,8 +465,14 @@ fn two_fetches_at_once_share_one_dial() {
         let a = fetch(&bob, &room, tmp.path().join(format!("home-{cycle}-a")));
         let b = fetch(&bob, &room, tmp.path().join(format!("home-{cycle}-b")));
         for (which, h) in [("a", a), ("b", b)] {
-            let (ok, took, said) = h.join().unwrap();
-            eprintln!("[proof] cycle {cycle} fetch {which}: ok={ok} in {took:?}");
+            let (ok, started, took, said) = h
+                .join()
+                .unwrap_or_else(|_| panic!("APPARATUS: fetch {which}'s thread panicked"));
+            let stalled = stalls.within(started, started + took);
+            eprintln!(
+                "[proof] cycle {cycle} fetch {which}: ok={ok} in {took:?} (runner stalled \
+                 {stalled:?})"
+            );
             // A fetch that fails is the claim failing, not the scene: a reach whose circuit another
             // reach closed waits out its attempt and gives up (red on the uncoalesced mutant, 10.24 s).
             if !ok {
@@ -383,8 +481,15 @@ fn two_fetches_at_once_share_one_dial() {
                     bob.daemon.as_ref().map(Running::said).unwrap_or_default()
                 ));
             }
-            if took > FETCH_WITHIN {
-                slow.push(format!("cycle {cycle} fetch {which}: {took:?}"));
+            // Past the bound even without the runner's own stalls: the product was slow.
+            if took.saturating_sub(stalled) > FETCH_WITHIN {
+                slow.push(format!(
+                    "cycle {cycle} fetch {which}: {took:?} (runner stalled {stalled:?})"
+                ));
+            } else if took > FETCH_WITHIN {
+                unmeasured.push(format!(
+                    "cycle {cycle} fetch {which}: {took:?}, of which the runner stalled {stalled:?}"
+                ));
             }
         }
         // Read after the dust settles and before the next restart zeroes the count: a second
@@ -392,8 +497,10 @@ fn two_fetches_at_once_share_one_dial() {
         // by a read the moment they returned.
         std::thread::sleep(SETTLE);
         let (ok, json, err) = bob.vox(&["status", "--json"]);
-        assert!(ok, "vox status --json: {err}");
-        let v: serde_json::Value = serde_json::from_str(&json).expect("status JSON");
+        assert!(ok, "PRODUCT: bob's `vox status --json` failed: {err}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|e| {
+            panic!("PRODUCT: bob's `vox status --json` is not JSON ({e}): {json}")
+        });
         let row = v["reach"]
             .as_array()
             .into_iter()
@@ -404,13 +511,27 @@ fn two_fetches_at_once_share_one_dial() {
         // stopped: bob's daemon went on listening on a port nothing would ever connect to (and,
         // when the first get stopped the shared one while the second was still connecting, the
         // second was refused). With both gets done, bob's daemon listens on no TCP port.
-        let listening = tcp_listeners(bob.daemon.as_ref().expect("bob's daemon").0.id());
+        let listening = tcp_listeners(
+            bob.daemon
+                .as_ref()
+                .expect("APPARATUS: bob's daemon handle is gone")
+                .0
+                .id(),
+        );
         eprintln!("[proof] cycle {cycle}: bob's daemon listens on {listening:?} after both gets");
         if !listening.is_empty() {
             left_listening.push(format!("cycle {cycle}: {listening:?}"));
         }
-        let ladders = row.and_then(|r| r["ladders"].as_u64()).unwrap_or(0);
-        let circuits = row.and_then(|r| r["circuits"].as_u64()).unwrap_or(0);
+        // No row, or a row without the field, cannot say how many: it is not zero.
+        let count = |field: &str| {
+            row.and_then(|r| r[field].as_u64()).unwrap_or_else(|| {
+                panic!(
+                    "CANNOT MEASURE: cycle {cycle}: bob's `vox status --json` has no `reach` \
+                     `{field}` for alice, so nothing dialled her or the field is gone: {json}"
+                )
+            })
+        };
+        let (ladders, circuits) = (count("ladders"), count("circuits"));
         eprintln!(
             "[proof] cycle {cycle}: bob's daemon ran {ladders} ladder(s) and asked for {circuits} \
              circuit(s) to alice"
@@ -420,48 +541,75 @@ fn two_fetches_at_once_share_one_dial() {
         }
         assert!(
             ladders >= 1,
-            "CANNOT PROVE: cycle {cycle} ran no ladder to alice, so nothing dialled her: {json}"
+            "CANNOT MEASURE: cycle {cycle} ran no ladder to alice, so nothing dialled her: {json}"
         );
         if ladders != 1 {
             extra.push(format!("cycle {cycle}: {ladders} ladders"));
         }
     }
-    let carried = circuits(&anchor);
+    let Some(carried) = circuits(&anchor) else {
+        panic!(
+            "CANNOT MEASURE: the anchor printed no status line to read its circuits from:\n{}",
+            anchor.said()
+        );
+    };
     eprintln!("[proof] the anchor reports {carried} circuit(s) carried");
     assert!(
         carried > 0,
-        "CANNOT PROVE: the anchor carried no circuit, so the path was not relayed"
+        "CANNOT MEASURE: the anchor carried no circuit, so the path was not relayed"
     );
     assert!(
         left_listening.is_empty(),
-        "each get must be given its own forward and stop it — bob's daemon was left listening \
+        "PRODUCT: each get must be given its own forward and stop it — bob's daemon was left listening \
          after both gets were done:\n{}",
         left_listening.join("\n")
     );
     assert!(
         failed.is_empty(),
-        "fetches started together must all succeed — a reach lost its circuit to another reach to \
+        "PRODUCT: fetches started together must all succeed — a reach lost its circuit to another reach to \
          the same peer:\n{}",
         failed.join("\n")
     );
     assert!(
         extra_circuits.is_empty(),
-        "reaches to alice started together must open one circuit to her, not one each: \
+        "PRODUCT: reaches to alice started together must open one circuit to her, not one each: \
          {extra_circuits:?}"
     );
     assert!(
         extra.is_empty(),
-        "reaches to alice started together must share one dial, one ladder a cycle: {extra:?}"
+        "PRODUCT: reaches to alice started together must share one dial, one ladder a cycle: {extra:?}"
     );
     assert!(
         slow.is_empty(),
-        "fetches started together took longer than {FETCH_WITHIN:?} — a reach lost its circuit to \
-         another reach to the same peer: {slow:?}"
+        "PRODUCT: fetches started together took longer than {FETCH_WITHIN:?}, past the runner's \
+         own stalls — a reach lost its circuit to another reach to the same peer: {slow:?}"
+    );
+    assert!(
+        unmeasured.is_empty(),
+        "CANNOT MEASURE: a fetch passed {FETCH_WITHIN:?} only by what the runner stalled during \
+         it: {unmeasured:?}"
     );
 }
 
 /// The TCP ports `pid` is listening on, as `lsof` reports them: what a forward leaves behind.
+///
+/// `lsof` exits 1 both when the process has no such socket and when it cannot see the process at
+/// all, so the process is first confirmed visible: an empty list from an `lsof` that could not look
+/// would read as "nothing left listening".
 fn tcp_listeners(pid: u32) -> Vec<String> {
+    let seen = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-F", "p"])
+        .output()
+        .unwrap_or_else(|e| panic!("CANNOT MEASURE: could not run lsof: {e}"));
+    assert!(
+        String::from_utf8_lossy(&seen.stdout)
+            .lines()
+            .any(|l| l == format!("p{pid}")),
+        "CANNOT MEASURE: lsof cannot see bob's daemon (pid {pid}), so it cannot say what it \
+         listens on: exit {:?}: {}",
+        seen.status.code(),
+        String::from_utf8_lossy(&seen.stderr)
+    );
     let out = Command::new("lsof")
         .args([
             "-a",
@@ -475,7 +623,14 @@ fn tcp_listeners(pid: u32) -> Vec<String> {
             "n",
         ])
         .output()
-        .expect("run lsof");
+        .unwrap_or_else(|e| panic!("CANNOT MEASURE: could not run lsof: {e}"));
+    // 0: listeners listed; 1 with nothing on stderr: none. Anything else is lsof failing.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.code() == Some(0) || (out.status.code() == Some(1) && stderr.trim().is_empty()),
+        "CANNOT MEASURE: lsof failed listing bob's daemon's TCP listeners: exit {:?}: {stderr}",
+        out.status.code()
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.strip_prefix('n').map(str::to_owned))

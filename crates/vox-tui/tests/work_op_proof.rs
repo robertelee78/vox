@@ -40,7 +40,7 @@ const RACE_ROUNDS: u32 = 20;
 
 fn rows_with_op(w: &Worker, r: &str, op: &str) -> Vec<serde_json::Value> {
     let o = w.vox(None, &["room", "read", r, "--json"]);
-    assert!(o.ok, "{o:?}");
+    assert!(o.ok, "PRODUCT: `vox room read --json` failed: {o:?}");
     o.ndjson()
         .into_iter()
         .filter(|x| x["op"]["id"] == op)
@@ -61,6 +61,9 @@ fn claim_text(session: &str, res: &str, op: &str) -> String {
 struct Consumer {
     child: std::process::Child,
     lines: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// Why the reader stopped, once it has: a line vox printed that is not JSON, the
+    /// pipe failing, or the stream ending.
+    stopped: Arc<Mutex<Option<String>>>,
 }
 
 impl Consumer {
@@ -75,31 +78,66 @@ impl Consumer {
         for v in HARNESS_SESSION_VARS {
             cmd.env_remove(v);
         }
-        let mut child = cmd.spawn().expect("spawn tail");
-        let out = child.stdout.take().unwrap();
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn `vox room tail`: {e}"));
+        let out = child
+            .stdout
+            .take()
+            .expect("APPARATUS: `vox room tail` has no stdout pipe");
         let lines = Arc::new(Mutex::new(Vec::new()));
-        let sink = lines.clone();
+        let stopped = Arc::new(Mutex::new(None));
+        let (sink, why) = (lines.clone(), stopped.clone());
+        // A reader thread's panic is swallowed with the thread, so it records why it
+        // stopped instead, and `wait` fails the test with that.
         std::thread::spawn(move || {
-            for l in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let mut reason = "PRODUCT: `vox room tail --json` ended its stream".to_owned();
+            for l in std::io::BufReader::new(out).lines() {
+                let l = match l {
+                    Ok(l) => l,
+                    Err(e) => {
+                        reason = format!("APPARATUS: reading `vox room tail`'s stdout failed: {e}");
+                        break;
+                    }
+                };
                 eprintln!("[tail] {l}");
-                sink.lock()
-                    .unwrap()
-                    .push(serde_json::from_str(&l).expect("NDJSON"));
+                match serde_json::from_str(&l) {
+                    Ok(v) => sink.lock().unwrap().push(v),
+                    Err(e) => {
+                        reason = format!(
+                            "PRODUCT: `vox room tail --json` printed a line that is not JSON ({e}): {l:?}"
+                        );
+                        break;
+                    }
+                }
             }
+            *why.lock().unwrap() = Some(reason);
         });
-        Self { child, lines }
+        Self {
+            child,
+            lines,
+            stopped,
+        }
     }
 
-    fn wait(&self, what: &str, pred: impl Fn(&[serde_json::Value]) -> bool) {
+    fn wait(&mut self, what: &str, pred: impl Fn(&[serde_json::Value]) -> bool) {
         let deadline = Instant::now() + support::TIMEOUT;
         while Instant::now() < deadline {
             if pred(&self.lines.lock().unwrap()) {
                 return;
             }
+            if let Some(why) = self.stopped.lock().unwrap().clone() {
+                let status = self.child.try_wait().ok().flatten();
+                panic!(
+                    "{why} (exit {status:?}) before the consumer saw {what}: {:?}",
+                    self.lines.lock().unwrap()
+                );
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!(
-            "the consumer never saw {what}: {:?}",
+            "PRODUCT: the consumer never saw {what} within {:?}: {:?}",
+            support::TIMEOUT,
             self.lines.lock().unwrap()
         );
     }
@@ -120,8 +158,8 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: could not build the test's tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temp dir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
@@ -141,40 +179,45 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
         "-",
     ];
     let first = alice.vox_in(Some("a1"), &args, Some("porting the codec"));
-    assert!(first.ok, "{first:?}");
+    assert!(first.ok, "PRODUCT: the first post failed: {first:?}");
     let again = alice.vox_in(
         Some("a1"),
         &args,
         Some("porting the codec — reworded on retry"),
     );
-    assert!(again.ok, "a retry must succeed: {again:?}");
-    assert_eq!(again.json()["status"], "already-posted", "{again:?}");
+    assert!(again.ok, "PRODUCT: a retry must succeed: {again:?}");
+    assert_eq!(
+        again.json()["status"],
+        "already-posted",
+        "PRODUCT: a retry must report the operation as already posted: {again:?}"
+    );
     assert_eq!(
         again.json()["entry_hash"],
         first.json()["entry_hash"],
-        "a retry must name the SAME entry"
+        "PRODUCT: a retry must name the SAME entry: first={first:?} again={again:?}"
     );
+    let rows = rows_with_op(alice, r, "op-retry-0001");
     assert_eq!(
-        rows_with_op(alice, r, "op-retry-0001").len(),
+        rows.len(),
         1,
-        "a retry must not post a second entry"
+        "PRODUCT: a retry must not post a second entry: {rows:?}"
     );
 
     // The consumer starts here, on the OTHER node, from the current end of its log.
-    let cursor = until(
+    let read = until(
         bob,
         None,
         "bob to see alice's status",
         &["room", "read", r, "--json"],
         |o: &Out| o.ok && o.ndjson().iter().any(|x| x["op"]["id"] == "op-retry-0001"),
-    )
-    .ndjson()
-    .last()
-    .unwrap()["entry_hash"]
-        .as_str()
-        .unwrap()
+    );
+    let cursor = read
+        .ndjson()
+        .last()
+        .and_then(|x| x["entry_hash"].as_str())
+        .unwrap_or_else(|| panic!("PRODUCT: bob's last row names no entry_hash: {read:?}"))
         .to_owned();
-    let consumer = Consumer::start(bob, r, &cursor);
+    let mut consumer = Consumer::start(bob, r, &cursor);
 
     // ---- (2) two entries past the lookup: still one operation ----
     for _ in 0..2 {
@@ -198,22 +241,27 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
     );
     assert!(
         o.ok,
-        "a retry of a duplicated operation reports the holding: {o:?}"
+        "PRODUCT: a retry of a duplicated operation reports the holding: {o:?}"
     );
-    assert_eq!(o.json()["status"], "already-posted", "{o:?}");
+    assert_eq!(
+        o.json()["status"],
+        "already-posted",
+        "PRODUCT: a retry of a duplicated operation must say it is already posted: {o:?}"
+    );
     let dups = rows_with_op(alice, r, "op-race-0002");
-    assert_eq!(dups.len(), 2, "two racing entries are both in the log");
-    let statuses: std::collections::BTreeSet<String> = dups
+    assert_eq!(
+        dups.len(),
+        2,
+        "PRODUCT: two racing entries are both in the log: {dups:?}"
+    );
+    let statuses: std::collections::BTreeSet<&str> = dups
         .iter()
-        .map(|x| x["op"]["status"].as_str().unwrap().to_owned())
+        .map(|x| x["op"]["status"].as_str().unwrap_or("<none>"))
         .collect();
     assert_eq!(
         statuses,
-        ["duplicate", "ok"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect(),
-        "{dups:?}"
+        ["duplicate", "ok"].into_iter().collect(),
+        "PRODUCT: one racing entry must read ok and the other duplicate: {dups:?}"
     );
     consumer.wait("both racing entries, one marked duplicate", |ls| {
         ls.iter()
@@ -230,7 +278,10 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
         Some("a1"),
         &["room", "claim", r, "c-one", "--op", "op-conflict-03"],
     );
-    assert!(o.ok && o.stdout.contains("you hold c-one"), "{o:?}");
+    assert!(
+        o.ok && o.stdout.contains("you hold c-one"),
+        "PRODUCT: alice/a1's claim must say it holds c-one: {o:?}"
+    );
     consumer.wait("the first claim, as an ordinary operation", |ls| {
         ls.iter()
             .any(|x| x["op"]["id"] == "op-conflict-03" && x["op"]["status"] == "ok")
@@ -264,23 +315,23 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
         .json();
         assert!(
             resource(&b, "c-two").is_none(),
-            "{}: a conflicted operation had an effect: {b}",
+            "PRODUCT: {}: a conflicted operation had an effect: {b}",
             w.name
         );
         assert!(
             resource(&b, "dup-res").is_some(),
-            "{}: the duplicated operation must still hold: {b}",
+            "PRODUCT: {}: the duplicated operation must still hold: {b}",
             w.name
         );
         let conflicted = b["violations"]
             .as_array()
-            .unwrap()
+            .unwrap_or_else(|| panic!("PRODUCT: {}: the board has no violations list: {b}", w.name))
             .iter()
             .filter(|v| v["outcome"]["conflict"].is_array())
             .count();
         assert_eq!(
             conflicted, 2,
-            "{}: both conflicting entries are reported: {b}",
+            "PRODUCT: {}: both conflicting entries are reported: {b}",
             w.name
         );
     }
@@ -291,7 +342,7 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
     assert_eq!(
         o.code,
         Some(4),
-        "reusing a conflicted op must exit 4, never 0: {o:?}"
+        "PRODUCT: reusing a conflicted op must exit 4, never 0: {o:?}"
     );
 
     // ---- (4) two conflicting posts racing never both succeed ----
@@ -322,13 +373,23 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
                 cmd.env_remove(v);
             }
             cmd.env("VOX_SESSION", "a1");
-            cmd.spawn().unwrap()
+            cmd.spawn()
+                .unwrap_or_else(|e| panic!("APPARATUS: could not spawn racer {n}: {e}"))
         };
         let (p1, p2) = (spawn(1), spawn(2));
-        let (o1, o2) = (
-            p1.wait_with_output().unwrap(),
-            p2.wait_with_output().unwrap(),
-        );
+        let collect = |p: std::process::Child, n: u32| {
+            p.wait_with_output()
+                .unwrap_or_else(|e| panic!("APPARATUS: could not collect racer {n}: {e}"))
+        };
+        let (o1, o2) = (collect(p1, 1), collect(p2, 2));
+        let said = |o: &std::process::Output| {
+            format!(
+                "exit {:?}, stdout {:?}, stderr {:?}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        };
         eprintln!(
             "[receipt] race {round}: exit {:?} {:?}",
             o1.status.code(),
@@ -336,19 +397,23 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
         );
         assert!(
             !(o1.status.success() && o2.status.success()),
-            "two conflicting posts under one op both reported success"
+            "PRODUCT: race {round}: two conflicting posts under one op both reported success: \
+             {} | {}",
+            said(&o1),
+            said(&o2)
         );
         assert!(
             [o1.status.code(), o2.status.code()].contains(&Some(4)),
-            "the loser of a conflicting race must exit 4: {:?} {:?}",
-            String::from_utf8_lossy(&o1.stderr),
-            String::from_utf8_lossy(&o2.stderr)
+            "PRODUCT: race {round}: the loser of a conflicting race must exit 4: {} | {}",
+            said(&o1),
+            said(&o2)
         );
         let entries = rows_with_op(alice, r, &race_op);
         if entries.len() == 2 {
             assert!(
                 entries.iter().all(|x| x["op"]["status"] == "conflict"),
-                "{entries:?}"
+                "PRODUCT: race {round}: two entries under one op must both read conflict: \
+                 {entries:?}"
             );
         }
     }

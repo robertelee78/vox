@@ -75,7 +75,7 @@ fn agreed(b: &serde_json::Value) -> serde_json::Value {
 
 fn board(w: &Worker, session: Option<&str>, room: &str) -> serde_json::Value {
     let o = w.vox(session, &["room", "board", room, "--json"]);
-    assert!(o.ok, "board: {o:?}");
+    assert!(o.ok, "PRODUCT: `vox room board` failed: {o:?}");
     o.json()
 }
 
@@ -95,6 +95,14 @@ fn wait_state(
         |o: &Out| o.ok && pred(resource(&o.json(), r)),
     )
     .json()
+}
+
+/// The wall clock in milliseconds — the clock a handoff's deadline is measured against.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("APPARATUS: the system clock is before 1970")
+        .as_millis() as u64
 }
 
 fn held_by<'a>(fp: &'a str, session: &'a str) -> impl Fn(Option<&serde_json::Value>) -> bool + 'a {
@@ -136,15 +144,15 @@ fn claims_in_local_order(o: &Out, r: &str) -> Vec<(String, String, u64)> {
 }
 
 #[test]
-#[ignore = "three networked nodes with production Argon2id; CI runs it in release"]
+#[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
 fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: could not build the test's tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temp dir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
@@ -166,7 +174,11 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
                 w.pass.to_str().unwrap(),
             ],
         );
-        assert!(o.ok, "{} must be able to name its peer: {o:?}", w.name);
+        assert!(
+            o.ok,
+            "PRODUCT: {} must be able to name its peer: {o:?}",
+            w.name
+        );
         let listed = w.vox(
             None,
             &[
@@ -178,29 +190,32 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         );
         assert!(
             listed.stdout.contains(name),
-            "{} must now call its peer {name:?}: {listed:?}",
+            "PRODUCT: {} must now call its peer {name:?}: {listed:?}",
             w.name
         );
     }
 
     // ---- (1) ownership is per session ----
     let o = bob.vox(Some("b1"), &["room", "claim", r, "own-1"]);
-    assert!(o.ok && o.stdout.contains("you hold own-1"), "{o:?}");
+    assert!(
+        o.ok && o.stdout.contains("you hold own-1"),
+        "PRODUCT: bob/b1's claim must say it holds own-1: {o:?}"
+    );
     let o = bob.vox(Some("b2"), &["room", "claim", r, "own-1"]);
     assert_eq!(
         o.code,
         Some(1),
-        "a second session of the same harness must LOSE, not share: {o:?}"
+        "PRODUCT: a second session of the same harness must LOSE, not share: {o:?}"
     );
     assert!(
         o.stderr.contains("held by") && o.stderr.contains("/b1"),
-        "{o:?}"
+        "PRODUCT: the losing session must be told bob/b1 holds it: {o:?}"
     );
     let o = bob.vox(Some("b2"), &["room", "release", r, "own-1"]);
     assert_eq!(
         o.code,
         Some(1),
-        "another session's release must have no effect, and say so: {o:?}"
+        "PRODUCT: another session's release must have no effect, and say so: {o:?}"
     );
     wait_state(
         alice,
@@ -212,31 +227,35 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
 
     // ---- (2) untargeted handoff, completed by a bob session ----
     let o = alice.vox(Some("a1"), &["room", "claim", r, "h-any"]);
-    assert!(o.ok, "{o:?}");
+    assert!(o.ok, "PRODUCT: alice/a1 could not claim h-any: {o:?}");
     let o = alice.vox(
         Some("a1"),
         &["room", "handoff", r, "h-any", "--to", b_prefix],
     );
-    assert!(o.ok && o.stdout.contains("reserved for"), "{o:?}");
+    assert!(
+        o.ok && o.stdout.contains("reserved for"),
+        "PRODUCT: a handoff must say whom it reserves the item for: {o:?}"
+    );
     for w in [alice, bob] {
         let b = wait_state(w, r, "the pending handoff everywhere", "h-any", |x| {
             x.is_some_and(|x| x["state"] == "pending" && x["to_fp"] == b_fp && x["from_fp"] == a_fp)
         });
         assert!(
-            resource(&b, "h-any").unwrap()["owner_fp"].is_null(),
-            "pending names no owner"
+            resource(&b, "h-any").is_some_and(|x| x["owner_fp"].is_null()),
+            "PRODUCT: {}: a pending handoff must name no owner: {b}",
+            w.name
         );
     }
     let o = alice.vox(Some("a2"), &["room", "claim", r, "h-any"]);
     assert_eq!(
         o.code,
         Some(1),
-        "a non-recipient must not take a reserved item: {o:?}"
+        "PRODUCT: a non-recipient must not take a reserved item: {o:?}"
     );
     let o = bob.vox(Some("b2"), &["room", "claim", r, "h-any"]);
     assert!(
         o.ok && o.stdout.contains("you hold h-any"),
-        "the recipient's claim completes it: {o:?}"
+        "PRODUCT: the recipient's claim completes it: {o:?}"
     );
     wait_state(
         alice,
@@ -249,15 +268,12 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     assert_eq!(
         o.code,
         Some(1),
-        "the sender relinquished it; its release must change nothing: {o:?}"
+        "PRODUCT: the sender relinquished it; its release must change nothing: {o:?}"
     );
 
     // ---- (3) a session-targeted handoff ----
-    assert!(
-        alice
-            .vox(Some("a1"), &["room", "claim", r, "h-targeted"])
-            .ok
-    );
+    let o = alice.vox(Some("a1"), &["room", "claim", r, "h-targeted"]);
+    assert!(o.ok, "PRODUCT: alice/a1 could not claim h-targeted: {o:?}");
     let o = alice.vox(
         Some("a1"),
         &[
@@ -271,7 +287,7 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
             "b2",
         ],
     );
-    assert!(o.ok, "{o:?}");
+    assert!(o.ok, "PRODUCT: the session-targeted handoff failed: {o:?}");
     wait_state(
         bob,
         r,
@@ -283,23 +299,24 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     assert_eq!(
         o.code,
         Some(1),
-        "the other session of the recipient harness must not complete it: {o:?}"
+        "PRODUCT: the other session of the recipient harness must not complete it: {o:?}"
     );
     let o = bob.vox(Some("b1"), &["room", "decline", r, "h-targeted"]);
-    assert_eq!(o.code, Some(1), "…nor decline it: {o:?}");
+    assert_eq!(o.code, Some(1), "PRODUCT: …nor decline it: {o:?}");
     let o = bob.vox(Some("b2"), &["room", "claim", r, "h-targeted"]);
-    assert!(o.ok && o.stdout.contains("you hold h-targeted"), "{o:?}");
+    assert!(
+        o.ok && o.stdout.contains("you hold h-targeted"),
+        "PRODUCT: the named session's claim must complete the handoff: {o:?}"
+    );
 
     // ---- (4) a decline frees; it does not return to the sender ----
-    assert!(alice.vox(Some("a1"), &["room", "claim", r, "h-decline"]).ok);
-    assert!(
-        alice
-            .vox(
-                Some("a1"),
-                &["room", "handoff", r, "h-decline", "--to", b_prefix]
-            )
-            .ok
+    let o = alice.vox(Some("a1"), &["room", "claim", r, "h-decline"]);
+    assert!(o.ok, "PRODUCT: alice/a1 could not claim h-decline: {o:?}");
+    let o = alice.vox(
+        Some("a1"),
+        &["room", "handoff", r, "h-decline", "--to", b_prefix],
     );
+    assert!(o.ok, "PRODUCT: the handoff of h-decline failed: {o:?}");
     wait_state(
         bob,
         r,
@@ -308,43 +325,64 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         |x| x.is_some_and(|x| x["state"] == "pending"),
     );
     let o = bob.vox(Some("b1"), &["room", "decline", r, "h-decline"]);
-    assert!(o.ok && o.stdout.contains("it is free"), "{o:?}");
+    assert!(
+        o.ok && o.stdout.contains("it is free"),
+        "PRODUCT: a decline must say the item is free: {o:?}"
+    );
     let b = wait_state(alice, r, "alice to see the decline", "h-decline", |x| {
         x.is_none()
     });
     assert!(
         resource(&b, "h-decline").is_none(),
-        "a declined item must be free, NOT back with the sender"
+        "PRODUCT: a declined item must be free, NOT back with the sender: {b}"
     );
     let o = alice.vox(Some("a2"), &["room", "claim", r, "h-decline"]);
     assert!(
         o.ok && o.stdout.contains("you hold h-decline"),
-        "a fresh claim by a third session: {o:?}"
+        "PRODUCT: a fresh claim by a third session must take the declined item: {o:?}"
     );
 
     // ---- (5) a no-TTL claim's handoff still lapses ----
-    assert!(
-        alice.vox(Some("a1"), &["room", "claim", r, "h-expiry"]).ok,
-        "a claim with no --ttl"
+    let o = alice.vox(Some("a1"), &["room", "claim", r, "h-expiry"]);
+    assert!(o.ok, "PRODUCT: a claim with no --ttl failed: {o:?}");
+    // The deadline is read from vox's own answer, so the lapse is checked against the
+    // clock it is computed on — not against a sleep that a slow runner can outlast.
+    let o = alice.vox(
+        Some("a1"),
+        &[
+            "room", "handoff", r, "h-expiry", "--to", b_prefix, "--ttl", "3", "--json",
+        ],
     );
+    assert!(o.ok, "PRODUCT: the handoff with --ttl 3 failed: {o:?}");
+    let state = &o.json()["state"];
     assert!(
-        alice
-            .vox(
-                Some("a1"),
-                &["room", "handoff", r, "h-expiry", "--to", b_prefix, "--ttl", "3"]
-            )
-            .ok
+        state["state"] == "pending",
+        "PRODUCT: a handoff of a no-TTL claim must be pending on the sender's node: {o:?}"
     );
-    wait_state(bob, r, "bob to see the short handoff", "h-expiry", |x| {
-        x.is_some_and(|x| x["state"] == "pending")
-    });
-    std::thread::sleep(std::time::Duration::from_secs(4));
+    let deadline = state["deadline_millis"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("PRODUCT: a --ttl handoff must report its deadline: {o:?}"));
+    // Bob has the handoff once he holds every entry alice does. That does not race the
+    // deadline: a lapsed handoff is still an entry in his log.
+    let entries = board(alice, None, r)["position"]["entries"].clone();
+    until(
+        bob,
+        None,
+        "bob to hold the handoff entry",
+        &["room", "board", r, "--json"],
+        |o: &Out| o.ok && o.json()["position"]["entries"] == entries,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(
+        deadline.saturating_sub(now_ms()) + 1_000,
+    ));
     for w in [alice, bob] {
         let b = board(w, None, r);
         assert!(
             resource(&b, "h-expiry").is_none(),
-            "{}: the handoff's own deadline must free it: {b}",
-            w.name
+            "PRODUCT: {}: {} ms past the handoff's own deadline it still has not freed the \
+             item: {b}",
+            w.name,
+            now_ms() - deadline
         );
     }
 
