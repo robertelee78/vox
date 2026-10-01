@@ -3,7 +3,7 @@
 **Status**: accepted (2026-09-21) — the policy is in force from this change; the harness lands with it
 and grows per capability
 **Date**: 2026-09-21
-**Updated**: 2026-10-01 — "What may block a release, what is optional, what is deleted" added: a valid proof (the shipped binary, used as a person would, whose red names product or test) blocks; an optional test is opt-in and never blocks; everything else, report-only checks included, is deleted. Later the same day: an optional proof is fully optional (it blocks neither CI nor the release gate, sits behind the one cargo feature `optional-proofs`, is compiled by CI and listed in `docs/release/optional-proofs.md`), and a proof is run once and repeated only on smoke. "Publish only what CI proved" amended where it allowed a report-only arm. Also 2026-10-01 — M18.3's journey gains an anchorless arm, and `BoardUnreachable` is described as the board (the host's own or an anchor's), per ADR-012's restated anchor principle. 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
+**Updated**: 2026-10-01 — "What may block a release, what is optional, what is deleted" added: a valid proof (the shipped binary, used as a person would, whose red names product or test) blocks; an optional test is opt-in and never blocks; everything else, report-only checks included, is deleted. Later the same day: an optional proof is fully optional (it blocks neither CI nor the release gate, sits behind the one cargo feature `optional-proofs`, is compiled by CI and listed in `docs/release/optional-proofs.md`), and a proof is run once and repeated only on smoke. The live-model OpenCode proofs and R40/R41/R42 are ruled fully optional, so a tag is no longer blocked by them (§3, "Publish only what CI proved" and "Only real use" amended). "Publish only what CI proved" amended where it allowed a report-only arm. Also 2026-10-01 — M18.3's journey gains an anchorless arm, and `BoardUnreachable` is described as the board (the host's own or an anchor's), per ADR-012's restated anchor principle. 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
 work, and the two obligations they cannot yet meet are recorded in §3's accepted-gaps table rather
 than skipped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -88,6 +88,12 @@ or blocked obligation MUST be recorded as failing or blocked, never as waived-gr
 | Gap | Accepted because | Where it is proved instead |
 |---|---|---|
 | `opencode`: `agent_rehearsal_proof`, `drain_self_filter_proof`, `opencode_plugin_proof`, `tracker_rehearsal_proof` | they drive a live model through a real OpenCode, and CI runners have neither OpenCode nor a model account. The decider chose (2026-09-26) "Only on this Mac": they run with the decider's account on a real Mac. | `scripts/release-gate.sh`, which runs with **no** gap accepted and refuses a tag unless they are green |
+
+**Amended 2026-10-01 (the decider's ruling):** asked whether the release gate should still block a tag on the live-model OpenCode
+proofs, the decider answered "Fully optional". They are optional proofs ("What may block a release,
+what is optional, what is deleted"): they block nothing, neither CI nor the release gate, and a tag is
+no longer refused because they are not green. The table's last column describes the gate before this
+ruling; `scripts/release-gate.sh` is to stop requiring them.
 
 Until 2026-09-26 this table held `install.apple_gate_refuses_unsigned_bytes` (macOS-only, reported
 blocked on Linux). It is closed, as recorded below.
@@ -805,8 +811,10 @@ and R42 is proved by RP-22/23/24 in `build-test`). Both are blocking. No proof i
 (2026-09-27): `cross_process_join_proof` runs in `build-test`, and the reporting-only `flaky-watch` job
 that held it is removed. On the macOS runner R41's WAN link is reported rather than gated
 (`VOX_PERF_REPORT_ONLY=WAN`, a decider decision); it is gated on ubuntu and on real hardware by
-`scripts/release-gate.sh`. **Amended 2026-10-01:** a report-only arm is not permitted ("What may block a release, what is
-optional, what is deleted"); this one is to become blocking or opt-in. Every `cargo test` runs `--no-fail-fast`, so one red cannot hide the rest.
+`scripts/release-gate.sh`. **Amended 2026-10-01 (the decider's ruling):** the decider ruled R40, R41 and R42 "Fully optional", so the transport gates are to
+leave the blocking set: compiled by CI under the `optional-proofs` feature and not run, and not
+required by `scripts/release-gate.sh`. That also removes the report-only WAN arm, which "What may block a
+release, what is optional, what is deleted" forbids. Every `cargo test` runs `--no-fail-fast`, so one red cannot hide the rest.
 
 **Re-running.** If CI on the tagged commit fails and a re-run of that CI run passes, re-run the
 release workflow (its `ci-passed` job reads the run's latest conclusion). Nothing is re-tagged.
@@ -865,7 +873,8 @@ is back in the gate. Its two gaps (`cross-process-join`, `cross-process-tunnel`)
 one accepted gap left is `opencode`. The five live-model proofs need OpenCode and a model account. The
 decider chose (2026-09-26) that they run on the local macOS release gate with the decider's account,
 and that **a tag is not cut unless they are green there**. CI keeps the exception, and says why in
-ci.yml.
+ci.yml. **Amended 2026-10-01 (the decider's ruling):** these proofs are now "Fully optional": a tag is no longer blocked by them, on
+CI or on the local release gate (§3).
 
 **§5 is stale, not current.** Its in-source suites (`governance/vectors.rs`, `cpace`, `cbor`, the UPnP
 mock, `deniable/tests.rs`, the Argon2id timing spike) no longer exist in the tree: there are no
@@ -944,10 +953,16 @@ prove nothing a person depends on.
   the assertion that makes its claim**. A CANNOT MEASURE is not a red and MUST NOT be counted as the
   mutant's result (§7, and "Prove the escalation, not the refusal").
 
-**What this amends.** "Publish only what CI proved" (above) says R41's WAN link on the macOS runner
-is reported rather than gated (`VOX_PERF_REPORT_ONLY=WAN`). That is a report-only arm, which this
-section forbids; it is amended below to say so. The arm is to become a blocking proof or an opt-in
-optional one; until that change lands, CI still sets the variable.
+**Which proofs are optional (the decider, 2026-10-01).** Asked whether the release gate should still
+block a tag on the live-model OpenCode proofs and on R40, R41 and R42, the decider answered "Fully
+optional". They are optional proofs under class 2: they block neither CI nor the release gate.
+
+**What this amends.** §3 and "Only real use of the product is a test" said a tag is not cut unless the
+live-model proofs are green on the local release gate; "Publish only what CI proved" made the
+transport gates (R40, R41) blocking and let R41's WAN link on the macOS runner be reported rather than
+gated (`VOX_PERF_REPORT_ONLY=WAN`), a report-only arm this section forbids. All three are amended in
+place to say so. Until the CI and release-gate changes land, `ci.yml` and `scripts/release-gate.sh`
+still behave as before.
 
 ## Links
 

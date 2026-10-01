@@ -26,7 +26,8 @@ decider's own. Each rule names the ADR section that holds the full record.
     release gate. "those types of tests are great to have at the ready for troubleshooting". One
     mechanism only: the cargo feature `optional-proofs`. CI compiles them without running them, so
     they stay ready, and `docs/release/optional-proofs.md` lists them. A proof that did not run
-    never reads as a pass. (ADR-018, 2026-10-01 section)
+    never reads as a pass. The live-model OpenCode proofs and R40, R41 and R42 are optional: they
+    never block a tag. (ADR-018, 2026-10-01 section)
 - **Run a proof once; repeat only on smoke.** "it feels wasteful to test the same things
   2398439487398327492847239847234 times"; "test when you find smoke"; "not just for funzies". Smoke
   is a red, a flake someone has seen, a timing near its bound, or a claim that is itself a rate.
@@ -80,4 +81,4 @@ unreachable when it was reached. When the anchor is missing, say truthfully what
 ## Words
 
 - Write whitelist and blacklist, in code, comments, docs and messages. Never allow-list or
-  deny-list.
+  deny-list. This is a standing ruling of the decider's.
