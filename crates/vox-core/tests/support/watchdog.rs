@@ -106,10 +106,16 @@ pub const DEBUG_JOIN: Duration = Duration::from_millis(291_980);
 #[allow(dead_code)]
 pub const DEBUG_UNLOCK: Duration = Duration::from_millis(17_590);
 
-/// What a debug build adds to the budget, in seconds: the largest any test of this binary asked
-/// for through [`arm_for`]. Tests run in parallel threads of one process, so the largest covers
-/// every one of them.
-static DEBUG_EXTRA: AtomicU64 = AtomicU64::new(0);
+/// What [`DEBUG_JOIN`] rests on, printed when a debug build arms for its setup.
+const DEBUG_JOIN_MEASURED: &str = "PENDING-MEASUREMENT";
+
+/// What [`DEBUG_UNLOCK`] rests on, printed when a debug build arms for its setup.
+const DEBUG_UNLOCK_MEASURED: &str = "PENDING-MEASUREMENT";
+
+/// The budget, in seconds: the largest any test of this binary asked for through [`arm_for`] or
+/// [`arm_for_setup`], and never less than [`DEFAULT_BUDGET`]. Tests run in parallel threads of one
+/// process, so the largest covers every one of them.
+static BUDGET_SECS: AtomicU64 = AtomicU64::new(DEFAULT_BUDGET.as_secs());
 
 /// What `joins` joins and `unlocks` unlocks cost this build beyond a release build's: in a
 /// release build nothing, in a debug build their measured most ([`DEBUG_JOIN`],
@@ -124,11 +130,22 @@ pub fn debug_cost(joins: u32, unlocks: u32) -> Duration {
 }
 
 /// [`arm`], for a test whose setup makes `joins` joins and `unlocks` production-Argon2id unlocks:
-/// a debug build's budget grows by their measured cost ([`debug_cost`]).
+/// a debug build's budget grows by their measured cost ([`debug_cost`]), and says so.
 #[allow(dead_code)]
-pub fn arm_for(joins: u32, unlocks: u32) {
-    DEBUG_EXTRA.fetch_max(debug_cost(joins, unlocks).as_secs(), Ordering::Relaxed);
-    arm();
+pub fn arm_for_setup(joins: u32, unlocks: u32) {
+    let extra = debug_cost(joins, unlocks);
+    if !extra.is_zero() {
+        say(&format!(
+            "[watchdog] debug build: budget {}s = {}s + {joins} join(s) x {:.1}s + {unlocks} \
+             unlock(s) x {:.1}s (each the most measured: {DEBUG_JOIN_MEASURED}; \
+             {DEBUG_UNLOCK_MEASURED})\n",
+            (DEFAULT_BUDGET + extra).as_secs(),
+            DEFAULT_BUDGET.as_secs(),
+            DEBUG_JOIN.as_secs_f64(),
+            DEBUG_UNLOCK.as_secs_f64(),
+        ));
+    }
+    arm_for(DEFAULT_BUDGET + extra);
 }
 
 /// How long the stack dump may take before the abort goes ahead without it. Symbolicating a
@@ -174,7 +191,17 @@ thread_local! {
 /// Bound this test process's total wall-clock time. Idempotent, so every test in a binary may
 /// call it; the budget covers the binary, not one test, because libtest runs tests in parallel
 /// threads of one process and a per-test bound would abort a healthy neighbour.
+#[allow(dead_code)] // a proof that needs a longer bound calls `arm_for` instead
 pub fn arm() {
+    arm_for(DEFAULT_BUDGET);
+}
+
+/// [`arm`], with `budget` in place of the default: for a proof whose product bounds are longer
+/// than [`DEFAULT_BUDGET`] (a debug-build join may take minutes). The binary's budget is the
+/// largest any of its tests asked for, whichever armed first. `VOX_TEST_WATCHDOG_SECS` still
+/// overrides it.
+pub fn arm_for(default_budget: Duration) {
+    BUDGET_SECS.fetch_max(default_budget.as_secs(), Ordering::Relaxed);
     let name = std::thread::current()
         .name()
         .unwrap_or("<unnamed thread>")
@@ -189,8 +216,8 @@ pub fn arm() {
         }
     });
     ARMED.call_once(|| {
-        // An explicit budget is taken as given; the default grows by what a debug build's tests
-        // asked for, read afresh on every look, since a test may arm after the first did.
+        // An explicit budget is taken as given; otherwise the largest any test asked for, read
+        // afresh on every look, since a test may arm after the first did.
         let fixed = match std::env::var("VOX_TEST_WATCHDOG_SECS") {
             Ok(v) => match v.parse::<u64>() {
                 Ok(0) => return,
@@ -200,9 +227,7 @@ pub fn arm() {
             Err(_) => None,
         };
         let budget = move || {
-            fixed.unwrap_or_else(|| {
-                DEFAULT_BUDGET + Duration::from_secs(DEBUG_EXTRA.load(Ordering::Relaxed))
-            })
+            fixed.unwrap_or_else(|| Duration::from_secs(BUDGET_SECS.load(Ordering::Relaxed)))
         };
         let started = Instant::now();
         std::thread::Builder::new()

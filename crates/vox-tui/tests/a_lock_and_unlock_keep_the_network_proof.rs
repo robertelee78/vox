@@ -143,7 +143,7 @@ fn seconds_after(said: &str, what: &str) -> Option<f64> {
 fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
     // One join, through the TUI; 6 unlocks: two `vox id`s, alice's daemon, the room, and the
     // TUI's unlock and unlock again.
-    watchdog::arm_for(1, 6);
+    watchdog::arm_for_setup(1, 6);
     let tmp = tempfile::tempdir().unwrap();
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");

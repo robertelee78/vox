@@ -214,7 +214,7 @@ fn names(list: &[(String, u64)], fp: &str) -> bool {
 fn an_equivocation_is_caught_said_held_back_and_kept() {
     // Four joins; 36 unlocks: five `vox id`s, twenty `trust add`s, nine daemon starts, the room
     // created, and carol's TUI.
-    watchdog::arm_for(4, 36);
+    watchdog::arm_for_setup(4, 36);
     let tmp = tempfile::tempdir().unwrap();
     let dir = |n: &str| {
         let d = tmp.path().join(n);

@@ -123,7 +123,7 @@ fn backoffs(status: &serde_json::Value, peer: &str) -> Vec<String> {
 fn a_burst_past_the_slot_cap_is_queued() {
     // Bob's joins, [`JOINS_AT_ONCE`] at a time, and the late joins; unlocks: two `vox id`s, two
     // `trust add`s, two daemons, and a room created per join.
-    watchdog::arm_for(
+    watchdog::arm_for_setup(
         (ROOMS.div_ceil(JOINS_AT_ONCE) + STAGE_TRIES) as u32,
         (6 + ROOMS + STAGE_TRIES) as u32,
     );

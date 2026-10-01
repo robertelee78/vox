@@ -26,8 +26,8 @@
 //! must be gone too, with the watchdog saying `0 remain`. And one `vox node` is started under a
 //! `sh` that exits at once, so it is reparented to init (launchd) **before** the abort and is no
 //! longer anyone's descendant — the way a process leaves the parent-pid tree. After the abort,
-//! every listed pid must be gone, and a count of this process group's orphans (`ps`, as `pgrep
-//! -g` would) must be 0. Mutation: the old kill (the parent-pid tree, as listed before the dumps)
+//! every listed pid must be gone, and a count of the inner test's process group's orphans (`ps`, as
+//! `pgrep -g` would) must be 0. Mutation: the old kill (the parent-pid tree, as listed before the dumps)
 //! — the late node and the reparented one outlive the abort — red.
 
 #![cfg(unix)]
@@ -35,6 +35,7 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -42,38 +43,24 @@ const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// Set by the outer test: the directory the inner one works in.
 const INNER: &str = "VOX_WATCHDOG_PROOF_INNER";
 
-/// Every process reparented to init in this process's group — the group the inner test ran in —
-/// except this process's own ancestors: what an aborted inner test left behind, counted as `pgrep
-/// -g` would, not by the pids it wrote down.
-fn group_orphans() -> Vec<u32> {
+/// Every live process reparented to init in process group `group` — the inner test's own group,
+/// which it leads: what an aborted inner test left behind, counted as `pgrep -g <group>` would,
+/// not by the pids it wrote down.
+fn group_orphans(group: u32) -> Vec<u32> {
     let out = Command::new("ps")
         .args(["-A", "-o", "pid=,ppid=,pgid=,stat="])
         .output()
         .expect("ps");
-    let rows: Vec<(u32, u32, u32, bool)> = String::from_utf8_lossy(&out.stdout)
+    String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace();
-            Some((
-                it.next()?.parse().ok()?,
-                it.next()?.parse().ok()?,
-                it.next()?.parse().ok()?,
-                it.next()?.starts_with('Z'),
-            ))
+            let pid: u32 = it.next()?.parse().ok()?;
+            let ppid: u32 = it.next()?.parse().ok()?;
+            let pgid: u32 = it.next()?.parse().ok()?;
+            let zombie = it.next()?.starts_with('Z');
+            (pgid == group && ppid == 1 && !zombie).then_some(pid)
         })
-        .collect();
-    let me = std::process::id();
-    let Some(&(_, mut up, group, _)) = rows.iter().find(|r| r.0 == me) else {
-        return Vec::new();
-    };
-    let mut ancestors = Vec::new();
-    while let Some(r) = rows.iter().find(|r| r.0 == up && !ancestors.contains(&r.0)) {
-        ancestors.push(r.0);
-        up = r.1;
-    }
-    rows.iter()
-        .filter(|r| r.2 == group && r.1 == 1 && !r.3 && r.0 != me && !ancestors.contains(&r.0))
-        .map(|r| r.0)
         .collect()
 }
 
@@ -187,6 +174,9 @@ fn a_watchdog_abort_leaves_nothing_running() {
         ])
         .env(INNER, dir)
         .env("VOX_TEST_WATCHDOG_SECS", "3")
+        // Its own process group, so what it leaves behind is counted by group, apart from every
+        // other process this test's own group holds.
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
@@ -245,10 +235,10 @@ fn a_watchdog_abort_leaves_nothing_running() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let left: Vec<_> = pids.iter().filter(|(_, p)| alive(*p)).collect();
-    let orphans = group_orphans();
+    let orphans = group_orphans(inner.id());
     eprintln!(
         "[proof] {} of {} listed processes still running after the abort: {left:?}; orphans of \
-         this process group: {} {orphans:?}",
+         its process group: {} {orphans:?}",
         left.len(),
         pids.len(),
         orphans.len()

@@ -208,7 +208,7 @@ fn missing_ranges(seen: &BTreeSet<usize>) -> Vec<(usize, usize)> {
 #[ignore = "real vox daemons, 1,500 CLI posts and production Argon2id; CI runs it in release"]
 fn a_newcomer_trusted_before_every_post_reads_all_of_them() {
     // One join; 7 unlocks: two `vox id`s, two `trust add`s, two daemons and the room.
-    watchdog::arm_for(1, 7);
+    watchdog::arm_for_setup(1, 7);
     let tmp = tempfile::tempdir().unwrap();
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
