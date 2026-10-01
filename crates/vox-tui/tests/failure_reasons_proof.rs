@@ -67,6 +67,11 @@ const KEYRING_FILL: bool = !cfg!(debug_assertions) || cfg!(feature = "optional-p
 /// The slowest of four whole debug runs of this proof with case (9): 3,265.6 s, 3,408.0 s,
 /// 3,566.5 s and 4,225.4 s (#295).
 const SLOWEST_DEBUG_RUN: Duration = Duration::from_millis(4_225_400);
+/// A release build's budget. Whole release runs took 311.6 s and 439 s at ordinary load, and one
+/// at load 77 was still in case (9)'s fill when 600 s ran out (#295). So the slowest run seen
+/// took more than 600 s, and the budget is twice that: a hang is minutes or hours over, so the
+/// headroom costs the watchdog nothing.
+const RELEASE_BUDGET: Duration = Duration::from_secs(2 * 600);
 
 /// Say, past the test harness's capture, that `what` was not run, so a green run never reads as
 /// having proven it.
@@ -254,7 +259,7 @@ fn every_common_failure_names_its_cause() {
             // the whole run, not summed from per-add maxima.
             watchdog::arm_for_debug_total(SLOWEST_DEBUG_RUN, 4);
         } else {
-            watchdog::arm();
+            watchdog::arm_for(RELEASE_BUDGET);
         }
     } else {
         // A debug build without case (9): its joins and unlocks at twice their measured most.
