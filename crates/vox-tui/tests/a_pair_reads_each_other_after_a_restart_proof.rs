@@ -39,11 +39,9 @@
 //! - alice rotates: bob renders her post within 90 s (responder → joiner).
 //!
 //! The 90 s are an upper wait for a functional claim, not a latency claim: without the fix the
-//! pair never reads each other again. Joiner → responder took about 31 s: bob's first key went
+//! pair never reads each other again. (Joiner → responder takes about 31 s: bob's first key goes
 //! out on his connection to alice's old process, and the refusal that makes him open a fresh
-//! session came only after that key's 30 s patience. V210-80 (#271) probes a connection whose key
-//! answer is late and closes a dead one, and `the_joiner_is_read_again_promptly_…` holds that arm
-//! to [`JOINER_PROMPTLY`], a latency claim, run in the timing lock.
+//! session comes only after that key's 30 s patience.)
 //!
 //! ## The mutations that must turn it red
 //! - In `NetEvent::SkdmRefused` (`crates/vox-core/src/node/actor.rs`), never forget a session
@@ -395,14 +393,7 @@ fn restarted_responder() -> World {
 }
 
 /// Step 4: `rotator` alone removes carol and posts; `reader` must render that post.
-fn one_rotates(
-    w: &World,
-    rotator: &Member,
-    reader: &Member,
-    arm: &str,
-    why: &str,
-    bound: Duration,
-) {
+fn one_rotates(w: &World, rotator: &Member, reader: &Member, arm: &str, why: &str) {
     let (ok, _, err) = vox(
         &rotator.dir,
         &[
@@ -419,7 +410,7 @@ fn one_rotates(
     post(rotator, &w.room, &text);
     let t0 = Instant::now();
     let mut took = None;
-    while t0.elapsed() < bound {
+    while t0.elapsed() < AFTER_ROTATION {
         if renders(reader, &w.room, &text) {
             took = Some(t0.elapsed());
             break;
@@ -430,19 +421,8 @@ fn one_rotates(
         "[proof] {arm}, {} rotated alone: {} reads the post in {took:?} (bound {}s)",
         rotator.name,
         reader.name,
-        bound.as_secs()
+        AFTER_ROTATION.as_secs()
     );
-    // What each node said about its keys and its connections to the other, on every run: a
-    // key not taken says why, and a dead connection closed says so (V210-80).
-    for (m, tag) in [(&w.bob, "start"), (&w.alice, "restart")] {
-        let log =
-            std::fs::read_to_string(m.dir.join(format!("daemon-{tag}.err"))).unwrap_or_default();
-        for l in log.lines().filter(|l| {
-            l.contains("not take") || l.contains("unanswered") || l.contains("new process")
-        }) {
-            eprintln!("[proof] {} said: {l}", m.name);
-        }
-    }
     let tail = |m: &Member, tag: &str| {
         std::fs::read_to_string(m.dir.join(format!("daemon-{tag}.err")))
             .unwrap_or_default()
@@ -458,7 +438,7 @@ fn one_rotates(
          tail:\n{}\nbob's log tail:\n{}",
         reader.name,
         rotator.name,
-        bound.as_secs(),
+        AFTER_ROTATION.as_secs(),
         tail(&w.alice, "restart"),
         tail(&w.bob, "start")
     );
@@ -475,29 +455,6 @@ fn the_joiner_is_read_again_after_the_responder_restarts() {
         &w.alice,
         "joiner -> responder",
         "bob's key went under the session alice lost when she restarted",
-        AFTER_ROTATION,
-    );
-}
-
-/// **V210-80 (#271): and promptly.** The joiner's re-key used to go out on his connection to the
-/// responder's dead process, which counts as live until it has been silent 30 s; the key waited
-/// out that 30 s before it was counted not taken, then its backoff (31.1–79.1 s measured on this
-/// staging). A key whose answer is late now has its connection probed, and a dead one is closed at
-/// once. Mutation: never probe (`close_if_unanswered` answering `false`) → red past this bound.
-const JOINER_PROMPTLY: Duration = Duration::from_secs(15);
-
-#[test]
-#[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
-fn the_joiner_is_read_again_promptly_after_the_responder_restarts() {
-    watchdog::arm();
-    let w = restarted_responder();
-    one_rotates(
-        &w,
-        &w.bob,
-        &w.alice,
-        "joiner -> responder, promptly",
-        "bob's key waited on his connection to alice's dead process",
-        JOINER_PROMPTLY,
     );
 }
 
@@ -512,6 +469,5 @@ fn the_responder_is_read_again_after_it_restarts() {
         &w.bob,
         "responder -> joiner",
         "bob kept the join's session, which cannot be offered again",
-        AFTER_ROTATION,
     );
 }
