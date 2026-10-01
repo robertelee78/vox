@@ -364,7 +364,10 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             })
             .unwrap_or_default()
     };
-    println!("[proof] vox-oc-* in this run's TMPDIR before it: {}", wake_dirs().len());
+    println!(
+        "[proof] vox-oc-* in this run's TMPDIR before it: {}",
+        wake_dirs().len()
+    );
     let env: Vec<(&str, &std::ffi::OsStr)> = vec![
         ("TMPDIR", oc_tmp.as_os_str()),
         ("XDG_CONFIG_HOME", oc_cfg.as_os_str()),
