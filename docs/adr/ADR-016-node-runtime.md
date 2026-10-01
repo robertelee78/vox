@@ -2,6 +2,8 @@
 
 **Status**: accepted (2026-09-19) — **M13 (single-device node), M14 (two machines chat), M15 (anchors: symmetric-NAT swarm formation *and* convergence between members never online together) and M16.1 (a TCP service reached across the overlay) are all gated in `crates/vox-core/tests/` and run in CI's release step**; the person-facing service surface moves to ADR-017
 **Date**: 2026-09-19
+**Updated**: 2026-10-01 — anchor wording brought in line with ADR-012's restated anchor principle (an anchor only bridges hosts both behind NAT; nothing else requires one): No DHT, the invite link, the bootstrap set, the network join, M14.7e item 4 and M15.1's board-first join.
+
 **Updated**: 2026-09-22 (second note) — **OPEN DEFECT: a cross-process join through an anchor fails roughly
 half the time, at the responder dial.** Named here rather than left as a flaky gate, because it is a product
 defect and the gate is telling the truth.
@@ -83,8 +85,9 @@ series has already fixed:
 - **The headless node is a ciphertext-only sync peer, store, rendezvous point and relay anchor**
   (ADR-012, ADR-014, ADR-015 §"headless node is a sync peer, not a control plane"). It holds no
   user secrets and is never remote-controlled.
-- **No DHT.** Cold start uses a user-controlled bootstrap set, by default the user's own always-on
-  node (ADR-012 §Bootstrap).
+- **No DHT.** Cold start uses the invite link's addresses: the inviting node's own, and any anchors
+  the user configured. An always-on node is needed only to bridge hosts that are both behind NAT
+  (ADR-012 §Bootstrap).
 - **The at-rest unit is the sealed segment** (ADR-010): `log-db | plaintext-cache | index |
   key-material`, sealed under the channel SEK; the store is a durable blob map.
 - **Rust-maximal** (ADR-001 #10): no native code enters the tree.
@@ -155,9 +158,9 @@ decrypt/author paths require — not a configuration flag.
   genesis and the creator's first governance entries appended to the DAG; a member address record
   published (below).
 - **Invite link.** `vox://<channel_id-base32>?b=<multiaddr>[&b=…][&r=<responder-fingerprint>]`. It
-  carries the **rendezvous half** of ADR-005's magnet-link design only: the channelID and the
-  bootstrap multiaddrs of one or more anchor nodes, plus an optional pin of the responder's
-  fingerprint. **The passphrase is never in the link** — the joining client collects it through the
+  carries the **rendezvous half** of ADR-005's magnet-link design only: the channelID and at least
+  one place to reach the room — always the inviting node itself, and the room's and configured
+  anchors if there are any — plus an optional pin of the responder's fingerprint. **The passphrase is never in the link** — the joining client collects it through the
   masked prompt (ADR-015) and it travels out-of-band, so a leaked link is a leaked rendezvous, not a
   leaked channel (the ADR-005 separation). The pre-join and join flows below need nothing else.
 
@@ -165,7 +168,7 @@ decrypt/author paths require — not a configuration flag.
 
 Any node serves the rendezvous service on its `VoxEndpoint` (ALPN `vox/1`, mutually authenticated,
 ADR-011); the configured bootstrap set (`BootstrapSet`) is simply the anchors a client publishes to
-and reads from. It is a request/response protocol on one QUIC bi-stream (u32-BE length-prefixed
+and reads from, if it has any; every node also serves its own rooms on its own board. It is a request/response protocol on one QUIC bi-stream (u32-BE length-prefixed
 canonical-CBOR frames, the ADR-011 stream convention): `PUT <record>` for the three record kinds and
 `GET <channel_id, epoch, kinds>` returning every live record, each gated by the existing
 `RendezvousStore` policy (member-only via the channel's membership oracle, `MIN_REFRESH_SECS`,
@@ -190,7 +193,8 @@ golden-vector obligation extend with it.
 
 ### Join over the network
 
-The joiner resolves the link's anchors, fetches the channel's records, publishes its pre-join record,
+The joiner dials the link's entries (anchors and the inviting node), fetches the channel's records
+from a board that holds them, publishes its pre-join record,
 and dials a member (the pinned responder if given, else any member with live endpoints) with
 `connect_direct`. On a dedicated `join` bi-stream the two sides exchange, in order, the ADR-005
 messages the existing state machine already produces and consumes — the signed `ResponderNonce`
@@ -580,7 +584,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   performs, while keeping the actor the single writer of channel state: `accept_stream` authorizes an
   inbound stream and **serves the board itself** (it needs no channel state), handing every other kind back
   as an `Inbound` for the actor; `publish_local` / `own_records` file this node's genesis, address record
-  and bundle on its own board (a node is its own first anchor, and dialing itself would be absurd);
+  and bundle on its own board (a node is the first board for its own rooms, and dialing itself would be absurd);
   `publish_channel_records` and `publish_genesis` do the same to a remote anchor; `fetch_channel` reads the
   board; `start_join` / `answer_join` run the two sides of the ADR-005 exchange. `SharedMembership` is the
   seam the served board reads: the actor publishes a membership snapshot whenever it changes, and staleness
@@ -649,7 +653,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
      the joiner classifies the member it is joining through as `JoinResponder` (pairwise, plus what an
      unknown peer may already open) from just before the exchange until `JoinerDone`. Without that, a
      joiner's first room was the one room whose key was refused at accept.
-  4. **A node must publish its records to the *anchors*, not only to its own board**, and must **learn the
+  4. **A node must publish its records to its anchors, when it has any, as well as to its own board**, and must **learn the
      current members from the board before syncing**. A key nobody can find cannot be admitted, and an
      ADR-008 session hard-fails on the first entry from an unadmitted author — so a member who joined after
      us would otherwise make every later session fail. Both are now part of join and sync.
@@ -753,7 +757,8 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
     configured set, are persisted in a new sealed segment (`SEG_ANCHORS = 4`, `ChannelState::anchors` /
     `add_anchors`), because a node that forgot them after a restart could not republish its address and
     would fall off the swarm.
-  - **The join is board-first.** The joiner dials the link's anchors in order until one answers, reads the
+  - **The join is board-first.** The joiner dials the link's entries (the room's anchors, then configured
+    anchors, then the inviting node itself) and takes a board that holds the room, reads the
     channel from that board, **announces its pre-join record there before anything else** — on the anchor
     it is what lets the anchor coordinate a punch or carry a circuit for it, on the responder it is what
     authorizes the join stream — then `reach`es the responder (the `r=` pin, else any member the board has

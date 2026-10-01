@@ -3,7 +3,7 @@
 **Status**: accepted (2026-09-21) — the policy is in force from this change; the harness lands with it
 and grows per capability
 **Date**: 2026-09-21
-**Updated**: 2026-10-01 — "What may block a release, what is optional, what is deleted" added: a valid proof (the shipped binary, used as a person would, whose red names product or test) blocks; an optional test is opt-in, never blocks and is loud when not run; everything else, report-only checks included, is deleted. "Publish only what CI proved" amended where it allowed a report-only arm. 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
+**Updated**: 2026-10-01 — "What may block a release, what is optional, what is deleted" added: a valid proof (the shipped binary, used as a person would, whose red names product or test) blocks; an optional test is opt-in, never blocks and is loud when not run; everything else, report-only checks included, is deleted. "Publish only what CI proved" amended where it allowed a report-only arm. Also 2026-10-01 — M18.3's journey gains an anchorless arm, and `BoardUnreachable` is described as the board (the host's own or an anchor's), per ADR-012's restated anchor principle. 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
 work, and the two obligations they cannot yet meet are recorded in §3's accepted-gaps table rather
 than skipped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -426,7 +426,8 @@ Each item is one branch, red→green, with this ADR updated in the same change (
   their blocked claims as failures, which is how the two gaps above came to be written down.
 - **M18.3 — the proof harness.** The node/edge/journey matrix above, driving the shipped binary, with
   retained receipts. Its first obligations are the four edges the rehearsal exercised:
-  `anchor → serve`, `serve → connect`, `connect → up`, `up → ssh`. Gate: each of the three known defects
+  `anchor → serve`, `serve → connect`, `connect → up`, `up → ssh`, and the same journey with no
+  anchor, where host and guest reach each other directly (added 2026-10-01). Gate: each of the three known defects
   is reproduced by the harness when its fix is reverted.
 
 ## A third, and a gate that asserted a guarantee the model declines to make (2026-09-24, CLOSED same day)
@@ -513,7 +514,7 @@ recurred: 12 of 12 on 1de7548 at 1-minute loads up to 69, and 15 of 15 with 005b
 64b9074's test file) under 18 busy processes, at loads up to 95. **Its cause is not named**, and those
 runs only bound its rate: 30 clean runs in a row are what a 1–2% flake produces more often than not.
 What #192 changed is that the next red names itself. `vox room join` now says which side was
-unreachable — the anchor (`BoardUnreachable`) or every member it knows (`Unreachable`), which were one
+unreachable — the board (`BoardUnreachable`: the host's own or an anchor's) or every member it knows (`Unreachable`), which were one
 fault whose words blamed the members either way — and prints the join's recorded steps and what each
 responder said. And the proof reads each daemon's and the anchor's output line by line as it is
 written, where it used to read stderr to EOF, which comes only when the child exits after the panic, so
