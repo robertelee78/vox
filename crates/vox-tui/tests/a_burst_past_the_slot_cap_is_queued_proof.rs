@@ -36,6 +36,9 @@
 //!    post in room 39, 24 s). The push is asserted, not only the read, because Bob's own 30 s tick
 //!    can carry the post and would hide a port still backing off.
 //!
+//! A warm-up post that never reaches Bob once both joins succeeded is a product red (`PRODUCT:`),
+//! not a precondition: delivery is the product.
+//!
 //! ## Preconditions (else CANNOT MEASURE)
 //! - The burst reached the slot cap: on Alice's `vox status --json`, `skipped_at_cap` rose (the
 //!   base) or `queued` rose (ADR-025). A burst that never met the cap proves nothing.
@@ -149,7 +152,8 @@ fn a_burst_past_the_slot_cap_is_queued() {
         }
         assert!(
             start.elapsed() < Duration::from_secs(240),
-            "CANNOT MEASURE: bob never read the warm-up in rooms {unread:?}\nalice:\n{}\nbob:\n{}",
+            "PRODUCT: after both joins succeeded, bob read no warm-up post in rooms {unread:?} \
+             within 240 s of alice posting there\nalice:\n{}\nbob:\n{}",
             alice_d.transcript(),
             bob_d.transcript()
         );
