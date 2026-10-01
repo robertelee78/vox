@@ -523,6 +523,13 @@ pub(crate) const QUEUE_DELAY_SHARE: f64 = 0.4;
 /// cap it took 1.35x, the Cubic flow kept what it got against another Cubic (40 against 38 Mbit/s),
 /// and tail drops fell from 44 thousand to 2.3 thousand.
 pub(crate) const GENTLE_LOSS_CAP: f64 = 0.05;
+/// Loss that grows with Vox's own sending is congestion, whatever the delay says: the loss share
+/// has risen past `max(LOSS_RISE_FACTOR × baseline, baseline + rise)` over the share recorded when
+/// the tier began (`mark_loss_baseline`). Random loss does not move with the rate Vox sends at;
+/// loss Vox causes does. `TIER2_LOSS_RISE` is the absolute rise for tier 2; tier 3's trial uses its
+/// own, in `taper.rs`.
+pub(crate) const LOSS_RISE_FACTOR: f64 = 1.5;
+pub(crate) const TIER2_LOSS_RISE: f64 = 0.005;
 /// How many recent rounds the loss counts cover.
 pub(crate) const LOSS_ROUNDS: usize = 8;
 /// How long the best delivery rate is remembered.
@@ -562,6 +569,7 @@ pub(crate) struct PathSignals {
     last_app_limited: bool,
     rounds: u64,
     recent: std::collections::VecDeque<RoundLoss>,
+    loss_baseline: Option<f64>,
 }
 
 impl Default for PathSignals {
@@ -590,6 +598,7 @@ impl PathSignals {
             last_app_limited: false,
             rounds: 0,
             recent: std::collections::VecDeque::with_capacity(LOSS_ROUNDS + 1),
+            loss_baseline: None,
         }
     }
 
@@ -696,7 +705,10 @@ impl PathSignals {
         let congestion = persistent
             || lost_bytes == 0
             || self.queue_building()
-            || self.loss_share() > GENTLE_LOSS_CAP;
+            || self.loss_share() > GENTLE_LOSS_CAP
+            || self
+                .loss_baseline
+                .is_some_and(|b| self.loss_risen(b, TIER2_LOSS_RISE));
         if congestion {
             self.round_queued += 1;
         } else {
@@ -768,6 +780,22 @@ impl PathSignals {
     /// Losses that came with a queue (or past the cap), over the last `rounds` finished rounds.
     pub(crate) fn losses_with_queue_in_last(&self, rounds: usize) -> u32 {
         self.recent.iter().rev().take(rounds).map(|r| r.queued_losses).sum()
+    }
+
+    /// Record the loss share now as the baseline that [`Self::on_loss`] compares against: the taper
+    /// calls it on entering tier 2, from tier 1's sending.
+    pub(crate) fn mark_loss_baseline(&mut self) {
+        self.loss_baseline = Some(self.loss_share());
+    }
+
+    /// Forget the baseline (back in tier 1, every loss is Cubic's anyway).
+    pub(crate) fn clear_loss_baseline(&mut self) {
+        self.loss_baseline = None;
+    }
+
+    /// Has the loss share risen past `max(LOSS_RISE_FACTOR × baseline, baseline + rise)`?
+    pub(crate) fn loss_risen(&self, baseline: f64, rise: f64) -> bool {
+        self.loss_share() > (LOSS_RISE_FACTOR * baseline).max(baseline + rise)
     }
 
     /// Bytes lost over bytes sent, across the last [`LOSS_ROUNDS`] finished rounds and this one.
