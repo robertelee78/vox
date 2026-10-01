@@ -51,7 +51,8 @@ use support::{until, Worker};
 
 /// A stand-in Claude Code messaging socket: every connection's bytes, as they are written.
 fn listen(path: &std::path::Path) -> mpsc::Receiver<String> {
-    let listener = UnixListener::bind(path).expect("bind the stand-in session socket");
+    let listener = UnixListener::bind(path)
+        .unwrap_or_else(|e| panic!("APPARATUS: bind the stand-in session socket: {e}"));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -89,23 +90,33 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
         })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox agent hook");
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn vox agent hook: {e}"));
     if let Some(input) = stdin {
         child
             .stdin
             .take()
-            .unwrap()
+            .expect("APPARATUS: the hook's stdin")
             .write_all(input.as_bytes())
-            .unwrap();
+            .unwrap_or_else(|e| panic!("APPARATUS: write the hook's stdin: {e}"));
     }
-    let out = child.wait_with_output().expect("vox agent hook ran");
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: wait for vox agent hook: {e}"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
     eprintln!(
         "[receipt] vox {} -> {:?}; stderr: {}",
         args.join(" "),
         out.status.code(),
-        String::from_utf8_lossy(&out.stderr).trim()
+        stderr.trim()
     );
-    assert!(out.status.success(), "`vox agent hook` must exit 0");
+    assert!(
+        out.status.success(),
+        "PRODUCT: `vox agent hook` must exit 0; it exited {:?} and said: {}",
+        out.status.code(),
+        stderr.trim()
+    );
 }
 
 /// The endpoint bob's daemon will wake `session` at, as the hook registered it.
@@ -113,7 +124,12 @@ fn registered_endpoint(bob: &Worker, session: &str) -> (String, String) {
     let body = std::fs::read(bob.paths.session_file(session)).unwrap_or_else(|e| {
         panic!("CANNOT MEASURE: `vox agent hook` registered no session {session}: {e}")
     });
-    let v: serde_json::Value = serde_json::from_slice(&body).expect("a session registration");
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT: `vox agent hook` wrote a session registration that is not JSON ({e}): {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
     (
         v["harness"].as_str().unwrap_or_default().to_owned(),
         v["endpoint"].as_str().unwrap_or_default().to_owned(),
@@ -123,24 +139,36 @@ fn registered_endpoint(bob: &Worker, session: &str) -> (String, String) {
 /// Alice posts `text` exactly as given, through `vox room post <room> -` on her daemon.
 fn post(alice: &Worker, room: &str, text: &str) {
     let o = alice.vox_in(None, &["room", "post", room, "-"], Some(text));
-    assert!(o.ok, "alice could not post: {o:?}");
+    assert!(o.ok, "PRODUCT: alice could not post: {o:?}");
 }
 
-/// Everything bob's stand-in session receives within `within`, stopping early once `done`.
+/// Everything bob's stand-in session receives within `within`, stopping early once `done`, and
+/// the apparatus clock: the longest the collecting loop itself went between two of its own
+/// half-second waits. A loop that stalled for a large part of the window cannot say a wake did
+/// not come in it.
 fn collect(
     inbox: &mpsc::Receiver<String>,
     within: Duration,
     done: impl Fn(&str) -> bool,
-) -> Vec<String> {
+) -> (Vec<String>, Duration) {
+    const WAIT: Duration = Duration::from_millis(500);
     let mut got = Vec::new();
+    let mut stall = Duration::ZERO;
     let deadline = Instant::now() + within;
     while Instant::now() < deadline && !done(&got.join("\n")) {
-        if let Ok(frames) = inbox.recv_timeout(Duration::from_millis(500)) {
+        let asked = Instant::now();
+        if let Ok(frames) = inbox.recv_timeout(WAIT) {
             eprintln!("[receipt] bob's session received: {frames}");
             got.push(frames);
         }
+        stall = stall.max(asked.elapsed().saturating_sub(WAIT));
     }
-    got
+    (got, stall)
+}
+
+/// Whether a stall of the collecting loop leaves too little of `window` to judge a miss.
+fn stalled(stall: Duration, window: Duration) -> bool {
+    stall * 4 > window
 }
 
 #[test]
@@ -150,8 +178,8 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: a tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
     let room = r.id.clone();
@@ -217,7 +245,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     );
     // Twenty seconds after it landed: ten sweeps of the daemon's two-second tick, and long
     // enough for a wrongly-woken or twice-woken session to show.
-    let woken = collect(&inbox, Duration::from_secs(20), |_| false);
+    let (woken, stall) = collect(&inbox, Duration::from_secs(20), |_| false);
     let all = woken.join("\n");
     let wakes = woken
         .iter()
@@ -230,33 +258,47 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         all.contains("OTHER-ADDRESSEE"),
         all.contains("NOT-URGENT")
     );
-    assert!(
-        all.contains("WAKE-UP-FROM-ALICE"),
-        "an urgent message addressed to bob, from another node, must interrupt bob's session; \
-         received {woken:?}; bob's daemon stderr:\n{}",
-        std::fs::read_to_string(&err_path).unwrap_or_default()
-    );
+    if !all.contains("WAKE-UP-FROM-ALICE") {
+        let daemon = std::fs::read_to_string(&err_path).unwrap_or_default();
+        assert!(
+            !stalled(stall, Duration::from_secs(20)),
+            "CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 20 s window, so \
+             a missing wake cannot be judged; received {woken:?}; bob's daemon stderr:\n{daemon}"
+        );
+        panic!(
+            "PRODUCT: an urgent message addressed to bob, from another node, did not interrupt \
+             bob's session within 20 s (apparatus stall {stall:?}); received {woken:?}; bob's \
+             daemon stderr:\n{daemon}"
+        );
+    }
     assert!(
         all.contains("a-token"),
-        "the wake must authenticate with the token the harness registered: {woken:?}"
+        "PRODUCT: the wake must authenticate with the token the harness registered: {woken:?}"
     );
     assert!(
         !all.contains("OTHER-ADDRESSEE"),
-        "a message addressed to another agent must not interrupt bob"
+        "PRODUCT: a message addressed to another agent interrupted bob: {woken:?}"
     );
     assert!(
         !all.contains("NOT-URGENT"),
-        "an addressed message that is not urgent must wait for the next turn"
+        "PRODUCT: an addressed message that is not urgent interrupted bob instead of waiting for \
+         the next turn: {woken:?}"
     );
     assert_eq!(
         wakes, 1,
-        "one urgent message wakes the session once: {woken:?}"
+        "PRODUCT: one urgent message must wake the session once: {woken:?}"
     );
 
     // ---- (4) a wedged session must not stall anybody else's wake ----
     // An OpenCode endpoint that accepts and never answers: its wake would wait for ever.
-    let wedge = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let wedge_url = format!("http://{}", wedge.local_addr().unwrap());
+    let wedge = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("APPARATUS: bind the wedged endpoint: {e}"));
+    let wedge_url = format!(
+        "http://{}",
+        wedge
+            .local_addr()
+            .unwrap_or_else(|e| panic!("APPARATUS: the wedged endpoint's address: {e}"))
+    );
     std::thread::spawn(move || {
         let mut held = Vec::new();
         for s in wedge.incoming().flatten() {
@@ -291,7 +333,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         .unwrap_or(0);
     assert_eq!(
         registered, 2,
-        "CANNOT MEASURE: exactly two sessions registered"
+        "PRODUCT: after two hooks, bob's daemon must hold exactly two session registrations"
     );
     for n in 1..=2 {
         post(
@@ -302,18 +344,26 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
             ),
         );
     }
-    let got = collect(&inbox, Duration::from_secs(45), |g| {
+    let (got, stall) = collect(&inbox, Duration::from_secs(45), |g| {
         g.contains("WEDGE-TEST-1") && g.contains("WEDGE-TEST-2")
-    })
-    .join("\n");
+    });
+    let got = got.join("\n");
     println!(
         "[proof] with a wedged session registered, bob's session got WEDGE-TEST-1 {} and \
          WEDGE-TEST-2 {}",
         got.contains("WEDGE-TEST-1"),
         got.contains("WEDGE-TEST-2")
     );
-    assert!(
-        got.contains("WEDGE-TEST-1") && got.contains("WEDGE-TEST-2"),
-        "a wedged session stalled another session's wakes; received: {got}"
-    );
+    if !(got.contains("WEDGE-TEST-1") && got.contains("WEDGE-TEST-2")) {
+        let daemon = std::fs::read_to_string(&err_path).unwrap_or_default();
+        assert!(
+            !stalled(stall, Duration::from_secs(45)),
+            "CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 45 s window, so \
+             a missing wake cannot be judged; received: {got}; bob's daemon stderr:\n{daemon}"
+        );
+        panic!(
+            "PRODUCT: a wedged session stalled another session's wakes (apparatus stall \
+             {stall:?}); received: {got}; bob's daemon stderr:\n{daemon}"
+        );
+    }
 }

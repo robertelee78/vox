@@ -43,9 +43,8 @@ const REFUSAL: Duration = Duration::from_secs(60);
 
 fn free_tcp_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+        .and_then(|l| l.local_addr())
+        .unwrap_or_else(|e| panic!("APPARATUS: pick a free TCP port: {e}"))
         .port()
 }
 
@@ -81,7 +80,7 @@ fn a_forward_refuses_to_bind_where_the_network_can_reach_it() {
         let left = REFUSAL.saturating_sub(t0.elapsed());
         assert!(
             !left.is_zero(),
-            "`vox forward … {exposed}` neither exited nor bound within {REFUSAL:?}. It said:\n{}",
+            "PRODUCT: `vox forward … {exposed}` neither exited nor bound within {REFUSAL:?}. It said:\n{}",
             fwd.transcript()
         );
         match fwd.lines.recv_timeout(left.min(Duration::from_secs(1))) {
@@ -106,7 +105,7 @@ fn a_forward_refuses_to_bind_where_the_network_can_reach_it() {
             Duration::from_secs(60),
         );
         panic!(
-            "`vox forward` bound {exposed} — every interface — and reported {line:?}; a \
+            "PRODUCT: `vox forward` bound {exposed} — every interface — and reported {line:?}; a \
              connection through it {}. Whoever reaches that port gets this room's service on \
              the guest's membership, with no key and no consent of their own",
             match carried {
@@ -115,21 +114,24 @@ fn a_forward_refuses_to_bind_where_the_network_can_reach_it() {
             }
         );
     }
-    let status = fwd.child.wait().expect("the forward's exit status");
+    let status = fwd
+        .child
+        .wait()
+        .unwrap_or_else(|e| panic!("APPARATUS: wait for the forward's exit status: {e}"));
     let took = t0.elapsed();
     let said = fwd.transcript();
     println!("[proof] `vox forward … {exposed}` exited {status} after {took:?}");
     assert!(
         !status.success(),
-        "`vox forward … {exposed}` exited successfully. It said:\n{said}"
+        "PRODUCT: `vox forward … {exposed}` exited successfully. It said:\n{said}"
     );
     assert!(
         said.contains("loopback"),
-        "the refusal must say the port has to be on loopback. It said:\n{said}"
+        "PRODUCT: the refusal must say the port has to be on loopback. It said:\n{said}"
     );
     assert!(
         !said.contains("not reachable yet"),
-        "the refusal came only after waiting for a path to the host — it must be refused before \
+        "PRODUCT: the refusal came only after waiting for a path to the host — it must be refused before \
          anything is dialled. It said:\n{said}"
     );
 
@@ -138,14 +140,17 @@ fn a_forward_refuses_to_bind_where_the_network_can_reach_it() {
     println!("[proof] {exposed} free afterwards: {}", taken.is_ok());
     assert!(
         taken.is_ok(),
-        "the refused forward left something on {exposed}: {:?}",
+        "PRODUCT: the refused forward left something on {exposed}: {:?}",
         taken.err()
     );
     drop(taken);
 
     // ---- 3. the same guest forwarding on loopback works -------------------------------------
     let (_fwd, at) = w.forward("loopback-forward", &w.guest_dir);
-    assert!(at.ip().is_loopback(), "the control forward bound {at}");
+    assert!(
+        at.ip().is_loopback(),
+        "PRODUCT: the control forward on loopback bound {at}"
+    );
     let payload = b"through a loopback forward";
     let back = round_trip(at, payload, Duration::from_secs(120))
         .expect("CANNOT MEASURE: a loopback forward from the same guest must carry a connection");
