@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""opencode_wake.py <vox> <data_dir> <config_dir> <room> <project> <xdg_config> <plugin_log> <tag>
+"""opencode_wake.py <vox> <data_dir> <config_dir> <room> <project> <xdg_config> <plugin_log> <tmpdir> <tag>
 
 A plain `opencode`, opened by hand with no flags, interrupted by an urgent message addressed to it
 (ADR-020 §6, ADR-021 F17). The caller runs the `vox daemon` holding `<room>` and has installed
@@ -31,18 +31,28 @@ The screen is read through pyte, as the person sees it. Prints, each on its own 
   rather than its words; `<tag> RECEIVED: never` if that turn never answered;
 - `<tag> SCREEN:` and the screen, whenever anything above is not clean.
 
+Then the person quits, and the plugin's wake directory (`vox-oc-*` in `<tmpdir>`, this run's own
+`TMPDIR`) must go with each session (ADR-021 F17). The session above is quit by closing its
+terminal (SIGHUP), and three more plain `opencode`s are opened, each with no turn at all:
+- `<tag> QUIT <how>: removed|left <dir>` — whether that session's directory was gone within
+  `GONE_SECS` of `opencode` exiting, for `hup`, `ctrl+c` (pressed twice) and `/exit`;
+- `<tag> SWEPT: removed|left <dir>` — a fourth session is SIGKILLed **together with** the helper
+  that would have removed its directory, so the directory is left as a crash leaves it; the next
+  `opencode` opened must remove it when it starts.
+
 Exit 0 = it ran to the end (the caller judges the lines); 2 = apparatus (pyte missing, the TUI
 never drew, the turn never started, a post failed); 1 = the driver hung (`HUNG at <stage>`,
 `vox_pty.py`). OpenCode is stopped by its PID, with bounded waits.
 """
-import glob, json, os, re, shutil, subprocess, sys, time
+import glob, json, os, re, shutil, signal, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pyte, reap, stage  # noqa: E402
 
-VOX, DATA, CFG, ROOM, PROJECT, XDG, PLUGIN_LOG, TAG = sys.argv[1:9]
+VOX, DATA, CFG, ROOM, PROJECT, XDG, PLUGIN_LOG, TMP, TAG = sys.argv[1:10]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
+GONE_SECS = 5  # the helper removes it the moment the pipe closes; this is slack, not a wait
 SLEEP = 45  # long enough that the wake is posted and relayed while the tool still runs
 # The tool's own output, computed by the shell so the command's text cannot match it: on screen
 # only once `sleep` has run to its end, whatever the model chooses to say afterwards.
@@ -61,9 +71,9 @@ arm(BUDGET, TAG)
 
 # A cleared environment: an inherited one (cargo test's) silently disables plugin hooks, and a
 # real Claude Code session's variables must never reach anything here.
-env = {k: os.environ[k] for k in ("PATH", "HOME", "SHELL", "LANG", "TMPDIR", "USER")
-       if k in os.environ}
+env = {k: os.environ[k] for k in ("PATH", "HOME", "SHELL", "LANG", "USER") if k in os.environ}
 env.update(TERM="xterm-256color", XDG_CONFIG_HOME=XDG, VOX_DATA_DIR=DATA, VOX_CONFIG_DIR=CFG,
+           TMPDIR=TMP,  # this run's own, so its wake directories are exactly the ones counted
            VOX_BIN=VOX, VOX_PLUGIN_LOG=PLUGIN_LOG,
            # What a person exports before opening `opencode`; nothing else is configured.
            VOX_ROOM=ROOM, VOX_AGENT_NAME="bobby")
@@ -119,13 +129,64 @@ def received(session):
     return users
 
 
+def wake_dirs():
+    return set(glob.glob(os.path.join(TMP, "vox-oc-*")))
+
+
+def open_plain(known):
+    """A plain `opencode` opened by hand in the project, and the wake directory its plugin made
+    (the one in `<tmpdir>` not in `known`, holding its socket); `None` for the directory if none
+    appeared."""
+    t = Tui([opencode], env, rows=60, cols=200)
+    ok = t.until(lambda: any(os.path.exists(os.path.join(d, "wake.sock"))
+                             for d in wake_dirs() - known), 60)
+    new = sorted(wake_dirs() - known)
+    return t, (new[0] if ok and len(new) == 1 else None)
+
+
+def quit(t, how):
+    """The person quits `opencode`: `hup` closes its terminal, `ctrl+c` presses ctrl+C (twice,
+    unless the first already ended it), `/exit` types the command. Whether it exited."""
+    if how == "hup":
+        t.close()  # the terminal goes away: the kernel hangs up its session
+        return reap(t.pid, 15)
+    try:
+        if how == "ctrl+c":
+            t.key("\x03", 1)
+            if not reap(t.pid, 0, t.drain):
+                t.key("\x03", 1)
+        else:
+            t.key("/exit", 1)
+            t.key("\r", 1)
+    except OSError:
+        pass  # its terminal already closed under the key: it is exiting
+    return reap(t.pid, 15, t.drain)
+
+
+def gone(d):
+    end = time.time() + GONE_SECS
+    while os.path.exists(d) and time.time() < end:
+        time.sleep(0.1)
+    return not os.path.exists(d)
+
+
+def helper_of(d):
+    """The pid of the process that is to remove `d` when its `opencode` exits, if one runs."""
+    ps = subprocess.run(["ps", "-axww", "-o", "pid=,args="], capture_output=True, text=True).stdout
+    for line in ps.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if "vox-oc-cleanup" in args and args.rstrip().endswith(d):
+            return int(pid)
+    return None
+
+
 BEFORE = set(glob.glob(os.path.join(DATA, "*", "sessions", "*.json")))  # earlier sessions
 code = 2
 tui = None
 try:
     stage("open opencode")
     os.chdir(PROJECT)  # opened in the project, as a person does; the pty's child inherits it
-    tui = Tui([opencode], env, rows=60, cols=200)
+    tui, first = open_plain(wake_dirs())
     flat = lambda: " ".join(tui.text().split())  # noqa: E731 — wrapped text, as one line
     if not tui.until(lambda: len(tui.text().strip()) > 0, 60):
         print(f"{TAG} APPARATUS: opencode never drew its screen")
@@ -191,6 +252,62 @@ try:
               f"envelope={'yes' if envelope else 'no'}")
         if woken != 1 or others != 1 or envelope:
             print(f"{TAG} GIVEN:\n" + "\n----\n".join(users))
+
+    # ---- the person quits, and each session's wake directory goes with it ----
+    stage("close the terminal of the session above")
+    if first is None:
+        print(f"{TAG} APPARATUS: no wake directory of the first session's could be told apart "
+              f"in {TMP}: {sorted(wake_dirs())}")
+        sys.exit(2)
+    if not quit(tui, "hup"):
+        print(f"{TAG} APPARATUS: opencode outlived its terminal closing")
+        sys.exit(2)
+    tui = None
+    print(f"{TAG} QUIT hup: {'removed' if gone(first) else 'left'} {first}")
+    for how in ("ctrl+c", "/exit"):
+        stage(f"open a plain opencode and quit it by {how}")
+        tui, d = open_plain(wake_dirs())
+        if d is None:
+            print(f"{TAG} APPARATUS: the plugin of the opencode to quit by {how} opened no wake "
+                  f"directory in {TMP} within 60s: {sorted(wake_dirs())}")
+            sys.exit(2)
+        tui.pump(3)  # its prompt takes keys once it has finished starting
+        if not quit(tui, how):
+            print(f"{TAG} APPARATUS: opencode did not exit on {how}")
+            print(f"{TAG} SCREEN:\n{tui.text()}")
+            sys.exit(2)
+        tui = None
+        print(f"{TAG} QUIT {how}: {'removed' if gone(d) else 'left'} {d}")
+
+    stage("kill an opencode and its cleanup together, then open another")
+    tui, crashed = open_plain(wake_dirs())
+    if crashed is None:
+        print(f"{TAG} APPARATUS: the plugin of the opencode to kill opened no wake directory")
+        sys.exit(2)
+    helper = helper_of(crashed)
+    if helper is not None:
+        os.kill(helper, signal.SIGKILL)
+    os.kill(tui.pid, signal.SIGKILL)
+    if not reap(tui.pid, 15, tui.drain):
+        print(f"{TAG} APPARATUS: opencode outlived SIGKILL")
+        sys.exit(2)
+    tui.close()
+    tui = None
+    if not os.path.exists(crashed):
+        print(f"{TAG} APPARATUS: {crashed} went with the kill, so it cannot show the next "
+              f"start removing it (helper pid {helper})")
+        sys.exit(2)
+    time.sleep(11)  # older than the plugin's guard for a socket bound and not yet listening
+    tui, d = open_plain(wake_dirs())
+    if d is None:
+        print(f"{TAG} APPARATUS: the opencode opened after the kill made no wake directory")
+        sys.exit(2)
+    print(f"{TAG} SWEPT: {'removed' if gone(crashed) else 'left'} {crashed}")
+    tui.pump(3)
+    if not quit(tui, "/exit"):
+        print(f"{TAG} APPARATUS: opencode did not exit on /exit")
+        sys.exit(2)
+    tui = None
     code = 0
 except Hung as h:
     print(f"{TAG} HUNG at {h}")

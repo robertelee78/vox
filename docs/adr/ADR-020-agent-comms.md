@@ -977,8 +977,8 @@ Both unknowns are already spiked; neither remains open.
   > message that woke nothing, and no envelope JSON. **A Claude Code wake had the same defect:**
   > measured against a live Claude Code 2.1.287, a message written to its messaging socket runs
   > `UserPromptSubmit` with that message as `prompt`, so the drain read the woken message into the
-  > same turn. The drain now recognises its own wake in the `prompt` it runs on (the wake's header for
-  > the room, the entry and every word) and skips that entry; `remote_interrupt_proof` (5) runs the
+  > same turn. The drain now recognises its own wake in the `prompt` it runs on (the wake's opening, its
+  > room's label, the entry and every word) and skips that entry; `remote_interrupt_proof` (5) runs the
   > hook on the wake its stand-in socket received and asserts the room read leaves it out. That spike
   > also showed Claude Code presenting the wake as a message "from another Claude session … a
   > teammate's request", so the wake now opens by saying plainly it is a Vox room message: who sent
