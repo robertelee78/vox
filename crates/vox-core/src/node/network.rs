@@ -1431,6 +1431,10 @@ impl NodeNet {
         store: &Store,
         ring: &tokio::sync::Mutex<PrekeyRing>,
         pending_joins: u32,
+        slot: Option<(
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+            Option<tokio::sync::oneshot::Receiver<()>>,
+        )>,
         admit_before_accepting: F,
     ) -> Result<JoinOutcome>
     where
@@ -1444,8 +1448,22 @@ impl NodeNet {
             base_difficulty: Difficulty::DEFAULT_INVITE,
             pending_joins,
             now_secs: self.now(),
+            worked: slot
+                .as_ref()
+                .map(|(worked, _)| std::sync::Arc::clone(worked)),
         };
-        run_responder(send, recv, peer, &cfg, store, ring, admit_before_accepting).await
+        let ended = slot.and_then(|(_, ended)| ended);
+        run_responder(
+            send,
+            recv,
+            peer,
+            &cfg,
+            store,
+            ring,
+            ended,
+            admit_before_accepting,
+        )
+        .await
     }
 
     /// Run the ADR-005 **joiner** side against a member over `conn` (which must be

@@ -83,6 +83,19 @@ impl Profile {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
+        Self::create_noting(paths, passphrase, now_secs, argon2, &|| {})
+    }
+
+    /// [`Profile::create_with_profile`], calling `waiting` once if another vox holds the
+    /// profile's lock for longer than a second, so the caller can say so where its user will
+    /// see it (see [`LockWaitNotice`]).
+    pub fn create_noting(
+        paths: Paths,
+        passphrase: &[u8],
+        now_secs: u64,
+        argon2: Argon2Profile,
+        waiting: LockWaitNotice<'_>,
+    ) -> Result<Self> {
         // **One creation at a time per profile** (V210-91). Two `vox id`s started together
         // both saw no vault, and the second moved the first's store aside and renamed its own
         // vault over the first's: both printed a fingerprint, and one of them was gone. The
@@ -91,6 +104,7 @@ impl Profile {
         let _creating = lock_dir(
             &paths.profile_dir,
             "lock the profile to create its identity",
+            waiting,
         )?;
         if Self::exists(&paths) {
             return Err(Error::Profile("identity already exists in this profile"));
@@ -208,6 +222,12 @@ impl Profile {
     /// Unlock with the identity passphrase. A wrong passphrase (or a tampered
     /// vault) is [`Error::AtRestUnlockFailed`]; the profile stays locked.
     pub fn unlock(&mut self, passphrase: &[u8]) -> Result<()> {
+        self.unlock_noting(passphrase, &|| {})
+    }
+
+    /// [`Profile::unlock`], calling `waiting` once if a migration has to wait more than a second
+    /// for another vox holding the profile's lock (see [`LockWaitNotice`]).
+    pub fn unlock_noting(&mut self, passphrase: &[u8], waiting: LockWaitNotice<'_>) -> Result<()> {
         if self.unlocked.is_some() {
             return Ok(());
         }
@@ -222,6 +242,7 @@ impl Profile {
             let held = lock_dir(
                 &self.paths.profile_dir,
                 "lock the profile to migrate its identity",
+                waiting,
             )?;
             self.vault = read_vault(&self.paths)?;
             Some(held)
@@ -417,21 +438,71 @@ pub(crate) fn test_pause(env: &str, what: &str) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
+/// What a vox does when it has waited a second for another one's profile lock: called
+/// once, from another thread, while the wait goes on.
+///
+/// **The caller decides where the notice goes** (V210-100). It was printed to stderr from here,
+/// and `vox tui` draws on the terminal stderr writes to: the line landed inside the TUI's screen,
+/// across its prompt box, and stayed there. The node turns it into
+/// [`NodeEvent::WaitingForProfile`](crate::node::api::NodeEvent::WaitingForProfile); a CLI verb
+/// prints its words, and the TUI puts its own in its status line.
+pub type LockWaitNotice<'a> = &'a (dyn Fn() + Sync);
+
 /// Take an exclusive lock on the directory `dir`, waiting for any other holder; it is
 /// released when the returned handle drops (or the process exits, however it exits). `op`
-/// names what the lock is for, in an error.
+/// names what the lock is for, in an error. If the lock is not free within [`LOCK_PATIENCE`],
+/// `waiting` is called, once.
 ///
 /// The directory itself is locked rather than a lock file beside the vault, so locking a
 /// profile leaves no file behind that is not the profile's own.
-fn lock_dir(dir: &std::path::Path, op: &'static str) -> Result<std::fs::File> {
+fn lock_dir(
+    dir: &std::path::Path,
+    op: &'static str,
+    waiting: LockWaitNotice<'_>,
+) -> Result<std::fs::File> {
     let fail = |e: std::io::Error| Error::Path {
         op,
         detail: format!("{}: {e}", dir.display()),
     };
     let handle = std::fs::File::open(dir).map_err(fail)?;
-    handle.lock().map_err(fail)?;
+    match handle.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::Error(e)) => return Err(fail(e)),
+        // **A wait is never silent** (V210-100). Another vox holds the profile while it creates
+        // or upgrades the identity, which takes a second or two; but one that is stopped
+        // (Ctrl-Z) or stuck holds it for as long as it stays so, and a vox waiting on it with
+        // nothing on the screen looked hung. So if the wait goes on, the caller is told, once.
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let (done, patience) = std::sync::mpsc::channel::<()>();
+            let locked = std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    if patience.recv_timeout(LOCK_PATIENCE)
+                        == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    {
+                        waiting();
+                    }
+                });
+                let locked = handle.lock();
+                drop(done);
+                locked
+            });
+            locked.map_err(fail)?;
+        }
+    }
+    #[cfg(feature = "test-knobs")]
+    test_pause(TEST_LOCK_HOLD_ENV, "holding the profile lock");
     Ok(handle)
 }
+
+/// How long a vox waits for another one's profile lock before saying that it is waiting.
+const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// **For proofs only.** When set, a vox that has just taken the profile lock (to create the
+/// identity, or to migrate it) holds it this many milliseconds before going on, so a proof can
+/// stop it while it holds the lock. Nothing a person runs sets it; unset, nothing changes. Not
+/// compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_LOCK_HOLD_ENV: &str = "VOX_TEST_LOCK_HOLD_MS";
 
 /// An owned passphrase check (see [`Profile::passphrase_verifier`]).
 #[derive(Clone)]

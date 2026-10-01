@@ -77,3 +77,6 @@ redb.workspace = true
 # command stops mid-handshake on purpose, so the test drives a QUIC client of its own.
 quinn.workspace = true
 rustls.workspace = true
+# V210-85's proof stops `vox connect` at its passphrase prompts, which it shows only on a terminal:
+# the test opens a pty of its own and reads the terminal's modes back after the stop.
+rustix = { workspace = true, features = ["pty", "termios"] }

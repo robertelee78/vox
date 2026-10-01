@@ -20,15 +20,21 @@
 //! so is unshaped loopback, as a raw-efficiency figure, not the bar. The emulator is userspace, so
 //! its own ceiling bounds the 10 Gbit/s figure; that is reported with it, not hidden.
 //!
+//! **Every red names its side** (V210-98). The emulator is part of the apparatus, and on a busy
+//! machine it can fall behind the link it plays, which the raw arm (behind a TCP proxy and a deep
+//! buffer) cannot feel and the tunnel's congestion control does. So:
+//! - **APPARATUS** (CANNOT MEASURE, never green and never the tunnel's): the emulator fell short of
+//!   [`EMULATOR_FIDELITY`] in any calibration window, or ran more than [`MAX_EMULATOR_LATENESS`] late
+//!   during a timed tunnel transfer. The message names the window or the lateness: that run
+//!   measured the emulator, not vox.
+//! - **PRODUCT**: the emulator carried the link and was on time, and vox carried less than
+//!   [`MIN_RATIO`] of raw. The message names the lateness it was on time within and the figure.
+//!
+//! Every run, passing or not, prints each link's percentage, drops, calibration windows, lateness
+//! and per-round figures.
+//!
 //! Mutation knob (test-side only): `VOX_PERF_MIN_RATIO` replaces the target ratio. Diagnostic knob:
 //! `VOX_PERF_ONLY=<text>` runs only the links whose name contains it.
-//!
-//! `VOX_PERF_REPORT_ONLY=<text>`: the gated links whose name contains it are measured and
-//! reported, not gated. Set only by CI's macOS runner for the WAN link (decider, 2026-09-26):
-//! GitHub's 3-core macOS VM stalls its processes long enough to overflow socket buffers, and the
-//! same build measured 29-106% of raw there from run to run, against 98-103% on a real Mac and ~95%
-//! on ubuntu. WAN is gated on real hardware (the local macOS gate) and on ubuntu. The VM itself is
-//! tracked as its own item: people run agents inside VMs.
 
 #![cfg(unix)]
 
@@ -107,6 +113,44 @@ const LINKS: [Link; 4] = [
 /// TCP proxy) never sees one, so they are reported beside every figure.
 static TAIL_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How late, in microseconds, the emulator released a packet past the instant the link would have
+/// delivered it: the longest since the last [`take_lateness`], across both directions of the UDP
+/// shaper, counted only while a link is applied (unshaped, a packet's wait is its queue, not
+/// lateness).
+///
+/// **A stalled emulator is a stalled link that the raw arm cannot feel.** When the thread that
+/// releases packets does not run, the link it plays stops, and then catches up in a burst. The raw
+/// arm terminates at a TCP proxy behind a deep buffer and never sees it. The tunnel's congestion
+/// control does: on GitHub's macOS runner, an emulator paused 10 of every 100 ms (lateness 41-92 ms)
+/// took the tunnel to 84.9% of raw in one run of three, and 20 of every 100 ms (95-172 ms) to 60.7%
+/// and 81.0%, while the calibration still read 98-100%. A gated figure measured across such a
+/// stall measures the instrument, so it is CANNOT MEASURE (V210-98).
+static LATENESS_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_lateness(shaped: bool, due: Instant) {
+    if shaped {
+        let late = Instant::now().saturating_duration_since(due).as_micros() as u64;
+        LATENESS_US.fetch_max(late, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The longest lateness since the last call, and start counting afresh.
+fn take_lateness() -> Duration {
+    Duration::from_micros(LATENESS_US.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The most an emulator may run late during a gated transfer and still be measuring the link.
+/// Measured on GitHub's runners: 5-24 ms on macOS's VM in runs where the tunnel held the link's
+/// full rate, under 7 ms on ubuntu. The stalls that moved the tunnel's figure were 41 ms and longer.
+const MAX_EMULATOR_LATENESS: Duration = Duration::from_millis(25);
+
+/// Write `line` to stderr directly, so it is shown on a passing run too: libtest captures
+/// `eprintln!` on a pass, and a gate whose green runs print no figure hides its margin (V210-98).
+fn shown(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
 /// The link both shapers apply now; `None` passes traffic through unshaped.
 type Shared = Arc<Mutex<Option<Link>>>;
 
@@ -155,7 +199,7 @@ fn udp_direction(
     carried: Arc<std::sync::atomic::AtomicU64>,
     seed: u64,
 ) {
-    let (tx, queue) = mpsc::channel::<(Instant, Vec<u8>)>();
+    let (tx, queue) = mpsc::channel::<(Instant, Vec<u8>, bool)>();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
         let mut pacer = Pacer::new();
@@ -180,14 +224,15 @@ fn udp_direction(
                     pacer.release(&l, now, n + 28)
                 }
             };
-            if tx.send((due, buf[..n].to_vec())).is_err() {
+            if tx.send((due, buf[..n].to_vec(), l.is_some())).is_err() {
                 return;
             }
         }
     });
     std::thread::spawn(move || {
-        for (due, pkt) in queue {
+        for (due, pkt, shaped) in queue {
             sleep_until(due);
+            note_lateness(shaped, due);
             carried.fetch_add(pkt.len() as u64, std::sync::atomic::Ordering::Relaxed);
             send(&pkt);
         }
@@ -231,7 +276,7 @@ fn udp_shaper(
     // Toward the host: learn the client from its first packet.
     let (front_rx, back_tx) = (front.try_clone().unwrap(), back.try_clone().unwrap());
     let learn = Arc::clone(&client);
-    let (tx, queue) = mpsc::channel::<(Instant, Vec<u8>)>();
+    let (tx, queue) = mpsc::channel::<(Instant, Vec<u8>, bool)>();
     {
         let link = Arc::clone(&link);
         std::thread::spawn(move || {
@@ -241,6 +286,7 @@ fn udp_shaper(
             while let Ok((n, from)) = front_rx.recv_from(&mut buf) {
                 *learn.lock().unwrap() = Some(from);
                 let now = Instant::now();
+                let shaped = link.lock().unwrap().is_some();
                 let due = match *link.lock().unwrap() {
                     None => now,
                     Some(l) => {
@@ -258,15 +304,16 @@ fn udp_shaper(
                         pacer.release(&l, now, n + 28)
                     }
                 };
-                if tx.send((due, buf[..n].to_vec())).is_err() {
+                if tx.send((due, buf[..n].to_vec(), shaped)).is_err() {
                     return;
                 }
             }
         });
         let carried = Arc::clone(&carried);
         std::thread::spawn(move || {
-            for (due, pkt) in queue {
+            for (due, pkt, shaped) in queue {
                 sleep_until(due);
+                note_lateness(shaped, due);
                 carried.fetch_add(pkt.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 let _ = back_tx.send(&pkt);
             }
@@ -294,15 +341,16 @@ fn udp_shaper(
 /// carry is not a link Vox can be measured on, so a gated link below [`EMULATOR_FIDELITY`] of its
 /// rate is reported as CANNOT MEASURE rather than blamed on the tunnel.
 ///
-/// **On a link, the sender is paced at 1.05x its rate, and the best of three windows counts.** An
+/// **On a link, the sender is paced at 1.05x its rate, and every one of three windows must hold.** An
 /// unpaced flood is a busy thread that competes with the emulator's own threads for the CPU, which
 /// measures the emulator under an overload the real transfers never create (they are paced by
 /// congestion control). On GitHub's 3-core macOS runner that competition alone took fidelity to
 /// 91.9% and 88.2% in 5 of 12 windows, where a paced sender got 96.8-98.0%. A window that catches
 /// the VM being preempted by its host loses a few percent more (2 of 18 paced windows there: 92.8%,
-/// 89.7%), and that is interference, not capacity: the capacity of an emulator is its best window.
-/// A genuinely slow emulator is slow in every window: slowed by 12 us per packet it delivered
-/// 34-63% on both runners, far below the bar. Unshaped (`None`) there is no rate to pace at, so it
+/// 89.7%). Counting only the best window once hid exactly that: the run that put the tunnel at
+/// 88.9% of raw had calibrated at 97.9%, 77.6% and 95.8%, and reported 97.9% (V210-98). An emulator
+/// that could not carry the link for two seconds of the run may not carry it during the transfers
+/// either, so a gated link needs [`EMULATOR_FIDELITY`] in every window. Unshaped (`None`) there is no rate to pace at, so it
 /// is one unpaced window, as before; it is reported, not gated.
 ///
 /// Returns each window's rate, in bytes per second: three on a link, one unshaped.
@@ -615,7 +663,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(MIN_RATIO);
-    eprintln!("uptime at start: {}", uptime());
+    shown(&format!("uptime at start: {}", uptime()));
 
     let tmp = tempfile::tempdir().unwrap();
     let anchor_dir = tmp.path().join("anchor");
@@ -765,7 +813,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     // its socket buffers and drops, so it cannot say what the emulator carries unshaped; the per-link
     // calibration below is paced by the link and can.)
     let mut report = Vec::new();
-    let (t, r) = measure(tunnel, sink_addr, &done, &carried, None);
+    let (t, r, _) = measure(tunnel, sink_addr, &done, &carried, None);
     report.push(format!(
         "unshaped (efficiency, not gated; bounded by the emulator): tunnel {:.1} MB/s, raw loopback TCP {:.1} MB/s, {:.1}%",
         t / 1e6,
@@ -776,51 +824,78 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     let mut failed = Vec::new();
     // Diagnostic knob (test-side only): `VOX_PERF_ONLY` runs just the links whose name contains it.
     let only = std::env::var("VOX_PERF_ONLY").ok();
-    // Empty is unset: CI writes an empty value on the runners where nothing is demoted, and every
-    // name contains "", so an empty value read as a filter demoted every gated link.
-    let report_only = std::env::var("VOX_PERF_REPORT_ONLY")
-        .ok()
-        .filter(|r| !r.is_empty());
-    for mut l in LINKS {
+    for l in LINKS {
         if only.as_deref().is_some_and(|o| !l.name.contains(o)) {
             continue;
         }
-        if report_only.as_deref().is_some_and(|r| l.name.contains(r)) {
-            l.gated = false;
-        }
         let windows = calibrate_windows(Some(l));
-        let fidelity = windows.iter().copied().fold(0.0, f64::max) * 8.0 / l.bits_per_sec;
+        // The weakest window, not the best (V210-98).
+        let fidelity = windows.iter().copied().fold(f64::INFINITY, f64::min) * 8.0 / l.bits_per_sec;
         let pct: Vec<String> = windows
             .iter()
             .map(|w| format!("{:.1}%", w * 8.0 / l.bits_per_sec * 100.0))
             .collect();
         assert!(
             !l.gated || fidelity >= EMULATOR_FIDELITY,
-            "CANNOT MEASURE {}: the emulator itself delivers only {:.1}% of the link's rate \
-             (windows {pct:?}; load: {})\nbusiest processes:\n{}",
+            "CANNOT MEASURE {} (APPARATUS): the emulator itself delivered only {:.1}% of the link's \
+             rate in a calibration window (windows {pct:?}; each must reach {:.0}%), so this run \
+             would measure the emulator, not vox (load: {})\nbusiest processes:\n{}",
             l.name,
             fidelity * 100.0,
+            EMULATOR_FIDELITY * 100.0,
             uptime(),
             busiest()
         );
         *link.lock().unwrap() = Some(l);
         std::thread::sleep(Duration::from_millis(500));
         let drops_before = TAIL_DROPS.load(std::sync::atomic::Ordering::Relaxed);
-        let (t, r) = measure(tunnel, raw, &done, &carried, Some(l));
+        let (t, r, rounds) = measure(tunnel, raw, &done, &carried, Some(l));
         let tail_drops = TAIL_DROPS.load(std::sync::atomic::Ordering::Relaxed) - drops_before;
         let ratio = t / r;
+        let late = rounds.iter().map(|x| x.2).max().unwrap_or_default();
+        let per_round: Vec<String> = rounds
+            .iter()
+            .map(|(t, r, late)| {
+                format!(
+                    "{:.1}/{:.1} MB/s late {} ms",
+                    t / 1e6,
+                    r / 1e6,
+                    late.as_millis()
+                )
+            })
+            .collect();
+        assert!(
+            !l.gated || late <= MAX_EMULATOR_LATENESS,
+            "CANNOT MEASURE {} (APPARATUS): the emulator was {} ms late during a timed tunnel \
+             transfer (at most {} ms measures the link), so this run measured the emulator, not vox; \
+             rounds (tunnel/raw): {per_round:?}; calibration windows {pct:?}; load: {}",
+            l.name,
+            late.as_millis(),
+            MAX_EMULATOR_LATENESS.as_millis(),
+            uptime()
+        );
         let verdict = if !l.gated {
             "reported".to_owned()
         } else if ratio >= min_ratio {
             format!("ok (>= {:.0}%)", min_ratio * 100.0)
         } else {
-            failed.push(format!("{}: {:.1}% of raw", l.name, ratio * 100.0));
+            failed.push(format!(
+                "{}: the emulator carried the link (every calibration window >= {:.0}%) and was on \
+                 time (max lateness {} ms), and vox carried {:.1}% of raw, under {:.0}%: vox is slow",
+                l.name,
+                EMULATOR_FIDELITY * 100.0,
+                late.as_millis(),
+                ratio * 100.0,
+                min_ratio * 100.0
+            ));
             format!("BELOW {:.0}%", min_ratio * 100.0)
         };
         report.push(format!(
             "{}: tunnel {:.1} MB/s ({:.0} Mbit/s), raw {:.1} MB/s ({:.0} Mbit/s), {:.1}% — {verdict}; \
-             emulator fidelity {:.1}%; queue drops {tail_drops}",
-            l.name, t / 1e6, t * 8.0 / 1e6, r / 1e6, r * 8.0 / 1e6, 100.0 * ratio, fidelity * 100.0
+             emulator fidelity {:.1}% (windows {pct:?}), lateness {} ms; queue drops {tail_drops}; \
+             rounds (tunnel/raw) {per_round:?}",
+            l.name, t / 1e6, t * 8.0 / 1e6, r / 1e6, r * 8.0 / 1e6, 100.0 * ratio, fidelity * 100.0,
+            late.as_millis()
         ));
     }
     *link.lock().unwrap() = None;
@@ -830,16 +905,16 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         .filter(|l| carried_line(l))
         .collect();
     for line in &report {
-        eprintln!("R41: {line}");
+        shown(&format!("R41: {line}"));
     }
-    eprintln!("uptime at end: {}", uptime());
+    shown(&format!("uptime at end: {}", uptime()));
     assert!(
         later.is_empty(),
         "CANNOT MEASURE: the tunnel fell back to a relay during the timed transfers: {later:?}"
     );
     assert!(
         failed.is_empty(),
-        "R41: the tunnel throttles the link it runs over: {failed:?}\n{}",
+        "R41 (PRODUCT): the tunnel throttles the link it runs over: {failed:?}\n{}",
         report.join("\n")
     );
     drop(forward);
@@ -847,26 +922,36 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     drop(anchor);
 }
 
+/// One round: the tunnel's and raw's throughput, and the emulator's longest lateness during the
+/// tunnel's transfer.
+type Round = (f64, f64, Duration);
+
 /// Median throughput of the tunnel and of raw over `ROUNDS` interleaved transfers, and a check that
 /// the tunnel's bytes crossed the shaper: a tunnel that bypassed it would score whatever it liked.
+/// Also each round's tunnel and raw figures, and how late the emulator ran during its tunnel
+/// transfer.
 fn measure(
     tunnel: SocketAddr,
     raw: SocketAddr,
     done: &mpsc::Receiver<(Instant, Instant)>,
     carried: &std::sync::atomic::AtomicU64,
     link: Option<Link>,
-) -> (f64, f64) {
+) -> (f64, f64, Vec<Round>) {
     let mut t = Vec::new();
     let mut r = Vec::new();
+    let mut rounds = Vec::new();
     for _ in 0..ROUNDS {
         let before = carried.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = take_lateness();
         t.push(transfer(tunnel, done));
+        let late = take_lateness();
         let crossed = carried.load(std::sync::atomic::Ordering::Relaxed) - before;
         assert!(
             crossed >= BYTES,
             "CANNOT MEASURE {link:?}: only {crossed} of the tunnel's {BYTES} bytes crossed the emulated link"
         );
         r.push(transfer(raw, done));
+        rounds.push((t[t.len() - 1], r[r.len() - 1], late));
     }
-    (median(t), median(r))
+    (median(t), median(r), rounds)
 }

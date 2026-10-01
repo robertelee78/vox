@@ -190,4 +190,4 @@ jobs:
         # gated here on ubuntu and on real Mac hardware by the local macOS gate before a tag.
         env:
           VOX_PERF_REPORT_ONLY: ${{ runner.os == 'macOS' && 'WAN' || '' }}
-        run: cargo test --release --workspace --no-fail-fast -- --ignored r40_ r41_
+        run: cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored r40_ r41_
