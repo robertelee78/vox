@@ -148,7 +148,8 @@ impl BootstrapSet {
         Ok(set)
     }
 
-    /// Merge `other`, **unioning the addresses** of anchors already present.
+    /// Merge `other`, **replacing the addresses** of anchors already present with the
+    /// ones `other` names.
     ///
     /// This replaced a plain `merge` that went through [`BootstrapSet::add`], which keeps
     /// the first entry for an identity and discards the rest — correct for building a set
@@ -158,42 +159,22 @@ impl BootstrapSet {
     /// for ever. It is gone rather than deprecated: every caller wanted this, so leaving
     /// the other one available left a landmine with no legitimate use.
     ///
-    /// The old addresses are kept rather than replaced: an anchor may legitimately have
-    /// several, the ladder tries them in order, and one that has stopped answering costs
-    /// a dial rather than a failure.
+    /// **Replaced, not accumulated** (V210-75). The old addresses used to be kept beside
+    /// the new, on the reasoning that a dead one costs only a dial. It cost more: every
+    /// move added one, the stale ones stayed first in the ladder, and past
+    /// [`MAX_ENDPOINTS`](crate::nat::multiaddr::MAX_ENDPOINTS) the merged list no longer
+    /// fit, so the refresh failed every time and a moved anchor could not be followed at
+    /// all. `other` is the current word on where an anchor is, and an anchor with several
+    /// addresses names all of them there.
     ///
     /// # Errors
-    /// [`Error::SizeLimitExceeded`] if a merged endpoint list outgrows its bound.
+    /// [`Error::SizeLimitExceeded`] if a new anchor would outgrow the set's bound. The
+    /// anchors before it are merged.
     pub fn merge_endpoints(&mut self, other: &BootstrapSet) -> Result<()> {
         for n in other.nodes() {
-            match self.get(&n.id).cloned() {
-                None => {
-                    self.add(n.clone())?;
-                }
-                Some(existing) => {
-                    let mut addrs: Vec<crate::nat::multiaddr::Multiaddr> =
-                        existing.endpoints.addrs().to_vec();
-                    let mut gained = false;
-                    for a in n.endpoints.addrs() {
-                        if !addrs.contains(a) {
-                            addrs.push(*a);
-                            gained = true;
-                        }
-                    }
-                    if !gained {
-                        continue;
-                    }
-                    let merged = BootstrapNode::new(existing.id, EndpointList::new(addrs)?)?;
-                    let mut rebuilt = BootstrapSet::new();
-                    for existing in self.nodes() {
-                        rebuilt.add(if existing.id == merged.id {
-                            merged.clone()
-                        } else {
-                            existing.clone()
-                        })?;
-                    }
-                    *self = rebuilt;
-                }
+            match self.nodes.iter_mut().find(|e| e.id == n.id) {
+                None => self.add(n.clone())?,
+                Some(existing) => existing.clone_from(n),
             }
         }
         Ok(())
