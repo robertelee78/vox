@@ -6222,15 +6222,6 @@ impl Node {
         self.renew_mappings_at = due;
     }
 
-    /// Re-run the ladder's publish side when the granted mappings are halfway through
-    /// their lifetime, so a node that outlives a two-hour mapping stays dialable.
-    ///
-    /// Nothing happens while the network is down: the renewal instant is left in place
-    /// so the next unlock's discovery supersedes it.
-    ///
-    /// The re-request runs on its own task (it talks to a gateway) and lands back as
-    /// [`NetEvent::AddressesDiscovered`], which republishes the address records too —
-    /// a renewal that came back with a *different* external port must be advertised.
     /// Renew each open room's own records when half their lifetime has passed (V210-68, #258).
     ///
     /// A node's address record lives two hours on a board ([`crate::nat::store::MAX_TTL_SECS`]),
@@ -6271,6 +6262,15 @@ impl Node {
             .insert(*room, self.now().saturating_add(half.max(1)));
     }
 
+    /// Re-run the ladder's publish side when the granted mappings are halfway through
+    /// their lifetime, so a node that outlives a two-hour mapping stays dialable.
+    ///
+    /// Nothing happens while the network is down: the renewal instant is left in place
+    /// so the next unlock's discovery supersedes it.
+    ///
+    /// The re-request runs on its own task (it talks to a gateway) and lands back as
+    /// [`NetEvent::AddressesDiscovered`], which republishes the address records too —
+    /// a renewal that came back with a *different* external port must be advertised.
     fn renew_mappings_if_due(&mut self) {
         let Some(due) = self.renew_mappings_at else {
             return;
