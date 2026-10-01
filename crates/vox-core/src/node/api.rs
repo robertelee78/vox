@@ -464,6 +464,10 @@ pub enum Fault {
     /// solve it than the member waits (V210-87). **Not [`Fault::Unreachable`]**, which is how it
     /// was reported: the member had been reached, and had waited.
     SolveTooSlow,
+    /// Every member that answered was already answering as many joins as it takes at once
+    /// (V210-92). **Not [`Fault::Refused`]**, which a joiner reads as a wrong passphrase: this one
+    /// was never checked.
+    MembersBusy,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
     /// A consent named a member this node has not admitted to the room (yet): it holds no
@@ -573,6 +577,9 @@ impl Fault {
             Fault::SolveTooSlow => {
                 "a member answered, but this device took longer to solve the join's proof of work than the member waits\n       your passphrase was never checked — this is not a verdict on it\n       run the join again when this device is less busy"
             }
+            Fault::MembersBusy => {
+                "a member answered, but it is busy answering other joins\n       your passphrase was never checked — this is not a verdict on it\n       try the join again shortly"
+            }
             Fault::Refused => "the other side refused",
             Fault::NotAdmitted => {
                 "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
@@ -650,6 +657,12 @@ impl std::fmt::Display for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeEvent {
+    /// Creating or unlocking the identity has waited more than a second for another vox that
+    /// holds this profile's lock (it is creating the identity, or migrating a v0.2.9 profile, or
+    /// it is stopped while doing so). Sent once per wait; the command goes on when the lock is
+    /// free. Each front end says it in its own place: the CLI on stderr, the TUI in its status
+    /// line (V210-100).
+    WaitingForProfile,
     /// A new rendered entry in a channel.
     NewEntry {
         /// The channel.

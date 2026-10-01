@@ -386,7 +386,21 @@ impl VoxEndpoint {
     /// # Errors
     /// If the OS CSPRNG is unavailable, since the address is drawn from it.
     pub fn attach_circuit(&self, peer: &Digest32) -> Result<CircuitPort> {
-        self.mux.attach(peer)
+        self.mux.attach(peer, None)
+    }
+
+    /// Attach an **inbound** circuit from `peer`, as [`Self::attach_circuit`] does, recording
+    /// where its far end comes from (V210-92). The connection the circuit makes carries it as
+    /// [`VoxConnection::circuit_origin`].
+    ///
+    /// # Errors
+    /// If the OS CSPRNG is unavailable, since the address is drawn from it.
+    pub fn attach_inbound_circuit(
+        &self,
+        peer: &Digest32,
+        origin: crate::transport::mux::CircuitOrigin,
+    ) -> Result<CircuitPort> {
+        self.mux.attach(peer, Some(origin))
     }
 
     /// Whether `addr` is a **live circuit** on this endpoint's socket — answered from the
@@ -579,6 +593,7 @@ impl VoxEndpoint {
     ) -> Result<VoxConnection> {
         // Read before this end answers anything: see [`VoxConnection::via_circuit`].
         let via_circuit = self.mux.is_circuit(incoming.remote_address());
+        let circuit_origin = self.mux.origin_of(incoming.remote_address());
         // A fresh slot for THIS connection's verifier output. We install a
         // per-connection server config so the verifier writes into our slot.
         let verified = VerifiedPeer::new();
@@ -601,7 +616,8 @@ impl VoxEndpoint {
             .await
             .map_err(|_| Error::SignatureInvalid)?
             .map_err(|_| Error::SignatureInvalid)?;
-        let conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
+        let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
+        conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
 
         // Transport-layer admission, after authentication. A non-admitted peer is
         // closed with the coded reason and rejected — indistinguishable on the wire
@@ -660,6 +676,7 @@ fn finish_connection(
         peer_process,
         session,
         via_circuit,
+        circuit_origin: None,
         datagram_tx: Mutex::new(DatagramSender::new()),
         datagram_rx: Mutex::new(ReplayWindow::default()),
         datagrams_dropped: AtomicU64::new(0),
@@ -729,6 +746,8 @@ pub struct VoxConnection {
     session: SessionEstablishment,
     /// Whether this connection was set up over a relay circuit (see [`Self::via_circuit`]).
     via_circuit: bool,
+    /// Where an inbound circuit's far end comes from (see [`Self::circuit_origin`]).
+    circuit_origin: Option<crate::transport::mux::CircuitOrigin>,
     /// Outbound datagram sequence numbers (monotonic, saturating).
     datagram_tx: Mutex<DatagramSender>,
     /// Inbound sliding anti-replay window.
@@ -787,6 +806,18 @@ impl VoxConnection {
     #[must_use]
     pub fn via_circuit(&self) -> bool {
         self.via_circuit
+    }
+
+    /// **Where the far end of an inbound circuit comes from** (V210-92): the source the node
+    /// recorded when it attached the circuit, from what the relay said of the asker and who the
+    /// relay is. `None` on a direct connection and on one this node dialled.
+    ///
+    /// A circuit's address is made up per circuit and says nothing about the peer behind it, so
+    /// without this every relayed join came from one place, and one stranger with many identities
+    /// behind one relay tied every newcomer that relay carried.
+    #[must_use]
+    pub fn circuit_origin(&self) -> Option<crate::transport::mux::CircuitOrigin> {
+        self.circuit_origin
     }
 
     /// The recorded session-establishment entry (tag `0x0011`) for this session,
