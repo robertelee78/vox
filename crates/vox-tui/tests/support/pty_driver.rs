@@ -5,7 +5,10 @@
 //! past its limit, with nothing in the log to say where. So:
 //!
 //! - the driver's **stderr is passed through live** — its `[pty …] <stage>` lines, and the stack it
-//!   prints if it hangs, reach the log as they happen, whatever becomes of this process after;
+//!   prints if it hangs, reach the log as they happen, whatever becomes of this process after —
+//!   and kept, so that a driver that **crashed** (an uncaught Python exception: exit 1, a
+//!   traceback, no verdict) is an `APPARATUS:` red quoting its traceback, never mistaken for a
+//!   driver stopped by its backstop or for a verdict about the product;
 //! - its **stdout** (the verdict lines) is collected and returned;
 //! - past [`BOUND`] it is sent SIGTERM, on which it prints `HUNG at <stage>` with its stack and
 //!   stops every process it started; if it still runs [`GRACE`] later it is killed;
@@ -24,8 +27,9 @@
 //! The driver's own budget (`VOX_PTY_BUDGET_SECS`, 240 s by default) comes first; this bound is
 //! the backstop for a driver that cannot run its own.
 
-use std::io::Read as _;
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Past this the driver is stopped from outside: beyond its own budget and its `faulthandler`
@@ -45,38 +49,72 @@ pub struct Driven {
     pub took: Duration,
     /// The last stage the driver named, if it named any.
     pub stage: Option<String>,
+    /// Everything the driver printed on stderr (it also went to the log live).
+    pub stderr: String,
 }
+
+/// The words a driver's verdict line carries, after its tag.
+const VERDICTS: [&str; 5] = ["PASS", "RED", "APPARATUS", "HUNG at", "the TUI said done"];
 
 impl Driven {
     /// Whether the driver printed a verdict line of `tag`'s: a pass, a red, an apparatus
     /// failure or its own hang report. A driver with none was stopped before it could say.
     #[must_use]
     pub fn has_verdict(&self, tag: &str) -> bool {
-        ["PASS", "RED", "APPARATUS", "HUNG at", "the TUI said done"]
+        VERDICTS
             .iter()
             .any(|v| self.stdout.contains(&format!("{tag} {v}")))
+    }
+
+    /// The traceback of a driver that **crashed** — Python's exit 1 on an uncaught exception, with
+    /// no verdict line of any tag — or `None`. A crash is the driver's fault, not the product's.
+    #[must_use]
+    pub fn crash(&self) -> Option<&str> {
+        let at = self.stderr.rfind("Traceback (most recent call last):")?;
+        let verdict = VERDICTS
+            .iter()
+            .any(|v| self.stdout.contains(&format!(" {v}")));
+        (self.code == Some(1) && !verdict).then(|| &self.stderr[at..])
     }
 }
 
 /// Run `python3 <script> <args…>`, bounded; see the module docs.
 #[allow(dead_code)] // a proof that needs a longer bound calls `run_within` or `run_for` instead
 pub fn run(script: &str, args: &[&str]) -> Driven {
-    drive(script, args, BOUND, Duration::ZERO)
+    checked(script, drive(script, args, BOUND, Duration::ZERO))
 }
 
 /// [`run`], stopped from outside past `bound` rather than [`BOUND`]: for a driver whose own
 /// budget is longer, because the product bounds it waits on are (a debug-build join).
+///
+/// A driver that crashed (see [`Driven::crash`]) is an `APPARATUS:` red here, with its traceback,
+/// before any caller can read its silence as a verdict.
 #[allow(dead_code)]
 pub fn run_within(script: &str, args: &[&str], bound: Duration) -> Driven {
-    drive(script, args, bound, Duration::ZERO)
+    checked(script, drive(script, args, bound, Duration::ZERO))
 }
 
 /// [`run`], for a driver that waits on work a debug build is slower at: its bound is [`BOUND`]
 /// plus `debug_cost` (the watchdog's `debug_cost` of that work, which is zero in a release build),
 /// and the driver's own waits grow by it too (`VOX_PTY_DEBUG_EXTRA_SECS`, `vox_pty.DEBUG_EXTRA`).
+/// A crashed driver is an `APPARATUS:` red, as in [`run_within`].
 #[allow(dead_code)]
 pub fn run_for(script: &str, args: &[&str], debug_cost: Duration) -> Driven {
-    drive(script, args, BOUND + debug_cost, debug_cost)
+    checked(script, drive(script, args, BOUND + debug_cost, debug_cost))
+}
+
+/// `driven`, unless the driver crashed: then an `APPARATUS:` red with its traceback.
+fn checked(script: &str, driven: Driven) -> Driven {
+    if let Some(traceback) = driven.crash() {
+        panic!(
+            "APPARATUS: the TUI driver {script} crashed (exit 1, an uncaught Python exception) at \
+             stage {:?} after {:?}, so it gave no verdict on the product.\n{traceback}\nIts stdout:\n{}",
+            driven.stage.as_deref().unwrap_or("(before its first stage)"),
+            driven.took,
+            driven.stdout
+        );
+    }
+    driven
 }
 
 fn drive(script: &str, args: &[&str], bound: Duration, debug_cost: Duration) -> Driven {
@@ -94,15 +132,33 @@ fn drive(script: &str, args: &[&str], bound: Duration, debug_cost: Duration) -> 
         .env("VOX_PTY_DEBUG_EXTRA_SECS", debug_cost.as_secs().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
-        .expect("python3 must be on PATH to drive the TUI");
-    let mut out = child.stdout.take().expect("stdout");
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run python3 to drive the TUI: {e}"));
+    let mut out = child.stdout.take().expect("APPARATUS: a piped stdout");
     let reader = std::thread::spawn(move || {
         let mut s = String::new();
         let _ = out.read_to_string(&mut s);
         s
     });
+    // Passed through to file descriptor 2 directly — no test capture holds it back, so it reaches
+    // the log however this process ends — and kept for a crash's red. Read on its own thread and
+    // never joined: a process the driver started may hold the pipe open.
+    let err = child.stderr.take().expect("APPARATUS: a piped stderr");
+    let said = Arc::new(Mutex::new(String::new()));
+    let err_reader = {
+        let said = Arc::clone(&said);
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                let _ = writeln!(std::io::stderr().lock(), "{line}");
+                let mut s = said
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.push_str(&line);
+                s.push('\n');
+            }
+        })
+    };
     let mut stopped = None;
     // pid → its start time, as first seen.
     let mut seen: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
@@ -114,7 +170,10 @@ fn drive(script: &str, args: &[&str], bound: Duration, debug_cost: Duration) -> 
             }
             looked = Instant::now();
         }
-        if let Some(status) = child.try_wait().expect("wait for the driver") {
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not wait for the TUI driver: {e}"))
+        {
             break Some(status);
         }
         match stopped {
@@ -173,11 +232,21 @@ fn drive(script: &str, args: &[&str], bound: Duration, debug_cost: Duration) -> 
         .ok()
         .map(|s| s.trim().to_owned());
     let _ = std::fs::remove_file(&stage_file);
+    // The driver has exited; its stderr closes with it unless a process it started holds it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !err_reader.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stderr = said
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     Driven {
         code: status.and_then(|s| s.code()),
         stdout,
         took: t0.elapsed(),
         stage,
+        stderr,
     }
 }
 
