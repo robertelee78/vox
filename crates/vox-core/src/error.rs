@@ -260,6 +260,16 @@ pub enum Error {
     #[error("peer unreachable — {0}")]
     LadderExhausted(String),
 
+    /// A QUIC handshake failed for a reason other than authentication: the peer refused or
+    /// closed the connection, never answered, or this node's endpoint is closing.
+    ///
+    /// Every handshake failure used to be [`Self::SignatureInvalid`], so a peer that was shutting
+    /// down, or a dial nobody answered, reached the operator as "signature verification failed" —
+    /// an alarm about keys for what is a closed door (V210-81). A failure of authentication itself
+    /// still is `SignatureInvalid`.
+    #[error("the connection could not be set up: {0}")]
+    Handshake(String),
+
     /// This node could not listen on a local address it was told to use.
     ///
     /// Carried whole rather than as a `&'static str`: "quic endpoint bind" was the only thing
@@ -457,6 +467,16 @@ pub enum Error {
     PeerRefused(crate::wire::WireError),
 }
 
+/// Why a node hung up, for [`IpcHandshake::HungUp`]'s message.
+fn hung_up_why(still_running: bool) -> &'static str {
+    if still_running {
+        "it is still running, so it ended this request itself; its log says why"
+    } else {
+        "it is no longer running: it stopped, crashed or was stopped while answering. Start it \
+         again"
+    }
+}
+
 /// How an attach to a node's control socket failed ([`Error::Ipc`]).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -470,6 +490,20 @@ pub enum IpcHandshake {
     /// Something accepted the connection and closed it without greeting.
     #[error("the node closed the connection before greeting")]
     ClosedBeforeHello,
+    /// The node greeted, took a request and closed the connection before replying (V210-101).
+    /// Nothing was malformed: the connection ended. Whether the node is still running is asked
+    /// with a fresh connection when the reply goes missing, because the two need different
+    /// remedies — a node that is gone is started again, one that is still running has a log that
+    /// says why it ended the request.
+    #[error("the node closed the connection before replying: {}", hung_up_why(*still_running))]
+    HungUp {
+        /// Whether a fresh connection to the same socket was taken when the reply went missing.
+        still_running: bool,
+    },
+    /// The connection ended under a write (V210-101). A client names it [`Self::HungUp`], once
+    /// it has asked whether the node is still running; the node's side says this.
+    #[error("the other end closed the control-socket connection")]
+    Cut,
     /// The node greeted in another control protocol: the two are different vox versions.
     #[error(
         "the node speaks a different control protocol (this vox is protocol {mine}, the node is \

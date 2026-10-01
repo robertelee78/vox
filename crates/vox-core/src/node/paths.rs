@@ -45,6 +45,10 @@ pub const RETENTION_FILE: &str = "retention";
 /// line naming where `vox room get` puts a collected file when no `--dir` or `--out` is
 /// given. A leading `~/` means the home directory. Absent, it is `~/Downloads`.
 pub const DOWNLOADS_FILE: &str = "downloads";
+
+/// The config file saying which rooms `vox node` serves: `anyone` or `trusted` (its
+/// `--serve` flag overrides it).
+pub const SERVE_FILE: &str = "serve";
 /// Directory of per-session read cursors inside a profile.
 pub const CURSOR_DIR: &str = "cursors";
 /// Where a harness session records how it can be woken (ADR-020 §6).
@@ -173,6 +177,12 @@ impl Paths {
     #[must_use]
     pub fn retention_file(&self) -> PathBuf {
         self.config_dir.join(RETENTION_FILE)
+    }
+
+    /// Which rooms `vox node` serves, for this profile ([`SERVE_FILE`]).
+    #[must_use]
+    pub fn serve_file(&self) -> PathBuf {
+        self.config_dir.join(SERVE_FILE)
     }
 
     /// The download-directory file for this profile ([`DOWNLOADS_FILE`]).

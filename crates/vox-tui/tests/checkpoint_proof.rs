@@ -28,6 +28,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -137,6 +139,7 @@ fn daemon(
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
     if let Some(idle) = idle_secs {
+        test_knobs::require(&[IDLE_ENV]);
         cmd.env(IDLE_ENV, idle.to_string());
     }
     let mut child = cmd.spawn().expect("spawn vox daemon");

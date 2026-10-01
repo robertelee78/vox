@@ -259,7 +259,7 @@ impl Member {
             &args(&["forward", name, "22", "0"]),
         );
         let bound = p
-            .wait_for(Duration::from_secs(20), |l| l.contains("forwarding"))
+            .line_within(Duration::from_secs(20), |l| l.contains("forwarding"))
             .is_some();
         // Whatever it printed as it went (a refusal ends the process, which ends the wait).
         std::thread::sleep(Duration::from_millis(100));

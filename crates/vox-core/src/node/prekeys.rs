@@ -120,11 +120,14 @@ pub const ONE_TIME_PREKEY_LOW_WATER: usize = 16;
 /// **Test-only**: a smaller one-time pool, so a proof crosses it in a dozen sessions rather than
 /// 64 (V210-77). Its value is the pool's target, from 1 to [`ONE_TIME_PREKEY_TARGET`], and the
 /// low-water mark is a quarter of it. Unset, empty, unparsable or out of range is the production
-/// pool: nothing in a real deployment sets it.
+/// pool: nothing in a real deployment sets it, and without the `test-knobs` feature (V210-105) it is
+/// not compiled in.
+#[cfg(feature = "test-knobs")]
 pub const TEST_ONE_TIME_PREKEYS_ENV: &str = "VOX_TEST_ONE_TIME_PREKEYS";
 
 /// The one-time pool's `(low-water mark, target)`: the production pair, or
 /// [`TEST_ONE_TIME_PREKEYS_ENV`]'s.
+#[cfg(feature = "test-knobs")]
 fn one_time_pool() -> (usize, usize) {
     static POOL: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
     *POOL.get_or_init(|| {
@@ -136,6 +139,12 @@ fn one_time_pool() -> (usize, usize) {
                 (n / 4, n)
             })
     })
+}
+
+/// The one-time pool's production `(low-water mark, target)`.
+#[cfg(not(feature = "test-knobs"))]
+const fn one_time_pool() -> (usize, usize) {
+    (ONE_TIME_PREKEY_LOW_WATER, ONE_TIME_PREKEY_TARGET)
 }
 
 /// How long a **consumed** one-time prekey is retained so a concurrent duplicate

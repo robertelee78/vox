@@ -1,0 +1,139 @@
+timing-slot: took slot2 of 3 at 20:13:12Z, load 49.87 60.86 54.04, 1 waiting
+run-slot: took slot1 of 6 at 20:13:13Z, load 49.87 60.86 54.04, 3 waiting
+
+running 1 test
+SPIKE arm changing rate 1000000000 ow 1 ms loss 0 qbdp 1 cc Err(NotPresent)
+TL changing t=0.5 vox 629.3 comp 0.0 Mbit/s late 2 ms
+TL changing t=1.0 vox 977.3 comp 0.0 Mbit/s late 8 ms
+TL changing t=1.5 vox 982.0 comp 0.0 Mbit/s late 5 ms
+TL changing t=2.0 vox 991.6 comp 0.0 Mbit/s late 5 ms
+TL changing t=2.5 vox 974.5 comp 0.0 Mbit/s late 6 ms
+TL changing t=3.0 vox 965.2 comp 0.0 Mbit/s late 4 ms
+TL changing t=3.5 vox 996.9 comp 0.0 Mbit/s late 6 ms
+TL changing t=4.0 vox 981.6 comp 0.0 Mbit/s late 4 ms
+TL changing t=4.5 vox 994.3 comp 0.0 Mbit/s late 7 ms
+TL changing t=5.0 vox 977.1 comp 0.0 Mbit/s late 5 ms
+TL changing t=5.5 vox 986.8 comp 0.0 Mbit/s late 3 ms
+TL changing t=6.0 vox 961.0 comp 0.0 Mbit/s late 8 ms
+TL changing t=6.5 vox 996.6 comp 0.0 Mbit/s late 2 ms
+TL changing t=7.0 vox 966.1 comp 0.0 Mbit/s late 11 ms
+TL changing t=7.5 vox 996.1 comp 0.0 Mbit/s late 2 ms
+TL changing t=8.0 vox 966.7 comp 0.0 Mbit/s late 7 ms
+TL changing t=8.5 vox 1001.5 comp 0.0 Mbit/s late 2 ms
+TL changing t=9.0 vox 966.8 comp 0.0 Mbit/s late 5 ms
+TL changing t=9.5 vox 935.3 comp 0.0 Mbit/s late 4 ms
+TL changing t=10.0 vox 995.1 comp 0.0 Mbit/s late 3 ms
+TL changing t=10.5 vox 682.6 comp 0.0 Mbit/s late 7 ms
+TL changing t=11.0 vox 979.5 comp 0.0 Mbit/s late 5 ms
+TL changing t=11.5 vox 980.7 comp 0.0 Mbit/s late 8 ms
+TL changing t=12.0 vox 985.8 comp 0.0 Mbit/s late 7 ms
+TL changing t=12.5 vox 978.3 comp 0.0 Mbit/s late 4 ms
+TL changing t=13.0 vox 941.5 comp 0.0 Mbit/s late 14 ms
+TL changing t=13.5 vox 989.0 comp 0.0 Mbit/s late 8 ms
+TL changing t=14.0 vox 991.9 comp 0.0 Mbit/s late 4 ms
+TL changing t=14.5 vox 969.5 comp 0.0 Mbit/s late 7 ms
+TL changing t=15.0 vox 1000.9 comp 0.0 Mbit/s late 4 ms
+TL changing t=15.5 vox 936.4 comp 0.0 Mbit/s late 12 ms
+TL changing t=16.0 vox 969.8 comp 0.0 Mbit/s late 6 ms
+TL changing t=16.5 vox 989.8 comp 0.0 Mbit/s late 5 ms
+TL changing t=17.0 vox 990.5 comp 0.0 Mbit/s late 3 ms
+TL changing t=17.5 vox 987.1 comp 0.0 Mbit/s late 5 ms
+TL changing t=18.0 vox 997.6 comp 0.0 Mbit/s late 3 ms
+TL changing t=18.5 vox 991.3 comp 0.0 Mbit/s late 3 ms
+TL changing t=19.0 vox 948.9 comp 0.0 Mbit/s late 13 ms
+TL changing t=19.5 vox 962.4 comp 0.0 Mbit/s late 15 ms
+TL changing t=20.0 vox 958.8 comp 0.0 Mbit/s late 10 ms
+TL changing t=20.5 vox 559.3 comp 0.0 Mbit/s late 4 ms
+TL changing t=21.0 vox 784.7 comp 0.0 Mbit/s late 42 ms
+TL changing t=21.5 vox 992.9 comp 0.0 Mbit/s late 9 ms
+TL changing t=22.0 vox 891.0 comp 0.0 Mbit/s late 6 ms
+TL changing t=22.5 vox 958.7 comp 0.0 Mbit/s late 6 ms
+TL changing t=23.0 vox 983.5 comp 0.0 Mbit/s late 4 ms
+TL changing t=23.5 vox 990.3 comp 0.0 Mbit/s late 4 ms
+TL changing t=24.0 vox 978.0 comp 0.0 Mbit/s late 4 ms
+TL changing t=24.5 vox 969.0 comp 0.0 Mbit/s late 2 ms
+TL changing t=25.0 vox 982.5 comp 0.0 Mbit/s late 2 ms
+TL changing t=25.5 vox 969.4 comp 0.0 Mbit/s late 6 ms
+TL changing t=26.0 vox 902.9 comp 0.0 Mbit/s late 9 ms
+TL changing t=26.5 vox 981.9 comp 0.0 Mbit/s late 4 ms
+TL changing t=27.0 vox 983.7 comp 0.0 Mbit/s late 3 ms
+TL changing t=27.5 vox 955.8 comp 0.0 Mbit/s late 8 ms
+TL changing t=28.0 vox 975.1 comp 0.0 Mbit/s late 5 ms
+TL changing t=28.5 vox 980.4 comp 0.0 Mbit/s late 2 ms
+TL changing t=29.0 vox 977.9 comp 0.0 Mbit/s late 8 ms
+TL changing t=29.5 vox 987.1 comp 0.0 Mbit/s late 6 ms
+TL changing t=30.0 vox 987.2 comp 0.0 Mbit/s late 6 ms
+RESULT changing clean1 vox 962.1 Mbit/s
+RESULT changing lossy vox 961.6 Mbit/s
+RESULT changing clean2 vox 939.6 Mbit/s
+TIER SPIKE-TAPER tier 3 rate 115.3 best 115.3 Mbit/s queue false lossless8 0 lossy false starved 1/0.0s/0 quiet 1 minrtt Some(0ns) srtt 152.455µs win 240000
+TIER SPIKE-TAPER tier 3 rate 12908.2 best 61338.7 Mbit/s queue false lossless8 0 lossy false starved 13/0.0s/0 quiet 0 minrtt Some(0ns) srtt 569.801µs win 846208
+TIER SPIKE-TAPER tier 3 rate 161.9 best 101431.7 Mbit/s queue false lossless8 0 lossy false starved 86/0.1s/0 quiet 0 minrtt Some(0ns) srtt 1.438833ms win 1558912
+TIER SPIKE-TAPER tier 3 rate 384.7 best 114440.5 Mbit/s queue false lossless8 0 lossy false starved 130/0.1s/0 quiet 0 minrtt Some(0ns) srtt 1.696992ms win 1010048
+TIER SPIKE-TAPER tier 3 rate 10387.4 best 239790.6 Mbit/s queue false lossless8 0 lossy false starved 242/0.2s/0 quiet 0 minrtt Some(0ns) srtt 475.316µs win 813419
+TIER SPIKE-TAPER tier 3 rate 3043.0 best 239790.6 Mbit/s queue false lossless8 0 lossy false starved 34/0.0s/0 quiet 0 minrtt Some(0ns) srtt 510.949µs win 1203766
+TIER SPIKE-TAPER tier 3 rate 7681.4 best 239790.6 Mbit/s queue false lossless8 0 lossy false starved 53/0.1s/0 quiet 0 minrtt Some(0ns) srtt 566.584µs win 1018240
+TIER SPIKE-TAPER tier 3 rate 102.0 best 102.0 Mbit/s queue false lossless8 0 lossy false starved 1/0.0s/0 quiet 1 minrtt Some(2.898416ms) srtt 1.041604ms win 32768
+TIER SPIKE-TAPER tier 3 rate 979.8 best 1106.1 Mbit/s queue false lossless8 0 lossy false starved 1/0.0s/0 quiet 30 minrtt Some(2.279334ms) srtt 5.145811ms win 795762
+TIER SPIKE-TAPER tier 3 rate 992.2 best 1127.8 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 17 minrtt Some(2.279334ms) srtt 6.321883ms win 789155
+TIER SPIKE-TAPER tier 3 rate 1000.2 best 1362.1 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 6.337618ms win 802495
+TIER SPIKE-TAPER tier 3 rate 1001.7 best 1362.1 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 9.833574ms win 1251951
+TIER SPIKE-TAPER tier 3 rate 1078.2 best 1441.9 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 6.113448ms win 750272
+TIER SPIKE-TAPER tier 3 rate 992.5 best 1441.9 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 9.433656ms win 1204051
+TIER SPIKE-TAPER tier 3 rate 1004.0 best 2133.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 7.924992ms win 976130
+TIER SPIKE-TAPER tier 3 rate 972.7 best 2133.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 6.220562ms win 759752
+TIER SPIKE-TAPER tier 3 rate 984.2 best 2133.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 6.600511ms win 958924
+TIER SPIKE-TAPER tier 3 rate 1007.7 best 2133.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 6.176335ms win 765355
+TIER SPIKE-TAPER tier 3 rate 1060.0 best 2133.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 6.233627ms win 882552
+TIER SPIKE-TAPER tier 3 rate 1029.8 best 2171.2 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 9.184414ms win 1159740
+TIER SPIKE-TAPER tier 3 rate 1067.0 best 2171.2 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 6.287353ms win 833765
+TIER SPIKE-TAPER tier 3 rate 1088.0 best 2782.8 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 7.89351ms win 807411
+TIER SPIKE-TAPER tier 3 rate 1031.5 best 2782.8 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 7.23055ms win 926154
+TIER SPIKE-TAPER tier 3 rate 999.3 best 2782.8 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 6.024838ms win 746642
+TIER SPIKE-TAPER tier 3 rate 933.0 best 2782.8 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 6.209753ms win 803963
+TIER SPIKE-TAPER tier 3 rate 1021.2 best 2782.8 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 10.877923ms win 1323934
+TIER SPIKE-TAPER tier 3 rate 963.1 best 2782.8 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.279334ms) srtt 15.759973ms win 1730425
+TIER SPIKE-TAPER tier 3 rate 332.8 best 2782.8 Mbit/s queue false lossless8 0 lossy false starved 20/0.1s/0 quiet 0 minrtt Some(2.226583ms) srtt 2.549079ms win 118505
+TIER SPIKE-TAPER tier 3 rate 953.8 best 2782.8 Mbit/s queue false lossless8 0 lossy false starved 1/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 5.444395ms win 1075214
+TIER SPIKE-TAPER tier 3 rate 891.4 best 2782.8 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 10.610545ms win 1433085
+TIER SPIKE-TAPER tier 3 rate 990.3 best 2782.8 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 6.329168ms win 851700
+TIER SPIKE-TAPER tier 3 rate 1083.8 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 6.021428ms win 881056
+TIER SPIKE-TAPER tier 3 rate 1011.1 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 7.395337ms win 980669
+TIER SPIKE-TAPER tier 3 rate 987.8 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 13.652249ms win 1701131
+TIER SPIKE-TAPER tier 3 rate 993.0 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 12.87221ms win 1541133
+TIER SPIKE-TAPER tier 3 rate 1001.0 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 8.827118ms win 1110859
+TIER SPIKE-TAPER tier 3 rate 975.9 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 5.897377ms win 745019
+TIER SPIKE-TAPER tier 3 rate 1026.6 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 11.230607ms win 1501770
+TIER SPIKE-TAPER tier 3 rate 915.6 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 8.554609ms win 1036906
+TIER SPIKE-TAPER tier 3 rate 1037.1 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 8.114273ms win 1086715
+TIER SPIKE-TAPER tier 3 rate 907.9 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 7.685902ms win 959940
+TIER SPIKE-TAPER tier 3 rate 1659.0 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 7.753335ms win 1323895
+TIER SPIKE-TAPER tier 3 rate 1572.5 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 6.53419ms win 997911
+TIER SPIKE-TAPER tier 3 rate 986.5 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 8.523765ms win 1054157
+TIER SPIKE-TAPER tier 3 rate 990.1 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 11.356235ms win 1462730
+TIER SPIKE-TAPER tier 3 rate 954.9 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 7.101735ms win 869398
+TIER SPIKE-TAPER tier 3 rate 910.9 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.226583ms) srtt 6.226821ms win 776986
+TIER SPIKE-TAPER tier 3 rate 44.4 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 3.610063ms win 32768
+TIER SPIKE-TAPER tier 3 rate 948.8 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 17.110567ms win 2104327
+TIER SPIKE-TAPER tier 3 rate 1017.3 best 3635.4 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 11.85385ms win 1639356
+TIER SPIKE-TAPER tier 3 rate 971.7 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 6.881166ms win 852078
+TIER SPIKE-TAPER tier 3 rate 1022.4 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 5.849637ms win 772670
+TIER SPIKE-TAPER tier 3 rate 968.3 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 7.092211ms win 963914
+TIER SPIKE-TAPER tier 3 rate 1001.0 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 5.456062ms win 704715
+TIER SPIKE-TAPER tier 3 rate 1015.0 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 5.70392ms win 754401
+TIER SPIKE-TAPER tier 3 rate 986.9 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 14.26541ms win 1799924
+TIER SPIKE-TAPER tier 3 rate 1001.9 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 6.037881ms win 777057
+TIER SPIKE-TAPER tier 3 rate 990.4 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 7.749331ms win 985037
+TIER SPIKE-TAPER tier 3 rate 990.9 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 9.79259ms win 1274401
+TIER SPIKE-TAPER tier 3 rate 998.6 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 10.799234ms win 1361282
+TIER SPIKE-TAPER tier 3 rate 994.5 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 10.944946ms win 1372432
+TIER SPIKE-TAPER tier 3 rate 1001.8 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 9.350884ms win 1181475
+TIER SPIKE-TAPER tier 3 rate 994.8 best 4621.5 Mbit/s queue false lossless8 0 lossy false starved 2/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 5.408699ms win 1199896
+TIER SPIKE-TAPER tier 3 rate 997.2 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 12.272953ms win 1539817
+TIER SPIKE-TAPER tier 3 rate 998.3 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 8.265092ms win 1045437
+TIER SPIKE-TAPER tier 3 rate 993.9 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 12.50926ms win 1567482
+TIER SPIKE-TAPER tier 3 rate 989.4 best 4621.5 Mbit/s queue true lossless8 0 lossy false starved 0/0.0s/0 quiet 0 minrtt Some(2.216834ms) srtt 7.90788ms win 1001223
+test spike_adr024 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 48.20s
+

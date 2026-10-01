@@ -229,7 +229,7 @@ fn origin(d: &mut Decoder<'_>) -> Result<[[u8; 16]; 3]> {
 }
 
 /// **Where the peer at the far end of `asker` is, as this relay says it to a target**: the
-/// asker's three source keys (`node::joinslots::source_levels`), each keyed with a secret this
+/// asker's three source keys (`nat::source::Source::of_conn`), each keyed with a secret this
 /// process drew at random and cut to 16 bytes. Two asks from one place give the same tags and two
 /// from different places different ones, so the target can group what this relay carries by where
 /// it comes from; the keys are never sent and are new every run, so the target cannot work the
@@ -247,7 +247,7 @@ pub fn origin_tags(asker: &VoxConnection) -> Result<[[u8; 16]; 3]> {
             KEY.get_or_init(|| drawn)
         }
     };
-    let levels = crate::node::joinslots::source_levels(asker);
+    let levels = crate::nat::source::Source::of_conn(asker).0;
     let mut tags = [[0u8; 16]; 3];
     for (tag, level) in tags.iter_mut().zip(levels.iter()) {
         let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key)
@@ -350,10 +350,16 @@ impl Drop for CircuitSlot {
 /// circuit runs: that is what marks those connections as carrying, so a retired one is
 /// not closed under a live circuit. `connected` resolves a fingerprint to a live
 /// connection (the relay's own peer table); `endpoint` is where a circuit terminating
-/// here is attached.
+/// here is attached. `shares_room` says whether two peers share a room this node serves: a
+/// relay is only ever carried between them (see `NodeNet::relays_between`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each is a separate authority the relay consults; bundling them would hide which"
+)]
 pub async fn serve_circuit<F>(
     carrier: &Arc<VoxConnection>,
     classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
+    shares_room: &(dyn Fn(&Digest32, &Digest32) -> bool + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
     connected: F,
@@ -366,7 +372,10 @@ where
     let peer = carrier.peer_id();
     match opening_answer(&mut recv).await? {
         CircuitFrame::Open { peer: target } => {
-            if !relays_for(classify(&peer)) || !relays_for(classify(&target)) {
+            if !relays_for(classify(&peer))
+                || !relays_for(classify(&target))
+                || !shares_room(&peer, &target)
+            {
                 refuse(&mut send, CircuitRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused(
                     "circuit: peer may not ask for a relay",
@@ -412,15 +421,18 @@ where
                 refuse(&mut send, CircuitRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused("circuit: peer may not relay to us"));
             }
-            // **Where the joiner behind it is** (V210-92). An anchor or a member is trusted to say,
-            // and its tags are kept apart from every other relay's. Any other relay — a pending
-            // joiner, which is a stranger like any other — is not: what it carries counts as
-            // coming from the relay itself, so a stranger cannot mint a source per relay identity
-            // it makes.
+            // **Where the peer behind it is** (V210-92, V210-70). An anchor or a member is trusted to
+            // say, under its own network: what it carries is filed first by where the relay itself
+            // connects from, which it cannot choose, then by the tags it gives. On an anchor that
+            // serves anyone, a member is anyone who put a genesis, so keying by the relay's
+            // identity let a stranger mint a source per relay it made. Any other relay — a pending
+            // joiner, a stranger like any other — is not trusted to say: what it carries counts as
+            // coming from the relay itself.
+            let relay_source = crate::nat::source::Source::of_conn(carrier);
             let source = if matches!(relay, PeerClass::Anchor | PeerClass::Member) {
-                crate::node::joinslots::relayed_origin(&peer, &tags)
+                crate::nat::source::Source::relayed_by(&relay_source, &tags).0
             } else {
-                crate::node::joinslots::source_levels(carrier)
+                relay_source.0
             };
             send_frame(&mut send, &CircuitFrame::Opened).await?;
             let mut flow = carrier.bind_flow(send, recv)?;

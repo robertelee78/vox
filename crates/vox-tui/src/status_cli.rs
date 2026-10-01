@@ -236,6 +236,28 @@ fn render(v: &Value) -> String {
         if let Some(f) = r.get("last_failure").and_then(Value::as_str) {
             let _ = write!(o, "; last failure: {f}");
         }
+        // A session that runs on: which end opened it, the step it is at and for how long
+        // (V210-110).
+        let running: Vec<String> = r
+            .get("running")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|x| {
+                let t = |k: &str| x.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_owned();
+                let ms = |k: &str| x.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                format!(
+                    "{} {} for {:.1}s (started {:.1}s ago)",
+                    t("dir"),
+                    t("step"),
+                    ms("for_ms") as f64 / 1000.0,
+                    ms("age_ms") as f64 / 1000.0
+                )
+            })
+            .collect();
+        if !running.is_empty() {
+            let _ = write!(o, "; running: {}", running.join(", "));
+        }
         o.push('\n');
     }
     o
