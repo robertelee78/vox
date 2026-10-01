@@ -631,13 +631,17 @@ pub async fn run_initiator(
     .await
     {
         // A member that ended this join while it solved (V210-92) said why before it stopped
-        // reading, so the write can fail with the reason already waiting: read it, briefly.
-        if let Ok(Ok(JoinFrame::Rejected(r))) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(&mut recv)).await
-        {
-            return Err(rejected(r));
-        }
-        return Err(if late { too_slow() } else { e });
+        // reading, so the write can fail with the reason already waiting: read it, briefly. Only
+        // `Busy` is told apart here. Any other refusal, from a member that stopped waiting for a
+        // grind past its patience, is that grind's, and is said as such (V210-87).
+        let said =
+            tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(&mut recv)).await;
+        return Err(match said {
+            Ok(Ok(JoinFrame::Rejected(JoinReject::Busy))) => Error::JoinResponderBusy,
+            _ if late => too_slow(),
+            Ok(Ok(JoinFrame::Rejected(r))) => rejected(r),
+            _ => e,
+        });
     }
     if let Some(stall) = std::env::var(TEST_STALL_AFTER_SOLVE_ENV)
         .ok()
