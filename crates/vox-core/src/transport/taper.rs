@@ -17,13 +17,13 @@
 //!   is marked as tier 2's baseline: loss that then grows with Vox's own sending is congestion.
 //! - **Climb 2 → 3** when the loss share over the last 32 MiB sent (`PathSignals::trend_share`)
 //!   is at or above [`GENTLE_LOSS_CAP`], past which tier 2 cuts for every loss, and no queue has
-//!   been held for [`CLIMB_3_QUEUE_ROUNDS`] rounds in the last [`CLIMB_3_ROUNDS`] rounds and
+//!   been held for [`CLIMB_3_QUEUE_ROUNDS`] rounds in a row in the last [`CLIMB_3_ROUNDS`] rounds and
 //!   [`CLIMB_3_TIME`]. Not the share over the last few rounds: at 8 KB datagrams eight rounds
 //!   hold a couple of hundred packets, and on a link losing 5% at random that share read 0–14%
 //!   from one half-second to the next, so a streak of rounds at the cap never reached 20 and tier 3
 //!   was never entered (measured: 1.42x and 1.62x a Cubic flow, against BBR's 7.68x). Nor a
-//!   single round's queue: one round in the trace read 39 ms on a 10.6 ms base with nothing else
-//!   on the path. **The loss share is the clean-LAN guard:** a clean link loses only when its
+//!   queue of a round or two: one round in the trace read 39 ms on a 10.6 ms base with nothing
+//!   else on the path, and see [`CLIMB_3_QUEUE_ROUNDS`]. **The loss share is the clean-LAN guard:** a clean link loses only when its
 //!   queue overflows, well under 1% of what it sends, so it never reaches BBR.
 //! - **Tier 3 is on trial for its whole stay.** A shallow buffer under congestion shows the same
 //!   entry signal as random loss; they part once Vox sends harder, since random loss stays flat
@@ -87,8 +87,12 @@ pub(crate) const CLIMB_1_LOSSES: u32 = 3;
 pub(crate) const CLIMB_3_ROUNDS: u32 = 20;
 /// …spanning at least this long; a queue is held when it shows for this many rounds in a row.
 pub(crate) const CLIMB_3_TIME: Duration = Duration::from_secs(2);
-/// The rounds in a row a queue must show to break a climb from tier 2.
-pub(crate) const CLIMB_3_QUEUE_ROUNDS: u32 = 2;
+/// The rounds in a row a queue must show to break a climb from tier 2. Not one or two: on a lossy
+/// link tier 2 sends little, and at 8 KB datagrams a round then holds one to four packets, so one
+/// delayed acknowledgement lifts a round's minimum round trip past the queue test. Measured on the
+/// 5% arm with nothing else on the path: rounds 4–7 ms over the base, two in a row about once a
+/// second, which broke every 2-second streak and kept tier 3 out (1.25x a Cubic flow).
+pub(crate) const CLIMB_3_QUEUE_ROUNDS: u32 = 8;
 /// Tier 3 fails when the loss share rises this much above its share at entry (or 1.5 times it).
 pub(crate) const TIER3_LOSS_RISE: f64 = 0.03;
 /// Tier 3 is locked out this long after a first failure…
