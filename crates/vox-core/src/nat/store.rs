@@ -38,7 +38,6 @@
 //! and has no ambient clock, which keeps it unit-testable and side-effect-free.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::IpAddr;
 
 use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
@@ -132,91 +131,28 @@ pub const MAX_AUTHORS_PER_BUCKET: usize = 1024;
 pub const MAX_GENESIS_CHANNELS: usize = 4096;
 
 /// Most distinct sources a board credits one room to (see [`Source`]): a bound on memory. Only
-/// the room's members add to it — the first put of its genesis, and member records, which only a
-/// member can sign.
+/// the room's members add to it: its creator's genesis, and a member's own address or bundle
+/// record.
 pub const MAX_SOURCES_PER_ROOM: usize = 16;
 
-/// **Where a room's records came from**, so a full board can share itself fairly between the
-/// peers filling it (V210-70): the network a peer published from — an IPv4 address, or an IPv6
-/// address by its /48 — or, for a peer reached through a relay
-/// (whose address this node cannot see), its identity. A /48 rather than the /64 one subscriber
-/// is usually given, because a host is commonly given far more than one /64: grouping less would
-/// let one machine appear as thousands of sources. Subscribers who share a /48 only share a count.
-///
-/// A room is credited to a source only by a record **the peer that brought it wrote**, and only
-/// when the board **stored** it: its genesis, put by its creator when the board did not hold it
-/// yet, and a member address or bundle record, put by that member, that the board did not already
-/// hold ([`Taken::stored`]). A room's genesis and its members' records are served to anyone who
-/// asks, so anyone can bring them to a board: credited to whoever brought them, a stranger put a
-/// real room's records back from its own network and had the room evicted with its own rooms
-/// (V210-70, c4), and could do the same to a board that did not hold them yet, after a restart or
-/// on an anchor the room had not used. Only a room's members can write its records, so a stranger
-/// cannot get itself credited with a room it is not in. A full board evicts from the
-/// source credited with the most rooms, so a stranger filling it from one network, or from a few,
-/// only ever displaces its own rooms, and a real room — live or long offline — is displaced only
-/// once no source holds more. A peer reached through a relay is known by identity, which is not
-/// free to multiply: a relay carries a circuit only between peers that share a room on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Source {
-    /// An IPv4 address.
-    V4([u8; 4]),
-    /// An IPv6 /48.
-    V6([u8; 6]),
-    /// A peer reached through a relay, by its fingerprint.
-    Relayed(Digest32),
-}
-
-impl Source {
-    /// The source for a peer seen at `ip` (an IPv4-mapped IPv6 address is its IPv4 address).
-    #[must_use]
-    pub fn of_addr(ip: IpAddr) -> Self {
-        match ip {
-            IpAddr::V4(v4) => Self::V4(v4.octets()),
-            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => Self::V4(v4.octets()),
-                None => {
-                    let mut net = [0u8; 6];
-                    net.copy_from_slice(&v6.octets()[..6]);
-                    Self::V6(net)
-                }
-            },
-        }
-    }
-}
-
-/// **What a board did with a member address or bundle record it admitted** (see
-/// [`RendezvousStore::accept_member`]).
-///
-/// Admission alone does not say whether anything was stored: a board takes a record it already
-/// holds as a no-op rather than refuse it (see `same_member_claim`), and a room's records are
-/// served to anyone who asks. So "admitted" cannot be what credits a room to the source a record
-/// came from ([`Source`], V210-70) — a stranger could fetch a real room's records and put them back
-/// from its own network — and neither can "news" alone, which a member's routine refresh is not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Taken {
-    /// The board already held this claim and the record arrived inside the refresh floor: a
-    /// re-send. Nothing was stored.
-    Held,
-    /// The same claim, re-signed past the refresh floor: stored, renewing the held record's
-    /// timestamp and expiry. Not news.
-    Renewed,
-    /// An author the board held nothing for, or a changed claim: stored, and news.
-    Learned,
-}
-
-impl Taken {
-    /// Whether the board **stored** the record: anything but a re-send of one it holds.
-    #[must_use]
-    pub fn stored(self) -> bool {
-        !matches!(self, Self::Held)
-    }
-
-    /// Whether the board **learned something** from it: a new author or a changed claim.
-    #[must_use]
-    pub fn learned(self) -> bool {
-        matches!(self, Self::Learned)
-    }
-}
+// **Where a room's records came from**, so a full board can share itself fairly between the peers
+// filling it (V210-70): the [`Source`] of the peer that put them, the definition the join slots
+// share (`nat::source`).
+//
+// A room is credited to a source only by a record **the peer that put it wrote**: its genesis, put
+// by its creator, and a member address or bundle record, put by that member — whether or not the
+// board already held it. A room's genesis and its members' records are served to anyone who asks,
+// so anyone can put them back: credited to whoever put them, a stranger re-sent a real room's
+// records from its own network and had the room evicted with its own rooms (c4); and credited only
+// when the put stored something new, a stranger who put them on a board first (after a restart)
+// left the member's own republish a no-op that credited nothing, so the room was credited to no
+// one and a flood of rooms credited to no one evicted it (c5). Only a room's members can write its
+// records, so a stranger cannot get itself credited with a room it is not in, and the member's own
+// put always credits the member's network. A full board evicts from the source credited with the
+// most rooms — coarse to fine, so a stranger filling it from one network, or from a few, only ever
+// displaces its own rooms — and a real room, live or long offline, is displaced only once no
+// source holds more.
+pub use crate::nat::source::Source;
 
 /// The expiry instant of a member record (epoch-seconds).
 fn member_expiry(rec: &RendezvousRecord) -> u64 {
@@ -376,19 +312,18 @@ impl RendezvousStore {
     ///   future-dated, over-long TTL, bucket full);
     /// - [`Error::MalformedRendezvous`] if the resolved key does not match the
     ///   record's signature/author binding;
-    /// - `Ok(taken)` on admission, where [`Taken`] says what the board did with it: nothing, for
-    ///   a record it already holds ([`Taken::Held`]); renewed the held record, for a member's
-    ///   routine refresh of the same claim ([`Taken::Renewed`]); or **learned something**, an
-    ///   author it held nothing for or a changed claim ([`Taken::Learned`]). Only the last is
-    ///   news, and that is what keeps a republish from looking like news: every node told of news
-    ///   republishes, so a refresh counted as news made two members' boards wake each other about
-    ///   a hundred times a second (#179).
+    /// - `Ok(learned)` on admission (the record becomes the current one for its author), where
+    ///   `learned` says whether the board **learned something**: an author it held nothing for,
+    ///   or a claim that differs from the one it held. A member's routine refresh of the claim
+    ///   the board already holds is `false`, and that is what keeps a republish from looking like
+    ///   news: every node told of news republishes, so a refresh counted as news made two members'
+    ///   boards wake each other about a hundred times a second (#179).
     pub fn accept_member(
         &mut self,
         record: RendezvousRecord,
         resolve_member: impl FnOnce(&Digest32) -> Option<CompositePublicKey>,
         now: u64,
-    ) -> Result<Taken> {
+    ) -> Result<bool> {
         // 1. Member-only: resolve the author's authenticated membership key. No key
         //    for this author_id ⇒ not a channel member ⇒ rejected.
         let author_pubkey = resolve_member(&record.author_id)
@@ -409,17 +344,13 @@ impl RendezvousStore {
         let bucket = self.members.entry(bucket_key).or_default();
 
         // 4. Freshness vs the current record for this author (if any).
-        let taken = if let Some(cur) = bucket.get(&record.author_id) {
+        let learned = if let Some(cur) = bucket.get(&record.author_id) {
             let same = same_member_claim(cur, &record);
             if same && within_refresh_floor(record.timestamp, cur.timestamp) {
-                return Ok(Taken::Held); // already held: see `check_replacement`
+                return Ok(false); // already held: see `check_replacement`
             }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
-            if same {
-                Taken::Renewed
-            } else {
-                Taken::Learned
-            }
+            !same
         } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
                 // New author would exceed the bucket cap: only admit if pruning expired
@@ -429,12 +360,12 @@ impl RendezvousStore {
                     return Err(Error::RendezvousRejected("member bucket at capacity"));
                 }
             }
-            Taken::Learned
+            true
         };
 
         // 5. Admit: replace the author's current record (one current per author).
         bucket.insert(record.author_id, record);
-        Ok(taken)
+        Ok(learned)
     }
 
     /// Admit (or refresh) a **member bundle** record (ADR-016 M14), enforcing the
@@ -450,13 +381,13 @@ impl RendezvousStore {
     /// root (checked by [`MemberBundleRecord::verify`]), so a member cannot
     /// publish another identity's prekeys under its own name.
     ///
-    /// Returns `Ok(taken)` as [`RendezvousStore::accept_member`] does.
+    /// Returns `Ok(learned)` as [`RendezvousStore::accept_member`] does.
     pub fn accept_bundle(
         &mut self,
         record: MemberBundleRecord,
         resolve_member: impl FnOnce(&Digest32) -> Option<CompositePublicKey>,
         now: u64,
-    ) -> Result<Taken> {
+    ) -> Result<bool> {
         // 1. Member-only.
         let author_pubkey = resolve_member(&record.author_id)
             .ok_or(Error::RendezvousRejected("author is not a channel member"))?;
@@ -477,17 +408,13 @@ impl RendezvousStore {
         let bucket = self.bundles.entry(bucket_key).or_default();
 
         // 4. Freshness vs the current bundle for this author (if any).
-        let taken = if let Some(cur) = bucket.get(&record.author_id) {
+        let learned = if let Some(cur) = bucket.get(&record.author_id) {
             let same = same_bundle_claim(cur, &record);
             if same && within_refresh_floor(record.timestamp, cur.timestamp) {
-                return Ok(Taken::Held); // already held: see `check_replacement`
+                return Ok(false); // already held: see `check_replacement`
             }
             check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
-            if same {
-                Taken::Renewed
-            } else {
-                Taken::Learned
-            }
+            !same
         } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
                 bucket.retain(|_, r| now < bundle_expiry(r));
@@ -495,12 +422,12 @@ impl RendezvousStore {
                     return Err(Error::RendezvousRejected("bundle bucket at capacity"));
                 }
             }
-            Taken::Learned
+            true
         };
 
         // 5. Admit: one current bundle per author.
         bucket.insert(record.author_id, record);
-        Ok(taken)
+        Ok(learned)
     }
 
     /// Admit a channel's **genesis** (ADR-007 §Genesis; M14.7b).
@@ -532,9 +459,10 @@ impl RendezvousStore {
                 if pinned {
                     self.pinned.insert(channel_id);
                 }
-                // No credit to `source`: a room's genesis is public, so anyone can put it
-                // again, and crediting that would let a stranger file a real room under its
-                // own network and have it evicted with its own rooms.
+                // Its creator putting it again credits the creator's network, as the first put
+                // would have: whoever put it first, the creator's own put must count (see
+                // [`Source`]). The service passes a source only for the creator's put.
+                self.note_source(&channel_id, source);
                 return Ok(());
             }
             return Err(Error::RendezvousRejected("genesis already present"));
@@ -582,10 +510,12 @@ impl RendezvousStore {
     }
 
     /// The room a full board gives up for a new one: from the source credited with the most
-    /// unpinned rooms — rooms credited to nobody (the ones an anchor put back on its board after a
-    /// restart, before anyone published to them again) counting as one source of their own — the
-    /// one credited to the fewest sources, then one with no live member record before one with,
-    /// the oldest first.
+    /// unpinned rooms — chosen coarse to fine ([`Source`]): the coarsest key holding the most
+    /// rooms, then within it the next level's, then the finest's, so one /56 cannot tie out its
+    /// neighbours in a /48 — with rooms credited to nobody (the ones an anchor put back on its
+    /// board after a restart, before anyone published to them again) counting as one source of
+    /// their own; and among that source's rooms the one credited to the fewest sources, then one
+    /// with no live member record before one with, the oldest first.
     fn eviction_candidate(&self, now: u64) -> Option<Digest32> {
         let unpinned = || {
             self.genesis
@@ -593,24 +523,44 @@ impl RendezvousStore {
                 .filter(|cid| !self.pinned.contains(*cid))
         };
         let sources_of = |cid: &Digest32| self.genesis_sources.get(cid).filter(|s| !s.is_empty());
-        let mut held: HashMap<Option<Source>, usize> = HashMap::new();
-        for cid in unpinned() {
-            match sources_of(cid) {
-                Some(sources) => {
-                    for source in sources {
-                        *held.entry(Some(*source)).or_default() += 1;
+        // The keys chosen so far, coarsest first; a room is in the running while one of its sources
+        // has them.
+        let mut chosen: Vec<Digest32> = Vec::with_capacity(Source::LEVELS);
+        let matches = |source: &Source, chosen: &[Digest32]| {
+            chosen
+                .iter()
+                .enumerate()
+                .all(|(i, k)| source.level(i) == *k)
+        };
+        for level in 0..Source::LEVELS {
+            let mut held: HashMap<Option<Digest32>, usize> = HashMap::new();
+            for cid in unpinned() {
+                match sources_of(cid) {
+                    Some(sources) => {
+                        let keys: BTreeSet<Digest32> = sources
+                            .iter()
+                            .filter(|s| matches(s, &chosen))
+                            .map(|s| s.level(level))
+                            .collect();
+                        for key in keys {
+                            *held.entry(Some(key)).or_default() += 1;
+                        }
                     }
+                    // Credited to nobody: one source of its own, weighed at the coarsest level.
+                    None if level == 0 => *held.entry(None).or_default() += 1,
+                    None => {}
                 }
-                None => *held.entry(None).or_default() += 1,
+            }
+            match held.into_iter().max_by_key(|(key, n)| (*n, *key))? {
+                (Some(key), _) => chosen.push(key),
+                (None, _) => break,
             }
         }
-        let (&largest, _) = held.iter().max_by_key(|(src, n)| (**n, **src))?;
         let live = self.live_channels(now);
         unpinned()
-            .filter(|cid| match (sources_of(cid), largest) {
-                (Some(sources), Some(src)) => sources.contains(&src),
-                (None, None) => true,
-                _ => false,
+            .filter(|cid| match sources_of(cid) {
+                Some(sources) => !chosen.is_empty() && sources.iter().any(|s| matches(s, &chosen)),
+                None => chosen.is_empty(),
             })
             .min_by_key(|cid| {
                 (

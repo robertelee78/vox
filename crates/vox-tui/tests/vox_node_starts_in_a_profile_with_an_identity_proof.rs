@@ -1,6 +1,6 @@
-//! V210-70 — **`vox node` starts in a profile that has an identity**, and `--serve trusted`
-//! leaves neither the identity passphrase nor the trust list readable, through the shipped
-//! binary.
+//! V210-70 — **`vox node --serve trusted` starts in a profile that has an identity**, and leaves
+//! neither the identity passphrase nor the trust list readable, through the shipped binary. (Plain
+//! `vox node` in such a profile is the operator first-run proof's, #298.)
 //!
 //! `--serve trusted` keeps the anchor's trust list in its own profile, which means the profile
 //! has an identity (`vox id`). A person who did that saw `vox node` refuse to start:
@@ -13,12 +13,12 @@
 //! the same store again for its anchored logs. A headless node networks as its key file and
 //! holds no room, so it never needs the vault.
 //!
-//! **Staging.** One profile, `vox id` in it, `vox trust add` of one fingerprint, then `vox node`
-//! twice: plain (`--serve anyone`, the default), and `--serve trusted`.
+//! **Staging.** One profile, `vox id` in it, `vox trust add` of one fingerprint, then
+//! `vox node --serve trusted`.
 //!
 //! **Asserted.**
-//! 1. Each `vox node` prints its `--anchor` spec within 120 s (it fails the proof if it exits
-//!    first) and never says the profile is already open. With `--serve trusted` it says it serves only the 1 trusted identity's rooms.
+//! 1. It prints its `--anchor` spec within 120 s (it fails the proof if it exits first), never
+//!    says the profile is already open, and says it serves only the 1 trusted identity's rooms.
 //! 2. With `--serve trusted` running, neither the identity passphrase nor the trusted
 //!    fingerprint (as text or as its 32 bytes) appears in anything the anchor printed or in any
 //!    file under the profile's data or config directory, and the passphrase is not on its
@@ -26,7 +26,7 @@
 //!
 //! **Mutation that must turn it red.** In `node::actor`'s `spawn_config`, open the profile's
 //! vault for a headless node again (`Profile::exists` without the `headless.is_none()` guard).
-//! Both starts fail with "another vox already has this profile open".
+//! The start fails with "another vox already has this profile open".
 
 #![cfg(unix)]
 
@@ -96,19 +96,15 @@ fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed
         "CANNOT MEASURE: vox trust add in the anchor's profile: {out}{err}"
     );
 
-    // ---- 1. both starts ----------------------------------------------------------------------
-    for extra in [&[][..], &["--serve", "trusted"][..]] {
-        let mut node = start(&data, extra);
+    // ---- 1. the start --------------------------------------------------------------------------
+    {
+        let mut node = start(&data, &["--serve", "trusted"]);
         let said = node.transcript();
-        println!("[proof] vox node {extra:?} in a profile with an identity: started");
+        println!("[proof] vox node --serve trusted in a profile with an identity: started");
         assert!(
             !said.contains("already has this profile open"),
-            "`vox node {extra:?}` said the profile is already open:\n{said}"
+            "`vox node --serve trusted` said the profile is already open:\n{said}"
         );
-        if extra.is_empty() {
-            drop(node);
-            continue;
-        }
         assert!(
             said.contains("serving only rooms made by the 1 identity this profile trusts"),
             "`vox node --serve trusted` did not say it serves only the trusted identity's rooms:\n{said}"
