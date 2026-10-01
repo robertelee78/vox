@@ -249,3 +249,110 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
     drop(host);
     drop(anchor);
 }
+
+/// **An anchor may be named by hostname** (ADR-017 decision 7, RP-06). A person configuring an
+/// anchor has a machine in mind, and that machine has a name; a home connection's address
+/// changes whenever the ISP decides, so a spec that only takes an address silently points
+/// nowhere after the next change.
+///
+/// The host here is told the anchor as `<fp>@localhost:<port>`, the way a person types it into
+/// the anchors file, and advertises itself at an address nobody can dial (`--at 127.0.0.1:1`).
+/// The guest has no anchor of its own. So the guest can reach the host **only** through the
+/// anchor the host found by its name: the join is the proof that the name was resolved and the
+/// anchor used.
+#[test]
+#[ignore = "production Argon2id + real binaries; CI runs it in release"]
+fn an_anchor_named_by_hostname_carries_a_join() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    let anchor_cfg = tmp.path().join("anchor-config");
+    let host_cfg = tmp.path().join("host-config");
+    let guest_cfg = tmp.path().join("guest-config");
+    let anchor_dir = tmp.path().join("anchor");
+    let host_dir = tmp.path().join("host");
+    let guest_dir = tmp.path().join("guest");
+    for d in [
+        &anchor_cfg,
+        &host_cfg,
+        &guest_cfg,
+        &anchor_dir,
+        &host_dir,
+        &guest_dir,
+    ] {
+        std::fs::create_dir_all(d).expect("APPARATUS: create a profile dir");
+    }
+
+    let mut anchor = Proc::spawn(
+        "anchor",
+        &anchor_dir,
+        &anchor_cfg,
+        &["node".into(), "--listen".into(), "127.0.0.1:0".into()],
+    );
+    // `<fp>@/ip4/127.0.0.1/udp/<port>`, the spec `vox node` prints for elsewhere.
+    let printed = anchor
+        .expect_line("an anchor spec on 127.0.0.1", |l| {
+            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
+        })
+        .trim()
+        .to_owned();
+    let (fp, addr) = printed.split_once('@').expect("a spec has an @");
+    let port = addr.rsplit('/').next().expect("a port after the last /");
+    // What a person writes: the machine's name, not its address.
+    let by_name = format!("{fp}@localhost:{port}");
+    std::fs::write(
+        host_cfg.join("anchors"),
+        format!("# the anchor, by name\n{by_name}\n"),
+    )
+    .expect("APPARATUS: write the host's anchors file");
+    eprintln!("[proof] the host's anchors file names the anchor as {by_name}");
+
+    let mut host = Proc::spawn(
+        "host",
+        &host_dir,
+        &host_cfg,
+        &[
+            "serve".into(),
+            "1".into(),
+            "--at".into(),
+            "127.0.0.1:1".into(),
+            "--listen".into(),
+            "127.0.0.1:0".into(),
+        ],
+    );
+    let address = after_label(
+        &host.expect_line("the vox:// address", |l| l.starts_with("address ")),
+        "address",
+    );
+    let passphrase = after_label(
+        &host.expect_line("the passphrase", |l| l.starts_with("passphrase ")),
+        "passphrase",
+    );
+    assert!(
+        address.contains("?a=") && address.contains("&b="),
+        "PRODUCT: the invite must carry the anchor the host found by the name {by_name}, so a \
+         guest can reach it: {address}"
+    );
+
+    let (ok, out, err) = vox_once(
+        &guest_dir,
+        &guest_cfg,
+        &[
+            "connect".into(),
+            address.clone(),
+            "--passphrase-file".into(),
+            room_pass_file(&guest_dir, &passphrase),
+            "--listen".into(),
+            "127.0.0.1:0".into(),
+        ],
+    );
+    assert!(
+        ok && out.contains("joined"),
+        "PRODUCT: a guest must join a host whose only way in is an anchor named {by_name}; \
+         `vox connect` said:\nstdout:\n{out}\nstderr:\n{err}\nThe host said:\n{}",
+        host.seen.join("\n")
+    );
+    eprintln!("[proof] the guest joined through the anchor named {by_name}");
+
+    drop(host);
+    drop(anchor);
+}
