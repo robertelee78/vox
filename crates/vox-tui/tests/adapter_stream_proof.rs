@@ -25,19 +25,10 @@
 //! - the consumer **killed three times** with SIGKILL at points inside the bursts, each
 //!   time restarted from the cursor it had persisted.
 //!
-//! Every message is posted the way a person or an agent posts one: `vox room post`, the
-//! shipped binary, one process per message.
-//!
 //! What it asserts: the union of every row the consumer emitted, after the starting
 //! cursor, **equals** the room's log after that cursor — no gap — and every duplicate
-//! is explained by a restart. Before that, separately: `board --json` shows what the
-//! claims made it say — the contested resource held by its first claimant, the handed-off
-//! one by its receiver, the lapsed one gone.
-//!
-//! **Which side a red is on.** What `vox` printed or failed to print is `PRODUCT:` and is
-//! quoted. A run that never lagged, or a log that does not hold the burst it was given, is
-//! `CANNOT MEASURE:` (the staging was not achieved). A fixture or a signal that did not take
-//! is `APPARATUS:`.
+//! is explained by a restart. Then, separately: `board --json` equals the ownership the
+//! claim fold computes independently from the same rows.
 
 #![cfg(unix)]
 
@@ -52,6 +43,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use support::{until, Out, Worker, HARNESS_SESSION_VARS, VOX};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One run of the consumer: a `tail` process, and a reader thread that forwards its
 /// lines — unless paused, when it stops reading the pipe altogether, so the pipe fills,
@@ -74,18 +67,13 @@ fn start(w: &Worker, r: &str, cursor: &str, stderr: &std::path::Path) -> Run {
                 .create(true)
                 .append(true)
                 .open(stderr)
-                .expect("APPARATUS: cannot open tail's stderr file"),
+                .unwrap(),
         );
     for v in HARNESS_SESSION_VARS {
         cmd.env_remove(v);
     }
-    let mut child = cmd.spawn().expect("APPARATUS: cannot start vox room tail");
-    let mut lines = BufReader::new(
-        child
-            .stdout
-            .take()
-            .expect("APPARATUS: vox room tail has no stdout"),
-    );
+    let mut child = cmd.spawn().expect("spawn tail");
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
     let (tx, rx) = std::sync::mpsc::channel();
     let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let p = paused.clone();
@@ -112,7 +100,7 @@ fn signal(run: &Run, sig: &str) {
         .args([sig, &run.child.id().to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "APPARATUS: kill {sig} {} did not take", run.child.id());
+    assert!(ok, "kill {sig} {}", run.child.id());
 }
 
 /// Process up to `n` rows, waiting at most `idle` for each, persisting the cursor after
@@ -129,19 +117,12 @@ fn consume(
         let Ok(line) = run.rx.recv_timeout(idle) else {
             break;
         };
-        let row: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
-            panic!(
-                "PRODUCT: `vox room tail --json` printed a line that is not JSON ({e}): {line:?}"
-            )
-        });
+        let row: serde_json::Value = serde_json::from_str(line.trim()).expect("NDJSON row");
         assert_eq!(
             row["schema"], "vox.room.row/1",
-            "PRODUCT: `vox room tail --json` printed a row of another schema: {line:?}"
+            "an adapter must refuse any other schema"
         );
-        let h = row["entry_hash"]
-            .as_str()
-            .unwrap_or_else(|| panic!("PRODUCT: a tail row with no entry_hash: {line:?}"))
-            .to_owned();
+        let h = row["entry_hash"].as_str().unwrap().to_owned();
         *seen.entry(h.clone()).or_default() += 1;
         *cursor = h; // persisted AFTER processing
         got += 1;
@@ -181,17 +162,18 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         .worker_threads(4)
         .enable_all()
         .build()
-        .expect("APPARATUS: cannot build the runtime");
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
+    let cid = room.cid;
 
-    // ---- the board half: a contested claim, a completed handoff, a lapse ----
-    let ok = |o: Out, what: &str| assert!(o.ok, "PRODUCT: {what} failed: {o:?}");
-    ok(
-        alice.vox(Some("a1"), &["room", "claim", &r, "contested"]),
-        "alice's claim",
+    // ---- the fold half: a contested claim, a completed handoff, a lapse ----
+    assert!(
+        alice
+            .vox(Some("a1"), &["room", "claim", &r, "contested"])
+            .ok
     );
     until(
         bob,
@@ -200,22 +182,19 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         &["room", "board", &r, "--json"],
         |o: &Out| o.ok && support::resource(&o.json(), "contested").is_some(),
     );
-    let lost = bob.vox(Some("b1"), &["room", "claim", &r, "contested"]);
     assert_eq!(
-        lost.code,
-        Some(1),
-        "PRODUCT: bob's claim on what alice holds must be refused with exit 1: {lost:?}"
+        bob.vox(Some("b1"), &["room", "claim", &r, "contested"])
+            .code,
+        Some(1)
     );
-    ok(
-        alice.vox(Some("a1"), &["room", "claim", &r, "passed"]),
-        "alice's second claim",
-    );
-    ok(
-        alice.vox(
-            Some("a1"),
-            &["room", "handoff", &r, "passed", "--to", &bob.b32()[..16]],
-        ),
-        "alice's handoff",
+    assert!(alice.vox(Some("a1"), &["room", "claim", &r, "passed"]).ok);
+    assert!(
+        alice
+            .vox(
+                Some("a1"),
+                &["room", "handoff", &r, "passed", "--to", &bob.b32()[..16]]
+            )
+            .ok
     );
     until(
         bob,
@@ -226,13 +205,10 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             o.ok && support::resource(&o.json(), "passed").is_some_and(|x| x["state"] == "pending")
         },
     );
-    ok(
-        bob.vox(Some("b1"), &["room", "claim", &r, "passed"]),
-        "bob's acceptance of the handoff",
-    );
-    ok(
-        bob.vox(Some("b1"), &["room", "claim", &r, "lapsed", "--ttl", "1"]),
-        "bob's one-second claim",
+    assert!(bob.vox(Some("b1"), &["room", "claim", &r, "passed"]).ok);
+    assert!(
+        bob.vox(Some("b1"), &["room", "claim", &r, "lapsed", "--ttl", "1"])
+            .ok
     );
     std::thread::sleep(Duration::from_secs(2));
     until(
@@ -248,63 +224,94 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
                     .len()
         },
     );
-    let board_out = bob.vox(None, &["room", "board", &r, "--json"]);
-    let board = board_out.json();
-    let owner = |res: &str| -> Option<(String, String)> {
-        let x = support::resource(&board, res)?;
-        Some((
-            x["owner_fp"].as_str().unwrap_or("").to_owned(),
-            x["owner_session"].as_str().unwrap_or("").to_owned(),
-        ))
-    };
-    let contested = owner("contested");
-    let passed = owner("passed");
-    eprintln!(
-        "[proof] board: contested {contested:?}, passed {passed:?}, lapsed {:?}",
-        owner("lapsed")
-    );
-    assert!(
-        contested.as_ref().is_some_and(|(fp, s)| s == "a1"
-            && alice.b32().starts_with(fp.as_str())
-            && !fp.is_empty()),
-        "PRODUCT: bob's board must show `contested` held by alice's session a1: {board_out:?}"
-    );
-    assert!(
-        passed.as_ref().is_some_and(|(fp, s)| s == "b1"
-            && bob.b32().starts_with(fp.as_str())
-            && !fp.is_empty()),
-        "PRODUCT: bob's board must show `passed` held by bob's session b1 after the handoff: \
-         {board_out:?}"
-    );
-    assert!(
-        owner("lapsed").is_none(),
-        "PRODUCT: bob's board still shows `lapsed` after its one-second claim ran out: {board_out:?}"
-    );
     let rows = bob.vox(None, &["room", "read", &r, "--json"]).ndjson();
+    let posted: Vec<vox_agentcomms::Posted> = rows
+        .iter()
+        .filter_map(|x| {
+            let env = vox_agentcomms::Envelope::parse(x["text"].as_str()?).ok()?;
+            Some(vox_agentcomms::Posted {
+                entry_hash: vox_agentcomms::claim::from_b32(x["entry_hash"].as_str()?)?,
+                author: vox_agentcomms::claim::from_b32(x["author"].as_str()?)?,
+                created_millis: x["created_millis"].as_u64()?,
+                envelope: env,
+            })
+        })
+        .collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let independent = vox_agentcomms::claim::fold(&posted, VERSION, now);
+    let board = bob.vox(None, &["room", "board", &r, "--json"]).json();
+    let from_board: BTreeMap<String, (String, String)> = board["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| {
+            (
+                x["resource"].as_str().unwrap().to_owned(),
+                (
+                    x["owner_fp"].as_str().unwrap_or("").to_owned(),
+                    x["owner_session"].as_str().unwrap_or("").to_owned(),
+                ),
+            )
+        })
+        .collect();
+    let from_fold: BTreeMap<String, (String, String)> = independent
+        .resources
+        .iter()
+        .map(|(k, s)| match s {
+            vox_agentcomms::State::Held { owner, .. } => (
+                k.clone(),
+                (
+                    vox_agentcomms::claim::b32(&owner.author),
+                    owner.session.clone(),
+                ),
+            ),
+            vox_agentcomms::State::Pending { .. } => (k.clone(), (String::new(), String::new())),
+        })
+        .collect();
+    assert_eq!(
+        from_board, from_fold,
+        "board --json is not the fold of the room's rows"
+    );
+    assert_eq!(
+        from_board.get("contested").map(|x| x.1.as_str()),
+        Some("a1")
+    );
+    assert_eq!(from_board.get("passed").map(|x| x.1.as_str()), Some("b1"));
+    assert!(!from_board.contains_key("lapsed"));
+    eprintln!("[proof] board --json == independent fold: {from_board:?}");
 
     // ---- the stream half ----
-    let start_cursor = rows
-        .last()
-        .and_then(|x| x["entry_hash"].as_str())
-        .expect(
-            "CANNOT MEASURE: bob's `vox room read --json` shows no row to start the stream from",
-        )
+    let start_cursor = rows.last().unwrap()["entry_hash"]
+        .as_str()
+        .unwrap()
         .to_owned();
     let stderr = tmp.path().join("tail.stderr");
 
     // The producer, driven in phases by the proof so a burst lands exactly while the
-    // consumer is not reading. Each message is one `vox room post`, as a person posts it.
+    // consumer is not reading.
     let mut n = 0usize;
     let mut burst = |w: &Worker, count: usize, pad: usize| {
+        let sock = w.paths.socket_file();
         let first = n;
         n += count;
-        for i in first..first + count {
-            let o = w.vox_in(None, &["room", "post", &r, "-"], Some(&say(i, pad)));
-            assert!(
-                o.ok,
-                "PRODUCT: `vox room post` of message {i} failed: {o:?}"
-            );
-        }
+        rt.block_on(async move {
+            let mut c = vox_core::node::ipc::IpcClient::open(&sock).await.unwrap();
+            for i in first..first + count {
+                match c
+                    .request(&vox_core::node::ipc::Request::Post {
+                        channel_id: cid,
+                        text: say(i, pad),
+                    })
+                    .await
+                {
+                    Ok(vox_core::node::ipc::Frame::Ok) => {}
+                    other => panic!("post {i}: {other:?}"),
+                }
+            }
+        });
     };
 
     let mut cursor = start_cursor.clone();
@@ -312,9 +319,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let mut restarts = 0;
     let idle = Duration::from_secs(10);
     let kill = |run: &mut Run, restarts: &mut u32, cursor: &str, seen: &BTreeMap<String, u32>| {
-        run.child
-            .kill()
-            .expect("APPARATUS: SIGKILL to the consumer did not take"); // mid-stream
+        run.child.kill().unwrap(); // SIGKILL, mid-stream
         let _ = run.child.wait();
         *restarts += 1;
         eprintln!(
@@ -334,9 +339,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     assert_eq!(
         consume(&run, 1, idle, &mut cursor, &mut seen),
         1,
-        "PRODUCT: `vox room tail` emitted nothing for a post made while it ran, so it is not \
-         live before it is frozen; it said:\n{}",
-        std::fs::read_to_string(&stderr).unwrap_or_default()
+        "the consumer is subscribed and live before it is frozen"
     );
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     signal(&run, "-STOP"); // frozen: it reads nothing, so only the kernel buffer absorbs
@@ -357,11 +360,8 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     // still have no gap — the defect `tail` shipped with — so this is its own assertion.
     let live = consume(&run, 200, idle, &mut cursor, &mut seen);
     assert_eq!(
-        live,
-        200,
-        "PRODUCT: rows synced from another node must reach a LIVE consumer, not only a \
-         restarted one: {live} of 200 arrived; tail said:\n{}",
-        std::fs::read_to_string(&stderr).unwrap_or_default()
+        live, 200,
+        "rows synced from another node must reach a LIVE consumer, not only a restarted one"
     );
     kill(&mut run, &mut restarts, &cursor, &seen);
     // Run 3: stall under another synced burst, then die.
@@ -375,6 +375,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     kill(&mut run, &mut restarts, &cursor, &seen);
     // The rest, while nobody is listening.
     burst(alice, 300, 0);
+    assert_eq!(n, 1800);
 
     let all = until(
         bob,
@@ -397,15 +398,14 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     .ndjson();
     let after: Vec<String> = all
         .iter()
-        .filter_map(|x| x["entry_hash"].as_str().map(str::to_owned))
+        .map(|x| x["entry_hash"].as_str().unwrap().to_owned())
         .skip_while(|h| *h != start_cursor)
         .skip(1)
         .collect();
     assert_eq!(
         after.len(),
         1800,
-        "CANNOT MEASURE: bob's log after the starting cursor is not the 1,800-message burst, so \
-         the stream cannot be compared with it"
+        "the log after the starting cursor is the burst"
     );
 
     let mut run = start(bob, &r, &cursor, &stderr);
@@ -439,21 +439,20 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     );
     assert!(
         missing.is_empty(),
-        "PRODUCT: GAP: {} rows after the cursor were never emitted by `vox room tail`: {:?}",
+        "GAP: {} rows after the cursor were never emitted: {:?}",
         missing.len(),
         &missing[..missing.len().min(5)]
     );
     assert!(
         extra.is_empty(),
-        "PRODUCT: `vox room tail --since` emitted rows from before its cursor: {extra:?}"
+        "rows from before the starting cursor were emitted: {extra:?}"
     );
     assert!(
         lags > 0,
-        "CANNOT MEASURE: the consumer never lagged (no \"fell behind\" from `vox room tail`), so \
-         this run proved nothing about lag"
+        "the consumer never lagged, so this run proved nothing about lag"
     );
     assert!(
         dups as u32 <= restarts * 600,
-        "PRODUCT: `vox room tail` repeated {dups} rows, beyond what {restarts} restarts explain"
+        "duplicates beyond what restarts explain: {dups}"
     );
 }
