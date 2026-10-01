@@ -802,6 +802,7 @@ pub async fn refuse_join_as(mut send: SendStream, reason: JoinReject) {
 /// So the caller uses this to apply the admission on the actor and wait for it. The wait happens
 /// here, on the slot's task, which is what keeps the actor free — the property the slot was
 /// introduced for.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct required input
 pub async fn run_responder<F, Fut>(
     mut send: SendStream,
     mut recv: RecvStream,
