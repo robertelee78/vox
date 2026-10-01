@@ -3,7 +3,7 @@
 **Status**: accepted (2026-09-21) — the policy is in force from this change; the harness lands with it
 and grows per capability
 **Date**: 2026-09-21
-**Updated**: 2026-10-01 — "What may block a release, what is optional, what is deleted" added: a valid proof (the shipped binary, used as a person would, whose red names product or test) blocks; an optional test is opt-in, never blocks and is loud when not run; everything else, report-only checks included, is deleted. "Publish only what CI proved" amended where it allowed a report-only arm. Also 2026-10-01 — M18.3's journey gains an anchorless arm, and `BoardUnreachable` is described as the board (the host's own or an anchor's), per ADR-012's restated anchor principle. 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
+**Updated**: 2026-10-01 — "What may block a release, what is optional, what is deleted" added: a valid proof (the shipped binary, used as a person would, whose red names product or test) blocks; an optional test is opt-in and never blocks; everything else, report-only checks included, is deleted. Later the same day: an optional proof is fully optional (it blocks neither CI nor the release gate, sits behind the one cargo feature `optional-proofs`, is compiled by CI and listed in `docs/release/optional-proofs.md`), and a proof is run once and repeated only on smoke. "Publish only what CI proved" amended where it allowed a report-only arm. Also 2026-10-01 — M18.3's journey gains an anchorless arm, and `BoardUnreachable` is described as the board (the host's own or an anchor's), per ADR-012's restated anchor principle. 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
 work, and the two obligations they cannot yet meet are recorded in §3's accepted-gaps table rather
 than skipped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -899,6 +899,10 @@ three classes, so that every test in the tree is exactly one of them. In the dec
 - "Valid proofs block; rest optional."
 - "spike tests are valid"; "optional tests are valid".
 - On report-only, informational and warning checks: "you know how I feel about fake tests."
+- On optional proofs: "Fully optional"; "those types of tests are great to have at the ready for
+  troubleshooting".
+- On repetition: "it feels wasteful to test the same things 2398439487398327492847239847234 times";
+  "test when you find smoke"; "not just for funzies".
 
 **Why.** The previous section removed tests that never ran the binary. The tests that remained still
 included some whose reds could not say which side had failed, and checks that ran in CI without the
@@ -913,10 +917,13 @@ prove nothing a person depends on.
    user**: it MUST drive the shipped `vox` binary as a person would, and MUST assert what that person
    sees or gets. Every failure path in it MUST say whether the product failed a person or the
    apparatus failed to measure. A test whose red does not say which MUST NOT block.
-2. **An optional test is opt-in.** An optional test MUST be off unless a person asks for it, MUST
-   NOT block a release, and MUST say loudly, by name, that it did not run when it is not enabled. A
-   skipped optional test MUST NOT read as a pass (§3). A spike is valid in the same way: it MUST be
-   run and its result reported, and it MUST NOT be committed to the gate.
+2. **An optional proof is fully optional.** It MUST block nothing: not CI and not the release gate.
+   It exists to be at the ready for troubleshooting. There MUST be one mechanism for it, the cargo
+   feature `optional-proofs`: an optional proof MUST be compiled only with that feature, CI MUST
+   compile it (without running it) so that it stays ready, and `docs/release/optional-proofs.md`
+   MUST list every optional proof. A proof that did not run MUST NOT read as a pass (§3). A spike is
+   valid in the same way: it MUST be run and its result reported, and it MUST NOT be committed to the
+   gate.
 3. **Everything else is deleted.** A unit test, an in-process library test, a test of an internal
    value, and a gate that adds CI time without proving a feature works for a user MUST NOT exist in
    the tree.
@@ -929,6 +936,10 @@ prove nothing a person depends on.
 - A new claim SHOULD extend an existing user-journey proof rather than add a test file, because the
   journey crosses the handoffs between commands where every defect in §1 lived.
 - A fix MUST delete the tests it makes redundant, in the same change.
+- A proof SHOULD be run **once**. It MUST be repeated only on smoke: a red, a flake someone has seen,
+  a timing near its bound, or a claim that is itself a rate. Callers' proofs MUST be run only where
+  the diff plausibly reaches them. A verifier MUST NOT re-run the fixer's greens, and nobody SHOULD
+  run locally what CI already runs.
 - Every proof MUST have a mutant: the product broken on purpose, under which the proof goes red **on
   the assertion that makes its claim**. A CANNOT MEASURE is not a red and MUST NOT be counted as the
   mutant's result (§7, and "Prove the escalation, not the refusal").

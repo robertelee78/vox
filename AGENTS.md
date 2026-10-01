@@ -22,8 +22,16 @@ decider's own. Each rule names the ADR section that holds the full record.
 - **Only valid proofs block; everything else is optional or deleted.** "Valid proofs block; rest
   optional." (ADR-018, 2026-10-01 section)
   - "spike tests are valid": run them and report the result; never commit them to the gate.
-  - "optional tests are valid": opt-in, never blocking, and loud when not run. A skipped optional
-    test never reads as a pass. (ADR-018 §3)
+  - "optional tests are valid", and "Fully optional": they block nothing, not CI and not the
+    release gate. "those types of tests are great to have at the ready for troubleshooting". One
+    mechanism only: the cargo feature `optional-proofs`. CI compiles them without running them, so
+    they stay ready, and `docs/release/optional-proofs.md` lists them. A proof that did not run
+    never reads as a pass. (ADR-018, 2026-10-01 section)
+- **Run a proof once; repeat only on smoke.** "it feels wasteful to test the same things
+  2398439487398327492847239847234 times"; "test when you find smoke"; "not just for funzies". Smoke
+  is a red, a flake someone has seen, a timing near its bound, or a claim that is itself a rate.
+  Run callers' proofs only where the diff plausibly reaches them. A verifier does not re-run the
+  fixer's greens. Do not run locally what CI already runs. (ADR-018, 2026-10-01 section)
 - **No report-only, informational or warning checks.** "you know how I feel about fake tests." A
   check either blocks as a valid proof, runs as an opt-in optional test, or is deleted. (ADR-018,
   2026-10-01 section)
