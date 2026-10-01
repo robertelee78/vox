@@ -47,6 +47,7 @@ use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
+use crate::node::status::PublishCause;
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
@@ -2378,6 +2379,9 @@ pub struct Node {
     /// long-running node by itself: it is re-requested at half its lifetime, the
     /// interval RFC 6887 §11.2.1 recommends.
     renew_mappings_at: Option<u64>,
+    /// When each open room's own records are next renewed on this node's board and its anchors
+    /// (V210-68, #258): half their lifetime after the last round that signed them.
+    records_renew_at: BTreeMap<Digest32, u64>,
     /// Per address family (`true` for the IPv6 pinhole, `false` for the IPv4 mapping), when the
     /// timed lease held for it runs out (unix seconds). Until then its mapped address is still
     /// advertised, even while its renewal is failing (V210-75).
@@ -2478,8 +2482,9 @@ pub struct Node {
     board_authors: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
-    /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
-    publish_again: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// Publishes asked for while that `(room, board)` round was in flight: run when it ends, and
+    /// counted under the cause that asked first (several asks while one round runs are one round).
+    publish_again: BTreeMap<(Digest32, Digest32), PublishCause>,
     /// How many times in a row each board has refused one of this node's own records as stale,
     /// for [`NetEvent::RepublishTo`]'s cap. Cleared by a round that went on.
     stale_retries: BTreeMap<(Digest32, Digest32), u32>,
@@ -2700,6 +2705,7 @@ impl Node {
             anchors_up: BTreeSet::new(),
             sync_dials: BTreeSet::new(),
             renew_mappings_at: None,
+            records_renew_at: BTreeMap::new(),
             mapping_expires: BTreeMap::new(),
             mapping_retry: BTreeMap::new(),
             ports: BTreeMap::new(),
@@ -2727,7 +2733,7 @@ impl Node {
             pairwise_out: BTreeMap::new(),
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
-            publish_again: std::collections::BTreeSet::new(),
+            publish_again: BTreeMap::new(),
             stale_retries: BTreeMap::new(),
             republish_pending: std::collections::BTreeSet::new(),
             stale_held: std::collections::BTreeSet::new(),
@@ -2952,6 +2958,7 @@ impl Node {
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
                     self.renew_mappings_if_due();
+                    self.renew_records_if_due().await;
                     self.adopt_anchored_from_board().await;
                     if self.view_stale.load(std::sync::atomic::Ordering::Relaxed) {
                         self.refresh_network_view().await;
@@ -3370,6 +3377,7 @@ impl Node {
         &mut self,
         channel_id: &Digest32,
         conn: &Arc<VoxConnection>,
+        cause: PublishCause,
     ) {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
@@ -3428,10 +3436,17 @@ impl Node {
         // (room, board) at a time; a publish asked for meanwhile runs once the round ends.
         let board_id = conn.peer_id();
         if !self.publishing.insert((*channel_id, board_id)) {
-            self.publish_again.insert((*channel_id, board_id));
+            match self.publish_again.entry((*channel_id, board_id)) {
+                std::collections::btree_map::Entry::Vacant(waiting) => {
+                    waiting.insert(cause);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    crate::node::status::SyncBook::note_publish_merged(&self.sync_book, cause);
+                }
+            }
             return;
         }
-        crate::node::status::SyncBook::note_publish_round(&self.sync_book);
+        crate::node::status::SyncBook::note_publish_round(&self.sync_book, cause);
         let conn = Arc::clone(conn);
         let tx = self.net_tx.clone();
         let cid = *channel_id;
@@ -4033,7 +4048,7 @@ impl Node {
 
     /// Put a channel's genesis and this node's records on every anchor this node is
     /// connected to (its configured set and the channel's own).
-    async fn publish_channel_to_anchors(&mut self, channel_id: &Digest32) {
+    async fn publish_channel_to_anchors(&mut self, channel_id: &Digest32, cause: PublishCause) {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
@@ -4050,7 +4065,8 @@ impl Node {
             .filter_map(|id| net.manager().existing(id))
             .collect();
         for conn in anchors {
-            self.publish_channel_to_anchor(channel_id, &conn).await;
+            self.publish_channel_to_anchor(channel_id, &conn, cause)
+                .await;
         }
     }
 
@@ -4062,6 +4078,11 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
+        // Armed before the round rather than after it: the records are signed below. **Only here**:
+        // every full round (this, then every anchor) comes through here, and a round to one anchor
+        // must not re-arm it, or an anchor reconnecting more often than every half-lifetime put
+        // the renewal off for good, and the own board and every other anchor lapsed.
+        self.arm_record_renewal(channel_id);
         let seq = self.next_record_seq(channel_id);
         let stamp = self.record_timestamp(channel_id);
         let Some(profile) = self.profile.as_ref() else {
@@ -4195,7 +4216,8 @@ impl Node {
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
                     self.publish_channel_locally(&channel_id).await;
-                    self.publish_channel_to_anchors(&channel_id).await;
+                    self.publish_channel_to_anchors(&channel_id, PublishCause::Opened)
+                        .await;
                     let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
                 }
             }
@@ -4438,7 +4460,8 @@ impl Node {
                 // around a ring of anchors.
                 if self.channels.contains_key(&channel_id) {
                     crate::node::status::SyncBook::note_board_news(&self.sync_book);
-                    self.publish_channel_to_anchors(&channel_id).await;
+                    self.publish_channel_to_anchors(&channel_id, PublishCause::BoardNews)
+                        .await;
                     self.note_new_members(&channel_id).await;
                 }
             }
@@ -4474,7 +4497,8 @@ impl Node {
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
                     self.publish_channel_locally(&channel_id).await;
-                    self.publish_channel_to_anchors(&channel_id).await;
+                    self.publish_channel_to_anchors(&channel_id, PublishCause::Addresses)
+                        .await;
                 }
             }
             NetEvent::ReachFailed { peer, why } => {
@@ -4549,7 +4573,12 @@ impl Node {
                 self.refresh_network_view().await;
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
-                    self.publish_channel_to_anchor(&channel_id, &conn).await;
+                    self.publish_channel_to_anchor(
+                        &channel_id,
+                        &conn,
+                        PublishCause::AnchorReturned,
+                    )
+                    .await;
                 }
             }
             NetEvent::BetterPath { conn } => {
@@ -4659,7 +4688,8 @@ impl Node {
                 let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
                 if let Some(conn) = conn {
                     // Queued behind a round in flight to that board, as any other publish is.
-                    self.publish_channel_to_anchor(&channel_id, &conn).await;
+                    self.publish_channel_to_anchor(&channel_id, &conn, PublishCause::AskedAgain)
+                        .await;
                 }
             }
             NetEvent::PublishDone {
@@ -4749,10 +4779,11 @@ impl Node {
                         }
                     }
                 }
-                if self.publish_again.remove(&(channel_id, board)) {
+                if let Some(cause) = self.publish_again.remove(&(channel_id, board)) {
                     let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
                     if let Some(conn) = conn {
-                        self.publish_channel_to_anchor(&channel_id, &conn).await;
+                        self.publish_channel_to_anchor(&channel_id, &conn, cause)
+                            .await;
                     }
                 }
                 // A session with that board for this room was held back while the round ran.
@@ -4766,7 +4797,8 @@ impl Node {
                 let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
                 match conn {
                     Some(conn) if self.channels.contains_key(&channel_id) => {
-                        self.publish_channel_to_anchor(&channel_id, &conn).await;
+                        self.publish_channel_to_anchor(&channel_id, &conn, PublishCause::Retry)
+                            .await;
                     }
                     _ => {
                         self.publish_failures.remove(&(channel_id, board));
@@ -4895,7 +4927,8 @@ impl Node {
                     // fires for news.
                     if o.governance > 0 {
                         self.refresh_reachers().await;
-                        self.publish_channel_to_anchors(&channel_id).await;
+                        self.publish_channel_to_anchors(&channel_id, PublishCause::Governance)
+                            .await;
                     }
                     // **A newcomer this session admitted is consented to now, not on the tick.** Two
                     // members who joined the same room learn of each other only here, from the board.
@@ -5227,7 +5260,8 @@ impl Node {
             // witnessed the join, so it vouches (ADR-016 M15.2a). The joiner has
             // published to this board by the time its own join returns; whatever is
             // there now goes up, and what arrives later goes with the next mirror.
-            self.publish_channel_to_anchors(&channel_id).await;
+            self.publish_channel_to_anchors(&channel_id, PublishCause::Join)
+                .await;
         }
         self.adopt_join_session(channel_id, peer, outcome.session, false)
             .await;
@@ -5637,9 +5671,10 @@ impl Node {
         self.publish_channel_locally(&parsed.channel_id).await;
         // And on every anchor we hold, so every other member can find our key and
         // admit us as a log author (without which their sync sessions fail).
-        self.publish_channel_to_anchors(&parsed.channel_id).await;
+        self.publish_channel_to_anchors(&parsed.channel_id, PublishCause::Join)
+            .await;
         if !self.anchor_ids.contains(&conn.peer_id()) {
-            self.publish_channel_to_anchor(&parsed.channel_id, &conn)
+            self.publish_channel_to_anchor(&parsed.channel_id, &conn, PublishCause::Join)
                 .await;
         }
         // **Joining releases no sender key** (M17.6). This is the correction to
@@ -6581,6 +6616,46 @@ impl Node {
     /// The re-request runs on its own task (it talks to a gateway) and lands back as
     /// [`NetEvent::AddressesDiscovered`], which republishes the address records too —
     /// a renewal that came back with a *different* external port must be advertised.
+    /// Renew each open room's own records when half their lifetime has passed (V210-68, #258).
+    ///
+    /// A node's address record lives two hours on a board ([`crate::nat::store::MAX_TTL_SECS`]),
+    /// and nothing renewed it on a schedule: a round went out only when something happened (the
+    /// room opened, a join, a board learned news, a sync applied a governance entry). Until #179 a
+    /// round also went out after every sync that brought messages, which renewed it by accident;
+    /// an idle room lost its record after two hours either way, and then a joiner or a restarted
+    /// member that finds this node through the board did not find it. So, whatever the traffic,
+    /// a round goes out at half the lifetime: to this node's own board and every anchor. It is
+    /// armed by every full round ([`Self::arm_record_renewal`], from `publish_channel_locally`), so
+    /// a node that published everywhere for another reason is not asked again sooner: at most one
+    /// renewal per room per half-lifetime. A round to one anchor does not arm it.
+    async fn renew_records_if_due(&mut self) {
+        let now = self.now();
+        let due: Vec<Digest32> = self
+            .records_renew_at
+            .iter()
+            .filter(|(room, at)| **at <= now && self.channels.contains_key(*room))
+            .map(|(room, _)| *room)
+            .collect();
+        for room in due {
+            self.records_renew_at.remove(&room);
+            crate::node::status::SyncBook::note_renewal(&self.sync_book);
+            self.publish_channel_locally(&room).await;
+            self.publish_channel_to_anchors(&room, PublishCause::Renewal)
+                .await;
+        }
+        // A room closed since it was armed is not renewed.
+        let open = &self.channels;
+        self.records_renew_at
+            .retain(|room, _| open.contains_key(room));
+    }
+
+    /// Arm `room`'s next renewal at half its records' lifetime from now.
+    fn arm_record_renewal(&mut self, room: &Digest32) {
+        let half = crate::nat::store::own_record_ttl_secs() / 2;
+        self.records_renew_at
+            .insert(*room, self.now().saturating_add(half.max(1)));
+    }
+
     fn renew_mappings_if_due(&mut self) {
         let Some(due) = self.renew_mappings_at else {
             return;
@@ -8412,7 +8487,8 @@ impl Node {
         self.adopt_channel_anchors(&id, None).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&id).await;
-        self.publish_channel_to_anchors(&id).await;
+        self.publish_channel_to_anchors(&id, PublishCause::Opened)
+            .await;
         let _ = self
             .event_tx
             .send(NodeEvent::ChannelOpened { channel_id: id });
@@ -8542,7 +8618,8 @@ impl Node {
         self.adopt_channel_anchors(&id, None).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&id).await;
-        self.publish_channel_to_anchors(&id).await;
+        self.publish_channel_to_anchors(&id, PublishCause::Opened)
+            .await;
         let _ = self
             .event_tx
             .send(NodeEvent::ChannelOpened { channel_id: id });
@@ -8728,7 +8805,8 @@ impl Node {
         self.adopt_channel_anchors(&channel_id, None).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&channel_id).await;
-        self.publish_channel_to_anchors(&channel_id).await;
+        self.publish_channel_to_anchors(&channel_id, PublishCause::Opened)
+            .await;
         let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
         Outcome::Done
     }
