@@ -252,7 +252,13 @@ fn daemon(w: &World, dir: &Path, pass_file: &Path) -> VoxProc {
 #[test]
 #[ignore = "real binaries; CI runs it in release"]
 fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
-    watchdog::arm();
+    // 24 starts in a row, each unlocking an identity with production Argon2id: a debug build took
+    // 298 s on a quiet box and passed the 600 s default under load with 8 of 24 done.
+    watchdog::arm_for(Duration::from_secs(if cfg!(debug_assertions) {
+        1800
+    } else {
+        600
+    }));
     let mut w = staged("an anchor, a `vox serve` host and a joined guest", || {
         World::new(echo_service(), true)
     });
