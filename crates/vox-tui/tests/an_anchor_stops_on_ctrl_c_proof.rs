@@ -362,7 +362,7 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
     };
     // At the prompt once it shows it and has turned echo off, so a passphrase is not shown.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !(screen().contains("identity passphrase") && !echo(&terminal)) {
+    while !screen().contains("identity passphrase") || echo(&terminal) {
         if let Ok(Some(st)) = child.try_wait() {
             panic!(
                 "APPARATUS: staging not achieved — {who} ended ({st}) before its prompt:\n{}",

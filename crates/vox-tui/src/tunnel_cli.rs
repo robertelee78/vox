@@ -1137,7 +1137,7 @@ pub struct RoomTarget {
 /// took the default action and ended them on the spot, saying nothing. A stop now ends the verb
 /// with [`AppError::stopped_by`], after the node is shut down so its peers are told it went.
 ///
-/// `stop` is the caller's [`crate::app::stop_requested`], taken before its passphrase prompts, so
+/// `stop` is the caller's `stop_requested`, taken before its passphrase prompts, so
 /// one listener covers the whole run.
 pub async fn with_room<F, Fut>(
     target: RoomTarget,
