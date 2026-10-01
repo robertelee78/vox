@@ -3904,6 +3904,15 @@ impl Node {
         // close, by this end's close on hearing it, or by a close that never arrived.
         let why = match (silent, conn.quinn().close_reason()) {
             _ if conn.peer_stopped() => "the anchor stopped".to_owned(),
+            // Its peer is still running, but its only path ran through a relay that stopped: that
+            // is the cause, not the probe's verdict on a path that no longer exists (V210-93).
+            _ if conn.carrier_stopped().is_some() => format!(
+                "its path ran through {}, which stopped",
+                crate::node::link::b32_encode(&conn.carrier_stopped().unwrap_or_default())
+                    .chars()
+                    .take(12)
+                    .collect::<String>()
+            ),
             (Some(s), _) => format!("it answered nothing for {}s", s.as_secs()),
             (None, Some(e)) => anchor_close_reason(&e, conn.closed_here()),
             (None, None) => "it is no longer held".to_owned(),
@@ -8425,12 +8434,17 @@ impl Node {
         self.accepted_hello.clear();
         self.reopen.clear();
         self.session_serial.clear();
-        // And take the network down: a locked node has no identity to present, so it
-        // must not keep serving or holding connections (M14.7d).
-        self.stop_network().await;
+        // The identity and its signer go before the network does (V210-93, V210-94): stopping
+        // the network now says goodbye to every peer and waits, boundedly, for each to hear it and
+        // for the closes to leave — up to a couple of seconds for a peer that does not answer —
+        // and none of that needs a secret, since a connection's keys are its own. A lock wipes
+        // every secret at once; it does not hold the identity while the network winds down.
         if let Some(p) = self.profile.as_mut() {
             p.lock();
         }
+        // And take the network down: a locked node has no identity to present, so it
+        // must not keep serving or holding connections (M14.7d).
+        self.stop_network().await;
         self.lock_was_unlocked |= was_unlocked;
         self.locking += 1;
         let (settled, on_settled) = oneshot::channel();

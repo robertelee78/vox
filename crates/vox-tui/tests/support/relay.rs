@@ -211,6 +211,18 @@ pub struct RelayWorld {
 }
 
 impl RelayWorld {
+    /// The host as an `--anchor` spec (`<fingerprint>@<address>`), from the address its room link
+    /// gives for it.
+    pub fn host_spec(&self) -> Option<String> {
+        let query = self.address.split_once('?')?.1;
+        let pairs: Vec<&str> = query.split('&').collect();
+        pairs.windows(2).find_map(|w| {
+            let id = w[0].strip_prefix("a=")?;
+            let at = w[1].strip_prefix("b=")?;
+            (id == self.host_fp).then(|| format!("{id}@{at}"))
+        })
+    }
+
     /// The room passphrase in a file, for `--passphrase-file`: a room passphrase is never
     /// taken from argv or the environment (V210-72).
     pub fn passphrase_file(&self) -> String {
@@ -327,25 +339,32 @@ impl RelayWorld {
     /// Start the guest's `vox forward` to the host's service, on `[::1]`; returns the local
     /// address it bound.
     pub fn forward(&mut self) -> SocketAddr {
+        self.forward_with_anchors(&[])
+    }
+
+    /// [`Self::forward`], naming `extra` anchors (`--anchor` specs) beside the world's own.
+    pub fn forward_with_anchors(&mut self, extra: &[&str]) -> SocketAddr {
         let (listen, spec) = self.guest_net();
         let (listen, spec) = (listen.to_owned(), spec.to_owned());
-        let mut fwd = VoxProc::spawn(
+        let passphrase_file = self.passphrase_file();
+        let mut list = vec![
             "forward",
-            &self.guest_dir,
-            &args(&[
-                "forward",
-                &self.room,
-                &self.host_fp,
-                &self.service,
-                "127.0.0.1:0",
-                "--passphrase-file",
-                &self.passphrase_file(),
-                "--anchor",
-                &spec,
-                "--listen",
-                &listen,
-            ]),
-        );
+            &self.room,
+            &self.host_fp,
+            &self.service,
+            "127.0.0.1:0",
+            "--passphrase-file",
+            &passphrase_file,
+            "--anchor",
+            &spec,
+            "--listen",
+            &listen,
+        ];
+        for a in extra {
+            list.push("--anchor");
+            list.push(a);
+        }
+        let mut fwd = VoxProc::spawn("forward", &self.guest_dir, &args(&list));
         let line = fwd.expect_line("the forward's bound address", |l| {
             l.starts_with("vox: 127.0.0.1:") && l.contains('→')
         });

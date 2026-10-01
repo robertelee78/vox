@@ -385,8 +385,12 @@ impl VoxEndpoint {
     ///
     /// # Errors
     /// If the OS CSPRNG is unavailable, since the address is drawn from it.
-    pub fn attach_circuit(&self, peer: &Digest32) -> Result<CircuitPort> {
-        self.mux.attach(peer, None)
+    pub fn attach_circuit(
+        &self,
+        peer: &Digest32,
+        carrier: Option<crate::transport::mux::CircuitCarrier>,
+    ) -> Result<CircuitPort> {
+        self.mux.attach(peer, None, carrier)
     }
 
     /// Attach an **inbound** circuit from `peer`, as [`Self::attach_circuit`] does, recording
@@ -399,8 +403,9 @@ impl VoxEndpoint {
         &self,
         peer: &Digest32,
         origin: crate::transport::mux::CircuitOrigin,
+        carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach(peer, Some(origin))
+        self.mux.attach(peer, Some(origin), carrier)
     }
 
     /// Whether `addr` is a **live circuit** on this endpoint's socket — answered from the
@@ -514,6 +519,7 @@ impl VoxEndpoint {
 
         // Read before the first packet leaves: see [`VoxConnection::via_circuit`].
         let via_circuit = self.mux.is_circuit(addr);
+        let carrier = self.mux.carrier_of(addr);
         // The SNI server name is unused for authentication (we authenticate by the
         // Vox identity), but rustls requires a syntactically valid name.
         let connecting = self
@@ -521,7 +527,9 @@ impl VoxEndpoint {
             .connect_with(client_cfg, addr, "vox.invalid")
             .map_err(|_| Error::MalformedBundle("quic connect"))?;
         let connection = connecting.await.map_err(|_| Error::SignatureInvalid)?; // handshake/auth failure
-        finish_connection(connection, &verified, now_secs, via_circuit)
+        let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
+        conn.carrier = carrier.filter(|_| via_circuit);
+        Ok(conn)
     }
 
     /// Accept the next inbound connection, admitting **any authenticated Vox
@@ -594,6 +602,7 @@ impl VoxEndpoint {
         // Read before this end answers anything: see [`VoxConnection::via_circuit`].
         let via_circuit = self.mux.is_circuit(incoming.remote_address());
         let circuit_origin = self.mux.origin_of(incoming.remote_address());
+        let carrier = self.mux.carrier_of(incoming.remote_address());
         // A fresh slot for THIS connection's verifier output. We install a
         // per-connection server config so the verifier writes into our slot.
         let verified = VerifiedPeer::new();
@@ -618,6 +627,7 @@ impl VoxEndpoint {
             .map_err(|_| Error::SignatureInvalid)?;
         let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
+        conn.carrier = carrier.filter(|_| via_circuit);
 
         // Transport-layer admission, after authentication. A non-admitted peer is
         // closed with the coded reason and rejected — indistinguishable on the wire
@@ -691,7 +701,8 @@ fn finish_connection(
         datagram_rx: Mutex::new(ReplayWindow::default()),
         datagrams_dropped: AtomicU64::new(0),
         closed_here: std::sync::OnceLock::new(),
-        peer_stopped: std::sync::atomic::AtomicBool::new(false),
+        peer_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        carrier: None,
     })
 }
 
@@ -770,8 +781,11 @@ pub struct VoxConnection {
     datagrams_dropped: AtomicU64,
     /// The code this end closed the connection with, if it did (see [`Self::closed_here`]).
     closed_here: std::sync::OnceLock<WireError>,
-    /// Whether the peer said it is stopping (see [`Self::peer_stopped`]).
-    peer_stopped: std::sync::atomic::AtomicBool,
+    /// Whether the peer said it is stopping (see [`Self::peer_stopped`]). Shared, so a
+    /// connection over a circuit this one carries can tell (see [`Self::carrier_stopped`]).
+    peer_stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Who carries this connection, if it runs over a circuit (see [`Self::carrier_stopped`]).
+    carrier: Option<crate::transport::mux::CircuitCarrier>,
 }
 
 /// The next [`VoxConnection::serial`].
@@ -958,6 +972,24 @@ impl VoxConnection {
     #[must_use]
     pub fn peer_stopped(&self) -> bool {
         self.peer_stopped.load(Ordering::Relaxed)
+    }
+
+    /// This connection as the carrier of a circuit: the peer's identity and its stop flag, for a
+    /// circuit opened through it (see [`crate::transport::mux::CircuitCarrier`]).
+    #[must_use]
+    pub fn as_carrier(&self) -> crate::transport::mux::CircuitCarrier {
+        (self.peer_id, Arc::clone(&self.peer_stopped))
+    }
+
+    /// **The relay this connection's only path ran through, if that relay said it was stopping**
+    /// (V210-93). A connection over a circuit loses its path when its relay stops, though its own
+    /// peer is still running; its loss is then the relay's stop, and is said as that.
+    #[must_use]
+    pub fn carrier_stopped(&self) -> Option<Digest32> {
+        self.carrier
+            .as_ref()
+            .filter(|(_, stopped)| stopped.load(Ordering::Relaxed))
+            .map(|(relay, _)| *relay)
     }
 
     /// The code this end first closed the connection with, through [`Self::close`]: quinn reports

@@ -401,7 +401,8 @@ where
                 crate::node::joinslots::source_levels(carrier)
             };
             send_frame(&mut send, &CircuitFrame::Opened).await?;
-            let port = endpoint.attach_inbound_circuit(&origin, source)?;
+            let port =
+                endpoint.attach_inbound_circuit(&origin, source, Some(carrier.as_carrier()))?;
             tokio::spawn(terminate(port, Arc::clone(carrier), send, recv));
             Ok(())
         }
@@ -457,7 +458,7 @@ pub async fn connect_through(
         }
         _ => return Err(Error::Unreachable("circuit: relay did not open")),
     }
-    let port = endpoint.attach_circuit(&peer)?;
+    let port = endpoint.attach_circuit(&peer, Some(relay.as_carrier()))?;
     // Read before the port moves into the driver: the address is allocated per circuit,
     // so the port is the only thing that knows it.
     let target = port.addr();

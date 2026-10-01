@@ -100,14 +100,12 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     // ---- the anchor is stopped, and comes back on the same port --------------------------------
     let anchor_dir = w.tmp.path().join("anchor");
     let killed = Instant::now();
-    let _ = std::process::Command::new("kill")
-        .args(["-INT", &w.anchor.proc.child.id().to_string()])
-        .status();
+    kill(["-INT", &w.anchor.proc.child.id().to_string()]);
     let stopping = Instant::now();
     while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
         assert!(
             stopping.elapsed() < Duration::from_secs(10),
-            "CANNOT MEASURE: the anchor did not stop within 10 s of SIGINT"
+            "`vox node` did not stop within 10 s of SIGINT: a clean stop was not obeyed"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -153,35 +151,72 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
         saw_it_go,
         "the forward did not say its anchor connection went ({GONE:?})\n{said}"
     );
-    assert_says_stopped("the forward", &said);
+    let anchor = anchor_id(&w);
+    assert_says_stopped("the forward", &said, &anchor);
     let host = w.host.as_mut().map(|h| h.transcript()).unwrap_or_default();
-    assert_says_stopped("the host", &host);
+    assert_says_stopped("the host", &host, &anchor);
 }
 
-/// A clean stop is said as one (V210-93): every "gone" line in `said` gives "the anchor stopped"
-/// as the reason, at least one does, and none calls it an authentication failure.
-fn assert_says_stopped(who: &str, said: &str) {
+/// A clean stop is said as one (V210-93), by every connection it ended:
+/// - a "gone" line about **the stopped anchor** (`anchor`, its `--anchor` spec) gives "the anchor
+///   stopped" as the reason, and at least one such line is said;
+/// - a "gone" line about **another anchor** — a node can hold its host as an anchor too, over a
+///   circuit through the stopped one — says its path ran through the stopped anchor, which
+///   stopped: that peer is still running, and its connection went with its relay;
+/// - none calls the stop an authentication failure.
+fn assert_says_stopped(who: &str, said: &str, anchor: &str) {
+    let anchor12: String = anchor.chars().take(12).collect();
+    let about_it = format!("connection to {anchor12}");
+    let through_it = format!("its path ran through {anchor12}, which stopped");
     let gone: Vec<&str> = said.lines().filter(|l| l.contains(GONE)).collect();
+    let (its, others): (Vec<&str>, Vec<&str>) = gone.iter().partition(|l| l.contains(&about_it));
     let auth = said.lines().filter(|l| l.contains(NOT_AUTH)).count();
     eprintln!(
-        "[proof] {who}: {} \"gone\" line(s), {} saying {STOPPED:?}, {auth} saying {NOT_AUTH:?}",
-        gone.len(),
-        gone.iter().filter(|l| l.contains(STOPPED)).count()
+        "[proof] {who}: {} \"gone\" line(s) about the stopped anchor, {} saying {STOPPED:?}; {} \
+         about other peers, {} saying their path ran through it; {auth} saying {NOT_AUTH:?}",
+        its.len(),
+        its.iter().filter(|l| l.contains(STOPPED)).count(),
+        others.len(),
+        others.iter().filter(|l| l.contains(&through_it)).count()
     );
     assert!(
         auth == 0,
         "{who} reported a cleanly stopped anchor as {NOT_AUTH:?}\n{said}"
     );
     assert!(
-        !gone.is_empty() && gone.iter().all(|l| l.contains(STOPPED)),
+        !its.is_empty() && its.iter().all(|l| l.contains(STOPPED)),
         "{who} did not say its anchor stopped ({STOPPED:?}) when it was stopped cleanly\n{said}"
     );
+    assert!(
+        others.iter().all(|l| l.contains(&through_it)),
+        "{who} said another connection went when the anchor stopped, without saying its path ran \
+         through the stopped anchor ({through_it:?})\n{said}"
+    );
+}
+
+/// Send `sig` to `pid`. A signal that cannot be sent leaves the scene unstaged: CANNOT MEASURE.
+fn kill<const N: usize>(args: [&str; N]) {
+    let sent = std::process::Command::new("kill")
+        .args(args)
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(sent, "CANNOT MEASURE: `kill {}` failed", args.join(" "));
+}
+
+/// The anchor's identity, from its `--anchor` spec.
+fn anchor_id(w: &RelayWorld) -> String {
+    w.anchor
+        .v4_spec
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn a_killed_anchor_is_noticed_promptly() {
-    let _ = stopped_for_good("KILL", KILLED_WITHIN, false);
+    let _ = stopped_for_good("KILL", KILLED_WITHIN, false, false);
 }
 
 /// **A clean stop is said as one even when the anchor was busy carrying for the node** (V210-93).
@@ -202,23 +237,33 @@ fn a_killed_anchor_is_noticed_promptly() {
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn an_anchor_stopped_while_it_carries_a_transfer_is_said_to_have_stopped() {
-    let mut w = stopped_for_good("INT", CLOSED_WITHIN, true);
+    let mut w = stopped_for_good("INT", CLOSED_WITHIN, true, false);
+    let anchor = anchor_id(&w);
     let said = w.fwd.as_mut().unwrap().transcript();
-    assert_says_stopped("the forward", &said);
+    assert_says_stopped("the forward", &said, &anchor);
 }
 
+/// **SIGTERM, and what else the stop ends** (V210-93). The forward also names its host as an
+/// anchor (`--anchor`), which a node may well hold: the families are split, so the only path to the
+/// host is a circuit through the anchor that is stopped. The forward must say the anchor stopped,
+/// within [`CLOSED_WITHIN`], and of its host — still running — that the connection went because
+/// its path ran through the anchor, which stopped: not a liveness probe's verdict on a path that no
+/// longer exists. This is the scene of a debug red (#287 c3), where the forward had taken its host
+/// as an anchor on its own and gave the probe's verdict.
+///
+/// Mutation: the relay's stop not carried to the connections over its circuits (the reason left to
+/// the probe) → red on the host's line.
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
-    let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false);
+    let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false, true);
+    let anchor = anchor_id(&w);
     let said = w.fwd.as_mut().unwrap().transcript();
-    assert_says_stopped("the forward", &said);
+    assert_says_stopped("the forward", &said, &anchor);
     // ---- and a forward stops on SIGTERM as it does on Ctrl-C -----------------------------------
     let fwd = w.fwd.as_mut().unwrap();
     let signalled = Instant::now();
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &fwd.child.id().to_string()])
-        .status();
+    kill(["-TERM", &fwd.child.id().to_string()]);
     let status = loop {
         if let Some(status) = fwd.child.try_wait().ok().flatten() {
             break Some(status);
@@ -247,7 +292,7 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
 /// Stop the anchor with `signal` and leave it down; the forward must say its anchor connection is
 /// gone within `within` of the signal. With `carrying`, a bulk echo runs through the forward, and
 /// so through the anchor's circuit, from before the stop until after it.
-fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorld {
+fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bool) -> RelayWorld {
     watchdog::arm();
     let mut w = RelayWorld::new(Split::Families);
     let (ok, took, out, err) = w.join_guest();
@@ -255,8 +300,17 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorl
         ok,
         "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
+    let anchor12: String = anchor_id(&w).chars().take(12).collect();
+    let host12: String = w.host_fp.chars().take(12).collect();
     let started = Instant::now();
-    let at = w.forward();
+    let at = if host_too {
+        let host = w
+            .host_spec()
+            .unwrap_or_else(|| panic!("CANNOT MEASURE: no address for the host in {}", w.address));
+        w.forward_with_anchors(&[&host])
+    } else {
+        w.forward()
+    };
     let first = round_trip(at, b"before", Duration::from_secs(30));
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
@@ -265,6 +319,19 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorl
     );
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
     let fwd = w.fwd.as_mut().unwrap();
+    if host_too {
+        // The forward holds its host as an anchor too, over the only path it has to it: a circuit
+        // through the anchor about to be stopped (the families are split).
+        let held = fwd
+            .transcript()
+            .lines()
+            .any(|l| l.contains(&format!("connection to {host12}")) && l.contains(CONNECTED));
+        assert!(
+            held,
+            "CANNOT MEASURE: the forward never connected to its host as an anchor\n{}",
+            fwd.transcript()
+        );
+    }
     let before = fwd
         .transcript()
         .lines()
@@ -297,26 +364,26 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorl
     // ---- the anchor is stopped, and stays down --------------------------------------------------
     let fwd_pid = w.fwd.as_mut().unwrap().child.id().to_string();
     if carrying {
-        let _ = std::process::Command::new("kill")
-            .args(["-STOP", &fwd_pid])
-            .status();
+        kill(["-STOP", &fwd_pid]);
         std::thread::sleep(FROZEN_BEFORE_STOP);
     }
     let at_stop = transfer.as_ref().map(Transfer::echoed);
     let stopped = Instant::now();
-    let _ = std::process::Command::new("kill")
-        .args([&format!("-{signal}"), &w.anchor.proc.child.id().to_string()])
-        .status();
+    kill([&format!("-{signal}"), &w.anchor.proc.child.id().to_string()]);
     if carrying {
         std::thread::sleep(FROZEN_AFTER_STOP);
-        let _ = std::process::Command::new("kill")
-            .args(["-CONT", &fwd_pid])
-            .status();
+        kill(["-CONT", &fwd_pid]);
     }
     while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
         assert!(
             stopped.elapsed() < Duration::from_secs(10),
-            "CANNOT MEASURE: the anchor did not exit within 10 s of SIG{signal}"
+            "{}the anchor did not exit within 10 s of SIG{signal}",
+            // SIGKILL is the kernel's to carry out; any other stop is the product's to obey.
+            if signal == "KILL" {
+                "CANNOT MEASURE: "
+            } else {
+                "`vox node` did not obey a stop: "
+            }
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -336,10 +403,11 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorl
     let mut said = None;
     while stopped.elapsed() < within + Duration::from_secs(30) {
         let _ = fwd.transcript();
-        said = fwd
-            .said_since(stopped)
-            .into_iter()
-            .find(|l| l.starts_with("[+") && l.contains(GONE));
+        said = fwd.said_since(stopped).into_iter().find(|l| {
+            l.starts_with("[+")
+                && l.contains(GONE)
+                && l.contains(&format!("connection to {anchor12}"))
+        });
         if said.is_some() {
             break;
         }
@@ -371,6 +439,37 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool) -> RelayWorl
         "the forward said its anchor connection went only {after:?} after SIG{signal}, over \
          {within:?}\n---- the forward ----\n{transcript}"
     );
+    if host_too {
+        // The host is still running; its connection went with the circuit through the stopped
+        // anchor, and that is what must be said of it — not a liveness probe's verdict on a path
+        // that no longer exists. Noticed by the forward's own watch of its anchors, within the
+        // bound a silent one gets.
+        let through = format!("its path ran through {anchor12}, which stopped");
+        let mut host_gone = None;
+        while stopped.elapsed() < KILLED_WITHIN + Duration::from_secs(10) && host_gone.is_none() {
+            let _ = fwd.transcript();
+            host_gone = fwd.said_since(stopped).into_iter().find(|l| {
+                l.starts_with("[+")
+                    && l.contains(GONE)
+                    && l.contains(&format!("connection to {host12}"))
+            });
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("[proof] SIG{signal}: the forward said of its host: {host_gone:?}");
+        let transcript = fwd.transcript();
+        let host_gone = host_gone.unwrap_or_else(|| {
+            panic!(
+                "the forward never said its connection to the host went, though the only path to \
+                 it ran through the stopped anchor\n---- the forward ----\n{transcript}"
+            )
+        });
+        assert!(
+            host_gone.contains(&through),
+            "the forward said its connection to the host went, but not that its path ran \
+             through the stopped anchor ({through:?}): {host_gone}\n---- the forward ----\n\
+             {transcript}"
+        );
+    }
     drop(transfer);
     w
 }
@@ -507,14 +606,12 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
             "CANNOT MEASURE: round {round}: the forward never said it reached its anchor\n{}",
             w.fwd.as_mut().unwrap().transcript()
         );
-        let _ = std::process::Command::new("kill")
-            .args(["-INT", &w.anchor.proc.child.id().to_string()])
-            .status();
+        kill(["-INT", &w.anchor.proc.child.id().to_string()]);
         let stopping = Instant::now();
         while w.anchor.proc.child.try_wait().ok().flatten().is_none() {
             assert!(
                 stopping.elapsed() < Duration::from_secs(10),
-                "CANNOT MEASURE: the anchor did not stop within 10 s of SIGINT"
+                "`vox node` did not stop within 10 s of SIGINT: a clean stop was not obeyed"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -526,15 +623,26 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
         std::thread::sleep(Duration::from_millis(500));
         w.anchor.restart(&anchor_dir);
     }
-    // Every stop is said within a few ticks of it: the last one is waited for.
+    // Every stop is said within a few ticks of it: the last one is waited for. Counted from the
+    // lines about the anchor itself, so a line about another connection cannot stand in for one.
+    let anchor = anchor_id(&w);
+    let about_it = format!(
+        "connection to {}",
+        anchor.chars().take(12).collect::<String>()
+    );
+    let said_of_it = |said: &str| {
+        said.lines()
+            .filter(|l| l.contains(GONE) && l.contains(&about_it))
+            .count()
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     let fwd = w.fwd.as_mut().unwrap();
     let mut said = fwd.transcript();
-    while said.lines().filter(|l| l.contains(GONE)).count() < stops && Instant::now() < deadline {
+    while said_of_it(&said) < stops && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
         said = fwd.transcript();
     }
-    let gone = said.lines().filter(|l| l.contains(GONE)).count();
+    let gone = said_of_it(&said);
     eprintln!(
         "[proof] the anchor was stopped {stops} times; the forward said it went {gone} times"
     );
@@ -543,7 +651,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
         "the anchor was stopped {stops} times, each the moment the forward reached it, and the \
          forward said it went only {gone} times\n{said}"
     );
-    assert_says_stopped("the forward", &said);
+    assert_says_stopped("the forward", &said, &anchor);
 }
 
 /// Read `proc`'s output as it arrives until a line containing `what`, and say when it came.
