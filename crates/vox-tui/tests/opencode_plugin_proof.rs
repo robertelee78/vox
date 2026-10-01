@@ -76,12 +76,12 @@
 //! The person quits that session by closing its terminal (SIGHUP), then opens three more plain
 //! `opencode`s:
 //!
-//! 5. each quit — terminal closed, ctrl+C, `/exit` — **removes that session's directory**;
-//! 6. one SIGKILLed together with the helper that removes its directory leaves it, as a crash
+//! 7. each quit — terminal closed, ctrl+C, `/exit` — **removes that session's directory**;
+//! 8. one SIGKILLed together with the helper that removes its directory leaves it, as a crash
 //!    does, and **the next `opencode` opened removes it**;
-//! 7. after every OpenCode of the run has exited, **no `vox-oc-*` is left** in its `TMPDIR`.
+//! 9. after every OpenCode of the run has exited, **no `vox-oc-*` is left** in its `TMPDIR`.
 //!
-//! Mutation-checked: no cleanup helper goes red at (5); no sweep at start goes red at (6).
+//! Mutation-checked: no cleanup helper goes red at (7); no sweep at start goes red at (8).
 //!
 //! OpenCode absent, or no usable credential, is reported **unproven and fails** —
 //! an absent prover is missing evidence, not evidence of correctness. Set
@@ -351,7 +351,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     let _ = &auth;
 
     // Every OpenCode here runs with this run's own `TMPDIR`, where its plugin makes its wake
-    // directory: (7) counts exactly this run's. Short, because a Unix socket's path is.
+    // directory: (9) counts exactly this run's. Short, because a Unix socket's path is.
     let oc_tmp = tmp.path().join("t");
     std::fs::create_dir_all(&oc_tmp)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make this run's TMPDIR {oc_tmp:?}: {e}"));
@@ -526,7 +526,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         println!("[proof] quit by {how}: its wake directory {quit}");
         assert!(
             quit.starts_with("removed "),
-            "PRODUCT (5): a hand-opened `opencode` quit by {how} must take its wake directory with it; \
+            "PRODUCT (7): a hand-opened `opencode` quit by {how} must take its wake directory with it; \
              it was {quit}{}",
             plugin_diag("quits")
         );
@@ -535,7 +535,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     println!("[proof] killed with its cleanup, then another opened: its wake directory {swept}");
     assert!(
         swept.starts_with("removed "),
-        "PRODUCT (6): the next `opencode` opened must remove a wake directory whose OpenCode was killed \
+        "PRODUCT (8): the next `opencode` opened must remove a wake directory whose OpenCode was killed \
          with its cleanup; it was {swept}{}",
         plugin_diag("sweep")
     );
@@ -546,6 +546,6 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     );
     assert!(
         left.is_empty(),
-        "PRODUCT (7): no wake directory may outlive the OpenCode that made it; this run left {left:?}"
+        "PRODUCT (9): no wake directory may outlive the OpenCode that made it; this run left {left:?}"
     );
 }
