@@ -94,8 +94,9 @@ fn bytes_in(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// How far `pid`'s open descriptors of `name` have read, from the shipped `lsof`.
-fn read_offsets(pid: u32, name: &str) -> Vec<u64> {
+/// How far `pid`'s open descriptors of `name` have read, from the shipped `lsof`; `None` when
+/// `lsof` listed no descriptor of `pid` at all (so it saw nothing, not a closed file).
+fn read_offsets(pid: u32, name: &str) -> Option<Vec<u64>> {
     let out = Command::new("lsof")
         .args([
             "-n",
@@ -112,7 +113,7 @@ fn read_offsets(pid: u32, name: &str) -> Vec<u64> {
         .output()
         .expect("lsof ran");
     let text = String::from_utf8_lossy(&out.stdout);
-    let (mut offset, mut offsets) = (None, Vec::new());
+    let (mut offset, mut offsets, mut listed) = (None, Vec::new(), false);
     for line in text.lines() {
         if let Some(o) = line.strip_prefix('o') {
             offset = o
@@ -128,9 +129,10 @@ fn read_offsets(pid: u32, name: &str) -> Vec<u64> {
             }
         } else if line.starts_with('f') {
             offset = None;
+            listed = true;
         }
     }
-    offsets
+    listed.then_some(offsets)
 }
 
 /// One staging. `None` when a precondition did not hold; else how long Alice's daemon took to
@@ -201,8 +203,15 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
     let held = bytes_in(&dir);
     // Alice's `vox room send` writes the whole file into her daemon, and closes.
     let t2 = Instant::now();
+    // `vox room send` closes the file as soon as it has read all of it; the collector already
+    // holds bytes read from it, so a file no longer open was read to its end (nothing has
+    // stopped the offer, and a read error is not staged here).
     let read = loop {
-        let read: u64 = read_offsets(send.0.id(), &offered).iter().sum();
+        let read: u64 = match read_offsets(send.0.id(), &offered) {
+            Some(offsets) if offsets.is_empty() => FILE_BYTES as u64,
+            Some(offsets) => offsets.iter().sum(),
+            None => 0,
+        };
         if read >= FILE_BYTES as u64 || t2.elapsed() > Duration::from_secs(10) {
             break read;
         }
