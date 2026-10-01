@@ -823,6 +823,15 @@ pub enum NodeEvent {
         /// Each step and how long it took, in order.
         steps: String,
     },
+    /// A join this node is running has begun a step: what it now waits for (V210-85).
+    ///
+    /// [`NodeEvent::JoinSteps`] arrives only once the join has ended, so a join that is stopped
+    /// before then — Ctrl-C, a service manager's SIGTERM — had nothing to say about where it was.
+    /// `vox connect` keeps the latest of these, and names it when it is stopped.
+    JoinStep {
+        /// The step, for the person: `dialling member 7r7pa7jfcfdo`.
+        step: String,
+    },
     /// An upgrade off a relayed path was tried and nothing better landed, with what each rung
     /// reported.
     ///

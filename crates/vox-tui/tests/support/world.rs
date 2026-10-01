@@ -105,33 +105,49 @@ impl VoxProc {
         what: &str,
         pred: impl Fn(&str) -> bool,
     ) -> String {
+        self.try_expect_within(within, what, pred)
+            .unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// [`Self::expect_within`], handing back why it did not come instead of panicking, so a proof
+    /// can say which side a missing line is on: a precondition the scene never reached
+    /// (apparatus), or something the product failed to say.
+    pub fn try_expect_within(
+        &mut self,
+        within: Duration,
+        what: &str,
+        pred: impl Fn(&str) -> bool,
+    ) -> Result<String, String> {
         if let Some(line) = self.seen.iter().find(|l| pred(l)) {
-            return line.clone();
+            return Ok(line.clone());
         }
         let deadline = Instant::now() + within;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !left.is_zero(),
-                "{}: timed out after {within:?} waiting for {what}. It said:\n{}",
-                self.name,
-                self.seen.join("\n")
-            );
+            if left.is_zero() {
+                return Err(format!(
+                    "{}: timed out after {within:?} waiting for {what}. It said:\n{}",
+                    self.name,
+                    self.seen.join("\n")
+                ));
+            }
             match self.lines.recv_timeout(left.min(Duration::from_secs(5))) {
                 Ok(line) => {
                     eprintln!("[{}] {line}", self.name);
                     let hit = pred(&line);
                     self.seen.push(line.clone());
                     if hit {
-                        return line;
+                        return Ok(line);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
-                    "{}: exited before saying {what}. It said:\n{}",
-                    self.name,
-                    self.seen.join("\n")
-                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "{}: exited before saying {what}. It said:\n{}",
+                        self.name,
+                        self.seen.join("\n")
+                    ))
+                }
             }
         }
     }
@@ -186,6 +202,16 @@ pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
         .stdin(Stdio::null())
         .output()
         .expect("run vox");
+    // **How it ended, not only whether it succeeded** (V210-85). A `vox connect` killed by the
+    // watchdog's SIGKILL read as `false` with empty output — the same as a verb that failed and
+    // said nothing — and was reported as a product failure with no reason.
+    if !out.status.success() {
+        eprintln!(
+            "[vox_once] vox {}: {}",
+            args.first().map_or("", String::as_str),
+            out.status
+        );
+    }
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

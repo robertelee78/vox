@@ -176,6 +176,9 @@ const T_PUBLISH_CURED: u64 = 2091;
 const T_CONNECTION_NOTE: u64 = 2092;
 /// [`NodeEvent::JoinSteps`]: where a join's time went.
 const T_JOIN_STEPS: u64 = 1718;
+/// [`NodeEvent::JoinStep`] (V210-85): the step a join is in now. Additive, away from the other
+/// additive tags.
+const T_JOIN_STEP: u64 = 2285;
 /// `NodeEvent::KeyNotTaken`.
 const T_KEY_NOT_TAKEN: u64 = 1719;
 /// `NodeEvent::WaitingForProfile` (V210-100). Additive, away from the sequential range and from
@@ -983,6 +986,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .uint(u64::from(*joined))
                 .text(steps);
         }
+        NodeEvent::JoinStep { step } => {
+            e.array(2).uint(T_JOIN_STEP).text(step);
+        }
         NodeEvent::StillRelayed { peer, reason } => {
             e.array(3).uint(T_STILL_RELAYED).bytes(peer).text(reason);
         }
@@ -1283,6 +1289,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             steps: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc join steps"))?
+                .to_owned(),
+        },
+        (T_JOIN_STEP, 2) => NodeEvent::JoinStep {
+            step: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc join step"))?
                 .to_owned(),
         },
         (T_JOIN_FAILED, 2) => NodeEvent::JoinFailed {
