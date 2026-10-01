@@ -426,9 +426,44 @@ fn lock_dir(dir: &std::path::Path, op: &'static str) -> Result<std::fs::File> {
         detail: format!("{}: {e}", dir.display()),
     };
     let handle = std::fs::File::open(dir).map_err(fail)?;
-    handle.lock().map_err(fail)?;
+    match handle.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::Error(e)) => return Err(fail(e)),
+        // **A wait is never silent** (V210-100). Another vox holds the profile while it creates
+        // or upgrades the identity, which takes a second or two; but one that is stopped
+        // (Ctrl-Z) or stuck holds it for as long as it stays so, and a vox waiting on it with
+        // nothing on the screen looked hung. So if the wait goes on, it says what it is waiting
+        // for, once.
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let (done, waiting) = std::sync::mpsc::channel::<()>();
+            let path = dir.display().to_string();
+            let notice = std::thread::spawn(move || {
+                if waiting.recv_timeout(LOCK_PATIENCE)
+                    == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    eprintln!(
+                        "vox: waiting for another vox that is using this profile ({path}); \
+                         if it is stopped (Ctrl-Z), resume it with `fg`"
+                    );
+                }
+            });
+            let locked = handle.lock();
+            drop(done);
+            let _ = notice.join();
+            locked.map_err(fail)?;
+        }
+    }
+    test_pause(TEST_LOCK_HOLD_ENV, "holding the profile lock");
     Ok(handle)
 }
+
+/// How long a vox waits for another one's profile lock before saying that it is waiting.
+const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// **For proofs only.** When set, a vox that has just taken the profile lock (to create the
+/// identity, or to migrate it) holds it this many milliseconds before going on, so a proof can
+/// stop it while it holds the lock. Nothing a person runs sets it; unset, nothing changes.
+pub const TEST_LOCK_HOLD_ENV: &str = "VOX_TEST_LOCK_HOLD_MS";
 
 /// An owned passphrase check (see [`Profile::passphrase_verifier`]).
 #[derive(Clone)]
