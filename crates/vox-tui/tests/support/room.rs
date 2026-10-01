@@ -512,3 +512,11 @@ pub async fn post_raw(w: &Worker, cid: [u8; 32], text: &str) {
         other => panic!("raw post refused: {other:?}"),
     }
 }
+
+impl Room {
+    /// The anchor's pid, for a proof that must stop it: it holds the room's entries too, and
+    /// would otherwise serve a stopped member's posts to the others.
+    pub fn anchor_pid(&self) -> u32 {
+        self._anchor.0.id()
+    }
+}
