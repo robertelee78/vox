@@ -93,8 +93,11 @@
 //! - The identity ignored: cases 1 and 2 red.
 //! - An ended join stopped without a word, or told the bare refusal: case 5 red.
 //! - A hold that has done its work ended like any other: case 6 red, alice ends one for carol.
-//! - No admission patience, so a join that did its work may stay quiet for ever: case 6 red,
-//!   carol is still kept out at the bound.
+//! - Nothing bounding a join once its work is done — neither the admission patience nor the
+//!   per-frame one — so a join that did its work may stay quiet for ever: case 6 red, carol is
+//!   still kept out at the bound. (Removing the admission patience alone leaves each frame's own
+//!   30s bound, which frees a quiet hold by itself; what the admission patience adds is a bound on
+//!   the exchange as a whole, against a joiner that sends each frame just in time.)
 
 #![cfg(unix)]
 
