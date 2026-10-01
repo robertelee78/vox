@@ -85,7 +85,7 @@
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -150,6 +150,26 @@ pub fn arm_for_setup(joins: u32, unlocks: u32) {
     arm_for(DEFAULT_BUDGET + extra);
 }
 
+/// [`arm`], for a proof whose debug-build budget is sized on its own whole run rather than on its
+/// steps (whose most-measured costs, summed, would come past what any run is given): twice
+/// `slowest`, the slowest of `runs` measured debug runs of that proof, and never less than
+/// [`DEFAULT_BUDGET`]. A release build's budget is unchanged.
+#[allow(dead_code)]
+pub fn arm_for_debug_total(slowest: Duration, runs: u32) {
+    if cfg!(debug_assertions) {
+        let budget = (slowest * 2).max(DEFAULT_BUDGET);
+        say(&format!(
+            "[watchdog] debug build: budget {}s = twice the slowest of {runs} measured debug \
+             runs of this proof ({:.1}s)\n",
+            budget.as_secs(),
+            slowest.as_secs_f64()
+        ));
+        arm_for(budget);
+    } else {
+        arm();
+    }
+}
+
 /// How long the stack dump may take before the abort goes ahead without it. Symbolicating a
 /// large test binary is the slow part; a dump that itself hangs must not undo the bound.
 const DUMP_PATIENCE: Duration = Duration::from_secs(90);
@@ -165,6 +185,10 @@ const KILL_PATIENCE: Duration = Duration::from_secs(10);
 const CENSUS_EVERY: Duration = Duration::from_secs(2);
 
 static ARMED: Once = Once::new();
+
+/// Set once [`fire`] begins. From then on a test thread that panics parks instead of finishing
+/// (see [`arm_for`]).
+static FIRING: AtomicBool = AtomicBool::new(false);
 
 /// Every descendant [`census`] has seen: `(pid, start time)`.
 static SEEN: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
@@ -231,6 +255,22 @@ pub fn arm_for(default_budget: Duration) {
         let budget = move || {
             fixed.unwrap_or_else(|| Duration::from_secs(BUDGET_SECS.load(Ordering::Relaxed)))
         };
+        // **Once the watchdog fires, the test cannot end the process first** (#295). Killing a
+        // proof's processes kills the `vox` verb a test thread is waiting on; that thread then
+        // panicked on the verb's empty stderr, libtest exited 101 as an ordinary red with no
+        // cause, and the kill loop never finished. So while it fires, a panicking test thread
+        // parks: the first red line is the watchdog's own, every descendant is looked for until
+        // none is left, and the abort is SIGABRT.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let watchdog = std::thread::current().name() == Some("vox-test-watchdog");
+            if FIRING.load(Ordering::SeqCst) && !watchdog {
+                loop {
+                    std::thread::park();
+                }
+            }
+            previous(info);
+        }));
         let started = Instant::now();
         std::thread::Builder::new()
             .name("vox-test-watchdog".to_owned())
@@ -402,6 +442,7 @@ fn kill_all(pids: &[u32]) -> usize {
 
 /// Say why, dump every thread, and abort.
 fn fire(elapsed: Duration, budget: Duration) -> ! {
+    FIRING.store(true, Ordering::SeqCst);
     let running = RUNNING
         .lock()
         .map(|r| r.join("\n    "))

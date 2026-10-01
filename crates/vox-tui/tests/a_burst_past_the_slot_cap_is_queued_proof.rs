@@ -66,9 +66,10 @@ use sync_pair::{counter, failures, pct, Member};
 const ROOMS: usize = 40;
 /// Each post readable by Bob within this of its `vox room post` returning: 2 s in a release build,
 /// where timing bounds count. A debug build seals and opens every post unoptimized, about ten times
-/// as slowly (#295: the burst's crossings p50 2.23 s, most 4.89 s, against p50 0.21 s in release),
-/// so it gets 10 s, twice its most measured — still far below the 30 s interval a skipped port waits.
-const BOUND: Duration = Duration::from_secs(if cfg!(debug_assertions) { 10 } else { 2 });
+/// as slowly (#295: three debug runs' burst crossings, most 4.89 s, 4.58 s and 6.13 s, against p50
+/// 0.21 s in release), so it gets 13 s, about twice its most measured — still far below the 30 s
+/// interval a skipped port waits.
+const BOUND: Duration = Duration::from_secs(if cfg!(debug_assertions) { 13 } else { 2 });
 /// The post in the late-joined room readable by Bob within this, once he has synced with Alice
 /// there: well under the 30 s `Policy` backoff the refused push used to wait out (24 s on CI). 5 s
 /// in a release build; 15 s in a debug build (see [`BOUND`]), still half that backoff.
@@ -131,12 +132,10 @@ fn backoffs(status: &serde_json::Value, peer: &str) -> Vec<String> {
 #[test]
 #[ignore = "two real daemons with production Argon2id and 40 rooms; CI runs it in release"]
 fn a_burst_past_the_slot_cap_is_queued() {
-    // Bob's joins, [`JOINS_AT_ONCE`] at a time, and the late joins; unlocks: two `vox id`s, two
-    // `trust add`s, two daemons, and a room created per join.
-    watchdog::arm_for_setup(
-        (ROOMS.div_ceil(JOINS_AT_ONCE) + STAGE_TRIES) as u32,
-        (6 + ROOMS + STAGE_TRIES) as u32,
-    );
+    // Sized on the whole debug run (#295): its 19 joins and 51 unlocks, each at twice its most
+    // measured, would ask for 7,434 s, past what any run is given. Three debug runs of this proof
+    // took 1,317.9 s, 1,696.9 s and 2,001.2 s.
+    watchdog::arm_for_debug_total(Duration::from_millis(2_001_200), 3);
     shown(&format!(
         "[proof] {PROFILE} build: bounds {BOUND:?} for the burst, {LATE_BOUND:?} for the late join"
     ));

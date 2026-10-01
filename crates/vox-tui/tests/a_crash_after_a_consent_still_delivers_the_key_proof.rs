@@ -197,10 +197,10 @@ fn alive(p: &mut Proc) -> bool {
 #[test]
 #[ignore = "real vox daemons under the syscall interposer, production Argon2id; CI runs it in release"]
 fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
-    // At most one join per kill point; unlocks: alice's `vox id`, daemon and room, and per kill
-    // point bob's `vox id`, `trust add` and daemon, alice's `trust add`, and after a kill both
-    // daemons again, alice's `trust list` and her `trust add` once more.
-    watchdog::arm_for_setup(MAX_POINTS as u32, 3 + 8 * MAX_POINTS as u32);
+    // Sized on the whole debug run (#295): its up to 16 joins and 131 unlocks, each at twice its
+    // most measured, would ask for 8,838 s, past what any run is given. Two debug runs of this
+    // proof took 1,041.7 s and 1,270.0 s.
+    watchdog::arm_for_debug_total(Duration::from_millis(1_270_000), 2);
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let alice = root.join("alice");
