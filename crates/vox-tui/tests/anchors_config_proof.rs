@@ -62,18 +62,24 @@ impl Proc {
             .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
         let out = child.stdout.take().expect("stdout");
         let (tx, rx) = mpsc::channel();
+        let out_tx = tx.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
+                if out_tx.send(line).is_err() {
                     break;
                 }
             }
         });
+        // stderr goes to the same lines, marked, because what a node says there (which anchor it
+        // reached) is part of what a person sees.
         if let Some(err) = child.stderr.take() {
             let n = name.to_owned();
             std::thread::spawn(move || {
                 for line in BufReader::new(err).lines().map_while(Result::ok) {
                     eprintln!("[{n} stderr] {line}");
+                    if tx.send(format!("[stderr] {line}")).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -256,10 +262,15 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
 /// nowhere after the next change.
 ///
 /// The host here is told the anchor as `<fp>@localhost:<port>`, the way a person types it into
-/// the anchors file, and advertises itself at an address nobody can dial (`--at 127.0.0.1:1`).
-/// The guest has no anchor of its own. So the guest can reach the host **only** through the
-/// anchor the host found by its name: the join is the proof that the name was resolved and the
-/// anchor used.
+/// the anchors file. Two things must follow, both as a person sees them:
+///
+/// - the host says it **connected to that anchor** (a name resolved to the wrong place says
+///   "dialling this anchor failed" instead);
+/// - a guest whose **only** way to the host is that anchor joins. The invite names the host's
+///   own address as well, and on one machine a guest would simply dial it, which is right
+///   (ADR-012: an anchor only bridges hosts that cannot otherwise find each other) and proves
+///   nothing about the anchor. So the guest is handed the invite with the host's own address
+///   replaced by one nobody answers, which is what a host behind NAT looks like from outside.
 #[test]
 #[ignore = "production Argon2id + real binaries; CI runs it in release"]
 fn an_anchor_named_by_hostname_carries_a_join() {
@@ -328,17 +339,73 @@ fn an_anchor_named_by_hostname_carries_a_join() {
         "passphrase",
     );
     assert!(
-        address.contains("?a=") && address.contains("&b="),
+        address.contains(&format!("a={fp}")),
         "PRODUCT: the invite must carry the anchor the host found by the name {by_name}, so a \
          guest can reach it: {address}"
     );
+    // The fingerprint as a node's messages abbreviate it.
+    let short = &fp[..26];
+    let reached = format!("connection to {short} — connected to this anchor");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !host.seen.iter().any(|l| l.contains(&reached)) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !left.is_zero(),
+            "PRODUCT: within 60 s the host never said it connected to the anchor it was told as \
+             {by_name}. It said:\n{}",
+            host.seen.join("\n")
+        );
+        match host.lines.recv_timeout(left) {
+            Ok(l) => {
+                eprintln!("[host] {l}");
+                host.seen.push(l);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "PRODUCT: the host exited before connecting to the anchor named {by_name}. It \
+                 said:\n{}",
+                host.seen.join("\n")
+            ),
+        }
+    }
+    eprintln!("[proof] the host connected to the anchor named {by_name}");
+
+    // The guest's invite, with the host's own address (the entry its `r=` pins) made one that
+    // nobody answers: the anchor is now the only way in.
+    let (base, query) = address
+        .split_once('?')
+        .unwrap_or_else(|| panic!("PRODUCT: the invite has no query: {address}"));
+    let host_id = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("r="))
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: the invite pins no host (r=): {address}"));
+    let (mut current, mut replaced, mut kept) = (None, false, Vec::new());
+    for kv in query.split('&') {
+        if let Some(id) = kv.strip_prefix("a=") {
+            current = Some(id);
+        } else if kv.starts_with("b=") && current == Some(host_id) {
+            if !replaced {
+                kept.push("b=/ip4/127.0.0.1/udp/1");
+                replaced = true;
+            }
+            continue;
+        }
+        kept.push(kv);
+    }
+    assert!(
+        replaced,
+        "CANNOT MEASURE: staging not achieved: the invite names no address of the host itself to \
+         make unreachable: {address}"
+    );
+    let behind_nat = format!("{base}?{}", kept.join("&"));
+    eprintln!("[proof] the guest is given {behind_nat}");
 
     let (ok, out, err) = vox_once(
         &guest_dir,
         &guest_cfg,
         &[
             "connect".into(),
-            address.clone(),
+            behind_nat.clone(),
             "--passphrase-file".into(),
             room_pass_file(&guest_dir, &passphrase),
             "--listen".into(),
