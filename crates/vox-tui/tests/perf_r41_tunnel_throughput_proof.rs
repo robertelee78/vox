@@ -308,8 +308,14 @@ fn udp_shaper(
         });
         let carried = Arc::clone(&carried);
         std::thread::spawn(move || {
+            // MUTANT (V210-98 demo): the emulator stalls 50 of every 100 ms while a link is applied.
+            let start = Instant::now();
             for (due, pkt, shaped) in queue {
                 sleep_until(due);
+                let phase = start.elapsed().as_millis() % 100;
+                if shaped && phase >= 50 {
+                    std::thread::sleep(Duration::from_millis((100 - phase) as u64));
+                }
                 note_lateness(shaped, due);
                 carried.fetch_add(pkt.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 let _ = back_tx.send(&pkt);
