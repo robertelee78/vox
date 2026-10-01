@@ -2755,13 +2755,51 @@ impl ChannelState {
     /// who kept consent permanently unable to read the messages sent before their
     /// re-key.
     pub fn rotate_sender(&mut self, profile: &Profile, now_secs: u64) -> Result<u64> {
+        let floor = self.sender.chain_id();
+        self.rotate_sender_past(profile, now_secs, floor)
+    }
+
+    /// The highest sender-key generation this identity's own entries here were sealed under, if
+    /// any: what an earlier membership of this room used (V030-08).
+    #[must_use]
+    pub fn own_highest_generation(&self) -> Option<u64> {
+        let me = self.me();
+        self.dag.feed(&me).and_then(|feed| {
+            feed.iter()
+                .filter_map(|e| e.payload.as_deref())
+                .filter_map(|p| crate::group::message::GroupMessage::from_wire(p).ok())
+                .map(|m| m.header.chain_id)
+                .max()
+        })
+    }
+
+    /// Carry on past an earlier membership's sender keys (V030-08): a member that left and
+    /// joined again starts from a fresh generation 0, and the others still hold its earlier
+    /// generation 0 — keyed by the same id, so they keep the old one and read nothing new. Rotate
+    /// to a generation past the highest one its own entries used. Whether it rotated.
+    pub fn continue_past_earlier_generations(
+        &mut self,
+        profile: &Profile,
+        now_secs: u64,
+    ) -> Result<bool> {
+        match self.own_highest_generation() {
+            Some(high) if high >= self.sender.chain_id() => {
+                self.rotate_sender_past(profile, now_secs, high)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// [`Self::rotate_sender`], to a generation past `floor`.
+    fn rotate_sender_past(&mut self, profile: &Profile, now_secs: u64, floor: u64) -> Result<u64> {
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
             ));
         }
         let store = profile.store();
-        let next = self.sender.rotated(now_secs)?;
+        let next = self.sender.rotated_past(floor, now_secs)?;
         let chain_id = next.chain_id();
         let me = self.me();
         // The mint's place in the consent order, persisted before the generation exists

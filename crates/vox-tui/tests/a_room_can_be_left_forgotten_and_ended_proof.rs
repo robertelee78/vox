@@ -12,10 +12,11 @@
 //!   name her; from then on, while bob and carol keep posting to each other, bob opens and admits
 //!   no sync session with alice (his `vox status --json` sync row for her stays still), alice is
 //!   delivered none of the new posts, and her own post is refused as from a member who left.
-//! - **Rejoin.** Alice leaves, then joins again with the room's address and passphrase, as anyone
-//!   joins (the decider, 2026-10-01). Within [`WITHIN`] bob's roster names her again, a message she
-//!   posts reaches bob and one bob posts reaches her, and bob has not frozen her for signing two
-//!   entries at one position: her joined-again node continued her feed rather than restarting it.
+//! - **Rejoin.** Alice leaves, then joins again through bob with the room's address and passphrase,
+//!   as anyone joins (the decider, 2026-10-01). Within [`WITHIN`] bob's and carol's rosters name her
+//!   again (carol learns it only from her signed return), what she posts reaches both and what bob
+//!   posts reaches her, and bob has not frozen her for signing two entries at one position: her
+//!   joined-again node continued her feed rather than restarting it.
 //! - **Forget.** Alice runs `vox room forget` on a room she is still in. It is left first (bob's
 //!   roster loses her), then nothing of the room is left on her node: `vox room list` lacks it, it
 //!   does not come back when her daemon restarts, and her `store.redb` no longer holds the room's
@@ -215,8 +216,10 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
     let rt = runtime();
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
-    let room = room_of(&rt, tmp.path(), &["alice", "bob"]);
-    let (alice, bob) = (&room.workers[0], &room.workers[1]);
+    let room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
+    let [alice, bob, carol] = &room.workers[..] else {
+        unreachable!()
+    };
     let id = room.id.as_str();
     let link = setup(bob, &["room", "invite", id]).stdout.trim().to_owned();
 
@@ -239,38 +242,63 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
     assert!(
         o.ok,
         "PRODUCT: alice, who left, was refused joining again with the room's address and \
-         passphrase: {o:?}"
+         passphrase: {o:?}\nbob's daemon said:\n{}",
+        std::fs::read_to_string(tmp.path().join("bob.daemon.err")).unwrap_or_default()
     );
-    let (back, o) = poll(bob, &["room", "roster", id], WITHIN, |o| {
-        o.ok && o.stdout.contains(&alice.b32())
-    });
-    assert!(
-        back,
-        "PRODUCT: {WITHIN:?} after alice joined again, bob's roster does not name her: {o:?}"
-    );
+    // Bob answered her join; carol learns she is back only from her signed return.
+    for w in [bob, carol] {
+        let (back, o) = poll(w, &["room", "roster", id], WITHIN, |o| {
+            o.ok && o.stdout.contains(&alice.b32())
+        });
+        assert!(
+            back,
+            "PRODUCT: {WITHIN:?} after alice joined again, {}'s roster does not name her: {o:?}",
+            w.name
+        );
+    }
     eprintln!(
-        "[proof] rejoin: bob's roster named alice again {:.1}s after her join began",
+        "[proof] rejoin: bob's and carol's rosters named alice again {:.1}s after her join began",
         t.elapsed().as_secs_f64()
     );
-    let o = alice.vox(None, &["room", "post", id, "alice is back"]);
-    assert!(
-        o.ok,
-        "PRODUCT: alice's post after joining again was refused: {o:?}"
-    );
-    let (read, o) = poll(bob, &["room", "read", id], WITHIN, |o| {
-        o.stdout.contains("alice is back")
-    });
+    // Rooms are forward-only (ADR-006): a member reads an author from the key the author released
+    // to it, so a post made before that release stays unreadable to it, as for any member who has
+    // just joined (`support::room` waits the same way). Each side keeps posting fresh messages
+    // until the other reads one.
+    let reads = |author: &Worker, reader: &Worker, what: &str| -> (bool, Out) {
+        let deadline = Instant::now() + WITHIN;
+        let mut n = 0u32;
+        loop {
+            n += 1;
+            let o = author.vox(None, &["room", "post", id, &format!("{what} {n}")]);
+            assert!(o.ok, "PRODUCT: {}'s post was refused: {o:?}", author.name);
+            std::thread::sleep(Duration::from_secs(1));
+            let r = reader.vox(None, &["room", "read", id]);
+            if r.stdout.contains(what) {
+                return (true, r);
+            }
+            if Instant::now() >= deadline {
+                return (false, r);
+            }
+        }
+    };
+    let (read, o) = reads(alice, bob, "alice is back");
     assert!(
         read,
-        "PRODUCT: bob does not read what alice posted after joining again: {o:?}"
+        "PRODUCT: within {WITHIN:?}, bob read none of what alice posted after joining again: \
+         {o:?}\nalice's daemon said:\n{}\nbob's daemon said:\n{}",
+        std::fs::read_to_string(tmp.path().join("alice.daemon.err")).unwrap_or_default(),
+        std::fs::read_to_string(tmp.path().join("bob.daemon.err")).unwrap_or_default()
     );
-    setup(bob, &["room", "post", id, "welcome back, alice"]);
-    let (read, o) = poll(alice, &["room", "read", id], WITHIN, |o| {
-        o.stdout.contains("welcome back, alice")
-    });
+    let (read, o) = reads(alice, carol, "alice is back, carol");
     assert!(
         read,
-        "PRODUCT: alice, joined again, does not read what bob posted: {o:?}"
+        "PRODUCT: within {WITHIN:?}, carol read none of what alice posted after joining again: \
+         {o:?}"
+    );
+    let (read, o) = reads(bob, alice, "welcome back, alice");
+    assert!(
+        read,
+        "PRODUCT: within {WITHIN:?}, alice, joined again, read none of what bob posted: {o:?}"
     );
     // `frozen` is null while a session holds the room; read until it is said.
     let frozen: Vec<String> = {

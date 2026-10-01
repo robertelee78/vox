@@ -819,6 +819,15 @@ impl<'a> Resolver<'a> {
                 GovBody::ConsentRevocation(r) => {
                     last.insert((r.body.author_id, r.body.target_id), false);
                 }
+                // A member that left and joined again starts its consents over (V030-08): it
+                // joined from scratch and holds none of the keys its earlier grants released,
+                // so they no longer describe who reads it.
+                GovBody::Lifecycle(l)
+                    if l.body.kind == crate::governance::lifecycle::LifecycleKind::Return
+                        && l.body.issuer_id == e.author_id =>
+                {
+                    last.retain(|(author, _), _| *author != l.body.issuer_id);
+                }
                 _ => {}
             }
         }

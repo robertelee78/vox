@@ -2982,7 +2982,9 @@ impl Node {
                         self.refresh_network_view().await;
                     }
                     self.redial_anchors_if_due();
-                    self.tend_lifecycle().await;
+                    // A room forgotten, gone quiet, or back from a join changes what a person is
+                    // shown: the view is published for it below, not left until the next event.
+                    let tended = self.tend_lifecycle().await;
                     // A rotation's re-keys go out as the remaining consenters become
                     // reachable, which is why they are retried here and not only at
                     // the moment of rotation (M18.1).
@@ -3003,7 +3005,7 @@ impl Node {
                     self.sync_tick().await;
                     let ran = self.schedule().await;
                     self.retry_orphaned_consents().await;
-                    if ran || self.paths_moved() {
+                    if ran || tended || self.paths_moved() {
                         self.publish().await;
                     }
                     // Retention on every tick: the index is ordered by age, so a pass that
@@ -4219,6 +4221,7 @@ impl Node {
     async fn refresh_network_view(&self) {
         let Some(net) = self.net.as_ref() else { return };
         let mut policy = PeerPolicy::new();
+        let mut departed: std::collections::BTreeSet<Digest32> = std::collections::BTreeSet::new();
         for (cid, shared) in &self.channels {
             let Ok(ch) = shared.try_lock() else {
                 // Busy: a session holds it. Keep the policy we have, and say it is behind so the
@@ -4233,6 +4236,18 @@ impl Node {
                 .map(|k| (k.fingerprint(), k))
                 .collect();
             policy.add_members(members.keys().copied());
+            // A member that left may join again, like anyone with the passphrase (V030-08), and
+            // nothing else: it is classed a joiner, not left in whatever class it last held (a
+            // node it once let in still knew it as that node's join responder, which may not
+            // open a join, and its join was refused at the stream).
+            for left in ch
+                .author_fingerprints()
+                .into_iter()
+                .filter(|a| ch.has_left(a))
+            {
+                policy.expect_joiner(left);
+                departed.insert(left);
+            }
             net.membership().set_channel(*cid, ch.epoch(), members);
         }
         // An anchored channel's known authors are its members as far as this node's
@@ -4253,8 +4268,10 @@ impl Node {
             policy.add_members(members.keys().copied());
             net.membership().set_channel(*cid, st.epoch(), members);
         }
-        // Anchors are not channel membership: they are carried in by hand.
-        for anchor in &self.anchor_ids {
+        // Anchors are not channel membership: they are carried in by hand. A member that left is
+        // not one either, though a link named its board: it is a joiner now (above), and as an
+        // anchor its join was refused at the stream (an anchor may not open one).
+        for anchor in self.anchor_ids.iter().filter(|a| !departed.contains(*a)) {
             policy.add_anchor(*anchor);
         }
         // Replacing wholesale would drop the pending joiners the actor is expecting, and the
@@ -9397,7 +9414,7 @@ impl Node {
         }
         self.note_local_append(channel_id);
         // `tend_lifecycle` starts the wind-down: the room is ended from here on, on this node.
-        self.tend_lifecycle().await;
+        let _ = self.tend_lifecycle().await;
         Outcome::Done
     }
 
@@ -9505,6 +9522,9 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.refresh_network_view().await;
+        // Published before it is said: whoever is told the room is forgotten and then looks
+        // (`vox room list`) must not still see it.
+        self.publish().await;
         let _ = self.event_tx.send(NodeEvent::RoomForgotten {
             channel_id: *channel_id,
         });
@@ -9520,7 +9540,8 @@ impl Node {
     /// - a room this node left or holds ended passes that on — each member synced with after it
     ///   counts — then goes quiet: no session, dial or publish for it any more. A room left with
     ///   `vox room forget` is deleted then.
-    async fn tend_lifecycle(&mut self) {
+    async fn tend_lifecycle(&mut self) -> bool {
+        let mut changed = false;
         let now_ms = (self.millis_clock)();
         for cid in std::mem::take(&mut self.feed_known) {
             let Some(shared) = self.channels.get(&cid).map(Arc::clone) else {
@@ -9535,12 +9556,16 @@ impl Node {
             let returned = {
                 let mut ch = shared.lock().await;
                 ch.set_own_feed_pending(false);
+                // Past the sender keys an earlier membership released, which the others still
+                // hold under the same ids (V030-08).
+                let _ = ch.continue_past_earlier_generations(profile, now);
                 ch.say_returned(profile, now)
             };
             self.feed_pending.remove(&cid);
             if matches!(returned, Ok(true)) {
                 self.note_local_append(&cid);
             }
+            changed = true;
         }
         let rooms: Vec<(Digest32, Arc<tokio::sync::Mutex<ChannelState>>)> = self
             .channels
@@ -9615,6 +9640,7 @@ impl Node {
             for peer in peers {
                 self.drop_port(&cid, &peer);
             }
+            changed = true;
             let _ = self.event_tx.send(NodeEvent::RoomQuiet {
                 channel_id: cid,
                 handed,
@@ -9624,6 +9650,7 @@ impl Node {
                 let _ = self.purge_room(&cid).await;
             }
         }
+        changed
     }
 
     /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). The `bind:`
