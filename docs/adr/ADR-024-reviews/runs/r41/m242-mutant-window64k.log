@@ -1,0 +1,27 @@
+timing-slot: took slot1 of 3 at 21:12:46Z, load 40.87 44.84 46.21, 0 waiting
+run-slot: took slot4 of 6 at 21:12:47Z, load 40.87 44.84 46.21, 3 waiting
+
+running 1 test
+uptime at start: 14:12  up 21:15, 4 users, load averages: 40.87 44.84 46.21
+
+thread 'r41_a_tunnel_does_not_throttle_the_link_it_runs_over' (71083816) panicked at crates/vox-tui/tests/perf_r41_tunnel_throughput_proof.rs:886:9:
+CANNOT MEASURE 1 Gbit/s, LAN (2 ms RTT) (APPARATUS): the emulator itself delivered only 82.5% of the link's rate in a calibration window (windows ["95.2%", "92.0%", "82.5%"]; each must reach 95%), so this run would measure the emulator, not vox (load: 14:13  up 21:15, 4 users, load averages: 38.58 44.04 45.90)
+busiest processes:
+ %CPU COMM
+144.7 ~/.rustup/toolchains/1.94.0-aarch64-apple-darwin/bin/rustc
+134.8 ~/.rustup/toolchains/1.94.0-aarch64-apple-darwin/bin/rustc
+ 70.4 /opt/vox/.claude/worktrees/fix-adr024-m242-mutant/target/release/deps/perf_r41_tunnel_throughput_proof-036a59fbbd5ad6d8
+ 50.8 /opt/vox/.claude/worktrees/fix-301-harness-c21/target/release/vox
+ 50.7 ~/.rustup/toolchains/1.94.0-aarch64-apple-darwin/bin/rustc
+ 48.6 /opt/vox/.claude/worktrees/f306-early/target/debug/vox
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test r41_a_tunnel_does_not_throttle_the_link_it_runs_over ... FAILED
+
+failures:
+
+failures:
+    r41_a_tunnel_does_not_throttle_the_link_it_runs_over
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.43s
+
+rc=101

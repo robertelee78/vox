@@ -154,7 +154,17 @@ with its output: the RESULT line of each run (means over the last two thirds of 
 loss share = lost bytes over lost plus acknowledged bytes, and queue rise = the last finished round's
 minimum round trip minus the windowed base, both over trace lines at least 17 s into the sending
 process (past the unshaped warm-up and the 10 s base window), with nearest-rank percentiles; the
-emulator's lateness is the largest per half-second window of the run. The tier-2 rows give the loss
+emulator's lateness is the largest per half-second window of the run.
+
+**When an arm measures the emulator, not Vox.** Tier 2's queue test reads a 4 ms rise in a round's
+minimum round trip, and an emulator that releases late can fake or hide one. But a round's minimum is
+over every packet in the round (about 25 at 200 Mbit/s), so one late release does not move it; only
+sustained lateness does. R41's arms are therefore to print the emulator's lateness per second, and an
+arm is CANNOT MEASURE when the emulator ran at least 4 ms late in more than 10% of its judged
+seconds, or in its median second, as well as when any second ran more than 25 ms late (the bound
+R41's raw-TCP links use). A bound on the worst second alone would make nearly every arm CANNOT
+MEASURE on a machine doing ordinary work: the worst second of every 200 Mbit/s spike run was 8–19 ms.
+The 10% is to be calibrated from the per-arm counts R41 prints. The tier-2 rows give the loss
 trend the loss share the tier-1 run on the same link measured, as tier 2 is to take it on entry.
 
 ### Base round trip: a 10 s windowed minimum (`BASE_RTT_WINDOW`)
@@ -253,21 +263,29 @@ Sending harder separates them: random loss stays flat (5.37% under tier 2, 5.01%
 times the rate); congestion loss climbs (4.59% to 13.00%). So tier 3 is to be entered on trial, judged
 by the same trend test with a wider margin:
 
-- **2 → 3 (a trial):** after tier 2's dwell, at least 20 rounds and 2 s in tier 2 with the loss share
-  at or above the cap and no queue in any of those rounds. The loss share over the last 32 MiB is
-  recorded as the trial's baseline. Tier 3 starts in BBR's steady state (ProbeBW) at the current
+- **2 → 3 (a trial):** after tier 2's dwell, the loss share over the last 32 MiB at or above the cap,
+  through at least 20 rounds and 2 s in which no queue holds for two rounds in a row. That loss share
+  is recorded as the trial's baseline. Not the 8-round share and not "no queue in any round"
+  (fix-adr024-bbr's trace at 5% random loss, `runs/voxbbr/trace5.txt` with `r41-5pct.log`): the
+  8-round share swung between 0.000 and 0.138, so a streak of rounds at the cap never passed 7 of the
+  20 it needed, and single rounds 39.4 ms and 23.7 ms long on a 10.6 ms base reset it; tier 2 never
+  climbed and the 5%-loss arm read 1.42×. Tier 3 starts in BBR's steady state (ProbeBW) at the current
   delivery rate, round trip and window, never in Startup, whose 2.885× gain would breach the trial's
   bound.
 - **Loss that grows leaves tier 3, at any time in it, not only during the trial:** the share over the
   last 32 MiB passes max(1.5 × the baseline, the baseline + 3 points). That is a failed trial.
 - **Back-off after a failed trial:** tier 3 is barred for 30 s, doubled after each failed trial up to
   8 min, and reset to 30 s only after a stay in tier 3 of 5 min with no failure.
-- **A queue leaves tier 3 (rule 3):** the last round's minimum round trip at or above
-  `1.25 × max(base, window ÷ delivery rate) + 4 ms` (`TIER3_QUEUE_FACTOR`, `TIER3_QUEUE_MIN`), held
-  for two rounds. Tier 3 has its own queue test because BBR stands a queue of its own: the tier-2 test
-  threw it out within a second, every time, and with no other flow its rounds' minimum round trip
-  was 18–38 ms on a 10.7 ms base (fix-adr024-bbr). `window ÷ delivery rate` is the round trip BBR's
-  own data in flight explains; another flow's queue pushes the round trip past it.
+- **A queue leaves tier 3 (rule 3): UNMEASURED; its test is an obligation of M24.4.** Tier 3 needs a
+  queue test of its own, because BBR stands a queue of its own and the tier-2 test threw it out within
+  a second with no other flow (fix-adr024-bbr). The candidate test, the last round's minimum round
+  trip at or above `1.25 × max(base, window ÷ delivery rate) + 4 ms` held for two rounds, **does not
+  yet work**: in the solo run committed as `runs/voxbbr/lossy-bbr.log` it read a queue in 22 of 68
+  samples, up to 4 in a row, with Vox alone; and for a window-limited flow `window ÷ delivery rate` is
+  about the current round trip, so the test cancels itself (ac-verm241). M24.4 is to fix the test
+  (for instance with BBR's max-filtered bottleneck bandwidth as the rate) and prove both halves on the
+  shipped binary: it stays quiet with Vox alone, and it fires on the shared ¼-BDP arm. Until it does,
+  ADR-024 makes no claim about rule 3 in tier 3.
 - **How tier 3 paces.** quinn-proto 0.11 paces every connection from the window and the smoothed
   round trip; it never reads a controller's pacing rate (`pacing_rate` is reported in metrics only).
   So `VoxBbr`'s gains, including its probing cycle, are to act through its window alone, and its
@@ -285,6 +303,15 @@ to 8 min. So a competing flow is to lose its share for at most about 3 s in ever
 minute, then in every 8 minutes. That is the price of reaching 7× on a Wi-Fi link that loses 5% of its
 packets. ADR-024 makes no claim about any window shorter than a congested arm's whole run: the arms
 are to print the 2 s windows only as a line marked DIAGNOSTIC, never as a verdict.
+
+### An idle restart: the tier resets, the tier-3 back-off survives
+
+`IdleRestart` starts a fresh controller after the connection sends nothing for `IDLE_RESTART` (1 s)
+and several round trips, because the path may have changed. The tier and the 10 s base round trip
+are to reset with it: the next transfer starts in tier 1 and climbs again (at least the 2 s dwell,
+then three losses without a queue). The tier-3 back-off is to survive it: a failed trial is fairness
+memory, and pausing must not buy a new trial. R41's "paused" arm (the 1%-loss link, a 3 s pause) is
+to show the speed a person sees after the pause.
 
 ### Tier 1 ↔ 2 and dwell
 
@@ -357,7 +384,8 @@ risks, stated plainly:
   - **clean LAN-like**, 400 Mbit/s, 2 ms: every one of 30 seconds at the clean bar (90% of raw), the
     proof that a clean link is not held in a tier that slows it. 400 Mbit/s because the userspace
     emulator calibrates that rate on a machine doing ordinary work; R41's 1 Gbit/s LAN link often
-    cannot (calibration windows of 74–83% at load 38–66, each must reach 95%), and stays as it is.
+    cannot (its weakest calibration window read 78.8%, 75.6% and 82.5% in three runs at load 38–66,
+    where each must reach 95%: `runs/r41/`), and stays as it is.
 
   The lossy arms are to be red on today's tier 1.
 - **M24.3 — Tier 2** (loss-aware Cubic) with the queue test, the cap and the trend, proved on all arms.
