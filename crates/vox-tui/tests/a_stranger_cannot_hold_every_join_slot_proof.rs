@@ -950,8 +950,13 @@ const FRAME_PATIENCE: Duration = Duration::from_secs(30);
 /// patience — 30s, inside this bound — so that case guards against **no** bound after the work
 /// (carol is never let in) and the drip case against the admission patience alone.
 const ADMIT_BOUND: Duration = Duration::from_secs(36);
-/// The stranger's grind in the worked cases, so its sixteen joins do their work at nearly once.
-const STALL_GRIND_MS: u64 = 15_000;
+/// The stranger's grind in the worked cases, so its sixteen joins do their work at nearly once: a
+/// floor well above a real solve on a busy machine (measured 15-48s for sixteen at once at load
+/// 80), so the floor, not the solve, decides when each finishes.
+const STALL_GRIND_MS: u64 = 60_000;
+/// At most this far apart may the sixteen holds do their work, or the first is given back
+/// (at [`ADMISSION_PATIENCE`]) before carol can try while all of them hold: CANNOT MEASURE.
+const WORKED_SPREAD: Duration = Duration::from_secs(10);
 /// The drip case's wait before each frame the stranger still owes after its work: inside the
 /// per-frame bound (30s) each time, and 50s in all, far past the admission patience (20s).
 const DRIP_MS: u64 = 25_000;
@@ -1001,6 +1006,14 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
         std::thread::sleep(Duration::from_millis(250));
     }
     let first_worked = first_worked.unwrap_or_else(Instant::now);
+    let spread = first_worked.elapsed();
+    assert!(
+        spread < WORKED_SPREAD,
+        "CANNOT MEASURE: {case}: the stranger's joins did their work {:.1}s apart, past {}s: the \
+         first would be given back before carol could try while all of them hold",
+        spread.as_secs_f64(),
+        WORKED_SPREAD.as_secs()
+    );
     eprintln!(
         "[proof] {} {case}: all {SLOTS} of the stranger's joins did their work after {:.1}s, \
          {:.1}s after the first",
