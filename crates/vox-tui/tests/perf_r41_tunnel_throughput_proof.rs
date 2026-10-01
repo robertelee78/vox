@@ -1079,16 +1079,30 @@ const FAIR_HIGH: f64 = 2.0;
 /// whose network changes under a live tunnel gets the new link's speed after that, and that is what
 /// the arms judge. A fresh comparison flow pays only its own ramp, within the same allowance.
 const SETTLE: Duration = Duration::from_secs(12);
-/// How long each arm measures, past the settle.
+/// How long each lossy arm measures, past the settle.
 const MEASURE: Duration = Duration::from_secs(15);
+/// How long each congested arm measures, past the settle: long enough that tier 3's trials (2 s each,
+/// then a back-off of 30 s or more) run and fail inside it, so the share judged is the whole run's,
+/// trials included, not a steady state between them.
+const CONGESTED_MEASURE: Duration = Duration::from_secs(60);
 /// The window a person's speed is read in.
 const WINDOW: Duration = Duration::from_secs(1);
 /// The changing arm: each phase's length, and how soon after the loss ends Vox must be back at the
 /// clean bar.
 const PHASE: Duration = Duration::from_secs(20);
 const RECOVER_WITHIN: Duration = Duration::from_secs(5);
-/// How long into the lossy phase Vox may take to find its lossy-link speed before it is judged.
-const CLIMB_WITHIN: Duration = Duration::from_secs(5);
+/// How long into the lossy phase Vox may take to find its lossy-link speed before it is judged: at
+/// 5% loss that is a climb of two tiers (at least 1 s in tier 1, 2 s of dwell and 2 s of evidence in
+/// tier 2, then tier 3's trial), as ADR-024's thresholds set it.
+const CLIMB_WITHIN: Duration = Duration::from_secs(8);
+
+/// The changing arm's name for a lossy phase on `lossy`.
+fn changing_name(lossy: &Link) -> String {
+    format!(
+        "changing, 200 Mbit/s, 10 ms RTT: clean, {:.0}% loss, clean",
+        lossy.loss * 100.0
+    )
+}
 
 /// Write to the tunnel at `to` as fast as it takes, until `stop`.
 fn stream_to(to: SocketAddr, stop: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
@@ -1337,9 +1351,9 @@ fn taper_arms(
     let judged = |w: &[Window]| w[w.len() - MEASURE.as_secs() as usize..].to_vec();
 
     // The lossy link: Vox alone, then the comparison flow alone, each over the same loss.
-    let mut lossy_bar = None;
+    let mut lossy_bars: Vec<(&str, f64)> = Vec::new();
     for lossy in [WIFI, WIFI_HEAVY] {
-        let feeds_changing = lossy.name == WIFI.name && wanted("changing");
+        let feeds_changing = wanted(&changing_name(&lossy));
         if !wanted(lossy.name) && !feeds_changing {
             continue;
         }
@@ -1359,9 +1373,7 @@ fn taper_arms(
         assert_on_time(lossy.name, &c);
         assert_competed(lossy.name, &c);
         let (vm, cm) = (mean_of(&v, |x| x.vox), mean_of(&c, |x| x.other));
-        if lossy.name == WIFI.name {
-            lossy_bar = Some(cm * LOSSY_WIN);
-        }
+        lossy_bars.push((lossy.name, cm * LOSSY_WIN));
         let ratio = vm / cm;
         let verdict = if ratio >= LOSSY_WIN {
             format!("ok (>= {LOSSY_WIN:.1}x)")
@@ -1396,7 +1408,8 @@ fn taper_arms(
         let stop = Arc::new(AtomicBool::new(false));
         competitor_sender(&rt, competitor, Arc::clone(&stop));
         let pump = stream_to(tunnel, Arc::clone(&stop));
-        let w = judged(&windows(settle_and_measure, |_| {}));
+        let all = windows(SETTLE + CONGESTED_MEASURE, |_| {});
+        let w = all[SETTLE.as_secs() as usize..].to_vec();
         stop.store(true, Relaxed);
         let _ = pump.join();
         std::thread::sleep(Duration::from_secs(1));
@@ -1425,35 +1438,52 @@ fn taper_arms(
         } else {
             format!("fair ({FAIR_LOW:.1}x-{FAIR_HIGH:.1}x)")
         };
+        // The cost of a failed tier-3 trial, made visible: the 2 s windows furthest from fair.
+        let pairs: Vec<f64> = w
+            .windows(2)
+            .map(|p| (p[0].vox + p[1].vox) / (p[0].other + p[1].other).max(1.0))
+            .collect();
+        let worst_high = pairs.iter().copied().fold(0.0, f64::max);
+        let worst_low = pairs.iter().copied().fold(f64::INFINITY, f64::min);
         report.push(format!(
-            "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.2}x — {verdict}; per-second vox \
-             {:?}, Cubic {:?}",
+            "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.2}x over {} s — {verdict}; worst 2 s \
+             windows {worst_low:.2}x and {worst_high:.2}x; per-second vox {:?}, Cubic {:?}",
             congested.name,
             vm / 1e6,
             cm / 1e6,
+            CONGESTED_MEASURE.as_secs(),
             mbit(&w, |x| x.vox),
             mbit(&w, |x| x.other)
         ));
     }
 
-    // The changing link: clean, 1% loss, clean, under one running transfer.
-    if wanted("changing") {
+    // The changing links: clean, lossy, clean, under one running transfer, at 1% loss (tier 2's
+    // case) and at 5% (tier 3's).
+    for lossy_link in [WIFI, WIFI_HEAVY] {
+        let name = changing_name(&lossy_link);
+        if !wanted(&name) {
+            continue;
+        }
         let clean = Link {
             loss: 0.0,
-            ..WIFI
+            ..lossy_link
         };
         // The clean bar: raw TCP over the same clean link, as for every gated link above.
         *link.lock().unwrap() = Some(clean);
         std::thread::sleep(Duration::from_millis(500));
         let raw_rate = transfer(raw, done) * 8.0;
         let bar = raw_rate * MIN_RATIO;
-        let lossy_bar = lossy_bar.expect("the lossy arm ran first");
+        let lossy_bar = lossy_bars
+            .iter()
+            .find(|(n, _)| *n == lossy_link.name)
+            .map(|&(_, b)| b)
+            .expect("the lossy arm for this link runs first");
         let stop = Arc::new(AtomicBool::new(false));
         let pump = stream_to(tunnel, Arc::clone(&stop));
         let l = Arc::clone(link);
         let all = windows(SETTLE + PHASE * 3, move |t| {
             let lossy = t >= SETTLE + PHASE && t < SETTLE + PHASE * 2;
-            *l.lock().unwrap() = Some(if lossy { WIFI } else { clean });
+            *l.lock().unwrap() = Some(if lossy { lossy_link } else { clean });
         });
         stop.store(true, Relaxed);
         let _ = pump.join();
@@ -1464,8 +1494,7 @@ fn taper_arms(
             &all[s + n..s + 2 * n],
             &all[s + 2 * n..s + 3 * n],
         );
-        assert_on_time("changing", &all[s..]);
-        let name = "changing (200 Mbit/s, 10 ms RTT: clean, 1% loss, clean)";
+        assert_on_time(&name, &all[s..]);
         let below = |w: &[Window]| w.iter().filter(|x| x.vox < bar).count();
         let r = RECOVER_WITHIN.as_secs() as usize;
         let lossy_mean = mean_of(&lossy[CLIMB_WITHIN.as_secs() as usize..], |x| x.vox);
