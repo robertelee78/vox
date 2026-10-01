@@ -37,7 +37,7 @@ const ROOM_PASS: &str = "channel passphrase";
 /// silently name a session. **This test process may itself be running inside Claude
 /// Code or Codex**, and a leaked `CLAUDE_CODE_SESSION_ID` would make every worker the
 /// same session — the exact defect these proofs exist to catch.
-pub const HARNESS_SESSION_VARS: [&str; 10] = [
+pub const HARNESS_SESSION_VARS: [&str; 11] = [
     "VOX_SESSION",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
@@ -51,7 +51,8 @@ pub const HARNESS_SESSION_VARS: [&str; 10] = [
     // wants a wake endpoint sets its own.
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
-    "OPENCODE_SERVER_URL",
+    "VOX_OPENCODE_WAKE_SOCKET",
+    "VOX_OPENCODE_WAKE_TOKEN",
     "VOX_HARNESS",
 ];
 

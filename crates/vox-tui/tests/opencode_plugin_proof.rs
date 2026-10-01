@@ -49,6 +49,25 @@
 //! before printing what is unread): the codeword must not reach the model, and the proof
 //! goes red at "the room never reached the model".
 //!
+//! ## A plain `opencode`, opened by hand, can be interrupted (ADR-020 §6, ADR-021 F17)
+//!
+//! The same daemon, room and installed plugin, then what a person does: open `opencode` in
+//! the project with **no flags** — `VOX_ROOM` and `VOX_AGENT_NAME` exported, nothing else —
+//! in a pty, and ask it for a turn that runs `sleep`. While the tool runs, they post an urgent
+//! message addressed to someone else, then one addressed to this agent. The work is in
+//! `tests/pty/opencode_wake.py` (the screen read through `pyte`); this asserts what it saw:
+//!
+//! 1. the session's own drain registered it with the daemon as **OpenCode, reachable** (the
+//!    plugin's wake socket) — a plain `opencode` has no listener of its own, and before F17 it
+//!    registered as `unknown`;
+//! 2. the message addressed to someone else **never reaches the screen** while the turn runs;
+//! 3. the one addressed to this agent **reaches the screen mid-turn**, before the tool ends;
+//! 4. and the running turn **still finishes**: the interrupt queues into it, never aborts it.
+//!
+//! Mutation-checked: `vox agent hook` not registering the plugin's socket (the session stays
+//! `unknown`) goes red at (1) and (3); the plugin taking the wake and never relaying it goes
+//! red at (3).
+//!
 //! OpenCode absent, or no usable credential, is reported **unproven and fails** —
 //! an absent prover is missing evidence, not evidence of correctness. Set
 //! `VOX_PROOF_ALLOW_UNPROVEN=opencode` to accept that gap deliberately and visibly.
@@ -57,6 +76,9 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -181,7 +203,8 @@ fn opencode_turn(
 #[test]
 #[ignore = "drives a real model through a real harness; CI runs it in release"]
 fn a_real_model_reads_the_room_through_the_opencode_plugin() {
-    watchdog::arm();
+    // Five or six real model turns, one of them a 45 s tool, plus the pty driver's own bound.
+    watchdog::arm_for(Duration::from_secs(900));
 
     if which("opencode").is_none() {
         assert!(
@@ -298,6 +321,18 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     let project = fixture.join("project");
     std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
     std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
+    // What a plain `opencode` (no `-m`) runs with: the model, and a shell tool it may use
+    // without asking — the interrupt case needs a turn that is busy running one.
+    std::fs::write(
+        project.join("opencode.json"),
+        serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "model": model(),
+            "permission": { "bash": "allow" }
+        })
+        .to_string(),
+    )
+    .unwrap();
     // The credential is only *located* through the real data dir; nothing is copied.
     let _ = &auth;
 
@@ -372,5 +407,76 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         !without.contains(&codeword),
         "`--pure` disables external plugins, so the codeword must be unreachable — if it still \
          appears, this test is not measuring the plugin. Got: {without:?}"
+    );
+
+    // ---- a plain `opencode`, opened by hand, interrupted mid-turn (F17) ----
+    let _ = std::fs::write(&plugin_log, "");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/opencode_wake.py");
+    let out = pty_driver::run(
+        script,
+        &[
+            VOX,
+            data.to_str().unwrap(),
+            cfg.to_str().unwrap(),
+            &room,
+            project.to_str().unwrap(),
+            oc_cfg.to_str().unwrap(),
+            plugin_log.to_str().unwrap(),
+            "wake",
+        ],
+    );
+    let said = out.stdout.clone();
+    eprintln!(
+        "{said}\n[proof] the driver took {:?}; its last stage: {:?}{}",
+        out.took,
+        out.stage,
+        plugin_diag("hand-opened")
+    );
+    match out.code {
+        Some(0) => {}
+        Some(2) => panic!("CANNOT MEASURE: the hand-opened session's apparatus failed: {said}"),
+        _ if out.has_verdict("wake") => {
+            panic!("CANNOT MEASURE: the hand-opened session's driver hung or went red: {said}")
+        }
+        _ => panic!(
+            "CANNOT MEASURE: the hand-opened session's driver was stopped before it gave a \
+             verdict, at stage {:?} (exit {:?}; its stack is above): {said}",
+            out.stage.as_deref().unwrap_or("(before its first stage)"),
+            out.code
+        ),
+    }
+    let line = |key: &str| {
+        said.lines()
+            .find_map(|l| l.strip_prefix(&format!("wake {key}: ")))
+            .unwrap_or("(no line)")
+            .to_owned()
+    };
+    let (registered, other, wake, turn) = (
+        line("REGISTERED"),
+        line("OTHER"),
+        line("WAKE"),
+        line("TURN"),
+    );
+    println!(
+        "[proof] hand-opened `opencode`: registered {registered:?}; addressed to someone else: \
+         {other}; addressed to it: {wake}; its running turn: {turn}"
+    );
+    assert!(
+        registered.starts_with("opencode /") && registered.ends_with("wake.sock"),
+        "(1) a plain `opencode` must register as OpenCode, reachable through the plugin's wake \
+         socket; its drain registered {registered:?}"
+    );
+    assert_eq!(
+        other, "absent",
+        "(2) an urgent message addressed to someone else must not interrupt this session: {said}"
+    );
+    assert!(
+        wake.starts_with("shown mid-turn"),
+        "(3) an urgent message addressed to this session must interrupt it while its turn runs; \
+         it was {wake}: {said}"
+    );
+    assert_eq!(
+        turn, "completed",
+        "(4) the interrupt must queue into the running turn, not abort it: {said}"
     );
 }

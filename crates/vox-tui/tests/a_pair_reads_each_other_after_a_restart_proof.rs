@@ -65,7 +65,7 @@ const ROOMPASS: &str = "the room passphrase";
 const AFTER_ROTATION: Duration = Duration::from_secs(90);
 
 /// Everything a harness might have put in this process's environment (see `support/room.rs`).
-const HARNESS_VARS: [&str; 10] = [
+const HARNESS_VARS: [&str; 11] = [
     "VOX_SESSION",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
@@ -74,7 +74,8 @@ const HARNESS_VARS: [&str; 10] = [
     "VOX_AGENT_NAME",
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
-    "OPENCODE_SERVER_URL",
+    "VOX_OPENCODE_WAKE_SOCKET",
+    "VOX_OPENCODE_WAKE_TOKEN",
     "VOX_HARNESS",
 ];
 
