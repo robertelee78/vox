@@ -207,6 +207,7 @@ fn fire(elapsed: Duration, budget: Duration) -> ! {
     say(&format!(
         "\n\
          ==================== vox test watchdog ====================\n\
+         APPARATUS (watchdog): no verdict was reached; this run says nothing about the product.\n\
          This test process has been running for {elapsed:?} and is being aborted.\n\
          \n\
          It is hung, not slow: the budget is {budget:?}. A `tokio::time::timeout` did\n\
