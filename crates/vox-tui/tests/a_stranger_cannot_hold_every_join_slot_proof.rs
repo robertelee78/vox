@@ -519,41 +519,48 @@ fn anchor_circuits(s: &Staged) -> (usize, usize) {
 }
 
 /// How many circuits `who`'s node has asked a relay for, to any peer (`vox status --json`,
-/// `reach[].circuits`).
+/// `reach[].circuits`). Asked for, not used: the reachability ladder races its rungs, so a join
+/// that went direct may have asked too. Printed, never asserted on.
 fn circuits_asked(who: &Who) -> u64 {
-    let (ok, out, err) = who.vox(&["status", "--json"], None);
-    assert!(ok, "CANNOT MEASURE: vox status --json failed: {err}");
-    let v: serde_json::Value = serde_json::from_str(out.trim())
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: status is not JSON ({e}): {out}"));
-    v["reach"]
-        .as_array()
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no reach: {out}"))
-        .iter()
-        .map(|r| r["circuits"].as_u64().unwrap_or(0))
-        .sum()
+    let (ok, out, _) = who.vox(&["status", "--json"], None);
+    if !ok {
+        return 0;
+    }
+    serde_json::from_str::<serde_json::Value>(out.trim())
+        .ok()
+        .and_then(|v| {
+            v["reach"]
+                .as_array()
+                .map(|r| r.iter().map(|r| r["circuits"].as_u64().unwrap_or(0)).sum())
+        })
+        .unwrap_or(0)
 }
 
-/// What the path every join took says about the case, read from each joiner's own node: none
-/// relayed in [`Layout::TwoAddresses`] (else the address dimension is not what was measured), every
-/// one relayed in [`Layout::Relayed`]. `Err` is CANNOT MEASURE, returned rather than raised so the
-/// caller can stop the stranger first.
+/// What the path every join took says about the case, read from the **anchor**, the only relay
+/// here: what it carried is what was relayed. None in [`Layout::TwoAddresses`] (else the address
+/// dimension is not what was measured); in [`Layout::Relayed`], a circuit for every stranger
+/// identity and carol at once, since every one of their joins is held open while carol joins.
+/// `Err` is CANNOT MEASURE, returned rather than raised so the caller can stop the stranger first.
 fn paths(s: &Staged, case: &str) -> Result<(), String> {
+    std::thread::sleep(Duration::from_secs(2));
+    let (max, reports) = anchor_circuits(s);
     let carol = circuits_asked(&s.carol);
     let strangers: Vec<u64> = s.strangers.iter().map(circuits_asked).collect();
-    let (max, reports) = anchor_circuits(s);
     eprintln!(
-        "[proof] {} {case}: circuits asked for — carol {carol}, the strangers {strangers:?}; the \
-         anchor carried at most {max} at once ({reports} reports)",
+        "[proof] {} {case}: the anchor carried at most {max} circuit(s) at once ({reports} \
+         reports); circuits asked for — carol {carol}, the strangers {strangers:?}",
         profile()
     );
+    let want = s.strangers.len() + 1;
     match s.layout {
-        Layout::TwoAddresses if carol > 0 || strangers.iter().any(|&n| n > 0) => Err(format!(
-            "CANNOT MEASURE: {case}: some join was relayed (carol {carol}, strangers \
-             {strangers:?}), not from the address measured"
+        Layout::TwoAddresses if max > 0 || reports == 0 => Err(format!(
+            "CANNOT MEASURE: {case}: the anchor carried {max} circuit(s) ({reports} reports), so \
+             some join was relayed and not from the address measured"
         )),
-        Layout::Relayed if carol == 0 || strangers.iter().any(|&n| n == 0) => Err(format!(
-            "CANNOT MEASURE: {case}: not every join was relayed (carol {carol}, strangers \
-             {strangers:?})"
+        Layout::Relayed if max < want => Err(format!(
+            "CANNOT MEASURE: {case}: the anchor carried at most {max} circuit(s) at once, not one \
+             for each of the {} stranger identities and carol ({want}): not every join was relayed",
+            s.strangers.len()
         )),
         _ => Ok(()),
     }
