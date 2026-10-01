@@ -782,9 +782,30 @@ fn an_anchor_stopped_by_sigquit_stops_cleanly_and_is_noticed() {
         "CANNOT MEASURE: no echo through the forward before the anchor was stopped: {first:?}\n{}",
         w.fwd.as_mut().unwrap().transcript()
     );
-    // Long enough that the forward holds its anchor connection and its circuit.
+    // Long enough that the forward holds its anchor connection and its circuit, and has held it
+    // for more than one of its 1 s ticks: an anchor lost before the forward's tick has seen its
+    // connection is V210-93's case (#287) and its proof, not this one, which is about how the
+    // anchor stops. In a debug build the forward spends about 5 s unlocking its identity first, so
+    // the wait is counted from when it said it reached its anchor, not from its start.
     std::thread::sleep(Duration::from_secs(4).saturating_sub(started.elapsed()));
     let fwd = w.fwd.as_mut().unwrap();
+    let _ = fwd.transcript();
+    let reached = fwd
+        .timed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(_, l)| l.contains("connected to this anchor"))
+        .map(|(at, _)| *at);
+    let Some(reached) = reached else {
+        panic!(
+            "CANNOT MEASURE: the forward never said it reached its anchor\n{}",
+            fwd.transcript()
+        )
+    };
+    std::thread::sleep(
+        (reached + Duration::from_millis(2500)).saturating_duration_since(Instant::now()),
+    );
     assert!(
         !fwd.transcript().contains(GONE),
         "CANNOT MEASURE: the forward said its anchor went before it was stopped\n{}",
