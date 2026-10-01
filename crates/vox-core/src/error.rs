@@ -351,13 +351,13 @@ pub enum Error {
     /// An anchor only bridges hosts that cannot otherwise reach each other (ADR-012), so a verb
     /// that truly needs one fails where it needs it, not here.
     #[error(
-        "the anchors file {path} names no usable anchor ({skipped} line(s) skipped, said above); \
+        "the anchors file {path} names no usable anchor ({skipped} skipped, each said above); \
          a peer this machine can reach directly needs none"
     )]
     AnchorsFileUnusable {
         /// The anchors file.
         path: String,
-        /// How many of its lines were skipped.
+        /// How many of its lines were skipped; 1 for a file that cannot be read at all.
         skipped: usize,
     },
 

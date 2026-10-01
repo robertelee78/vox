@@ -13,6 +13,8 @@
 //! fingerprint). No `--anchor`, no `vox node` running, both on `127.0.0.1`. Then, each a real `vox`:
 //! - `vox id` prints alice's fingerprint and exits 0; `vox trust add` (each trusts the other) exits
 //!   0. Each says the file and both lines were skipped and that it carries on.
+//! - with alice's anchors file replaced by bytes that are not text, `vox id` still prints her
+//!   fingerprint and exits 0, saying the file is skipped whole, why, and that it carries on.
 //! - alice's `vox daemon` **starts** (answers `vox room list`) and says it carries on; she
 //!   `vox room create`s a room, posts in it, and `vox room invite`s.
 //! - bob **`vox connect`s** with that address and the room passphrase, and exits 0.
@@ -42,7 +44,8 @@
 //! "waits on" half: `vox tui` sleeping before it draws when its anchors file names no usable
 //! anchor must turn the TUI arm red as PRODUCT, not CANNOT MEASURE. And for the last arm: the
 //! `BoardUnreachable` advice saying "the anchor could not be reached … check `vox node`" again
-//! must turn it red as PRODUCT.
+//! must turn it red as PRODUCT. And for the unreadable file: `merge_anchors_file` returning its
+//! `Error::Path` again for a file it cannot read turns the `vox id` step red as PRODUCT.
 
 #![cfg(unix)]
 
@@ -258,6 +261,27 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
         );
     }
 
+    // ---- an anchors file that cannot be read as text stops nothing either -----------------------
+    // It was an error that named neither the file nor why ("profile path read: anchors file"),
+    // and every verb, `vox id` included, refused on it (ac-ver302's verdict on 3b790e64).
+    std::fs::write(alice.join("cfg").join("anchors"), b"\xff\xfe\x00bad\n").unwrap();
+    let (ok, out, err) = vox_once(&alice, &args(&["id"]));
+    let named = err.contains(&format!("{alice_file} is skipped whole: it is not text"))
+        && err.contains("names no usable anchor")
+        && err.contains("carrying on with no anchor");
+    println!(
+        "[proof] vox id, anchors file not text: exit ok {ok}; printed the fingerprint: {}; named \
+         the file and carried on: {named}",
+        out.trim() == alice_fp
+    );
+    assert!(
+        ok && out.trim() == alice_fp && named,
+        "PRODUCT: `vox id` with an anchors file that is not text must print its fingerprint \
+         ({alice_fp}), exit 0, and say the file is skipped, why, and that it carries on; it exited \
+         ok={ok}, printed {out:?} and said:\n{err}"
+    );
+    std::fs::write(alice.join("cfg").join("anchors"), &bad).unwrap();
+
     // ---- alice hosts a room from her daemon ------------------------------------------------------
     let alice_daemon = daemon(&alice, &pass, "alice-daemon");
     let said = alice_daemon.said();
@@ -352,6 +376,19 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
             alice_daemon.said()
         );
     }
+    // Bob reached alice directly, and nothing in this run is an anchor: a note that he
+    // "connected to this anchor" tells him he is using one (ac-ver302's finding on 3b790e64).
+    let said = bob_daemon.said();
+    let notes: Vec<&str> = said
+        .lines()
+        .filter(|l| l.contains("connection to "))
+        .collect();
+    println!("[proof] bob's daemon's connection notes: {notes:?}");
+    assert!(
+        !said.contains("connected to this anchor"),
+        "PRODUCT: bob reached alice, the room's host, directly with no anchor anywhere, but his \
+         daemon called her an anchor:\n{said}"
+    );
     drop(bob_daemon);
 
     // ---- bob's TUI opens the room ----------------------------------------------------------------

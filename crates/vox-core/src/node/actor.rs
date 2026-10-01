@@ -4808,9 +4808,27 @@ impl Node {
                 self.anchor_window.remove(&peer);
                 // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
                 // whose forward said it dialled and then nothing).
+                //
+                // **Named for what it is** (V210-107). A room's own host is dialled the same way —
+                // its link entry is a board too — and was noted "connected to this anchor", which
+                // told a person reaching a host directly that they were using an anchor. An anchor
+                // is one this node was given (`--anchor`, the anchors file) or a room names that is
+                // not one of its members.
+                let anchor = self.anchors.get(&peer).is_some()
+                    || self
+                        .room_anchors
+                        .values()
+                        .any(|set| set.get(&peer).is_some());
                 if let Some(net) = self.net.as_ref() {
-                    net.manager()
-                        .note(peer, "connected to this anchor".to_owned());
+                    net.manager().note(
+                        peer,
+                        if anchor {
+                            "connected to this anchor"
+                        } else {
+                            "connected to this room host's board"
+                        }
+                        .to_owned(),
+                    );
                 }
                 self.anchor_ids.insert(peer);
                 self.adopt_connection(Arc::clone(&conn));

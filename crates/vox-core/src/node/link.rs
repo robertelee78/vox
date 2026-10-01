@@ -262,10 +262,17 @@ fn resolve_host(host: &str, port: &str, want6: Option<bool>) -> Result<Vec<Multi
 /// failures are hard to attribute. Failing the whole file was worse the other way: one host that
 /// did not resolve took every anchor with it, and the error named neither the line nor the reason.
 ///
+/// **A file that cannot be read is skipped and named the same way** (V210-107): not UTF-8, not
+/// readable, or a directory. It was an [`Error::Path`] that said "profile path read: anchors
+/// file" — neither which file nor why — and every verb, `vox id` included, refused on it: the
+/// anchors-file refusal V210-107 removed for unusable lines, back by another door. An anchor only
+/// bridges hosts that cannot otherwise reach each other (ADR-012), so a file nobody can read
+/// costs at most that bridge, and the verb carries on to whoever it can reach directly.
+///
 /// A host is resolved here, which blocks: an async caller runs this on a blocking thread.
 ///
 /// # Errors
-/// [`Error::Path`] if the file exists and cannot be read.
+/// None today; the `Result` is kept for the callers' `?`.
 pub fn merge_anchors_file(
     set: &mut crate::nat::bootstrap::BootstrapSet,
     path: &std::path::Path,
@@ -273,11 +280,13 @@ pub fn merge_anchors_file(
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => {
-            return Err(Error::Path {
-                op: "read",
-                detail: "anchors file".to_owned(),
-            })
+        Err(e) => {
+            let why = if e.kind() == std::io::ErrorKind::InvalidData {
+                "it is not text (UTF-8)".to_owned()
+            } else {
+                format!("it cannot be read: {e}")
+            };
+            return Ok(vec![format!("{} is skipped whole: {why}", path.display())]);
         }
     };
     let mut skipped = Vec::new();
