@@ -65,6 +65,11 @@
 //! - **out of BBR**: [`VoxCubic::seeded`] in congestion avoidance at BBR's delivery rate times the
 //!   windowed minimum round trip.
 //!
+//! # Idle restart
+//! `IdleRestart` (congestion.rs) rebuilds this controller after the connection has sent nothing
+//! for a while: the tier goes back to 1 and the base round trip is measured afresh, because the
+//! path may have changed. The tier-3 lockout is handed on ([`Tier3Backoff`]).
+//!
 //! # Troubleshooting
 //! Each switch emits `tracing::debug!` under the target `vox::congestion`, with the tiers, the
 //! reason and the signal that decided it. Nothing prints by default.
@@ -185,15 +190,19 @@ impl Streak {
     }
 }
 
-/// Tier 3's lockout after failures.
+/// Tier 3's lockout after failures. It outlives the controller: `IdleRestart` rebuilds the
+/// connection's controller at tier 1 after an idle period, with a fresh base round trip, because the
+/// path may have changed; but it hands this on ([`Tapered::tier3_backoff`],
+/// [`Tapered::with_tier3_backoff`]), so a sender that pauses does not earn a retry of a trial that
+/// failed.
 #[derive(Debug, Clone, Copy, Default)]
-struct Backoff {
+pub(crate) struct Tier3Backoff {
     /// The lockout the next failure imposes ([`BACKOFF_FIRST`] when `None`).
     next: Option<Duration>,
     until: Option<Instant>,
 }
 
-impl Backoff {
+impl Tier3Backoff {
     fn locked(&self, now: Instant) -> bool {
         self.until.is_some_and(|t| now < t)
     }
@@ -219,7 +228,7 @@ pub(crate) struct Tapered {
     rounds_in_tier: u32,
     /// The loss share when tier 3 was entered.
     entry_share: f64,
-    backoff: Backoff,
+    backoff: Tier3Backoff,
     /// Rounds without a held queue, toward a climb from tier 2.
     unqueued: Streak,
     /// Rounds in a row that showed a queue (any tier but 3).
@@ -240,13 +249,30 @@ impl Tapered {
             entered_at: now,
             rounds_in_tier: 0,
             entry_share: 0.0,
-            backoff: Backoff::default(),
+            backoff: Tier3Backoff::default(),
             unqueued: Streak::default(),
             queued: Streak::default(),
             quiet: Streak::default(),
             loss_gone: Streak::default(),
             queue: Streak::default(),
         }
+    }
+
+    /// A connection's controller after an idle restart: tier 1, Cubic in slow start, a fresh base
+    /// round trip, and the tier-3 lockout the previous controller had built up.
+    pub(crate) fn with_tier3_backoff(
+        now: Instant,
+        current_mtu: u16,
+        backoff: Tier3Backoff,
+    ) -> Self {
+        let mut tapered = Self::new(now, current_mtu);
+        tapered.backoff = backoff;
+        tapered
+    }
+
+    /// The tier-3 lockout, for an idle restart to hand on.
+    pub(crate) fn tier3_backoff(&self) -> Tier3Backoff {
+        self.backoff
     }
 
     /// The round trip BBR's own window can raise with no other flow on the path.
