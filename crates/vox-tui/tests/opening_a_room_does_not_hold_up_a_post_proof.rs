@@ -25,10 +25,11 @@
 //!    and types its passphrase. The driver times every post, and times the open from the
 //!    passphrase's Enter to the first `vox room read B` that succeeds.
 //!
-//! **Asserted:** every post that started while the open ran, from its start to the room being
-//! open, answered within [`BOUND`], V210-08's bound for a post on loopback. Preconditions, or
-//! `CANNOT MEASURE`: the open took at least [`MIN_OPEN`] (else there was nothing to wait for), at
-//! least [`MIN_DURING`] posts started during it, and every post succeeded.
+//! **Asserted:** every post that overlapped the open, from its start to the room being open,
+//! answered within [`BOUND`], V210-08's bound for a post on loopback. The bound is asserted
+//! **before** the preconditions, so a post over it is red whatever else the run shows.
+//! Preconditions, or `CANNOT MEASURE`: every post succeeded, the open took at least [`MIN_OPEN`]
+//! (else there was nothing to wait for), and at least [`MIN_DURING`] posts overlapped it.
 //!
 //! **Mutation that must turn it red:** the open back on the actor, where `ChannelState::open`
 //! (unwrap and re-verify) is awaited inline, as before 7507d3a. A post made during the open then
@@ -64,7 +65,7 @@ const SEED: usize = 3000;
 /// An open shorter than this could not hold a post past [`BOUND`] even on the actor, so it would
 /// measure nothing: the open must take at least the bound itself.
 const MIN_OPEN: Duration = BOUND;
-/// Posts that must start during the open for it to have been measured at all.
+/// Posts that must overlap the open for it to have been measured at all.
 const MIN_DURING: usize = 2;
 
 /// A `vox daemon`, killed by its own PID when dropped.
@@ -254,19 +255,31 @@ fn a_post_answers_while_the_node_opens_another_room() {
     }
     let (from, to) = window.unwrap_or_else(|| panic!("CANNOT MEASURE: no open window: {said}"));
     let took = Duration::from_secs_f64(to - from);
+    // Every post that **overlapped** the open: started before it ended and finished after it
+    // began. A post that started just before the open and was held for all of it is the defect at
+    // its plainest, so it counts; counting only posts that *started* during the open let one such
+    // post read as "too few posts" (CANNOT MEASURE) instead of red.
     let during: Vec<(f64, f64)> = posts
         .iter()
-        .filter(|(start, _, _)| *start >= from && *start < to)
+        .filter(|(start, ms, _)| *start < to && start + ms / 1000.0 > from)
         .map(|(start, ms, _)| (start - from, *ms))
         .collect();
     let slowest = during.iter().map(|(_, ms)| *ms).fold(0.0_f64, f64::max);
     let all_slowest = posts.iter().map(|(_, ms, _)| *ms).fold(0.0_f64, f64::max);
     println!(
         "[proof] the open of bravo ({SEED} entries) took {took:?}; {} post(s) to alpha started \
-         during it, slowest {slowest:.1} ms (bound {BOUND:?}); {} post(s) in all, slowest \
+         or overlapped it, slowest {slowest:.1} ms (bound {BOUND:?}); {} post(s) in all, slowest \
          {all_slowest:.1} ms; during: {during:?}",
         during.len(),
         posts.len()
+    );
+    // **The bound first.** A post over it is the defect whatever else the run shows, so no
+    // precondition may turn it into a CANNOT MEASURE: under the defect the first post blocks for
+    // the whole open, and fewer posts then start during it.
+    assert!(
+        slowest < BOUND.as_secs_f64() * 1000.0,
+        "a post to alpha took {slowest:.1} ms (bound {BOUND:?}) while the same node opened bravo \
+         with its passphrase: the open held the node"
     );
     assert!(
         posts.iter().all(|(_, _, ok)| *ok),
@@ -278,12 +291,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
     );
     assert!(
         during.len() >= MIN_DURING,
-        "CANNOT MEASURE: only {} post(s) started during the open",
+        "CANNOT MEASURE: only {} post(s) overlapped the open",
         during.len()
-    );
-    assert!(
-        slowest < BOUND.as_secs_f64() * 1000.0,
-        "a post to alpha took {slowest:.1} ms (bound {BOUND:?}) while the same node opened bravo \
-         with its passphrase: the open held the node"
     );
 }
