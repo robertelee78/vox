@@ -336,7 +336,8 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     );
     let took = t0.elapsed();
     eprintln!(
-        "[proof] carol's join with the pinned member offline: ok={ok} in {:.1}s (bound {}s)",
+        "[proof] carol's join with the pinned member offline: ok={ok} in {:.1}s (release bound \
+         {}s)",
         took.as_secs_f64(),
         JOIN_BOUND.as_secs()
     );
