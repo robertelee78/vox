@@ -1727,6 +1727,10 @@ fn hex(bytes: &[u8]) -> String {
 /// If the node cannot be reached, the room is unknown, the file cannot be read, or
 /// the node refuses to offer the service.
 pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Result<(), AppError> {
+    // Every stop signal, not Ctrl-C alone (V210-108): SIGTERM and SIGHUP ended the offer on the
+    // spot, leaving it on the node. Taken first, so a stop sent while the offer is being made is
+    // not the default action's silent death; the loop below acts on it.
+    let interrupted = crate::app::stop_requested("vox room send");
     let (sha256, size) = digest_file(path)?;
     let name = path
         .file_name()
@@ -1799,11 +1803,10 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
     println!("     Ctrl-C stops the offer; the announcement stays on the log");
 
     let path = path.to_owned();
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
+    // One stop listener for the whole loop, taken above: one made per turn misses a SIGINT that
     // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
     tokio::pin!(interrupted);
-    loop {
+    let signal = loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((mut sock, _)) = accepted else { continue };
@@ -1828,17 +1831,17 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
                     let _ = sock.flush().await;
                 });
             }
-            _ = &mut interrupted => break,
+            signal = &mut interrupted => break signal,
         }
-    }
-    println!("vox: no longer offering {tag}");
+    };
+    crate::app::say(format_args!("vox: no longer offering {tag}"));
     let _ = client
         .request(&Request::RemoveService {
             channel_id,
             service_tag: tag,
         })
         .await;
-    Ok(())
+    Err(AppError::stopped_by(signal))
 }
 
 fn room_of_label(channel_id: Digest32) -> String {

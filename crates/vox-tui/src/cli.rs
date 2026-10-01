@@ -230,9 +230,12 @@ where
     let outcome = rt.block_on(async move { crate::tunnel_cli::with_room(target, body).await });
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
+        // Its own code (a stop exits 128 + the signal's number, V210-108), and written without
+        // panicking: after a hangup stderr can be a terminal that is gone.
         Err(e) => {
-            eprintln!("vox: {e}");
-            ExitCode::FAILURE
+            use std::io::Write as _;
+            let _ = writeln!(io::stderr(), "vox: {e}");
+            e.exit_code()
         }
     }
 }
@@ -1514,104 +1517,131 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // **A stop signal ends a room verb cleanly** (V210-108): `vox room tail` runs until
+            // stopped, and Ctrl-C, SIGTERM or a closed terminal ended it on the spot, saying
+            // nothing. `vox room send` handles its own stop, because it withdraws its offer first.
+            let handles_its_own_stop = matches!(sub, RoomCmd::Send(_));
             let outcome = rt.block_on(async {
-                match &sub {
-                    RoomCmd::Post(a) => {
-                        let opts = crate::room_cli::PostOpts {
-                            kind: a.kind.clone(),
-                            work: a.work.clone(),
-                            attempt: a.attempt.clone(),
-                            to: a.to.clone(),
-                            urgent: a.urgent,
-                            re: a.re.clone(),
-                            thread: a.thread.clone(),
-                            data: a.data.clone(),
-                            coord: a.coord.opts(),
-                        };
-                        crate::room_cli::post_cmd(&paths, &a.room, a.text.as_deref(), &opts).await
-                    }
-                    RoomCmd::Read(a) => {
-                        crate::room_cli::read(&paths, &a.room, a.since.as_deref(), a.limit, a.json)
+                let work = async {
+                    match &sub {
+                        RoomCmd::Post(a) => {
+                            let opts = crate::room_cli::PostOpts {
+                                kind: a.kind.clone(),
+                                work: a.work.clone(),
+                                attempt: a.attempt.clone(),
+                                to: a.to.clone(),
+                                urgent: a.urgent,
+                                re: a.re.clone(),
+                                thread: a.thread.clone(),
+                                data: a.data.clone(),
+                                coord: a.coord.opts(),
+                            };
+                            crate::room_cli::post_cmd(&paths, &a.room, a.text.as_deref(), &opts)
+                                .await
+                        }
+                        RoomCmd::Read(a) => {
+                            crate::room_cli::read(
+                                &paths,
+                                &a.room,
+                                a.since.as_deref(),
+                                a.limit,
+                                a.json,
+                            )
                             .await
+                        }
+                        RoomCmd::Tail(a) => {
+                            crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
+                        }
+                        RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
+                        RoomCmd::List(_) => crate::room_cli::list(&paths).await,
+                        RoomCmd::Claim(a) => {
+                            crate::room_cli::claim_resource(
+                                &paths,
+                                &a.room,
+                                a.resource.as_deref(),
+                                a.work.as_deref(),
+                                a.ttl,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Release(a) => {
+                            crate::room_cli::release_resource(
+                                &paths,
+                                &a.room,
+                                &a.resource,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Decline(a) => {
+                            crate::room_cli::decline_resource(
+                                &paths,
+                                &a.room,
+                                &a.resource,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Renew(a) => {
+                            crate::room_cli::renew_resource(
+                                &paths,
+                                &a.room,
+                                &a.resource,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Handoff(a) => {
+                            crate::room_cli::handoff_resource(
+                                &paths,
+                                &a.room,
+                                &a.resource,
+                                &a.to,
+                                a.to_session.as_deref(),
+                                a.ttl,
+                                &a.coord.opts(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Board(a) => {
+                            crate::room_cli::board(&paths, &a.room, a.json, a.session.as_deref())
+                                .await
+                        }
+                        RoomCmd::Send(a) => {
+                            crate::room_cli::send_file(&paths, &a.room, &a.path).await
+                        }
+                        RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
+                        RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
+                        RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
+                        RoomCmd::Get(a) => {
+                            crate::room_cli::get_file(
+                                &paths,
+                                &a.room,
+                                &a.file,
+                                a.dir.as_deref(),
+                                a.out.as_deref(),
+                            )
+                            .await
+                        }
                     }
-                    RoomCmd::Tail(a) => {
-                        crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
-                    }
-                    RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
-                    RoomCmd::List(_) => crate::room_cli::list(&paths).await,
-                    RoomCmd::Claim(a) => {
-                        crate::room_cli::claim_resource(
-                            &paths,
-                            &a.room,
-                            a.resource.as_deref(),
-                            a.work.as_deref(),
-                            a.ttl,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Release(a) => {
-                        crate::room_cli::release_resource(
-                            &paths,
-                            &a.room,
-                            &a.resource,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Decline(a) => {
-                        crate::room_cli::decline_resource(
-                            &paths,
-                            &a.room,
-                            &a.resource,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Renew(a) => {
-                        crate::room_cli::renew_resource(
-                            &paths,
-                            &a.room,
-                            &a.resource,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Handoff(a) => {
-                        crate::room_cli::handoff_resource(
-                            &paths,
-                            &a.room,
-                            &a.resource,
-                            &a.to,
-                            a.to_session.as_deref(),
-                            a.ttl,
-                            &a.coord.opts(),
-                        )
-                        .await
-                    }
-                    RoomCmd::Board(a) => {
-                        crate::room_cli::board(&paths, &a.room, a.json, a.session.as_deref()).await
-                    }
-                    RoomCmd::Send(a) => crate::room_cli::send_file(&paths, &a.room, &a.path).await,
-                    RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
-                    RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
-                    RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
-                    RoomCmd::Get(a) => {
-                        crate::room_cli::get_file(
-                            &paths,
-                            &a.room,
-                            &a.file,
-                            a.dir.as_deref(),
-                            a.out.as_deref(),
-                        )
-                        .await
+                };
+                if handles_its_own_stop {
+                    work.await
+                } else {
+                    let stop = crate::app::stop_requested("vox room");
+                    tokio::select! {
+                        done = work => done,
+                        signal = stop => Err(crate::app::AppError::stopped_by(signal)),
                     }
                 }
             });
             match outcome {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("vox: {e}");
+                    // Not `eprintln!`: after a hangup stderr can be a terminal that is gone.
+                    use std::io::Write as _;
+                    let _ = writeln!(io::stderr(), "vox: {e}");
                     // 3 = version refusal, 4 = operation conflict (ADR-021 §5, §6).
                     e.exit_code()
                 }
@@ -1704,9 +1734,12 @@ pub fn run() -> ExitCode {
                 args.passphrase_file.clone(),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
+                // Its own code (a stop exits 128 + the signal's number, V210-108), and written
+                // without panicking: after a hangup stderr can be a terminal that is gone.
                 Err(e) => {
-                    eprintln!("vox: {e}");
-                    ExitCode::FAILURE
+                    use std::io::Write as _;
+                    let _ = writeln!(io::stderr(), "vox: {e}");
+                    e.exit_code()
                 }
             }
         }
