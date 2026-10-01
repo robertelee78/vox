@@ -220,6 +220,10 @@ pub struct Dag {
     /// like a fork whose held side cannot incriminate (both are dropped and the session goes
     /// on), and a gate that can only watch for a freeze cannot tell the two apart.
     refused_below_checkpoint: u64,
+    /// Entries held without their body whose body has since arrived and been put back
+    /// ([`Dag::fill_body`], V030-10), for the caller to store and render; taken by
+    /// [`Dag::take_filled`].
+    filled: Vec<Digest32>,
     /// Authors whose feed is closed here from a position on, because the entry they signed there
     /// could not be classified (V210-74): nothing from that position on is taken, and it is not
     /// asked for again. Kept in memory only; after a restart the entry is refused again on sight.
@@ -375,6 +379,51 @@ impl Dag {
         self.feeds
             .get_mut(&author)
             .is_some_and(|f| f.prune_payload(seq))
+    }
+
+    /// **A body that arrives for a skeleton held without one is put back** (V030-10). A skeleton
+    /// is taken whenever it verifies, so an author's feed never stops at a body a peer did not
+    /// send; the body stays owed, and when any peer serves it — the payload the skeleton commits
+    /// to, by hash and length — it is the entry's again. A checkpoint that arrives this way is
+    /// read as one arriving whole would be. Returns whether a body was put back.
+    pub fn fill_body(&mut self, entry: &Entry) -> bool {
+        let Some(payload) = entry.payload.as_ref() else {
+            return false;
+        };
+        if entry.verify_payload_binding().is_err() {
+            return false;
+        }
+        let hash = entry.entry_hash();
+        let Some((author, seq)) = self.by_hash.get(&hash).copied() else {
+            return false;
+        };
+        let Some(feed) = self.feeds.get_mut(&author) else {
+            return false;
+        };
+        if !feed.restore_payload(seq, payload.clone()) {
+            return false;
+        }
+        let signed = feed.get(seq).is_some_and(Entry::is_signed);
+        if let Some(cp) = Checkpoint::from_payload(payload)
+            .ok()
+            .flatten()
+            .filter(|_| signed)
+        {
+            let names = feed.get(cp.seq).map(Entry::entry_hash) == Some(cp.entry_hash);
+            if cp.seq < seq && names {
+                let held = self.checkpoints.entry(author).or_insert((0, cp.entry_hash));
+                if cp.seq > held.0 {
+                    *held = (cp.seq, cp.entry_hash);
+                }
+            }
+        }
+        self.filled.push(hash);
+        true
+    }
+
+    /// The entries whose body [`Dag::fill_body`] put back since the last call.
+    pub fn take_filled(&mut self) -> Vec<Digest32> {
+        std::mem::take(&mut self.filled)
     }
 
     /// Whether an entry with this hash is stored.

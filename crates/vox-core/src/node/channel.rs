@@ -491,6 +491,11 @@ pub struct Rendered {
     /// flight land within a second of each other and above one another in the order;
     /// that is ordinary concurrency, and flagging it would make the flag meaningless.
     pub late: bool,
+    /// **Not received yet** (V030-10): a message whose signed envelope this node holds and whose
+    /// body no peer has supplied yet, and which has not expired by this node's own reckoning. Its
+    /// `text` is empty; it is asked for again on every sync, and replaced by the message when the
+    /// body arrives. Never stored: [`ChannelState::shown_timeline`] places one for each owed body.
+    pub owed: bool,
 }
 
 /// How many more of an author's entries must have expired since its last checkpoint before it
@@ -498,6 +503,21 @@ pub struct Rendered {
 /// size it saves on one skeleton, so one per 32 costs about 3% of what it frees, and a room
 /// that expires slowly is not filled with checkpoints.
 pub const CHECKPOINT_EVERY: usize = 32;
+
+/// How many owed bodies (V030-10) one sync session asks a peer for at most. The rest are asked of
+/// the next session: a peer that stripped a long run is not asked for all of it at once.
+pub const MAX_OWED_ASKED: usize = 256;
+
+/// One entry a sync stored, for [`ChannelState::absorb_arrived`]: `(author, entry hash, body, the
+/// log page it is already stored in)`. The page is set only for a body that arrived for a skeleton
+/// held without one (V030-10).
+type Arrived = (Digest32, Digest32, Option<Vec<u8>>, Option<u64>);
+
+/// Whether an entry claimed at `claimed_ms` is past `ttl` seconds of retention at `now_secs`
+/// (`ttl == 0` keeps everything).
+fn expired_at(claimed_ms: u64, now_secs: u64, ttl: u64) -> bool {
+    ttl != 0 && claimed_ms / 1_000 <= now_secs.saturating_sub(ttl)
+}
 
 /// How long nothing new must have expired before an author closes a backlog smaller than
 /// [`CHECKPOINT_EVERY`] with a checkpoint anyway: ten minutes. Long enough that a room expiring
@@ -538,6 +558,18 @@ pub struct ChannelState {
     /// uses its message key up even when what it opened does not render, so a pass that rendered
     /// nothing must write the chains too, or a restart could derive that key again.
     chains_advanced: bool,
+    /// **Bodies owed** (V030-10): `(author, seq)` of each entry held without its body that has not
+    /// expired by this node's own reckoning ([`ChannelState::body_expired`]). Asked of every peer
+    /// whose feed reaches it, on every sync, until one supplies it or it expires here. May hold
+    /// positions that have since expired or been filled; [`ChannelState::forget_settled_owed`]
+    /// drops those.
+    owed: BTreeSet<(Digest32, u64)>,
+    /// The last owed position [`ChannelState::owed_wants`] asked for: the next session asks from
+    /// after it, so bodies no peer holds never keep the rest from being asked for.
+    owed_asked_to: Option<(Digest32, u64)>,
+    /// The latest time this room was told (seconds): what "expired by now" is reckoned against
+    /// where no clock is passed in (the view, the want-list).
+    now_hint: u64,
     /// Rendered rows in the room's one order ([`Dag::causal_order`]), never in the
     /// order they arrived (PRD-001 R13).
     timeline: Vec<Rendered>,
@@ -1028,6 +1060,7 @@ fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
         arrival: 0,
         shown_at_ms: 0,
         late: false,
+        owed: false,
     })
 }
 
@@ -1263,6 +1296,9 @@ impl ChannelState {
             next_log_id: 1,
             set_aside: Vec::new(),
             chains_advanced: false,
+            owed: BTreeSet::new(),
+            owed_asked_to: None,
+            now_hint: now_secs,
             timeline: Vec::new(),
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
@@ -1383,6 +1419,9 @@ impl ChannelState {
         // position.
         let mut log_at: BTreeMap<u64, Digest32> = BTreeMap::new();
         let mut received: Vec<(u64, String, Digest32, Digest32, u64, u64)> = Vec::new();
+        // Each entry held without its body, `(author, seq, claimed_ms)`: owed again unless it has
+        // expired here (V030-10).
+        let mut held_bare: Vec<(Digest32, u64, u64)> = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
             next_log_id = id.saturating_add(1);
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
@@ -1467,6 +1506,13 @@ impl ChannelState {
                         inbound_packages.push(pkg);
                     }
                 }
+            }
+            if entry.payload.is_none() {
+                held_bare.push((
+                    entry.skeleton.author_id,
+                    entry.skeleton.seq,
+                    entry.skeleton.claimed_ms,
+                ));
             }
             log_at.insert(id, entry.entry_hash());
             log_ids.insert(entry.entry_hash(), id);
@@ -1676,6 +1722,14 @@ impl ChannelState {
             &gov_entries,
             now_secs,
         )?);
+        // By the room's retention; the node's own, set once the room is open, settles the rest
+        // (`set_node_retention`).
+        let room_ttl = evaluator.policy().ttl;
+        let owed = held_bare
+            .into_iter()
+            .filter(|(_, _, claimed)| !expired_at(*claimed, now_secs, room_ttl))
+            .map(|(author, seq, _)| (author, seq))
+            .collect();
         Ok(Self {
             channel_id: *channel_id,
             genesis,
@@ -1693,6 +1747,9 @@ impl ChannelState {
             next_log_id,
             set_aside,
             chains_advanced: false,
+            owed,
+            owed_asked_to: None,
+            now_hint: now_secs,
             timeline,
             timeline_generation,
             log_ids,
@@ -1955,6 +2012,9 @@ impl ChannelState {
             next_log_id: 1,
             set_aside: Vec::new(),
             chains_advanced: false,
+            owed: BTreeSet::new(),
+            owed_asked_to: None,
+            now_hint: now_secs,
             timeline: Vec::new(),
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
@@ -3388,6 +3448,125 @@ impl ChannelState {
     /// Takes effect at the next [`ChannelState::sweep_retention`].
     pub fn set_node_retention(&mut self, secs: u64) {
         self.node_retention = secs;
+        self.forget_settled_owed();
+    }
+
+    /// Whether an entry claimed at `claimed_ms` has expired here by `now_secs`: past this node's
+    /// effective retention (the room's, or its own shorter one). **The receiver's own reckoning**
+    /// (V030-10): from the author's signed claim, never from what a peer did or did not send.
+    #[must_use]
+    pub fn body_expired(&self, claimed_ms: u64, now_secs: u64) -> bool {
+        expired_at(claimed_ms, now_secs, self.effective_retention())
+    }
+
+    /// Drop from the owed bodies every one that has arrived, or has expired here since.
+    fn forget_settled_owed(&mut self) {
+        let (now, ttl) = (self.now_hint, self.effective_retention());
+        let dag = &self.dag;
+        self.owed.retain(|(author, seq)| {
+            dag.feed(author).and_then(|f| f.get(*seq)).is_some_and(|e| {
+                e.payload.is_none() && !expired_at(e.skeleton.claimed_ms, now, ttl)
+            })
+        });
+    }
+
+    /// The positions to ask a peer for whose bodies are owed here (V030-10), as want ranges: each
+    /// that the peer's feed reaches (`remote`), below anything `wants` already asks of that author,
+    /// at most [`MAX_OWED_ASKED`] positions per session, taken in turn from after the last one
+    /// asked for.
+    pub fn owed_wants(
+        &mut self,
+        remote: &[crate::log::sync::FeedFrontier],
+        wants: &[crate::log::sync::WantRange],
+    ) -> Vec<crate::log::sync::WantRange> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.forget_settled_owed();
+        let mut out: Vec<crate::log::sync::WantRange> = Vec::new();
+        let mut asked = 0usize;
+        let mut last = None;
+        let turn: Vec<(Digest32, u64)> = match self.owed_asked_to {
+            Some(p) => self
+                .owed
+                .range((Excluded(p), Unbounded))
+                .chain(self.owed.range(..=p))
+                .copied()
+                .collect(),
+            None => self.owed.iter().copied().collect(),
+        };
+        for (author, seq) in &turn {
+            if asked >= MAX_OWED_ASKED {
+                break;
+            }
+            // Not of a frozen author, nor from where an author's feed is closed here: as
+            // `wants_for_unfrozen` (ADR-025 D3, V210-74).
+            if self.dag.is_frozen(author)
+                || self
+                    .dag
+                    .refused_from(author)
+                    .is_some_and(|from| *seq >= from)
+            {
+                continue;
+            }
+            let reaches = remote
+                .iter()
+                .any(|f| f.author_id == *author && f.max_seq >= *seq);
+            let below = wants
+                .iter()
+                .filter(|w| w.author_id == *author)
+                .all(|w| *seq < w.from_seq);
+            if !reaches || !below {
+                continue;
+            }
+            asked += 1;
+            last = Some((*author, *seq));
+            match out.last_mut() {
+                Some(w) if w.author_id == *author && w.to_seq + 1 == *seq => w.to_seq = *seq,
+                _ => out.push(crate::log::sync::WantRange {
+                    author_id: *author,
+                    from_seq: *seq,
+                    to_seq: *seq,
+                }),
+            }
+        }
+        if last.is_some() {
+            self.owed_asked_to = last;
+        }
+        out
+    }
+
+    /// The timeline as a person is shown it: the rendered rows, and in its place in the room's
+    /// order a **not received yet** row ([`Rendered::owed`]) for each body still owed here
+    /// (V030-10). An expired message is not shown at all (PRD-001 R10).
+    #[must_use]
+    pub fn shown_timeline(&self) -> Vec<Rendered> {
+        let (now, ttl) = (self.now_hint, self.effective_retention());
+        let owed: Vec<Rendered> = self
+            .owed
+            .iter()
+            .filter_map(|(author, seq)| self.dag.feed(author)?.get(*seq))
+            .filter(|e| e.payload.is_none() && !expired_at(e.skeleton.claimed_ms, now, ttl))
+            .map(|e| Rendered {
+                entry_hash: e.entry_hash(),
+                author: e.skeleton.author_id,
+                created_millis: e.skeleton.claimed_ms,
+                text: String::new(),
+                arrival: 0,
+                shown_at_ms: 0,
+                late: false,
+                owed: true,
+            })
+            .collect();
+        if owed.is_empty() {
+            return self.timeline.clone();
+        }
+        let mut rows: Vec<Rendered> = self.timeline.iter().cloned().chain(owed).collect();
+        // Sorted only: the `late` marks are the timeline's, and an owed row was never shown.
+        rows.sort_by_cached_key(|r| {
+            self.dag
+                .order_key(&r.entry_hash)
+                .unwrap_or((u64::MAX, r.entry_hash))
+        });
+        rows
     }
 
     /// Set the **room's** retention (PRD-001 R7): append an ADR-007 policy-update carrying
@@ -3425,6 +3604,8 @@ impl ChannelState {
     ///
     /// Costs what it prunes, not what the room holds: the index is ordered by age.
     pub fn sweep_retention(&mut self, store: &Store, now_secs: u64) -> Result<usize> {
+        self.now_hint = self.now_hint.max(now_secs);
+        self.forget_settled_owed();
         let ttl = self.effective_retention();
         if ttl == 0 || self.poisoned {
             return Ok(0);
@@ -3882,15 +4063,33 @@ impl ChannelState {
         self.keep_forks(store)?;
         // A skeleton without its body — pruned at the peer — is stored too: the feed must
         // stay contiguous on disk or the next reopen breaks at the gap (ADR-023 decision 2).
-        let mut arrived: Vec<(Digest32, Digest32, Option<Vec<u8>>)> = Vec::new();
+        //
+        // The fourth field is the log page an entry is already stored in: set for a body that
+        // arrived for a skeleton held without one (V030-10), whose page is rewritten in place.
+        self.now_hint = self.now_hint.max(now_secs);
+        let mut arrived: Vec<Arrived> = Vec::new();
         for (author, head) in before {
             let Some(feed) = self.dag.feed(author) else {
                 continue;
             };
             for seq in (head + 1)..=self.dag.verified_head(author) {
                 if let Some(entry) = feed.get(seq) {
-                    arrived.push((*author, entry.entry_hash(), entry.payload.clone()));
+                    arrived.push((*author, entry.entry_hash(), entry.payload.clone(), None));
                 }
+            }
+        }
+        for hash in self.dag.take_filled() {
+            let (Some(entry), Some(id)) = (self.dag.get_by_hash(&hash), self.log_ids.get(&hash))
+            else {
+                continue;
+            };
+            if arrived.iter().all(|(_, h, ..)| *h != hash) {
+                arrived.push((
+                    entry.skeleton.author_id,
+                    hash,
+                    entry.payload.clone(),
+                    Some(*id),
+                ));
             }
         }
 
@@ -3928,7 +4127,7 @@ impl ChannelState {
         // D1). Counted at the row, not per `arrived` entry — a refusal before the row is queued
         // stores nothing, one after it still stores the row.
         let mut logged: u64 = 0;
-        for (author, entry_hash, payload) in arrived {
+        for (author, entry_hash, payload, refill) in arrived {
             let step =
                 (|| -> Result<std::result::Result<Vec<Rendered>, Error>> {
                     // A refusal, not a write failure: `Ok(Err(..))`.
@@ -3943,22 +4142,36 @@ impl ChannelState {
                     let key = refuse!(self.authors.get(&author).cloned().ok_or(
                         Error::MalformedGovernance("synced entry from an unadmitted author")
                     ));
-                    let wire = refuse!(self
+                    let held = refuse!(self
                         .dag
                         .get_by_hash(&entry_hash)
-                        .ok_or(Error::MalformedGovernance("synced entry vanished")))
-                    .to_wire();
+                        .ok_or(Error::MalformedGovernance("synced entry vanished")));
+                    let (wire, seq, claimed) =
+                        (held.to_wire(), held.skeleton.seq, held.skeleton.claimed_ms);
                     // Written before the entry is classified, exactly as each entry was when it
-                    // committed on its own: a refusal below still leaves its log row stored.
-                    let id = self.next_log_id;
+                    // committed on its own: a refusal below still leaves its log row stored. A body
+                    // that arrived for a held skeleton rewrites that skeleton's page.
+                    let id = match refill {
+                        Some(id) => id,
+                        None => {
+                            let id = self.next_log_id;
+                            self.log_ids.insert(entry_hash, id);
+                            self.next_log_id = id.saturating_add(1);
+                            id
+                        }
+                    };
                     let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
                     batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
-                    self.log_ids.insert(entry_hash, id);
-                    self.next_log_id = id.saturating_add(1);
                     logged += 1;
                     let Some(payload) = payload else {
-                        return Ok(Ok(Vec::new())); // a skeleton: stored, never rendered
+                        // A skeleton: stored, never rendered. Its body is owed unless it has
+                        // expired here (V030-10).
+                        if !self.body_expired(claimed, now_secs) {
+                            self.owed.insert((author, seq));
+                        }
+                        return Ok(Ok(Vec::new()));
                     };
+                    self.owed.remove(&(author, seq));
                     match refuse!(classify_payload(&payload)) {
                         EntryKind::Governance => {
                             let entry = refuse!(self
@@ -4422,6 +4635,7 @@ impl ChannelState {
             arrival: id,
             shown_at_ms: 0,
             late: false,
+            owed: false,
         };
         let cache_seg = seal_segment(
             &self.sek,
@@ -4717,6 +4931,7 @@ impl ChannelState {
             arrival: self.next_log_id,
             shown_at_ms: 0,
             late: false,
+            owed: false,
         };
 
         let id = self.next_log_id;
@@ -4996,10 +5211,12 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         &self,
         remote: &[crate::log::sync::FeedFrontier],
     ) -> std::result::Result<Vec<crate::log::sync::WantRange>, crate::wire::WireError> {
-        Ok(crate::log::sync::wants_for_unfrozen(
-            &self.room()?.dag,
-            remote,
-        ))
+        let mut room = self.room()?;
+        let mut wants = crate::log::sync::wants_for_unfrozen(&room.dag, remote);
+        // And every body owed here that this peer's feed reaches (V030-10).
+        let owed = room.owed_wants(remote, &wants);
+        wants.extend(owed);
+        Ok(wants)
     }
 
     fn entries(

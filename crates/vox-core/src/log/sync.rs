@@ -954,12 +954,10 @@ pub enum EntryClass {
     /// (ADR-025): the entry is refused, the rest of the batch is applied, and the port asks again
     /// once it has learned the room's members.
     Unadmitted,
-    /// Arrived without its payload (V210-74). The signature covers the skeleton only, so a peer
-    /// serving the entry can strip it; held, it would fill its position with nothing to log or
-    /// read. Never taken, and still owed: an honest peer serves it whole.
-    Withheld,
-    /// Past a position this side does not hold yet, in an author's feed (V210-74): after a
-    /// withheld entry in the same batch, say. Not taken, and still owed.
+    /// The body of an entry held without one (V030-10): put back, to be stored and shown.
+    BodyArrived,
+    /// Past a position this side does not hold yet, in an author's feed (V210-74). Not taken, and
+    /// still owed.
     Unlinked,
     /// A signed entry that cannot be classified (V210-74), or anything after it in its author's
     /// feed. Refused before anything is stored, and the author's feed is closed here from that
@@ -972,7 +970,7 @@ impl EntryClass {
     /// it is still owed once its author is admitted.
     #[must_use]
     pub fn fills(self) -> bool {
-        !matches!(self, Self::Unadmitted | Self::Withheld | Self::Unlinked)
+        !matches!(self, Self::Unadmitted | Self::Unlinked)
     }
 }
 
@@ -1026,7 +1024,7 @@ pub struct RoomSession {
     pub unadmitted: usize,
     /// Entries refused because their author is frozen.
     pub frozen: usize,
-    /// Entries refused as unheld (V210-74): withheld, unlinked, or unclassifiable.
+    /// Entries refused as unheld (V210-74): unlinked or unclassifiable.
     pub refused: usize,
     /// Forks recorded.
     pub forks: usize,
@@ -1241,10 +1239,10 @@ where
                 EntryClass::Unadmitted => out.unadmitted += 1,
                 EntryClass::Frozen => out.frozen += 1,
                 EntryClass::ForkHandled => out.forks += 1,
-                EntryClass::Withheld | EntryClass::Unlinked | EntryClass::Refused => {
+                EntryClass::Unlinked | EntryClass::Refused => {
                     out.refused += 1;
                 }
-                EntryClass::Stored | EntryClass::Duplicate => {}
+                EntryClass::Stored | EntryClass::Duplicate | EntryClass::BodyArrived => {}
             }
             if class.fills() {
                 coverage.fill(author, seq);
@@ -1459,8 +1457,20 @@ pub fn apply_entry_classified<R: AuthorResolver>(
     if dag.refused_from(&author).is_some_and(|from| seq >= from) {
         return Ok(EntryClass::Refused);
     }
-    if entry.payload.is_none() {
-        return Ok(EntryClass::Withheld);
+    // **An envelope is always taken; its body, if it did not come, is owed** (V030-10, the
+    // decider, 2026-10-01: "when we have an envelope that indicates that I should expect a body,
+    // if I have not received it yet, I know to keep asking for it"). v0.2.10 set a payload-less
+    // entry aside (V210-74), which in v0.3.0 also refused every honest pruned skeleton and stopped
+    // its author's feed for a late joiner. Taken, it links the feed; whether its body is expired
+    // or still owed is the receiver's own computation, and an owed body is asked for again.
+    // A body for a skeleton held without one is put back, if its author could sign it here.
+    if entry.payload.is_some() && dag.contains(&entry.entry_hash()) {
+        if resolver.unclassifiable(&entry).is_some() {
+            return Ok(EntryClass::Refused);
+        }
+        if dag.fill_body(&entry) {
+            return Ok(EntryClass::BodyArrived);
+        }
     }
     let head = dag.feed(&author).map_or(0, |f| f.max_seq());
     if seq > head.saturating_add(1) {

@@ -188,6 +188,18 @@ impl Feed {
         self.entries.get_mut(&seq).is_some_and(Entry::prune_payload)
     }
 
+    /// Give the entry at `seq`, held without its body, the body `payload` (V030-10). The caller has
+    /// checked that it is the one the skeleton commits to. Returns whether a body was put back.
+    pub fn restore_payload(&mut self, seq: u64, payload: Vec<u8>) -> bool {
+        match self.entries.get_mut(&seq) {
+            Some(e) if e.payload.is_none() => {
+                e.payload = Some(payload);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Drop the signature of the entry at `seq`, keeping its skeleton (ADR-023 decision 3).
     /// Returns whether a signature was dropped. The caller holds the author's checkpoint.
     pub fn drop_signature(&mut self, seq: u64) -> bool {
