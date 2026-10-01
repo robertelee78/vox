@@ -13,8 +13,9 @@
 //!
 //! # Decisions, evaluated once per round trip
 //! - **Climb 1 → 2** when the last [`CLIMB_1_ROUNDS`] rounds held at least [`CLIMB_1_LOSSES`]
-//!   losses with no queue building, once tier 1's dwell is over. Tier 1's loss share
-//!   is marked as tier 2's baseline: loss that then grows with Vox's own sending is congestion.
+//!   losses with no queue building, once tier 1's dwell is over, and the loss share over the last
+//!   32 MiB is at least [`TIER2_ENTRY_SHARE`]. That share is marked as tier 2's baseline: loss
+//!   that then grows with Vox's own sending is congestion.
 //! - **Climb 2 → 3** when the loss share over the last 32 MiB sent (`PathSignals::trend_share`)
 //!   is at or above [`GENTLE_LOSS_CAP`], past which tier 2 cuts for every loss, and no queue has
 //!   been held for [`CLIMB_3_QUEUE_ROUNDS`] rounds in a row in the last [`CLIMB_3_ROUNDS`] rounds and
@@ -35,13 +36,20 @@
 //! - **Descend 3 → 2 on a queue** held for [`TIER3_QUEUE_ROUNDS`] rounds, dwell or not (rule 3:
 //!   BBR must never hold a congested path). Tier 3 has its own queue test. quinn paces from the
 //!   window and the smoothed round trip, never from BBR's pacing rate, so BBR here is
-//!   window-bound: its window (twice the bandwidth-delay product, plus the acknowledgement
-//!   aggregation it measured) can raise the round trip to `window / rate` with no other flow on
-//!   the path. Measured on a 200 Mbit/s, 10.7 ms path with 1% loss and no other flow: round
-//!   minimums of 18–38 ms against a `window / rate` of up to 39 ms. So a round's minimum round trip
-//!   past [`TIER3_QUEUE_FACTOR`] × `max(base, window / rate)` + [`TIER3_QUEUE_MIN`] is another
-//!   flow's queue. The other tiers' test (a share of the base) read BBR's own queue as congestion
-//!   and took tier 3 out within a second, every time.
+//!   window-bound: its target window (twice the bandwidth-delay product, plus the acknowledgement
+//!   aggregation it measured) can raise the round trip that far with no other flow on the path
+//!   ([`VoxBbr::standing_rtt`]). Measured on a 200 Mbit/s, 10.7 ms path with 1% loss and no other
+//!   flow: round minimums of 18–38 ms. So a round's minimum round trip past
+//!   [`TIER3_QUEUE_FACTOR`] × `standing_rtt(base)` + [`TIER3_QUEUE_MIN`] is another flow's queue.
+//!   Two inputs are fixed against what they would otherwise hide. The base is never above the base
+//!   at entry to tier 3: another flow's standing queue lifts every sample, and a base that followed
+//!   it would cancel the test (measured with a Cubic flow on a 4-BDP buffer: no round fired in 125
+//!   samples). And the bound is BBR's target, not its current window: in recovery or ProbeRtt the
+//!   window drops below the queue it has already built, and the test then fired with no other flow.
+//!   A share of the base, the other tiers' test, read BBR's own queue as congestion and took tier 3
+//!   out within a second, every time. **No delay test that stays quiet with Vox alone can see a
+//!   buffer of a bandwidth-delay product or less**: BBR's own window fills it. There the
+//!   whole-stay loss check is the guard.
 //! - **Descend 3 → 2 when the loss is gone:** the loss share under half [`GENTLE_LOSS_CAP`] for
 //!   [`QUIET_ROUNDS`] rounds and [`QUIET_TIME`].
 //! - **Descend 2 → 1** after a quiet stretch: [`QUIET_ROUNDS`] consecutive rounds and
@@ -55,8 +63,11 @@
 //!
 //! # Hand-off (rule 5)
 //! A switch hands the connection's rate on, so it never pays slow start again:
-//! - **into BBR**: [`VoxBbr::seeded`] with the best rate, the windowed minimum round trip and the
-//!   current window, in ProbeBw, never Startup: Startup's 2.885 gain on a congested path is what
+//! - **into BBR**: [`VoxBbr::seeded`] with the rate tier 2 was sending at (its window over the
+//!   smoothed round trip), the base round trip and the current window, in ProbeBw, never Startup.
+//!   Not the best rate: a round closed on bunched acknowledgements once read 6.4 Gbit/s on a
+//!   200 Mbit/s link, and BBR seeded with it filled the buffer in its first round. BBR's own
+//!   delivery-rate samples raise a low seed within a few rounds. Never Startup: Startup's 2.885 gain on a congested path is what
 //!   the trial must not risk;
 //! - **out of BBR**: [`VoxCubic::seeded`] in congestion avoidance at BBR's delivery rate times the
 //!   windowed minimum round trip.
@@ -83,6 +94,13 @@ use super::vox_bbr::{RateSeed, VoxBbr};
 pub(crate) const CLIMB_1_ROUNDS: usize = 8;
 /// …and the losses with no queue building it needs in them.
 pub(crate) const CLIMB_1_LOSSES: u32 = 3;
+/// The loss share over the last 32 MiB a climb from tier 1 also needs. Tier 2's loss baseline is
+/// that same share, so tier 2 starts from the loss that made it, never from clean history: a
+/// link that turned lossy mid-transfer otherwise entered tier 2 with a baseline of 0.1%, and 1%
+/// random loss then read as risen, so tier 2 cut like Cubic (measured: 57 Mbit/s through a 1%
+/// phase that tier 2 carries at about 180). A clean link's overflow losses, about 0.1%, never
+/// reach it.
+pub(crate) const TIER2_ENTRY_SHARE: f64 = 0.005;
 /// Consecutive rounds without a held queue for a climb from tier 2…
 pub(crate) const CLIMB_3_ROUNDS: u32 = 20;
 /// …spanning at least this long; a queue is held when it shows for this many rounds in a row.
@@ -224,6 +242,8 @@ pub(crate) struct Tapered {
     rounds_in_tier: u32,
     /// The loss share when tier 3 was entered.
     entry_share: f64,
+    /// The base round trip when tier 3 was entered.
+    tier3_entry_base: Option<Duration>,
     backoff: Tier3Backoff,
     /// Rounds without a held queue, toward a climb from tier 2.
     unqueued: Streak,
@@ -245,6 +265,7 @@ impl Tapered {
             entered_at: now,
             rounds_in_tier: 0,
             entry_share: 0.0,
+            tier3_entry_base: None,
             backoff: Tier3Backoff::default(),
             unqueued: Streak::default(),
             queued: Streak::default(),
@@ -271,13 +292,14 @@ impl Tapered {
         self.backoff
     }
 
-    /// The round trip BBR's own window can raise with no other flow on the path.
-    fn bbr_own_rtt(bbr: &VoxBbr, base: Duration) -> Duration {
-        let rate = bbr.delivery_rate();
-        if rate == 0 {
-            return base;
+    /// The base round trip tier 3's queue test measures from: the path's, but never above what it
+    /// was when tier 3 was entered. Another flow's standing queue raises every sample, and a base
+    /// that followed it up would hide that very queue.
+    fn tier3_base(&self) -> Option<Duration> {
+        match (self.signals.min_rtt(), self.tier3_entry_base) {
+            (Some(now), Some(entry)) => Some(now.min(entry)),
+            (now, entry) => now.or(entry),
         }
-        base.max(Duration::from_secs_f64(bbr.window() as f64 / rate as f64))
     }
 
     /// One round has finished: update the streaks, and switch tier if they say so.
@@ -292,14 +314,9 @@ impl Tapered {
         }
         let share = self.signals.loss_share();
         let queued = self.signals.queue_building();
-        let tier3_queued = match (
-            &self.tier,
-            self.signals.round_min_rtt(),
-            self.signals.min_rtt(),
-        ) {
+        let tier3_queued = match (&self.tier, self.signals.round_min_rtt(), self.tier3_base()) {
             (Tier::Bbr(bbr), Some(round_min), Some(base)) => {
-                round_min
-                    >= Self::bbr_own_rtt(bbr, base).mul_f64(TIER3_QUEUE_FACTOR) + TIER3_QUEUE_MIN
+                round_min >= bbr.standing_rtt(base).mul_f64(TIER3_QUEUE_FACTOR) + TIER3_QUEUE_MIN
             }
             _ => false,
         };
@@ -329,7 +346,8 @@ impl Tapered {
             TierId::One
                 if dwelt
                     && self.signals.losses_without_queue_in_last(CLIMB_1_ROUNDS)
-                        >= CLIMB_1_LOSSES =>
+                        >= CLIMB_1_LOSSES
+                    && self.signals.trend_share() >= TIER2_ENTRY_SHARE =>
             {
                 Some((TierId::Two, "loss without a queue", false))
             }
@@ -354,6 +372,15 @@ impl Tapered {
         }
     }
 
+    /// The rate a window sustains over a round trip, bytes per second.
+    fn window_rate(window: u64, rtt: Duration) -> u64 {
+        if rtt.is_zero() {
+            0
+        } else {
+            (window as f64 / rtt.as_secs_f64()) as u64
+        }
+    }
+
     fn switch(&mut self, now: Instant, to: TierId, reason: &str) {
         let from = self.tier_id;
         let window = self.tier.controller().window();
@@ -364,7 +391,7 @@ impl Tapered {
                 now,
                 self.mtu,
                 RateSeed {
-                    delivery_rate: self.signals.best_rate(now),
+                    delivery_rate: Self::window_rate(window, self.signals.srtt()),
                     min_rtt,
                     window,
                     last_sent_pn,
@@ -395,7 +422,10 @@ impl Tapered {
         match (from, to) {
             (TierId::One, TierId::Two) => self.signals.mark_loss_baseline(),
             (TierId::Two, TierId::One) => self.signals.clear_loss_baseline(),
-            (_, TierId::Three) => self.entry_share = self.signals.trend_share(),
+            (_, TierId::Three) => {
+                self.entry_share = self.signals.trend_share();
+                self.tier3_entry_base = self.signals.min_rtt();
+            }
             _ => {}
         }
         tracing::debug!(
