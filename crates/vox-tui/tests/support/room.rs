@@ -225,6 +225,14 @@ pub struct Room {
     _anchor: Proc,
 }
 
+impl Room {
+    /// The anchor's pid, for a proof that must stop it: it holds the room's entries too, and
+    /// would otherwise serve a stopped member's posts to the others.
+    pub fn anchor_pid(&self) -> u32 {
+        self._anchor.0.id()
+    }
+}
+
 fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
     let (data, cfg) = (tmp.join("anchor/data"), tmp.join("anchor/cfg"));
     std::fs::create_dir_all(&cfg).unwrap();
@@ -510,13 +518,5 @@ pub async fn post_raw(w: &Worker, cid: [u8; 32], text: &str) {
     {
         Ok(vox_core::node::ipc::Frame::Ok) => {}
         other => panic!("raw post refused: {other:?}"),
-    }
-}
-
-impl Room {
-    /// The anchor's pid, for a proof that must stop it: it holds the room's entries too, and
-    /// would otherwise serve a stopped member's posts to the others.
-    pub fn anchor_pid(&self) -> u32 {
-        self._anchor.0.id()
     }
 }
