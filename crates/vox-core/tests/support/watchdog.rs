@@ -411,10 +411,11 @@ fn fire(elapsed: Duration, budget: Duration) -> ! {
          ==================== vox test watchdog ====================\n\
          This test process has been running for {elapsed:?} and is being aborted.\n\
          \n\
-         It is hung, not slow: the budget is {budget:?}. A `tokio::time::timeout` did\n\
-         not save it, which means the runtime is not making progress — a task\n\
-         spinning without yielding, a blocking call on a runtime thread, or a\n\
-         leaked task after `block_on` returned.\n\
+         APPARATUS: the test's budget is exceeded ({budget:?}). This is not yet a\n\
+         product verdict: it is a product hang OR an apparatus stall (a `vox` it\n\
+         started stuck, the test itself not making progress, or a machine too\n\
+         slow for the budget). The dumps below say which: a test process only\n\
+         waiting on its children points at the descendant that is busy or stuck.\n\
          \n\
          Tests still running:\n    {running}\n\
          \n\
