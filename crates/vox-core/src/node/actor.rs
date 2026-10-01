@@ -2409,7 +2409,11 @@ impl Node {
             headless,
             anchor_logs,
         } = cfg;
-        let profile = if Profile::exists(&paths) {
+        // A headless node networks as its key file and holds no room, so it never opens the
+        // profile's vault — which a `vox node --serve trusted` profile has, to keep its trust
+        // list. Opening it here held the store the anchor's own logs need, and the anchor
+        // refused to start: "another vox already has this profile open".
+        let profile = if headless.is_none() && Profile::exists(&paths) {
             Some(Profile::open(paths.clone())?)
         } else {
             None
@@ -2886,7 +2890,11 @@ impl Node {
             return Outcome::Failed(Fault::IdentityExists);
         }
         let now = self.now();
-        match Profile::create_with_profile(self.paths.clone(), passphrase, now, self.argon2) {
+        let events = self.event_tx.clone();
+        let waiting = move || {
+            let _ = events.send(NodeEvent::WaitingForProfile);
+        };
+        match Profile::create_noting(self.paths.clone(), passphrase, now, self.argon2, &waiting) {
             Ok(p) => {
                 self.profile = Some(p);
                 // A fresh identity gets its prekey ring immediately: without it the
@@ -2907,7 +2915,11 @@ impl Node {
         let Some(profile) = self.profile.as_mut() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        match profile.unlock(passphrase) {
+        let events = self.event_tx.clone();
+        let waiting = move || {
+            let _ = events.send(NodeEvent::WaitingForProfile);
+        };
+        match profile.unlock_noting(passphrase, &waiting) {
             Ok(()) => {
                 let now = self.now();
                 if let Err(e) = self.load_prekeys(now) {

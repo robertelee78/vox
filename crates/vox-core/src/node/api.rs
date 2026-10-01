@@ -650,6 +650,12 @@ impl std::fmt::Display for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeEvent {
+    /// Creating or unlocking the identity has waited more than a second for another vox that
+    /// holds this profile's lock (it is creating the identity, or migrating a v0.2.9 profile, or
+    /// it is stopped while doing so). Sent once per wait; the command goes on when the lock is
+    /// free. Each front end says it in its own place: the CLI on stderr, the TUI in its status
+    /// line (V210-100).
+    WaitingForProfile,
     /// A new rendered entry in a channel.
     NewEntry {
         /// The channel.
