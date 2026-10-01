@@ -1718,6 +1718,10 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// How long a stopped `vox room send` waits for its daemon to withdraw the offer: as long as
+/// `vox daemon` gives its own node to stop.
+const REMOVE_SERVICE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `vox room send` — offer a file to a room and announce it.
 ///
 /// Runs until interrupted: the bytes are served live, so stopping this stops the
@@ -1820,12 +1824,23 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
         }
     }
     println!("vox: no longer offering {tag}");
-    let _ = client
-        .request(&Request::RemoveService {
+    // Bounded: a daemon that does not answer (stopped, wedged) left this waiting for ever, and
+    // a stop that only SIGKILL could end. Its sessions are reset below either way.
+    let removed = tokio::time::timeout(
+        REMOVE_SERVICE_PATIENCE,
+        client.request(&Request::RemoveService {
             channel_id,
             service_tag: tag,
-        })
-        .await;
+        }),
+    )
+    .await;
+    if removed.is_err() {
+        eprintln!(
+            "vox: the daemon did not answer within {}s; stopping anyway — the offer's transfers \
+             are reset, and there is nothing left for it to serve",
+            REMOVE_SERVICE_PATIENCE.as_secs()
+        );
+    }
     // Then reset what is still in flight, and wait for the resets to leave before exiting:
     // an exit would close these sockets gracefully.
     let _ = stop.send(true);
