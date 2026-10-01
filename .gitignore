@@ -1,6 +1,8 @@
 # Ruflo / Claude-Flow config + runtime artifacts (local, not source)
 .claude/
 CLAUDE.md
+# ...except the root one, which only points at AGENTS.md (the repository's agent rules)
+!/CLAUDE.md
 .claude-flow/
 .swarm/
 ruvector.db
