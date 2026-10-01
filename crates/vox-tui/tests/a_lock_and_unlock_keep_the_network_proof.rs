@@ -145,7 +145,9 @@ fn seconds_after(said: &str, what: &str) -> Option<f64> {
 #[ignore = "a real vox daemon and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
     test_knobs::require(&["VOX_TEST_STOPPED_DELAY_MS"]);
-    watchdog::arm();
+    // One join, through the TUI; 6 unlocks: two `vox id`s, alice's daemon, the room, and the
+    // TUI's unlock and unlock again.
+    watchdog::arm_for_setup(1, 6);
     let tmp = tempfile::tempdir().unwrap();
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
@@ -177,7 +179,8 @@ fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
     );
     let hold = HOLD_SECS.to_string();
     let delay = STOPPED_DELAY_MS.to_string();
-    let out = pty_driver::run(
+    // The driver waits on the TUI's two unlocks and the join.
+    let out = pty_driver::run_for(
         script,
         &[
             VOX,
@@ -190,6 +193,7 @@ fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
             &delay,
             "cargo",
         ],
+        watchdog::debug_cost(1, 2),
     );
     let said = out.stdout.clone();
     println!(

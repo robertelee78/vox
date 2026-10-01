@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::net::UnixStream;
 
 use crate::cbor::{Decoder, Encoder};
-use crate::error::{Error, Result};
+use crate::error::{Error, IpcHandshake, Result};
 use crate::hash::Digest32;
 use crate::node::ipc::{read_frame, write_frame, Frame, PROTOCOL_VERSION};
 use crate::node::link::b32_encode;
@@ -469,31 +469,41 @@ pub async fn request(path: &Path) -> Result<String> {
 
 async fn ask(path: &Path) -> Result<String> {
     let mut stream = crate::node::ipc::connect_own(path).await?;
+    // A connection that ends is named as such, never as a malformed message (V210-101); and none
+    // of this is an identity bundle, which `MalformedBundle` said.
     let Some(hello) = read_frame(&mut stream).await? else {
-        return Err(Error::MalformedBundle("ipc closed before hello"));
+        return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
     };
     match Frame::from_bytes(&hello)? {
         Frame::Hello { protocol, .. } if protocol == PROTOCOL_VERSION => {}
-        _ => return Err(Error::MalformedBundle("ipc protocol version")),
+        Frame::Hello { protocol, .. } => {
+            return Err(Error::Ipc(IpcHandshake::Protocol {
+                mine: PROTOCOL_VERSION,
+                theirs: protocol,
+            }))
+        }
+        _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
     }
     let mut e = Encoder::new();
     e.array(1).uint(T_STATUS);
-    write_frame(&mut stream, &e.finish()).await?;
+    if let Err(e) = write_frame(&mut stream, &e.finish()).await {
+        return Err(crate::node::ipc::named(path, e).await);
+    }
     let Some(body) = read_frame(&mut stream).await? else {
-        return Err(Error::MalformedBundle("ipc closed before reply"));
+        return Err(crate::node::ipc::hung_up(path).await);
     };
     let mut d = Decoder::new(&body);
     if let (Ok(2), Ok(T_STATUS_REPORT)) = (d.array(), d.uint()) {
         return d
             .text()
             .map(str::to_owned)
-            .map_err(|_| Error::MalformedBundle("ipc status reply"));
+            .map_err(|_| Error::MalformedIpc("ipc status reply"));
     }
     match Frame::from_bytes(&body)? {
         Frame::Error { reason } => Err(Error::Path {
             op: "vox status",
             detail: reason,
         }),
-        _ => Err(Error::MalformedBundle("ipc status reply")),
+        _ => Err(Error::MalformedIpc("ipc status reply")),
     }
 }

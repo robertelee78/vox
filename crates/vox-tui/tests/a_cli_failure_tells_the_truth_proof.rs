@@ -14,9 +14,16 @@
 //!    greeting. Each must now exit non-zero within 30 s (the product's patience is 10 s; the
 //!    bound here is hard-coded) saying the node did not answer. The control: after SIGCONT the
 //!    same `vox status` answers, so the node, not the proof, was what went quiet.
-//! 3. **`vox room tail` exits non-zero when its node dies.** It exited 0, so a supervisor that
-//!    restarts a failed tail never restarted it. The daemon is killed with SIGKILL by its PID;
-//!    the tail must exit non-zero within 30 s, saying the node stopped.
+//! 3. **`vox room tail` exits non-zero when its node dies, even part-way through a frame.** It
+//!    exited 0, so a supervisor that restarts a failed tail never restarted it. The daemon is
+//!    killed with SIGKILL by its PID; the tail must exit non-zero within 30 s, saying the node
+//!    stopped, and never call it a "malformed control-socket message" (V210-101, #305). The kill
+//!    lands mid-frame by construction: the proof stops reading the tail's output, then posts six
+//!    messages of 60,000 characters. The tail blocks writing them to its full stdout pipe, so it
+//!    stops reading its socket, and the daemon blocks part-way through writing the next one —
+//!    each frame is larger than the socket's buffers (8 KiB each way on macOS). After the kill
+//!    the output is read again, and the tail meets a length, part of a body, then EOF. If the
+//!    tail printed all six, no frame was cut: CANNOT MEASURE.
 //! 4. **A service removal that fails names its cause**, not a hard-coded "was not offered". The
 //!    one cause a person can stage is a tag that is not offered, and its wording is asserted
 //!    here; the others (a store that failed, a node with no identity) cannot be staged through
@@ -31,6 +38,12 @@
 //!    CANNOT MEASURE. The control: after SIGCONT the same daemon answers `vox status`. A node
 //!    whose actor is stuck while it still greets cannot be staged through any command; that
 //!    half (the ping each check sends through the actor) rests on code review.
+//! 7. **A request whose node is killed mid-request names the hang-up** (V210-101, #305). Staged as
+//!    (5), but the joiner's daemon is killed with SIGKILL, so its connection ends rather than
+//!    going quiet. The join must exit non-zero within the proof's bound, saying the node closed
+//!    the connection before replying and is no longer running, and never call it a "malformed
+//!    control-socket message": nothing arrived to be malformed. If it says the node closed the
+//!    connection before greeting, the kill came before the request was sent: CANNOT MEASURE.
 //! 6. **A holder whose control socket cannot be bound runs on, and says why** (separate test,
 //!    `a_holder_runs_without_its_control_socket`). A profile path too long for a socket puts the
 //!    socket in `$TMPDIR/vox-<uid>`, and there a plain file stands where that directory should be
@@ -55,9 +68,13 @@
 //! **Mutations that must turn it red**, one per claim: (1) drop the exchange failure's
 //! `why.push` in the actor's join walk — no `said:` line; (2) remove the `ANSWER_WITHIN` bound
 //! from `IpcClient::open` and `status::request` — `vox status` is still running at 30 s;
-//! (3) `Ok(None) => return Ok(())` back in `room_cli::tail` — the tail exits 0; (5)
+//! (3) `Ok(None) => return Ok(())` back in `room_cli::tail` — the tail exits 0; and
+//! `read_frame`'s EOF inside a body mapped back to `MalformedIpc("ipc read body")` — the tail says
+//! "malformed control-socket message"; (5)
 //! `IpcClient::request` without `while_answering` — the join is still running at 45 s; (6)
-//! `serve_control_socket(..)?`, a bind failure fatal again — `vox serve` exits 1 at once.
+//! `serve_control_socket(..)?`, a bind failure fatal again — `vox serve` exits 1 at once; (7)
+//! `IpcClient::request`'s end-of-stream mapped back to `MalformedIpc("ipc closed before reply")` —
+//! the join says "malformed control-socket message".
 
 #![cfg(unix)]
 
@@ -67,6 +84,7 @@ mod watchdog;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,6 +97,9 @@ struct Proc {
     child: Child,
     out: Arc<Mutex<Vec<String>>>,
     err: Arc<Mutex<Vec<String>>>,
+    /// While set, nothing more of this process's stdout is read, so its pipe fills and its
+    /// writes block.
+    hold_out: Arc<AtomicBool>,
 }
 
 impl Drop for Proc {
@@ -90,12 +111,19 @@ impl Drop for Proc {
     }
 }
 
-fn collect(stream: impl Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
+fn collect(stream: impl Read + Send + 'static, hold: Arc<AtomicBool>) -> Arc<Mutex<Vec<String>>> {
     let lines = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
-        for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            sink.lock().unwrap().push(line);
+        let mut lines = BufReader::new(stream).lines();
+        loop {
+            while hold.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let Some(Ok(line)) = lines.next() else { break };
+            sink.lock()
+                .expect("APPARATUS: harness step failed")
+                .push(line);
         }
     });
     lines
@@ -130,26 +158,41 @@ impl Proc {
     ) -> Self {
         let mut child = command(dir, args, envs)
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(stdin.as_bytes()).expect("write stdin");
+            .unwrap_or_else(|e| panic!("APPARATUS: harness could not spawn {name}: {e}"));
+        let mut pipe = child.stdin.take().expect("APPARATUS: harness: stdin");
+        pipe.write_all(stdin.as_bytes())
+            .expect("APPARATUS: harness: write stdin");
         drop(pipe);
-        let out = collect(child.stdout.take().expect("stdout"));
-        let err = collect(child.stderr.take().expect("stderr"));
+        let hold_out = Arc::new(AtomicBool::new(false));
+        let out = collect(
+            child.stdout.take().expect("APPARATUS: harness: stdout"),
+            Arc::clone(&hold_out),
+        );
+        let err = collect(
+            child.stderr.take().expect("APPARATUS: harness: stderr"),
+            Arc::new(AtomicBool::new(false)),
+        );
         Self {
             name,
             child,
             out,
             err,
+            hold_out,
         }
     }
 
     fn stdout(&self) -> Vec<String> {
-        self.out.lock().unwrap().clone()
+        self.out
+            .lock()
+            .expect("APPARATUS: harness step failed")
+            .clone()
     }
 
     fn stderr(&self) -> String {
-        self.err.lock().unwrap().join("\n")
+        self.err
+            .lock()
+            .expect("APPARATUS: harness step failed")
+            .join("\n")
     }
 
     fn expect_out(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
@@ -172,7 +215,7 @@ impl Proc {
     fn exit_within(&mut self, within: Duration) -> Option<(ExitStatus, Duration)> {
         let t0 = Instant::now();
         while t0.elapsed() < within {
-            if let Some(s) = self.child.try_wait().expect("wait") {
+            if let Some(s) = self.child.try_wait().expect("APPARATUS: harness: wait") {
                 return Some((s, t0.elapsed()));
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -227,10 +270,10 @@ fn must(what: &str, r: Option<(bool, String, Duration)>) -> (bool, String, Durat
 #[ignore = "three real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn a_cli_failure_tells_the_truth() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: harness step failed");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: harness step failed");
         d
     };
     let (anchor_dir, host_dir, joiner_dir) = (dir("anchor"), dir("host"), dir("joiner"));
@@ -243,8 +286,12 @@ fn a_cli_failure_tells_the_truth() {
     let bound = Duration::from_secs(30);
     let mut claims = 0usize;
 
-    let service = TcpListener::bind("127.0.0.1:0").unwrap();
-    let service_port = service.local_addr().unwrap().port().to_string();
+    let service = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: harness step failed");
+    let service_port = service
+        .local_addr()
+        .expect("APPARATUS: harness step failed")
+        .port()
+        .to_string();
 
     let anchor = Proc::spawn(
         "anchor",
@@ -279,7 +326,7 @@ fn a_cli_failure_tells_the_truth() {
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
             .strip_prefix(label)
-            .unwrap()
+            .expect("APPARATUS: harness step failed")
             .trim()
             .to_owned()
     };
@@ -307,7 +354,7 @@ fn a_cli_failure_tells_the_truth() {
         took.as_secs_f64(),
         said.trim().replace('\n', " / ")
     );
-    assert!(!ok, "a wrong passphrase must not join: {said}");
+    assert!(!ok, "PRODUCT (1): a wrong passphrase must not join: {said}");
     assert!(
         said.contains("refused the join"),
         "CANNOT MEASURE (1): the join was not refused by a member, so the exchange was not \
@@ -316,12 +363,12 @@ fn a_cli_failure_tells_the_truth() {
     let said_line = said.lines().find(|l| l.trim_start().starts_with("said:"));
     assert!(
         said_line.is_some_and(|l| l.contains("exchange")),
-        "(1) a join refused in the exchange must say what the member said (a `said:` line \
+        "PRODUCT (1) a join refused in the exchange must say what the member said (a `said:` line \
          naming the exchange); it said:\n{said}"
     );
     assert!(
         !said.contains("Failed("),
-        "(1) an enum token reached the person:\n{said}"
+        "PRODUCT (1) an enum token reached the person:\n{said}"
     );
     claims += 1;
 
@@ -356,11 +403,11 @@ fn a_cli_failure_tells_the_truth() {
     );
     assert!(
         !ok,
-        "(4) removing a service never offered must fail: {said}"
+        "PRODUCT (4) removing a service never offered must fail: {said}"
     );
     assert!(
         said.contains("not offered in this room") && !said.contains("Failed("),
-        "(4) the failure must name its cause: {said}"
+        "PRODUCT (4) the failure must name its cause: {said}"
     );
     claims += 1;
 
@@ -389,7 +436,7 @@ fn a_cli_failure_tells_the_truth() {
         &format!("{passphrase}\n"),
     );
     std::thread::sleep(Duration::from_secs(1));
-    if let Some(s) = join.child.try_wait().expect("wait") {
+    if let Some(s) = join.child.try_wait().expect("APPARATUS: harness: wait") {
         signal("CONT", host_pid);
         std::thread::sleep(Duration::from_millis(100));
         panic!(
@@ -411,7 +458,7 @@ fn a_cli_failure_tells_the_truth() {
     );
     let Some((status, took)) = ended else {
         panic!(
-            "(5) `vox room join` against a node suspended mid-request was still running after \
+            "PRODUCT (5) `vox room join` against a node suspended mid-request was still running after \
              {mid_bound:?}"
         );
     };
@@ -430,11 +477,11 @@ fn a_cli_failure_tells_the_truth() {
     );
     assert!(
         !status.success(),
-        "(5) a join whose node was suspended mid-request must fail: {said}"
+        "PRODUCT (5) a join whose node was suspended mid-request must fail: {said}"
     );
     assert!(
         said.contains("stopped answering while this request waited"),
-        "(5) the join must say its node stopped answering while it waited: {said}"
+        "PRODUCT (5) the join must say its node stopped answering while it waited: {said}"
     );
     let (ok, said, took) = must(
         "vox status (late, resumed)",
@@ -450,6 +497,87 @@ fn a_cli_failure_tells_the_truth() {
          silence was not the suspension's: {said}"
     );
     drop(late);
+    claims += 1;
+
+    // ---- (7) a node killed mid-request: the request names the hang-up, never "malformed" ----
+    let gone_dir = dir("gone");
+    let (ok, said, _) = must("vox id (gone)", vox(&gone_dir, &["id"], "", quick));
+    assert!(ok, "CANNOT MEASURE (7): vox id (gone): {said}");
+    let mut gone = Proc::spawn(
+        "gone-daemon",
+        &gone_dir,
+        &["daemon", "--listen", "127.0.0.1:0", "--anchor", &spec],
+        &format!("{IDPASS}\n"),
+    );
+    gone.expect_out("its control socket", |l| l.contains("control socket"));
+    let gone_pid = gone.child.id();
+    // As in (5): the host is suspended, so the join is still being worked on when its own node
+    // is killed. A kill, not a suspension: the connection ends, it does not go quiet.
+    assert!(
+        signal("STOP", host_pid),
+        "CANNOT MEASURE (7): could not SIGSTOP the host"
+    );
+    let mut join = Proc::spawn(
+        "gone join",
+        &gone_dir,
+        &["room", "join", &address, "--name", "svc"],
+        &format!("{passphrase}\n"),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    if let Some(s) = join.child.try_wait().expect("APPARATUS: harness: wait") {
+        signal("CONT", host_pid);
+        panic!(
+            "CANNOT MEASURE (7): the join ended ({s}) before its node could be killed \
+             mid-request: {}\n{}",
+            join.stdout().join("\n"),
+            join.stderr()
+        );
+    }
+    assert!(
+        signal("KILL", gone_pid),
+        "CANNOT MEASURE (7): could not SIGKILL the joiner's daemon"
+    );
+    let _ = gone.child.wait();
+    let ended = join.exit_within(bound);
+    assert!(
+        signal("CONT", host_pid),
+        "CANNOT MEASURE (7): could not SIGCONT the host"
+    );
+    let Some((status, took)) = ended else {
+        panic!(
+            "PRODUCT (7): `vox room join` whose node was killed mid-request was still running \
+             after {bound:?}"
+        );
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let said = format!("{}\n{}", join.stdout().join("\n"), join.stderr());
+    eprintln!(
+        "[room join, node killed mid-request] exit {:?} in {:.1}s: {}",
+        status.code(),
+        took.as_secs_f64(),
+        said.trim().replace('\n', " / ")
+    );
+    assert!(
+        !said.contains("closed the connection before greeting"),
+        "CANNOT MEASURE (7): the node was gone before it greeted, so no request was in flight: \
+         {said}"
+    );
+    assert!(
+        !status.success(),
+        "PRODUCT (7): a join whose node was killed mid-request must fail: {said}"
+    );
+    assert!(
+        !said.contains("malformed"),
+        "PRODUCT (7): a node that hung up was called malformed, though nothing arrived to be \
+         malformed: {said}"
+    );
+    assert!(
+        said.contains("closed the connection before replying")
+            && said.contains("no longer running"),
+        "PRODUCT (7): the join must say its node closed the connection before replying and is no \
+         longer running: {said}"
+    );
+    drop(gone);
     claims += 1;
 
     // ---- the tail, attached and delivering before anything is done to its node ----
@@ -489,7 +617,9 @@ fn a_cli_failure_tells_the_truth() {
     );
     for (verb, r) in [("vox status", status), ("vox room list", list)] {
         let Some((ok, said, took)) = r else {
-            panic!("(2) `{verb}` against a suspended node was still running after {bound:?}");
+            panic!(
+                "PRODUCT (2) `{verb}` against a suspended node was still running after {bound:?}"
+            );
         };
         eprintln!(
             "[{verb}, node suspended] ok={ok} in {:.1}s: {}",
@@ -498,11 +628,11 @@ fn a_cli_failure_tells_the_truth() {
         );
         assert!(
             !ok,
-            "(2) `{verb}` against a suspended node must fail: {said}"
+            "PRODUCT (2) `{verb}` against a suspended node must fail: {said}"
         );
         assert!(
             said.contains("did not answer"),
-            "(2) `{verb}` must say the node did not answer: {said}"
+            "PRODUCT (2) `{verb}` must say the node did not answer: {said}"
         );
     }
     let (ok, said, took) = must(
@@ -520,14 +650,33 @@ fn a_cli_failure_tells_the_truth() {
     );
     claims += 1;
 
-    // ---- (3) the node dies under the tail ----
+    // ---- (3) the node dies under the tail, part-way through a frame ----
+    // The tail's output is no longer read, and six posts each larger than everything between the
+    // daemon and the tail's stdout can buffer are made: the tail blocks printing, and the daemon
+    // blocks inside its write of the next frame.
+    tail.hold_out.store(true, Ordering::SeqCst);
+    const BIG: usize = 6;
+    let filler = "x".repeat(60_000);
+    for i in 0..BIG {
+        let text = format!("big-{i}-{filler}");
+        let (ok, said, _) = must(
+            "vox room post (big)",
+            vox(&joiner_dir, &["room", "post", &room, &text], "", quick),
+        );
+        assert!(
+            ok,
+            "CANNOT MEASURE (3): a 60,000-character post was not made: {said}"
+        );
+    }
+    std::thread::sleep(Duration::from_secs(2));
     assert!(
         signal("KILL", pid),
         "CANNOT MEASURE (3): could not SIGKILL the daemon"
     );
     let _ = joiner.child.wait();
+    tail.hold_out.store(false, Ordering::SeqCst);
     let Some((status, took)) = tail.exit_within(bound) else {
-        panic!("(3) the tail was still running {bound:?} after its node was killed");
+        panic!("PRODUCT (3) the tail was still running {bound:?} after its node was killed");
     };
     std::thread::sleep(Duration::from_millis(100));
     let err = tail.stderr();
@@ -539,16 +688,32 @@ fn a_cli_failure_tells_the_truth() {
     );
     assert!(
         !status.success(),
-        "(3) the tail exited 0 when its node died; a supervisor would not restart it: {err}"
+        "PRODUCT (3) the tail exited 0 when its node died; a supervisor would not restart it: {err}"
+    );
+    assert!(
+        !err.contains("malformed"),
+        "PRODUCT (3) a node that died part-way through a frame was called malformed, though what \
+         arrived was only cut short: {err}"
     );
     assert!(
         err.contains("the node stopped"),
-        "(3) the tail must say its node stopped: {err}"
+        "PRODUCT (3) the tail must say its node stopped: {err}"
+    );
+    let printed = tail.stdout().iter().filter(|l| l.contains("big-")).count();
+    eprintln!("[room tail, node killed] printed {printed} of {BIG} big posts");
+    assert!(
+        printed < BIG,
+        "CANNOT MEASURE (3): the tail printed all {BIG} big posts before its node died, so no \
+         frame was cut part-way"
     );
     claims += 1;
 
     eprintln!("[proof] {claims} claims held");
-    assert_eq!(claims, 5);
+    assert_eq!(
+        claims, 6,
+        "APPARATUS: {claims} claims were counted, not the 6 this test stages (1, 2, 3, 4, 5, 7): \
+         a claim was skipped or added without its count"
+    );
 }
 
 /// (6) A holder whose control socket cannot be bound runs on, and says why.
@@ -556,23 +721,30 @@ fn a_cli_failure_tells_the_truth() {
 #[ignore = "real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn a_holder_runs_without_its_control_socket() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: harness step failed");
     let quick = Duration::from_secs(90);
     // A profile path too long for a socket address, so the socket falls back to
     // `$TMPDIR/vox-<uid>`; and there, a plain file where that directory should be.
     let long = |n: &str| {
         let d = tmp.path().join(format!("{n}-{}", "p".repeat(120)));
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: harness step failed");
         d
     };
     let (host_dir, guest_dir) = (long("host"), long("guest"));
     let anchor_dir = tmp.path().join("anchor");
-    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: harness step failed");
     let blocked_tmp = tmp.path().join("t");
-    std::fs::create_dir_all(&blocked_tmp).unwrap();
-    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    std::fs::create_dir_all(&blocked_tmp).expect("APPARATUS: harness step failed");
+    let uid = String::from_utf8(
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("APPARATUS: harness step failed")
+            .stdout,
+    )
+    .expect("APPARATUS: harness step failed");
     let squat = blocked_tmp.join(format!("vox-{}", uid.trim()));
-    std::fs::write(&squat, "not a directory\n").unwrap();
+    std::fs::write(&squat, "not a directory\n").expect("APPARATUS: harness step failed");
     let tmpdir = format!("{}/", blocked_tmp.display());
     let env = [("TMPDIR", tmpdir.as_str())];
     let mut held = 0usize;
@@ -594,8 +766,12 @@ fn a_holder_runs_without_its_control_socket() {
         let (ok, said, _) = must("vox id", vox_env(d, &["id"], "", quick, &env));
         assert!(ok, "CANNOT MEASURE: vox id: {said}");
     }
-    let service = TcpListener::bind("127.0.0.1:0").unwrap();
-    let service_port = service.local_addr().unwrap().port().to_string();
+    let service = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: harness step failed");
+    let service_port = service
+        .local_addr()
+        .expect("APPARATUS: harness step failed")
+        .port()
+        .to_string();
     let mut host = Proc::spawn_env(
         "host",
         &host_dir,
@@ -616,14 +792,24 @@ fn a_holder_runs_without_its_control_socket() {
         if host.stdout().iter().any(|l| l.starts_with("passphrase")) {
             break true;
         }
-        if host.child.try_wait().expect("wait").is_some() || t0.elapsed() > quick {
+        if host
+            .child
+            .try_wait()
+            .expect("APPARATUS: harness: wait")
+            .is_some()
+            || t0.elapsed() > quick
+        {
             break false;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
     // Still serving a moment after it printed them.
     std::thread::sleep(Duration::from_secs(2));
-    let running = host.child.try_wait().expect("wait").is_none();
+    let running = host
+        .child
+        .try_wait()
+        .expect("APPARATUS: harness: wait")
+        .is_none();
     let err = host.stderr();
     eprintln!(
         "[vox serve, socket blocked] printed={printed} running={running}: {}",
@@ -631,7 +817,7 @@ fn a_holder_runs_without_its_control_socket() {
     );
     assert!(
         printed && running,
-        "(6) `vox serve` must keep serving when its control socket cannot be bound; \
+        "PRODUCT (6) `vox serve` must keep serving when its control socket cannot be bound; \
          printed={printed} running={running}; stderr:\n{err}"
     );
     let warned = |said: &str| {
@@ -641,20 +827,20 @@ fn a_holder_runs_without_its_control_socket() {
     };
     assert!(
         warned(&err),
-        "(6) `vox serve` must say the control socket is unavailable, where and why: {err}"
+        "PRODUCT (6) `vox serve` must say the control socket is unavailable, where and why: {err}"
     );
     held += 1;
 
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
             .strip_prefix(label)
-            .unwrap()
+            .expect("APPARATUS: harness step failed")
             .trim()
             .to_owned()
     };
     let (address, passphrase) = (field("address"), field("passphrase"));
     let pass_file = guest_dir.join("room-pass");
-    std::fs::write(&pass_file, format!("{passphrase}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{passphrase}\n")).expect("APPARATUS: harness step failed");
     let (ok, said, took) = must(
         "vox connect",
         vox_env(
@@ -663,7 +849,7 @@ fn a_holder_runs_without_its_control_socket() {
                 "connect",
                 &address,
                 "--passphrase-file",
-                pass_file.to_str().unwrap(),
+                pass_file.to_str().expect("APPARATUS: harness step failed"),
                 "--anchor",
                 &spec,
                 "--listen",
@@ -682,24 +868,29 @@ fn a_holder_runs_without_its_control_socket() {
     );
     assert!(
         ok && said.contains("joined."),
-        "(6) `vox connect` must join when its control socket cannot be bound: {said}"
+        "PRODUCT (6) `vox connect` must join when its control socket cannot be bound: {said}"
     );
     assert!(
         warned(&said),
-        "(6) `vox connect` must say the control socket is unavailable, where and why: {said}"
+        "PRODUCT (6) `vox connect` must say the control socket is unavailable, where and why: {said}"
     );
     held += 1;
 
     // What stood where the directory should be was never used.
     let left = std::fs::symlink_metadata(&squat).map(|m| m.file_type().is_file());
     assert!(
-        matches!(left, Ok(true)) && std::fs::read_to_string(&squat).unwrap() == "not a directory\n",
-        "(6) the file at {} was changed: {left:?}",
+        matches!(left, Ok(true))
+            && std::fs::read_to_string(&squat).expect("APPARATUS: harness step failed")
+                == "not a directory\n",
+        "PRODUCT (6) the file at {} was changed: {left:?}",
         squat.display()
     );
     drop(service);
     eprintln!("[proof] {held} holders ran without their control socket");
-    assert_eq!(held, 2);
+    assert_eq!(
+        held, 2,
+        "APPARATUS: {held} holders were counted, not the 2 this test stages (serve, connect)"
+    );
 }
 
 // ---- V210-85 (#277): a `vox connect` stopped by a signal says why ------------------------------

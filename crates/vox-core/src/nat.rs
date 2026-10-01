@@ -40,4 +40,5 @@ pub mod portmap;
 pub mod reachability;
 pub mod record;
 pub mod service;
+pub mod source;
 pub mod store;

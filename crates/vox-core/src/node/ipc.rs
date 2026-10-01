@@ -1388,36 +1388,53 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
 // ---- transport -------------------------------------------------------------
 
 /// Write one length-prefixed frame, mirroring [`crate::transport::framing`].
+///
+/// A write that fails is the connection ending under it ([`IpcHandshake::Cut`]), never a
+/// malformed message (V210-101): nothing was received to be malformed.
 pub async fn write_frame(s: &mut UnixStream, body: &[u8]) -> Result<()> {
     let len =
         u32::try_from(body.len()).map_err(|_| Error::SizeLimitExceeded("ipc frame length"))?;
     s.write_all(&len.to_be_bytes())
         .await
-        .map_err(|_| Error::MalformedIpc("ipc write len"))?;
+        .map_err(|_| Error::Ipc(IpcHandshake::Cut))?;
     s.write_all(body)
         .await
-        .map_err(|_| Error::MalformedIpc("ipc write body"))?;
+        .map_err(|_| Error::Ipc(IpcHandshake::Cut))?;
     Ok(())
 }
 
-/// Read one length-prefixed frame of at most `MAX_FRAME` bytes. A clean EOF
-/// exactly at a frame boundary is the peer hanging up → `Ok(None)`.
+/// Read one length-prefixed frame of at most `MAX_FRAME` bytes. The connection ending, at a
+/// frame boundary **or part-way through a frame**, is the peer hanging up → `Ok(None)`.
+///
+/// Part-way counts too (V210-101): a node killed while it writes a reply larger than the socket's
+/// buffer leaves the reader a length and part of a body, then EOF. That is a hang-up, not a
+/// malformed message, and so is a read the OS fails (a reset): neither is bytes that arrived and
+/// did not parse, the one case "malformed" names.
 pub async fn read_frame(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    match s.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(_) => return Err(Error::MalformedIpc("ipc read len")),
+    if s.read_exact(&mut len_buf).await.is_err() {
+        return Ok(None);
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > frame_limit() {
         return Err(Error::SizeLimitExceeded("ipc frame length"));
     }
     let mut body = vec![0u8; len];
-    s.read_exact(&mut body)
-        .await
-        .map_err(|_| Error::MalformedIpc("ipc read body"))?;
+    if s.read_exact(&mut body).await.is_err() {
+        // What did arrive may be part of a passphrase (V210-94).
+        zeroize::Zeroize::zeroize(&mut body);
+        return Ok(None);
+    }
     Ok(Some(body))
+}
+
+/// A failed exchange with the node at `path`, with the connection ending under a write named as
+/// the hang-up it is ([`hung_up`]).
+pub(crate) async fn named(path: &Path, e: Error) -> Error {
+    match e {
+        Error::Ipc(IpcHandshake::Cut) => hung_up(path).await,
+        e => e,
+    }
 }
 
 // ---- server ----------------------------------------------------------------
@@ -1450,6 +1467,17 @@ impl Drop for IpcServer {
 /// served off the actor the moment they are asked, so a node that takes this long is not busy: it
 /// is suspended or stuck, and waiting longer only hides that.
 pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The error for a node that closed the connection before replying (V210-101): never "malformed",
+/// since nothing arrived to be malformed. A fresh connection, bounded, tells a node that is gone
+/// from one that ended this request itself.
+pub async fn hung_up(path: &Path) -> Error {
+    let still_running = matches!(
+        tokio::time::timeout(ANSWER_WITHIN, connect_own(path)).await,
+        Ok(Ok(_))
+    );
+    Error::Ipc(IpcHandshake::HungUp { still_running })
+}
 
 /// The error for a node that did not answer within [`ANSWER_WITHIN`].
 #[must_use]
@@ -1502,13 +1530,15 @@ async fn still_answering(path: &Path) -> Result<()> {
     };
     // A bare exchange, not `request`, which would check on the check.
     let ping = async {
-        write_frame(&mut probe.stream, &Request::Ping.to_bytes()).await?;
+        if let Err(e) = write_frame(&mut probe.stream, &Request::Ping.to_bytes()).await {
+            return Err(named(path, e).await);
+        }
         read_frame(&mut probe.stream).await
     };
     match tokio::time::timeout(ACTOR_WITHIN, ping).await {
         // Any answer, even an error from a node too old to know the ping, is an answer.
         Ok(Ok(Some(_))) => Ok(()),
-        Ok(Ok(None)) => Err(Error::MalformedIpc("ipc closed before reply")),
+        Ok(Ok(None)) => Err(hung_up(path).await),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(Error::Ipc(IpcHandshake::Stuck {
             secs: ACTOR_WITHIN.as_secs(),
@@ -2101,7 +2131,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 // once could not be placed. They follow the fault's name, one per line:
                 // `steps: …`, then `said: …`.
                 other => {
-                    let mut reason = format!("{other:?}");
+                    // The name `vox room join` reads back with `Fault::from_name` (V210-114).
+                    let mut reason = match other {
+                        crate::node::api::Outcome::Failed(fault) => {
+                            format!("Failed({})", fault.name())
+                        }
+                        other => format!("{other:?}"),
+                    };
                     let (mut steps, mut said) = (None, None);
                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
                     while steps.is_none() || said.is_none() {
@@ -2356,9 +2392,11 @@ impl IpcClient {
         let Self { stream, path, .. } = self;
         let exchange = async {
             // Wiped once sent: it may carry a passphrase (V210-94).
-            write_frame(stream, &zeroize::Zeroizing::new(req.to_bytes())).await?;
+            if let Err(e) = write_frame(stream, &zeroize::Zeroizing::new(req.to_bytes())).await {
+                return Err(named(path, e).await);
+            }
             let Some(body) = read_frame(stream).await? else {
-                return Err(Error::MalformedIpc("ipc closed before reply"));
+                return Err(hung_up(path).await);
             };
             Frame::from_bytes(&body)
         };
