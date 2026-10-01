@@ -178,6 +178,9 @@ const T_CONNECTION_NOTE: u64 = 2092;
 const T_JOIN_STEPS: u64 = 1718;
 /// `NodeEvent::KeyNotTaken`.
 const T_KEY_NOT_TAKEN: u64 = 1719;
+/// `NodeEvent::WaitingForProfile` (V210-100). Additive, away from the sequential range and from
+/// the tags the v0.3.0 line uses.
+const T_WAITING_FOR_PROFILE: u64 = 2100;
 /// A sync session with a peer did not complete, and why (#202).
 const T_SYNC_FAILED: u64 = 1720;
 /// [`NodeEvent::RoomNotRemembered`] (#208). Additive, and far from the other additive tags so a
@@ -871,6 +874,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::Unlocked => {
             e.array(1).uint(T_UNLOCKED);
         }
+        NodeEvent::WaitingForProfile => {
+            e.array(1).uint(T_WAITING_FOR_PROFILE);
+        }
         NodeEvent::Locked => {
             e.array(1).uint(T_LOCKED);
         }
@@ -1179,6 +1185,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
         }
         (T_UNLOCKED, 1) => NodeEvent::Unlocked,
+        (T_WAITING_FOR_PROFILE, 1) => NodeEvent::WaitingForProfile,
         (T_LOCKED, 1) => NodeEvent::Locked,
         (T_SHUTDOWN, 1) => NodeEvent::Shutdown,
         (T_CHANNEL_OPENED, 2) => NodeEvent::ChannelOpened {

@@ -31,6 +31,9 @@
 //! - every row key of v0.2.9's store (its room's segments and key wraps, and its meta rows) is
 //!   still in the store;
 //! - the vault is version 2, and no `store.redb.rewrite` or `*.orphaned-*` is left;
+//! - **the profile was migrated exactly once**: every process runs with
+//!   `VOX_TEST_REWRITE_DELAY_MS` (0 when nothing is staged), which makes each one that migrates
+//!   say so, and the trial counts those lines;
 //! - every run that failed names another vox holding the profile — never an internal error.
 //!
 //! A lone unlock of a copy is the control: it must pass the same row checks, or nothing here
@@ -38,8 +41,10 @@
 //!
 //! Mutations that must turn it red: the profile lock released before the store's rename (or not
 //! taken at all): in the staged arm the second process migrates the old file and renames it over
-//! the first one's, and the first one's `trust add` is gone. `Error::ProfileBusy` reported as an
-//! internal fault again: the natural arm's refusals are unnamed.
+//! the first one's, and the first one's `trust add` is gone. A waiter that does not read the vault
+//! again under the lock: it migrates a second time (harmlessly, but a trial counts 2).
+//! `Error::ProfileBusy` reported as an internal fault again: the natural arm's refusals are
+//! unnamed.
 
 #![cfg(unix)]
 
@@ -281,12 +286,19 @@ impl Ran {
     }
 }
 
+/// Start `vox trust add` on `data`. Every process gets `VOX_TEST_REWRITE_DELAY_MS` (0 unless
+/// `env` sets it), so each one that migrates says so ([`AT_REWRITE`]) and a trial can count its
+/// migrations.
 fn trust_add(data: &Path, who: &'static str, fp: &str, env: &[(&str, &str)]) -> VoxProc {
+    let mut env = env.to_vec();
+    if !env.iter().any(|(k, _)| *k == "VOX_TEST_REWRITE_DELAY_MS") {
+        env.push(("VOX_TEST_REWRITE_DELAY_MS", "0"));
+    }
     VoxProc::spawn_env(
         &format!("trust add {who}"),
         data,
         &args(&["trust", "add", fp, "--name", who]),
-        env,
+        &env,
     )
 }
 
@@ -330,6 +342,8 @@ struct Tally {
     left: Vec<String>,
     dave_gone: usize,
     second_migrated: usize,
+    /// Trials in which the profile was not migrated exactly once.
+    not_once: Vec<String>,
 }
 
 impl Tally {
@@ -371,8 +385,14 @@ impl Tally {
         for f in leftovers(data) {
             self.left.push(format!("{label}: {f}"));
         }
+        let migrations = runs.iter().filter(|r| r.said.contains(AT_REWRITE)).count();
+        if migrations != 1 {
+            self.not_once
+                .push(format!("{label}: migrated {migrations} times"));
+        }
         println!(
-            "[trial] {label}: exited 0 {oks}/2; trust list {names:?}; rows {} of v0.2.9's {} kept; vault v{}",
+            "[trial] {label}: exited 0 {oks}/{}; migrations {migrations}; trust list {names:?}; rows {} of v0.2.9's {} kept; vault v{}",
+            runs.len(),
             template.intersection(&now).count(),
             template.len(),
             vault_version(data)
@@ -462,15 +482,18 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
             && ctl.lost_rows.is_empty()
             && ctl.not_v2 == 0
             && ctl.left.is_empty()
-            && ctl.dave_gone == 0,
-        "CANNOT MEASURE: a lone unlock of the copy already fails the checks: adds lost {:?}, rows \
-         lost {:?}, not v2 {}, left {:?}, dave gone {}, unnamed {:?}",
+            && ctl.dave_gone == 0
+            && ctl.not_once.is_empty(),
+        "CANNOT MEASURE: a lone unlock of the copy already fails the checks (or its migration is \
+         not counted): adds lost {:?}, rows lost {:?}, not v2 {}, left {:?}, dave gone {}, \
+         unnamed {:?}, migrations {:?}",
         ctl.lost_adds,
         ctl.lost_rows,
         ctl.not_v2,
         ctl.left,
         ctl.dave_gone,
-        ctl.unnamed
+        ctl.unnamed,
+        ctl.not_once
     );
 
     // ---- 1. natural: two at once, the second a little later each time --------------------
@@ -519,7 +542,7 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
             "[proof] {arm}: {} trials x 2: both exited 0 {}, one {}, none {}; refused naming \
              another vox {}; `trust add`s that exited 0 and are gone {}; v0.2.9 rows gone {}; \
              failed without naming the cause {}; vault not v2 {}; files left {}; dave gone {}; \
-             second process migrated too {}",
+             second process migrated too {}; trials not migrated exactly once {}",
             t.trials,
             t.both_ok,
             t.one_ok,
@@ -531,7 +554,8 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
             t.not_v2,
             t.left.len(),
             t.dave_gone,
-            t.second_migrated
+            t.second_migrated,
+            t.not_once.len()
         );
     }
     println!("[proof] staged: the first process reached the released store in {reached}/{STAGED}");
@@ -561,6 +585,12 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
         assert_eq!(
             t.none_ok, 0,
             "both unlocks were refused, so the profile could be opened by neither"
+        );
+        assert!(
+            t.not_once.is_empty(),
+            "a profile was not migrated exactly once — a vox that waited for the lock migrated \
+             it again: {:#?}",
+            t.not_once
         );
     }
 }

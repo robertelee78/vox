@@ -192,6 +192,36 @@ pub fn serve_control_socket(
     }
 }
 
+/// What a CLI verb says on stderr when creating or unlocking the identity waits for another vox
+/// holding the profile (V210-100). It names no particular remedy beyond the one that is true
+/// wherever that vox runs: under a shell's job control `fg` resumes a stopped one, but a daemon
+/// under tmux or a service manager is resumed its own way.
+pub const WAITING_FOR_PROFILE: &str = "vox: waiting for another vox that is using this profile; \
+     this goes on as soon as that one is done (if that vox is stopped, e.g. with Ctrl-Z, resume it)";
+
+/// Apply `cmd` (creating or unlocking the identity), and if the node says it is waiting for
+/// another vox holding the profile, say so on stderr — once, while it waits.
+pub async fn apply_saying_waits(node: &NodeHandle, cmd: NodeCommand) -> Outcome {
+    let mut events = node.subscribe();
+    let apply = node.apply(cmd);
+    tokio::pin!(apply);
+    let mut said = false;
+    loop {
+        tokio::select! {
+            out = &mut apply => return out,
+            ev = events.next(), if !said => match ev {
+                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
+                    eprintln!("{WAITING_FOR_PROFILE}");
+                    said = true;
+                }
+                Some(_) => {}
+                // The actor is gone; the apply answers for itself.
+                None => said = true,
+            },
+        }
+    }
+}
+
 pub async fn open_profile(
     paths: Paths,
     listen: SocketAddr,
@@ -214,10 +244,9 @@ pub async fn open_profile(
     };
     let secret = Secret::new(identity_passphrase.as_bytes().to_vec());
     let out = if existed {
-        node.apply(NodeCommand::Unlock { passphrase: secret }).await
+        apply_saying_waits(&node, NodeCommand::Unlock { passphrase: secret }).await
     } else {
-        node.apply(NodeCommand::CreateIdentity { passphrase: secret })
-            .await
+        apply_saying_waits(&node, NodeCommand::CreateIdentity { passphrase: secret }).await
     };
     // **Another vox made it first** (V210-91): there was no identity when this one looked,
     // and there is one now, so it was created by a vox started at the same moment. Nothing
@@ -257,11 +286,13 @@ async fn open_room(
         Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&socket)),
         Err(e) => return Err(e.into()),
     };
-    let out = node
-        .apply(NodeCommand::Unlock {
+    let out = apply_saying_waits(
+        &node,
+        NodeCommand::Unlock {
             passphrase: Secret::new(identity_passphrase.as_bytes().to_vec()),
-        })
-        .await;
+        },
+    )
+    .await;
     if out == Outcome::Failed(Fault::ProfileBusy) {
         return Err(profile_busy(&socket));
     }
