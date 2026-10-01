@@ -546,8 +546,6 @@ pub(crate) const TREND_BYTES: u64 = 32 << 20;
 const TREND_ROUNDS: usize = 4096;
 /// How many recent rounds the loss counts cover.
 pub(crate) const LOSS_ROUNDS: usize = 8;
-/// How long the best delivery rate is remembered.
-pub(crate) const BEST_RATE_WINDOW: Duration = Duration::from_secs(10);
 
 /// One finished round: packets the controller saw sent and lost in it, and whether a queue showed.
 #[derive(Debug, Clone, Copy, Default)]
@@ -558,20 +556,16 @@ struct RoundLoss {
     queued_losses: u32,
 }
 
-/// The path, as every tier sees it: a windowed base round trip, each round's minimum round trip,
-/// delivery rate per round, the best rate of the last [`BEST_RATE_WINDOW`], and recent losses with
-/// and without a queue. Rounds are counted in packet numbers, as HyStart++'s are: a round ends when a
+/// The path, as every tier sees it: a base round trip, each round's minimum round trip, and recent
+/// losses with and without a queue. Rounds are counted in packet numbers, as HyStart++'s are: a round ends when a
 /// packet sent after it began is acknowledged. Each acknowledgement's sample is its own `now - sent`.
 #[derive(Debug, Clone)]
 pub(crate) struct PathSignals {
     /// Monotonic deque of (when, sample): the front is the base round trip.
     base: std::collections::VecDeque<(Instant, Duration)>,
-    /// Monotonic deque of (when, rate): the front is the best rate.
-    best: std::collections::VecDeque<(Instant, u64)>,
     srtt: Duration,
     last_sent_pn: u64,
     round_end_pn: Option<u64>,
-    round_start: Option<Instant>,
     round_min: Option<Duration>,
     round_acked: u64,
     round_sent: u64,
@@ -579,7 +573,6 @@ pub(crate) struct PathSignals {
     round_gentle: u32,
     round_queued: u32,
     last_round_min: Option<Duration>,
-    last_rate: u64,
     last_app_limited: bool,
     rounds: u64,
     recent: std::collections::VecDeque<RoundLoss>,
@@ -598,11 +591,9 @@ impl PathSignals {
     pub(crate) fn new() -> Self {
         Self {
             base: std::collections::VecDeque::new(),
-            best: std::collections::VecDeque::new(),
             srtt: Duration::ZERO,
             last_sent_pn: 0,
             round_end_pn: None,
-            round_start: None,
             round_min: None,
             round_acked: 0,
             round_sent: 0,
@@ -610,7 +601,6 @@ impl PathSignals {
             round_gentle: 0,
             round_queued: 0,
             last_round_min: None,
-            last_rate: 0,
             last_app_limited: false,
             rounds: 0,
             recent: std::collections::VecDeque::with_capacity(LOSS_ROUNDS + 1),
@@ -620,12 +610,11 @@ impl PathSignals {
         }
     }
 
-    pub(crate) fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+    pub(crate) fn on_sent(&mut self, _now: Instant, bytes: u64, last_packet_number: u64) {
         self.last_sent_pn = last_packet_number;
         self.round_sent += bytes;
         if self.round_end_pn.is_none() {
             self.round_end_pn = Some(last_packet_number);
-            self.round_start = Some(now);
         }
     }
 
@@ -657,7 +646,7 @@ impl PathSignals {
 
     pub(crate) fn on_end_acks(
         &mut self,
-        now: Instant,
+        _now: Instant,
         _in_flight: u64,
         app_limited: bool,
         largest: Option<u64>,
@@ -669,31 +658,6 @@ impl PathSignals {
             return;
         }
         // A round has ended.
-        let elapsed = self
-            .round_start
-            .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
-        // No round is shorter than the path's base round trip: one that seems to be closed on a
-        // bunch of acknowledgements arriving together, and its bytes over its own length read as
-        // several times the link (fix-adr024-bbr measured 875-3368 Mbit/s on a 200 Mbit/s link).
-        let elapsed = elapsed.max(self.min_rtt().unwrap_or(Duration::ZERO));
-        if !elapsed.is_zero() {
-            self.last_rate = (self.round_acked as f64 / elapsed.as_secs_f64()) as u64;
-            // An application-limited round says what the application offered, not what the path
-            // carries, so it never sets the best rate.
-            if !app_limited {
-                while self.best.back().is_some_and(|&(_, r)| r <= self.last_rate) {
-                    self.best.pop_back();
-                }
-                self.best.push_back((now, self.last_rate));
-            }
-        }
-        while self
-            .best
-            .front()
-            .is_some_and(|&(t, _)| now.saturating_duration_since(t) > BEST_RATE_WINDOW)
-        {
-            self.best.pop_front();
-        }
         self.last_app_limited = app_limited;
         if self.round_acked <= SMALL_ROUND_BYTES && self.round_packets >= 2 {
             if let Some(m) = self.round_min {
@@ -718,7 +682,6 @@ impl PathSignals {
         self.round_lost = 0;
         self.round_gentle = 0;
         self.round_queued = 0;
-        self.round_start = Some(now);
         self.round_end_pn = Some(self.last_sent_pn);
     }
 
@@ -783,16 +746,6 @@ impl PathSignals {
         rise >= QUEUE_DELAY_MIN.max(base.mul_f64(QUEUE_DELAY_SHARE))
     }
 
-    /// Bytes per second delivered over the last finished round.
-    pub(crate) fn delivery_rate(&self) -> u64 {
-        self.last_rate
-    }
-
-    /// The best delivery rate of the last [`BEST_RATE_WINDOW`], application-limited rounds excluded.
-    pub(crate) fn best_rate(&self, _now: Instant) -> u64 {
-        self.best.front().map_or(0, |&(_, r)| r)
-    }
-
     pub(crate) fn rounds(&self) -> u64 {
         self.rounds
     }
@@ -815,12 +768,22 @@ impl PathSignals {
 
     /// Losses without a queue, over the last `rounds` finished rounds.
     pub(crate) fn losses_without_queue_in_last(&self, rounds: usize) -> u32 {
-        self.recent.iter().rev().take(rounds).map(|r| r.gentle_losses).sum()
+        self.recent
+            .iter()
+            .rev()
+            .take(rounds)
+            .map(|r| r.gentle_losses)
+            .sum()
     }
 
     /// Losses that came with a queue (or past the cap), over the last `rounds` finished rounds.
     pub(crate) fn losses_with_queue_in_last(&self, rounds: usize) -> u32 {
-        self.recent.iter().rev().take(rounds).map(|r| r.queued_losses).sum()
+        self.recent
+            .iter()
+            .rev()
+            .take(rounds)
+            .map(|r| r.queued_losses)
+            .sum()
     }
 
     /// Record the loss share now, over the last [`TREND_BYTES`] (or all there is), as the baseline
@@ -841,7 +804,8 @@ impl PathSignals {
     /// rounds, which delays the answer and never hastens it.
     pub(crate) fn loss_risen(&self, baseline: f64, rise: f64) -> bool {
         let (sent, _) = self.trend_bytes();
-        sent >= TREND_BYTES && self.trend_share() > (LOSS_RISE_FACTOR * baseline).max(baseline + rise)
+        sent >= TREND_BYTES
+            && self.trend_share() > (LOSS_RISE_FACTOR * baseline).max(baseline + rise)
     }
 
     /// Bytes sent and lost over the last [`TREND_BYTES`] (or all there is), newest rounds first.
@@ -874,7 +838,9 @@ impl PathSignals {
             .iter()
             .rev()
             .take(LOSS_ROUNDS)
-            .fold((self.round_sent, self.round_lost), |(s, l), r| (s + r.sent, l + r.lost));
+            .fold((self.round_sent, self.round_lost), |(s, l), r| {
+                (s + r.sent, l + r.lost)
+            });
         if sent == 0 {
             0.0
         } else {
