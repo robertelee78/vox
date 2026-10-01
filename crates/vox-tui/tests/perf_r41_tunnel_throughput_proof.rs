@@ -1141,6 +1141,10 @@ const WINDOW: Duration = Duration::from_secs(1);
 /// clean bar.
 const PHASE: Duration = Duration::from_secs(20);
 const RECOVER_WITHIN: Duration = Duration::from_secs(5);
+/// The paused arm: the 1%-loss link, a transfer that stops for [`PAUSE`] and resumes.
+const PAUSED_NAME: &str = "paused, Wi-Fi-like, 200 Mbit/s, 10 ms RTT, 1% loss, 3 s pause";
+/// Longer than vox-core's `IDLE_RESTART` (1 s), so the connection's controller restarts.
+const PAUSE: Duration = Duration::from_secs(3);
 /// How long into the lossy phase Vox may take to find its lossy-link speed before it is judged: at
 /// 5% loss that is a climb of two tiers (at least 1 s in tier 1, 2 s of dwell and 2 s of evidence in
 /// tier 2, then tier 3's trial), as ADR-024's thresholds set it.
@@ -1234,6 +1238,27 @@ fn late_fault(arm: &str, w: &[Window]) -> Option<String> {
         )
     })
 }
+
+/// How late the emulator ran across an arm's judged seconds: the most, the median, and how many
+/// seconds held a release at least [`QUEUE_SIGNAL_LATENESS`] late. Printed with every arm, because
+/// tier 2 reads a queue from a 4 ms rise in a round's minimum round trip, and an emulator that runs
+/// that late can fake or hide it.
+fn lateness(w: &[Window]) -> String {
+    let mut ms: Vec<u128> = w.iter().map(|x| x.late.as_millis()).collect();
+    ms.sort_unstable();
+    let late = w.iter().filter(|x| x.late >= QUEUE_SIGNAL_LATENESS).count();
+    format!(
+        "emulator lateness per second: max {} ms, median {} ms, {late} of {} seconds at or over {} ms",
+        ms.last().copied().unwrap_or_default(),
+        ms.get(ms.len() / 2).copied().unwrap_or_default(),
+        w.len(),
+        QUEUE_SIGNAL_LATENESS.as_millis()
+    )
+}
+
+/// The rise in a round's minimum round trip that tier 2 reads as a queue (ADR-024,
+/// `QUEUE_DELAY_MIN`): emulator lateness at this size can fake or hide the signal.
+const QUEUE_SIGNAL_LATENESS: Duration = Duration::from_millis(4);
 
 /// Record an arm's line as it is measured, so an arm that ends the run early leaves the others'.
 fn note(report: &mut Vec<String>, line: String) {
@@ -1474,12 +1499,13 @@ fn taper_arms(
         };
         note(report, format!(
             "{}: clean bar {:.1} Mbit/s ({:.0}% of raw {:.1}); vox mean {:.1} Mbit/s, {below} seconds \
-             below — {verdict}; calibration {pct:?}; per-second {:?}",
+             below — {verdict}; calibration {pct:?}; {}; per-second {:?}",
             CLEAN_LAN.name,
             bar / 1e6,
             MIN_RATIO * 100.0,
             raw_rate / 1e6,
             mean_of(w, |x| x.vox) / 1e6,
+            lateness(w),
             mbit(w, |x| x.vox)
         ));
     }
@@ -1488,7 +1514,8 @@ fn taper_arms(
     // The lossy link: Vox alone, then the comparison flow alone, each over the same loss.
     let mut lossy_bars: Vec<(&str, f64)> = Vec::new();
     for lossy in [WIFI, WIFI_HEAVY] {
-        let feeds_changing = wanted(&changing_name(&lossy));
+        let feeds_changing =
+            wanted(&changing_name(&lossy)) || (lossy.name == WIFI.name && wanted(PAUSED_NAME));
         if !wanted(lossy.name) && !feeds_changing {
             continue;
         }
@@ -1529,10 +1556,12 @@ fn taper_arms(
         };
         note(report, format!(
             "{}: vox {:.1} Mbit/s, Cubic on the same loss {:.1} Mbit/s, {ratio:.2}x — {verdict}; \
-             per-second vox {:?}, Cubic {:?}",
+             vox's {}; the Cubic flow's {}; per-second vox {:?}, Cubic {:?}",
             lossy.name,
             vm / 1e6,
             cm / 1e6,
+            lateness(&v),
+            lateness(&c),
             mbit(&v, |x| x.vox),
             mbit(&c, |x| x.other)
         ));
@@ -1594,12 +1623,13 @@ fn taper_arms(
             pairs.iter().copied().fold(0.0, f64::max)
         ));
         note(report, format!(
-            "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.2}x over {} s — {verdict}; \
+            "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.2}x over {} s — {verdict}; {}; \
              per-second vox {:?}, Cubic {:?}",
             congested.name,
             vm / 1e6,
             cm / 1e6,
             CONGESTED_MEASURE.as_secs(),
+            lateness(&w),
             mbit(&w, |x| x.vox),
             mbit(&w, |x| x.other)
         ));
@@ -1690,14 +1720,77 @@ fn taper_arms(
         };
         note(report, format!(
             "{name}: clean bar {:.1} Mbit/s ({:.0}% of raw {:.1}), lossy bar {:.1} Mbit/s; \
-             per-second clean {:?}, lossy {:?}, clean {:?} — {verdict}",
+             per-second clean {:?}, lossy {:?}, clean {:?} — {verdict}; {}",
             bar / 1e6,
             MIN_RATIO * 100.0,
             raw_rate / 1e6,
             lossy_bar / 1e6,
             mbit(clean1, |x| x.vox),
             mbit(lossy, |x| x.vox),
-            mbit(clean2, |x| x.vox)
+            mbit(clean2, |x| x.vox),
+            lateness(&all[s..])
+        ));
+    }
+
+    // The paused link: one tunnel on the 1%-loss link that stops sending for longer than the
+    // controller's idle restart (vox-core's `IDLE_RESTART`, 1 s), then resumes. Whatever the
+    // controller keeps or forgets across that restart, a person's next transfer must find the
+    // lossy link's speed again.
+    'paused: {
+        if !wanted(PAUSED_NAME) {
+            break 'paused;
+        }
+        let Some(lossy_bar) = lossy_bars
+            .iter()
+            .find(|(n, _)| *n == WIFI.name)
+            .map(|&(_, b)| b)
+        else {
+            cannot.push(format!(
+                "CANNOT MEASURE {PAUSED_NAME} (APPARATUS): the 1% lossy arm it is judged against did \
+                 not measure (precondition unmet)"
+            ));
+            break 'paused;
+        };
+        *link.lock().unwrap() = Some(WIFI);
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = stream_to(tunnel, Arc::clone(&stop));
+        let before = windows(SETTLE + MEASURE, |_| {});
+        stop.store(true, Relaxed);
+        let _ = pump.join();
+        std::thread::sleep(PAUSE);
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = stream_to(tunnel, Arc::clone(&stop));
+        let after = windows(CLIMB_WITHIN + MEASURE, |_| {});
+        stop.store(true, Relaxed);
+        let _ = pump.join();
+        let judged_after = &after[CLIMB_WITHIN.as_secs() as usize..];
+        if let Some(e) = late_fault(PAUSED_NAME, judged_after) {
+            cannot.push(e);
+            break 'paused;
+        }
+        let m = mean_of(judged_after, |x| x.vox);
+        let verdict = if m >= lossy_bar {
+            "ok".to_owned()
+        } else {
+            failed.push(format!(
+                "{PAUSED_NAME}: the emulator was on time; after a {} s pause, past the first {} s, \
+                 vox carried {:.1} Mbit/s, under the lossy bar of {:.1} Mbit/s ({LOSSY_WIN:.1}x the \
+                 Cubic flow on the same loss): vox loses its lossy-link speed across a pause",
+                PAUSE.as_secs(),
+                CLIMB_WITHIN.as_secs(),
+                m / 1e6,
+                lossy_bar / 1e6
+            ));
+            "BELOW".to_owned()
+        };
+        note(report, format!(
+            "{PAUSED_NAME}: lossy bar {:.1} Mbit/s; before the pause vox {:.1} Mbit/s, after it {:.1} \
+             Mbit/s — {verdict}; {}; per-second after {:?}",
+            lossy_bar / 1e6,
+            mean_of(&before[before.len() - MEASURE.as_secs() as usize..], |x| x.vox) / 1e6,
+            m / 1e6,
+            lateness(judged_after),
+            mbit(&after, |x| x.vox)
         ));
     }
     drop(rt);
