@@ -11,9 +11,11 @@
 //!   7 d). Its room is then the idle one, and the next stranger's room displaced it.
 //!
 //! The board now gives up a room from **the source credited with the most rooms**
-//! (`nat::store::Source`: the network a peer published from; a room is credited to whoever first
-//! published its genesis and to whoever publishes a member record for it, which only a member can
-//! sign). A stranger filling it from one network displaces only its own rooms.
+//! (`nat::store::Source`: the network a peer published from; a room is credited only by a record
+//! the board stored that the peer bringing it wrote — its creator's genesis, a member's own address
+//! or bundle record — so only its members can credit it; see
+//! `a_stranger_resending_a_rooms_records_cannot_crowd_it_out_proof`). A stranger filling it from
+//! one network displaces only its own rooms.
 //!
 //! **Staging.** The anchor (`vox node`, the default: it serves any room published to it) listens
 //! dual-stack on `[::]`; the victim `vox daemon` and the joiner are on `127.0.0.1`, and the
