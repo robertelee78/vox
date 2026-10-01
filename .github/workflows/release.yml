@@ -22,8 +22,13 @@ jobs:
   ci-passed:
     name: CI passed on this exact commit
     runs-on: ubuntu-latest
-    # CI's slowest job has a 120-minute budget; a tag pushed straight after `main` waits for it.
-    timeout-minutes: 150
+    # **Queue time is not a budget** (V210-116). This waits for as long as CI's run on this commit
+    # is queued or running, up to just under GitHub's six-hour cap on a job. It counted 140 minutes
+    # from the tag push, queue included, and CI's own job ran up to 117 minutes, so a tag pushed
+    # while runners were backed up (six CI runs queued on 2026-10-01) failed to publish a commit CI
+    # went on to pass. What bounds CI is its own jobs' limits, which `scripts/release-gate.sh`
+    # checks before a tag (V210-14).
+    timeout-minutes: 350
     permissions:
       actions: read
       contents: read
@@ -37,7 +42,9 @@ jobs:
           set -eu
           url="repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=main&per_page=1"
           seen=""
-          for i in $(seq 1 280); do
+          i=0
+          while :; do
+            i=$((i + 1))
             line=$(gh api "$url" --jq '.workflow_runs[0] | select(. != null) | "\(.id) \(.status) \(.conclusion) \(.html_url)"' || true)
             if [ -z "$line" ]; then
               # CI starts within seconds of a push to main; five minutes without one means this
@@ -60,8 +67,6 @@ jobs:
             fi
             sleep 30
           done
-          echo "::error::CI on $SHA did not finish within this job's budget"
-          exit 1
 
   build-linux-x64:
     needs: [ci-passed]
