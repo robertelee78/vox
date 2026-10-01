@@ -1059,40 +1059,14 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
 /// **Every fault, not the ones a join was expected to meet** (V210-83). It knew ten, and a join
 /// that failed for any other — the store, the node shutting down, a bug — printed the enum's name
 /// to the person: `cannot join: Failed(Storage)`.
+///
+/// **And every fault added since** (V210-114): its own table here knew the 28 of V210-83, and
+/// `ProfileBusy`, `IdentityFileUnwritable` and `NotAdmitted`, added after it, fell out of it. The
+/// names now come from [`Fault::from_name`], made from the one list that `Fault::name` must cover.
 pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
     let first = reason.lines().next().unwrap_or_default();
     let name = first.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
-    Some(match name {
-        "NoIdentity" => Fault::NoIdentity,
-        "IdentityExists" => Fault::IdentityExists,
-        "Locked" => Fault::Locked,
-        "WrongPassphrase" => Fault::WrongPassphrase,
-        "UnknownChannel" => Fault::UnknownChannel,
-        "ChannelNotOpen" => Fault::ChannelNotOpen,
-        "TooLong" => Fault::TooLong,
-        "KeyringFull" => Fault::KeyringFull,
-        "Storage" => Fault::Storage,
-        "SealedUnreadable" => Fault::SealedUnreadable,
-        "ShuttingDown" => Fault::ShuttingDown,
-        "NotNetworked" => Fault::NotNetworked,
-        "BadLink" => Fault::BadLink,
-        "RoomNotOnBoard" => Fault::RoomNotOnBoard,
-        "BoardUnreachable" => Fault::BoardUnreachable,
-        "Unreachable" => Fault::Unreachable,
-        "SolveTooSlow" => Fault::SolveTooSlow,
-        "MembersBusy" => Fault::MembersBusy,
-        "Refused" => Fault::Refused,
-        "NotConsented" => Fault::NotConsented,
-        "StillTrusted" => Fault::StillTrusted,
-        "NotLoopback" => Fault::NotLoopback,
-        "AddressInUse" => Fault::AddressInUse,
-        "AlreadyMember" => Fault::AlreadyMember,
-        "NotAServiceRoom" => Fault::NotAServiceRoom,
-        "NotOffered" => Fault::NotOffered,
-        "NoSuchForward" => Fault::NoSuchForward,
-        "Internal" => Fault::Internal,
-        _ => return None,
-    })
+    Fault::from_name(name)
 }
 
 /// What a daemon's reply to a failed join says after the fault's name: its `steps: …` and

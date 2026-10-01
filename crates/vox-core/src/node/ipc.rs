@@ -2121,7 +2121,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 // once could not be placed. They follow the fault's name, one per line:
                 // `steps: …`, then `said: …`.
                 other => {
-                    let mut reason = format!("{other:?}");
+                    // The name `vox room join` reads back with `Fault::from_name` (V210-114).
+                    let mut reason = match other {
+                        crate::node::api::Outcome::Failed(fault) => {
+                            format!("Failed({})", fault.name())
+                        }
+                        other => format!("{other:?}"),
+                    };
                     let (mut steps, mut said) = (None, None);
                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
                     while steps.is_none() || said.is_none() {
