@@ -744,8 +744,14 @@ that proves it.**
   > read each other); the reason is written at the top of the proof. The nodes name each other by
   > petnames the other never uses, and their folded boards are compared field by field. Five mutations
   > caught: the handoff inert (F1), `to_session` ignored, a no-TTL holding's expiry inherited, a decline
-  > returning to the sender, and the owner compared by author only (F3). Also `agentcomms_gate` (17
-  > tests) folds every permutation — 120 orders of a contested claim plus handoff — to one state.
+  > returning to the sender, and the owner compared by author only (F3).
+  >
+  > **2026-10-01:** the order claim had no proof. `agentcomms_gate`, cited here for "folds every
+  > permutation", was deleted with the non-product tests (V29-17), and every step of
+  > `work_handoff_proof` waits for the other node, so both nodes logged every row in the same order
+  > and a fold in local order stayed green. Case (6), **order**, now stages opposite local orders
+  > through the shipped binary; the local-order fold mutant goes red on it as PRODUCT ("alice and bob
+  > fold different boards for h-order").
 
 - **M21.3 — renewal bound to one acquisition.**
 
