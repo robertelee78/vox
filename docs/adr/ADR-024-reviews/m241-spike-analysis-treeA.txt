@@ -1,0 +1,162 @@
+Method:
+- RESULT: the run's own RESULT line, verbatim (means over the last two thirds of the timeline).
+- Trace time is milliseconds since the sending `vox forward` process started its controller code.
+  "Judged" trace lines are those at trace time >= T0_MS (default 17000): past the unshaped warm-up
+  (about 6 s) plus the 10 s windowed base round trip, so the base is the shaped link's.
+- Loss share: sum of lost bytes on judged L lines / (that + sum of acked bytes on judged S lines).
+- Queue rise at a loss: the qd field (last finished round's minimum minus the windowed base, in us)
+  on judged L lines; nearest-rank percentiles.
+- Delay-classified: share of judged L lines with delayq 1.
+- Timeline: the TL lines (500 ms windows of the sink's counters); min/max over the given span.
+- Lateness: the largest "late N ms" on any TL line of the run.
+T0_MS = 17000
+
+== lossy-cubic
+    RESULT lossy vox 57.3 Mbit/s, cubic 61.7 Mbit/s, ratio 0.93; loss drops 567 tail drops 0
+    loss share (judged): 0.99%  over 101 loss events
+    queue rise at a loss (judged, ms): p10 10.95 p50 12.04 p90 14.12 p99 20.07  n=101
+    delay-classified (judged): 100.0%
+    emulator lateness, max over the run: 18 ms
+== lossy-t2-085
+    RESULT lossy vox 63.3 Mbit/s, cubic 62.7 Mbit/s, ratio 1.01; loss drops 590 tail drops 0
+    loss share (judged): 1.00%  over 110 loss events
+    queue rise at a loss (judged, ms): p10 0.29 p50 1.28 p90 3.44 p99 7.62  n=110
+    delay-classified (judged): 17.3%
+    emulator lateness, max over the run: 13 ms
+== lossy-t2-withhold
+    RESULT lossy vox 169.8 Mbit/s, cubic 61.4 Mbit/s, ratio 2.77; loss drops 1367 tail drops 0
+    loss share (judged): 1.00%  over 502 loss events
+    queue rise at a loss (judged, ms): p10 0.60 p50 2.19 p90 4.39 p99 10.38  n=502
+    delay-classified (judged): 12.0%
+    emulator lateness, max over the run: 12 ms
+== lossy-t2-rep
+    RESULT lossy vox 176.7 Mbit/s, cubic 62.0 Mbit/s, ratio 2.85; loss drops 1683 tail drops 0
+    loss share (judged): 0.97%  over 509 loss events
+    queue rise at a loss (judged, ms): p10 0.42 p50 1.78 p90 4.40 p99 6.68  n=509
+    delay-classified (judged): 11.2%
+    emulator lateness, max over the run: 13 ms
+== lossy-t2-trend
+    RESULT lossy vox 97.1 Mbit/s, cubic 60.0 Mbit/s, ratio 1.62; loss drops 1067 tail drops 0
+    loss share (judged): 0.98%  over 299 loss events
+    queue rise at a loss (judged, ms): p10 0.40 p50 1.25 p90 3.35 p99 8.97  n=299
+    delay-classified (judged): 5.4%
+    emulator lateness, max over the run: 13 ms
+== lossy5-t2-cap5
+    RESULT lossy vox 32.0 Mbit/s, cubic 25.1 Mbit/s, ratio 1.27; loss drops 2115 tail drops 0
+    loss share (judged): 5.07%  over 587 loss events
+    queue rise at a loss (judged, ms): p10 0.56 p50 1.88 p90 3.37 p99 15.09  n=587
+    delay-classified (judged): 6.3%
+    emulator lateness, max over the run: 12 ms
+== lossy5-t2-rep
+    RESULT lossy vox 35.0 Mbit/s, cubic 24.6 Mbit/s, ratio 1.42; loss drops 2065 tail drops 0
+    loss share (judged): 5.16%  over 622 loss events
+    queue rise at a loss (judged, ms): p10 0.52 p50 1.64 p90 2.66 p99 7.90  n=622
+    delay-classified (judged): 2.3%
+    emulator lateness, max over the run: 19 ms
+== lossy5-bbr
+    RESULT lossy vox 176.6 Mbit/s, cubic 23.0 Mbit/s, ratio 7.68; loss drops 7237 tail drops 0
+    loss share (judged): 5.04%  over 2620 loss events
+    queue rise at a loss (judged, ms): p10 0.16 p50 0.88 p90 4.07 p99 11.25  n=2620
+    delay-classified (judged): 19.4%
+    emulator lateness, max over the run: 14 ms
+== lossy5-bbr-rep
+    RESULT lossy vox 178.4 Mbit/s, cubic 24.4 Mbit/s, ratio 7.31; loss drops 7290 tail drops 0
+    loss share (judged): 5.01%  over 2626 loss events
+    queue rise at a loss (judged, ms): p10 0.27 p50 1.10 p90 4.51 p99 10.64  n=2626
+    delay-classified (judged): 21.2%
+    emulator lateness, max over the run: 12 ms
+== cong-cubic
+    RESULT congested vox 98.8 Mbit/s, cubic 97.4 Mbit/s, share ratio vox/cubic 1.01; tail drops 417
+    loss share (judged): 0.26%  over 101 loss events
+    queue rise at a loss (judged, ms): p10 3.64 p50 6.64 p90 8.63 p99 9.13  n=101
+    delay-classified (judged): 97.0%
+    emulator lateness, max over the run: 9 ms
+== cong-t2-withhold
+    RESULT congested vox 105.2 Mbit/s, cubic 91.6 Mbit/s, share ratio vox/cubic 1.15; tail drops 23612
+    loss share (judged): 0.23%  over 94 loss events
+    queue rise at a loss (judged, ms): p10 4.77 p50 7.39 p90 8.59 p99 9.28  n=94
+    delay-classified (judged): 91.5%
+    emulator lateness, max over the run: 15 ms
+== cong-t2-trend
+    RESULT congested vox 91.2 Mbit/s, cubic 105.1 Mbit/s, share ratio vox/cubic 0.87; tail drops 442
+    loss share (judged): 0.28%  over 108 loss events
+    queue rise at a loss (judged, ms): p10 4.45 p50 7.06 p90 8.37 p99 8.94  n=108
+    delay-classified (judged): 89.8%
+    emulator lateness, max over the run: 11 ms
+== cong-shallow-cubic
+    RESULT congested vox 38.3 Mbit/s, cubic 38.1 Mbit/s, share ratio vox/cubic 1.00; tail drops 1574
+    loss share (judged): 3.10%  over 419 loss events
+    queue rise at a loss (judged, ms): p10 0.95 p50 1.81 p90 2.62 p99 12.81  n=419
+    delay-classified (judged): 8.4%
+    emulator lateness, max over the run: 15 ms
+== cong-shallow-t2
+    RESULT congested vox 80.9 Mbit/s, cubic 15.4 Mbit/s, share ratio vox/cubic 5.26; tail drops 44101
+    loss share (judged): 35.61%  over 7826 loss events
+    queue rise at a loss (judged, ms): p10 0.44 p50 1.68 p90 3.02 p99 7.29  n=7826
+    delay-classified (judged): 4.6%
+    emulator lateness, max over the run: 11 ms
+== cong-shallow-t2-cap5
+    RESULT congested vox 54.1 Mbit/s, cubic 40.0 Mbit/s, share ratio vox/cubic 1.35; tail drops 2338
+    loss share (judged): 4.34%  over 766 loss events
+    queue rise at a loss (judged, ms): p10 0.48 p50 1.57 p90 2.45 p99 3.96  n=766
+    delay-classified (judged): 0.8%
+    emulator lateness, max over the run: 12 ms
+== cong-shallow-t2-cap5-80s
+    RESULT congested vox 49.8 Mbit/s, cubic 38.8 Mbit/s, share ratio vox/cubic 1.29; tail drops 4692
+    loss share (judged): 4.57%  over 1692 loss events
+    queue rise at a loss (judged, ms): p10 0.57 p50 1.57 p90 2.60 p99 6.93  n=1692
+    delay-classified (judged): 2.9%
+    emulator lateness, max over the run: 10 ms
+== cong-shallow-bbr
+    RESULT congested vox 154.6 Mbit/s, cubic 21.4 Mbit/s, share ratio vox/cubic 7.22; tail drops 18924
+    loss share (judged): 15.70%  over 8185 loss events
+    queue rise at a loss (judged, ms): p10 0.37 p50 1.20 p90 2.00 p99 5.24  n=8185
+    delay-classified (judged): 3.5%
+    emulator lateness, max over the run: 20 ms
+== lan-cong-cubic
+    RESULT congested vox 448.6 Mbit/s, cubic 489.7 Mbit/s, share ratio vox/cubic 0.92; tail drops 2226
+    loss share (judged): 0.39%  over 531 loss events
+    queue rise at a loss (judged, ms): p10 0.71 p50 1.36 p90 1.78 p99 2.36  n=531
+    delay-classified (judged): 2.4%
+    emulator lateness, max over the run: 44 ms
+== lan-cong-t2
+    RESULT congested vox 641.4 Mbit/s, cubic 251.0 Mbit/s, share ratio vox/cubic 2.56; tail drops 11030
+    loss share (judged): 2.16%  over 4190 loss events
+    queue rise at a loss (judged, ms): p10 0.65 p50 1.40 p90 1.71 p99 2.18  n=4190
+    delay-classified (judged): 0.3%
+    emulator lateness, max over the run: 53 ms
+== lan-cong-t2-trend
+    RESULT congested vox 548.4 Mbit/s, cubic 387.7 Mbit/s, share ratio vox/cubic 1.41; tail drops 3484
+    loss share (judged): 0.61%  over 979 loss events
+    queue rise at a loss (judged, ms): p10 0.64 p50 1.38 p90 1.87 p99 3.10  n=979
+    delay-classified (judged): 0.6%
+    emulator lateness, max over the run: 21 ms
+== lan-shallow-t2
+    RESULT congested vox 160.5 Mbit/s, cubic 141.8 Mbit/s, share ratio vox/cubic 1.13; tail drops 10178
+    loss share (judged): 5.59%  over 2830 loss events
+    queue rise at a loss (judged, ms): p10 0.32 p50 0.53 p90 1.35 p99 7.92  n=2830
+    delay-classified (judged): 3.4%
+    emulator lateness, max over the run: 13 ms
+== changing-t2-cap5
+    RESULT changing clean1 vox 197.6 Mbit/s
+    RESULT changing lossy vox 173.8 Mbit/s
+    RESULT changing clean2 vox 197.5 Mbit/s
+    loss share (judged): 0.40%  over 563 loss events
+    queue rise at a loss (judged, ms): p10 0.48 p50 2.03 p90 8.84 p99 157.20  n=563
+    delay-classified (judged): 18.3%
+    emulator lateness, max over the run: 22 ms
+== timeline lossy-t2-withhold vox-alone t=10.5..30 s: min 95.2 max 198.1 Mbit/s over 40 windows
+== timeline lossy-t2-rep vox-alone t=10.5..30 s: min 125.9 max 199.9 Mbit/s over 40 windows
+== timeline changing-t2-cap5 changing t=40.5..60 s: min 169.1 max 226.8 Mbit/s over 40 windows
+== lossy-t2-trend32
+    RESULT lossy vox 184.2 Mbit/s, cubic 62.6 Mbit/s, ratio 2.94; loss drops 1696 tail drops 0
+    loss share (judged): 0.97%  over 534 loss events
+    queue rise at a loss (judged, ms): p10 0.36 p50 2.01 p90 4.39 p99 5.68  n=534
+    delay-classified (judged): 11.6%
+    emulator lateness, max over the run: 9 ms
+== lan-cong-t2-trend32
+    RESULT congested vox 548.3 Mbit/s, cubic 335.4 Mbit/s, share ratio vox/cubic 1.63; tail drops 4538
+    loss share (judged): 0.85%  over 1504 loss events
+    queue rise at a loss (judged, ms): p10 0.62 p50 1.38 p90 1.73 p99 3.45  n=1504
+    delay-classified (judged): 1.0%
+    emulator lateness, max over the run: 64 ms
