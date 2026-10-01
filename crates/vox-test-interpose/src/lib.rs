@@ -48,6 +48,11 @@
 //! are counted only while the file exists, so a proof arms it at the moment the operation under
 //! test starts, and sweeps `N`. The kill is recorded first: `kill path n`.
 //!
+//! ## Memory scan on cue
+//! With `VOX_INTERPOSE_SCAN` naming a directory, a thread of this library's looks through every
+//! readable page of the process for byte strings a proof names, when the proof asks: see the
+//! `scan` module (V210-94). It starts at the process's first recorded call.
+//!
 //! ## Variadic calls
 //! `open`, `openat` and `fcntl` take their last argument variadically. On Apple arm64 a variadic
 //! argument is passed on the stack, not in the register a non-variadic function reads it from,
@@ -61,6 +66,8 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_ulong, CStr};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
+mod scan;
 
 const O_WRONLY: c_int = 0x0001;
 const O_APPEND: c_int = 0x0008;
@@ -164,6 +171,8 @@ fn log_fd() -> c_int {
 fn record(fields: &[&str]) {
     // SAFETY: __error returns this thread's errno location.
     let saved = unsafe { *__error() };
+    // Started from the first recorded call: the library has no load-time constructor.
+    scan::start_once();
     let fd = log_fd();
     if fd >= 0 {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);

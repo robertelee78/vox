@@ -423,7 +423,7 @@ impl PrekeyRing {
     /// canonical bodies means the at-rest form pins exactly the bytes the root
     /// signature covers.
     fn encode(&self) -> Zeroizing<Vec<u8>> {
-        let mut e = Encoder::new();
+        let mut e = Encoder::for_secrets();
         e.array(8).uint(RING_VERSION);
         // Identity DH key.
         e.array(3)
