@@ -31,7 +31,8 @@
 //!   `INCOMING` frame carries three tags for the asker's address, coarse to fine, keyed per
 //!   process so this node can group joiners by them but never learns a relayed joiner's address
 //!   ([`crate::node::circuitstream::origin_tags`]). They are taken only from a relay this node
-//!   trusts to say — its **anchor or a member** — and are kept apart per relay. A relay that is
+//!   trusts to say — its **anchor or a member** — and are filed under the relay's own network,
+//!   which the relay cannot choose (`nat::source::Source::relayed_by`). A relay that is
 //!   only a pending joiner is a stranger like any other, so what it carries counts as coming from
 //!   the relay itself; otherwise a stranger could mint a source per relay identity it made.
 //!   A relay that lies about its tags can only mis-group what it carries, which it could as well
@@ -55,76 +56,14 @@
 //! who they say they are, not by what they have done.
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::hash::{domain_hash, Digest32};
-use crate::transport::mux::CircuitOrigin;
-use crate::transport::quic::VoxConnection;
+use crate::hash::Digest32;
 
-/// Where a join came from, as far as sharing the slots goes: three opaque keys, coarse to fine.
-/// See the module docs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JoinSource(pub [Digest32; 3]);
-
-impl JoinSource {
-    /// The source of a join arriving on `conn`: its address, or for a relayed join the origin
-    /// recorded when its circuit was attached.
-    #[must_use]
-    pub fn of(conn: &VoxConnection) -> Self {
-        Self(source_levels(conn))
-    }
-}
-
-/// The three source keys of `ip`, coarse to fine: an IPv4 address at every level, an IPv6
-/// address by its /48, /56 and /64.
-#[must_use]
-pub fn address_levels(ip: IpAddr) -> [Digest32; 3] {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            let key = domain_hash("vox/join-source/v4", &v4.octets());
-            [key, key, key]
-        }
-        IpAddr::V6(v6) => {
-            let o = v6.octets();
-            [
-                domain_hash("vox/join-source/v6/48", &o[..6]),
-                domain_hash("vox/join-source/v6/56", &o[..7]),
-                domain_hash("vox/join-source/v6/64", &o[..8]),
-            ]
-        }
-    }
-}
-
-/// The source keys of whoever is at the far end of `conn`: its address, or, over a circuit, the
-/// origin recorded for it. A circuit with **no origin recorded** is one source, the same for every
-/// such circuit: nothing about it says where it comes from, and keying it on anything the far end
-/// chooses — its identity, which is free — would hand every stranger a source of its own.
-#[must_use]
-pub fn source_levels(conn: &VoxConnection) -> [Digest32; 3] {
-    if conn.via_circuit() {
-        return conn.circuit_origin().unwrap_or_else(|| {
-            let key = domain_hash("vox/join-source/relayed-unknown", &[]);
-            [key, key, key]
-        });
-    }
-    address_levels(conn.quinn().remote_address().ip())
-}
-
-/// The origin of a circuit `relay` carried here, from the `tags` it said the asker has. Kept
-/// apart per relay, so two relays' tags never fall together.
-#[must_use]
-pub fn relayed_origin(relay: &Digest32, tags: &[[u8; 16]; 3]) -> CircuitOrigin {
-    let level = |i: usize| {
-        let mut input = Vec::with_capacity(32 + 1 + 16);
-        input.extend_from_slice(relay.as_ref());
-        input.push(u8::try_from(i).unwrap_or(u8::MAX));
-        input.extend_from_slice(&tags[i]);
-        domain_hash("vox/join-source/relayed", &input)
-    };
-    [level(0), level(1), level(2)]
-}
+/// Where a join came from, as far as sharing the slots goes: the source definition the
+/// rendezvous board shares (`nat::source`), three keys coarse to fine. See the module docs.
+pub type JoinSource = crate::nat::source::Source;
 
 struct Hold {
     source: JoinSource,
