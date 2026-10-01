@@ -162,6 +162,8 @@ pub struct ViewModel {
     pub sync: SyncStatus,
     /// Whether the app is locked (SEK/identity zeroized, re-auth required).
     pub locked: bool,
+    /// Whether a lock is under way and waiting for work that holds a secret (V210-94).
+    pub locking: bool,
     /// Whether `mlock` is in effect; `false` surfaces the documented zeroize-only
     /// degradation warning (ADR-015 memory-protection honesty).
     pub mlock_active: bool,

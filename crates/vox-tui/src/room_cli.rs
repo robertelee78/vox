@@ -2469,7 +2469,7 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
             match crate::tunnel_cli::fault_named(&reason) {
                 Some(fault) => format!(
                     "cannot join: {}{}",
-                    crate::tunnel_cli::join_advice(Some(fault)),
+                    crate::tunnel_cli::join_advice_after(Some(fault), &reason),
                     crate::tunnel_cli::join_detail(&reason)
                 ),
                 None => format!("cannot join: {reason}"),
