@@ -48,11 +48,11 @@ fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
 }
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
-/// The most one `vox trust add` took a debug build in case (9)'s fill, eight at a time against one
-/// daemon, each checking the passphrase with production Argon2id (#295): 2,200 of them over two
+/// Twice the most one `vox trust add` took a debug build in case (9)'s fill (see the watchdog's
+/// `DEBUG_JOIN` for why twice), eight at a time against one daemon, each checking the passphrase with production Argon2id (#295): 2,200 of them over two
 /// runs, median 18.94 s and 20.54 s, most 56.50 s and 74.33 s, the whole fill 2,980.5 s and
 /// 3,792.7 s. Release: not counted.
-const DEBUG_FILL_ADD: Duration = Duration::from_millis(74_330);
+const DEBUG_FILL_ADD: Duration = Duration::from_millis(2 * 74_330);
 /// The joins (three `room join`s and `vox connect`) and the other unlocks (four `vox id`s, `serve`,
 /// two daemons, `trust remove`, `room post`, `connect`, `up` and two `forward`s) the test makes.
 const JOINS: u32 = 4;
@@ -229,8 +229,9 @@ fn free_tcp_port() -> u16 {
 #[test]
 #[ignore = "four real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn every_common_failure_names_its_cause() {
-    // A debug build's budget: its joins and unlocks at their measured most, and the fill's 138
-    // rounds of eight `trust add`s, each at its measured most (#295). A release build's: 600 s.
+    // A debug build's budget: its joins and unlocks at twice their measured most, and the fill's
+    // 138 rounds of eight `trust add`s, each at twice its measured most (#295). A release
+    // build's: 600 s.
     let rounds = 1_100u32.div_ceil(8);
     let fill = if cfg!(debug_assertions) {
         DEBUG_FILL_ADD * rounds
@@ -241,7 +242,8 @@ fn every_common_failure_names_its_cause() {
     if cfg!(debug_assertions) {
         eprintln!(
             "[watchdog] debug build: budget {}s = 600s + {}s for {JOINS} join(s) and {UNLOCKS} \
-             unlock(s) + {rounds} fill round(s) x {:.1}s",
+             unlock(s) + {rounds} fill round(s) x {:.1}s (twice the most of 2,200 measured adds, \
+             74.33s)",
             budget.as_secs(),
             watchdog::debug_cost(JOINS, UNLOCKS).as_secs(),
             DEBUG_FILL_ADD.as_secs_f64()
