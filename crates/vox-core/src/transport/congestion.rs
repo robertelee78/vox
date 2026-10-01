@@ -49,14 +49,15 @@ pub const IDLE_RESTART: Duration = Duration::from_secs(1);
 /// restarted between two flights of the same transfer.
 const IDLE_RTTS: u32 = 4;
 
-/// Builds `IdleRestart` controllers around `VoxCubic`.
+/// Builds `IdleRestart` controllers around the tapered controller (`taper::Tapered`), which starts
+/// every connection, and every restart after idle, in tier 1.
 #[derive(Debug, Default)]
 pub struct IdleRestartConfig;
 
 impl ControllerFactory for IdleRestartConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         Box::new(IdleRestart {
-            inner: Box::new(VoxCubic::new(now, current_mtu)),
+            inner: Box::new(super::taper::Tapered::new(now, current_mtu)),
             mtu: current_mtu,
             last_sent: None,
             srtt: Duration::ZERO,
@@ -79,7 +80,7 @@ impl Controller for IdleRestart {
             .last_sent
             .is_some_and(|t| now.saturating_duration_since(t) > idle)
         {
-            self.inner = Box::new(VoxCubic::new(now, self.mtu));
+            self.inner = Box::new(super::taper::Tapered::new(now, self.mtu));
         }
         self.last_sent = Some(now);
         self.inner.on_sent(now, bytes, last_packet_number);
