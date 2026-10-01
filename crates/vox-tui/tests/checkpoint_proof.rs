@@ -18,7 +18,13 @@
 //!   one signed by alice's own key (an equivocation) and one without a signature, both offered
 //!   to alice's room through the same acceptance path sync uses.
 //!
-//! Mutations (each run, each red): shedding disabled; the pre-checkpoint refusal removed.
+//! - **V030-10: a newcomer after an expiry reads the author on.** The expired skeletons are taken,
+//!   bob reckons them expired himself (none shows as "not received yet", none is shown), and
+//!   alice's next message reaches him.
+//!
+//! Mutations (each run, each red): shedding disabled; the pre-checkpoint refusal removed;
+//! v0.2.10's Withheld rule (a payload-less entry set aside) — "bob never caught up"; expiry never
+//! reckoned by the receiver — bob shows the expired ones as not received yet.
 
 #![cfg(unix)]
 
@@ -34,6 +40,8 @@ use vox_core::atrest::store::SegmentKind;
 use vox_core::hash::COMPOSITE_SIG_LEN;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
+/// What `vox room read` prints for a message whose body is still owed (V030-10).
+const NOT_RECEIVED_YET: &str = vox_core::node::api::NOT_RECEIVED_YET;
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
 /// Messages alice writes before the room starts disappearing.
@@ -470,7 +478,8 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
         }
         assert!(
             Instant::now() < deadline,
-            "bob never caught up: {} of {} entries",
+            "PRODUCT: bob never caught up: `vox room read --hashes` shows him {} of alice's {} \
+             entries; a newcomer's sync stopped at alice's expired ones",
             o.len(),
             a.len()
         );
@@ -484,6 +493,45 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
         a == b
     );
     assert_eq!(a, b, "the newcomer's order differs from alice's");
+
+    // ---- V030-10: the expired skeletons are expired to bob, and alice's feed goes on ----------
+    // Bob reckons their expiry himself, from each skeleton's signed time and the room's retention:
+    // none is owed, so none shows as "not received yet", and none is shown at all (R10).
+    let shown = read(bob, &room);
+    let owed = texts(&shown)
+        .iter()
+        .filter(|t| **t == NOT_RECEIVED_YET)
+        .count();
+    let old = texts(&shown)
+        .iter()
+        .filter(|t| t.starts_with("old "))
+        .count();
+    println!(
+        "bob shows {} rows: {owed} not received yet, {old} expired ones",
+        shown.len()
+    );
+    assert_eq!(
+        owed, 0,
+        "PRODUCT: bob shows {owed} of alice's expired messages as not received yet; their expiry \
+         is his to reckon from the room's retention, and they are expired"
+    );
+    assert_eq!(
+        old, 0,
+        "PRODUCT: bob shows {old} of alice's expired messages"
+    );
+    let next = "alice, after bob joined";
+    post(alice, &room, next);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !texts(&read(bob, &room)).contains(&next) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: alice's next message never reached bob: her feed stopped at the expired \
+             ones\nbob shows: {:?}",
+            read(bob, &room)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    println!("bob reads alice's next message: {next:?}");
     stop_all(vec![alice_d, bob_d]);
     let joined = log_pages(bob);
     let (j_pages, j_bytes, j_small) = page_stats(&joined);

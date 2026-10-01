@@ -25,16 +25,21 @@
 //! binding's reason, and after a restart the room is open with nothing set aside. Arm and mode by
 //! the verifier (vox-0e-ver74).
 //!
-//! ## A payload stripped in transit ([`a_stripped_payload_is_refused_and_the_real_entry_arrives`])
+//! ## A body stripped in transit is owed ([`a_stripped_body_is_owed_and_asked_for_until_it_arrives`])
 //! Mallory runs as `strip-payload`: she serves every entry without its payload. The signature
-//! covers the skeleton only, so the stripped entry verifies; it used to be taken as held, filling
-//! its position with nothing: never logged, never rendered, never asked for again. Staging: Bob is
-//! stopped (SIGSTOP), Alice posts, Mallory gets it; Alice and the anchor (which holds the room's
-//! entries too) are stopped and Bob resumed, so Bob's only copy is Mallory's. Asserted:
-//! 1. Bob reads Alice's posts, the first one included (Mallory may serve that one too);
-//! 2. once Alice is back, Bob reads the post he first got from Mallory, and he refused her copy
-//!    (precondition, else CANNOT MEASURE: Bob had a session with Mallory while Alice was stopped);
-//! 3. and still does after his daemon restarts.
+//! covers the skeleton only, so the stripped entry verifies. v0.2.10 set it aside (V210-74); in
+//! v0.3.0 an honest peer serves payload-less skeletons too (retention), so the decider's rule holds
+//! (V030-10, 2026-10-01): the envelope is taken, and a body not received that has not expired by
+//! the receiver's own reckoning is owed, shown as "not received yet" and asked for on every sync.
+//! Staging: Bob is stopped (SIGSTOP), Alice posts twice, Mallory gets both; Alice and the anchor
+//! (which holds the room's entries too) are stopped and Bob resumed, so Bob's only copy is Mallory's.
+//! Asserted:
+//! 1. Bob reads Alice's first post (Mallory may serve that one too);
+//! 2. with Mallory his only source, Bob shows both posts as not received yet: the envelopes were
+//!    taken and Alice's feed goes on past the first (precondition, else CANNOT MEASURE: Bob had a
+//!    session with Mallory while Alice was stopped);
+//! 3. once Alice is back, Bob reads both, and shows nothing as not received yet;
+//! 4. and still reads them after his daemon restarts.
 //!
 //! ## A message lost before V210-73 is reported ([`a_message_lost_to_the_old_row_ids_is_reported`])
 //! Before V210-73 a reopened room resumed its row ids from its log rows alone, so its first post
@@ -50,8 +55,9 @@
 //!   arm 1 goes red at (4), the entry was stored;
 //! - that, and a refusal after it is held ending the pass as an error again: red at (2), the room's
 //!   sync is poisoned;
-//! - no refusal of a withheld payload: arm 2 goes red at (2), Bob holds an empty copy and never asks
-//!   again;
+//! - v0.2.10's Withheld rule (a payload-less entry set aside): the stripped arm goes red at (2);
+//! - a body not received taken as expired (never owed): the stripped arm goes red at (2), and Bob
+//!   never asks again;
 //! - no report of a lost message: arm 3 goes red;
 //! - no binding check before holding (`unclassifiable` answering `None` for governance): the
 //!   misbound arm goes red, the entry was stored.
@@ -87,6 +93,27 @@ fn arrives(m: &Member, room: &str, text: &str) -> Option<Duration> {
         std::thread::sleep(Duration::from_millis(250));
     }
     None
+}
+
+/// The entry hashes of the messages `m` shows as not received yet in `room` (V030-10), from the
+/// first column of `vox room read`.
+fn owed_rows(m: &Member, room: &str) -> Vec<String> {
+    let (ok, out, _) = m.vox(&["room", "read", room], None);
+    if !ok {
+        return Vec::new();
+    }
+    out.lines()
+        .filter(|l| l.ends_with(vox_core::node::api::NOT_RECEIVED_YET))
+        .filter_map(|l| l.split(' ').next().map(str::to_owned))
+        .collect()
+}
+
+/// The entry hash `m` shows `text` under in `room`, from the first column of `vox room read`.
+fn hash_of(m: &Member, room: &str, text: &str) -> Option<String> {
+    let (_, out, _) = m.vox(&["room", "read", room], None);
+    out.lines()
+        .find(|l| l.ends_with(text))
+        .and_then(|l| l.split(' ').next().map(str::to_owned))
 }
 
 /// `m`'s count of refused entries, from `from` or from anyone.
@@ -209,7 +236,7 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
 
 #[test]
 #[ignore = "real daemons against the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
-fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
+fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
     const MODE: &str = "strip-payload";
     watchdog::arm();
     let sender = mutant_sender();
@@ -243,27 +270,55 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
         bob.status()
     );
 
-    // ---- bob's only copy of alice's post is mallory's --------------------------------------
+    // ---- bob's only copy of alice's posts is mallory's --------------------------------------
     let sessions = |m: &Member| {
         let st = bob.status();
         counter(&st, "opened", Some(&m.fp)) + counter(&st, "admitted", Some(&m.fp))
     };
     let with_mallory = sessions(&mallory);
-    // Bob may have refused a stripped copy already, of the first post: only a new one counts.
-    let since = refused(&bob, Some(&mallory));
     bob_d.signal("-STOP");
-    let post = "alice, while bob was away";
-    alice.post(&room, post);
-    let held = arrives(&mallory, &room, post);
-    // The anchor holds the room's entries too, and would serve bob the whole one.
+    // Two, so the second shows whether alice's feed goes on past a body bob does not have.
+    let posts = [
+        "alice, while bob was away",
+        "alice, again while bob was away",
+    ];
+    for p in posts {
+        alice.post(&room, p);
+    }
+    let held = posts.iter().all(|p| arrives(&mallory, &room, p).is_some());
+    // Which entries they are, as alice shows them: what bob must show as not received yet.
+    let hashes: Vec<String> = posts
+        .iter()
+        .filter_map(|p| hash_of(&alice, &room, p))
+        .collect();
+    // The anchor holds the room's entries too, and would serve bob the whole ones.
     alice_d.signal("-STOP");
     anchor_d.signal("-STOP");
     bob_d.signal("-CONT");
     assert!(
-        held.is_some(),
-        "CANNOT MEASURE: mallory never had alice's post, so bob could not get it from her"
+        held,
+        "CANNOT MEASURE: mallory never had alice's posts, so bob could not get them from her"
     );
-    let refused = refused_by(&bob, Some(&mallory), since);
+    assert_eq!(
+        hashes.len(),
+        posts.len(),
+        "CANNOT MEASURE: alice's own read does not show her posts"
+    );
+    // **The envelopes are taken and the bodies are owed** (V030-10): bob shows both posts as not
+    // received yet, the second linked after the first, while mallory is his only source.
+    let owed_posts = |m: &Member| {
+        let owed = owed_rows(m, &room);
+        hashes.iter().filter(|h| owed.contains(h)).count()
+    };
+    let t = Instant::now();
+    let mut owed = 0;
+    while t.elapsed() < ARRIVES_WITHIN {
+        owed = owed_posts(&bob);
+        if owed >= posts.len() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let served = sessions(&mallory).saturating_sub(with_mallory);
     assert!(
         announced(&mallory_d, MODE),
@@ -275,25 +330,47 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
         "CANNOT MEASURE: bob had no session with mallory while alice was stopped\nbob's status: {}",
         bob.status()
     );
-
-    // ---- alice comes back: bob gets her post whole ------------------------------------------
-    alice_d.signal("-CONT");
-    anchor_d.signal("-CONT");
-    let took = arrives(&bob, &room, post);
-    println!("[proof] stripped: bob refused {refused} entr(ies) from mallory; alice's post reached him: {took:?}");
-    assert!(
-        took.is_some(),
-        "bob never read alice's post after mallory served it stripped: he holds an empty one\n\
-         bob's status: {}",
-        bob.status()
+    println!(
+        "[proof] stripped: with mallory his only source, bob shows {owed} of alice's {} posts as \
+         not received yet",
+        posts.len()
     );
     assert!(
-        refused >= 1,
-        "bob had {served} session(s) with mallory while alice was stopped and refused nothing"
+        owed >= posts.len(),
+        "PRODUCT: bob shows {owed} of alice's {} stripped posts as not received yet: an envelope \
+         without its body was set aside, or taken as expired\nbob reads: {:?}",
+        posts.len(),
+        bob.vox(&["room", "read", &room], None).1
+    );
+
+    // ---- alice comes back: bob asks again and gets her posts whole --------------------------
+    alice_d.signal("-CONT");
+    anchor_d.signal("-CONT");
+    for p in posts {
+        let took = arrives(&bob, &room, p);
+        println!("[proof] stripped: {p:?} reached bob whole: {took:?}");
+        assert!(
+            took.is_some(),
+            "PRODUCT: bob never read {p:?} once alice was back: the body he was owed was not \
+             asked for again\nbob reads: {:?}",
+            bob.vox(&["room", "read", &room], None).1
+        );
+    }
+    println!(
+        "[proof] stripped: bob reads:\n{}",
+        bob.vox(&["room", "read", &room], None).1
+    );
+    let left = owed_posts(&bob);
+    assert_eq!(
+        left,
+        0,
+        "PRODUCT: bob reads alice's posts and still shows {left} of them as not received yet\n\
+         bob reads: {:?}",
+        bob.vox(&["room", "read", &room], None).1
     );
     drop(bob_d);
     let _bob_d = bob.daemon(Some(&spec));
-    let reopened = arrives(&bob, &room, post);
+    let reopened = arrives(&bob, &room, posts[1]);
     println!("[proof] stripped: after a restart bob reads it: {reopened:?}");
     assert!(
         reopened.is_some(),

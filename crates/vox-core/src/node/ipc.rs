@@ -67,7 +67,9 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// v0.2.10's changes are carried at 7 without a bump, as v0.2.10 carried them at 5: `Rooms` is
 /// paged (an unpaged request is still read as the first page), and its new events
 /// (`SyncFailed`, `RoomNotRemembered`) are additive tags.
-pub const PROTOCOL_VERSION: u64 = 7;
+///
+/// 8: a row says whether its body is **not received yet** (V030-10, [`MessageRow::owed`]).
+pub const PROTOCOL_VERSION: u64 = 8;
 
 /// Largest frame accepted in either direction.
 ///
@@ -913,13 +915,14 @@ impl Frame {
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
                 for r in rows {
-                    e.array(6)
+                    e.array(7)
                         .bytes(&r.entry_hash)
                         .bytes(&r.author)
                         .uint(r.created_millis)
                         .text(&r.text)
                         .uint(r.arrival)
-                        .uint(u64::from(r.late));
+                        .uint(u64::from(r.late))
+                        .uint(u64::from(r.owed));
                 }
             }
             Frame::Order { entries } => {
@@ -1240,7 +1243,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rows = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedIpc("ipc row"))?;
-                if arity != 6 {
+                if arity != 7 {
                     return Err(Error::MalformedIpc("ipc row arity"));
                 }
                 rows.push(MessageRow {
@@ -1255,6 +1258,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                         .uint()
                         .map_err(|_| Error::MalformedBundle("ipc arrival"))?,
                     late: flag(d, "ipc late")?,
+                    owed: flag(d, "ipc owed")?,
                 });
             }
             return Ok(Frame::Rows { rows });
@@ -1356,6 +1360,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     text,
                     arrival,
                     late,
+                    owed: false,
                 },
             }
         }
@@ -2140,10 +2145,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     }
                 }
                 (Some(cursor), None) => {
+                    // A message not received yet has no arrival to read on from (V030-10): as a
+                    // cursor its `0` would re-deliver the whole room.
                     let Some(mark) = detail
                         .timeline
                         .iter()
-                        .find(|r| r.entry_hash == cursor)
+                        .find(|r| r.entry_hash == cursor && !r.owed)
                         .map(|r| r.arrival)
                     else {
                         return Frame::Error {

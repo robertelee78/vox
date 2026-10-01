@@ -612,6 +612,7 @@ fn row_json(
         "author": claim::b32(&r.author),
         "created_millis": r.created_millis,
         "text": r.text,
+        "owed": r.owed,
         "envelope": envelope,
         "parse_error": parse_error,
         "op": op,
@@ -634,13 +635,17 @@ fn after_cursor(
     match cursor {
         None => Ok(rows.iter().collect()),
         Some(c) => {
-            let mark = rows
-                .iter()
-                .find(|r| r.entry_hash == c)
-                .map(|r| r.arrival)
-                .ok_or_else(|| {
-                    AppError::Usage(format!("cursor {} is not in this room's timeline", id(&c)))
-                })?;
+            let row = rows.iter().find(|r| r.entry_hash == c).ok_or_else(|| {
+                AppError::Usage(format!("cursor {} is not in this room's timeline", id(&c)))
+            })?;
+            // A message not received yet has no arrival to read on from (V030-10).
+            if row.owed {
+                return Err(AppError::Usage(format!(
+                    "cursor {} is a message not received yet; read on from one that has arrived",
+                    id(&c)
+                )));
+            }
+            let mark = row.arrival;
             let mut newer: Vec<&vox_core::node::api::MessageRow> =
                 rows.iter().filter(|r| r.arrival > mark).collect();
             newer.sort_by_key(|r| r.arrival);
@@ -658,6 +663,15 @@ fn after_cursor(
 /// control character (a carriage return, an escape sequence) is shown escaped rather than
 /// passed to the terminal. `--json` needs none of this: each row is one JSON-escaped line.
 fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
+    // A message whose envelope is held and whose body is still asked for (V030-10).
+    if r.owed {
+        return format!(
+            "{} {} {}",
+            id(&r.entry_hash),
+            crate::ident::author_id(&r.author),
+            vox_core::node::api::NOT_RECEIVED_YET
+        );
+    }
     let mut text = String::with_capacity(r.text.len());
     for c in r.text.chars() {
         match c {
@@ -870,6 +884,11 @@ pub async fn tail(
     // Index everything, emit only what arrived after the cursor, in the order it arrived.
     let mut backlog: Vec<&vox_core::node::api::MessageRow> = Vec::new();
     for r in &all {
+        // A message not received yet has not arrived: it is emitted when its body does
+        // (V030-10), so it is not seen yet.
+        if r.owed {
+            continue;
+        }
         seen.insert(r.entry_hash);
         by_hash.insert(r.entry_hash, r.clone());
         if let Ok(e) = Envelope::parse(&r.text) {
@@ -889,7 +908,7 @@ pub async fn tail(
                        out: &mut std::io::StdoutLock<'_>,
                        ops: &mut vox_agentcomms::ops::OpIndex,
                        last: &mut Option<Digest32>| {
-        if !seen.insert(r.entry_hash) {
+        if r.owed || !seen.insert(r.entry_hash) {
             return;
         }
         let mut newly_conflicted = false;
@@ -1643,7 +1662,8 @@ pub async fn board(
                 "violations": violations,
                 "position": {
                     "entries": snap.rows.len(),
-                    "last": snap.rows.last().map(|r| claim::b32(&r.entry_hash)),
+                    // A cursor, so never a message not received yet (V030-10).
+                    "last": snap.rows.iter().rev().find(|r| !r.owed).map(|r| claim::b32(&r.entry_hash)),
                 },
                 "now_millis": snap.now_millis,
             })

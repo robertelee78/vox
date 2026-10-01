@@ -598,7 +598,8 @@ async fn drain(
     let me = client.me();
     let fresh: Vec<vox_core::node::api::MessageRow> = rows
         .iter()
-        .filter(|r| !is_own(r, me, &input.session_id))
+        // A message not received yet has nothing to say to the agent until it is (V030-10).
+        .filter(|r| !r.owed && !is_own(r, me, &input.session_id))
         .cloned()
         .collect();
 
@@ -643,7 +644,8 @@ async fn drain(
         // Nothing new: emit nothing at all rather than "no new messages". An
         // agent's context is not the place for a heartbeat, and a quiet room
         // should cost zero tokens per turn.
-        if let Some(last) = rows.last() {
+        // The cursor is never a message not received yet: it has no arrival (V030-10).
+        if let Some(last) = rows.iter().rev().find(|r| !r.owed) {
             let _ = save_cursor(paths, &room_key, &input.session_id, &last.entry_hash);
         }
         record_held();
@@ -667,7 +669,7 @@ async fn drain(
     // Bounded (PRD-001 D9): what did not fit is delivered next turn, so the cursor
     // moves only as far as the last message shown — or past everything when all of
     // it was.
-    let mut upto = rows.last();
+    let mut upto = rows.iter().rev().find(|r| !r.owed);
     if !fresh.is_empty() {
         let (text, shown) = render(&label, &fresh, notice.as_deref());
         context.push_str(&text);

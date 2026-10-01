@@ -65,7 +65,15 @@ pub struct MessageRow {
     /// It took its place above a row this node had already shown: it arrived late
     /// (ADR-023 decision 1).
     pub late: bool,
+    /// **Not received yet** (V030-10): this node holds the message's signed envelope and is still
+    /// asking for its body, which has not expired here. `text` is empty and `arrival` is `0`, so a
+    /// read from a cursor never yields it; the message replaces it when the body arrives.
+    pub owed: bool,
 }
+
+/// What a person is shown in place of a message whose body is owed ([`MessageRow::owed`],
+/// V030-10).
+pub const NOT_RECEIVED_YET: &str = "(not received yet)";
 
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -148,7 +148,7 @@ fn detail_of(ch: &ChannelState) -> ChannelDetail {
         local_name: ch.local_name().to_owned(),
         epoch: ch.epoch(),
         members: ch.members(),
-        timeline: ch.timeline().iter().map(row_of).collect(),
+        timeline: ch.shown_timeline().iter().map(row_of).collect(),
         order: ch.order_keys(),
         services: ch
             .services()
@@ -10219,6 +10219,7 @@ fn row_of(r: &Rendered) -> MessageRow {
         text: r.text.clone(),
         arrival: r.arrival,
         late: r.late,
+        owed: r.owed,
     }
 }
 

@@ -288,7 +288,11 @@ impl LiveCore {
                             },
                             // Displayed as a time of day, so seconds; the full precision is kept for ordering.
                             timestamp: r.created_millis / 1_000,
-                            body: Some(r.text.clone()),
+                            body: Some(if r.owed {
+                                vox_core::node::api::NOT_RECEIVED_YET.to_owned()
+                            } else {
+                                r.text.clone()
+                            }),
                             late: r.late,
                         })
                         .collect(),
