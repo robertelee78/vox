@@ -16,7 +16,7 @@ use vox_core::hash::Digest32;
 use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::nat::multiaddr::Multiaddr;
 use vox_core::nat::reachability::is_routable;
-use vox_core::node::actor::{Bind, Node, NodeConfig, NodeHandle};
+use vox_core::node::actor::{Bind, EventStreamItem, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome, Secret};
 use vox_core::node::link::{b32_decode, b32_encode, vox_hostname};
 use vox_core::node::paths::Paths;
@@ -655,36 +655,112 @@ pub async fn serve(
 ///
 /// One-shot: joining is a durable act recorded in the profile, so there is nothing to
 /// keep running. What makes the printed name resolve is `vox up` (decision 5).
+///
+/// `waiting` is kept on the step the join is in, so a `vox connect` stopped part-way says
+/// where it was (V210-85).
 pub async fn connect(
     node: &NodeHandle,
     url: &str,
     name: &str,
     room_passphrase: &str,
+    waiting: &Waiting,
 ) -> Result<(), AppError> {
-    let out = node
-        .apply(NodeCommand::JoinChannel {
-            link: url.to_owned(),
-            local_name: name.to_owned(),
-            // Canonicalization is the node's, at its one boundary — see
-            // `actor::room_passphrase`. Doing it here as well would be a second place
-            // for the two sides to disagree.
-            passphrase: Secret::new(room_passphrase.as_bytes().to_vec()),
-        })
-        .await;
+    // Taken before the command, so the join's first step is not raised before anyone listens.
+    let mut steps = node.subscribe();
+    waiting.on("the node to take the join");
+    let join = node.apply(NodeCommand::JoinChannel {
+        link: url.to_owned(),
+        local_name: name.to_owned(),
+        // Canonicalization is the node's, at its one boundary — see
+        // `actor::room_passphrase`. Doing it here as well would be a second place
+        // for the two sides to disagree.
+        passphrase: Secret::new(room_passphrase.as_bytes().to_vec()),
+    });
+    tokio::pin!(join);
+    let out = loop {
+        tokio::select! {
+            out = &mut join => break out,
+            item = steps.next() => match item {
+                Some(EventStreamItem::Event(NodeEvent::JoinStep { step })) => waiting.on(step),
+                Some(_) => {}
+                None => break (&mut join).await,
+            },
+        }
+    };
     if !out.is_done() {
         return Err(AppError::Usage(why_a_join_failed(node, out).await));
     }
-    let channel_id = loop {
-        match node.next_event().await {
-            Some(NodeEvent::Joined { channel_id, .. }) => break channel_id,
-            Some(ref other) => say_if_it_explains_a_failure(other),
-            None => return Err(AppError::Usage("the node stopped".into())),
-        }
-    };
+    // **`Done` is the join.** This waited on the event stream for `Joined`, with no bound — and
+    // that stream drops its oldest events under a burst, so a `Joined` lost there left `vox
+    // connect` waiting for good, saying nothing. The node raises `Joined` and the join's steps
+    // before it answers, so what they explain is already queued: say it, and take the room from
+    // the address the node just joined by.
+    while let Some(ev) = node.try_next_event() {
+        say_if_it_explains_a_failure(&ev);
+    }
+    let channel_id = vox_core::node::link::InviteLink::parse(url)
+        .map_err(|e| AppError::Usage(format!("joined, but the address no longer reads: {e}")))?
+        .channel_id;
     println!("joined. reachable as {}", vox_hostname(&channel_id));
     println!("        run `vox up` on this machine to make that name resolve");
     let _ = node.apply(NodeCommand::Shutdown).await;
     Ok(())
+}
+
+/// What a one-shot verb is waiting for, and since when: what it says when it is stopped before it
+/// finishes (V210-85).
+///
+/// A `vox connect` stopped by Ctrl-C, a SIGTERM or a hangup died on the signal's default action and
+/// printed nothing, so a person — or a proof reading its stderr — got a non-zero exit with no reason
+/// at all, after however long it had been joining. A SIGKILL cannot be answered; these can.
+pub struct Waiting {
+    started: Instant,
+    /// What the verb could not finish without.
+    outcome: &'static str,
+    now: std::sync::Mutex<(String, Instant)>,
+}
+
+impl Waiting {
+    /// Start the clock. `outcome` is what did not happen if the verb is stopped: `the room was not
+    /// joined`.
+    #[must_use]
+    pub fn new(outcome: &'static str) -> std::sync::Arc<Self> {
+        let now = Instant::now();
+        std::sync::Arc::new(Self {
+            started: now,
+            outcome,
+            now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+        })
+    }
+
+    /// The verb now waits for `what`.
+    pub fn on(&self, what: impl Into<String>) {
+        if let Ok(mut now) = self.now.lock() {
+            *now = (what.into(), Instant::now());
+        }
+    }
+
+    /// The error a verb stopped by `signal` ends with: how long it ran, what did not happen, and
+    /// what it had been waiting for, for how long. Exits 128 + the signal's number, as a shell
+    /// reports a process the signal killed.
+    #[must_use]
+    pub fn stopped_by(&self, signal: crate::app::StopSignal) -> AppError {
+        let (what, since) = self
+            .now
+            .lock()
+            .map(|n| (n.0.clone(), n.1))
+            .unwrap_or_else(|_| (String::from("something it cannot name"), self.started));
+        AppError::Refused {
+            code: signal.exit_code(),
+            message: format!(
+                "stopped by {} after {:.1}s — {}\n       it had waited {:.1}s for {what}",
+                signal.name(),
+                self.started.elapsed().as_secs_f64(),
+                self.outcome,
+                since.elapsed().as_secs_f64(),
+            ),
+        }
+    }
 }
 
 /// `vox up` — the local entry point: a SOCKS5 proxy carrying one room's services
@@ -875,15 +951,33 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
     // what to actually do. A paragraph is not a better error message than a sentence —
     // the first version of this fix was four lines of prose and read like documentation
     // at exactly the moment somebody is stuck.
-    let advice = join_advice(match out {
+    let fault = match out {
         Outcome::Failed(fault) => Some(fault),
         Outcome::Done | Outcome::Bound(_) => None,
-    });
+    };
+    let advice = join_advice_after(fault, &said.join("; "));
 
     if said.is_empty() {
         format!("cannot join: {advice}")
     } else {
         format!("cannot join: {} — {advice}", said.join("; "))
+    }
+}
+
+/// [`join_advice`], told what the join said about itself: `said` is its reason and its steps.
+///
+/// **A member reached and then silent is not a member never reached** (V210-85). A join exchange
+/// that ran out of time ends as `Unreachable`, the fault of a member nobody could reach, and its
+/// advice — "no member it knows could be reached … ask a member to come online" — sent a person to
+/// bring online a member that had been online and reached, and then stopped answering. A join that
+/// got as far as the exchange says so in its steps (`<member>: exchange …`).
+pub(crate) fn join_advice_after(fault: Option<Fault>, said: &str) -> &'static str {
+    let reached = said.contains(": exchange: ") || said.contains(": exchange (incl. solve) ");
+    match fault {
+        Some(Fault::Unreachable) if reached => {
+            "a member was reached, but did not answer the join exchange in time\n       your passphrase was never checked — this is not a verdict on it\n       the member may have gone offline part-way, or be too busy to answer; try again while it is online"
+        }
+        other => join_advice(other),
     }
 }
 
@@ -940,8 +1034,14 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::NotNetworked) => {
             "this node is not networked, or its identity is locked\n       nothing about the room is in question"
         }
-        Some(Fault::Locked | Fault::NoIdentity) => {
-            "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
+        // **Locked is not "no identity"** (V210-94). A join a lock cut short, or one asked of a
+        // locked node, has an identity to join as; it was told to run `vox id`, which would make
+        // a second one.
+        Some(Fault::Locked) => {
+            "this profile's identity is locked: a lock stopped the join, or it was locked already\n       unlock it (open `vox tui`, or start `vox daemon`), then run the join again"
+        }
+        Some(Fault::NoIdentity) => {
+            "this profile has no identity yet, so there is nobody to join as\n       run `vox id` to make one"
         }
         // Joining a room this node already holds used to say `Failed(IdentityExists)`.
         Some(Fault::AlreadyMember) => Fault::AlreadyMember.explain(),

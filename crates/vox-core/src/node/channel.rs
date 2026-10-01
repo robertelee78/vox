@@ -844,7 +844,7 @@ pub(crate) fn parse_authors(bytes: &[u8]) -> Result<BTreeMap<Digest32, Composite
 /// [`ReceiverChain::to_state`] blob (which carries its own author/chain binding).
 /// Secret-bearing, so the assembled buffer zeroizes on drop.
 fn receivers_bytes(receivers: &BTreeMap<(Digest32, u64), ReceiverChain>) -> Zeroizing<Vec<u8>> {
-    let mut e = Encoder::new();
+    let mut e = Encoder::for_secrets();
     e.array(2).uint(RECEIVERS_VERSION).array(receivers.len());
     for chain in receivers.values() {
         e.bytes(&chain.to_state());

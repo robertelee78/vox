@@ -317,6 +317,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Reopened { .. } => "holding a room that reopened",
         NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
+        NetEvent::LockSettled => "answering a lock that has settled",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::Stopped { .. } => "shutting the network down",
     }
@@ -844,6 +845,8 @@ enum NetEvent {
     /// The reopening has tried every room (#208). A room still marked as reopening would not
     /// open: it stays remembered, and closed. The unlock is answered now.
     ReopenFinished,
+    /// A lock has settled: nothing it stopped holds a secret any more (V210-94).
+    LockSettled,
     /// A forward's first dial finished (#215): bind the forward, or say why not, and answer the
     /// command.
     ForwardDialed {
@@ -1331,6 +1334,74 @@ fn test_stopped_delay_ms() -> Option<u64> {
     std::env::var(TEST_STOPPED_DELAY_ENV).ok()?.parse().ok()
 }
 
+/// **For proofs only.** When set, each blocking task that holds a secret (`secret_blocking`)
+/// waits this many milliseconds, holding what it was given, before it starts its work: a stand-in
+/// for a slow Argon2id or a large room, so a proof can lock while one runs (V210-94). Nothing a
+/// person runs sets it; unset, nothing changes.
+pub const TEST_SECRET_WORK_DELAY_ENV: &str = "VOX_TEST_SECRET_WORK_DELAY_MS";
+
+/// Run `work`, which holds a secret, on a blocking thread, and hold a read guard of `secret_work`
+/// until it is done and its result handed over; `None` if the thread panicked.
+///
+/// **A lock waits for these** (V210-94). A blocking thread cannot be aborted, so a lock that only
+/// aborted the task awaiting it left the thread running on with what it was given — a passphrase
+/// inside Argon2id, a room's key being opened — for up to one derivation after the node said it
+/// was locked. [`Node::lock_all`] takes the write side, which it gets only once every such thread
+/// has finished and dropped (zeroizing) its inputs. So each caller hands `work` only what that
+/// work needs, never the identity signer or a key it does not use, and keeps the rest with the
+/// task a lock aborts.
+async fn secret_blocking<T: Send + 'static>(
+    secret_work: &Arc<tokio::sync::RwLock<()>>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let held = Arc::clone(secret_work).read_owned().await;
+    let delay = std::env::var(TEST_SECRET_WORK_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let (done, result) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let _held = held;
+        if let Some(ms) = delay {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+        // Handed over, or dropped right here if the task that wanted it was aborted meanwhile:
+        // before the guard goes, since what `work` made may be a secret too.
+        let _ = done.send(work());
+    });
+    result.await.ok()
+}
+
+/// The identity's half of a room key's seal for `channel_id` ([`seal_off_actor`]), taken with
+/// the signer where the signer already is.
+fn id_factor_for(
+    signer: &crate::atrest::vault::VaultRootSigner,
+    channel_id: &Digest32,
+) -> crate::error::Result<zeroize::Zeroizing<[u8; crate::atrest::idfactor::FACTOR_ID_LEN]>> {
+    use crate::atrest::idfactor::IdentityFactor as _;
+    crate::atrest::idfactor::SignatureIdentityFactor::new(signer).factor_id(channel_id)
+}
+
+/// Seal `sek` under the identity's `factor_id` ([`id_factor_for`]) and `passphrase`, with the
+/// Argon2id half on a blocking thread ([`secret_blocking`]) that is given only the passphrase and
+/// the salt. No signer crosses into a thread a lock cannot stop, and the SEK stays with the
+/// caller's task, sealed once the passphrase's factor is back (V210-94).
+async fn seal_off_actor(
+    secret_work: &Arc<tokio::sync::RwLock<()>>,
+    factor_id: &[u8; crate::atrest::idfactor::FACTOR_ID_LEN],
+    sek: crate::atrest::sek::Sek,
+    passphrase: Secret,
+    argon2: Argon2Profile,
+) -> crate::error::Result<(crate::atrest::sek::Sek, crate::atrest::SekWrap)> {
+    let salt = crate::atrest::sek::fresh_salt()?;
+    let factor_pass = secret_blocking(secret_work, move || {
+        crate::atrest::sek::factor_pass(&passphrase, &salt, argon2)
+    })
+    .await
+    .unwrap_or(Err(Error::Argon2Failed))?;
+    let wrap = sek.seal_with_factors(factor_id, &factor_pass, &salt, argon2)?;
+    Ok((sek, wrap))
+}
+
 /// **For proofs only.** When set to `N`, the node loses the first `N` pairwise streams that
 /// carry a hello: it resets them unread, as a stream lost with its connection is, so the sender
 /// learns only that its key was not taken. The simultaneous-session proof uses it to force what a
@@ -1486,6 +1557,10 @@ struct Joiner {
     pow_params: Option<crate::join::pow::PowParams>,
     argon2: Argon2Profile,
     passphrase: Secret,
+    /// The node's [`secret_blocking`] guard: the seal's Argon2id runs under it.
+    secret_work: Arc<tokio::sync::RwLock<()>>,
+    /// Where each step is announced as it begins: see [`NodeEvent::JoinStep`].
+    events: broadcast::Sender<NodeEvent>,
 }
 
 /// A caller's reply carried by a task that [`Node::lock_all`] may abort (V210-76): answered
@@ -1559,6 +1634,11 @@ impl JoinSteps {
 }
 
 impl Joiner {
+    /// Say which step the join has begun, so a join stopped part-way can name it (V210-85).
+    fn begin(&self, step: String) {
+        let _ = self.events.send(NodeEvent::JoinStep { step });
+    }
+
     /// Dial a peer, and tell the actor at once so it serves the connection's streams — the
     /// responder talks to us over it during the join itself.
     async fn dial(
@@ -1681,6 +1761,7 @@ impl Joiner {
         let parsed = &self.parsed;
         let net = Arc::clone(&self.net);
         let t = std::time::Instant::now();
+        self.begin(format!("reaching a board ({} route(s))", self.routes.len()));
         // **Which side was unreachable is part of the answer (#192).** A board that never answered,
         // or stopped answering while it was read, is `BoardUnreachable`; `Unreachable` below is
         // kept for a join whose board answered and whose members did not.
@@ -1690,6 +1771,10 @@ impl Joiner {
         };
         steps.took("board", t);
         let t = std::time::Instant::now();
+        self.begin(format!(
+            "reading the room from board {}",
+            crate::node::network::short_id(board.peer_id())
+        ));
         let fetched = net.fetch_channel(&board, &parsed.channel_id, 0).await;
         steps.took(
             if fetched.is_ok() {
@@ -1770,6 +1855,10 @@ impl Joiner {
             .to_wire()
         };
         let t = std::time::Instant::now();
+        self.begin(format!(
+            "announcing this joiner to board {}",
+            crate::node::network::short_id(board.peer_id())
+        ));
         let announced = announce(&board, &prejoin_wire).await;
         if announced.is_err() {
             steps.took("announce to the board (failed)", t);
@@ -1788,6 +1877,7 @@ impl Joiner {
             let short = crate::node::network::short_id(responder);
             if responder_endpoints.is_empty() && board.peer_id() != responder {
                 let t = std::time::Instant::now();
+                self.begin(format!("waiting for member {short} to publish an address"));
                 let mut polls = 0u32;
                 let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
                 while tokio::time::Instant::now() < deadline {
@@ -1825,6 +1915,7 @@ impl Joiner {
                 Arc::clone(&board)
             } else {
                 let t = std::time::Instant::now();
+                self.begin(format!("dialling member {short}"));
                 let dialled = self.dial(responder, &responder_endpoints, false).await;
                 steps.took(&format!("{short}: dial"), t);
                 match dialled {
@@ -1871,6 +1962,10 @@ impl Joiner {
             }
             let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(dh);
             let t = std::time::Instant::now();
+            self.begin(format!(
+                "the join exchange with member {short} (this machine's proof of work, then \
+                 the member's answer)"
+            ));
             let exchanged = net
                 .start_join(&conn, ctx, &self.passphrase, signer, &ik)
                 .await;
@@ -1920,23 +2015,18 @@ impl Joiner {
             });
         };
         // The room key, sealed under the passphrase with production Argon2id — seconds of CPU,
-        // on a blocking thread and not the actor.
+        // on a blocking thread and not the actor. That thread gets the passphrase and nothing
+        // else (V210-94): the identity half of the key is taken here, where a lock's abort
+        // reaches, and so is the SEK.
         let sek = crate::atrest::sek::Sek::generate().map_err(|e| JoinerLost::of(fault_of(&e)))?;
-        let (signer, channel_id, passphrase, argon2) = (
-            Arc::clone(&self.signer),
-            parsed.channel_id,
-            self.passphrase.clone(),
-            self.argon2,
-        );
+        let factor_id = id_factor_for(&self.signer, &parsed.channel_id)
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        let (passphrase, argon2) = (self.passphrase.clone(), self.argon2);
         let t = std::time::Instant::now();
-        let sealed = tokio::task::spawn_blocking(move || {
-            let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
-            sek.seal(&factor, &channel_id, &passphrase, argon2)
-                .map(|wrap| (sek, wrap))
-        })
-        .await
-        .unwrap_or(Err(Error::Argon2Failed))
-        .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        self.begin("sealing the room key under the passphrase".to_owned());
+        let sealed = seal_off_actor(&self.secret_work, &factor_id, sek, passphrase, argon2)
+            .await
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
         steps.took("seal", t);
         Ok(JoinerWon {
             joined,
@@ -2273,14 +2363,18 @@ pub struct Node {
     join_slots: Arc<std::sync::Mutex<crate::node::joinslots::JoinSlots>>,
     /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
     verify_slots: Arc<tokio::sync::Semaphore>,
-    /// The join exchanges running right now, both sides of them, and the room creations sealing
-    /// their key (V210-76).
+    /// The join exchanges running right now, both sides of them, the room creations sealing
+    /// their key (V210-76), and the identity-passphrase checks (V210-94).
     ///
     /// Tracked rather than detached for one reason: each holds an `Arc<VaultRootSigner>`, and
     /// ADR-015 says a locked node holds no identity secrets. [`Node::lock_all`] aborts this set,
     /// so the last handle goes with the lock and "locked" keeps meaning *now* instead of *once
     /// this joiner gets bored*.
     join_tasks: tokio::task::JoinSet<()>,
+    /// Held for reading by every blocking thread that holds a secret ([`secret_blocking`]), and
+    /// taken for writing by [`Node::lock_all`], which so waits for each to finish and wipe what
+    /// it was given: an abort cannot stop a blocking thread (V210-94).
+    secret_work: Arc<tokio::sync::RwLock<()>>,
     /// The sync counters `vox status --json` reports (ADR-025 S0b).
     sync_book: crate::node::status::SharedSyncBook,
     /// Rooms this node is joining right now (their join is on a `Joiner` task).
@@ -2290,9 +2384,20 @@ pub struct Node {
     reopening: std::collections::BTreeSet<Digest32>,
     /// The reopening task, aborted at lock: it holds room keys, and a locked node holds none
     /// (ADR-015).
-    reopen_task: Option<tokio::task::AbortHandle>,
+    reopen_task: Option<tokio::task::JoinHandle<()>>,
     /// Unlock replies held until the reopening has finished (#208).
     unlock_waiters: Vec<oneshot::Sender<Outcome>>,
+    /// Locks begun whose settling — the wait for work still holding a secret — has not reported
+    /// back yet (`NetEvent::LockSettled`, V210-94). While any is, the node is *locking*: the
+    /// identity is already locked and refuses new work, but not every secret is gone yet.
+    locking: usize,
+    /// Lock replies held until the node has settled locked.
+    lock_waiters: Vec<oneshot::Sender<Outcome>>,
+    /// Whether a lock now settling found the node unlocked, so settling says `Locked`.
+    lock_was_unlocked: bool,
+    /// Unlocks asked for while locking, run once it has settled: an unlock in between would
+    /// start new work beside threads still holding the old secrets.
+    unlock_after_lock: Vec<(Secret, oneshot::Sender<Outcome>)>,
     /// The last `refresh_network_view` gave up on a busy room, so the view is behind and the tick
     /// rebuilds it. Atomic only because the refresh takes `&self`.
     view_stale: std::sync::atomic::AtomicBool,
@@ -2557,10 +2662,15 @@ impl Node {
             join_slots: crate::node::joinslots::JoinSlots::new(JOINS_IN_FLIGHT),
             verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
             join_tasks: tokio::task::JoinSet::new(),
+            secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
             reopening: std::collections::BTreeSet::new(),
             reopen_task: None,
             unlock_waiters: Vec::new(),
+            locking: 0,
+            lock_waiters: Vec::new(),
+            lock_was_unlocked: false,
+            unlock_after_lock: Vec::new(),
             view_stale: std::sync::atomic::AtomicBool::new(false),
             held_pairwise: Vec::new(),
             board_authors: BTreeMap::new(),
@@ -2718,14 +2828,33 @@ impl Node {
                     // told `Done` — `vox daemon`, which then opens its control socket — must not
                     // find a room it held still closed.
                     if let NodeCommand::Unlock { passphrase } = command {
-                        let outcome = self.unlock(&passphrase).await;
+                        if self.locking > 0 {
+                            self.unlock_after_lock.push((passphrase, reply));
+                        } else {
+                            self.unlock_and_answer(&passphrase, reply).await;
+                        }
                         self.note_if_stalled(name, started);
                         self.publish().await;
-                        if outcome.is_done() && self.reopen_task.is_some() {
-                            self.unlock_waiters.push(reply);
-                        } else {
-                            let _ = reply.send(outcome);
+                        continue;
+                    }
+                    // **A lock is answered once it has settled, and the actor does not wait for
+                    // that** (V210-94, and V210-71's rule that nothing slow stalls the actor). The
+                    // lock itself — the identity, the rooms, the tasks, the network — happens now;
+                    // waiting for work still holding a secret happens on a task of its own, which
+                    // reports `NetEvent::LockSettled`. Meanwhile the node answers everyone else and
+                    // says it is locking.
+                    if matches!(command, NodeCommand::Lock) && self.headless.is_none() {
+                        drop(self.lock_all().await);
+                        self.lock_waiters.push(reply);
+                        // What work finished just before the lock and queued for the actor — a
+                        // sealed room key and its passphrase, a joined room, a reopened room — is
+                        // handled now, not on a later turn: each is refused while locked and its
+                        // secrets dropped, and until then they sat in this queue after the lock.
+                        while let Ok(event) = net_rx.try_recv() {
+                            self.handle_net(event).await;
                         }
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
                         continue;
                     }
                     let outcome = self.handle(command).await;
@@ -2788,7 +2917,12 @@ impl Node {
         // Channel closed or shutdown: lock (wipe every SEK + the signer) and stop.
         let store = self.log_store();
         self.stop_network().await;
-        self.lock_all().await;
+        // Here the actor does wait for the lock to settle: it is stopping, and `Done` means gone.
+        let _ = self.lock_all().await.await;
+        for (_, reply) in std::mem::take(&mut self.unlock_after_lock) {
+            let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
+        }
+        self.settle_lock().await;
         self.publish().await;
         let _ = self.event_tx.send(NodeEvent::Shutdown);
         // **`Done` means gone.** `Shutdown` used to be answered before any of the above ran, and
@@ -2826,7 +2960,8 @@ impl Node {
                 if self.headless.is_some() {
                     return Outcome::Failed(Fault::NoIdentity);
                 }
-                self.lock_all().await;
+                // Not reached for a node with an identity: `run` answers its lock once it settles.
+                drop(self.lock_all().await);
                 Outcome::Done
             }
             NodeCommand::AddAnchors { anchors } => {
@@ -3014,7 +3149,7 @@ impl Node {
                 if let Err(e) = self.load_prekeys(now) {
                     // The identity is usable but the ring is not: lock again rather
                     // than run without key-agreement keys.
-                    self.lock_all().await;
+                    drop(self.lock_all().await);
                     // The passphrase was just proved by the vault, so a blob that will not open
                     // is not a wrong passphrase (V210-40).
                     return Outcome::Failed(match e {
@@ -3023,7 +3158,7 @@ impl Node {
                     });
                 }
                 if let Err(e) = self.start_network() {
-                    self.lock_all().await;
+                    drop(self.lock_all().await);
                     return Outcome::Failed(fault_of(&e));
                 }
                 let _ = self.event_tx.send(NodeEvent::Unlocked);
@@ -4037,6 +4172,7 @@ impl Node {
                 self.reopening.remove(&channel_id);
                 let _ = self.forget_open(&channel_id);
             }
+            NetEvent::LockSettled => self.settle_lock().await,
             NetEvent::ReopenFinished => {
                 self.reopening.clear();
                 self.reopen_task = None;
@@ -4167,6 +4303,10 @@ impl Node {
                         let _ = self.event_tx.send(NodeEvent::JoinSteps {
                             joined: true,
                             steps: won.steps.render(),
+                        });
+                        let _ = self.event_tx.send(NodeEvent::JoinStep {
+                            step: "making the room here and publishing this member on its boards"
+                                .to_owned(),
                         });
                         self.finish_join_channel(*parsed, local_name, passphrase, now, me, won)
                             .await
@@ -5342,6 +5482,8 @@ impl Node {
             pow_params: self.pow_params,
             argon2: self.argon2,
             passphrase: passphrase.clone(),
+            secret_work: Arc::clone(&self.secret_work),
+            events: self.event_tx.clone(),
         };
         let tx = self.net_tx.clone();
         // **Tracked, so a lock aborts it** (V210-76). The joiner holds the vault signer, the
@@ -8179,19 +8321,26 @@ impl Node {
         );
     }
 
-    async fn lock_all(&mut self) {
+    /// Lock now, and settle off the actor.
+    ///
+    /// Everything the actor holds goes at once: the rooms' keys, the tasks holding the identity
+    /// (aborted), the network, the identity itself. What no abort reaches — a blocking thread
+    /// still holding a secret, an aborted task not yet polled — is waited for by a task of its
+    /// own, which then reports `NetEvent::LockSettled` (V210-94). The actor does not wait for it:
+    /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
+    /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
+    async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         let was_unlocked = self.profile.as_ref().is_some_and(Profile::is_unlocked);
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
-        // Abort the join exchanges first. Each holds an `Arc<VaultRootSigner>` and an
-        // `Arc` of the ring below, so locking while one runs would otherwise mean the
-        // secrets outlive the lock — for however long a joiner felt like waiting. Aborting
-        // drops both at the task's next await point, which is what makes ADR-015's
-        // lock/zeroize still true now that the exchange runs off the actor.
+        // Abort the join exchanges and the reopening (#208): each holds the identity or room keys.
+        // An aborted task drops what it holds only when it is next polled, so they are collected
+        // by the settling task below, not here.
         self.join_tasks.abort_all();
-        // The reopening holds room keys too: stopped, and nothing it opened is held (#208).
-        if let Some(task) = self.reopen_task.take() {
+        let aborted = std::mem::take(&mut self.join_tasks);
+        let reopening = self.reopen_task.take();
+        if let Some(task) = &reopening {
             task.abort();
         }
         self.reopening.clear();
@@ -8208,9 +8357,6 @@ impl Node {
         for reply in std::mem::take(&mut self.unlock_waiters) {
             let _ = reply.send(Outcome::Done);
         }
-        // Awaited, not polled: `try_join_next` collects only tasks that have already finished, and
-        // an aborted one drops its handles — the signer, the ring, the store — at its next await.
-        while self.join_tasks.join_next().await.is_some() {}
         // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
         // no key-agreement material (ADR-015 lock/zeroize).
         self.prekeys = None;
@@ -8234,8 +8380,63 @@ impl Node {
         if let Some(p) = self.profile.as_mut() {
             p.lock();
         }
-        if was_unlocked {
+        self.lock_was_unlocked |= was_unlocked;
+        self.locking += 1;
+        let (settled, on_settled) = oneshot::channel();
+        let secret_work = Arc::clone(&self.secret_work);
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let mut aborted = aborted;
+            if let Some(task) = reopening {
+                let _ = task.await;
+            }
+            while aborted.join_next().await.is_some() {}
+            // And the blocking threads those tasks started, which no abort reaches: an Argon2id
+            // seal with the room passphrase, a passphrase check, a room being reopened with its
+            // key. Each holds the read side until it has finished and dropped what it was given,
+            // so taking the write side is waiting for the last of them. Nothing new starts
+            // meanwhile: the identity is locked, and an unlock waits for this.
+            drop(secret_work.write().await);
+            let _ = settled.send(());
+            let _ = tx.send(NetEvent::LockSettled).await;
+        });
+        on_settled
+    }
+
+    /// A lock's settling reported back ([`Self::lock_all`]): once the last has, the node is
+    /// locked. Its lock commands are answered, `Locked` is said, and the unlocks asked for
+    /// meanwhile run.
+    async fn settle_lock(&mut self) {
+        self.locking = self.locking.saturating_sub(1);
+        if self.locking > 0 {
+            return;
+        }
+        // The view first: whoever is told the lock is done reads a locked view.
+        self.publish().await;
+        for reply in std::mem::take(&mut self.lock_waiters) {
+            let _ = reply.send(Outcome::Done);
+        }
+        if std::mem::take(&mut self.lock_was_unlocked) {
             let _ = self.event_tx.send(NodeEvent::Locked);
+        }
+        for (passphrase, reply) in std::mem::take(&mut self.unlock_after_lock) {
+            self.unlock_and_answer(&passphrase, reply).await;
+        }
+    }
+
+    /// Unlock, and answer `reply` — at once, or once the rooms it held are held again (#208):
+    /// they reopen off the actor so the node answers everyone meanwhile, but a caller told `Done`
+    /// — `vox daemon`, which then opens its control socket — must not find a room it held still
+    /// closed.
+    async fn unlock_and_answer(&mut self, passphrase: &Secret, reply: oneshot::Sender<Outcome>) {
+        let outcome = self.unlock(passphrase).await;
+        // The view first, as for every command: a caller told `Done` reads the view at once (the
+        // trust keyring, the rooms) and must find the unlock in it.
+        self.publish().await;
+        if outcome.is_done() && self.reopen_task.is_some() {
+            self.unlock_waiters.push(reply);
+        } else {
+            let _ = reply.send(outcome);
         }
     }
 
@@ -8270,21 +8471,28 @@ impl Node {
     /// Begin creating a room: the genesis here, the Argon2id seal on a blocking thread, and the
     /// reply carried to `NetEvent::ChannelSealed`. Any failure before the seal answers at once.
     /// Check the identity passphrase on a blocking thread and answer `reply` from there.
-    fn begin_verify_passphrase(&self, passphrase: Secret, reply: oneshot::Sender<Outcome>) {
+    fn begin_verify_passphrase(&mut self, passphrase: Secret, reply: oneshot::Sender<Outcome>) {
         let Some(profile) = self.profile.as_ref() else {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
             return;
         };
         let verifier = profile.passphrase_verifier();
         let slots = Arc::clone(&self.verify_slots);
+        let secret_work = Arc::clone(&self.secret_work);
         // Waiting for a slot happens here, off the actor; the check itself on a blocking
-        // thread, holding the slot until it is done.
-        tokio::spawn(async move {
+        // thread, holding the slot until it is done. Tracked, so a lock stops a check still
+        // waiting for its slot, and waits for one running (V210-94): each holds the identity
+        // passphrase, and a running one the identity it unlocks to compare.
+        let reply = AnsweredIfAborted(Some(reply));
+        self.reap_join_tasks();
+        self.join_tasks.spawn(async move {
             let Ok(slot) = slots.acquire_owned().await else {
-                let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
+                if let Some(reply) = reply.into_reply() {
+                    let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
+                }
                 return;
             };
-            let outcome = tokio::task::spawn_blocking(move || {
+            let outcome = secret_blocking(&secret_work, move || {
                 let _slot = slot;
                 match verifier.verify(&passphrase) {
                     Ok(()) => Outcome::Done,
@@ -8293,7 +8501,9 @@ impl Node {
             })
             .await
             .unwrap_or(Outcome::Failed(Fault::Internal));
-            let _ = reply.send(outcome);
+            if let Some(reply) = reply.into_reply() {
+                let _ = reply.send(outcome);
+            }
         });
     }
 
@@ -8320,8 +8530,13 @@ impl Node {
                 return;
             }
         };
-        let signer = match profile.signer_arc() {
-            Ok(s) => s,
+        // The identity's half of the seal is taken here, on the actor, so the task below never
+        // holds the signer (V210-94).
+        let factor_id = match profile
+            .signer()
+            .and_then(|signer| id_factor_for(signer, &genesis.channel_id()))
+        {
+            Ok(f) => f,
             Err(e) => {
                 let _ = reply.send(Outcome::Failed(fault_of(&e)));
                 return;
@@ -8329,20 +8544,16 @@ impl Node {
         };
         let argon2 = self.argon2;
         let tx = self.net_tx.clone();
-        let channel_id = genesis.channel_id();
+        let secret_work = Arc::clone(&self.secret_work);
         let seal_passphrase = passphrase.clone();
-        // Tracked, so a lock aborts it: it holds the signer (V210-76). The seal itself runs on a
-        // blocking thread, which cannot be interrupted; its result is dropped with the task.
+        // Tracked, so a lock aborts it: it holds the room key (V210-76). The Argon2id half runs
+        // on a blocking thread, which cannot be interrupted, so the lock waits for that
+        // (`secret_blocking`); it holds the passphrase alone.
         let reply = AnsweredIfAborted(Some(reply));
         self.reap_join_tasks();
         self.join_tasks.spawn(async move {
-            let sealed = tokio::task::spawn_blocking(move || {
-                let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
-                sek.seal(&factor, &channel_id, &seal_passphrase, argon2)
-                    .map(|wrap| (sek, wrap))
-            })
-            .await
-            .unwrap_or(Err(Error::Argon2Failed));
+            let sealed =
+                seal_off_actor(&secret_work, &factor_id, sek, seal_passphrase, argon2).await;
             let Some(reply) = reply.into_reply() else {
                 return;
             };
@@ -8494,10 +8705,13 @@ impl Node {
         }
         self.reopening.extend(rooms.iter().map(|(id, _, _)| *id));
         let tx = self.net_tx.clone();
+        let secret_work = Arc::clone(&self.secret_work);
         let task = tokio::spawn(async move {
             for (id, sek, passphrase) in rooms {
                 let store = Arc::clone(&store);
-                let opened = tokio::task::spawn_blocking(move || {
+                // The room's key and passphrase go to a blocking thread, which a lock waits for
+                // (V210-94).
+                let opened = secret_blocking(&secret_work, move || {
                     match store.get_sek_wrap(&id) {
                         Ok(Some(_)) => {}
                         Ok(None) => return Some(Err(())),
@@ -8511,13 +8725,13 @@ impl Node {
                 })
                 .await;
                 let event = match opened {
-                    Ok(Some(Ok(channel))) => NetEvent::Reopened {
+                    Some(Some(Ok(channel))) => NetEvent::Reopened {
                         channel_id: id,
                         channel: Box::new(channel),
                     },
-                    Ok(Some(Err(()))) => NetEvent::ReopenGone { channel_id: id },
+                    Some(Some(Err(()))) => NetEvent::ReopenGone { channel_id: id },
                     // A room that exists but will not open stays remembered and closed.
-                    Ok(None) | Err(_) => continue,
+                    Some(None) | None => continue,
                 };
                 if tx.send(event).await.is_err() {
                     return;
@@ -8525,7 +8739,7 @@ impl Node {
             }
             let _ = tx.send(NetEvent::ReopenFinished).await;
         });
-        self.reopen_task = Some(task.abort_handle());
+        self.reopen_task = Some(task);
     }
 
     async fn open_channel(&mut self, channel_id: &Digest32, passphrase: &Secret) -> Outcome {
@@ -9010,7 +9224,8 @@ impl Node {
             fingerprint: p.fingerprint(),
             created: p.created(),
         });
-        let locked = !self.profile.as_ref().is_some_and(Profile::is_unlocked);
+        // Locked once the lock has settled; until then, locking (V210-94).
+        let locked = !self.profile.as_ref().is_some_and(Profile::is_unlocked) && self.locking == 0;
         let channels = self
             .profile
             .as_ref()
@@ -9036,6 +9251,7 @@ impl Node {
         self.view_tx.send_replace(NodeView {
             identity,
             locked,
+            locking: self.locking > 0,
             mlock_active: true,
             listening,
             anchoring: Vec::new(),
@@ -9084,7 +9300,8 @@ impl Node {
             fingerprint: p.fingerprint(),
             created: p.created(),
         });
-        let locked = !self.profile.as_ref().is_some_and(Profile::is_unlocked);
+        // Locked once the lock has settled; until then, locking (V210-94).
+        let locked = !self.profile.as_ref().is_some_and(Profile::is_unlocked) && self.locking == 0;
         let listening = self
             .net
             .as_ref()
@@ -9176,6 +9393,7 @@ impl Node {
         let view = NodeView {
             identity,
             locked,
+            locking: self.locking > 0,
             mlock_active,
             listening,
             channels,

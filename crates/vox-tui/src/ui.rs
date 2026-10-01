@@ -320,7 +320,13 @@ fn pane_block(title: &str, focus: bool) -> Block<'_> {
 }
 
 fn render_status_bar(frame: &mut Frame, area: Rect, vm: &ViewModel) {
-    let lock = if vm.locked { "LOCKED" } else { "unlocked" };
+    let lock = if vm.locking {
+        "locking… waiting for work that holds a secret to finish"
+    } else if vm.locked {
+        "LOCKED"
+    } else {
+        "unlocked"
+    };
     let mlock = if vm.mlock_active {
         String::new()
     } else {
