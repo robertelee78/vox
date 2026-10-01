@@ -619,6 +619,71 @@ impl std::fmt::Display for Fault {
     }
 }
 
+/// A fault's name and its way back from one, made from **one list** (V210-114).
+///
+/// A daemon names the fault of a failed join over its control socket (`Failed(ProfileBusy)`),
+/// and `vox room join` turns the name back into the fault to say what it means. That was a table
+/// of its own in the CLI, and every fault added after it was written fell out of it unseen:
+/// `ProfileBusy`, `IdentityFileUnwritable` and `NotAdmitted` reached the person as a bare
+/// `Failed(…)`, not as their cause. Here [`Fault::name`]'s match is exhaustive, so a fault that is
+/// not on the list does not build, and [`Fault::from_name`] is made from the same list.
+macro_rules! fault_names {
+    ($($fault:ident),* $(,)?) => {
+        impl Fault {
+            /// This fault's name, as its `Debug` writes it: what crosses the control socket.
+            #[must_use]
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Fault::$fault => stringify!($fault),)*
+                }
+            }
+
+            /// The fault named `name` (as [`Fault::name`] gives it), if there is one.
+            #[must_use]
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $(stringify!($fault) => Some(Fault::$fault),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+fault_names!(
+    NoIdentity,
+    IdentityExists,
+    Locked,
+    WrongPassphrase,
+    UnknownChannel,
+    ChannelNotOpen,
+    TooLong,
+    KeyringFull,
+    Storage,
+    ProfileBusy,
+    IdentityFileUnwritable,
+    SealedUnreadable,
+    ShuttingDown,
+    NotNetworked,
+    BadLink,
+    RoomNotOnBoard,
+    BoardUnreachable,
+    Unreachable,
+    SolveTooSlow,
+    MembersBusy,
+    Refused,
+    NotAdmitted,
+    NotConsented,
+    StillTrusted,
+    NotLoopback,
+    AddressInUse,
+    AlreadyMember,
+    NotAServiceRoom,
+    NotOffered,
+    NoSuchForward,
+    Internal,
+);
+
 /// The result of a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
