@@ -1,0 +1,25 @@
+name: diag-r41
+on:
+  push:
+    branches: ['ac-fix98/**']
+jobs:
+  r41:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      VOX_PERF_ONLY: "1 Gbit/s"
+    steps:
+      - if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+      - uses: actions/checkout@v4
+      - run: cargo build --release -p vox-tui --tests --bins 2>&1 | tail -3
+      - run: cargo test --release -p vox-tui --test perf_r41_tunnel_throughput_proof -- --ignored > r41.log 2>&1 || true
+      - run: grep -E '^R41|^PRODUCT|^APPARATUS|CANNOT|panicked|test result' r41.log | cut -c1-900
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r41-${{ matrix.os }}
+          path: r41.log
