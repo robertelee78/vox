@@ -687,7 +687,24 @@ fn sync_dir(dir: &Path) -> Result<(), AppError> {
 /// A power loss in between left an empty or partial file under the name `vox` or `.vox-previous`:
 /// the one binary that had to survive. Every copy that is about to be renamed goes through here.
 /// `mode`, when given, is set before the flush, so the flush covers it too.
+///
+/// **A leftover at `to` is removed first** (V210-83). `to` is always a partial name, so whatever
+/// is there is scratch from a transition that was cut short. `fs::copy` carries the source's mode,
+/// and the download is `0555`, so a cut-short copy left a read-only partial that the next copy
+/// could not open for writing: every later `vox update` failed with a bare "Permission denied".
+/// Removing it needs only the directory to be writable, which the rename after it needs anyway.
 fn copy_durably(from: &Path, to: &Path, mode: Option<u32>) -> Result<(), AppError> {
+    match fs::remove_file(to) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(usage(format!(
+                "cannot clear {}, left over from an update that was cut short: {e}\n       \
+                 remove it by hand, then run this again",
+                to.display()
+            )))
+        }
+    }
     fs::copy(from, to).map_err(AppError::Io)?;
     if let Some(mode) = mode {
         fs::set_permissions(to, fs::Permissions::from_mode(mode)).map_err(AppError::Io)?;
