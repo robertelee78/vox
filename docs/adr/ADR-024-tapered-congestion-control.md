@@ -163,7 +163,8 @@ sustained lateness does. R41's arms are therefore to print the emulator's latene
 arm is CANNOT MEASURE when the emulator ran at least 4 ms late in more than 10% of its judged
 seconds, or in its median second, as well as when any second ran more than 25 ms late (the bound
 R41's raw-TCP links use). A bound on the worst second alone would make nearly every arm CANNOT
-MEASURE on a machine doing ordinary work: the worst second of every 200 Mbit/s spike run was 8–19 ms.
+MEASURE on a machine doing ordinary work: the worst half-second window of tree B's 200 Mbit/s runs
+was 9–19 ms late (138 ms in `cong-shallow-bbr-i`), and tree A's reached 22 ms.
 The 10% is to be calibrated from the per-arm counts R41 prints. The tier-2 rows give the loss
 trend the loss share the tier-1 run on the same link measured, as tier 2 is to take it on entry.
 
@@ -267,9 +268,11 @@ by the same trend test with a wider margin:
   through at least 20 rounds and 2 s in which no queue holds for two rounds in a row. That loss share
   is recorded as the trial's baseline. Not the 8-round share and not "no queue in any round"
   (fix-adr024-bbr's trace at 5% random loss, `runs/voxbbr/trace5.txt` with `r41-5pct.log`): the
-  8-round share swung between 0.000 and 0.138, so a streak of rounds at the cap never passed 7 of the
+  8-round share swung between 0.000 and 0.143, so a streak of rounds at the cap never passed 7 of the
   20 it needed, and single rounds 39.4 ms and 23.7 ms long on a 10.6 ms base reset it; tier 2 never
-  climbed and the 5%-loss arm read 1.42×. Tier 3 starts in BBR's steady state (ProbeBW) at the current
+  climbed, and the 5%-loss arm read 1.42× (that R41 run as a whole ended CANNOT MEASURE because the
+  tunnel fell back to a relay during it, so the 1.42× is not a measurement of tier 2; it shows only
+  that tier 3 was never entered). Tier 3 starts in BBR's steady state (ProbeBW) at the current
   delivery rate, round trip and window, never in Startup, whose 2.885× gain would breach the trial's
   bound.
 - **Loss that grows leaves tier 3, at any time in it, not only during the trial:** the share over the
@@ -279,13 +282,17 @@ by the same trend test with a wider margin:
 - **A queue leaves tier 3 (rule 3): UNMEASURED; its test is an obligation of M24.4.** Tier 3 needs a
   queue test of its own, because BBR stands a queue of its own and the tier-2 test threw it out within
   a second with no other flow (fix-adr024-bbr). The candidate test, the last round's minimum round
-  trip at or above `1.25 × max(base, window ÷ delivery rate) + 4 ms` held for two rounds, **does not
-  yet work**: in the solo run committed as `runs/voxbbr/lossy-bbr.log` it read a queue in 22 of 68
-  samples, up to 4 in a row, with Vox alone; and for a window-limited flow `window ÷ delivery rate` is
-  about the current round trip, so the test cancels itself (ac-verm241). M24.4 is to fix the test
-  (for instance with BBR's max-filtered bottleneck bandwidth as the rate) and prove both halves on the
-  shipped binary: it stays quiet with Vox alone, and it fires on the shared ¼-BDP arm. Until it does,
-  ADR-024 makes no claim about rule 3 in tier 3.
+  trip at or above `1.25 × max(base, window ÷ delivery rate) + 4 ms` held for two rounds, where the
+  rate is BBR's max-filtered bottleneck bandwidth, is **unproven**. The solo run committed as
+  `runs/voxbbr/lossy-bbr.log` does not test it: that run carried an earlier test (base +
+  max(4 ms, 1.5 × base)), which read a queue in 22 of 68 samples with Vox alone and was dropped for it
+  (fix-adr024-bbr). M24.4 is to prove on the shipped binary that the test stays quiet with Vox alone
+  and fires when a competing flow's queue builds. Because BBR's own window (about two
+  bandwidth-delay products) can raise the round trip by about one base round trip, no delay test
+  that is quiet with Vox alone can fire where the bottleneck holds a queue of one bandwidth-delay
+  product or less; on such buffers the guard is the loss check above, and whether the ¼-BDP arm or a
+  deeper one is where rule 3 must fire is to be settled in M24.4. Until then ADR-024 makes no claim
+  about rule 3 in tier 3.
 - **How tier 3 paces.** quinn-proto 0.11 paces every connection from the window and the smoothed
   round trip; it never reads a controller's pacing rate (`pacing_rate` is reported in metrics only).
   So `VoxBbr`'s gains, including its probing cycle, are to act through its window alone, and its
