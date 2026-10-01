@@ -2,9 +2,43 @@
 
 **Status**: implemented and composed — all four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`, `crates/vox-core/src/node/{network,coordstream,circuitstream}.rs`, `crates/vox-core/src/transport/mux.rs`), proved against simulated RFC 4787 NATs; rung 2 complete including UPnP-IGD (proved against a specification-faithful in-process gateway, real-router validation pending); DHT not started (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-09-24 — each circuit's relay is recorded where the circuit is attached (`MuxSocket::attach_via`), so `vox status` names the relay carrying a relayed path (PRD-001 R35). 2026-09-24 — relay circuits carry the inner QUIC packets as **datagrams** on flows bound to each leg's circuit stream, not as frames on the stream (ADR-022 M22.2); the circuit-stream note below says what changed and why. 2026-09-21 — recorded that **preferring a direct path is deliberate and address privacy is not a goal**; a relay-mandatory "location-hidden" mode was specified and reverted the same day (see the Decision). 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
+**Updated**: 2026-10-01 — **the anchor principle restated** (a restatement of the original design, not a new decision): an anchor only bridges hosts both behind NAT that cannot otherwise find each other, and no create, serve, invite, join or connect requires one; prose that had drifted from it (Context (c), the Decision's 2-member sentence, Bootstrap, the honest limit, Consequences) amended to match. 2026-09-24 — each circuit's relay is recorded where the circuit is attached (`MuxSocket::attach_via`), so `vox status` names the relay carrying a relayed path (PRD-001 R35). 2026-09-24 — relay circuits carry the inner QUIC packets as **datagrams** on flows bound to each leg's circuit stream, not as frames on the stream (ADR-022 M22.2); the circuit-stream note below says what changed and why. 2026-09-21 — recorded that **preferring a direct path is deliberate and address privacy is not a goal**; a relay-mandatory "location-hidden" mode was specified and reverted the same day (see the Decision). 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
+
+## The anchor principle, restated (2026-10-01)
+
+**This restates the original design; it is not a new decision.** It has been the design since the
+first line of code: the Decision below (2026-06-19) prefers a direct path at every rung, lets any
+member serve as rendezvous, and brings in the user's own always-on node only for the residual pair
+that cannot otherwise meet. It is restated here because later prose, code and issue text drifted
+toward treating an anchor as a step every room needs. In the decider's words (2026-10-01):
+
+- "anchors effectively bridge hosts that can't otherwise find each other"
+- "for all other use cases, direct is fine, sans anchor"
+- "an anchor is only required for the initial Rendezvous for two hosts that are both behind NAT --
+  it shouldn't strictly always be required to join/create a room"
+
+So:
+
+- An anchor **MUST** be needed only to bridge two hosts that are both behind NAT and cannot otherwise
+  find or reach each other.
+- Creating, serving, inviting, joining and connecting **MUST NOT** require an anchor. When the peer
+  can be reached directly (an address in the link, a working port mapping, the same LAN), the
+  connection goes direct: no anchor, no wait for one, and no failure because one is absent.
+- An invite link **MUST** always name the inviting host, so a guest who can reach it directly never
+  depends on an anchor.
+- When an anchor is missing or down, the product **MUST** say truthfully what that costs, and
+  **MUST NOT** call an anchor unreachable when it was reached, or blame an anchor the person never
+  needed.
+
+**Known departures, to be fixed in v0.2.10** (found by the 2026-10-01 anchor sweep, read in code on
+`integrate/v0.2.10` 69616f40; none is fixed by this change): `vox serve` with no anchor refuses on a
+host whose only addresses are private; a join stops at the first board that lacks the room instead of
+trying the host named in the link; an anchors file whose every line is unusable stops verbs that
+need no anchor; four or more anchors push the host out of the invite link; a join waits up to 20 s for
+the host's address on the board while the link carries it; and the join failure texts blame "the
+anchor" when the board was the host.
 
 ## Circuit addressing
 
@@ -54,17 +88,20 @@ The overlay must connect peers with no privileged central server (ADR-001), incl
 case: a two-member channel where both peers may be behind NAT with no third member to coordinate.
 Research established hard facts: (a) cold-start onto a DHT requires some well-known bootstrap node;
 (b) hole-punching always requires a reachable third party to coordinate, and both-symmetric-NAT
-pairs cannot be hole-punched at all; (c) no serverless messenger achieves zero-dedicated-
-infrastructure 2-party contact — a minimal coordinator is fundamentally required. The honest goal
+pairs cannot be hole-punched at all; (c) two parties that are both behind NAT
+cannot make first contact without a third party they can both reach; when either can be reached
+directly, no coordinator is needed. The honest goal
 is to *minimize and decentralize* that unavoidable layer, not eliminate it.
 
 ## Decision
 
 **Any node can serve; users run their own.** Vox ships so that any node may *optionally* act as a
 bootstrap / rendezvous / relay point. No Vox-operated infrastructure. For 3+-member channels, any
-other online member serves as rendezvous/relay (availability is emergent, ADR-001). For the
-2-member case, the user runs their own always-on node (e.g. a LAN box with a port-forward) as the
-anchor for their channels — user-controlled, open-source, ciphertext-only. This makes even the
+other online member serves as rendezvous/relay (availability is emergent, ADR-001). For a
+2-member room whose two hosts are both behind NAT and cannot otherwise find each other, the user runs
+their own always-on node (e.g. a LAN box with a port-forward) as the anchor that bridges them —
+user-controlled, open-source, ciphertext-only. Where either host can be reached directly, the two
+connect directly with no anchor. This makes even the
 dual-symmetric-NAT 2-member case work, and is strictly better than the author's prior Tor-onion+ssh
 approach (faster; signaling-only coordination, not a full relayed circuit; any peer, not a fixed
 hidden service).
@@ -123,8 +160,10 @@ against (ADR-005) — never as channel content. They carry the same caps/TTL/mul
 records. This is the executable schema for the "pre-join rendezvous record class" referenced by ADR-004.
 
 **Bootstrap (concrete, no third-party security dependency).** Cold-start onto the swarm uses a
-**configurable bootstrap set the user controls**: by default the user's own always-on node (the
-ADR-012 decision below) is their primary bootstrap + rendezvous; a user may additionally opt into a
+**configurable bootstrap set the user controls**: when the user runs an always-on node (the
+ADR-012 decision below), it is their primary bootstrap + rendezvous; with none, the invite link's
+addresses (the inviting node's own) are the bootstrap, and peers that can reach each other directly
+need nothing more; a user may additionally opt into a
 community/volunteer set. Vox does **not** treat any external/public DHT as a security dependency —
 bootstrap nodes only *introduce* peers (they can neither read traffic nor forge membership), so a
 hostile or absent bootstrap degrades availability but never confidentiality or authenticity. (This
@@ -134,8 +173,9 @@ replaces the earlier "possibly piggyback public DHT" wording, which was a false 
 gate + `(channelID, epoch)`-bound PoW join tokens + identity-bound log acceptance; the per-author
 quotas once listed here were removed 2026-09-24, PRD-001 R3), not by rate-limiting alone. There is no admin admission step (ADR-007).
 
-**Honest limit (documented).** Two peers both behind CGNAT/symmetric NAT with no IPv6 and no
-reachable coordinator cannot connect. Global joint-IPv6 probability for a random pair is only
+**Honest limit (documented).** Two peers both behind NAT, with no IPv6 path, no port mapping and no
+third party both can reach, cannot connect; if both NATs are symmetric, that third party must also
+relay. Global joint-IPv6 probability for a random pair is only
 ~0.17–0.20 today (rising), so a coordinator/relay remains mandatory for the residual — satisfied by
 the user's own node.
 
@@ -147,7 +187,8 @@ the user's own node.
 - Honest, defensible "serverless" posture: no *privileged* server, minimal user-runnable infra.
 
 ### Negative
-- Strict zero-infrastructure is impossible; some bootstrap/coordinator always exists.
+- Strict zero-infrastructure is impossible for two hosts both behind NAT; for them a
+  bootstrap/coordinator (an anchor) must exist. Every other pair needs none.
 - The pure 2-member, both-CGNAT, no-IPv6, no-own-node case is unsupported (documented limit).
 - IPv6/PCP availability is uneven; UPnP carries security baggage (mitigated in the client, see
   Implementation notes — the baggage is the router's, and the client follows nothing off the responder).

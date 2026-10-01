@@ -8,13 +8,13 @@ and is now genuinely built, with a real-binary proof. Decisions 1 and 9 are
 and not built**; what ships today implements the withdrawn model and is a live
 vulnerability until M17.6–M17.13 land.
 **Date**: 2026-09-21
+**Updated**: 2026-10-01 — anchor wording brought in line with ADR-012's restated anchor principle (an anchor only bridges hosts both behind NAT; nothing else requires one): decision 8's reachability table, and what "cannot be reached" means for `vox serve`'s refusal. 2026-09-24 — PRD-001: refusals through `vox up`/`vox forward` are honest, removing a service cuts its live sessions, and forwards survive a host restart (ADR-013 "Tunnel honesty"). 2026-09-21 (third revision, then revised again the same day after independent review) — capability-bearing rooms are withdrawn (see the note below).
 **Updated**: 2026-09-24 (fourth revision) — **names are this machine's own words** (decision 12, the
 decider's answer to PRD-001 R20): `nas.family.vox` is the node *this* machine named `nas` when it trusted
 it, in the room *this* machine calls `family`. Nothing is published or global. Decision 1's host-committed
 random label and decision 9's service descriptor are **superseded**, and the milestones that would have
 built them — **M17.9, M17.10 and M17.12 — are withdrawn**, never built. Decision 12 is built (M17.18).
-**Updated**: 2026-09-24 — PRD-001: refusals through `vox up`/`vox forward` are honest, removing a service cuts its live sessions, and forwards survive a host restart (ADR-013 "Tunnel honesty").
-**Updated**: 2026-09-21 (third revision, then revised again the same day after independent review) —
+**Note, 2026-09-21 (third revision, then revised again the same day after independent review)** —
 **capability-bearing rooms are withdrawn.** Decision 3 held that *"'may this member dial it' and 'is this
 person a member' are the same question, asked once."* That is refuted: admission to a room is passphrase +
 proof-of-work, so under it any party who obtains an address and a passphrase — or, via the vouching path,
@@ -470,8 +470,8 @@ on.
 Rules the surface must honour:
 
 - **`vox serve` names its audience and its non-audience**, as above.
-- **`vox serve` refuses to start rather than appear to work.** If the host cannot be reached and has no
-  anchor configured, it says so and says what to do, instead of naming a service nobody can reach.
+- **`vox serve` refuses to start rather than appear to work.** If the host cannot be reached by anyone,
+  its LAN included, and has no anchor configured, it says so and says what to do, instead of naming a service nobody can reach.
 - **The nonce is persisted** in the profile directory, so the name survives a restart. Losing it loses the
   name; there is no recovery path, because any recovery path implies a derivable — and therefore guessable
   — name.
@@ -679,8 +679,13 @@ The host side varies with reachability, because the ADR-012 ladder is not unifor
 | The host is | Extra host step | Why |
 |---|---|---|
 | publicly reachable, or behind a router that granted a port map (UPnP/PCP/NAT-PMP, ADR-012 rungs 1–2) | none | peers reach the host's own address; no anchor involved |
-| behind a cone NAT | none | rung 3 hole-punches, proved against real NAT behaviour (ADR-016 M14.9) |
-| behind a symmetric NAT at **both** ends | one anchor line in the config file, once | rung 4 relays, and a relay must exist somewhere and be named |
+| behind NAT, with the guest on the same LAN or otherwise able to reach the host directly | none | direct; no anchor involved |
+| behind NAT at **both** ends, neither reachable | one anchor line in the config file, once | the anchor introduces them and coordinates a hole punch (rung 3, proved against real NAT behaviour, ADR-016 M14.9); if both NATs are symmetric it also relays (rung 4) |
+
+*Amended 2026-10-01 (ADR-012, "The anchor principle, restated"):* the earlier rows said a cone NAT
+needed no anchor, which omitted that a punch between two NATed hosts needs a coordinator both can
+reach, and limited the anchor to symmetric NAT at both ends. NAT at both ends makes the anchor needed
+for the first meeting.
 
 The common home-router case is therefore at parity with Tor on both sides. Only symmetric-NAT-on-both-ends
 makes the anchor load-bearing for carried traffic, and Tor has thousands of volunteer relays to draw on

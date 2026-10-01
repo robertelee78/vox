@@ -79,8 +79,8 @@ QUIC/DCUtR, NAT/IPv6, deniable authentication).
 | 021 | implemented on PR #14, not yet on `main` (M21.1–M21.8); M21.9–M21.10 decided | work-item interop: session-scoped claims, pending handoffs, bound renewals, op ids, the exact-version gate, a gapless `tail --json`, `board --json`, structured `post`. Vox holds no work state; an external tracker owns it. No wire change. |
 
 **The node runtime that composes the layers is in.** ADR-016 landed through M15 — join, per-sender
-consent and log sync run between separate hosts over QUIC, through the full NAT ladder, relayed by an
-anchor you run yourself — and ADR-017 landed through M17.3, so a room-bound TCP service is reachable
+consent and log sync run between separate hosts over QUIC, through the full NAT ladder: directly where
+either host can be reached, and, where both are behind NAT, bridged by an anchor you run yourself — and ADR-017 landed through M17.3, so a room-bound TCP service is reachable
 by its `.vox` name through a loopback SOCKS5 proxy. **What is missing** is the proof harness that will
 qualify releases (ADR-018 M18.3), golden **wire-byte** vectors for the ADR-008 struct tags (see the
 gates below; `v0.1.0`'s bytes are now what `v0.2.0` must not break), re-keying for a member first met
