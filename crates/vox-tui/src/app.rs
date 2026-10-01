@@ -94,7 +94,7 @@ impl AppError {
 /// What the TUI's status line says while creating or unlocking the identity waits for another
 /// vox holding the profile.
 pub const WAITING_FOR_PROFILE_TUI: &str =
-    "another vox is using this profile — waiting for it to finish (it goes on by itself)";
+    "waiting: another vox holds this profile open, and only one at a time may write it — this goes on by itself";
 
 pub trait CoreHandle {
     /// The latest view model to render (may fold in pending core events).
@@ -229,7 +229,13 @@ impl TerminalIo for CrosstermIo {
         enable_raw_mode()?;
         self.entered = true;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        // Cleared as well: on a terminal without an alternate screen, anything printed before the
+        // TUI started (a wait for the profile, V210-100) would otherwise show through.
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        )?;
         self.terminal = Some(Terminal::new(CrosstermBackend::new(stdout))?);
         Ok(())
     }
@@ -554,7 +560,8 @@ pub fn run_node(
         .bind(vox_core::node::actor::Bind::Addr(listen))
         .anchors(anchors)
         .headless(signer)
-        .anchor_logs(true);
+        .anchor_logs(true)
+        .on_profile_wait(crate::tunnel_cli::say_waiting);
     let cfg = match serve_only {
         Some(creators) => {
             println!(
@@ -1147,7 +1154,8 @@ pub fn run_daemon(
     let node = loop {
         let cfg = vox_core::node::actor::NodeConfig::new()
             .bind(vox_core::node::actor::Bind::Addr(listen))
-            .anchors(anchors.clone());
+            .anchors(anchors.clone())
+            .on_profile_wait(crate::tunnel_cli::say_waiting);
         match rt.block_on(async { Node::spawn_config(paths.clone(), cfg) }) {
             Err(vox_core::error::Error::ProfileBusy)
                 if started.elapsed() < PROFILE_RELEASE_PATIENCE =>
@@ -1607,9 +1615,12 @@ pub fn run_live(
         .worker_threads(2)
         .enable_all()
         .build()?;
+    // Opening the profile happens before the TUI takes the screen, so a wait for another vox
+    // holding it is said on the terminal as a CLI verb says it (V210-100).
     let cfg = vox_core::node::actor::NodeConfig::new()
         .bind(vox_core::node::actor::Bind::Addr(listen))
-        .anchors(anchors);
+        .anchors(anchors)
+        .on_profile_wait(crate::tunnel_cli::say_waiting);
     let node = rt.block_on(async { Node::spawn_config(paths.clone(), cfg) })?;
     // The ADR-020 control socket, so agent sessions on this machine can attach to
     // this node rather than each running one of their own. Held for the life of

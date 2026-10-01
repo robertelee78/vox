@@ -153,13 +153,33 @@ pub fn identity_passphrase_for(
 /// `serve`, `connect`, `service`, `forward` and `up` — which go through
 /// `open_room` — still got the bare "another vox already has this profile open" with no
 /// remedy, which is the message the fix existed to replace.
-fn profile_busy(socket: &std::path::Path) -> AppError {
+///
+/// **A holder that is only slow is not told to stop** (V210-100). A `vox daemon` or `vox tui`
+/// answers on the control socket and keeps the profile for as long as it runs, so stopping it, or
+/// asking it through `vox room …`, is the remedy. Any other holder is a `vox node` (which serves
+/// no socket) or a command that has not finished while this one waited (up to
+/// [`PROFILE_PATIENCE`](vox_core::node::profile::PROFILE_PATIENCE)) — slow, or stopped — and the
+/// true thing to say is that it is still using the profile, and how to find it: the lock is the
+/// profile directory held open, so `lsof` on it names the process.
+fn profile_busy(paths: &Paths) -> AppError {
+    let socket = paths.socket_file();
+    if vox_core::node::profile::holder_serves(&socket) {
+        return AppError::Usage(format!(
+            "a vox is already running for this profile, and only one at a time may hold it.\n\
+             \x20      Its control socket is {}\n\
+             \x20      Stop that node to run this command, or use the `vox room …` verbs, \
+             which ask the running node instead of starting a second one.",
+            socket.display()
+        ));
+    }
     AppError::Usage(format!(
-        "a vox is already running for this profile, and only one at a time may hold it.\n\
-         \x20      Its control socket is {}\n\
-         \x20      Stop that node to run this command, or use the `vox room …` verbs, \
-         which ask the running node instead of starting a second one.",
-        socket.display()
+        "another vox is still using this profile, and only one at a time may hold it.\n\
+         \x20      It is a command that has not finished (a slow one, or one stopped, e.g. with \
+         Ctrl-Z, which goes on once resumed), or a `vox node` on this profile, which holds it \
+         until it stops.\n\
+         \x20      To see which process it is: lsof {}\n\
+         \x20      Run this command again once it is done.",
+        paths.profile_dir.display()
     ))
 }
 
@@ -197,8 +217,18 @@ pub fn serve_control_socket(
 /// holding the profile (V210-100). It names no particular remedy beyond the one that is true
 /// wherever that vox runs: under a shell's job control `fg` resumes a stopped one, but a daemon
 /// under tmux or a service manager is resumed its own way.
-pub const WAITING_FOR_PROFILE: &str = "vox: waiting for another vox that is using this profile; \
-     this goes on as soon as that one is done (if that vox is stopped, e.g. with Ctrl-Z, resume it)";
+/// It names the cause in the words a refusal uses (`Fault::ProfileBusy`, V210-114), so a person
+/// sees one phrase for one cause.
+pub const WAITING_FOR_PROFILE: &str =
+    "vox: waiting: another vox holds this profile open, and only \
+     one at a time may write it\n       this goes on as soon as that one is done; if that vox is \
+     stopped (e.g. with Ctrl-Z), resume it";
+
+/// Say [`WAITING_FOR_PROFILE`] on stderr: what a verb's node calls if opening the profile waits
+/// for another vox holding it.
+pub fn say_waiting() {
+    eprintln!("{WAITING_FOR_PROFILE}");
+}
 
 /// Apply `cmd` (creating or unlocking the identity), and if the node says it is waiting for
 /// another vox holding the profile, say so on stderr — once, while it waits.
@@ -282,8 +312,11 @@ pub async fn open_profile(
     identity_passphrase: &str,
 ) -> Result<NodeHandle, AppError> {
     let existed = vox_core::node::profile::Profile::exists(&paths);
-    let cfg = NodeConfig::new().bind(Bind::Addr(listen)).anchors(anchors);
-    let socket = paths.socket_file();
+    let cfg = NodeConfig::new()
+        .bind(Bind::Addr(listen))
+        .anchors(anchors)
+        .on_profile_wait(say_waiting);
+    let for_busy = paths.clone();
     let node = match Node::spawn_config(paths, cfg) {
         Ok(n) => n,
         // **A profile that is busy is not a profile that is broken.** redb is
@@ -292,7 +325,7 @@ pub async fn open_profile(
         // with "store open: Database already open. Cannot acquire lock.", which names a
         // storage engine and no remedy. Running a daemon is the documented way to run
         // agent comms, so this was the ordinary case, not an edge one.
-        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&socket)),
+        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&for_busy)),
         Err(e) => return Err(e.into()),
     };
     let secret = Secret::new(identity_passphrase.as_bytes().to_vec());
@@ -313,7 +346,7 @@ pub async fn open_profile(
         ));
     }
     if out == Outcome::Failed(Fault::ProfileBusy) {
-        return Err(profile_busy(&socket));
+        return Err(profile_busy(&for_busy));
     }
     if let Outcome::Failed(fault) = out {
         if let Some(why) = bind_failure(listen, Socket::Udp, fault) {
@@ -337,11 +370,14 @@ async fn open_room(
     room_prefix: &str,
     room_passphrase: &str,
 ) -> Result<(NodeHandle, Digest32), AppError> {
-    let cfg = NodeConfig::new().bind(Bind::Addr(listen)).anchors(anchors);
-    let socket = paths.socket_file();
+    let cfg = NodeConfig::new()
+        .bind(Bind::Addr(listen))
+        .anchors(anchors)
+        .on_profile_wait(say_waiting);
+    let for_busy = paths.clone();
     let node = match Node::spawn_config(paths, cfg) {
         Ok(n) => n,
-        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&socket)),
+        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&for_busy)),
         Err(e) => return Err(e.into()),
     };
     let out = apply_saying_waits(
@@ -352,7 +388,7 @@ async fn open_room(
     )
     .await;
     if out == Outcome::Failed(Fault::ProfileBusy) {
-        return Err(profile_busy(&socket));
+        return Err(profile_busy(&for_busy));
     }
     if let Outcome::Failed(fault) = out {
         if let Some(why) = bind_failure(listen, Socket::Udp, fault) {
