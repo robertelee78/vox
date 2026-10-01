@@ -147,10 +147,19 @@ if [ -e "$INSTALL_DIR/vox" ] && [ ! -e "$INSTALL_DIR/$MARKER" ]; then
   fail "$INSTALL_DIR/vox exists but was not installed by this installer; remove it or set VOX_INSTALL_DIR"
 fi
 # Written on the destination's own filesystem, so the final rename is atomic.
+#
+# **A partial left by a run that was cut short is removed first** (V210-117). A partial name only
+# ever holds scratch, and one can be read-only: `vox update` before v0.2.10 left a 0555
+# `.vox-candidate.partial` when interrupted, and `cp` cannot open that for writing, so every later
+# run of this installer stopped at a bare "Permission denied". The previous binary is copied to a
+# partial of its own and renamed into place, for the same reason: a rename replaces a file that
+# cannot be written to, and a copy onto it does not.
+rm -f "$INSTALL_DIR/.vox-candidate.partial" "$INSTALL_DIR/.vox-previous.partial"
 cp "$tmp/$ASSET" "$INSTALL_DIR/.vox-candidate.partial"
 chmod 0755 "$INSTALL_DIR/.vox-candidate.partial"
 if [ -e "$INSTALL_DIR/vox" ]; then
-  cp -p "$INSTALL_DIR/vox" "$INSTALL_DIR/.vox-previous"
+  cp -p "$INSTALL_DIR/vox" "$INSTALL_DIR/.vox-previous.partial"
+  mv -f "$INSTALL_DIR/.vox-previous.partial" "$INSTALL_DIR/.vox-previous"
 fi
 # The marker says "this install is ours" and names the channel `vox update` resolves the next
 # release on. Strict schema-1 JSON, the same shape the binary parses with deny_unknown_fields.
