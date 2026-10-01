@@ -8,12 +8,23 @@
 //! MEASURE: the anchor did not stop within 10 s of SIGINT" in
 //! `an_anchor_that_restarts_is_redialled_promptly_proof`.
 //!
-//! The scene: an anchor is started and settles; it is then stopped (SIGSTOP) for longer than one
-//! tick, which is what a loaded box does to a process it does not schedule, sent SIGINT, and
-//! resumed. On waking the tick and the signal are ready together. Each of [`TRIALS`] anchors must
-//! say it is shutting down and exit within [`STOP_WITHIN`].
+//! **And on every stop signal, not only Ctrl-C** (V210-85, #277): SIGTERM (a service manager,
+//! `kill`), SIGHUP (its terminal closed, its ssh session gone) and SIGQUIT (`Ctrl-\`) stop it the
+//! same way. Left to their defaults they killed it on the spot — SIGQUIT with a core dump — its
+//! closes unsent.
 //!
-//! Mutation: the listener made inside the `select!` again → red (13 of 20 anchors never exited).
+//! **The scene:** an anchor is started and settles; it is then stopped (SIGSTOP) for longer than
+//! one tick, which is what a loaded box does to a process it does not schedule, sent a stop signal,
+//! and resumed. On waking the tick and the signal are ready together. The [`TRIALS`] anchors take
+//! SIGINT, SIGTERM, SIGHUP and SIGQUIT in turn. Each must exit within [`STOP_WITHIN`] with status 0,
+//! not by the signal, and say which signal stopped it and that it is shutting down.
+//!
+//! **A red names its side.** An anchor that never wrote its anchors file, or a `kill` that failed,
+//! is CANNOT MEASURE (the scene was not staged). Anything after the signal is the product's: it
+//! did not exit, died by the signal, or exited without saying why.
+//!
+//! Mutations: the listener made inside the `select!` again → red (13 of 20 anchors never exited);
+//! SIGHUP or SIGQUIT not taken → those trials die by the signal → red.
 //!
 //! **2. Every verb, every stop signal (V210-108, #303).** SIGINT, SIGTERM, SIGHUP and SIGQUIT are
 //! each a clean stop: people run these verbs in tmux, over ssh and under systemd, whose stop and
@@ -32,9 +43,13 @@
 //! - a **client** (`vox up`, `vox forward`, `vox room tail`, `vox room send`) says on stderr
 //!   `vox: stopped by <SIGNAL>` and exits 128 + the signal's number, as a shell reports it.
 //!
+//! **A red names its side.** A verb that never reached serving, or a `kill` that failed, is
+//! APPARATUS (staging not achieved). Anything after the signal is the product's, quoting what it
+//! said: it did not stop, died by the signal, exited with the wrong code, or did not say why.
+//!
 //! Mutations, one per claim: `vox serve`'s runner listening for Ctrl-C alone; `with_room`
-//! (`vox up`, `vox forward`) listening for Ctrl-C alone; `vox daemon` ignoring SIGHUP again. Each
-//! goes red on the signals it no longer takes.
+//! (`vox up`, `vox forward`) listening for Ctrl-C alone; `vox daemon` ignoring SIGHUP again; a
+//! stopped `vox serve` exiting 128+n as a client does. Each goes red on the stops it gets wrong.
 
 #![cfg(unix)]
 
@@ -54,17 +69,26 @@ use world::{after_label, args, echo_service, vox_once, VoxProc, World, IDENTITY}
 /// How many anchors are signalled. On the unfixed code 13 of 20 missed the signal, so ten that all
 /// stop is not luck.
 const TRIALS: usize = 10;
+/// The stop signals, taken in turn, with the name `vox node` gives each.
+const SIGNALS: [(&str, &str); 4] = [
+    ("-INT", "SIGINT"),
+    ("-TERM", "SIGTERM"),
+    ("-HUP", "SIGHUP"),
+    ("-QUIT", "SIGQUIT"),
+];
 /// Longer than the anchor's 500 ms tick, so a tick is due when it wakes.
 const DESCHEDULED: Duration = Duration::from_millis(1200);
 /// A clean stop takes well under a second.
 const STOP_WITHIN: Duration = Duration::from_secs(10);
+/// How long an anchor may take to start and write its anchors file.
+const LINE_PATIENCE: Duration = Duration::from_secs(60);
 
 fn signal(pid: u32, sig: &str) {
-    let status = std::process::Command::new("kill")
+    let sent = std::process::Command::new("kill")
         .args([sig, &pid.to_string()])
         .status()
-        .expect("kill");
-    assert!(status.success(), "kill {sig} {pid} failed");
+        .is_ok_and(|s| s.success());
+    assert!(sent, "CANNOT MEASURE: `kill {sig} {pid}` failed");
 }
 
 #[test]
@@ -74,49 +98,67 @@ fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
     let tmp = tempfile::tempdir().unwrap();
     let mut stuck = Vec::new();
     for trial in 0..TRIALS {
+        let (sig, name) = SIGNALS[trial % SIGNALS.len()];
         let dir = tmp.path().join(format!("anchor{trial}"));
         std::fs::create_dir_all(dir.join("cfg")).unwrap();
         let mut anchor =
             VoxProc::spawn("anchor", &dir, &args(&["node", "--listen", "127.0.0.1:0"]));
-        anchor.expect_line("the anchors file written", |l| {
+        if let Err(why) = anchor.try_expect_within(LINE_PATIENCE, "the anchors file written", |l| {
             l.starts_with("vox node: wrote ")
-        });
+        }) {
+            panic!("CANNOT MEASURE: anchor {trial} never settled: {why}");
+        }
         let pid = anchor.child.id();
         signal(pid, "-STOP");
         std::thread::sleep(DESCHEDULED);
-        signal(pid, "-INT");
+        signal(pid, sig);
         signal(pid, "-CONT");
         let signalled = Instant::now();
         while anchor.child.try_wait().ok().flatten().is_none() && signalled.elapsed() < STOP_WITHIN
         {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let exited = anchor.child.try_wait().ok().flatten().is_some();
+        let status = anchor.child.try_wait().ok().flatten();
         let said = anchor.transcript();
         let shut = said.lines().any(|l| l == "vox node: shutting down");
+        let named = said
+            .lines()
+            .any(|l| l == format!("vox node: stopped by {name}"));
         eprintln!(
-            "[proof] anchor {trial}: exited {exited} after {:?}, said it was shutting down: {shut}",
+            "[proof] anchor {trial}, {name}: exited {status:?} after {:?}, said it was stopped by \
+             {name}: {named}, shutting down: {shut}",
             signalled.elapsed()
         );
-        if !exited {
+        let Some(status) = status else {
             let _ = anchor.child.kill();
             let _ = anchor.child.wait();
-            stuck.push(format!("anchor {trial}:\n{said}"));
-        } else {
-            assert!(
-                shut,
-                "anchor {trial} exited without saying it was shutting down:\n{said}"
-            );
-        }
+            stuck.push(format!("anchor {trial} ({name}):\n{said}"));
+            continue;
+        };
+        assert_eq!(
+            status.signal(),
+            None,
+            "anchor {trial}: `vox node` died by {name} instead of stopping:\n{said}"
+        );
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "anchor {trial}: `vox node` stopped by {name} ended with {status}:\n{said}"
+        );
+        assert!(
+            named && shut,
+            "anchor {trial} exited on {name} without saying it was stopped by {name} and is \
+             shutting down:\n{said}"
+        );
     }
     eprintln!(
-        "[proof] {} of {TRIALS} anchors stopped on Ctrl-C",
+        "[proof] {} of {TRIALS} anchors stopped (SIGINT, SIGTERM, SIGHUP and SIGQUIT in turn)",
         TRIALS - stuck.len()
     );
     assert!(
         stuck.is_empty(),
-        "{} of {TRIALS} anchors did not stop within {STOP_WITHIN:?} of a SIGINT that landed with a \
-         tick:\n{}",
+        "{} of {TRIALS} anchors did not stop within {STOP_WITHIN:?} of a stop signal that landed \
+         with a tick:\n{}",
         stuck.len(),
         stuck.join("\n")
     );
