@@ -19,8 +19,8 @@
 //!   `--listen`: the host prints an address naming itself, and the guest gets in.
 //! - **B, the anchors are down.** Four anchors, all stopped, given to a host on `127.0.0.1`: the
 //!   address is printed anyway, names the host (a link holds four boards, and the host must not be
-//!   the one dropped), the host says which anchors have not taken the room, and a guest on
-//!   `127.0.0.1` with no anchor gets in.
+//!   the one dropped), the host says which of the anchors it names have not taken the room, and a
+//!   guest on `127.0.0.1` with no anchor gets in.
 //! - **C, a guest who can reach only the anchor.** The anchor is stopped; the host on `127.0.0.1`
 //!   prints its address at once and says the anchor has not taken the room. While the anchor stays
 //!   stopped the host must not say it has. The anchor comes back; the instant the host says it took
@@ -325,8 +325,18 @@ fn b_anchors_that_are_down_do_not_hold_back_the_address() {
         "PRODUCT: with four anchors, the address `vox serve` printed does not name the host \
          ({host_fp}) — only anchors, all down: {address}"
     );
-    // The host says, of each anchor, that it has not taken the room.
-    let shorts: Vec<String> = specs.iter().map(|s| short(s)).collect();
+    // The host says, of each anchor the address names, that it has not taken the room. (A link
+    // holds four boards, and the host is one, so one of the four anchors is left out of it.)
+    let shorts: Vec<String> = specs
+        .iter()
+        .filter(|s| address.contains(s.split_once('@').map_or("-", |(fp, _)| fp)))
+        .map(|s| short(s))
+        .collect();
+    assert!(
+        !shorts.is_empty(),
+        "PRODUCT: the address `vox serve` printed names none of the four anchors it was given: \
+         {address}"
+    );
     let _ = line_within(&mut host, NOTE_WITHIN, |l| {
         l.contains("not taken") && shorts.iter().all(|s| l.contains(s.as_str()))
     });
