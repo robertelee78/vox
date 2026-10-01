@@ -416,6 +416,13 @@ const SOLVE_BUDGET_PER_EXPECTED_SOLVE: std::time::Duration = std::time::Duration
 /// second or two. Unset, empty or unparsable is no floor.
 pub const TEST_SOLVE_AT_LEAST_ENV: &str = "VOX_TEST_SOLVE_AT_LEAST_MS";
 
+/// Test-only: once this joiner has sent its solution, wait this many milliseconds before reading
+/// the member's answer — a join that has done its work and then goes quiet, which the member's
+/// [`ADMISSION_PATIENCE`] exists for (V210-92). It says so on stderr when it starts waiting, so a
+/// proof can tell the work was done. **For proofs; nothing in a real deployment sets it.** Unset,
+/// empty or unparsable is no wait.
+pub const TEST_STALL_AFTER_SOLVE_ENV: &str = "VOX_TEST_STALL_AFTER_SOLVE_MS";
+
 /// How close to the responder's patience a grind may finish and still count as in time. The
 /// responder started its clock when it sent the challenge, a one-way trip before this side started
 /// its own, so a grind that ended just inside the patience here may have ended just outside it
@@ -612,6 +619,13 @@ pub async fn run_initiator(
             return Err(rejected(r));
         }
         return Err(if late { too_slow() } else { e });
+    }
+    if let Some(stall) = std::env::var(TEST_STALL_AFTER_SOLVE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        eprintln!("vox: test: solved, now silent for {stall}ms ({TEST_STALL_AFTER_SOLVE_ENV})");
+        tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
     }
 
     // 3. SHARE.
