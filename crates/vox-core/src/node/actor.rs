@@ -5213,10 +5213,17 @@ impl Node {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
     ) {
+        let now_ms = (self.millis_clock)();
         let answerable = match self.channels.get(&channel_id) {
             Some(shared) => {
                 let c = shared.lock().await;
-                c.can_answer_join() && c.epoch() == epoch
+                // A room that ended takes nobody in, a node that left it answers for it no more,
+                // and a member that left does not come back (V030-08).
+                c.can_answer_join()
+                    && c.epoch() == epoch
+                    && c.ended(now_ms).is_none()
+                    && !c.has_left(&c.me())
+                    && !c.has_left(&peer)
             }
             None => false,
         };

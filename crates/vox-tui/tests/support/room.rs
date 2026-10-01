@@ -104,6 +104,8 @@ pub struct Worker {
     /// The identity passphrase file the daemon was unlocked with.
     pub pass: std::path::PathBuf,
     daemon: Option<Proc>,
+    /// The anchor its daemon was started with, so it can be started again the same way.
+    anchor: String,
 }
 
 impl Worker {
@@ -214,6 +216,14 @@ impl Worker {
     pub fn b32(&self) -> String {
         vox_core::node::link::b32_encode(&self.fp)
     }
+
+    /// Stop this worker's daemon, by its own handle, and start it again as it was started.
+    #[allow(dead_code)] // not every proof that includes this support module restarts one
+    pub fn restart_daemon(&mut self, err: &std::path::Path) {
+        drop(self.daemon.take());
+        let anchor = self.anchor.clone();
+        start_daemon(self, &anchor, err);
+    }
 }
 
 /// A room shared by every worker, and the processes that serve it. Dropping it kills
@@ -271,6 +281,7 @@ fn worker(tmp: &std::path::Path, name: &str) -> Worker {
         fp: [0; 32],
         pass,
         daemon: None,
+        anchor: String::new(),
     };
     // `vox id` creates the identity on first use and prints its fingerprint.
     let o = w.vox(
@@ -303,6 +314,7 @@ fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
         .spawn()
         .expect("spawn vox daemon");
     w.daemon = Some(Proc(child));
+    w.anchor = anchor.to_owned();
     let started = Instant::now();
     let deadline = started + DAEMON_START_PATIENCE;
     while !w.vox(None, &["room", "list"]).ok {
