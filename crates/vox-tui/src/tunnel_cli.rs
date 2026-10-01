@@ -76,8 +76,12 @@ pub fn identity_passphrase_for(
         ));
     }
     if let Some(path) = file {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+        // The whole file is the passphrase and whatever follows it, so it is wiped on drop like
+        // the copy returned: only that copy should outlive this read.
+        let text = zeroize::Zeroizing::new(
+            std::fs::read_to_string(&path)
+                .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?,
+        );
         let first = text.lines().next().unwrap_or_default();
         if first.is_empty() {
             return Err(AppError::Usage(format!(
@@ -510,19 +514,10 @@ pub async fn forward(
     println!("     Ctrl-C to stop");
     // Keep reading events while forwarding, so a connection the host refused or cut says
     // why here (PRD-001 R23). The application only ever sees its socket reset; waiting on
-    // Ctrl-C alone left the reason in a queue nobody read.
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
-    tokio::pin!(interrupted);
-    loop {
-        tokio::select! {
-            _ = &mut interrupted => break,
-            ev = node.next_event() => match ev {
-                Some(ref ev) => say_if_it_explains_a_failure(ev),
-                None => break,
-            },
-        }
+    // Ctrl-C alone left the reason in a queue nobody read. A stop signal ends the run in
+    // `with_room` (V210-108).
+    while let Some(ev) = node.next_event().await {
+        say_if_it_explains_a_failure(&ev);
     }
     println!("vox: stopping the forward");
     let _ = node.apply(NodeCommand::StopForward { local: bound }).await;
@@ -624,30 +619,28 @@ pub async fn serve(
     println!("  `vox trust list` shows who you have decided about");
     println!("Ctrl-C to stop");
 
-    // Until interrupted: report who reaches the service. The service itself cannot say
-    // — every Vox client arrives at it from loopback (ADR-017 decision 6).
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
-    tokio::pin!(interrupted);
+    // Until stopped: report who reaches the service. The service itself cannot say
+    // — every Vox client arrives at it from loopback (ADR-017 decision 6). A stop signal ends the
+    // run in the verb's runner, which raced it from before the identity was unlocked (V210-108).
     loop {
-        tokio::select! {
-            _ = &mut interrupted => break,
-            event = node.next_event() => match event {
-                Some(NodeEvent::TunnelServed { client, service_tag, .. }) => {
-                    println!("vox: {} reached {service_tag:?}", crate::ident::author_id(&client));
-                }
-                Some(NodeEvent::PeerJoined { peer, .. }) => {
-                    println!("vox: {} joined", crate::ident::author_id(&peer));
-                }
-                Some(ref other) => say_if_it_explains_a_failure(other),
-                None => return Err(AppError::Usage("the node stopped".into())),
-            },
+        match node.next_event().await {
+            Some(NodeEvent::TunnelServed {
+                client,
+                service_tag,
+                ..
+            }) => {
+                println!(
+                    "vox: {} reached {service_tag:?}",
+                    crate::ident::author_id(&client)
+                );
+            }
+            Some(NodeEvent::PeerJoined { peer, .. }) => {
+                println!("vox: {} joined", crate::ident::author_id(&peer));
+            }
+            Some(ref other) => say_if_it_explains_a_failure(other),
+            None => return Err(AppError::Usage("the node stopped".into())),
         }
     }
-    println!("vox: stopping");
-    let _ = node.apply(NodeCommand::Shutdown).await;
-    Ok(())
 }
 
 /// `vox connect <address>` — join the room an address names, and print the name its
@@ -718,6 +711,9 @@ pub struct Waiting {
     /// What the verb could not finish without.
     outcome: &'static str,
     now: std::sync::Mutex<(String, Instant)>,
+    /// A server's verb (`vox serve`): being stopped is how it ends, so a stop is a clean exit, not
+    /// an error (V210-108).
+    serves: bool,
 }
 
 impl Waiting {
@@ -730,7 +726,27 @@ impl Waiting {
             started: now,
             outcome,
             now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+            serves: false,
         })
+    }
+
+    /// [`Waiting::new`] for a server's verb, which runs until it is stopped: a stop is its normal
+    /// end and exits 0, as a service manager expects of a service it stopped (V210-108).
+    #[must_use]
+    pub fn server() -> std::sync::Arc<Self> {
+        let now = Instant::now();
+        std::sync::Arc::new(Self {
+            started: now,
+            outcome: "it was serving",
+            now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+            serves: true,
+        })
+    }
+
+    /// Whether a stop is this verb's normal end (see [`Waiting::server`]).
+    #[must_use]
+    pub fn serves(&self) -> bool {
+        self.serves
     }
 
     /// The verb now waits for `what`.
@@ -793,25 +809,17 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     println!("then:  ssh user@{hostname}");
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     println!("Ctrl-C to stop");
-    // Wait on Ctrl-C, but keep reading events so a session cut by the host withdrawing our
-    // reach says so (ADR-017 M17.11). Without this the proxy stays up and silent and the
-    // person sees only `ssh` dying, which reads as a network fault and invites a retry that
-    // cannot succeed.
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
-    tokio::pin!(interrupted);
-    loop {
-        tokio::select! {
-            _ = &mut interrupted => break,
-            ev = node.next_event() => match ev {
-                Some(NodeEvent::ReachWithdrawn { port, .. }) => {
-                    println!("vox: the host withdrew access to port {port} — that session was cut");
-                    println!("     nothing to retry: ask them to trust this identity again");
-                }
-                Some(ref other) => say_if_it_explains_a_failure(other),
-                None => break,
-            },
+    // Until stopped — a stop signal ends the run in `with_room` (V210-108) — keep reading events
+    // so a session cut by the host withdrawing our reach says so (ADR-017 M17.11). Without this
+    // the proxy stays up and silent and the person sees only `ssh` dying, which reads as a network
+    // fault and invites a retry that cannot succeed.
+    while let Some(ev) = node.next_event().await {
+        match ev {
+            NodeEvent::ReachWithdrawn { port, .. } => {
+                println!("vox: the host withdrew access to port {port} — that session was cut");
+                println!("     nothing to retry: ask them to trust this identity again");
+            }
+            ref other => say_if_it_explains_a_failure(other),
         }
     }
     println!("vox: stopping the proxy");
@@ -1108,29 +1116,58 @@ pub struct RoomTarget {
 }
 
 /// Shared entry: open the room, run `body`, shut down.
-pub async fn with_room<F, Fut>(target: RoomTarget, body: F) -> Result<(), AppError>
+///
+/// **The whole run races every stop signal** (V210-108): SIGINT, SIGTERM, SIGHUP and SIGQUIT, from
+/// before the room is opened. `vox up` and `vox forward` run until stopped, and they listened for
+/// Ctrl-C alone: SIGTERM and SIGHUP — a service manager's stop, a closed tmux pane or ssh session —
+/// took the default action and ended them on the spot, saying nothing. A stop now ends the verb
+/// with [`AppError::stopped_by`], after the node is shut down so its peers are told it went.
+///
+/// `stop` is the caller's `stop_requested`, taken before its passphrase prompts, so
+/// one listener covers the whole run.
+pub async fn with_room<F, Fut>(
+    target: RoomTarget,
+    mut stop: std::pin::Pin<&mut impl std::future::Future<Output = crate::app::StopSignal>>,
+    body: F,
+) -> Result<(), AppError>
 where
     F: FnOnce(NodeHandle, Digest32) -> Fut,
     Fut: std::future::Future<Output = Result<(), AppError>>,
 {
     let socket = target.paths.socket_file();
-    let (node, channel_id) = open_room(
+    let opening = open_room(
         target.paths,
         target.listen,
         target.anchors,
         &target.identity_passphrase,
         &target.room,
         &target.room_passphrase,
-    )
-    .await?;
+    );
+    let (node, channel_id) = tokio::select! {
+        opened = opening => opened?,
+        signal = &mut stop => return Err(AppError::stopped_by(signal)),
+    };
     let _control = serve_control_socket(&node, socket);
     let handle = node.clone();
-    let result = body(node, channel_id).await;
-    // The verbs are one-shot; `forward` shuts the node down itself when the person
-    // interrupts it, and a second shutdown is harmless.
+    let result = tokio::select! {
+        done = body(node, channel_id) => done,
+        signal = &mut stop => {
+            crate::app::say(format_args!("vox: stopping"));
+            // Bounded: the node handles one thing at a time, and what it was doing can be a
+            // round trip to a peer that has gone (see `app::run_daemon`). A stop has to mean stop.
+            let _ = tokio::time::timeout(STOP_PATIENCE, handle.apply(NodeCommand::Shutdown)).await;
+            return Err(AppError::stopped_by(signal));
+        }
+    };
+    // The verbs are one-shot; `forward` shuts the node down itself when it ends, and a second
+    // shutdown is harmless.
     let _ = handle.apply(NodeCommand::Shutdown).await;
     result
 }
+
+/// How long a stopped verb waits for its node to shut down before it exits anyway. A clean
+/// shutdown takes milliseconds; this is for a node stuck on a peer that vanished.
+const STOP_PATIENCE: Duration = Duration::from_secs(5);
 
 /// Read a passphrase from the terminal without echoing it (ADR-015: a passphrase is
 /// never shown, never in a flag, never in the shell's history). Falls back to a plain

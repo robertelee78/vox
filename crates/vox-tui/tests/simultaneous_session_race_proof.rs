@@ -366,6 +366,12 @@ fn race(lose: Lose) {
     );
 
     // ---- they converge and read each other ----
+    // **Two cures hold this, so this proof cannot see either regress alone** (V210-89, V210-71).
+    // A hello counts as delivered only once a key sealed under its session is taken (#281); and a
+    // key refused as not opening under the session the peer holds marks that session dead, so the
+    // retry offers a fresh hello (#262, finding A). With both in, counting a hello on write stays
+    // green here (A heals the pair), and so does removing A (the hello rule does). Whoever removes
+    // either must know the other is then this race's only guard.
     // Each posts a fresh probe every round until the other reads one of them.
     let deadline = Instant::now() + Duration::from_secs(90);
     let (mut bob_reads_carol, mut carol_reads_bob) = (false, false);
@@ -406,10 +412,12 @@ fn race(lose: Lose) {
     let lost = |d: &Daemon| d.1.lock().unwrap().matches(LOST_SAID).count();
     let (bob_lost, carol_lost) = (lost(&bob), lost(&carol));
     eprintln!(
-        "[proof] release={} lose={lose:?}: after the race ({n} probe rounds): bob reads carol at \
-         {bob_read_at:?}, carol reads bob at {carol_read_at:?} after the relay's release; hellos \
-         lost: bob {bob_lost}, carol {carol_lost}; bob's session loses: {bob_loses}",
-        !cfg!(debug_assertions)
+        "[proof] release={} lose={lose:?}: after the race ({n} probe rounds, watched {:.1?} of \
+         90s): bob reads carol at {bob_read_at:?}, carol reads bob at {carol_read_at:?} after the \
+         relay's release; hellos lost: bob {bob_lost}, carol {carol_lost}; bob's session loses: \
+         {bob_loses}",
+        !cfg!(debug_assertions),
+        released.elapsed()
     );
     for (at, who) in &refusals_seen {
         eprintln!("[proof] {who}'s key refused, seen at {at:?} after the release");
