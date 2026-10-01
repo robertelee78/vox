@@ -1201,8 +1201,8 @@ impl ConnectionManager {
         n
     }
 
-    /// **Tell every peer this node is stopping, and wait — at most `patience` — until each has
-    /// received it** (V210-93); how many confirmed it.
+    /// **Tell every peer this node is stopping, and wait — at most `patience` for each of two
+    /// rounds — until each has received it** (V210-93); how many confirmed it.
     ///
     /// Said before any connection is closed, while each still runs, because the close itself
     /// cannot be relied on to arrive: it is one datagram, never sent again, and quinn does not
@@ -1212,40 +1212,29 @@ impl ConnectionManager {
     /// clean stop as an anchor that answered nothing for 8 s. A [`StreamKind::Goodbye`] stream is
     /// delivered like any data, and "received" is the peer's acknowledgement of it.
     ///
+    /// **Relayed connections first, as with the closes** ([`Self::close_relayed`]): a peer that
+    /// hears the goodbye closes that connection, and a direct connection to a relay carries this
+    /// node's circuits. Told all at once, the relay closed the carrier as soon as it heard, and the
+    /// goodbye on every relayed connection behind it was never delivered: measured on `vox
+    /// connect`, the relayed connection to the host went unconfirmed for the whole `patience` on
+    /// every stop, while the anchor's confirmed in a quarter of a millisecond.
+    ///
     /// Bounded, and spent only on a peer that does not answer: a stop is never held up for long
     /// by a peer that is gone.
     pub async fn say_goodbye(&self, patience: Duration) -> usize {
-        let peers: Vec<Arc<VoxConnection>> = lock(&self.retiring)
+        let live: Vec<Arc<VoxConnection>> = lock(&self.retiring)
             .iter()
             .map(|(c, _)| Arc::clone(c))
             .chain(lock(&self.conns).values().cloned())
             .filter(|c| is_live(c))
             .collect();
-        let mut saying = tokio::task::JoinSet::new();
-        for conn in peers {
-            saying.spawn(async move {
-                let (mut send, _recv) =
-                    crate::transport::streams::open_typed(&conn, StreamKind::Goodbye).await?;
-                let _ = send.finish();
-                // `None`: every byte of it acknowledged. A stream the peer stopped, or one on a
-                // connection that closed meanwhile, ends the wait too, uncounted.
-                let heard = matches!(send.stopped().await, Ok(None));
-                Ok::<bool, Error>(heard)
-            });
-        }
-        let mut heard = 0;
-        let _ = tokio::time::timeout(patience, async {
-            while let Some(done) = saying.join_next().await {
-                if matches!(done, Ok(Ok(true))) {
-                    heard += 1;
-                }
-            }
-        })
-        .await;
-        heard
+        let (relayed, direct): (Vec<_>, Vec<_>) = live
+            .into_iter()
+            .partition(|c| path_class(&self.endpoint, c) == PathClass::Relayed);
+        goodbye_to(relayed, patience).await + goodbye_to(direct, patience).await
     }
 
-    /// Close every connection (node shutdown).
+        /// Close every connection (node shutdown).
     pub fn close_all(&self) {
         for (conn, _) in lock(&self.retiring).drain(..) {
             conn.close(WireError::ShuttingDown);
@@ -1254,6 +1243,35 @@ impl ConnectionManager {
             conn.close(WireError::ShuttingDown);
         }
     }
+}
+
+/// Say goodbye on each of `conns` at once (see [`ConnectionManager::say_goodbye`]), and wait at
+/// most `patience` for the peers to confirm it; how many did.
+async fn goodbye_to(conns: Vec<Arc<VoxConnection>>, patience: Duration) -> usize {
+    if conns.is_empty() {
+        return 0;
+    }
+    let mut saying = tokio::task::JoinSet::new();
+    for conn in conns {
+        saying.spawn(async move {
+            let (mut send, _recv) =
+                crate::transport::streams::open_typed(&conn, StreamKind::Goodbye).await?;
+            let _ = send.finish();
+            // `None`: every byte of it acknowledged. A stream the peer stopped, or one on a
+            // connection that closed meanwhile, ends the wait too, uncounted.
+            Ok::<bool, Error>(matches!(send.stopped().await, Ok(None)))
+        });
+    }
+    let mut heard = 0;
+    let _ = tokio::time::timeout(patience, async {
+        while let Some(done) = saying.join_next().await {
+            if matches!(done, Ok(Ok(true))) {
+                heard += 1;
+            }
+        }
+    })
+    .await;
+    heard
 }
 
 /// Whether a connection is still usable.

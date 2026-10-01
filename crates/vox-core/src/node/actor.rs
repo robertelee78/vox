@@ -125,8 +125,9 @@ const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
 const CLOSE_FLUSH: Duration = Duration::from_secs(1);
 
 /// How long stopping the network waits for its peers to confirm they heard it is stopping (see
-/// `ConnectionManager::say_goodbye`). A live peer confirms within a round trip; this is spent only
-/// on one that does not answer, and is a ceiling, not a wait.
+/// `ConnectionManager::say_goodbye`), in each of its two rounds (relayed connections, then the
+/// rest). A live peer confirms within a round trip; this is spent only on one that does not
+/// answer, and is a ceiling, not a wait.
 const GOODBYE_PATIENCE: Duration = Duration::from_millis(500);
 
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
