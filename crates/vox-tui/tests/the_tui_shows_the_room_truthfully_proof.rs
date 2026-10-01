@@ -175,6 +175,10 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
                 out.code
             )
         }
+        // A `vox` step before the claims failed: the driver quotes what `vox` said.
+        _ if said.contains("truth PRODUCT:") => panic!(
+            "PRODUCT: a `vox` step on the way to the TUI's claims failed: {said}"
+        ),
         _ => panic!(
             "PRODUCT: the TUI must show the room's newest message, follow and scroll, show consent, \
              verification, reachability and sync as the node has them, and consent to the \

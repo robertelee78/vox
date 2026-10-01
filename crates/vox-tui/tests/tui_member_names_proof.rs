@@ -59,6 +59,10 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
         Some(1) if said.contains("did not return within") => {
             panic!("PRODUCT: a `vox` verb ran past the product's own bound for it: {said}")
         }
+        // A `vox` step before the members pane failed: the driver quotes what `vox` said.
+        Some(1) if said.contains("cargo PRODUCT:") => {
+            panic!("PRODUCT: a `vox` step before the TUI's members pane failed: {said}")
+        }
         Some(1) if said.contains("cargo RED") => panic!(
             "PRODUCT: the TUI must name alice \"alice\" and carol by 26 characters + \"(not in \
              keyring)\": {said}"
