@@ -61,6 +61,157 @@ pub struct MessageRow {
     pub text: String,
 }
 
+/// A room's rendered timeline as the view carries it, oldest first (V210-120).
+///
+/// **A new message costs what it adds, not what came before it.** Each new row was published by
+/// rebuilding the room's whole timeline, so the work a node did per message grew with the room's
+/// history: a member reading a long room behind a burst spent seconds on rows nobody had changed.
+/// Rows are held in shared, immutable chunks. A message adds a small chunk, small chunks merge
+/// into larger ones only up to [`Timeline::CHUNK`] rows, and a full chunk is never copied again.
+/// So an append copies at most a chunk's worth of rows, and a clone of the view copies one pointer
+/// per chunk.
+#[derive(Clone, Default)]
+pub struct Timeline {
+    chunks: Vec<std::sync::Arc<[MessageRow]>>,
+    len: usize,
+}
+
+impl Timeline {
+    /// The most rows a chunk holds before it is frozen.
+    pub const CHUNK: usize = 1024;
+
+    /// How many rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether there are no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Every row, oldest first.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &MessageRow> + '_ {
+        self.chunks.iter().flat_map(|c| c.iter())
+    }
+
+    /// Every row from position `start` on, oldest first, skipping whole chunks before it.
+    pub fn iter_from(&self, start: usize) -> impl Iterator<Item = &MessageRow> + '_ {
+        let mut skip = start;
+        self.chunks.iter().flat_map(move |c| {
+            let from = skip.min(c.len());
+            skip -= from;
+            c[from..].iter()
+        })
+    }
+
+    /// The row at position `i`, oldest first.
+    #[must_use]
+    pub fn get(&self, mut i: usize) -> Option<&MessageRow> {
+        for c in &self.chunks {
+            if i < c.len() {
+                return c.get(i);
+            }
+            i -= c.len();
+        }
+        None
+    }
+
+    /// The oldest row.
+    #[must_use]
+    pub fn first(&self) -> Option<&MessageRow> {
+        self.chunks.first().and_then(|c| c.first())
+    }
+
+    /// The newest row.
+    #[must_use]
+    pub fn last(&self) -> Option<&MessageRow> {
+        self.chunks.last().and_then(|c| c.last())
+    }
+
+    /// This timeline with `rows` added after its newest row. Nothing already held is copied but
+    /// the open chunks that the new rows merge into, which are at most [`Self::CHUNK`] rows.
+    #[must_use]
+    pub fn appended(&self, rows: impl IntoIterator<Item = MessageRow>) -> Self {
+        let added: std::sync::Arc<[MessageRow]> = rows.into_iter().collect();
+        if added.is_empty() {
+            return self.clone();
+        }
+        let mut next = self.clone();
+        next.len += added.len();
+        next.chunks.push(added);
+        // Merge the newest chunks while the older of the two is no larger than the newer, as a
+        // binary counter carries, and never into a chunk past `CHUNK`: chunks stay few, and an
+        // append copies a bounded number of rows.
+        while let [.., older, newer] = next.chunks.as_slice() {
+            if older.len() > newer.len() || older.len() + newer.len() > Self::CHUNK {
+                break;
+            }
+            let merged: std::sync::Arc<[MessageRow]> =
+                older.iter().chain(newer.iter()).cloned().collect();
+            next.chunks.pop();
+            next.chunks.pop();
+            next.chunks.push(merged);
+        }
+        next
+    }
+
+    /// Whether both hold the very same chunks: equal without reading a row.
+    fn shares_chunks(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.chunks.len() == other.chunks.len()
+            && self
+                .chunks
+                .iter()
+                .zip(&other.chunks)
+                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+    }
+}
+
+impl FromIterator<MessageRow> for Timeline {
+    fn from_iter<I: IntoIterator<Item = MessageRow>>(rows: I) -> Self {
+        let mut t = Self::default();
+        let mut chunk = Vec::with_capacity(Self::CHUNK);
+        for row in rows {
+            chunk.push(row);
+            if chunk.len() == Self::CHUNK {
+                t.len += chunk.len();
+                t.chunks.push(std::mem::take(&mut chunk).into());
+            }
+        }
+        if !chunk.is_empty() {
+            t.len += chunk.len();
+            t.chunks.push(chunk.into());
+        }
+        t
+    }
+}
+
+impl<'a> IntoIterator for &'a Timeline {
+    type Item = &'a MessageRow;
+    type IntoIter = Box<dyn DoubleEndedIterator<Item = &'a MessageRow> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+impl PartialEq for Timeline {
+    fn eq(&self, other: &Self) -> bool {
+        self.shares_chunks(other) || (self.len == other.len && self.iter().eq(other.iter()))
+    }
+}
+
+impl Eq for Timeline {}
+
+impl std::fmt::Debug for Timeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
@@ -73,8 +224,9 @@ pub struct ChannelDetail {
     /// Members, in fingerprint order.
     pub members: Vec<Digest32>,
     /// The render-gated timeline, oldest first. Shared, not copied: every clone of the view — each
-    /// IPC read page takes one — used to copy every room's whole timeline (V210-71).
-    pub timeline: std::sync::Arc<[MessageRow]>,
+    /// IPC read page takes one — used to copy every room's whole timeline (V210-71); and a new
+    /// message adds its row without rebuilding the rest (V210-120).
+    pub timeline: Timeline,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
