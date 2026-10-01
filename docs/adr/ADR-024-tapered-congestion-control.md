@@ -224,6 +224,7 @@ then congestion and tier 2 is Cubic.
 |---|---|---|---|---|---|
 | 5% random loss | tier 2, 5% cap (run 1 / 2) | 32.0 / 35.0 | 25.1 / 24.6 | 1.27× / 1.42× | 5.07% / 5.16% |
 | 5% random loss | quinn's BBR (run 1 / 2) | 176.6 / 178.4 | 23.0 / 24.4 | **7.68× / 7.31×** | 5.04% / 5.01% |
+| 1% random loss | `VoxBbr` held in tier 3 (fix-adr024-bbr, smoke) | 195.8 | 62.5 | 3.13× | 0.8–2.2% |
 | ¼-BDP queue, shared | tier 2, 5% cap | 54.1 | 40.0 | 1.35× | 4.34% |
 | ¼-BDP queue, shared | quinn's BBR | 154.6 | 21.4 | **7.22×, unfair** | 15.70% |
 
@@ -233,18 +234,24 @@ Sending harder separates them: random loss stays flat (5.07–5.16% under tier 2
 at five times the rate); congestion loss climbs (4.34% to 15.70%). So tier 3 is to be entered on trial,
 judged by the same trend test with a wider margin:
 
-- **2 → 3 (a trial):** at least 20 rounds and 2 s in tier 2 with the loss share at or above the cap
+- **2 → 3 (a trial):** after tier 2's dwell, at least 20 rounds and 2 s in tier 2 with the loss share at or above the cap
   and no queue in any of those rounds. The loss share over the last 32 MiB is recorded as the trial's
   baseline. Tier 3 starts in BBR's steady state (ProbeBW) at the current delivery rate, round trip and
   window, never in Startup, whose 2.885× gain would breach the trial's bound.
-- **Loss that grows leaves tier 3, at any time in it:** the share over the last 32 MiB passes
+- **Loss that grows leaves tier 3, at any time in it, not only during the trial:** the share over the last 32 MiB passes
   max(1.5 × the baseline, the baseline + 3 points). That is a failed trial.
 - **Back-off after a failed trial:** tier 3 is barred for 30 s, doubled after each failed trial up to
   8 min, and reset to 30 s only after a stay in tier 3 of 5 min with no failure.
-- **A queue leaves tier 3 (rule 3):** the last round's minimum round trip at or above the base plus
-  max(4 ms, 1.5 × the base), held for two rounds. Tier 3 has its own queue test because BBR's window
-  gain of 2 stands up to one base round trip of queue by design: the tier-2 test threw it out within
-  a second, every time (fix-adr024-bbr).
+- **A queue leaves tier 3 (rule 3):** the last round's minimum round trip at or above
+  `1.25 × max(base, window ÷ delivery rate) + 4 ms` (`TIER3_QUEUE_FACTOR`, `TIER3_QUEUE_MIN`), held
+  for two rounds. Tier 3 has its own queue test because BBR stands a queue of its own: the tier-2 test
+  threw it out within a second, every time, and with no other flow its rounds' minimum round trip
+  was 18–38 ms on a 10.7 ms base (fix-adr024-bbr). `window ÷ delivery rate` is the round trip BBR's
+  own data in flight explains; another flow's queue pushes the round trip past it.
+- **How tier 3 paces.** quinn-proto 0.11 paces every connection from the window and the smoothed
+  round trip; it never reads a controller's pacing rate (`pacing_rate` is reported in metrics only).
+  So `VoxBbr`'s gains, including its probing cycle, are to act through its window alone, and its
+  seeded rate is to drive sending as `window = rate × round trip`.
 - **ECN marks and persistent congestion leave tier 3 at once,** with Cubic's reduction.
 - **3 → 2 when the loss goes:** the loss share under half the cap (2.5%) for 40 rounds and 4 s, handed
   down to a `VoxCubic` seeded in congestion avoidance at the delivery rate × the base round trip.
@@ -260,7 +267,7 @@ in every minute, then in every 8 minutes. That is the price of reaching 7× on a
 
 ### Tier 1 ↔ 2 and dwell
 
-- **1 → 2:** at least 3 losses without a queue within 8 rounds, once the tier-1 dwell is over.
+- **1 → 2:** at least 3 losses without a queue within 8 rounds, once tier 1's dwell (below) is over.
 - **2 → 1:** no loss without a queue for 40 rounds and 4 s.
 - **Dwell:** at least 2 s and 20 rounds in a tier before any switch, except rule 3.
 
@@ -271,7 +278,10 @@ Tier 2 with the cap (200 Mbit/s, 10 ms; 20 s clean, 20 s at 1% loss, 20 s clean,
 169.1–226.8 Mbit/s (the lowest, 169.1, 18 s after the loss ended); the first three after the loss
 ended carried 191.5, 184.6 and 198.8 Mbit/s.
 
-### Not proven, and why it errs safe
+### Not proven: no claim is made for these
+
+ADR-024 makes **no claim** for the cases below; none is measured, and none is to be built for v0.2.10
+(the decider, through vox, 2026-10-01). Where the design's behaviour can be reasoned, it errs safe:
 
 - **Jittery links (cellular), bursty loss:** jitter that delays whole rounds reads as a queue, and a
   burst of losses trips the cap; either way tier 2 behaves as Cubic and tier 3 is not entered. These
