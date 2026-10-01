@@ -230,6 +230,9 @@ pub async fn open_profile(
                 .into(),
         ));
     }
+    if out == Outcome::Failed(Fault::ProfileBusy) {
+        return Err(profile_busy(&socket));
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot open this profile's identity: {out}"
@@ -259,6 +262,9 @@ async fn open_room(
             passphrase: Secret::new(identity_passphrase.as_bytes().to_vec()),
         })
         .await;
+    if out == Outcome::Failed(Fault::ProfileBusy) {
+        return Err(profile_busy(&socket));
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot unlock this profile: {out}"

@@ -9085,6 +9085,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::Profile("no such channel in this profile") => Fault::UnknownChannel,
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
         Error::AtRestLocked => Fault::Locked,
+        Error::ProfileBusy => Fault::ProfileBusy,
         // Before the general size arm: a full keyring is not an input that was too long.
         Error::SizeLimitExceeded("trusted identities") => Fault::KeyringFull,
         Error::SizeLimitExceeded(_) => Fault::TooLong,

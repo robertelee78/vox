@@ -88,7 +88,10 @@ impl Profile {
         // vault over the first's: both printed a fingerprint, and one of them was gone. The
         // directory is locked across the whole create, so the check below and the files it
         // guards are one step; whoever comes second finds the vault and is refused.
-        let _creating = lock_dir(&paths.profile_dir)?;
+        let _creating = lock_dir(
+            &paths.profile_dir,
+            "lock the profile to create its identity",
+        )?;
         if Self::exists(&paths) {
             return Err(Error::Profile("identity already exists in this profile"));
         }
@@ -173,15 +176,10 @@ impl Profile {
 
     /// Open an existing profile, **locked**.
     pub fn open(paths: Paths) -> Result<Self> {
-        let vault_path = paths.vault_file();
-        if !vault_path.is_file() {
+        if !paths.vault_file().is_file() {
             return Err(Error::Profile("no identity in this profile"));
         }
-        let bytes = std::fs::read(&vault_path).map_err(|e| Error::Path {
-            op: "read vault",
-            detail: format!("{}: {e}", vault_path.display()),
-        })?;
-        let vault = IdentityVault::from_canonical_slice(&bytes)?;
+        let vault = read_vault(&paths)?;
         // **Read-only while locked.** A locked profile only reads its public facts, and opening
         // the store writable writes to it — so a command refused for a wrong passphrase used to
         // leave the profile changed. It becomes writable in `unlock`, once the passphrase is
@@ -213,6 +211,23 @@ impl Profile {
         if self.unlocked.is_some() {
             return Ok(());
         }
+        // **A version-1 vault is migrated under the profile lock, start to finish** (V210-100).
+        // The migration rewrites the store into a new file and renames it over the old one, and
+        // redb's own lock is on the file, so it lapses between releasing the old file and the
+        // rename: a second vox unlocking the same profile at that moment opened the old file,
+        // migrated it again and renamed its copy over the first one's, and every row the first
+        // had written since was gone. Whoever waits here reads the vault again once it has the
+        // lock, so a profile another vox has just migrated is not migrated twice.
+        let _migrating = if self.vault.version < VAULT_VERSION {
+            let held = lock_dir(
+                &self.paths.profile_dir,
+                "lock the profile to migrate its identity",
+            )?;
+            self.vault = read_vault(&self.paths)?;
+            Some(held)
+        } else {
+            None
+        };
         let backup = self.vault.unlock(passphrase)?;
         let signer = VaultRootSigner::from_backup(&backup)?;
         if signer.fingerprint() != self.fingerprint {
@@ -243,6 +258,7 @@ impl Profile {
         passphrase: &[u8],
     ) -> Result<()> {
         crate::node::seal_migration::migrate_to_vault_seals(&self.store, signer)?;
+        test_pause(TEST_REWRITE_DELAY_ENV, "about to rewrite the store");
         // The old seals are still in the file's replaced pages until it is rewritten. Before the
         // vault moves to v2: a crash after the rewrite leaves a v1 vault, whose next unlock
         // repeats both; a crash after the vault would leave the old pages for good.
@@ -371,14 +387,42 @@ impl Profile {
     }
 }
 
+/// Read and parse the profile's vault file.
+fn read_vault(paths: &Paths) -> Result<IdentityVault> {
+    let vault_path = paths.vault_file();
+    let bytes = std::fs::read(&vault_path).map_err(|e| Error::Path {
+        op: "read vault",
+        detail: format!("{}: {e}", vault_path.display()),
+    })?;
+    IdentityVault::from_canonical_slice(&bytes)
+}
+
+/// **For proofs only.** When set, a migrating unlock waits this many milliseconds after
+/// re-sealing the blobs and before rewriting the store, which stands for a slow disk or a
+/// process descheduled at the worst moment. The concurrent-migration proof uses it to hold a
+/// second vox inside a migration while the first finishes its own. Nothing a person runs sets
+/// it; unset, nothing changes.
+pub const TEST_REWRITE_DELAY_ENV: &str = "VOX_TEST_REWRITE_DELAY_MS";
+
+/// Wait for the milliseconds named by the proof-only variable `env`, saying so on stderr so a
+/// proof can tell the moment has been reached; nothing when it is unset.
+pub(crate) fn test_pause(env: &str, what: &str) {
+    let Some(ms) = std::env::var(env).ok().and_then(|v| v.parse::<u64>().ok()) else {
+        return;
+    };
+    eprintln!("vox-test: {what} (waiting {ms} ms for {env})");
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
 /// Take an exclusive lock on the directory `dir`, waiting for any other holder; it is
-/// released when the returned handle drops (or the process exits, however it exits).
+/// released when the returned handle drops (or the process exits, however it exits). `op`
+/// names what the lock is for, in an error.
 ///
-/// The directory itself is locked rather than a lock file beside the vault, so creating a
+/// The directory itself is locked rather than a lock file beside the vault, so locking a
 /// profile leaves no file behind that is not the profile's own.
-fn lock_dir(dir: &std::path::Path) -> Result<std::fs::File> {
+fn lock_dir(dir: &std::path::Path, op: &'static str) -> Result<std::fs::File> {
     let fail = |e: std::io::Error| Error::Path {
-        op: "lock the profile to create its identity",
+        op,
         detail: format!("{}: {e}", dir.display()),
     };
     let handle = std::fs::File::open(dir).map_err(fail)?;
