@@ -190,7 +190,7 @@ const UDP_SOCKET_BUFFER: usize = 4 << 20;
 
 /// Per-stream flow-control window (and half the connection's send window), sized for the
 /// bandwidth-delay product of a 1 Gbit/s path at ~130 ms, or 10 Gbit/s at ~13 ms.
-pub const STREAM_WINDOW: u32 = 16 << 20;
+pub const STREAM_WINDOW: u32 = 64 << 10; // MUTANT (V210-98 c3)
 
 /// Flow-control credit a peer gets for the whole connection, across all its streams: what this
 /// node will buffer for one peer that sends and is not read.
