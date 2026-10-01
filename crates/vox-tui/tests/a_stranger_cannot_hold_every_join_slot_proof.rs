@@ -34,13 +34,13 @@
 //!    `127.0.0.1` and `::1` are two sources.
 //!
 //!
-//!    The anchor must carry **no circuit** for the whole case (its own `circuit(s) carried`
-//!    reports), so no join measured here rode a relay; otherwise CANNOT MEASURE.
+//!    No joiner may have asked for a circuit (each one's own `vox status --json`), so no join
+//!    measured here rode a relay; otherwise CANNOT MEASURE.
 //! 4. `a_relayed_flood_from_one_host_does_not_keep_a_relayed_joiner_from_another_out`: as 3, but
-//!    **every join relayed** by the one anchor (see `Layout::Relayed`: alice listens on one family
-//!    and the joiners on the other, so neither a dial nor a hole punch reaches her). The sixteen
-//!    stranger identities are relayed from one host, carol from another origin on the same machine.
-//!    The anchor must report a circuit for each of them and carol at once, else CANNOT MEASURE.
+//!    **every join relayed** by the one anchor (see `Layout::Relayed`: alice listens on the LAN
+//!    address and the joiners on loopback, so neither a dial nor a hole punch reaches her). The
+//!    sixteen stranger identities are relayed from 127.0.0.1, carol from ::1. Each joiner's own
+//!    `vox status --json` must show it asked for a circuit, else CANNOT MEASURE.
 //!    Only the origin the relay says tells carol from the flood: a relayed join's circuit address
 //!    is made up per circuit and says nothing.
 //!
@@ -273,11 +273,13 @@ enum Layout {
     /// `127.0.0.1` (`VOX_TEST_ADVERTISE`, inert when unset); the strangers on 127.0.0.1 and carol on
     /// ::1. Two sources, every join direct: the anchor must carry no circuit.
     TwoAddresses,
-    /// Every join **relayed** by the one anchor, from two origins. Alice listens on one family only
-    /// and the joiners on the other, so neither a dial nor a hole punch can reach her. On macOS:
-    /// alice on 127.0.0.1, the strangers on `[::1]`, carol on `[fe80::1%1]` (lo0's link-local, a
-    /// second IPv6 source). On Linux, whose `lo` answers for all of 127/8 but has no link-local:
-    /// alice on `[::1]`, the strangers on 127.0.0.1, carol on 127.0.0.2. No sudo either way.
+    /// Every join **relayed** by the one anchor, from two origins. Alice listens on this machine's
+    /// LAN address (the one it would send off-machine from), which reaches the anchor on `[::]`; the
+    /// strangers listen on 127.0.0.1 and carol on `[::1]`. A loopback-bound node can neither dial
+    /// nor punch to a LAN address, so every join reaches alice over the anchor's circuit, and the
+    /// anchor sees the strangers at 127.0.0.1 and carol at ::1. No sudo; no LAN address is
+    /// CANNOT MEASURE. (A link-local `fe80::1%lo0` would be a third loopback source, but the
+    /// transport does not keep an IPv6 scope, so an anchor cannot answer it.)
     Relayed,
 }
 
@@ -351,7 +353,8 @@ fn stage(
     let v6_spec = format!("{fp}@/ip6/::1/udp/{port}");
     // Alice on both families, advertising exactly her two loopback addresses: what the ladder
     // would add (this machine's LAN addresses) would be a third source nobody here chose.
-    let macos = cfg!(target_os = "macos");
+    let lan = lan_v4();
+    let lan_spec = lan.map(|ip| format!("{fp}@/ip4/{ip}/udp/{port}"));
     let (alice_listen, alice_spec, alice_env) = match layout {
         Layout::OneAddress => ("127.0.0.1:0".to_owned(), &v4_spec, Vec::new()),
         Layout::TwoAddresses => {
@@ -368,19 +371,17 @@ fn stage(
                 )],
             )
         }
-        Layout::Relayed if macos => ("127.0.0.1:0".to_owned(), &v4_spec, Vec::new()),
-        Layout::Relayed => ("[::1]:0".to_owned(), &v6_spec, Vec::new()),
+        Layout::Relayed => match (lan, &lan_spec) {
+            (Some(ip), Some(spec)) => (format!("{ip}:0"), spec, Vec::new()),
+            _ => panic!("CANNOT MEASURE: this machine has no LAN IPv4 address to put alice on"),
+        },
     };
     let (carol_listen, carol_spec) = match layout {
         Layout::OneAddress => ("127.0.0.1:0", &v4_spec),
         Layout::TwoAddresses => ("[::1]:0", &v6_spec),
-        Layout::Relayed if macos => ("[fe80::1%1]:0", &v6_spec),
-        Layout::Relayed => ("127.0.0.2:0", &v4_spec),
+        Layout::Relayed => ("[::1]:0", &v6_spec),
     };
-    let (stranger_listen, stranger_spec) = match layout {
-        Layout::Relayed if macos => ("[::1]:0", &v6_spec),
-        _ => ("127.0.0.1:0", &v4_spec),
-    };
+    let (stranger_listen, stranger_spec) = ("127.0.0.1:0", &v4_spec);
     let alice_err = tmp.join("alice.daemon.err");
     // Identities and daemons four at a time: each is production Argon2id at 256 MiB or more.
     let everyone: Vec<&Who> = [&alice, &carol].into_iter().chain(&strangers).collect();
@@ -466,6 +467,17 @@ fn stage(
         stranger_errs,
         alice_err,
         links,
+    }
+}
+
+/// This machine's LAN IPv4 address: the one a socket would send off-machine from. Connecting a UDP
+/// socket sends nothing; 192.0.2.1 is a documentation address, never reached.
+fn lan_v4() -> Option<std::net::Ipv4Addr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?;
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
     }
 }
 
@@ -639,6 +651,12 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
             Some(ROOM_PASS),
         );
         let took = t.elapsed();
+        eprintln!(
+            "[proof] {} {case}: carol's join ok={ok} in {:.1}s: {}",
+            profile(),
+            took.as_secs_f64(),
+            format!("{out}{err}").replace('\n', " / ")
+        );
         if let Err(cannot) = paths(s, case) {
             done.store(true, Ordering::SeqCst);
             panic!("{cannot}");
