@@ -23,7 +23,7 @@
 //! **ADR-024's arms** (the decider, 2026-10-01; see `taper_arms`): on a clean 400 Mbit/s, 2 ms
 //! LAN-like link, which the emulator carries under ordinary load, every second is at the clean bar
 //! (90% of raw); on a 200 Mbit/s, 10 ms Wi-Fi-like
-//! link at 1% and at 5% loss the tunnel carries at least [`LOSSY_WIN`] of a Cubic flow on the same
+//! link at 1% and at 6% loss the tunnel carries at least [`LOSSY_WIN`] of a Cubic flow on the same
 //! loss; on a link it shares with a Cubic flow (200 Mbit/s through a one-BDP and a quarter-BDP queue,
 //! and a 400 Mbit/s, 2 ms LAN-like link through a one-BDP queue, each over [`CONGESTED_MEASURE`]), its rate is
 //! between [`FAIR_LOW`] and [`FAIR_HIGH`] of that flow's; and on a link that goes clean, lossy and
@@ -1083,10 +1083,12 @@ const WIFI: Link = Link {
     gated: true,
     queue_bdps: None,
 };
-/// The same link at 5% loss: past tier 2's loss cap, where only tier 3 (BBR) clears the bar.
+/// The same link at 6% loss: clearly past tier 2's 5% loss cap, where only tier 3 (BBR) clears the
+/// bar. Not 5%: a link at exactly the cap is the boundary, and may stay in tier 2 (the decider,
+/// 2026-10-01), so an arm there would test boundary noise, not the rule.
 const WIFI_HEAVY: Link = Link {
-    name: "Wi-Fi-like, 200 Mbit/s, 10 ms RTT, 5% loss",
-    loss: 0.05,
+    name: "Wi-Fi-like, 200 Mbit/s, 10 ms RTT, 6% loss",
+    loss: 0.06,
     ..WIFI
 };
 /// The congested arm's link: the same rate and round trip, no random loss, and a router queue of
@@ -1164,7 +1166,7 @@ const PAUSED_NAME: &str = "paused, Wi-Fi-like, 200 Mbit/s, 10 ms RTT, 1% loss, 3
 /// Longer than vox-core's `IDLE_RESTART` (1 s), so the connection's controller restarts.
 const PAUSE: Duration = Duration::from_secs(3);
 /// How long into the lossy phase Vox may take to find its lossy-link speed before it is judged: at
-/// 5% loss that is a climb of two tiers (at least 1 s in tier 1, 2 s of dwell and 2 s of evidence in
+/// 6% loss that is a climb of two tiers (at least 1 s in tier 1, 2 s of dwell and 2 s of evidence in
 /// tier 2, then tier 3's trial), as ADR-024's thresholds set it.
 const CLIMB_WITHIN: Duration = Duration::from_secs(8);
 
