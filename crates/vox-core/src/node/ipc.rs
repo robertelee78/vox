@@ -2155,8 +2155,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => {}
                 other => {
-                    // **With why** (V210-96): an address withheld because no board holds the room
-                    // names each board and what kept the room off it.
+                    // **With why** (V210-96): an address withheld because it would lead nowhere
+                    // says so, naming each anchor and what kept the room off it, in place of the
+                    // fault's general advice — which speaks of an anchor even when none was named.
                     let mut reason = other.to_string();
                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
                     while let Ok(Some(item)) =
@@ -2168,7 +2169,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         }) = item
                         {
                             if c == channel_id {
-                                reason.push_str(&format!("\nsaid: {why}"));
+                                reason = format!("the address was not handed out: {why}");
                                 break;
                             }
                         }

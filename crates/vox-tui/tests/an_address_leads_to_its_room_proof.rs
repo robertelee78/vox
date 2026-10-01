@@ -32,6 +32,10 @@
 //!   which has nothing for the room. The forward opens [`FORWARD_OPENS`] after the guest first
 //!   knocks on it, inside the 30 s a dial is given. Asserted: the join gets in, and its steps say
 //!   another board was asked.
+//! - **E, an address that would lead nowhere.** No anchor, and a host that knows no address of its
+//!   own (`VOX_TEST_ADVERTISE` holds its discovery empty — what a person meets while discovery
+//!   waits on a gateway that does not answer, C5). Asserted: no address is printed, the host says
+//!   it knows no address of its own, and it stops with a failure.
 //!
 //! **Every red names which it is** (the decider: a test that cannot tell a broken product from a
 //! broken test is not a valid test). `PRODUCT:` — `vox` did the wrong thing, and what it said is
@@ -40,7 +44,7 @@
 //! the claim was measured. The watchdog (`support/watchdog.rs`) names itself when it fires.
 //!
 //! **Mutations that must turn it red:** `vox serve` refusing without an anchor or public address
-//! (A); minting the address before the host knows an address of its own (A); not counting the
+//! (A); minting the address before the host knows an address of its own (E); not counting the
 //! host's own board, so a down anchor holds the address back (B, C); capping the link's boards
 //! after adding the host (B); saying an anchor took the room before it did (C); stopping the join
 //! at the first board's "nothing for room" (D).
@@ -86,6 +90,9 @@ const TAKEN_WITHIN: Duration = Duration::from_secs(120);
 /// The watchdog's bound on the whole binary: its four arms took 623 s in debug on 2026-10-01, which
 /// is past the default 600 s, so twice that, rounded up.
 const BUDGET: Duration = Duration::from_secs(1300);
+/// How long the host may take, past making its room, to withhold an address that would lead
+/// nowhere and say why (arm E): the node's `ADDRESS_PATIENCE` (30 s), and margin.
+const WITHHELD_WITHIN: Duration = Duration::from_secs(60);
 /// How long after the guest's first datagram reaches the closed forward it opens (arm D).
 const FORWARD_OPENS: Duration = Duration::from_secs(3);
 
@@ -656,5 +663,74 @@ fn d_a_join_asks_every_board_the_address_names() {
          was asked, so the first board it took held the room and the fallback was never needed \
          (the forward was closed for {FORWARD_OPENS:?} after the guest first knocked). `vox \
          connect` said:\n{err}"
+    );
+}
+
+#[test]
+#[ignore = "a real host, production Argon2id; CI runs it in release"]
+fn e_an_address_that_would_lead_nowhere_is_withheld_and_why_is_said() {
+    watchdog::arm_for(BUDGET);
+    let tmp = tempfile::tempdir().unwrap();
+    let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
+    let host_fp = two_identities(&guest_dir, &host_dir);
+    // No anchor, and an address discovery that never finds an address of the host's own. A person
+    // meets this while discovery is still waiting on a gateway that does not answer (C5); that
+    // cannot be staged here without root, so `VOX_TEST_ADVERTISE` (which no address parses from)
+    // stands in for it, holding the host to no address of its own for the whole run.
+    let mut host = VoxProc::spawn_env(
+        "host",
+        &host_dir,
+        &args(&["serve", "22"]),
+        &[("VOX_TEST_ADVERTISE", "none")],
+    );
+    let said = line_within(&mut host, ROOM_WITHIN + WITHHELD_WITHIN, |l| {
+        l.starts_with("address ") || l.contains("knows no address of its own")
+    });
+    let Some(said) = said else {
+        panic!(
+            "{}: `vox serve`, knowing no address of its own and given no anchor, neither printed \
+             an address nor said why it withheld one within {:?}. It said:\n{}",
+            host_verdict(&mut host),
+            ROOM_WITHIN + WITHHELD_WITHIN,
+            host.transcript()
+        );
+    };
+    if said.starts_with("address ") {
+        let address = after_label(&said, "address");
+        assert!(
+            !address.contains(&format!("a={host_fp}")),
+            "APPARATUS: staging not achieved — the address names the host as a route, so it knew \
+             an address of its own (`VOX_TEST_ADVERTISE` had no effect): {address}"
+        );
+        panic!(
+            "PRODUCT: `vox serve` printed an address that names no route at all — no address of \
+             the host's own and no anchor — which a guest cannot use: {address}\nIt said:\n{}",
+            host.transcript()
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Ok(Some(status)) = host.child.try_wait() {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!("[proof] arm E: the host withheld its address and exited {status:?}");
+    let said_all = host.transcript();
+    assert!(
+        said_all.contains("names no anchor") && !said_all.contains("the anchor could not be reached"),
+        "PRODUCT: `vox serve` was given no anchor, and its reason for withholding the address must \
+         say it names none rather than blame an anchor (an anchor bridges hosts that cannot \
+         otherwise find each other; nothing else needs one). It said:\n{said_all}"
+    );
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "PRODUCT: `vox serve` said it withheld the address ({said}) but did not stop with a \
+         failure ({status:?}): a host that hands out nothing must not look like it serves.\nIt \
+         said:\n{}",
+        host.transcript()
     );
 }

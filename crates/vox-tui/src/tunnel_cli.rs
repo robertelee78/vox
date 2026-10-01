@@ -567,19 +567,18 @@ pub async fn serve(
     // who joined at once was told the board had nothing for the room.
     let out = node.apply(NodeCommand::Invite { channel_id }).await;
     if !out.is_done() {
-        // With why, which the node says board by board.
-        let mut why = String::new();
+        // With why, which the node says anchor by anchor, in place of the fault's general advice
+        // (which speaks of an anchor even when none was named).
+        let mut why = out.to_string();
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_secs(1), node.next_event()).await
         {
             if let NodeEvent::AddressWithheld { reason, .. } = ev {
-                why = format!("\n       {reason}");
+                why = format!("the address was not handed out: {reason}");
                 break;
             }
         }
-        return Err(AppError::Usage(format!(
-            "cannot mint an address: {out}{why}"
-        )));
+        return Err(AppError::Usage(format!("cannot mint an address: {why}")));
     }
     let url = loop {
         match node.next_event().await {

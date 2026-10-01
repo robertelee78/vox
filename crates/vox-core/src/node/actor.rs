@@ -5584,14 +5584,20 @@ impl Node {
             .into_iter()
             .map(|b| format!("board {}: {}", short(b), self.why_not_on(room, b)))
             .collect();
+        // No anchor named is said as that, not as an anchor that failed: none was needed until
+        // this node turned out to know no address of its own.
+        let anchors = if boards.is_empty() {
+            "it names no anchor".to_owned()
+        } else {
+            format!("no anchor it names holds the room — {}", boards.join("; "))
+        };
         let _ = self.event_tx.send(NodeEvent::AddressWithheld {
             channel_id: room,
             reason: format!(
                 "after {}s this node still knows no address of its own to put in the address of \
-                 room {}, and no anchor it names holds the room, so it would lead nowhere — {}",
+                 room {}, and {anchors}, so it would lead nowhere",
                 ADDRESS_PATIENCE.as_secs(),
                 short(room),
-                boards.join("; ")
             ),
         });
         let _ = reply.send(Outcome::Failed(Fault::BoardUnreachable));
