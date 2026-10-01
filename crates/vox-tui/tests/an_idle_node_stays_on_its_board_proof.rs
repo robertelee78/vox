@@ -129,6 +129,19 @@ fn publish(data: &Path, what: &str) -> u64 {
         .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.{what}: {out}"))
 }
 
+/// A node's publish rounds by cause so far (`publish.by_cause` in `vox status --json`).
+fn by_cause(data: &Path) -> std::collections::BTreeMap<String, u64> {
+    let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
+    assert!(ok, "vox status --json: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status is JSON");
+    v["publish"]["by_cause"]
+        .as_object()
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.by_cause: {out}"))
+        .iter()
+        .map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0)))
+        .collect()
+}
+
 /// `address` without the `a=<who>&b=<endpoint>` pair naming `who`: what is left names the anchor.
 fn without_endpoint_of(address: &str, who: &str) -> String {
     let (head, query) = address.split_once('?').expect("an address with a query");
@@ -268,6 +281,7 @@ fn idle_then_join(churn: bool) {
         publish(&alice_dir, "renewals"),
         publish(&alice_dir, "rounds"),
     );
+    let causes_before = by_cause(&alice_dir);
     let idle = Duration::from_secs(ttl * LIFETIMES);
     let idle_from = Instant::now();
     let mut restarts = 0u32;
@@ -288,6 +302,21 @@ fn idle_then_join(churn: bool) {
     }
     let renewed = publish(&alice_dir, "renewals").saturating_sub(before);
     let rounds = publish(&alice_dir, "rounds").saturating_sub(rounds_before);
+    // What asked for each round while everyone was idle.
+    let causes: std::collections::BTreeMap<String, u64> = by_cause(&alice_dir)
+        .into_iter()
+        .map(|(k, n)| {
+            let was = causes_before.get(&k).copied().unwrap_or(0);
+            (k, n.saturating_sub(was))
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    println!("[proof] alice's publish rounds while idle, by cause: {causes:?}");
+    assert_eq!(
+        causes.values().sum::<u64>(),
+        rounds,
+        "CANNOT MEASURE: alice's rounds by cause {causes:?} do not add up to her {rounds} rounds"
+    );
 
     // ---- Carol, who has only the anchor ----------------------------------------------------
     let mut anchor_only = without_endpoint_of(&link, &alice_fp);

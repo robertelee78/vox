@@ -47,6 +47,7 @@ use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
+use crate::node::status::PublishCause;
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
@@ -2987,6 +2988,7 @@ impl Node {
         &mut self,
         channel_id: &Digest32,
         conn: &Arc<VoxConnection>,
+        cause: PublishCause,
     ) {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
@@ -3048,7 +3050,7 @@ impl Node {
             self.publish_again.insert((*channel_id, board_id));
             return;
         }
-        crate::node::status::SyncBook::note_publish_round(&self.sync_book);
+        crate::node::status::SyncBook::note_publish_round(&self.sync_book, cause);
         let conn = Arc::clone(conn);
         let tx = self.net_tx.clone();
         let cid = *channel_id;
@@ -3580,7 +3582,7 @@ impl Node {
 
     /// Put a channel's genesis and this node's records on every anchor this node is
     /// connected to (its configured set and the channel's own).
-    async fn publish_channel_to_anchors(&mut self, channel_id: &Digest32) {
+    async fn publish_channel_to_anchors(&mut self, channel_id: &Digest32, cause: PublishCause) {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
@@ -3597,7 +3599,8 @@ impl Node {
             .filter_map(|id| net.manager().existing(id))
             .collect();
         for conn in anchors {
-            self.publish_channel_to_anchor(channel_id, &conn).await;
+            self.publish_channel_to_anchor(channel_id, &conn, cause)
+                .await;
         }
     }
 
@@ -3747,7 +3750,8 @@ impl Node {
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
                     self.publish_channel_locally(&channel_id).await;
-                    self.publish_channel_to_anchors(&channel_id).await;
+                    self.publish_channel_to_anchors(&channel_id, PublishCause::Opened)
+                        .await;
                     let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
                 }
             }
@@ -3967,7 +3971,8 @@ impl Node {
                 // around a ring of anchors.
                 if self.channels.contains_key(&channel_id) {
                     crate::node::status::SyncBook::note_board_news(&self.sync_book);
-                    self.publish_channel_to_anchors(&channel_id).await;
+                    self.publish_channel_to_anchors(&channel_id, PublishCause::BoardNews)
+                        .await;
                     self.note_new_members(&channel_id).await;
                 }
             }
@@ -3990,7 +3995,8 @@ impl Node {
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
                     self.publish_channel_locally(&channel_id).await;
-                    self.publish_channel_to_anchors(&channel_id).await;
+                    self.publish_channel_to_anchors(&channel_id, PublishCause::Addresses)
+                        .await;
                 }
             }
             NetEvent::ReachFailed { peer, why } => {
@@ -4059,7 +4065,12 @@ impl Node {
                 self.refresh_network_view().await;
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
-                    self.publish_channel_to_anchor(&channel_id, &conn).await;
+                    self.publish_channel_to_anchor(
+                        &channel_id,
+                        &conn,
+                        PublishCause::AnchorReturned,
+                    )
+                    .await;
                 }
             }
             NetEvent::BetterPath { conn } => {
@@ -4159,7 +4170,8 @@ impl Node {
                 let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
                 if let Some(conn) = conn {
                     // Queued behind a round in flight to that board, as any other publish is.
-                    self.publish_channel_to_anchor(&channel_id, &conn).await;
+                    self.publish_channel_to_anchor(&channel_id, &conn, PublishCause::AskedAgain)
+                        .await;
                 }
             }
             NetEvent::PublishDone {
@@ -4252,7 +4264,8 @@ impl Node {
                 if self.publish_again.remove(&(channel_id, board)) {
                     let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
                     if let Some(conn) = conn {
-                        self.publish_channel_to_anchor(&channel_id, &conn).await;
+                        self.publish_channel_to_anchor(&channel_id, &conn, PublishCause::Again)
+                            .await;
                     }
                 }
                 // A session with that board for this room was held back while the round ran.
@@ -4266,7 +4279,8 @@ impl Node {
                 let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
                 match conn {
                     Some(conn) if self.channels.contains_key(&channel_id) => {
-                        self.publish_channel_to_anchor(&channel_id, &conn).await;
+                        self.publish_channel_to_anchor(&channel_id, &conn, PublishCause::Retry)
+                            .await;
                     }
                     _ => {
                         self.publish_failures.remove(&(channel_id, board));
@@ -4388,7 +4402,8 @@ impl Node {
                     // fires for news.
                     if o.governance > 0 {
                         self.refresh_reachers().await;
-                        self.publish_channel_to_anchors(&channel_id).await;
+                        self.publish_channel_to_anchors(&channel_id, PublishCause::Governance)
+                            .await;
                     }
                     // **A newcomer this session admitted is consented to now, not on the tick.** Two
                     // members who joined the same room learn of each other only here, from the board.
@@ -4719,7 +4734,8 @@ impl Node {
             // witnessed the join, so it vouches (ADR-016 M15.2a). The joiner has
             // published to this board by the time its own join returns; whatever is
             // there now goes up, and what arrives later goes with the next mirror.
-            self.publish_channel_to_anchors(&channel_id).await;
+            self.publish_channel_to_anchors(&channel_id, PublishCause::Join)
+                .await;
         }
         self.adopt_join_session(channel_id, peer, outcome.session, false)
             .await;
@@ -5130,9 +5146,10 @@ impl Node {
         self.publish_channel_locally(&parsed.channel_id).await;
         // And on every anchor we hold, so every other member can find our key and
         // admit us as a log author (without which their sync sessions fail).
-        self.publish_channel_to_anchors(&parsed.channel_id).await;
+        self.publish_channel_to_anchors(&parsed.channel_id, PublishCause::Join)
+            .await;
         if !self.anchor_ids.contains(&conn.peer_id()) {
-            self.publish_channel_to_anchor(&parsed.channel_id, &conn)
+            self.publish_channel_to_anchor(&parsed.channel_id, &conn, PublishCause::Join)
                 .await;
         }
         // **Joining releases no sender key** (M17.6). This is the correction to
@@ -6001,7 +6018,8 @@ impl Node {
             self.records_renew_at.remove(&room);
             crate::node::status::SyncBook::note_renewal(&self.sync_book);
             self.publish_channel_locally(&room).await;
-            self.publish_channel_to_anchors(&room).await;
+            self.publish_channel_to_anchors(&room, PublishCause::Renewal)
+                .await;
         }
         // A room closed since it was armed is not renewed.
         let open = &self.channels;
@@ -7820,7 +7838,8 @@ impl Node {
         self.adopt_channel_anchors(&id, None).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&id).await;
-        self.publish_channel_to_anchors(&id).await;
+        self.publish_channel_to_anchors(&id, PublishCause::Opened)
+            .await;
         let _ = self
             .event_tx
             .send(NodeEvent::ChannelOpened { channel_id: id });
@@ -7963,7 +7982,8 @@ impl Node {
         self.adopt_channel_anchors(&id, None).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&id).await;
-        self.publish_channel_to_anchors(&id).await;
+        self.publish_channel_to_anchors(&id, PublishCause::Opened)
+            .await;
         let _ = self
             .event_tx
             .send(NodeEvent::ChannelOpened { channel_id: id });
@@ -8109,7 +8129,8 @@ impl Node {
                 self.adopt_channel_anchors(channel_id, None).await;
                 self.refresh_network_view().await;
                 self.publish_channel_locally(channel_id).await;
-                self.publish_channel_to_anchors(channel_id).await;
+                self.publish_channel_to_anchors(channel_id, PublishCause::Opened)
+                    .await;
                 let _ = self.event_tx.send(NodeEvent::ChannelOpened {
                     channel_id: *channel_id,
                 });
