@@ -3,26 +3,20 @@
 #
 #   GH_TOKEN=$(gh auth token --user robertelee78) scripts/release-gate.sh
 #
-# A tag is not cut unless this exits 0. It is the one place where:
+# A tag is not cut unless this exits 0. It runs what CI's build-test runs, on real Mac hardware:
+# fmt, clippy -D warnings, the debug suite, rustdoc -D warnings, and the release `--ignored`
+# suite, with no gap accepted. And it checks **the CI run on this commit** passed, with every job
+# inside two-thirds of its `timeout-minutes` (V210-14, #187). release.yml publishes only a commit
+# whose CI passed on main (#186); this refuses earlier, and says which job is near its limit.
 #
-# - **the live-model proofs run** (ADR-018, "No proof is excluded by name, and one gap remains").
-#   CI keeps one accepted gap, `opencode`: its runners have neither OpenCode nor a model account.
-#   The decider chose (2026-09-26) "Only on this Mac": those proofs run here, with the decider's
-#   OpenCode account, and must be green before every tag. Here VOX_PROOF_ALLOW_UNPROVEN is unset,
-#   so a live-model proof that cannot run is red, not excused;
-# - **R41's WAN link is gated on real hardware** (decider, 2026-09-26). CI reports it on the
-#   macOS runner, whose VM stalls, and gates it only on ubuntu;
-# - **the CI run on this commit is checked** to have passed, with every job inside two-thirds of its
-#   `timeout-minutes` (V210-14, #187). release.yml publishes only a commit whose CI passed on main
-#   (#186); this refuses earlier, and says which job is near its limit.
+# **The optional proofs do not run here** (decider, 2026-10-01: "Fully optional"): the live-model
+# proofs, the PRD-001 timing proofs (R40, R41, R42) and the heavy ones block nothing, here or in
+# CI. They run only with vox-tui's `optional-proofs` feature, which this does not enable: in their
+# place the suite runs stand-ins that print `OPTIONAL PROOF NOT RUN` and pass. They are kept ready
+# for troubleshooting, and docs/release/optional-proofs.md says how to run each.
 #
-# It runs what CI's build-test and transport-gates run, with nothing skipped but the gap-free
-# set: fmt, clippy -D warnings, the debug suite, rustdoc -D warnings, and the release `--ignored`
-# suite including the transport proofs.
-#
-# Needs: macOS; `opencode` on PATH, logged in; `pyte` importable, or VOX_PYTE_PATH set (the TUI
-# proof); `gh`; GH_TOKEN for the repository's account. Builds are polite (nice, 4 jobs) because
-# other work shares the machine; the proofs are timing-sensitive, so run nothing heavy alongside.
+# Needs: macOS; `pyte` importable, or VOX_PYTE_PATH set (the TUI proof); `gh`; GH_TOKEN for the
+# repository's account. Builds are polite (nice, 4 jobs) because other work shares the machine.
 set -u
 
 fail=0
@@ -30,7 +24,6 @@ note() { printf '%s\n' "release-gate: $*"; }
 bad() { note "RED: $*"; fail=1; }
 
 [ "$(uname -s)" = Darwin ] || { note "run this on a real Mac (the macOS gate); this is $(uname -s)"; exit 2; }
-command -v opencode >/dev/null 2>&1 || { note "opencode is not on PATH: the live-model proofs cannot run"; exit 2; }
 command -v gh >/dev/null 2>&1 || { note "gh is not on PATH: the CI run cannot be checked"; exit 2; }
 [ -n "${GH_TOKEN:-}" ] || { note "set GH_TOKEN for the repository's account"; exit 2; }
 if [ -z "${VOX_PYTE_PATH:-}" ] && ! python3 -c 'import pyte' >/dev/null 2>&1; then
@@ -42,7 +35,7 @@ head=$(git rev-parse HEAD)
 note "gating $head"
 
 # Nothing excused, and no live session leaks into the proofs (the harness strips these too).
-unset VOX_PROOF_ALLOW_UNPROVEN VOX_PERF_REPORT_ONLY VOX_PERF_ONLY VOX_PERF_MIN_RATIO
+unset VOX_PROOF_ALLOW_UNPROVEN VOX_PERF_ONLY VOX_PERF_MIN_RATIO
 unset CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN OPENCODE_SERVER_URL VOX_HARNESS
 
 polite() { nice -n 10 env CARGO_BUILD_JOBS=4 "$@"; }
@@ -64,7 +57,7 @@ if VOX_MUTANT_SENDER=$(polite scripts/build-mutant-sender.sh); then
 else
   bad "building the mutant sender"
 fi
-step "release suite (all proofs, live-model and transport included)" \
+step "release suite (every blocking proof; each optional one says NOT RUN)" \
   polite cargo test --release --workspace --no-fail-fast -- --ignored
 
 # ---- the CI run on this commit: passed, and every job well inside its limit ----

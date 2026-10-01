@@ -1,0 +1,80 @@
+# Optional proofs: the troubleshooting kit
+
+These are real proofs. Each drives the shipped `vox` as a person would and asserts what the person sees or gets. But each one is too heavy, needs a live model, or times something that only a real machine can measure honestly, so **none of them blocks anything** (decider, 2026-10-01: "Fully optional"). They block neither CI nor `scripts/release-gate.sh`.
+
+They are kept "at the ready for troubleshooting". When a user reports one of the symptoms below, run the matching proof.
+
+## How they are kept
+
+- **One switch.** vox-tui's cargo feature is `optional-proofs`. `heavy-proofs` is an alias for it, kept for branches that still name it.
+- **Without the feature they are loud, not silent.** Each optional test is compiled only with the feature (`#[cfg(feature = "optional-proofs")]`). Without it, a stand-in of the same name takes its place, in the module `optional_proof_not_run`. One macro makes the stand-ins: `not_run!` in `crates/vox-tui/tests/support/optional_proof.rs`, which every optional file invokes with its optional tests' names.
+  - A listing (`-- --ignored --list`) shows `optional_proof_not_run::<test>`, never nothing.
+  - A run without `--ignored` shows it `ignored, OPTIONAL PROOF NOT RUN: enable with --features optional-proofs …`.
+  - A run with `--ignored`, as in CI and `scripts/release-gate.sh`, prints `OPTIONAL PROOF NOT RUN: <file>::<test> needs --features optional-proofs …` past the test harness's capture, and passes. An optional proof blocks nothing.
+  - An optional half of a blocking file is a separate test, so the blocking half still runs.
+- **With the feature they run for real.** Nothing is excused, and `VOX_PROOF_ALLOW_UNPROVEN` is not read by any of them.
+  - A missing prover fails as `CANNOT MEASURE`, naming what is missing. A missing prover is `opencode`, its login, or a network.
+  - A product failure fails as the product's verdict.
+- **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
+
+## Running one
+
+- Run from the repository root, on a machine doing its ordinary work.
+- Run **one test at a time**, by its exact name, as each row shows.
+  - The watchdog's budget (10 minutes, `VOX_TEST_WATCHDOG_SECS` overrides it) covers a whole test binary.
+  - Two tests of one binary run together would share that budget.
+- The first run compiles vox-tui with the feature. Later runs reuse the build.
+
+"Time" is the release run's `finished in` from CI run 36830124620 (2026-10-01, ubuntu and macOS runners), the last run before these proofs left CI. The two figures are ubuntu / macOS. It is a guide, not a bound. A row says "not timed" when CI never ran that proof for real: CI had no model account.
+
+## The proofs
+
+### Live model (needs `opencode` on PATH, logged in: `~/.local/share/opencode/auth.json`)
+
+| Proof | Helps troubleshoot | Run | Needs | Time |
+|---|---|---|---|---|
+| `agent_rehearsal_proof::two_agent_sessions_and_an_operator_share_one_room` | Two AI sessions and a person in one room don't see each other's messages, or a session sees its own posts echoed. | `cargo test --release -p vox-tui --features optional-proofs --test agent_rehearsal_proof -- --ignored --exact two_agent_sessions_and_an_operator_share_one_room` | opencode + login; a model account (default `opencode/claude-haiku-4-5`, `VOX_PROOF_OPENCODE_MODEL` overrides it) | not timed; minutes of model turns |
+| `opencode_plugin_proof::a_real_model_reads_the_room_through_the_opencode_plugin` | An OpenCode agent never sees what was posted to its room. | `cargo test --release -p vox-tui --features optional-proofs --test opencode_plugin_proof -- --ignored --exact a_real_model_reads_the_room_through_the_opencode_plugin` | opencode + login | not timed; one or two model turns |
+| `an_agent_wake_is_safe_and_bounded_proof::a_live_model_is_shown_the_framed_attributed_wake` | An urgent message reaches the agent's model unattributed, or looks as if it came from the operator. | `cargo test --release -p vox-tui --features optional-proofs --test an_agent_wake_is_safe_and_bounded_proof -- --ignored --exact a_live_model_is_shown_the_framed_attributed_wake` | opencode + login | not timed; two model turns, each up to 180 s |
+| `drain_self_filter_proof::a_live_models_post_is_dropped_only_from_its_own_sessions_drain` | An OpenCode agent is fed its own posts back, or loses another session's posts. | `cargo test --release -p vox-tui --features optional-proofs --test drain_self_filter_proof -- --ignored --exact a_live_models_post_is_dropped_only_from_its_own_sessions_drain` | opencode + login; the model must run one shell command it is asked to (a model that won't is reported `CANNOT MEASURE`, not a product red) | not timed; two model turns |
+
+### A published release (needs the network and `gh`)
+
+**Planned, not yet built here (#301):** `update_proof`'s `journey.*` and `verify.*` claims, which run an already-published `vox update` through GitHub, are to be optional. Group D's change to `update_proof.rs` (branch `fix/v210-106-groupD`) moves them into their own test, `an_older_release_updates_itself_and_refuses_a_bad_download`, behind the opt-in `VOX_PROOF_UPDATE_JOURNEY=1`, which says `NOT RUN` without it. Once that lands, the test is to move behind `optional-proofs` with a stand-in like every other proof here, and a row for it is to be added here.
+
+### Timing a person feels (needs a real machine; a CI VM's stalls make these unreliable)
+
+| Proof | Helps troubleshoot | Run | Needs | Time |
+|---|---|---|---|---|
+| `perf_r40_chat_latency_proof::r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct` | Chat messages are slow to arrive between two online people on a direct path (PRD-001 R40, under 1 s). | `cargo test --release -p vox-tui --features optional-proofs --test perf_r40_chat_latency_proof -- --ignored --exact r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct` | a real machine | 8 s / 9 s |
+| `perf_r40_relayed_chat_proof::r40_a_message_between_two_online_nodes_arrives_in_under_a_second_relayed` | The same, when the only path is a relay (R40, under 1 s). | `cargo test --release -p vox-tui --features optional-proofs --test perf_r40_relayed_chat_proof -- --ignored --exact r40_a_message_between_two_online_nodes_arrives_in_under_a_second_relayed` | a real machine with IPv4 and IPv6 loopback (the split is checked first) | 22 s / 23 s, with the deleted control running alongside |
+| `perf_r41_tunnel_throughput_proof::r41_a_tunnel_does_not_throttle_the_link_it_runs_over` | A tunnel (`vox forward`, SOCKS) is much slower than the link it runs over (R41). | `cargo test --release -p vox-tui --features optional-proofs --test perf_r41_tunnel_throughput_proof -- --ignored --exact r41_a_tunnel_does_not_throttle_the_link_it_runs_over` | a real machine; ~2 GB through a userspace link emulator. **On a busy Mac it usually stops at its calibration, `CANNOT MEASURE`** (3 of 5 runs at load 41–52, verifier-294, 2026-10-01): the emulator alone could not hold the link's rate, so nothing about the tunnel was measured. That is not a product verdict; run it again with less else running. **Once #300's `test-knobs` feature lands**, R41 is to be run with both features, `--features vox-tui/optional-proofs,vox-tui/test-knobs`: it sets `VOX_TEST_ADVERTISE`, which a build without the knobs refuses (CANNOT MEASURE). | 318 s / 325 s |
+| `a_first_direct_connection_is_prompt_proof::a_first_direct_connection_completes_in_under_two_seconds` | The first connection to a host on the same network takes more than 2 s (R42). | `cargo test --release -p vox-tui --features optional-proofs --test a_first_direct_connection_is_prompt_proof -- --ignored --exact a_first_direct_connection_completes_in_under_two_seconds` | a real machine | 22 s / 25 s |
+| `a_first_punched_connection_is_prompt_proof::a_first_hole_punched_connection_completes_in_under_two_seconds` | The first connection through two NATs takes more than 2 s (R42). | `cargo test --release -p vox-tui --features optional-proofs --test a_first_punched_connection_is_prompt_proof -- --ignored --exact a_first_hole_punched_connection_completes_in_under_two_seconds` | a real machine | 45 s / 52 s |
+| `a_first_relayed_connection_is_under_two_seconds_proof::a_first_relayed_connection_completes_in_under_two_seconds` | The first relayed connection takes more than 2 s (R42). | `cargo test --release -p vox-tui --features optional-proofs --test a_first_relayed_connection_is_under_two_seconds_proof -- --ignored --exact a_first_relayed_connection_completes_in_under_two_seconds` | a real machine | 21 s / 21 s |
+| `an_ipv6_joiner_reaches_its_board_promptly_proof::an_ipv6_only_joiner_reaches_its_board_within_two_seconds` | On an IPv6-only network, reaching the anchor takes more than 2 s (R42). | `cargo test --release -p vox-tui --features optional-proofs --test an_ipv6_joiner_reaches_its_board_promptly_proof -- --ignored --exact an_ipv6_only_joiner_reaches_its_board_within_two_seconds` | a real machine with IPv6 loopback | 16 s for both tests (ubuntu) |
+| `an_ipv6_joiner_reaches_its_board_promptly_proof::a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seconds` | Dead anchors in a room's address delay joining past 2 s (R42). | `cargo test --release -p vox-tui --features optional-proofs --test an_ipv6_joiner_reaches_its_board_promptly_proof -- --ignored --exact a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seconds` | a real machine | (in the 16 s above) |
+| `a_post_answers_promptly_while_a_peer_posts_proof::a_post_answers_promptly_while_a_peer_posts` | `vox room post` is sluggish while someone else in the room is posting (100 ms). | `cargo test --release -p vox-tui --features optional-proofs --test a_post_answers_promptly_while_a_peer_posts_proof -- --ignored --exact a_post_answers_promptly_while_a_peer_posts` | a real machine | 11 s / 12 s |
+| `a_trust_check_does_not_stall_the_node_proof::a_trust_check_does_not_stall_posts_and_reads_on_the_same_node` | Posting and reading freeze while trust checks run (1 s and 150 ms bounds). | `cargo test --release -p vox-tui --features optional-proofs --test a_trust_check_does_not_stall_the_node_proof -- --ignored --exact a_trust_check_does_not_stall_posts_and_reads_on_the_same_node` | a real machine | 32 s / 42 s |
+
+### Heavy (minutes of work, thousands of posts, or long waits)
+
+| Proof | Helps troubleshoot | Run | Needs | Time |
+|---|---|---|---|---|
+| `a_join_outlives_its_displaced_path_proof::a_join_outlives_its_displaced_path` | A slow join fails when the network path changes under it. | `cargo test --release -p vox-tui --features optional-proofs --test a_join_outlives_its_displaced_path_proof -- --ignored --exact a_join_outlives_its_displaced_path` | time (a 300 s join grind) | 314 s / 315 s |
+| `a_slow_joiner_gets_in_or_is_told_why_proof::a_joiner_slower_than_the_old_patience_gets_in` | A slow machine can't get into a room. | `cargo test --release -p vox-tui --features optional-proofs --test a_slow_joiner_gets_in_or_is_told_why_proof -- --ignored --exact a_joiner_slower_than_the_old_patience_gets_in` | time (a 150 s grind) | 488 s / 490 s for both, run together |
+| `a_slow_joiner_gets_in_or_is_told_why_proof::a_joiner_slower_than_the_patience_is_told_why` | A machine too slow to join gets no explanation. | `cargo test --release -p vox-tui --features optional-proofs --test a_slow_joiner_gets_in_or_is_told_why_proof -- --ignored --exact a_joiner_slower_than_the_patience_is_told_why` | time (a 485 s grind; near the 10-minute watchdog, so run it alone) | (in the figure above) |
+| `two_backlogs_meet_proof::two_backlogs_that_meet_both_cross` | Two members who were offline with big backlogs don't both catch up. | `cargo test --release -p vox-tui --features optional-proofs --test two_backlogs_meet_proof -- --ignored --exact two_backlogs_that_meet_both_cross` | 48 MB of history | 42 s / 48 s |
+| `a_member_reads_only_what_follows_trust_proof::posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read` | Someone trusted later reads what came before the trust, or misses what came after. | `cargo test --release -p vox-tui --features optional-proofs --test a_member_reads_only_what_follows_trust_proof -- --ignored --exact posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read` | 3,160 posts through the CLI | 148 s / 181 s |
+| `a_newcomer_reads_the_whole_history_proof::a_newcomer_trusted_before_every_post_reads_all_of_them` | A newcomer trusted from the start misses part of a long room's history. | `cargo test --release -p vox-tui --features optional-proofs --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact a_newcomer_trusted_before_every_post_reads_all_of_them` | 1,500 posts | 27 s / 30 s |
+| `a_long_room_reopens_proof::a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_them_all` | A long room loses posts across a restart. | `cargo test --release -p vox-tui --features optional-proofs --test a_long_room_reopens_proof -- --ignored --exact a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_them_all` | 1,500 posts | 30 s / 40 s |
+| `an_idle_node_stays_on_its_board_proof::an_idle_node_stays_findable_on_its_board` | An idle `vox` stops being findable after a while. | `cargo test --release -p vox-tui --features optional-proofs --test an_idle_node_stays_on_its_board_proof -- --ignored --exact an_idle_node_stays_findable_on_its_board` | time (several record lifetimes) | 113 s / 107 s for both, run together |
+| `an_idle_node_stays_on_its_board_proof::a_round_to_one_anchor_does_not_put_off_the_others` | One flapping anchor makes you unfindable on the others. | `cargo test --release -p vox-tui --features optional-proofs --test an_idle_node_stays_on_its_board_proof -- --ignored --exact a_round_to_one_anchor_does_not_put_off_the_others` | time | (in the figure above) |
+| `a_relayed_pair_finds_a_direct_path_proof::a_relayed_pair_finds_a_direct_path_once_one_becomes_possible` | A relayed connection never upgrades to a direct one. | `cargo test --release -p vox-tui --features optional-proofs --test a_relayed_pair_finds_a_direct_path_proof -- --ignored --exact a_relayed_pair_finds_a_direct_path_once_one_becomes_possible` | time (two 60 s retries) | 138 s / 137 s |
+| `a_displaced_relay_is_let_go_proof::a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace` | An anchor keeps carrying relays for pairs that went direct. | `cargo test --release -p vox-tui --features optional-proofs --test a_displaced_relay_is_let_go_proof -- --ignored --exact a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace` | time (a 60 s grace) | 82 s / 83 s |
+
+### Spike (samples a race under deliberate CPU load)
+
+| Proof | Helps troubleshoot | Run | Needs | Time |
+|---|---|---|---|---|
+| `a_member_that_just_joined_is_not_refused_proof::a_member_that_just_joined_is_not_refused_by_its_anchor` | A member who just joined is told of an integrity failure that isn't real. | `cargo test --release -p vox-tui --features optional-proofs --test a_member_that_just_joined_is_not_refused_proof -- --ignored --exact a_member_that_just_joined_is_not_refused_by_its_anchor` | it makes its own CPU load; run it alone | 88 s / 102 s |

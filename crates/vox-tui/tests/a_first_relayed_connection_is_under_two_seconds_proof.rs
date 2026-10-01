@@ -31,7 +31,15 @@
 //! [`R42`] or never connects; stop superseding another process's connections and the restart
 //! samples exceed [`RESTART_WITHIN`], with no supersede said.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_first_relayed_connection_completes_in_under_two_seconds);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -73,8 +81,9 @@ fn reached(transcript: &str) -> Option<(u64, String)> {
     })
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+#[ignore = "real binaries, production Argon2id and a PoW; optional, run it in release"]
 fn a_first_relayed_connection_completes_in_under_two_seconds() {
     watchdog::arm();
     let mut w = RelayWorld::new(Split::Families);

@@ -25,7 +25,15 @@
 //! [`LOCAL_BOUND`], and the loaded median must not be more than [`MEDIAN_SLACK`] above the
 //! quiet one. Both are printed with the samples.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_trust_check_does_not_stall_posts_and_reads_on_the_same_node);
 
 #[path = "support/room.rs"]
 mod support;
@@ -93,8 +101,9 @@ fn stats(label: &str, v: &[Duration]) -> (Duration, Duration) {
     (median, max)
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "two networked nodes with production Argon2id; CI runs it in release"]
+#[ignore = "two networked nodes with production Argon2id; optional, run it in release"]
 fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()

@@ -33,7 +33,15 @@
 //! when its grace ends, about 60s after the upgrade and inside the 300s grind, and the join
 //! fails.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_join_outlives_its_displaced_path);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -73,8 +81,9 @@ fn profile() -> &'static str {
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "a grind floored at 300s, a relayed then direct path, real processes; CI runs it in release"]
+#[ignore = "a grind floored at 300s, a relayed then direct path, real processes; optional, run it in release"]
 fn a_join_outlives_its_displaced_path() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();

@@ -1,7 +1,10 @@
 //! V210-79 — **an agent's wake is safe, and claims and loops are bounded**, through the
 //! shipped `vox` binary: two `vox daemon`s, `vox room post`, `vox room claim` and the real
 //! drain hook `vox agent hook`, plus — for what a model is actually shown — a live OpenCode
-//! server and a real model turn.
+//! server and a real model turn, which is **optional** (decider, 2026-10-01): case 6 is its own
+//! test, [`a_live_model_is_shown_the_framed_attributed_wake`], and runs only with
+//! `--features optional-proofs` (docs/release/optional-proofs.md); without it a stand-in says it
+//! was not run.
 //!
 //! **Every Vox participant is the shipped binary** (`support/room.rs`): an anchor, alice's,
 //! bob's and carol's `vox daemon`, the room made with `vox room create|invite|join`, each trusting
@@ -54,18 +57,26 @@
 
 #![cfg(unix)]
 
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
 #[path = "support/room.rs"]
 mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+// The optional half, loud when not run: see the header.
+optional_proof::not_run!(a_live_model_is_shown_the_framed_attributed_wake);
 
-use std::io::{BufRead as _, Read as _};
+#[cfg(feature = "optional-proofs")]
+use std::io::BufRead as _;
+use std::io::Read as _;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use support::{until, Out, Worker, VOX};
+#[cfg(feature = "optional-proofs")]
+use support::VOX;
+use support::{until, Out, Worker};
 
 /// A stand-in Claude Code messaging socket: every connection's bytes, as they are written.
 fn listen(path: &Path) -> mpsc::Receiver<String> {
@@ -169,13 +180,6 @@ fn envelope_with(w: &Worker, r: &str, marker: &str) -> Option<serde_json::Value>
         .map(|x| x["envelope"].clone())
 }
 
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
-}
-
 /// Record a failed claim and carry on, so one mutant shows every case red.
 fn check(failures: &mut Vec<String>, ok: bool, what: String) {
     if !ok {
@@ -185,7 +189,7 @@ fn check(failures: &mut Vec<String>, ok: bool, what: String) {
 }
 
 #[test]
-#[ignore = "an anchor and two vox daemons with production Argon2id, and a live model turn; CI runs it in release"]
+#[ignore = "an anchor and three vox daemons with production Argon2id; CI runs it in release"]
 fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -541,9 +545,33 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         ),
     );
 
-    // ---- (6) live: what a real model is shown, and whom it takes it to be from ----
-    live(bob, alice, r, &mut failures, &daemon_err);
+    assert!(
+        failures.is_empty(),
+        "{} claim(s) failed:\n- {}",
+        failures.len(),
+        failures.join("\n- ")
+    );
+}
 
+/// Case 6, **live**: what a real model is shown, and whom it takes it to be from. Optional: see
+/// the header.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "an anchor and two vox daemons with production Argon2id, and a live model turn; optional, run it in release"]
+fn a_live_model_is_shown_the_framed_attributed_wake() {
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let (alice, bob) = (&room.workers[0], &room.workers[1]);
+    let daemon_err =
+        || std::fs::read_to_string(tmp.path().join("bob.daemon.err")).unwrap_or_default();
+    let mut failures = Vec::new();
+    live(bob, alice, room.id.as_str(), &mut failures, &daemon_err);
     assert!(
         failures.is_empty(),
         "{} claim(s) failed:\n- {}",
@@ -553,8 +581,10 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
 }
 
 /// A process killed and reaped when dropped, by its own handle.
+#[cfg(feature = "optional-proofs")]
 struct Kill(std::process::Child);
 
+#[cfg(feature = "optional-proofs")]
 impl Drop for Kill {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -562,6 +592,7 @@ impl Drop for Kill {
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 fn which(bin: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -569,12 +600,14 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
+#[cfg(feature = "optional-proofs")]
 fn model() -> String {
     std::env::var("VOX_PROOF_OPENCODE_MODEL")
         .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
 }
 
 /// A blocking HTTP/1.1 request to OpenCode's server; the response body.
+#[cfg(feature = "optional-proofs")]
 fn http(base: &str, method: &str, path: &str, body: Option<&str>) -> String {
     use std::io::Write as _;
     let addr = base.trim_start_matches("http://").trim_end_matches('/');
@@ -615,6 +648,7 @@ fn http(base: &str, method: &str, path: &str, body: Option<&str>) -> String {
 
 /// Every text part of `role`'s messages in OpenCode session `ses`, oldest first, and whether
 /// the session's latest message is an assistant's that has completed.
+#[cfg(feature = "optional-proofs")]
 fn texts(base: &str, ses: &str, role: &str) -> (Vec<String>, bool) {
     let v: serde_json::Value =
         serde_json::from_str(&http(base, "GET", &format!("/session/{ses}/message"), None))
@@ -642,6 +676,7 @@ fn texts(base: &str, ses: &str, role: &str) -> (Vec<String>, bool) {
     (out, done)
 }
 
+#[cfg(feature = "optional-proofs")]
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
@@ -651,6 +686,7 @@ fn free_port() -> u16 {
 
 /// Wait until session `ses` has settled — its latest assistant message completed and no new
 /// message for three polls — with at least `users` user messages; its texts by role.
+#[cfg(feature = "optional-proofs")]
 fn settled(base: &str, ses: &str, users: usize, within: Duration) -> (Vec<String>, Vec<String>) {
     let deadline = Instant::now() + within;
     let (mut last, mut calm) = (usize::MAX, 0);
@@ -671,6 +707,7 @@ fn settled(base: &str, ses: &str, users: usize, within: Duration) -> (Vec<String
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 fn live(
     bob: &Worker,
     alice: &Worker,
@@ -683,14 +720,11 @@ fn live(
             .join(".local/share/opencode/auth.json")
             .is_file()
     });
-    if which("opencode").is_none() || !auth {
-        assert!(
-            allow_unproven("opencode"),
-            "UNPROVEN: the live half needs `opencode` and a credential. Set \
-             VOX_PROOF_ALLOW_UNPROVEN=opencode to accept that gap deliberately."
-        );
-        return;
-    }
+    assert!(
+        which("opencode").is_some() && auth,
+        "CANNOT MEASURE: the live case needs `opencode` on PATH and a credential \
+         (~/.local/share/opencode/auth.json)"
+    );
     // One fixture per `vox` under test: OpenCode installs into its project and config
     // directories on first use, and two trees proving at once must not share one.
     let fixture = std::env::temp_dir().join(format!("vox-wake-framing-{:016x}", {

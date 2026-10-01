@@ -117,6 +117,7 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
     );
     assert!(out.status.success(), "vox update --rollback failed: {said}");
     let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
+    syscalls::assert_the_recorder_saw_vox(&events, "`vox update --rollback`");
     let (now_active, now_previous) = (version_of(&active), version_of(&previous));
     eprintln!(
         "[proof] after --rollback: vox reports {now_active:?}, .vox-previous reports \
@@ -476,6 +477,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
         let log = tmp.path().join("finish.tsv");
         let (ok, said) = rollback_with(&dir, &home, false, Some(&log));
         let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
+        syscalls::assert_the_recorder_saw_vox(&events, "(6a) finishing the swap");
         let (scratch, previous, dir_n) = (
             norm(&dir.join(".vox-rollback.partial")),
             norm(&dir.join(".vox-previous")),
@@ -515,6 +517,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
         let log = tmp.path().join("discard.tsv");
         let (ok, said) = rollback_with(&dir, &home, false, Some(&log));
         let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
+        syscalls::assert_the_recorder_saw_vox(&events, "(6b) discarding a leftover copy");
         let (scratch, dir_n) = (
             norm(&dir.join(".vox-rollback.partial")),
             std::fs::canonicalize(&dir).unwrap(),

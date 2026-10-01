@@ -236,6 +236,19 @@ pub fn parse(log: &str) -> Vec<Event> {
     events
 }
 
+/// The recorder's positive control, asserted wherever a proof reads a record: a record with no
+/// `open` by `vox` is a recorder that recorded nothing, never a `vox` that did nothing. (It replaces
+/// the recorder's separate self-test, gate plan v0.2.10 DELETE #3.)
+pub fn assert_the_recorder_saw_vox(events: &[Event], during: &str) {
+    assert!(
+        events.iter().any(|e| matches!(e.call, Call::Open { .. })),
+        "CANNOT MEASURE: the syscall recorder (vox-test-interpose under DYLD_INSERT_LIBRARIES) \
+         recorded no `open` by vox during {during} ({} call(s) in all): it is not recording, so \
+         nothing vox did can be judged from it",
+        events.len()
+    );
+}
+
 fn unreadable(line: &str) -> ! {
     panic!("CANNOT MEASURE: unreadable interposer line: {line:?}")
 }

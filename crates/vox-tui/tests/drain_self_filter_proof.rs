@@ -18,7 +18,11 @@
 //! - `B`'s drain shows A's message, and not its own;
 //! - H′'s `A` drain shows H's `A` message — same name, different author.
 //!
-//! **Live half** — a real OpenCode turn, with the plugin `vox agent plugin opencode`
+//! **Live half**, **optional** (decider, 2026-10-01): its own test,
+//! [`a_live_models_post_is_dropped_only_from_its_own_sessions_drain`], which runs only with
+//! `--features optional-proofs` (docs/release/optional-proofs.md; without it a stand-in says it
+//! was not run) — a real OpenCode turn, with
+//! the plugin `vox agent plugin opencode`
 //! prints: the model runs `vox room post` through its shell, and the plugin's
 //! `shell.env` hook names the session. The proof reads the posted row back and
 //! requires its `from` to be OpenCode's own session id — which is what makes the
@@ -27,23 +31,23 @@
 
 #![cfg(unix)]
 
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
 #[path = "support/room.rs"]
 mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+// The optional half, loud when not run: see the header.
+optional_proof::not_run!(a_live_models_post_is_dropped_only_from_its_own_sessions_drain);
 
-use std::path::Path;
-use std::process::Command;
+#[cfg(feature = "optional-proofs")]
+use std::{path::Path, process::Command};
 
-use support::{until, Out, Worker, VOX};
+#[cfg(feature = "optional-proofs")]
+use support::VOX;
+use support::{until, Out, Worker};
 
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
-}
-
+#[cfg(feature = "optional-proofs")]
 fn which(bin: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -51,6 +55,7 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
+#[cfg(feature = "optional-proofs")]
 fn auth_present() -> bool {
     std::env::var_os("HOME").is_some_and(|h| {
         Path::new(&h)
@@ -59,6 +64,7 @@ fn auth_present() -> bool {
     })
 }
 
+#[cfg(feature = "optional-proofs")]
 fn model() -> String {
     std::env::var("VOX_PROOF_OPENCODE_MODEL")
         .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
@@ -87,7 +93,7 @@ fn post(w: &Worker, r: &str, session: &str, body: &str) {
 }
 
 #[test]
-#[ignore = "two networked nodes with production Argon2id and a live model turn; CI runs it in release"]
+#[ignore = "two networked nodes with production Argon2id; CI runs it in release"]
 fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -140,16 +146,29 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
         !ap.contains("SAME-NAME-A-ON-H-PRIME") && ap.contains("OWN-A-ON-H"),
         "H′'s A drain: {ap}"
     );
+}
 
-    // ---- live half ----
-    if which("opencode").is_none() || !auth_present() {
-        assert!(
-            allow_unproven("opencode"),
-            "UNPROVEN: the live half needs `opencode` and a credential. Set \
-             VOX_PROOF_ALLOW_UNPROVEN=opencode to accept that gap deliberately."
-        );
-        return;
-    }
+/// The **live half**: a real OpenCode session's own post, made by its model through the plugin,
+/// is dropped from that session's drain and nothing else is. Optional: see the header.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two networked nodes with production Argon2id and live model turns; optional, run it in release"]
+fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let room = rt.block_on(support::room(tmp.path(), &["h", "h-prime"]));
+    let (h, hp) = (&room.workers[0], &room.workers[1]);
+    let r = room.id.as_str();
+    assert!(
+        which("opencode").is_some() && auth_present(),
+        "CANNOT MEASURE: the live half needs `opencode` on PATH and a credential \
+         (~/.local/share/opencode/auth.json)"
+    );
     // A persistent fixture: OpenCode installs node_modules into a project and its config
     // directory on first use, and until then a plugin may load while its hooks never fire.
     //
@@ -248,7 +267,7 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     // `$VOX_ROOM`'s value. A shared fixture used to add false ones (two trees overwriting
     // each other's `vox`), which the per-tree fixture removed. Neither says anything about the drain, so
     // neither is reported as a product red — and neither is retried until green. It
-    // fails as CANNOT PROVE, by name, unless that gap is accepted deliberately.
+    // fails as CANNOT MEASURE, by name.
     let ran = std::fs::read_to_string(&calls)
         .unwrap_or_default()
         .lines()
@@ -295,14 +314,10 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
              `vox`"
                 .to_owned()
         };
-        assert!(
-            allow_unproven("opencode-model-miss"),
-            "CANNOT PROVE (apparatus, not product): model {}: {what}. Its reply:\n{reply}\n\
-             Set VOX_PROOF_ALLOW_UNPROVEN=opencode-model-miss to accept that gap deliberately.",
+        panic!(
+            "CANNOT MEASURE (apparatus, not product): model {}: {what}. Its reply:\n{reply}",
             model()
         );
-        eprintln!("[unproven] {what}; the live half proves nothing");
-        return;
     }
     let rows = until(
         h,
