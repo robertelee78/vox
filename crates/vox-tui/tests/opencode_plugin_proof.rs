@@ -62,7 +62,8 @@
 //!    registered as `unknown`;
 //! 2. the message addressed to someone else **never reaches the screen** while the turn runs;
 //! 3. the one addressed to this agent **reaches the screen mid-turn**, before the tool ends;
-//! 4. and the running turn **still finishes**: the interrupt queues into it, never aborts it.
+//! 4. and the tool that was running **still runs to its end** (its output reaches the screen):
+//!    the interrupt queues into the running turn, never aborts it.
 //!
 //! Mutation-checked: `vox agent hook` not registering the plugin's socket (the session stays
 //! `unknown`) goes red at (1) and (3); the plugin taking the wake and never relaying it goes
@@ -477,6 +478,6 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     );
     assert_eq!(
         turn, "completed",
-        "(4) the interrupt must queue into the running turn, not abort it: {said}"
+        "(4) the interrupt must queue into the running turn, not abort its tool: {said}"
     );
 }
