@@ -270,9 +270,17 @@ impl Member {
     /// This member's sync counters, from the shipped `vox status --json`.
     pub fn status(&self) -> serde_json::Value {
         let (ok, out, err) = self.vox(&["status", "--json"], None);
-        assert!(ok, "{}: vox status --json: {err}", self.name);
-        serde_json::from_str(out.trim())
-            .unwrap_or_else(|e| panic!("{}: vox status --json printed {out:?}: {e}", self.name))
+        assert!(
+            ok,
+            "PRODUCT: {}: vox status --json failed: {err}",
+            self.name
+        );
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: {}: vox status --json printed what is not JSON, {out:?}: {e}",
+                self.name
+            )
+        })
     }
 
     /// A reader on this member's control socket.

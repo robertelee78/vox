@@ -19,7 +19,8 @@
 //! topology.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use quinn::{RecvStream, SendStream};
 use tokio::net::TcpStream;
@@ -261,7 +262,7 @@ pub async fn accept<F>(
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
 {
-    accept_reporting(send, recv, client_id, resolve, |_, _| Ok(())).await
+    accept_reporting(send, recv, client_id, resolve, |_, _| Ok(None)).await
 }
 
 /// [`accept`], reporting each authorized request to `served` before the local connect.
@@ -279,7 +280,8 @@ where
 ///
 /// `served` may still refuse the tunnel with an error, which the dialer sees as the same
 /// uniform denial: the host's one such refusal is a connection already carrying all the tunnels
-/// it may ([`Error::TunnelLimit`]).
+/// it may ([`Error::TunnelLimit`]). It may hand back where the splice is to mark the time it
+/// last moved a byte (`vox status`).
 pub async fn accept_reporting<F, S>(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -289,7 +291,7 @@ pub async fn accept_reporting<F, S>(
 ) -> Result<()>
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
-    S: FnOnce(&Digest32, &str) -> Result<()>,
+    S: FnOnce(&Digest32, &str) -> Result<Option<Arc<AtomicU64>>>,
 {
     let req = TunnelRequest::from_bytes(&read_frame(&mut recv).await?)?;
 
@@ -340,11 +342,14 @@ where
     };
     // Authorized, and not before: the host learns who reached what, and learns nothing
     // about a refusal it did not grant.
-    if let Err(e) = served(&req.channel_id, &req.service_tag) {
-        write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
-        let _ = send.finish();
-        return Err(e);
-    }
+    let moved = match served(&req.channel_id, &req.service_tag) {
+        Ok(moved) => moved,
+        Err(e) => {
+            write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
+            let _ = send.finish();
+            return Err(e);
+        }
+    };
 
     let tcp = match TcpStream::connect(target).await {
         Ok(t) => t,
@@ -358,7 +363,7 @@ where
     };
     write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
     let cut = withdrawn(reachers, offered, *client_id, req.service_tag);
-    splice_until(send, recv, tcp, cut).await
+    splice_until(send, recv, tcp, cut, moved).await
 }
 
 /// The QUIC application error code a host resets a tunnel stream with when it withdraws
@@ -421,7 +426,18 @@ async fn withdrawn(
 /// backend that resets reaches the far client as a reset, not as a clean EOF after a
 /// truncated reply.
 pub async fn splice(send: SendStream, recv: RecvStream, tcp: TcpStream) -> Result<()> {
-    splice_until(send, recv, tcp, std::future::pending()).await
+    splice_until(send, recv, tcp, std::future::pending(), None).await
+}
+
+/// [`splice`], marking in `moved` the time (Unix seconds) it last moved a byte either way, so
+/// `vox status` can show a tunnel that has gone still.
+pub async fn splice_moving(
+    send: SendStream,
+    recv: RecvStream,
+    tcp: TcpStream,
+    moved: Arc<AtomicU64>,
+) -> Result<()> {
+    splice_until(send, recv, tcp, std::future::pending(), Some(moved)).await
 }
 
 /// How long a tunnel that has sent its last byte waits for the peer to acknowledge it.
@@ -473,15 +489,22 @@ enum Leg {
 }
 
 /// [`splice`], ending early — and abortively, with [`REACH_WITHDRAWN_CODE`] — when `cut`
-/// resolves.
+/// resolves, and marking `moved` as [`splice_moving`] does.
 async fn splice_until(
     mut send: SendStream,
     mut recv: RecvStream,
     mut tcp: TcpStream,
     cut: impl core::future::Future<Output = ()>,
+    moved: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     const CHUNK: usize = 16 * 1024;
+    let mark = |moved: &Option<Arc<AtomicU64>>| {
+        if let Some(m) = moved {
+            m.store(crate::transport::quic::unix_now(), Ordering::Relaxed);
+        }
+    };
+    let moved_in = moved.clone();
     let outcome = {
         let (mut tcp_r, mut tcp_w) = tcp.split();
         let (send, recv) = (&mut send, &mut recv);
@@ -505,6 +528,7 @@ async fn splice_until(
                         if send.write_all(&buf[..n]).await.is_err() {
                             return Leg::Abort;
                         }
+                        mark(&moved);
                     }
                     Err(_) => return Leg::Abort,
                 }
@@ -523,6 +547,7 @@ async fn splice_until(
                         if tcp_w.write_all(&buf[..n]).await.is_err() {
                             return Leg::Abort;
                         }
+                        mark(&moved_in);
                     }
                     Err(quinn::ReadError::Reset(code))
                         if code == quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE) =>

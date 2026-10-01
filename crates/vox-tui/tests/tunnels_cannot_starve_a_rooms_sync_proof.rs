@@ -31,7 +31,9 @@
 //! Asserted: in each arm, every post is read within [`BOUND`]. In the cap arm, also: Bob's
 //! `vox room get` is refused within [`REFUSED_WITHIN`], saying [`LIMIT_SAID`]; the [`EXTRA`]
 //! tunnels each take less than [`ONE_WINDOW_TAKEN`]; and Alice's daemon grows by less than
-//! [`GREW_PAST_CAP`] (from `ps`) between the cap and past it.
+//! [`GREW_PAST_CAP`] (from `ps`) between the cap and past it. The refusal names the service the
+//! 16 go to and how to free one ([`FREE_ONE_SAID`]), and at the cap `vox status` (both `--json`
+//! and the lines a person reads) lists the 16 on each side: out on Bob's, in on Alice's.
 //!
 //! ## Preconditions (else CANNOT MEASURE)
 //! The control posts all arrived within [`BOUND`]. In the download arm, both collectors received
@@ -101,6 +103,13 @@ const GREW_PAST_CAP: u64 = EXTRA as u64 * STREAM_WINDOW as u64 / 2;
 const REFUSED_WITHIN: Duration = Duration::from_secs(30);
 /// What the person is told past the cap.
 const LIMIT_SAID: &str = "16 tunnels are already open to this member";
+/// How the refusal tells them to free one (decider, 2026-10-01).
+const FREE_ONE_SAID: [&str; 4] = [
+    "close the program using it",
+    "`vox forward`",
+    "`vox service remove`",
+    "`vox trust remove`",
+];
 
 /// A child process killed by its own PID however the proof ends.
 struct Kid(Child);
@@ -504,6 +513,41 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     let (more_socks, more) = writers(&bound, cap - written.len());
     let at_cap = stalled(|| loads(&written).into_iter().chain(loads(&more)).collect());
     let rss_at_cap = rss(alice_pid);
+    // What each side's `vox status` lists now: Bob's 16 tunnels to the offer, Alice's 16 from him.
+    let listed = |m: &Member, way: &str| -> (usize, String) {
+        let json = m.status();
+        let rows = json["tunnels"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|t| {
+                        t["service"].as_str() == Some(tag.as_str())
+                            && t["direction"].as_str() == Some(way)
+                            && t["opened"].as_u64().is_some_and(|s| s > 0)
+                            && t["last_moved"].as_u64().is_some_and(|s| s > 0)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let (ok, human, err) = m.vox(&["status"], None);
+        assert!(ok, "PRODUCT: {}: vox status failed: {err}", m.name);
+        (rows, human)
+    };
+    let (bob_rows, bob_human) = listed(&bob, "out");
+    let (alice_rows, alice_human) = listed(&alice, "in");
+    let human_lines = |text: &str, way: &str| {
+        text.lines()
+            .filter(|l| l.starts_with(&format!("tunnel {way} ")) && l.contains(tag.as_str()))
+            .count()
+    };
+    let (bob_lines, alice_lines) = (
+        human_lines(&bob_human, "to"),
+        human_lines(&alice_human, "from"),
+    );
+    eprintln!(
+        "[proof] cap arm: vox status lists {bob_rows} tunnel(s) on Bob ({bob_lines} line(s)) and \
+         {alice_rows} on Alice ({alice_lines} line(s)) for {tag}; Bob's says:\n{bob_human}"
+    );
     let (extra_socks, extra) = writers(&bound, EXTRA);
     let past_cap = stalled(|| loads(&extra));
     let rss_past_cap = rss(alice_pid);
@@ -550,11 +594,24 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     }
     send.signal("-CONT");
 
+    eprintln!("[proof] cap arm: Bob's `vox room get` past the cap said:\n{get_said}");
     assert!(
-        refused.is_some_and(|ok| !ok) && get_said.contains(LIMIT_SAID),
-        "PRODUCT: with {cap} tunnels open to Alice, Bob's `vox room get` was not refused saying \
-         {LIMIT_SAID:?} within {REFUSED_WITHIN:?}: it exited {refused:?} (None: still running) and \
+        refused.is_some_and(|ok| !ok)
+            && get_said.contains(LIMIT_SAID)
+            && FREE_ONE_SAID.iter().all(|s| get_said.contains(s))
+            && get_said.contains(&format!("{tag} ×{cap}")),
+        "PRODUCT: with {cap} tunnels open to Alice, Bob's `vox room get` was not refused within \
+         {REFUSED_WITHIN:?} saying {LIMIT_SAID:?}, how to free one ({FREE_ONE_SAID:?}) and which \
+         service they go to (\"{tag} ×{cap}\"): it exited {refused:?} (None: still running) and \
          said {get_said:?}"
+    );
+    assert!(
+        [bob_rows, bob_lines, alice_rows, alice_lines]
+            .iter()
+            .all(|&n| n == cap),
+        "PRODUCT: with {cap} tunnels open from Bob to Alice's offer, `vox status` did not list each \
+         on both sides: Bob {bob_rows} in --json, {bob_lines} line(s); Alice {alice_rows} in \
+         --json, {alice_lines} line(s)\nBob's vox status:\n{bob_human}\nAlice's:\n{alice_human}"
     );
     assert!(
         past_cap.iter().flatten().all(|&b| b < ONE_WINDOW_TAKEN),

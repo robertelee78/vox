@@ -8920,7 +8920,7 @@ impl Node {
                 Ok(conn) => {
                     // A forward whose every connection would be refused is refused now, in
                     // words, rather than bound and then resetting each connection (V210-81).
-                    let full = conn.tunnels_full();
+                    let room = conn.room_for_a_tunnel();
                     let _ = tx
                         .send(NetEvent::Dialed {
                             conn,
@@ -8928,11 +8928,7 @@ impl Node {
                             board: false,
                         })
                         .await;
-                    if full {
-                        Err(Error::TunnelLimit)
-                    } else {
-                        Ok(())
-                    }
+                    room
                 }
                 Err(e) => Err(e),
             };
@@ -8967,7 +8963,7 @@ impl Node {
         if let Err(e) = result {
             // A member reached, whose connection carries all the tunnels it may, is not one
             // that could not be reached.
-            if !matches!(e, Error::TunnelLimit) {
+            if !matches!(e, Error::TunnelLimit(_)) {
                 let _ = self.event_tx.send(NodeEvent::PeerUnreachable {
                     peer: *host,
                     why: e.to_string(),
@@ -9500,7 +9496,7 @@ fn fault_of(e: &Error) -> Fault {
         // fault: falling through to `Internal` made the join walk stop after one responder.
         Error::LadderExhausted(_) => Fault::Unreachable,
         Error::LocalBind { .. } => Fault::AddressInUse,
-        Error::TunnelLimit => Fault::TunnelLimit,
+        Error::TunnelLimit(_) => Fault::TunnelLimit,
         Error::Profile("no identity in this profile") => Fault::NoIdentity,
         Error::Profile("identity already exists in this profile") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,

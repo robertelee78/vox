@@ -727,6 +727,33 @@ pub async fn read(
     Ok(())
 }
 
+/// The services of the tunnels open to or from `member`, each with its count (`22 ×2`), from
+/// `vox status`. Empty when the node does not say.
+async fn tunnels_to(paths: &Paths, member: &Digest32) -> Vec<String> {
+    let Ok(json) = vox_core::node::status::request(&paths.socket_file()).await else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return Vec::new();
+    };
+    let member = vox_core::node::link::b32_encode(member);
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for t in v
+        .get("tunnels")
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|t| t.get("peer").and_then(|p| p.as_str()) == Some(member.as_str()))
+    {
+        let service = t.get("service").and_then(|s| s.as_str()).unwrap_or("?");
+        *counts.entry(service.to_owned()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(s, n)| if n == 1 { s } else { format!("{s} ×{n}") })
+        .collect()
+}
+
 /// The members the node holds back for equivocating in `room` (V210-63), from `vox status`.
 /// Empty when the node does not say: the rows are still worth printing.
 async fn equivocations_in(paths: &Paths, room: &Digest32) -> Vec<(Digest32, u64)> {
@@ -2158,13 +2185,20 @@ async fn collect_offer(
         .await
     {
         Ok(Frame::Bound { local }) => local,
-        // The sender was reached and is serving; this member's connection to it is full.
+        // The sender was reached and is serving; this member's connection to it is full. Which
+        // tunnels hold it is said too, from the node's own list (`vox status`).
         Ok(Frame::Error { reason })
             if reason == vox_core::node::api::Fault::TunnelLimit.explain() =>
         {
+            let open = tunnels_to(paths, &offer.author).await;
             return Err(AppError::Usage(format!(
-                "cannot collect the offer: {reason}"
-            )))
+                "cannot collect the offer: {reason}{}",
+                if open.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n       open to it now: {}", open.join(", "))
+                }
+            )));
         }
         Ok(Frame::Error { reason }) => {
             return Err(AppError::Usage(format!(

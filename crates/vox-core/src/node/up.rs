@@ -266,7 +266,7 @@ pub async fn open_tunnel<D: HostDialer>(
     loop {
         let attempt = async {
             let conn = reach_host_with_patience(dialer, host).await?;
-            let credit = conn.carry_tunnel()?;
+            let credit = conn.carry_tunnel(service_tag, true)?;
             let (mut send, mut recv) = crate::transport::streams::open_typed(
                 &conn,
                 crate::transport::streams::StreamKind::Tunnel,
@@ -277,7 +277,7 @@ pub async fn open_tunnel<D: HostDialer>(
         };
         match attempt.await {
             Ok(streams) => return Ok(streams),
-            Err(e @ (Error::TunnelDenied(_) | Error::TunnelLimit)) => return Err(e),
+            Err(e @ (Error::TunnelDenied(_) | Error::TunnelLimit(_))) => return Err(e),
             Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
             Err(_) => tokio::time::sleep(HOST_POLL).await,
         }
@@ -296,7 +296,7 @@ pub fn refusal(e: &Error, what: &str) -> String {
             "the host refused {what} — it has not trusted this identity (`vox trust add`), \
              or offers nothing there, or its service did not answer"
         ),
-        Error::TunnelLimit => format!("{what} was not opened: {e}"),
+        Error::TunnelLimit(_) => format!("{what} was not opened: {e}"),
         other => format!("could not reach the host for {what}: {other}"),
     }
 }
@@ -349,7 +349,7 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
     let tag = port.to_string();
     // `_carried` and `_credit` are held for the whole splice (see [`open_tunnel`]): the path, and
     // the tunnel's receive window of its own on it.
-    let (send, recv, _carried, _credit) =
+    let (send, recv, _carried, credit) =
         match open_tunnel(dialer, &room.host, &room.channel_id, &tag).await {
             Ok(streams) => streams,
             Err(why) => {
@@ -365,7 +365,7 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
             }
         };
     socks::write_reply(&mut stream, Reply::Succeeded, UNSPECIFIED).await?;
-    match crate::tunnel::session::splice(send, recv, stream).await {
+    match crate::tunnel::session::splice_moving(send, recv, stream, credit.moved()).await {
         // The session was established and then cut by a decision. Report it; every other
         // ending is silent (M17.11).
         Err(Error::TunnelRevoked(why)) => {

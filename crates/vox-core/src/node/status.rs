@@ -15,7 +15,7 @@
 //! `[2301]`, and the node answers `[2302, json]`. The tags are the ones PRD-001 R35's fuller
 //! `vox status` uses on the v0.3.0 line, so that report can fold this one in: the JSON is an
 //! object whose `"sync"` key holds the per-`(room, peer)` rows, and other sections can be added
-//! beside it without changing this one.
+//! beside it without changing this one. `"tunnels"` lists every live tunnel (V210-81).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -397,6 +397,24 @@ impl SyncBook {
                 "{{\"room\":\"{}\",\"entries\":[{}]}}",
                 b32_encode(room),
                 list.join(",")
+            );
+        }
+        // **Every live tunnel** (V210-81): the member, the service, which way it was opened, and
+        // when it was opened and last moved a byte (Unix seconds), so a stale one is visible.
+        s.push_str("],\"tunnels\":[");
+        for (i, t) in crate::transport::quic::live_tunnels().iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(
+                s,
+                "{{\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\"opened\":{},\
+                 \"last_moved\":{}}}",
+                b32_encode(&t.peer),
+                json_string(&t.service),
+                if t.outbound { "out" } else { "in" },
+                t.opened,
+                t.last_moved
             );
         }
         s.push_str("]}");

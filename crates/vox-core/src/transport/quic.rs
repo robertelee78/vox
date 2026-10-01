@@ -809,11 +809,23 @@ pub struct VoxConnection {
 }
 
 /// A tunnel's share of its connection's receive window, held for as long as the tunnel runs
-/// (see [`CONNECTION_WINDOW`]). Dropping it gives the share back.
+/// (see [`CONNECTION_WINDOW`]). Dropping it gives the share back, and takes the tunnel off
+/// [`live_tunnels`].
 #[must_use = "the credit lasts only as long as the guard is held"]
 pub struct TunnelCredit {
     tunnels: Arc<Mutex<u32>>,
     connection: Connection,
+    id: u64,
+    moved: Arc<AtomicU64>,
+}
+
+impl TunnelCredit {
+    /// Where the tunnel's splice marks the time it last moved a byte, in Unix seconds (see
+    /// [`LiveTunnel::last_moved`]).
+    #[must_use]
+    pub fn moved(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.moved)
+    }
 }
 
 impl Drop for TunnelCredit {
@@ -821,7 +833,91 @@ impl Drop for TunnelCredit {
         let mut n = lock(&self.tunnels);
         *n = n.saturating_sub(1);
         set_tunnel_window(&self.connection, *n);
+        lock(&LIVE).remove(&self.id);
     }
+}
+
+/// One live tunnel, as `vox status` lists it (V210-81): so a person can see which tunnels hold a
+/// member's connection, and which of them is stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTunnel {
+    /// The member at the other end.
+    pub peer: Digest32,
+    /// The service it reaches: a port, or a `vox room send` offer's tag.
+    pub service: String,
+    /// Whether this node opened it (to reach the member's service), rather than serving it.
+    pub outbound: bool,
+    /// When it was opened, in Unix seconds.
+    pub opened: u64,
+    /// When it last moved a byte either way, in Unix seconds; `opened` until it has.
+    pub last_moved: u64,
+}
+
+/// A live tunnel's entry in [`LIVE`].
+struct Live {
+    serial: u64,
+    peer: Digest32,
+    service: String,
+    outbound: bool,
+    opened: u64,
+    moved: Arc<AtomicU64>,
+}
+
+/// Every tunnel this process carries now, by a number of its own. A process runs one node, so
+/// this is the node's list.
+static LIVE: Mutex<std::collections::BTreeMap<u64, Live>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The next key in [`LIVE`].
+static NEXT_TUNNEL: AtomicU64 = AtomicU64::new(0);
+
+/// The time now in Unix seconds, as [`LiveTunnel`] states times.
+#[must_use]
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Every tunnel this node carries now, oldest first.
+#[must_use]
+pub fn live_tunnels() -> Vec<LiveTunnel> {
+    lock(&LIVE)
+        .values()
+        .map(|t| LiveTunnel {
+            peer: t.peer,
+            service: t.service.clone(),
+            outbound: t.outbound,
+            opened: t.opened,
+            last_moved: t.moved.load(Ordering::Relaxed).max(t.opened),
+        })
+        .collect()
+}
+
+/// What a person is told when a tunnel is refused at the cap: how many are open to this member,
+/// to which services, and how to free one (decider, 2026-10-01).
+fn limit_said(serial: u64) -> String {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for t in lock(&LIVE).values().filter(|t| t.serial == serial) {
+        *counts.entry(t.service.clone()).or_default() += 1;
+    }
+    let services: Vec<String> = counts
+        .iter()
+        .map(|(s, n)| {
+            if *n == 1 {
+                s.clone()
+            } else {
+                format!("{s} ×{n}")
+            }
+        })
+        .collect();
+    format!(
+        "{TUNNELS_PER_PEER} tunnels are already open to this member (to {})\n       \
+         to free one: close the program using it, or restart the `vox up` or `vox forward` \
+         carrying it; on the host, `vox service remove` the service, or `vox trust remove` the \
+         member\n       `vox status` lists every tunnel, and when each last moved",
+        services.join(", ")
+    )
 }
 
 /// Set `connection`'s receive window for `tunnels` running tunnels.
@@ -847,25 +943,47 @@ impl VoxConnection {
     /// tunnel is to be refused, not carried on credit the room's sync needs.
     ///
     /// Take it only for a tunnel this node authorized or opened for its own application: the
-    /// credit is memory this node agrees to hold for that peer.
-    pub fn carry_tunnel(&self) -> Result<TunnelCredit> {
+    /// credit is memory this node agrees to hold for that peer. `service` and `outbound` are what
+    /// [`live_tunnels`] lists it as.
+    pub fn carry_tunnel(&self, service: &str, outbound: bool) -> Result<TunnelCredit> {
         let mut n = lock(&self.tunnels);
         if at_tunnel_cap(*n) {
-            return Err(Error::TunnelLimit);
+            return Err(Error::TunnelLimit(limit_said(self.serial)));
         }
         *n += 1;
         set_tunnel_window(&self.connection, *n);
+        let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
+        let opened = unix_now();
+        let moved = Arc::new(AtomicU64::new(opened));
+        lock(&LIVE).insert(
+            id,
+            Live {
+                serial: self.serial,
+                peer: self.peer_id,
+                service: service.to_owned(),
+                outbound,
+                opened,
+                moved: Arc::clone(&moved),
+            },
+        );
         Ok(TunnelCredit {
             tunnels: Arc::clone(&self.tunnels),
             connection: self.connection.clone(),
+            id,
+            moved,
         })
     }
 
-    /// Whether this connection already carries as many tunnels as it may
+    /// [`Error::TunnelLimit`] if this connection already carries as many tunnels as it may
     /// ([`TUNNELS_PER_PEER`]), so another would be refused.
-    #[must_use]
-    pub fn tunnels_full(&self) -> bool {
-        at_tunnel_cap(*lock(&self.tunnels))
+    ///
+    /// # Errors
+    /// [`Error::TunnelLimit`], saying what it holds and how to free one.
+    pub fn room_for_a_tunnel(&self) -> Result<()> {
+        if at_tunnel_cap(*lock(&self.tunnels)) {
+            return Err(Error::TunnelLimit(limit_said(self.serial)));
+        }
+        Ok(())
     }
 
     /// **A name for this connection that no other connection in this process is ever given.**

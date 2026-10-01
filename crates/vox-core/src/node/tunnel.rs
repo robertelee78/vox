@@ -193,11 +193,13 @@ pub async fn serve_reporting(
             })
         },
         |channel_id, tag| {
+            let mut moved = None;
             if let Some(conn) = carried {
+                let taken = conn.carry_tunnel(tag, false)?;
+                moved = Some(taken.moved());
                 *credit
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(conn.carry_tunnel()?);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(taken);
             }
             if let Some(tx) = events {
                 let _ = tx.send(NodeEvent::TunnelServed {
@@ -206,7 +208,7 @@ pub async fn serve_reporting(
                     service_tag: tag.to_owned(),
                 });
             }
-            Ok(())
+            Ok(moved)
         },
     )
     .await;
@@ -323,9 +325,9 @@ impl Forward {
                     match up::open_tunnel(dialer.as_ref(), &host, &channel_id, &tag).await {
                         // `_carried` and `_credit` are held for the whole splice (see
                         // `up::open_tunnel`): the path, and the tunnel's receive window on it.
-                        Ok((send, recv, _carried, _credit)) => {
+                        Ok((send, recv, _carried, credit)) => {
                             if let Err(Error::TunnelRevoked(_)) =
-                                session::splice(send, recv, app).await
+                                session::splice_moving(send, recv, app, credit.moved()).await
                             {
                                 report(format!(
                                     "the host withdrew access to {tag:?} — that session was cut"
