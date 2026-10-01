@@ -221,6 +221,23 @@ impl VoxBbr {
         self.min_rtt
     }
 
+    /// The round trip this BBR can raise by itself on a path whose base round trip is `base`, with
+    /// no other flow: its target window (`cwnd_gain` bandwidth-delay products of `base`, plus the
+    /// acknowledgement aggregation it measured), or its current window if larger, drained at its
+    /// bandwidth estimate. quinn paces from the window, so this is the queue BBR alone can stand.
+    /// It is computed from `base`, not from this model's own minimum round trip, which a standing
+    /// queue of another flow's raises.
+    pub(crate) fn standing_rtt(&self, base: Duration) -> Duration {
+        let bw = self.max_bandwidth.get_estimate();
+        if bw == 0 {
+            return base;
+        }
+        let target = K_DERIVED_HIGH_CWNDGAIN as f64 * bw as f64 * base.as_secs_f64()
+            + self.ack_aggregation.max_ack_height.get() as f64;
+        let bytes = target.max(self.cwnd as f64);
+        base.max(Duration::from_secs_f64(bytes / bw as f64))
+    }
+
     fn enter_startup_mode(&mut self) {
         self.mode = Mode::Startup;
         self.pacing_gain = self.high_gain;
