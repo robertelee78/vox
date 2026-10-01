@@ -43,7 +43,15 @@
 //! **Mutation:** make the consent release cover no history (`history_plan` returns nothing) and
 //! this goes red with bob short of 1,500.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_newcomer_trusted_before_every_post_reads_all_of_them);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -204,8 +212,9 @@ fn missing_ranges(seen: &BTreeSet<usize>) -> Vec<(usize, usize)> {
     out
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real vox daemons, 1,500 CLI posts and production Argon2id; CI runs it in release"]
+#[ignore = "real vox daemons, 1,500 CLI posts and production Argon2id; optional, run it in release"]
 fn a_newcomer_trusted_before_every_post_reads_all_of_them() {
     // One join; 7 unlocks: two `vox id`s, two `trust add`s, two daemons and the room.
     watchdog::arm_for_setup(1, 7);

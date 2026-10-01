@@ -293,6 +293,11 @@ cargo build --workspace
 cargo test --release --workspace -- --ignored     # the proofs
 ```
 
+Proofs that are real but too heavy, live-model or timing-bound to block a release are optional:
+they run only with `--features optional-proofs` (without it, each says `OPTIONAL PROOF NOT RUN`)
+and are listed, with how to run each, in
+[docs/release/optional-proofs.md](docs/release/optional-proofs.md).
+
 There are no unit tests, by policy. A proof whose prover is missing — an uninstalled shell, a
 release that does not exist yet — is reported **unproven and fails**, rather than skipped quietly;
 accepting a gap means naming it in `VOX_PROOF_ALLOW_UNPROVEN`

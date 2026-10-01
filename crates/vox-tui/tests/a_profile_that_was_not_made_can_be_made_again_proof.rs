@@ -362,6 +362,7 @@ fn id_with_the_directory_unflushable(p: &Profile) -> (bool, String, bool) {
         .expect("run vox id under the interposer");
     let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
     let _ = std::fs::remove_file(&log);
+    syscalls::assert_the_recorder_saw_vox(&events, "`vox id` with the directory unflushable");
     let vault = dir.join("vault.cbor");
     let landed = events.iter().position(|e| {
         matches!(&e.call, syscalls::Call::Rename { to, .. } if syscalls::norm(to) == vault)

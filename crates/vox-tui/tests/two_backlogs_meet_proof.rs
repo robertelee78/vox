@@ -29,7 +29,15 @@
 //! rows, and carol reads every one of bob's**. If a precondition is not met, the run is CANNOT
 //! MEASURE, not a pass.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(two_backlogs_that_meet_both_cross);
 
 #[path = "support/world.rs"]
 mod world;
@@ -162,8 +170,9 @@ fn post_all(data: &Path, room: &str, who: &str) {
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real vox processes, 48 MB of history; CI runs it in release"]
+#[ignore = "real vox processes, 48 MB of history; optional, run it in release"]
 fn two_backlogs_that_meet_both_cross() {
     // Two joins; 13 unlocks: three `vox id`s, six `trust add`s, three daemons and the room.
     watchdog::arm_for_setup(2, 13);

@@ -12,8 +12,9 @@
 //! `--listen`: the anchor on `[::]` (dual-stack), the host on `127.0.0.1` (an IPv4 socket), the
 //! guest on `[::1]`. Each reaches the anchor; neither can send a datagram to the other — an IPv4
 //! socket cannot address `::1`, and a socket bound to `::1` cannot send to `127.0.0.1` — so no
-//! direct dial and no hole punch connects them. The gate asserts the product itself says the path
-//! is relayed, so a split that stopped splitting cannot pass it.
+//! direct dial and no hole punch connects them. That is checked first, as a precondition
+//! (`support/family_split.rs`), and the gate asserts the product itself says the path is relayed,
+//! so a split that stopped splitting cannot pass it.
 //!
 //! What must hold: the guest joins the host's room, and bytes cross a `vox forward` both ways.
 //!
@@ -56,6 +57,9 @@ mod nat;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
+#[path = "support/family_split.rs"]
+mod family_split;
+
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
@@ -72,6 +76,7 @@ const SYM_PAYLOAD: usize = 16 * 1024;
 #[ignore = "production Argon2id + a real PoW, three real `vox` processes; run in release"]
 fn a_guest_on_an_ipv6_socket_reaches_its_host_through_a_relay_circuit() {
     watchdog::arm();
+    family_split::assert_the_families_are_split();
     let mut w = RelayWorld::new(Split::Families);
     let (ok, took, out, err) = w.join_guest();
     assert!(
@@ -95,36 +100,6 @@ fn a_guest_on_an_ipv6_socket_reaches_its_host_through_a_relay_circuit() {
     w.assert_relayed("after the echo");
     w.expect_still_relayed();
     eprintln!("[test] echo crossed the circuit, and the forward reports the path relayed");
-}
-
-/// **The control**: the same anchor, verbs and service with the split removed — host and guest
-/// both on `127.0.0.1`. The pair goes direct: the anchor carries no circuit and the guest never
-/// reports `still relayed`. Without this, the relayed proofs on this harness could be relayed for
-/// some reason other than the split.
-#[test]
-#[ignore = "production Argon2id + a real PoW, three real `vox` processes; run in release"]
-fn without_the_split_the_same_pair_goes_direct() {
-    watchdog::arm();
-    let mut w = RelayWorld::new(Split::None);
-    let (ok, took, out, err) = w.join_guest();
-    assert!(
-        ok,
-        "the control guest could not join ({took:?}).\n{out}\n{err}"
-    );
-    let at = w.forward();
-    let back = round_trip(at, b"direct", Duration::from_secs(120)).expect("echo in the control");
-    assert_eq!(back, b"direct");
-    let circuits = w.anchor_circuits(Duration::from_secs(10));
-    let fwd = w.fwd.as_mut().unwrap().transcript();
-    eprintln!("[test] control: the anchor reports {circuits} circuit(s) carried after the echo");
-    assert_eq!(
-        circuits, 0,
-        "the control is relayed too, so the split is not what forces the relay"
-    );
-    assert!(
-        !fwd.contains("still relayed"),
-        "the control guest reports a relayed path:\n{fwd}"
-    );
 }
 
 /// What one request through `vox up` to the host's echo service came to.

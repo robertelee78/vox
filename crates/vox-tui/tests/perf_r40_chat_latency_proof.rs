@@ -28,7 +28,15 @@
 //! - `VOX_PERF_INJECT_MS` sleeps that long between starting the clock and launching the
 //!   post, so a slower path must turn this red.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -195,8 +203,9 @@ fn uptime() -> String {
         .unwrap_or_default()
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "two real daemons and production Argon2id; CI runs it in release"]
+#[ignore = "two real daemons and production Argon2id; optional, run it in release"]
 fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
     watchdog::arm();
     let target = env_ms("VOX_PERF_THRESHOLD_MS").unwrap_or(TARGET);

@@ -42,7 +42,18 @@
 //! Mutation: the renewal re-armed by a round to one anchor, and the second arm's Carol polls A's
 //! board; the first arm stays green, which is why the second exists.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    an_idle_node_stays_findable_on_its_board,
+    a_round_to_one_anchor_does_not_put_off_the_others
+);
 
 #[path = "support/world.rs"]
 mod world;
@@ -198,15 +209,17 @@ fn without_endpoint_of(address: &str, who: &str) -> String {
     format!("{head}?{}", kept.join("&"))
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; CI runs it in release"]
+#[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; optional, run it in release"]
 fn an_idle_node_stays_findable_on_its_board() {
     test_knobs::require(&["VOX_TEST_RECORD_TTL_SECS"]);
     idle_then_join(false);
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; CI runs it in release"]
+#[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; optional, run it in release"]
 fn a_round_to_one_anchor_does_not_put_off_the_others() {
     test_knobs::require(&["VOX_TEST_RECORD_TTL_SECS"]);
     idle_then_join(true);

@@ -40,7 +40,15 @@
 //! Replaces `crates/vox-core/tests/perf_r42_first_connect_open_gate.rs`, which ran every node in
 //! process on a NAT simulator.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_first_direct_connection_completes_in_under_two_seconds);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -88,6 +96,7 @@ fn stats(label: &str, samples: &[Duration]) -> Duration {
     s[s.len() - 1]
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "production Argon2id + a real PoW, a dozen cold `vox up` processes; run in release"]
 fn a_first_direct_connection_completes_in_under_two_seconds() {

@@ -92,11 +92,18 @@
 //!
 //! Mutation-checked: no cleanup helper goes red at (7); no sweep at start goes red at (8).
 //!
-//! OpenCode absent, or no usable credential, is reported **unproven and fails** —
-//! an absent prover is missing evidence, not evidence of correctness. Set
-//! `VOX_PROOF_ALLOW_UNPROVEN=opencode` to accept that gap deliberately and visibly.
+//! OpenCode absent, or no usable credential, fails as **CANNOT MEASURE** — an absent prover is
+//! missing evidence, not evidence of correctness.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_real_model_reads_the_room_through_the_opencode_plugin);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -116,13 +123,6 @@ const IDENTITY: &str = "identity passphrase";
 fn model() -> String {
     std::env::var("VOX_PROOF_OPENCODE_MODEL")
         .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
-}
-
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
 }
 
 fn which(bin: &str) -> Option<std::path::PathBuf> {
@@ -224,27 +224,20 @@ fn opencode_turn(
     )
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "drives a real model through a real harness; CI runs it in release"]
+#[ignore = "drives a real model through a real harness; optional, run it in release"]
 fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     // Five or six real model turns, one of them a 45 s tool, plus the pty driver's own bound.
     watchdog::arm_for(Duration::from_secs(900));
 
-    if which("opencode").is_none() {
-        assert!(
-            allow_unproven("opencode"),
-            "UNPROVEN: opencode is not installed, so nothing here was tested against a real \
-             harness. Install it, or set VOX_PROOF_ALLOW_UNPROVEN=opencode to accept the gap."
-        );
-        return;
-    }
+    assert!(
+        which("opencode").is_some(),
+        "CANNOT MEASURE: opencode is not installed, so nothing here can be tested against a real \
+         harness"
+    );
     let Some(auth) = auth_json() else {
-        assert!(
-            allow_unproven("opencode"),
-            "UNPROVEN: no opencode auth.json, so no model can run. Authenticate opencode, or set \
-             VOX_PROOF_ALLOW_UNPROVEN=opencode to accept the gap."
-        );
-        return;
+        panic!("CANNOT MEASURE: no opencode auth.json, so no model can run; authenticate opencode");
     };
 
     let tmp = tempfile::tempdir().unwrap();
