@@ -193,7 +193,8 @@ pub struct Evaluator {
 /// What a room's lifecycle facts say (V030-08), folded from the log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Lifecycle {
-    /// The members who have left, each by its own signed leave, with that leave's log entry.
+    /// The members who have left, each by its own signed leave not undone by a later return,
+    /// with that leave's log entry.
     pub departed: BTreeMap<Digest32, Digest32>,
     /// The log entry in which the creator ended the room, if it has.
     pub ended_by: Option<Digest32>,
@@ -284,7 +285,7 @@ impl Evaluator {
         let policy = resolver.resolve_policy(genesis)?;
         let consent = resolver.resolve_consent()?;
         let excluded = resolver.resolve_service_grant_exclusions()?;
-        let lifecycle = resolver.resolve_lifecycle();
+        let lifecycle = resolver.resolve_lifecycle()?;
 
         Ok(Self {
             channel_id,
@@ -843,15 +844,17 @@ impl<'a> Resolver<'a> {
     /// changes their mind issues an explicit certificate instead (which the grant term
     /// in [`Evaluator::grants`] deliberately does not suppress), and a new epoch clears
     /// every exclusion along with every certificate.
-    /// Fold the room-lifecycle facts (V030-08). A leave counts only from the member it names,
-    /// which the signature already binds (`issuer_id` is the signer, and the signer is the
-    /// entry's author). An end or an idle end counts only from the root admin — the creator,
-    /// not a delegate. None is epoch-bound: a passphrase rotation brings no member back and
-    /// reopens no room. The last idle end in canonical order wins.
-    fn resolve_lifecycle(&self) -> Lifecycle {
+    /// Fold the room-lifecycle facts (V030-08). A leave or a return counts only from the member
+    /// it names, which the signature already binds (`issuer_id` is the signer, and the signer is
+    /// the entry's author); a member's last one in canonical order says whether it is in. An end
+    /// counts from the root admin, or from an admin the creator delegated, as of the end's strict
+    /// causal past; an idle end only from the root admin. None is epoch-bound: a passphrase
+    /// rotation brings no member back and reopens no room. The last idle end wins.
+    fn resolve_lifecycle(&mut self) -> Result<Lifecycle> {
         use crate::governance::lifecycle::LifecycleKind;
         let mut out = Lifecycle::default();
-        for e in &self.causality.order {
+        let order: Vec<&GovEntry> = self.causality.order.clone();
+        for e in order {
             let GovBody::Lifecycle(l) = &e.body else {
                 continue;
             };
@@ -860,10 +863,21 @@ impl<'a> Resolver<'a> {
             }
             match l.body.kind {
                 LifecycleKind::Leave => {
-                    out.departed.entry(l.body.issuer_id).or_insert(e.entry_hash);
+                    out.departed.insert(l.body.issuer_id, e.entry_hash);
                 }
-                LifecycleKind::End if l.body.issuer_id == self.root_admin => {
-                    out.ended_by.get_or_insert(e.entry_hash);
+                LifecycleKind::Return => {
+                    out.departed.remove(&l.body.issuer_id);
+                }
+                LifecycleKind::End => {
+                    let admin = l.body.issuer_id == self.root_admin
+                        || self
+                            .strict_before(&e.entry_hash)?
+                            .authority
+                            .get(&l.body.issuer_id)
+                            .is_some_and(|c| !c.is_empty());
+                    if admin {
+                        out.ended_by.get_or_insert(e.entry_hash);
+                    }
                 }
                 LifecycleKind::IdleEnd(secs) if l.body.issuer_id == self.root_admin => {
                     out.idle_end_secs = Some(secs);
@@ -871,7 +885,7 @@ impl<'a> Resolver<'a> {
                 _ => {}
             }
         }
-        out
+        Ok(out)
     }
 
     fn resolve_service_grant_exclusions(&mut self) -> Result<BTreeSet<Digest32>> {

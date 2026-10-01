@@ -590,8 +590,12 @@ pub enum Fault {
     /// This identity has left the room (V030-08): it says nothing more there, and the other
     /// members no longer sync with it.
     LeftRoom,
-    /// Only the room's creator may do that — end the room, or choose its idle end (V030-08).
+    /// Only the room's creator may do that — end the room (or an admin it delegated), or choose
+    /// its idle end (V030-08).
     NotCreator,
+    /// This node joined the room a moment ago and is still reading it; its own entries wait until
+    /// it has (V030-08: a member that joins again must not reuse a position of its earlier feed).
+    StillJoining,
     /// The room's stored log was written by vox before v0.3.0, whose message format changed;
     /// v0.3.0 does not read it, and the room is made again (decider, 2026-09-29, #226).
     RoomFromBeforeV030,
@@ -702,7 +706,10 @@ impl Fault {
                 "this identity has left that room, so it says nothing more there\n       `vox room forget` deletes what this node still holds of it"
             }
             Fault::NotCreator => {
-                "only the room's creator may do that, and this identity did not create it"
+                "only the room's creator, or an admin it delegated, may do that — and this identity is neither"
+            }
+            Fault::StillJoining => {
+                "this node joined the room a moment ago and is still reading it\n       try again in a moment"
             }
             Fault::RoomFromBeforeV030 => {
                 "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and invite its members"

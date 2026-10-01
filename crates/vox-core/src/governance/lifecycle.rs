@@ -9,10 +9,13 @@
 //! itself and no peer can forge or suppress one it already holds.
 //!
 //! - **Leave** is signed by the member who leaves, and names nobody else: no member can leave
-//!   on another's behalf. Once a node holds it, it stops syncing with that member and
-//!   delivering keys to it. Leaving is final for that identity in that room.
-//! - **End** is signed by the room's creator (its genesis root admin), and only the creator's
-//!   counts. Once a node holds it, the room takes no new message.
+//!   on another's behalf. Once a node holds it, that member is no longer in the room: the node
+//!   stops syncing with it and delivering to it (the decider, 2026-10-01: "the node that left is
+//!   no longer in the swarm/room").
+//! - **Return** is signed by a member that left and joined again — by name and passphrase, like
+//!   any join (the decider, 2026-10-01: rejoining is just joining again). It undoes its leave.
+//! - **End** is signed by the room's creator (its genesis root admin) or an admin the creator
+//!   delegated (the decider, 2026-10-01). Once a node holds it, the room takes no new message.
 //! - **Idle end** is signed by the creator when the room is made. The room then ends once it
 //!   has seen no message for the chosen number of seconds. A room whose creator did not
 //!   choose one never ends by itself.
@@ -34,6 +37,8 @@ use crate::wire::{frame, parse_frame, signing_input, StructTag};
 pub enum LifecycleKind {
     /// The issuer has left the room.
     Leave,
+    /// The issuer, which had left, joined again.
+    Return,
     /// The room's creator has ended the room for everyone.
     End,
     /// The room's creator chose that the room end after this many seconds with no message.
@@ -46,6 +51,7 @@ impl LifecycleKind {
             LifecycleKind::Leave => 1,
             LifecycleKind::End => 2,
             LifecycleKind::IdleEnd(_) => 3,
+            LifecycleKind::Return => 4,
         }
     }
 
@@ -61,6 +67,7 @@ impl LifecycleKind {
             (1, 0) => Ok(LifecycleKind::Leave),
             (2, 0) => Ok(LifecycleKind::End),
             (3, s) if s > 0 => Ok(LifecycleKind::IdleEnd(s)),
+            (4, 0) => Ok(LifecycleKind::Return),
             _ => Err(Error::MalformedGovernance("room-lifecycle kind")),
         }
     }

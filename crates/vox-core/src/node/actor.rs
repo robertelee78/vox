@@ -2394,6 +2394,12 @@ pub struct Node {
     /// or published for them any more (V030-08). Not persisted: a reopened one winds down again,
     /// which costs one session per member.
     quiet: std::collections::BTreeSet<Digest32>,
+    /// Rooms this node joined whose own entries wait for a first completed sync, and those that
+    /// have had one (V030-08; `ChannelState::own_feed_pending`).
+    feed_pending: std::collections::BTreeSet<Digest32>,
+    feed_known: std::collections::BTreeSet<Digest32>,
+    /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
+    departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// Per `(room, member)`: consecutive keys not taken, and the unix second before which the
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
@@ -2743,6 +2749,9 @@ impl Node {
             fresh_details: BTreeMap::new(),
             winding: BTreeMap::new(),
             quiet: std::collections::BTreeSet::new(),
+            feed_pending: std::collections::BTreeSet::new(),
+            feed_known: std::collections::BTreeSet::new(),
+            departed_seen: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
             keys_in_flight: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
@@ -4351,10 +4360,11 @@ impl Node {
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
                 ) {
-                    let _ = shared
-                        .lock()
-                        .await
-                        .admit_author(profile.store(), &identity, now);
+                    let mut ch = shared.lock().await;
+                    let _ = ch.admit_author(profile.store(), &identity, now);
+                    // A member that left and proved the passphrase again is in again here, until
+                    // its own return reaches the others through this node (V030-08).
+                    ch.readmit(identity.fingerprint());
                 }
                 // And into the view the board and the stream gate read, before the joiner is
                 // answered: an author only the room knows is still a stranger to the board, which
@@ -5217,13 +5227,12 @@ impl Node {
         let answerable = match self.channels.get(&channel_id) {
             Some(shared) => {
                 let c = shared.lock().await;
-                // A room that ended takes nobody in, a node that left it answers for it no more,
-                // and a member that left does not come back (V030-08).
+                // A room that ended takes nobody in, and a node that left it answers for it no more
+                // (V030-08). A member that left may join again, like anyone with the passphrase.
                 c.can_answer_join()
                     && c.epoch() == epoch
                     && c.ended(now_ms).is_none()
                     && !c.has_left(&c.me())
-                    && !c.has_left(&peer)
             }
             None => false,
         };
@@ -5654,6 +5663,20 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::NotNetworked));
             return;
         };
+        // A room this identity left is joined again from scratch (V030-08: rejoining is just
+        // joining again): what this node still holds of it goes first.
+        if let Some(shared) = self.channels.get(&parsed.channel_id).map(Arc::clone) {
+            let left = {
+                let ch = shared.lock().await;
+                ch.has_left(&ch.me())
+            };
+            if left {
+                if let Outcome::Failed(f) = self.purge_room(&parsed.channel_id).await {
+                    let _ = reply.send(Outcome::Failed(f));
+                    return;
+                }
+            }
+        }
         if self.channels.contains_key(&parsed.channel_id) {
             // Already in the room: said as that, not as "an identity exists" (PRD-001 R36).
             let _ = reply.send(Outcome::Failed(Fault::AlreadyMember));
@@ -5805,6 +5828,10 @@ impl Node {
         };
         let mut channel = channel;
         channel.set_node_retention(self.node_retention_for(&parsed.channel_id));
+        // Its own entries wait for a first sync, which shows it any feed it left behind here
+        // (V030-08: a member that left, forgot the room and joined again).
+        channel.set_own_feed_pending(true);
+        self.feed_pending.insert(parsed.channel_id);
         self.remember_or_say(&channel);
         self.channels.insert(
             parsed.channel_id,
@@ -7543,6 +7570,9 @@ impl Node {
             }
         });
         self.sched_rooms.insert(channel_id);
+        if report.fail.is_none() && o.complete && self.feed_pending.contains(&channel_id) {
+            self.feed_known.insert(channel_id);
+        }
         if let Some(SyncFailure::Poisoned(_)) = &report.fail {
             // The room is poisoned: its ports retire their attempts and wait for a reopen, which
             // holds a new room instance and so new ports. No retry until then.
@@ -9454,6 +9484,9 @@ impl Node {
         }
         self.winding.remove(channel_id);
         self.quiet.remove(channel_id);
+        self.feed_pending.remove(channel_id);
+        self.feed_known.remove(channel_id);
+        self.departed_seen.remove(channel_id);
         self.fresh_details.remove(channel_id);
         self.room_anchors.remove(channel_id);
         self.reachers.remove(channel_id);
@@ -9479,20 +9512,44 @@ impl Node {
     }
 
     /// Tend every room's lifecycle (V030-08), each tick and after a leave or an end:
-    /// - a member that left is synced with no more, and loses the keys this identity gave it:
-    ///   its consent is withdrawn, which rotates the sender key, as a revocation does;
+    /// - a member that left is synced with no more and delivered nothing: it is simply not in the
+    ///   room (the decider, 2026-10-01: no key rotation — "the node that left is no longer in the
+    ///   swarm/room");
+    /// - a room this node joined lets its own entries through once a sync has shown it its own
+    ///   feed, and says it is back if it had left the room before;
     /// - a room this node left or holds ended passes that on — each member synced with after it
     ///   counts — then goes quiet: no session, dial or publish for it any more. A room left with
     ///   `vox room forget` is deleted then.
     async fn tend_lifecycle(&mut self) {
         let now_ms = (self.millis_clock)();
+        for cid in std::mem::take(&mut self.feed_known) {
+            let Some(shared) = self.channels.get(&cid).map(Arc::clone) else {
+                self.feed_pending.remove(&cid);
+                continue;
+            };
+            let now = self.now();
+            let Some(profile) = self.profile.as_ref() else {
+                self.feed_known.insert(cid);
+                break;
+            };
+            let returned = {
+                let mut ch = shared.lock().await;
+                ch.set_own_feed_pending(false);
+                ch.say_returned(profile, now)
+            };
+            self.feed_pending.remove(&cid);
+            if matches!(returned, Ok(true)) {
+                self.note_local_append(&cid);
+            }
+        }
         let rooms: Vec<(Digest32, Arc<tokio::sync::Mutex<ChannelState>>)> = self
             .channels
             .iter()
             .map(|(c, s)| (*c, Arc::clone(s)))
             .collect();
+        let store = self.profile.as_ref().map(Profile::store_handle);
         for (cid, shared) in rooms {
-            let Ok(ch) = shared.try_lock() else {
+            let Ok(mut ch) = shared.try_lock() else {
                 continue; // a session holds it; the next tick tends it
             };
             let me = ch.me();
@@ -9501,11 +9558,20 @@ impl Node {
                 .into_iter()
                 .filter(|a| *a != me && ch.has_left(a))
                 .collect();
-            let unconsent: Vec<Digest32> = departed
+            // A member that left and came back joined from scratch and holds none of this
+            // identity's keys: they are delivered to it again.
+            let seen = self.departed_seen.entry(cid).or_default();
+            let back: Vec<Digest32> = seen
                 .iter()
+                .filter(|d| !departed.contains(d))
                 .copied()
-                .filter(|d| ch.has_consented(d))
                 .collect();
+            *seen = departed.iter().copied().collect();
+            if let Some(store) = store.as_ref() {
+                for b in back {
+                    let _ = ch.forget_delivery(store, &b);
+                }
+            }
             let over = ch.has_left(&me) || ch.ended(now_ms).is_some();
             let members: Vec<Digest32> = ch.members().into_iter().filter(|m| *m != me).collect();
             let gen = ch.generation().load(std::sync::atomic::Ordering::Relaxed);
@@ -9514,9 +9580,6 @@ impl Node {
                 if self.ports.contains_key(&(cid, *d)) {
                     self.drop_port(&cid, d);
                 }
-            }
-            for d in unconsent {
-                let _ = self.revoke(&cid, d).await;
             }
             if !over || self.quiet.contains(&cid) {
                 continue;
@@ -10704,9 +10767,12 @@ fn fault_of(e: &Error) -> Fault {
             "this identity has left the room" | "this identity has already left the room",
         ) => Fault::LeftRoom,
         Error::Profile(
-            "only the room's creator may end it"
+            "only the room's creator or an admin may end it"
             | "only the room's creator may choose its idle end",
         ) => Fault::NotCreator,
+        Error::Profile("this node is still reading the room after joining it") => {
+            Fault::StillJoining
+        }
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
         // A join refused before the challenge (the responder does not hold that
         // channel open) reaches the joiner as a malformed exchange; report it as the

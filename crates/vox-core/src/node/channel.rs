@@ -678,6 +678,16 @@ pub struct ChannelState {
     /// In memory; a restart resets it together with every sync port. Shared with the actor, which
     /// reads it without the room's lock; it only changes under the lock.
     gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Members that left and that this node let in again by answering their join (V030-08):
+    /// members here until their signed return reaches it, which it then carries to the others.
+    /// In memory: a join is answered again after a restart.
+    readmitted: BTreeSet<Digest32>,
+    /// This node joined the room and has not yet completed a sync with a member, so it does not
+    /// yet know whether its own feed holds entries from an earlier membership (V030-08: a member
+    /// that left, forgot the room and joined again). Its own entries wait until it does: one
+    /// appended before would take a position its old feed already holds, which every other node
+    /// reads as signing two entries at one position.
+    own_feed_pending: bool,
 }
 
 impl std::fmt::Debug for ChannelState {
@@ -1347,6 +1357,8 @@ impl ChannelState {
             trust_marks: BTreeMap::new(),
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            readmitted: BTreeSet::new(),
+            own_feed_pending: false,
         })
     }
 
@@ -1796,6 +1808,8 @@ impl ChannelState {
             trust_marks,
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            readmitted: BTreeSet::new(),
+            own_feed_pending: false,
         })
     }
 
@@ -2062,6 +2076,8 @@ impl ChannelState {
             trust_marks: BTreeMap::new(),
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            readmitted: BTreeSet::new(),
+            own_feed_pending: false,
         })
     }
 
@@ -2404,6 +2420,11 @@ impl ChannelState {
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
+            ));
+        }
+        if self.own_feed_pending {
+            return Err(Error::Profile(
+                "this node is still reading the room after joining it",
             ));
         }
         let signer = profile.signer()?;
@@ -3742,6 +3763,11 @@ impl ChannelState {
     /// Append a control entry (a checkpoint) on this identity's own feed: signed and stored
     /// like governance, never folded into the ADR-007 evaluator, since it grants nothing.
     fn append_control(&mut self, profile: &Profile, payload: &[u8], now_secs: u64) -> Result<()> {
+        if self.own_feed_pending {
+            return Err(Error::Profile(
+                "this node is still reading the room after joining it",
+            ));
+        }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         let skeleton = self.next_skeleton(&me, payload, now_secs.saturating_mul(1_000));
@@ -3940,6 +3966,11 @@ impl ChannelState {
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
+            ));
+        }
+        if self.own_feed_pending {
+            return Err(Error::Profile(
+                "this node is still reading the room after joining it",
             ));
         }
         let signer = profile.signer()?;
@@ -4924,6 +4955,11 @@ impl ChannelState {
                 "this identity is not an author of the channel",
             ));
         }
+        if self.own_feed_pending {
+            return Err(Error::Profile(
+                "this node is still reading the room after joining it",
+            ));
+        }
         // An ended room takes no new message, and a member that left says nothing more
         // (V030-08). The actor says which to the person; this is the backstop.
         if self.ended(now_millis).is_some() {
@@ -5143,7 +5179,49 @@ impl ChannelState {
     /// Whether `who` has left this room, by its own signed leave (V030-08).
     #[must_use]
     pub fn has_left(&self, who: &Digest32) -> bool {
-        self.evaluator.lifecycle().departed.contains_key(who)
+        self.evaluator.lifecycle().departed.contains_key(who) && !self.readmitted.contains(who)
+    }
+
+    /// Let `who`, which left, back in on this node: it just proved the room's passphrase in a
+    /// join this node answered (V030-08). It is a member here until its own return reaches the
+    /// others through this node.
+    pub fn readmit(&mut self, who: Digest32) {
+        if self.evaluator.lifecycle().departed.contains_key(&who) {
+            self.readmitted.insert(who);
+        }
+    }
+
+    /// Whether this node's own entries wait for its first sync after a join (V030-08).
+    #[must_use]
+    pub fn own_feed_pending(&self) -> bool {
+        self.own_feed_pending
+    }
+
+    /// Hold (or release) this node's own entries until it knows its own feed (V030-08).
+    pub fn set_own_feed_pending(&mut self, pending: bool) {
+        self.own_feed_pending = pending;
+    }
+
+    /// Say this identity, which had left, is back (V030-08): it joined again. Nothing to say
+    /// when it had not left.
+    pub fn say_returned(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+        let signer = profile.signer()?;
+        if !self
+            .evaluator
+            .lifecycle()
+            .departed
+            .contains_key(&signer.fingerprint())
+        {
+            return Ok(false);
+        }
+        let fact = crate::governance::lifecycle::RoomLifecycle::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            crate::governance::lifecycle::LifecycleKind::Return,
+        )?;
+        self.append_governance(profile, &fact.to_wire(), now_secs)?;
+        Ok(true)
     }
 
     /// Whether this room is over, and why (V030-08): its creator ended it, or the idle end its
@@ -5185,12 +5263,16 @@ impl ChannelState {
         self.append_governance(profile, &fact.to_wire(), now_secs)
     }
 
-    /// End the room for everyone (V030-08). Only its creator may: anyone else is refused here
-    /// rather than writing an entry every other node would ignore.
+    /// End the room for everyone (V030-08). Only its creator, or an admin the creator delegated,
+    /// may: anyone else is refused here rather than writing an entry every other node would
+    /// ignore.
     pub fn end(&mut self, profile: &Profile, now_secs: u64) -> Result<Digest32> {
         let signer = profile.signer()?;
-        if signer.fingerprint() != self.evaluator.root_admin() {
-            return Err(Error::Profile("only the room's creator may end it"));
+        let me = signer.fingerprint();
+        if me != self.evaluator.root_admin() && !self.evaluator.admins().contains(&me) {
+            return Err(Error::Profile(
+                "only the room's creator or an admin may end it",
+            ));
         }
         let fact = crate::governance::lifecycle::RoomLifecycle::build(
             signer,

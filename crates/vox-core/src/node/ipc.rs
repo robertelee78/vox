@@ -2226,14 +2226,30 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             },
         },
         Request::Post { channel_id, text } => {
-            match handle
-                .apply(crate::node::api::NodeCommand::SendText { channel_id, text })
-                .await
-            {
-                crate::node::api::Outcome::Done => Frame::Ok,
-                other => Frame::Error {
-                    reason: other.to_string(),
-                },
+            // A room joined a moment ago takes this node's own entries once its first sync has
+            // shown it its own feed (V030-08); a post meanwhile waits for that, bounded, rather
+            // than being refused.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match handle
+                    .apply(crate::node::api::NodeCommand::SendText {
+                        channel_id,
+                        text: text.clone(),
+                    })
+                    .await
+                {
+                    crate::node::api::Outcome::Done => break Frame::Ok,
+                    crate::node::api::Outcome::Failed(crate::node::api::Fault::StillJoining)
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    other => {
+                        break Frame::Error {
+                            reason: other.to_string(),
+                        }
+                    }
+                }
             }
         }
         Request::Read {

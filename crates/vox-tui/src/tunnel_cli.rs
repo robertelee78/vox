@@ -1046,6 +1046,7 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
         "RoomEnded" => Fault::RoomEnded,
         "LeftRoom" => Fault::LeftRoom,
         "NotCreator" => Fault::NotCreator,
+        "StillJoining" => Fault::StillJoining,
         "Internal" => Fault::Internal,
         _ => return None,
     })

@@ -12,6 +12,10 @@
 //!   name her; from then on, while bob and carol keep posting to each other, bob opens and admits
 //!   no sync session with alice (his `vox status --json` sync row for her stays still), alice is
 //!   delivered none of the new posts, and her own post is refused as from a member who left.
+//! - **Rejoin.** Alice leaves, then joins again with the room's address and passphrase, as anyone
+//!   joins (the decider, 2026-10-01). Within [`WITHIN`] bob's roster names her again, a message she
+//!   posts reaches bob and one bob posts reaches her, and bob has not frozen her for signing two
+//!   entries at one position: her joined-again node continued her feed rather than restarting it.
 //! - **Forget.** Alice runs `vox room forget` on a room she is still in. It is left first (bob's
 //!   roster loses her), then nothing of the room is left on her node: `vox room list` lacks it, it
 //!   does not come back when her daemon restarts, and her `store.redb` no longer holds the room's
@@ -34,8 +38,9 @@
 //! failed, posting drove no session at all), so nothing about the claim was measured. The watchdog
 //! (`support/watchdog.rs`) names itself when it fires.
 //!
-//! **Mutations that must turn it red:** a member that left still synced with (leave); the room's
-//! rows not deleted (forget); a post taken after the end (end); the idle end ignored (idle end).
+//! **Mutations that must turn it red:** a member that left still synced with (leave); a member
+//! that joined again not saying it is back (rejoin); the room's rows not deleted (forget); a post
+//! taken after the end (end); the idle end ignored (idle end).
 
 #![cfg(unix)]
 
@@ -201,6 +206,103 @@ fn a_member_that_left_is_synced_with_and_delivered_to_no_more() {
         !o.ok && o.stderr.contains("left"),
         "PRODUCT: alice's post after leaving was not refused as from a member who left: {o:?}"
     );
+}
+
+#[test]
+#[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
+fn a_member_that_left_joins_again_and_is_a_member_again() {
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
+    let room = room_of(&rt, tmp.path(), &["alice", "bob"]);
+    let (alice, bob) = (&room.workers[0], &room.workers[1]);
+    let id = room.id.as_str();
+    let link = setup(bob, &["room", "invite", id]).stdout.trim().to_owned();
+
+    let o = alice.vox(None, &["room", "leave", id]);
+    assert!(o.ok, "PRODUCT: `vox room leave` was refused: {o:?}");
+    let (gone, o) = poll(bob, &["room", "roster", id], WITHIN, |o| {
+        o.ok && !o.stdout.contains(&alice.b32())
+    });
+    assert!(
+        gone,
+        "PRODUCT: {WITHIN:?} after alice left, bob's roster still names her: {o:?}"
+    );
+
+    let t = Instant::now();
+    let o = alice.vox_in(
+        None,
+        &["room", "join", &link, "--name", "mission"],
+        Some("channel passphrase"),
+    );
+    assert!(
+        o.ok,
+        "PRODUCT: alice, who left, was refused joining again with the room's address and \
+         passphrase: {o:?}"
+    );
+    let (back, o) = poll(bob, &["room", "roster", id], WITHIN, |o| {
+        o.ok && o.stdout.contains(&alice.b32())
+    });
+    assert!(
+        back,
+        "PRODUCT: {WITHIN:?} after alice joined again, bob's roster does not name her: {o:?}"
+    );
+    eprintln!(
+        "[proof] rejoin: bob's roster named alice again {:.1}s after her join began",
+        t.elapsed().as_secs_f64()
+    );
+    let o = alice.vox(None, &["room", "post", id, "alice is back"]);
+    assert!(
+        o.ok,
+        "PRODUCT: alice's post after joining again was refused: {o:?}"
+    );
+    let (read, o) = poll(bob, &["room", "read", id], WITHIN, |o| {
+        o.stdout.contains("alice is back")
+    });
+    assert!(
+        read,
+        "PRODUCT: bob does not read what alice posted after joining again: {o:?}"
+    );
+    setup(bob, &["room", "post", id, "welcome back, alice"]);
+    let (read, o) = poll(alice, &["room", "read", id], WITHIN, |o| {
+        o.stdout.contains("welcome back, alice")
+    });
+    assert!(
+        read,
+        "PRODUCT: alice, joined again, does not read what bob posted: {o:?}"
+    );
+    // `frozen` is null while a session holds the room; read until it is said.
+    let frozen: Vec<String> = {
+        let deadline = Instant::now() + WITHIN;
+        loop {
+            let status = setup(bob, &["status", "--json"]).json();
+            let row = status["rooms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|r| r["id"] == id)
+                .cloned();
+            if let Some(list) = row.as_ref().and_then(|r| r["frozen"].as_array()) {
+                break list
+                    .iter()
+                    .filter_map(|f| f.as_str().map(str::to_owned))
+                    .collect();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: bob's `vox status --json` never said whom it froze in the room within \
+                 {WITHIN:?}, so a restarted feed could not be seen: {row:?}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    assert!(
+        !frozen.iter().any(|f| *f == alice.b32()),
+        "PRODUCT: bob froze alice for signing two entries at one position: her node restarted \
+         her feed in the room when she joined again. Frozen: {frozen:?}"
+    );
+    eprintln!("[proof] rejoin: alice and bob read each other again, and bob froze nobody");
 }
 
 #[test]

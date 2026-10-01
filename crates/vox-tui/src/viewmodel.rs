@@ -266,8 +266,10 @@ pub enum UiError {
     RoomEnded,
     /// This identity left the room (V030-08).
     LeftRoom,
-    /// Only the room's creator may do that (V030-08).
+    /// Only the room's creator, or an admin it delegated, may do that (V030-08).
     NotCreator,
+    /// The room was joined a moment ago and is still being read (V030-08).
+    StillJoining,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
@@ -325,7 +327,8 @@ impl UiError {
             UiError::AlreadyMember => "you already hold that room — it is in your list",
             UiError::RoomEnded => "this room has ended — it takes no new message (:forget deletes it)",
             UiError::LeftRoom => "you left this room — :forget deletes what is still here",
-            UiError::NotCreator => "only the room's creator may end it",
+            UiError::NotCreator => "only the room's creator, or an admin it delegated, may end it",
+            UiError::StillJoining => "joined a moment ago and still reading the room — try again",
             UiError::Internal => "internal error",
         }
     }

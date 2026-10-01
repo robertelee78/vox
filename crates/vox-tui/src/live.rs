@@ -357,6 +357,7 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::RoomEnded => UiError::RoomEnded,
         Fault::LeftRoom => UiError::LeftRoom,
         Fault::NotCreator => UiError::NotCreator,
+        Fault::StillJoining => UiError::StillJoining,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
     }
