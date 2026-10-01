@@ -27,6 +27,11 @@ use std::time::Duration;
 
 /// Each needle byte is XORed with this in the `needles` file and while held here.
 pub const MASK: u8 = 0xA5;
+/// What a hit's surrounding bytes are XORed with in the report: not [`MASK`], so that the
+/// scanner's own needle, held masked, cannot read back as the passphrase when a report is decoded
+/// (it sat right before a product copy in one run, and read back as plain text). The report is
+/// hex, so it never holds a needle's raw bytes either way.
+pub const CONTEXT_MASK: u8 = 0x3C;
 /// Hits listed in `result`, at most; the count is always whole.
 const MAX_HITS: usize = 64;
 /// How much of a region is copied out at a time.
@@ -166,14 +171,14 @@ fn scan(needles: &[(String, Vec<u8>)]) -> String {
                         for i in find_all(chunk, needle) {
                             counts[k] += 1;
                             if hits.len() < MAX_HITS {
-                                // What surrounds the copy, masked so the report holds no needle
-                                // itself: 32 bytes before it and 8 after, within this chunk. It
-                                // tells a copy's container apart (a frame, a string, a key).
+                                // What surrounds the copy, as hex XORed with CONTEXT_MASK: 32
+                                // bytes before it and 8 after, within this chunk. It tells a
+                                // copy's container apart (a frame, a string, a key).
                                 let from = i.saturating_sub(32);
                                 let to = (i + needle.len() + 8).min(chunk.len());
                                 let around: String = chunk[from..to]
                                     .iter()
-                                    .map(|b| format!("{:02x}", b ^ MASK))
+                                    .map(|b| format!("{:02x}", b ^ CONTEXT_MASK))
                                     .collect();
                                 hits.push(format!(
                                     "hit\t{label}\t{:#x}\t{user_tag}\t{protection}\t{}:{around}",
