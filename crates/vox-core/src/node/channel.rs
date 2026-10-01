@@ -2335,11 +2335,13 @@ impl ChannelState {
     /// Record that `target` has been delivered generation `chain_id` of this
     /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
     pub fn note_delivered(&mut self, store: &Store, target: Digest32, chain_id: u64) -> Result<()> {
-        let entry = self.delivered.entry(target).or_default();
-        if *entry >= chain_id {
+        // **Generation 0 is recorded too** (V210-95). Defaulting a missing row to 0 and comparing
+        // made a taken generation-0 key look recorded already: it was held in memory and never
+        // written, so after a restart the member was owed the room's first key again.
+        if self.delivered.get(&target).is_some_and(|d| *d >= chain_id) {
             return Ok(());
         }
-        *entry = chain_id;
+        self.delivered.insert(target, chain_id);
         self.persist_delivered(store)
     }
 
