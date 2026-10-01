@@ -403,11 +403,11 @@ fn real_join(dir: &Path, link: &str, name: &str, what: &str) {
     println!("[proof] real join of {what}: ok={ok} in {took:?}");
     assert!(
         ok,
-        "a real joiner could not join {what} (after {took:?}): {out}{err}"
+        "PRODUCT: a real joiner could not join {what} (after {took:?}): {out}{err}"
     );
     assert!(
         took < JOIN_BOUND,
-        "a real joiner joined {what}, but only after {took:?}, over the {JOIN_BOUND:?} bound"
+        "PRODUCT: a real joiner joined {what}, but only after {took:?}, over the {JOIN_BOUND:?} bound"
     );
 }
 
@@ -454,7 +454,7 @@ fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
     println!("[proof] the anchor still serves the room in use: {kept}");
     assert!(
         kept,
-        "a stranger's live rooms displaced a room in use from the anchor"
+        "PRODUCT: a stranger's live rooms displaced a room in use from the anchor"
     );
 
     let (second, second_link) = create_room(&victim_dir, "second", ROOM_PASS);
@@ -463,7 +463,7 @@ fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
     println!("[proof] the anchor serves the room created after the live flood: {served}");
     assert!(
         served,
-        "a room created after a stranger filled the anchor with {ROOMS} rooms it keeps live is not \
+        "PRODUCT: a room created after a stranger filled the anchor with {ROOMS} rooms it keeps live is not \
          on the anchor: the stranger crowded it out"
     );
     let _joiner = daemon("joiner", &joiner_dir, free_port(), &spec, &pass_file);
@@ -528,7 +528,7 @@ fn a_room_whose_members_are_away_is_not_crowded_out() {
     println!("[proof] the anchor still serves the away room: {kept}");
     assert!(
         kept,
-        "a stranger's {ROOMS} live rooms displaced from the anchor a room whose members have been \
+        "PRODUCT: a stranger's {ROOMS} live rooms displaced from the anchor a room whose members have been \
          away past their records"
     );
 }
@@ -576,7 +576,7 @@ fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
     println!("[proof] after the flood the anchor holds of the room in use: {kept:?}");
     assert!(
         kept.0,
-        "a stranger re-sent a room's own records from its network and its flood then evicted the \
+        "PRODUCT: a stranger re-sent a room's own records from its network and its flood then evicted the \
          room in use from the anchor ({kept:?}): the re-send credited the room to the stranger"
     );
     let _joiner = daemon("joiner", &joiner_dir, free_port(), &spec, &pass_file);
@@ -670,7 +670,7 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
     println!("[proof] after the flood the restarted anchor holds of the room in use: {kept:?}");
     assert!(
         kept.0,
-        "the restarted anchor gave up the room in use to a flood credited to no one ({kept:?}), \
+        "PRODUCT: the restarted anchor gave up the room in use to a flood credited to no one ({kept:?}), \
          though its member resumed {REPUBLISH_SETTLE:?} before the flood: the stranger put the \
          room back first, and the member's own puts credited nothing"
     );
@@ -821,7 +821,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     );
     assert!(
         kept.0,
-        "the restarted anchor gave up a room whose creator is away and whose live member re-sent \
+        "PRODUCT: the restarted anchor gave up a room whose creator is away and whose live member re-sent \
          its own record ({kept:?}): a member's own put of a record the board already holds credited \
          nothing, so the room was credited to no one with the flood"
     );
