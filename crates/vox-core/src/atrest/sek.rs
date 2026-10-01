@@ -201,6 +201,11 @@ pub fn factor_pass(
     Ok(out)
 }
 
+/// A fresh random per-channel salt, as [`Sek::seal`] samples: for [`Sek::seal_with_factors`].
+pub fn fresh_salt() -> Result<[u8; SALT_LEN]> {
+    random_array::<SALT_LEN>()
+}
+
 /// Derive the KEK from both factors:
 /// `KEK = HKDF-SHA-256(factor_id ‖ factor_pass, info = "vox/sek-wrap/v1")`.
 fn derive_kek(
@@ -326,8 +331,28 @@ impl Sek {
         profile: Argon2Profile,
         salt: &[u8; SALT_LEN],
     ) -> Result<SekWrap> {
+        self.key_bytes()?;
+        let factor_id = id_factor.factor_id(channel_id)?;
+        let fp = factor_pass(passphrase, salt, profile)?;
+        self.seal_with_factors(&factor_id, &fp, salt, profile)
+    }
+
+    /// The seal's last step, from both factors already derived: [`Sek::seal_with_salt`] is
+    /// `factor_id` from the identity, `factor_pass` ([`factor_pass`]) from the passphrase under
+    /// `salt` and `profile`, then this.
+    ///
+    /// Split out so the node can run the Argon2id half — seconds, on a blocking thread that a
+    /// lock cannot interrupt — holding the passphrase and nothing else, while the identity signer
+    /// and this SEK stay with work a lock stops (V210-94).
+    pub fn seal_with_factors(
+        &self,
+        factor_id: &[u8; FACTOR_ID_LEN],
+        factor_pass: &[u8; FACTOR_PASS_LEN],
+        salt: &[u8; SALT_LEN],
+        profile: Argon2Profile,
+    ) -> Result<SekWrap> {
         let key = self.key_bytes()?;
-        let kek = derive_two_factor_kek(id_factor, channel_id, passphrase, salt, profile)?;
+        let kek = derive_kek(factor_id, factor_pass)?;
         let nonce = random_array::<NONCE_LEN>()?;
         let cipher = Aes256Gcm::new_from_slice(kek.as_ref()).map_err(|_| Error::Argon2Failed)?;
         let ct = cipher

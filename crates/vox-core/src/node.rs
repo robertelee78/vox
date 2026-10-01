@@ -33,6 +33,7 @@ pub mod content;
 pub mod coordstream;
 pub mod headless;
 pub mod ipc;
+pub mod joinslots;
 pub mod joinstream;
 pub mod link;
 pub mod net;
