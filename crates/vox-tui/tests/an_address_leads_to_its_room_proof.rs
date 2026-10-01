@@ -37,17 +37,26 @@
 //!   waits on a gateway that does not answer, C5). Asserted: no address is printed, the host says
 //!   it knows no address of its own, and it stops with a failure.
 //!
+//! - **F, a board that holds the room but not the host's address** (C7). The host's records are
+//!   given a short life (`VOX_TEST_RECORD_TTL_SECS`, 8 s) and the host is frozen (SIGSTOP) until
+//!   its address record on the anchor lapses, as a host that slept would leave it; the anchor still
+//!   holds the room's genesis and the host's bundle. The guest joins, and the host is resumed
+//!   (SIGCONT) a moment later. Asserted: the join gets in, and its steps say it dialled the host at
+//!   the link's address rather than polling the board for one.
+//!
 //! **Every red names which it is** (the decider: a test that cannot tell a broken product from a
 //! broken test is not a valid test). `PRODUCT:` — `vox` did the wrong thing, and what it said is
-//! quoted. `APPARATUS:` — the staging was not achieved or a precondition is unmet (a setup verb
-//! failed, an anchor printed no spec, the guest never reached the closed forward), so nothing about
+//! quoted; `PRODUCT (staging):` — a `vox` verb the staging runs failed (`vox id`, `vox trust add`,
+//! `vox node`). `APPARATUS:` — the staging was not achieved or a precondition is unmet (the guest
+//! never reached the closed forward, the board still held the host's address), so nothing about
 //! the claim was measured. The watchdog (`support/watchdog.rs`) names itself when it fires.
 //!
 //! **Mutations that must turn it red:** `vox serve` refusing without an anchor or public address
 //! (A); minting the address before the host knows an address of its own (E); not counting the
 //! host's own board, so a down anchor holds the address back (B, C); capping the link's boards
 //! after adding the host (B); saying an anchor took the room before it did (C); stopping the join
-//! at the first board's "nothing for room" (D).
+//! at the first board's "nothing for room" (D); polling the board for the host's address when the link
+//! gives it (F).
 //!
 //! **Why a file of its own:** no existing proof starts `vox serve` without an anchor or with its
 //! anchor down — the old refusal made that impossible — and the join journeys
@@ -107,7 +116,8 @@ fn short(spec: &str) -> String {
 
 /// A `vox node` anchor on `listen`, and the `fp@/ip…/udp/port` spec that names it on `family`.
 fn anchor_on(dir: &Path, listen: &str, v6: bool) -> (VoxProc, String) {
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a profile directory: {e}"));
     let mut a = VoxProc::spawn("anchor", dir, &args(&["node", "--listen", listen]));
     let spec = line_within(&mut a, Duration::from_secs(180), |l| {
         !l.starts_with("! ")
@@ -117,8 +127,8 @@ fn anchor_on(dir: &Path, listen: &str, v6: bool) -> (VoxProc, String) {
     let spec = spec
         .unwrap_or_else(|| {
             panic!(
-                "APPARATUS: the anchor on {listen} printed no --anchor spec, so there is no world \
-                 to measure in.\nanchor:\n{}",
+                "PRODUCT (staging): `vox node` on {listen} printed no --anchor spec, so there is no \
+                 world to measure in.\nanchor:\n{}",
                 a.transcript()
             )
         })
@@ -188,19 +198,20 @@ impl DualAnchor {
 /// A guest and a host with identities, the host trusting the guest. Returns the host's fingerprint.
 fn two_identities(guest: &Path, host: &Path) -> String {
     for d in [guest, host] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not make a profile directory: {e}"));
     }
     let (ok, guest_fp, err) = vox_once(guest, &args(&["id"]));
-    assert!(ok, "APPARATUS: setup verb `vox id` (guest) failed: {err}");
+    assert!(ok, "PRODUCT (staging): `vox id` (guest) failed: {err}");
     let (ok, host_fp, err) = vox_once(host, &args(&["id"]));
-    assert!(ok, "APPARATUS: setup verb `vox id` (host) failed: {err}");
+    assert!(ok, "PRODUCT (staging): `vox id` (host) failed: {err}");
     let (ok, out, err) = vox_once(
         host,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
     );
     assert!(
         ok,
-        "APPARATUS: setup verb `vox trust add` failed: {out}\n{err}"
+        "PRODUCT (staging): `vox trust add` failed: {out}\n{err}"
     );
     host_fp.trim().to_owned()
 }
@@ -291,7 +302,8 @@ fn passphrase_of(host: &mut VoxProc) -> String {
 #[ignore = "real host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
     let host_fp = two_identities(&guest_dir, &host_dir);
     // No --anchor, no --listen: as a person on a LAN runs it. (`r=` always names the host as the
@@ -343,7 +355,8 @@ fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
 #[ignore = "real anchors, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn b_anchors_that_are_down_do_not_hold_back_the_address() {
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
     // Four anchors — a link's whole capacity — each started for its identity, then stopped by PID.
     let mut specs = Vec::new();
@@ -441,7 +454,8 @@ fn b_anchors_that_are_down_do_not_hold_back_the_address() {
 #[ignore = "a real anchor, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (anchor_dir, host_dir, guest_dir) = (
         tmp.path().join("anchor"),
         tmp.path().join("host"),
@@ -545,7 +559,8 @@ fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
 #[ignore = "real anchors, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn d_a_join_asks_every_board_the_address_names() {
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (a4_dir, a6_dir, host_dir, guest_dir) = (
         tmp.path().join("a4"),
         tmp.path().join("a6"),
@@ -670,7 +685,8 @@ fn d_a_join_asks_every_board_the_address_names() {
 #[ignore = "a real host, production Argon2id; CI runs it in release"]
 fn e_an_address_that_would_lead_nowhere_is_withheld_and_why_is_said() {
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
     let host_fp = two_identities(&guest_dir, &host_dir);
     // No anchor, and an address discovery that never finds an address of the host's own. A person
@@ -732,5 +748,114 @@ fn e_an_address_that_would_lead_nowhere_is_withheld_and_why_is_said() {
          failure ({status:?}): a host that hands out nothing must not look like it serves.\nIt \
          said:\n{}",
         host.transcript()
+    );
+}
+
+/// Send `signal` (`STOP` or `CONT`) to `pid`, as `kill -<signal>` does.
+fn signal(pid: u32, signal: &str) {
+    let ok = std::process::Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(
+        ok,
+        "APPARATUS: could not send SIG{signal} to the host ({pid})"
+    );
+}
+
+#[test]
+#[ignore = "a real anchor, host and guest, production Argon2id and a real PoW; CI runs it in release"]
+fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
+    watchdog::arm_for(BUDGET);
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
+    let (anchor_dir, host_dir, guest_dir) = (
+        tmp.path().join("anchor"),
+        tmp.path().join("host"),
+        tmp.path().join("guest"),
+    );
+    let (_anchor, anchor_spec) = anchor_on(&anchor_dir, "127.0.0.1:0", false);
+    two_identities(&guest_dir, &host_dir);
+    let mut host = VoxProc::spawn_env(
+        "host",
+        &host_dir,
+        &args(&[
+            "serve",
+            "22",
+            "--anchor",
+            &anchor_spec,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+        &[("VOX_TEST_RECORD_TTL_SECS", "8")],
+    );
+    let address = line_within(&mut host, ROOM_WITHIN, |l| l.starts_with("address "));
+    let address = after_label(
+        &address.unwrap_or_else(|| {
+            panic!(
+                "{}: `vox serve` printed no address within {ROOM_WITHIN:?}. It said:\n{}",
+                host_verdict(&mut host),
+                host.transcript()
+            )
+        }),
+        "address",
+    );
+    let passphrase = passphrase_of(&mut host);
+    // The anchor takes the room — genesis, the host's bundle and its address record.
+    std::thread::sleep(Duration::from_secs(3));
+    let pid = host.child.id();
+    signal(pid, "STOP");
+    // Past the record's 8 s life from its last renewal: the anchor's board holds no address for
+    // the host, and still holds the room.
+    std::thread::sleep(Duration::from_secs(11));
+    let guest = {
+        let (dir, address, pass) = (
+            guest_dir.clone(),
+            address.clone(),
+            room_pass_file(&guest_dir, &passphrase),
+        );
+        std::thread::spawn(move || {
+            vox_joined(
+                &dir,
+                &args(&[
+                    "connect",
+                    &address,
+                    "--passphrase-file",
+                    &pass,
+                    "--listen",
+                    "127.0.0.1:0",
+                ]),
+            )
+        })
+    };
+    std::thread::sleep(Duration::from_millis(2500));
+    signal(pid, "CONT");
+    let t = Instant::now();
+    let (joined, out, err) = guest
+        .join()
+        .unwrap_or_else(|_| panic!("APPARATUS: the guest's `vox connect` thread panicked"));
+    let steps: Vec<&str> = err.lines().filter(|l| l.contains("join got in")).collect();
+    eprintln!(
+        "[proof] arm F: the host was frozen 13.5s; the guest's join {} {:.2}s after it resumed; \
+         its steps: {steps:?}",
+        if joined { "got in" } else { "failed" },
+        t.elapsed().as_secs_f64()
+    );
+    assert!(
+        joined,
+        "PRODUCT: the guest was refused although the link names the host's address and the host \
+         was back. `vox connect` said:\n{out}\n{err}\nhost:\n{}",
+        host.transcript()
+    );
+    assert!(
+        !err.contains("address poll"),
+        "PRODUCT: the join polled the board for the host's address although the link gives it, \
+         and dialled the host only once the board had one again. `vox connect` said:\n{err}"
+    );
+    assert!(
+        err.contains("the link's address"),
+        "APPARATUS: staging not achieved — the join neither polled the board nor dialled the \
+         link's address, so the board it used still held the host's address (or was the host). \
+         `vox connect` said:\n{err}"
     );
 }
