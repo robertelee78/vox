@@ -69,6 +69,8 @@ use previous_release::{previous_release, PREVIOUS};
 use world::{args, VoxProc, IDENTITY, VOX};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
+/// The vault versions this test's reader knows: v0.2.9's (1) and this build's (2).
+const KNOWN_VAULT_VERSIONS: [u8; 2] = [1, 2];
 
 // ---- driving a `vox` binary (this build's, or the previous release's) ------------------------
 
@@ -87,11 +89,18 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: could not start {}: {e}", exe.display()));
     if let Some(s) = stdin {
-        child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(s.as_bytes())
+            .unwrap_or_else(|e| panic!("APPARATUS: could not write vox {argv:?}'s stdin: {e}"));
     }
-    let out = child.wait_with_output().expect("vox finished");
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not wait for vox {argv:?}: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -101,7 +110,7 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
 
 fn ok(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> String {
     let (good, out, err) = vox_with(exe, data, argv, stdin);
-    assert!(good, "vox {argv:?} failed: {out}{err}");
+    assert!(good, "PRODUCT: vox {argv:?} failed: {out}{err}");
     out
 }
 
@@ -139,13 +148,23 @@ fn daemon(exe: &Path, name: &str, data: &Path, spec: &str, pass_file: &Path) -> 
         &[],
     );
     let deadline = Instant::now() + TIMEOUT;
+    let mut last = (String::new(), String::new());
     while Instant::now() < deadline {
-        if vox_with(exe, data, &["room", "list"], None).0 {
+        let (answered, out, err) = vox_with(exe, data, &["room", "list"], None);
+        if answered {
             return p;
         }
+        last = (out, err);
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    let mut p = p;
+    panic!(
+        "PRODUCT: {name}'s daemon never answered `vox room list` within {TIMEOUT:?}; the last \
+         answer: {}{}\n--- the daemon said:\n{}",
+        last.0,
+        last.1,
+        p.transcript()
+    );
 }
 
 fn signal(pid: u32, sig: &str) {
@@ -153,7 +172,7 @@ fn signal(pid: u32, sig: &str) {
         .args([sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill {sig} {pid}");
+    assert!(ok, "APPARATUS: `kill {sig} {pid}` did not take");
 }
 
 /// Create a room on `host`'s daemon, have `guest` join it, and return the room's id.
@@ -211,17 +230,54 @@ impl Disk {
         }
     }
 
+    /// The vault as the binary wrote it. A file the test's reader cannot parse is told apart:
+    /// a vault version this reader does not know is the reader's fault (APPARATUS); any other
+    /// failure is a file the binary wrote wrong (PRODUCT).
     fn vault(&self) -> IdentityVault {
-        IdentityVault::from_canonical_slice(&std::fs::read(&self.vault_file).unwrap()).unwrap()
+        let path = self.vault_file.display();
+        let bytes = std::fs::read(&self.vault_file).unwrap_or_else(|e| {
+            panic!("PRODUCT: the binary left no readable vault at {path}: {e}")
+        });
+        IdentityVault::from_canonical_slice(&bytes).unwrap_or_else(|e| {
+            // A canonical vault opens with a 5-array (0x85) and its version as a small uint.
+            match (bytes.first(), bytes.get(1)) {
+                (Some(0x85), Some(&v)) if v < 0x18 && !KNOWN_VAULT_VERSIONS.contains(&v) => panic!(
+                    "APPARATUS: the test's reader knows vault versions {KNOWN_VAULT_VERSIONS:?}, \
+                     and {path} is version {v}: {e}"
+                ),
+                _ => panic!(
+                    "PRODUCT: the binary wrote a vault at {path} that does not parse as a vault \
+                     ({} bytes, starting {:02x?}): {e}",
+                    bytes.len(),
+                    &bytes[..bytes.len().min(8)]
+                ),
+            }
+        })
     }
 
     /// The identity, unlocked — for the control and for handing the attacker its signing power.
     fn signer(&self) -> VaultRootSigner {
-        self.vault().unlock_signer(IDENTITY.as_bytes()).unwrap()
+        self.vault()
+            .unlock_signer(IDENTITY.as_bytes())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "PRODUCT: the vault the binary wrote does not unlock under the passphrase it \
+                     was given: {e}"
+                )
+            })
     }
 
     fn store(&self) -> Store {
-        Store::open_read_only(&self.store_file).unwrap()
+        Store::open_read_only(&self.store_file).unwrap_or_else(|e| match e {
+            vox_core::Error::ProfileBusy => panic!(
+                "APPARATUS: a vox process the test stopped still holds {}",
+                self.store_file.display()
+            ),
+            e => panic!(
+                "PRODUCT: the binary left a store at {} that does not open: {e}",
+                self.store_file.display()
+            ),
+        })
     }
 }
 
@@ -234,7 +290,14 @@ struct Blob {
 }
 
 fn meta_blob(store: &Store, name: &str) -> Option<SealedSegment> {
-    let blob = store.get_meta(name).unwrap()?;
+    let blob = store
+        .get_meta(name)
+        .unwrap_or_else(|e| panic!("PRODUCT: the binary's store does not read meta {name}: {e}"))?;
+    assert!(
+        blob.len() > NONCE_LEN,
+        "PRODUCT: the binary stored meta {name} as {} bytes, too short to be sealed",
+        blob.len()
+    );
     let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
     Some(SealedSegment {
         nonce: nonce.try_into().unwrap(),
@@ -267,7 +330,9 @@ fn blobs(disk: &Disk) -> Vec<Blob> {
             SegmentKind::PrekeyRing,
             prekeys::SEG_PREKEY_RING,
         )
-        .unwrap()
+        .unwrap_or_else(|e| {
+            panic!("PRODUCT: the binary's store does not read the prekey ring: {e}")
+        })
     {
         out.push(Blob {
             what: "prekey ring",
@@ -287,15 +352,15 @@ fn attacker_keys(blob: &Blob, attacker: &IdProofOnly<'_>) -> Vec<Sek> {
     let (legacy, label) = match blob.what {
         // v0.2.9 had no pending consents; builds between sealed them under the keyring's key.
         "trust keyring" => (
-            trust::legacy_trust_sek(attacker).unwrap(),
+            trust::legacy_trust_sek(attacker).expect("APPARATUS: the attacker's old keyring key"),
             trust::TRUST_SEK_INFO,
         ),
         "pending consents" => (
-            trust::legacy_trust_sek(attacker).unwrap(),
+            trust::legacy_trust_sek(attacker).expect("APPARATUS: the attacker's old keyring key"),
             pending_consent::PENDING_CONSENT_SEK_INFO,
         ),
         "prekey ring" => (
-            prekeys::legacy_ring_sek(attacker).unwrap(),
+            prekeys::legacy_ring_sek(attacker).expect("APPARATUS: the attacker's old ring key"),
             prekeys::PREKEY_RING_SEK_INFO,
         ),
         _ => unreachable!(),
@@ -316,7 +381,7 @@ fn attacker_keys(blob: &Blob, attacker: &IdProofOnly<'_>) -> Vec<Sek> {
         let mut key = zeroize::Zeroizing::new([0u8; 32]);
         hkdf::Hkdf::<Sha256>::new(None, &seed)
             .expand(label, key.as_mut())
-            .unwrap();
+            .expect("APPARATUS: HKDF of a 32-byte key");
         keys.push(Sek::from_bytes(key));
     }
     keys
@@ -325,9 +390,12 @@ fn attacker_keys(blob: &Blob, attacker: &IdProofOnly<'_>) -> Vec<Sek> {
 /// How many times each of `needles` occurs anywhere in the files of the profile directory,
 /// read as raw bytes: what an adversary with the disk sees, whatever the database thinks is live.
 fn occurrences(disk: &Disk, needles: &[Vec<u8>]) -> Vec<usize> {
-    let dir = disk.store_file.parent().unwrap();
+    let dir = disk
+        .store_file
+        .parent()
+        .expect("APPARATUS: the store has a directory");
     let files: Vec<Vec<u8>> = std::fs::read_dir(dir)
-        .unwrap()
+        .unwrap_or_else(|e| panic!("APPARATUS: listing {}: {e}", dir.display()))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| std::fs::read(e.path()).unwrap_or_default())
@@ -353,9 +421,13 @@ fn fingerprints_of(blobs: &[Blob]) -> Vec<Vec<u8>> {
 
 fn vault_key(blob: &Blob, signer: &VaultRootSigner) -> Sek {
     match blob.what {
-        "trust keyring" => trust::trust_sek(signer).unwrap(),
-        "pending consents" => pending_consent::pending_consent_sek(signer).unwrap(),
-        "prekey ring" => prekeys::ring_sek(signer).unwrap(),
+        "trust keyring" => {
+            trust::trust_sek(signer).expect("PRODUCT: the binary's vault yields no keyring key")
+        }
+        "pending consents" => pending_consent::pending_consent_sek(signer)
+            .expect("PRODUCT: the binary's vault yields no pending-consent key"),
+        "prekey ring" => prekeys::ring_sek(signer)
+            .expect("PRODUCT: the binary's vault yields no prekey-ring key"),
         _ => unreachable!(),
     }
 }
@@ -366,7 +438,7 @@ fn who_opens(disk: &Disk) -> (Vec<&'static str>, Vec<&'static str>) {
     let attacker = IdProofOnly(&signer);
     assert!(
         trust::trust_sek(&attacker).is_err(),
-        "the attacker must not be able to derive a vault key at all"
+        "PRODUCT: the attacker derives a vault key without the passphrase"
     );
     let (mut theirs, mut ours) = (Vec::new(), Vec::new());
     for blob in blobs(disk) {
@@ -393,14 +465,14 @@ fn present(disk: &Disk) -> Vec<&'static str> {
 #[ignore = "real vox processes with production Argon2id, and the v0.2.9 release; CI runs it in release"]
 fn node_wide_blobs_are_sealed_by_the_vault() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: a profile dir");
         d
     };
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: the passphrase file");
     let new = PathBuf::from(VOX);
 
     // ---- 1. a fresh profile ---------------------------------------------------------------
@@ -456,9 +528,9 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         theirs.is_empty(),
-        "a quantum adversary without the passphrase opens {theirs:?}"
+        "PRODUCT: a quantum adversary without the passphrase opens {theirs:?}"
     );
-    assert_eq!(version, 2, "a fresh vault is not version 2");
+    assert_eq!(version, 2, "PRODUCT: a fresh vault is not version 2");
 
     // ---- 2. a profile written by v0.2.9 ---------------------------------------------------
     let old = previous_release();
@@ -503,7 +575,12 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
 
     let file_facts = |d: &Disk| {
         use std::os::unix::fs::MetadataExt as _;
-        let m = std::fs::metadata(&d.store_file).unwrap();
+        let m = std::fs::metadata(&d.store_file).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: the binary left no store at {}: {e}",
+                d.store_file.display()
+            )
+        });
         (m.len(), m.ino())
     };
     let facts_before = file_facts(&disk);
@@ -532,7 +609,8 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         // v0.2.9 kept no set of open rooms (that is v0.2.10's, #208), so its room is reopened
         // the way a person running `vox daemon` does: a line with the room's passphrase.
         let with_room = tmp.path().join("idpass-with-room");
-        std::fs::write(&with_room, format!("{IDENTITY}\n{room} room pass\n")).unwrap();
+        std::fs::write(&with_room, format!("{IDENTITY}\n{room} room pass\n"))
+            .expect("APPARATUS: the passphrase file with a room");
         let _carol_d = daemon(&new, "carol", &carol, &spec, &with_room);
         ok(&new, &carol, &["room", "read", &room], None)
     };
@@ -555,29 +633,29 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         after_scan.iter().all(|n| *n == 0),
-        "the old seals, openable from the public key, are still on disk after migration: \
-         {after_scan:?} copies"
+        "PRODUCT: the old seals, openable from the public key, are still on disk after \
+         migration: {after_scan:?} copies"
     );
     assert!(
         listed.contains("dave"),
-        "the migrated keyring lost dave: {listed}"
+        "PRODUCT: the migrated keyring lost dave: {listed}"
     );
     assert!(
         reads.contains("written by v0.2.9"),
-        "the migrated profile cannot read its room: {reads}"
+        "PRODUCT: the migrated profile cannot read its room: {reads}"
     );
     assert_eq!(
         ours_after.len(),
         before.len(),
-        "a blob did not move to the vault's key: {ours_after:?} of {before:?}"
+        "PRODUCT: a blob did not move to the vault's key: {ours_after:?} of {before:?}"
     );
     assert!(
         theirs_after.is_empty(),
-        "after migration a quantum adversary still opens {theirs_after:?}"
+        "PRODUCT: after migration a quantum adversary still opens {theirs_after:?}"
     );
     assert_eq!(
         version_after, 2,
-        "the migrated vault is still version {version_after}"
+        "PRODUCT: the migrated vault is still version {version_after}"
     );
 
     // ---- 2b. no old seal left in the file ------------------------------------------------------
@@ -628,8 +706,8 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         small_scan_after.iter().all(|n| *n == 0),
-        "the old seals, openable from the public key, are still on disk after migration: \
-         {small_scan_after:?} copies"
+        "PRODUCT: the old seals, openable from the public key, are still on disk after \
+         migration: {small_scan_after:?} copies"
     );
 
     // ---- 2c. a rewrite that fails leaves the profile to migrate again ------------------------
@@ -659,12 +737,12 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     let mut squatter = blocked.store_file.clone().into_os_string();
     squatter.push(".rewrite");
     let squatter = PathBuf::from(squatter);
-    std::fs::create_dir(&squatter).unwrap();
+    std::fs::create_dir(&squatter).expect("APPARATUS: staging the obstacle");
     std::fs::write(
         squatter.join("keep"),
         b"a directory where the new store would go",
     )
-    .unwrap();
+    .expect("APPARATUS: staging the obstacle");
     let inode_before = file_facts(&blocked).1;
     let (migrated, out, err) = vox_with(&new, &gina, &["trust", "list"], None);
     let (inode_after, version) = (file_facts(&blocked).1, blocked.vault().version);
@@ -675,9 +753,9 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         !migrated && inode_after == inode_before && version == 1,
-        "a migration whose store rewrite failed went on (vault v{version}): {out}{err}"
+        "PRODUCT: a migration whose store rewrite failed went on (vault v{version}): {out}{err}"
     );
-    std::fs::remove_dir_all(&squatter).unwrap();
+    std::fs::remove_dir_all(&squatter).expect("APPARATUS: removing the obstacle");
     let listed = ok(&new, &gina, &["trust", "list"], None);
     let residue = occurrences(&blocked, &gina_old);
     let version = blocked.vault().version;
@@ -688,7 +766,7 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         version == 2 && listed.contains("hal") && residue.iter().all(|n| *n == 0),
-        "the migration did not complete once the rewrite could: vault v{version}, old seals \
+        "PRODUCT: the migration did not complete once the rewrite could: vault v{version}, old seals \
          {residue:?}: {listed}"
     );
 
@@ -704,7 +782,8 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         !out.contains("mallory"),
-        "a keyring planted with a key computable from the public key was accepted: {out}{err}"
+        "PRODUCT: a keyring planted with a key computable from the public key was accepted: \
+         {out}{err}"
     );
     // And it says why, truthfully: the passphrase was right, so "the passphrase is wrong" would
     // send a person to retype a correct one.
@@ -715,13 +794,14 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         err.contains("will not open under it") && !err.contains("passphrase is wrong"),
-        "a keyring that will not open under a correct passphrase was reported as: {err}"
+        "PRODUCT: a keyring that will not open under a correct passphrase was reported as: {err}"
     );
     // (b) The same, with the vault relabelled v1, which is what makes an unlock migrate.
     {
         let mut vault = disk.vault();
         vault.version = 1;
-        std::fs::write(&disk.vault_file, vault.to_canonical_vec()).unwrap();
+        std::fs::write(&disk.vault_file, vault.to_canonical_vec())
+            .expect("APPARATUS: relabelling the vault");
     }
     let (opened, out, err) = vox_with(&new, &carol, &["trust", "list"], None);
     println!(
@@ -731,11 +811,12 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         !out.contains("mallory"),
-        "a keyring planted with a key computable from the public key was accepted: {out}{err}"
+        "PRODUCT: a keyring planted with a key computable from the public key was accepted: \
+         {out}{err}"
     );
     assert!(
         !opened,
-        "a v2 vault relabelled v1 still unlocked: {out}{err}"
+        "PRODUCT: a v2 vault relabelled v1 still unlocked: {out}{err}"
     );
 }
 
@@ -745,17 +826,24 @@ fn plant_mallory(disk: &Disk) {
         let signer = disk.signer();
         let attacker = IdProofOnly(&signer);
         let mut planted = trust::Keyring::new();
-        planted.trust([7u8; 32], "mallory").unwrap();
+        planted
+            .trust([7u8; 32], "mallory")
+            .unwrap_or_else(|e| panic!("APPARATUS: the attacker's keyring: {e}"));
         let sealed = seal_segment(
-            &trust::legacy_trust_sek(&attacker).unwrap(),
+            &trust::legacy_trust_sek(&attacker)
+                .unwrap_or_else(|e| panic!("APPARATUS: the attacker's old key: {e}")),
             SegmentKind::Trust,
             trust::TRUST_SEGMENT_ID,
             &planted.to_bytes(),
         )
-        .unwrap();
-        let store = Store::open(&disk.store_file).unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: sealing the attacker's keyring: {e}"));
+        let store = Store::open(&disk.store_file).unwrap_or_else(|e| {
+            panic!("CANNOT MEASURE: the attacker could not open the stopped store to plant: {e}")
+        });
         let mut blob = sealed.nonce.to_vec();
         blob.extend_from_slice(&sealed.ciphertext);
-        store.put_meta(trust::TRUST_META_KEY, &blob).unwrap();
+        store
+            .put_meta(trust::TRUST_META_KEY, &blob)
+            .unwrap_or_else(|e| panic!("CANNOT MEASURE: planting the attacker's keyring: {e}"));
     }
 }

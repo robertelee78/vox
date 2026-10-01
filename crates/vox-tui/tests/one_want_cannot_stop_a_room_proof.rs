@@ -26,6 +26,12 @@
 //!    the feed's length when the session began and that plus the one post made during the
 //!    attack. The session ends cleanly.
 //!
+//! **Which side a red names.** The bound is checked against an apparatus clock on the same
+//! timeline: the [`HELD`] staging posts are timed exactly as the attack's post is, before the
+//! attack. If the slowest of them already took [`PATIENCE`], this runner cannot time a post
+//! inside the bound at all, and a slow post reads `CANNOT MEASURE: apparatus took …`;
+//! otherwise it reads `PRODUCT: took … (apparatus …)`.
+//!
 //! **Mutation that must turn it red.** Put the per-number loop back in
 //! `log::sync::entries_for_wants` (`for seq in from_seq..=to_seq { feed.get(seq) }` over the
 //! unmerged ranges). The serve then never finishes with the room locked, and the post does not
@@ -72,14 +78,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: spawn vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: vox's stdin")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("APPARATUS: write vox's stdin");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -100,17 +106,19 @@ fn vox_timed(data: &Path, argv: &[&str], cap: Duration) -> (bool, Duration, Stri
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(&out_file).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(&out_file).expect("APPARATUS: create vox's output file"),
+        ))
         .stderr(Stdio::from(
             std::fs::OpenOptions::new()
                 .append(true)
                 .open(&out_file)
-                .unwrap(),
+                .expect("APPARATUS: open vox's output file"),
         ))
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: spawn vox");
     let ok = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.try_wait().expect("APPARATUS: wait for vox") {
             break status.success();
         }
         if t0.elapsed() >= cap {
@@ -246,13 +254,21 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         .next()
         .expect("CANNOT MEASURE: the new room in `vox room list`")
         .to_owned();
+    // The apparatus clock: each staging post is timed exactly as the attack's post is.
+    let mut apparatus = Duration::ZERO;
     for i in 1..=HELD {
-        let (ok, _, err) = vox_once(
+        let (ok, took, said) = vox_timed(
             &victim_dir,
-            &args(&["room", "post", &prefix, &format!("held {i}")]),
+            &["room", "post", &prefix, &format!("held {i}")],
+            PATIENCE * 6,
         );
-        assert!(ok, "CANNOT MEASURE: post {i}: {err}");
+        assert!(
+            ok,
+            "CANNOT MEASURE: staging post {i} failed in {took:?}: {said}"
+        );
+        apparatus = apparatus.max(took);
     }
+    println!("[proof] apparatus: the slowest of {HELD} staging posts took {apparatus:?}");
     let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "invite", &prefix]));
     assert!(ok, "CANNOT MEASURE: room invite: {err}");
     let link = link.trim().to_owned();
@@ -280,7 +296,9 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
                 .map(str::to_owned)
         })
         .expect("CANNOT MEASURE: the victim's read names its room");
-    let cid = vox_core::node::link::b32_decode(&room, "room id").expect("a room id");
+    let cid = vox_core::node::link::b32_decode(&room, "room id").unwrap_or_else(|e| {
+        panic!("CANNOT MEASURE: the victim's read named room {room:?} ({e:?})")
+    });
 
     // Mallory's node goes; her identity stays, in the profile the binary wrote.
     stop(mallory);
@@ -354,7 +372,8 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         }
         eprintln!(
             "[proof] session attempt {attempt} ended before the WANT: {:?}",
-            rt.block_on(task).unwrap()
+            rt.block_on(task)
+                .expect("APPARATUS: the test-side sync client panicked")
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -371,12 +390,18 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
     // ---- 2. the room still works --------------------------------------------------------
     let text = "posted while the WANT was being served";
     let (ok, took, said) = vox_timed(&victim_dir, &["room", "post", &room, text], PATIENCE * 6);
-    println!("[proof] post during the attack: ok={ok} in {took:?}");
+    println!("[proof] post during the attack: ok={ok} in {took:?} (apparatus {apparatus:?})");
+    assert!(
+        took < PATIENCE || apparatus < PATIENCE,
+        "CANNOT MEASURE: apparatus took {apparatus:?} for a staging post before the attack, \
+         so a post inside {PATIENCE:?} cannot be timed on this runner (the post during the \
+         attack took {took:?}, ok={ok}). It said: {said}"
+    );
     assert!(
         ok && took < PATIENCE,
-        "a post into the room on the victim took {took:?} (ok={ok}; bound {PATIENCE:?}) while \
-         one member's WANT (author, 1, u64::MAX) was being served — one request stops the room \
-         (PRD-001 D2/R4). It said: {said}"
+        "PRODUCT: a post into the room on the victim took {took:?} (apparatus {apparatus:?}; \
+         ok={ok}; bound {PATIENCE:?}) while one member's WANT (author, 1, u64::MAX) was being \
+         served — one request stops the room (PRD-001 D2/R4). It said: {said}"
     );
     let (ok, t, read) = vox_timed(&victim_dir, &["room", "read", &room], PATIENCE * 6);
     println!(
@@ -385,15 +410,20 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
     );
     assert!(
         ok && t < PATIENCE && read.contains(text),
-        "the victim's `vox room read` took {t:?} (ok={ok}) and did not show the post made \
-         during the attack:\n{read}"
+        "PRODUCT: the victim's `vox room read` took {t:?} (apparatus {apparatus:?}; ok={ok}) \
+         and did not show the post made during the attack:\n{read}"
     );
 
     // ---- 3. what was served: each held entry once ---------------------------------------
+    // The test-side client only reads: it ends when the victim finishes serving and closes the
+    // session, so a session still open at 60 s is the victim still serving.
     let y: Yield = rt
         .block_on(async { tokio::time::timeout(Duration::from_secs(60), attack).await })
-        .expect("mallory's session did not end within 60 s")
-        .unwrap();
+        .expect(
+            "PRODUCT: the victim was still serving mallory's WANT 60 s after it was sent \
+             (the test-side client was waiting for the victim to finish the session)",
+        )
+        .expect("APPARATUS: the test-side sync client panicked");
     let feed = y
         .have
         .iter()
@@ -412,16 +442,19 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
     assert_eq!(
         y.distinct,
         y.entries,
-        "the WANT must serve each entry once — {DUPLICATES} duplicate ranges merged — but {} of \
+        "PRODUCT: the WANT must serve each entry once — {DUPLICATES} duplicate ranges merged — but {} of \
          the {} entries served were repeats",
         y.entries - y.distinct,
         y.entries
     );
     assert!(
         (feed..=feed + 1).contains(&(y.entries as u64)),
-        "the WANT must be served the {feed} entries held, plus at most the one posted during \
+        "PRODUCT: the WANT must be served the {feed} entries held, plus at most the one posted during \
          the attack — got {}",
         y.entries
     );
-    assert_eq!(y.ended, None, "the session must end cleanly");
+    assert_eq!(
+        y.ended, None,
+        "PRODUCT: the victim's session with mallory must end cleanly"
+    );
 }

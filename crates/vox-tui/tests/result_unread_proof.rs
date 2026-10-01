@@ -75,8 +75,8 @@ fn a_result_names_the_addressed_messages_its_session_has_not_read() {
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: build the test's runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: create a tempdir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();

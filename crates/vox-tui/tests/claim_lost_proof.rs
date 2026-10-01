@@ -21,7 +21,7 @@ mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::{until, Out, Worker};
 
@@ -40,13 +40,28 @@ fn drain(w: &Worker, r: &str, session: &str) -> String {
             session,
         ],
     );
-    assert!(o.ok, "the drain hook must not fail: {o:?}");
+    assert!(o.ok, "PRODUCT: the drain hook failed: {o:?}");
     o.stdout
 }
 
 fn claim(w: &Worker, session: &str, r: &str, res: &str, ttl: &str) {
     let o = w.vox(Some(session), &["room", "claim", r, res, "--ttl", ttl]);
-    assert!(o.ok, "{session} must win {res}: {o:?}");
+    assert!(o.ok, "PRODUCT: {session} was refused {res}: {o:?}");
+}
+
+/// The short claims below lapse after [`SHORT_TTL`]. A drain only reports the loss of a claim it
+/// saw held, so the claim and the drain that records it must both finish inside the TTL; if the
+/// staging itself took longer, the claim may have lapsed before it was ever recorded, and what
+/// follows cannot be measured. Timed from before the claim was made, which the TTL starts after.
+const SHORT_TTL: Duration = Duration::from_secs(2);
+
+fn recorded_within_ttl(since: Instant, what: &str) {
+    let took = since.elapsed();
+    assert!(
+        took < SHORT_TTL,
+        "CANNOT MEASURE: claiming {what} and recording it in a drain took {took:?}, past its \
+         {SHORT_TTL:?} TTL, so it may have lapsed before the drain saw it held"
+    );
 }
 
 #[test]
@@ -57,20 +72,22 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: a tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
 
     // ---- (1) held and unchanged: nothing ----
     claim(alice, "s1", r, "kept", "600");
+    let t = Instant::now();
     claim(alice, "s1", r, "lapses", "2");
     let _ = drain(alice, r, "s1"); // records what s1 holds
     let quiet = drain(alice, r, "s1");
+    recorded_within_ttl(t, "`lapses` and draining twice");
     assert!(
         !quiet.contains("no longer hold"),
-        "a session whose claims did not change must be told nothing: {quiet:?}"
+        "PRODUCT: a session whose claims did not change must be told nothing: {quiet:?}"
     );
 
     // ---- (2) a lapse is reported, once ----
@@ -78,21 +95,23 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let told = drain(alice, r, "s1");
     assert!(
         told.contains("You no longer hold `lapses`") && told.contains("lapsed"),
-        "a lapsed claim must be reported with its reason: {told:?}"
+        "PRODUCT: a lapsed claim must be reported with its reason: {told:?}"
     );
     assert!(
         !told.contains("`kept`"),
-        "a claim still held must not be reported: {told:?}"
+        "PRODUCT: a claim still held must not be reported: {told:?}"
     );
     let again = drain(alice, r, "s1");
     assert!(
         !again.contains("no longer hold"),
-        "the loss must be reported once, not every turn: {again:?}"
+        "PRODUCT: the loss must be reported once, not every turn: {again:?}"
     );
 
     // ---- (3) someone else now holds it ----
+    let t = Instant::now();
     claim(alice, "s1", r, "taken", "2");
     let _ = drain(alice, r, "s1");
+    recorded_within_ttl(t, "`taken`");
     std::thread::sleep(Duration::from_secs(4));
     until(
         bob,
@@ -116,12 +135,14 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     assert!(
         told.contains("You no longer hold `taken`: your claim lapsed, and it is now held by")
             && told.contains(&format!("{}/b1", &bob_fp[..26])),
-        "a claim someone else now holds must name the holder: {told:?}"
+        "PRODUCT: a claim someone else now holds must name the holder: {told:?}"
     );
 
     // ---- (3b) lapsed, then reserved for someone by a handoff ----
+    let t = Instant::now();
     claim(alice, "s1", r, "reserved", "2");
     let _ = drain(alice, r, "s1");
+    recorded_within_ttl(t, "`reserved`");
     std::thread::sleep(Duration::from_secs(4));
     until(
         bob,
@@ -144,7 +165,10 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
             "s9",
         ],
     );
-    assert!(o.ok, "{o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT: bob's handoff of `reserved` to alice/s9 failed: {o:?}"
+    );
     until(
         alice,
         Some("s1"),
@@ -160,23 +184,27 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
         told.contains(
             "You no longer hold `reserved`: your claim lapsed, and it is now reserved for"
         ) && told.contains(&format!("{}/s9", &alice_fp[..26])),
-        "a lapsed claim now reserved by a handoff must say so and name the recipient: {told:?}"
+        "PRODUCT: a lapsed claim now reserved by a handoff must say so and name the recipient: \
+         {told:?}"
     );
 
     // ---- (4) a session's own release is not news — with a positive control ----
     claim(alice, "s1", r, "mine", "600");
+    let t = Instant::now();
     claim(alice, "s1", r, "gone", "2");
     let _ = drain(alice, r, "s1");
+    recorded_within_ttl(t, "`gone`");
     let o = alice.vox(Some("s1"), &["room", "release", r, "mine"]);
-    assert!(o.ok, "{o:?}");
+    assert!(o.ok, "PRODUCT: alice's release of `mine` failed: {o:?}");
     std::thread::sleep(Duration::from_secs(4));
     let told = drain(alice, r, "s1");
     assert!(
         told.contains("You no longer hold `gone`"),
-        "the positive control: the same drain must report the lapse of `gone`: {told:?}"
+        "PRODUCT: the positive control: the same drain must report the lapse of `gone`: \
+         {told:?}"
     );
     assert!(
         !told.contains("`mine`"),
-        "a session's own release must not be reported back to it: {told:?}"
+        "PRODUCT: a session's own release must not be reported back to it: {told:?}"
     );
 }

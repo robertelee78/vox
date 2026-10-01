@@ -20,6 +20,12 @@
 //! 2. every post made during it is taken within [`ANSWER_WITHIN`];
 //! 3. bob's daemon reports no stall of a second or more while opening the forward.
 //!
+//! **Which side a red names.** Before the fetch, bob makes the same posts timed exactly the same
+//! way: the apparatus clock on the same timeline. If the slowest of those already took
+//! [`ANSWER_WITHIN`], this runner cannot time a post inside the bound, and a slow post during the
+//! fetch reads `CANNOT MEASURE: apparatus took …`; otherwise it reads `PRODUCT: took …
+//! (apparatus …)`.
+//!
 //! Mutation: the dial back on the actor (the parent of this change) — (2) and (3) go red.
 
 #![cfg(unix)]
@@ -43,7 +49,6 @@ struct Running(Child, Arc<Mutex<String>>);
 
 impl Running {
     /// Whatever the child has said so far, for an assertion message.
-    #[allow(dead_code)]
     fn said(&self) -> String {
         self.1.lock().map(|s| s.clone()).unwrap_or_default()
     }
@@ -104,14 +109,14 @@ impl Agent {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         child
             .stdin
             .take()
-            .unwrap()
+            .expect("APPARATUS: vox's stdin")
             .write_all(stdin.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
+            .expect("APPARATUS: write vox's stdin");
+        let out = child.wait_with_output().expect("APPARATUS: wait for vox");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -131,7 +136,7 @@ impl Agent {
             .env_remove("VOX_ROOM")
             .stdin(Stdio::null())
             .output()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -150,7 +155,7 @@ impl Agent {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .expect("spawn vox")
+                .expect("APPARATUS: spawn vox")
         };
         let said = Arc::new(Mutex::new(String::new()));
         drain(child.stdout.take(), &said);
@@ -174,7 +179,7 @@ fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
         daemon: None,
     };
     let (ok, _, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
-    assert!(ok, "{name}: vox id: {err}");
+    assert!(ok, "CANNOT MEASURE: {name}: vox id: {err}");
     a.daemon = Some(a.spawn(&[
         "daemon",
         "--listen",
@@ -185,8 +190,17 @@ fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
         a.id_pass(),
     ]));
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !a.vox(&["room", "list"]).0 {
-        assert!(Instant::now() < deadline, "{name}'s daemon never answered");
+    loop {
+        let (ok, _, err) = a.vox(&["room", "list"]);
+        if ok {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: {name}'s daemon never answered `vox room list` in 60 s ({err}); \
+             the daemon said: {}",
+            a.daemon.as_ref().map(Running::said).unwrap_or_default()
+        );
         std::thread::sleep(Duration::from_millis(250));
     }
     a
@@ -214,7 +228,7 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "CANNOT MEASURE: the anchor never printed its spec in 60 s; it said: {said}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -222,7 +236,7 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
 
 fn fingerprint(a: &Agent) -> String {
     let (ok, out, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
-    assert!(ok, "vox id: {err}");
+    assert!(ok, "CANNOT MEASURE: vox id: {err}");
     out.trim().to_owned()
 }
 
@@ -237,7 +251,7 @@ fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> S
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}; last saw {last}");
+    panic!("CANNOT MEASURE: timed out waiting for {what}; last saw {last}");
 }
 
 /// How long the daemon may take to take a post while a fetch dials.
@@ -269,37 +283,55 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
             "--identity-passphrase-file",
             who.id_pass(),
         ]);
-        assert!(ok, "trust {name}: {err}");
+        assert!(ok, "CANNOT MEASURE: trust {name}: {err}");
     }
     let (ok, _, err) = alice.vox_with(&["room", "create", "--name", "mission"], ROOM_PASS);
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "CANNOT MEASURE: vox room create: {err}");
     let label = alice
         .vox(&["room", "list"])
         .1
         .split_whitespace()
         .next()
-        .expect("a room")
+        .expect("CANNOT MEASURE: alice's new room in `vox room list`")
         .to_owned();
     let (ok, link, err) = alice.vox(&["room", "invite", &label]);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "CANNOT MEASURE: vox room invite: {err}");
     let link = link.trim().to_owned();
     let room = link
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
-        .expect("an invite link naming the room")
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: an invite link naming the room: {link:?}"))
         .to_owned();
     let mut joined = false;
+    let mut last = String::new();
     for _ in 0..6 {
-        if bob
-            .vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS)
-            .0
-        {
+        let (ok, out, err) = bob.vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS);
+        if ok {
             joined = true;
             break;
         }
+        last = format!("stdout={out:?} stderr={err:?}");
         std::thread::sleep(Duration::from_secs(5));
     }
-    assert!(joined, "bob never joined");
+    assert!(
+        joined,
+        "CANNOT MEASURE: bob's join failed 6 times; the last said {last}"
+    );
+
+    // ---- the apparatus clock: the same posts, timed the same way, with no fetch running ----
+    // Taken while alice is still up, so these posts start no dial to her that could change
+    // what the fetch below dials.
+    let mut apparatus = Duration::ZERO;
+    for n in 0..3 {
+        let asked = Instant::now();
+        let (ok, _, err) = bob.vox(&["room", "post", &room, &format!("before {n}")]);
+        let t = asked.elapsed();
+        assert!(
+            ok,
+            "CANNOT MEASURE: a post before the fetch failed in {t:?}: {err}"
+        );
+        apparatus = apparatus.max(t);
+    }
 
     // ---- alice offers a file; bob sees the offer; alice's node goes, unannounced ----
     let offer = alice.spawn(&["room", "send", &room, source.to_str().unwrap()]);
@@ -326,7 +358,7 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
                 .env_remove("VOX_ROOM")
                 .stdin(Stdio::null())
                 .output()
-                .expect("spawn vox room get");
+                .expect("APPARATUS: spawn vox room get");
             (
                 out.status.success(),
                 started.elapsed(),
@@ -345,7 +377,9 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
         let (ok, _, err) = bob.vox(&["room", "post", &room, &format!("still here {n}")]);
         answers.push((asked.elapsed(), ok, err));
     }
-    let (got, took, said) = fetch.join().unwrap();
+    let (got, took, said) = fetch
+        .join()
+        .expect("APPARATUS: the thread running `vox room get` panicked");
     let stalls: Vec<String> = bob
         .daemon
         .as_ref()
@@ -356,26 +390,37 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
         .map(str::to_owned)
         .collect();
     eprintln!(
-        "[proof] the fetch took {took:?} (ok={got}); `vox room post` during it answered after {:?}; \
-         bob's daemon reported {} forward stall(s): {stalls:?}",
+        "[proof] the fetch took {took:?} (ok={got}); `vox room post` during it answered after {:?} \
+         (apparatus {apparatus:?}); bob's daemon reported {} forward stall(s): {stalls:?}",
         answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>(),
         stalls.len()
     );
     assert!(
         !got,
-        "CANNOT PROVE: the fetch from a member who is gone succeeded, so nothing was dialled: {said}"
+        "CANNOT MEASURE: the fetch from a member who is gone succeeded, so nothing was dialled: \
+         {said}"
     );
+    let all = answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>();
     for (t, ok, err) in &answers {
-        assert!(*ok, "`vox room post` failed during the fetch: {err}");
+        assert!(
+            *ok,
+            "PRODUCT: `vox room post` failed during the fetch after {t:?}: {err}"
+        );
+        assert!(
+            *t < ANSWER_WITHIN || apparatus < ANSWER_WITHIN,
+            "CANNOT MEASURE: apparatus took {apparatus:?} for a post with no fetch running, so a \
+             post inside {ANSWER_WITHIN:?} cannot be timed on this runner; during the fetch: \
+             {all:?}"
+        );
         assert!(
             *t < ANSWER_WITHIN,
-            "bob's daemon took {t:?} to take a post while a fetch dialled — the dial \
-             held its actor (#215); all answers: {:?}",
-            answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>()
+            "PRODUCT: bob's daemon took {t:?} (apparatus {apparatus:?}) to take a post while a \
+             fetch dialled — the dial held its actor (#215); all answers: {all:?}"
         );
     }
     assert!(
         stalls.is_empty(),
-        "bob's daemon stopped answering while it opened the forward (#215): {stalls:?}"
+        "PRODUCT: bob's daemon said it stopped answering while it opened the forward (#215): \
+         {stalls:?}"
     );
 }

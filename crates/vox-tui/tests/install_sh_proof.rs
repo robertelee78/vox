@@ -191,10 +191,12 @@ fn serve(root: &Path) -> Result<Server, String> {
 /// `download/v<version>/vox-<triple>`. `mangle` gets the last word on the record's fields.
 fn release_tree(root: &Path, channel: &str, mangle: &dyn Fn(&mut BTreeMap<&str, String>)) {
     let triple = target_triple();
-    let bin = std::fs::read(VOX).unwrap();
+    let bin = std::fs::read(VOX).unwrap_or_else(|e| panic!("APPARATUS: read the vox binary: {e}"));
     let asset_dir = root.join("releases/download").join(format!("v{SERVED}"));
-    std::fs::create_dir_all(&asset_dir).unwrap();
-    std::fs::write(asset_dir.join(format!("vox-{triple}")), &bin).unwrap();
+    std::fs::create_dir_all(&asset_dir)
+        .unwrap_or_else(|e| panic!("APPARATUS: create the release tree: {e}"));
+    std::fs::write(asset_dir.join(format!("vox-{triple}")), &bin)
+        .unwrap_or_else(|e| panic!("APPARATUS: write the served binary: {e}"));
 
     let mut f: BTreeMap<&str, String> = BTreeMap::new();
     f.insert("kind", "vox.standalone-release".into());
@@ -220,12 +222,13 @@ fn release_tree(root: &Path, channel: &str, mangle: &dyn Fn(&mut BTreeMap<&str, 
         .collect::<Vec<_>>()
         .join(",");
     let rec_dir = root.join("releases/latest/download");
-    std::fs::create_dir_all(&rec_dir).unwrap();
+    std::fs::create_dir_all(&rec_dir)
+        .unwrap_or_else(|e| panic!("APPARATUS: create the record dir: {e}"));
     std::fs::write(
         rec_dir.join(format!("{channel}-{triple}.json")),
         format!("{{{body}}}\n"),
     )
-    .unwrap();
+    .unwrap_or_else(|e| panic!("APPARATUS: write the release record: {e}"));
 }
 
 /// Run the real `install.sh` against `server`, installing into `home/bin`.
@@ -240,9 +243,11 @@ fn run_installer_env(
     channel: &str,
     extra: &[(&str, &str)],
 ) -> (bool, String) {
-    std::fs::create_dir_all(home).unwrap();
-    let mut f = std::fs::File::create(home.join(".zshrc")).unwrap();
-    f.write_all(b"export VOX_PROOF_USER_LINE=kept\n").unwrap();
+    std::fs::create_dir_all(home).unwrap_or_else(|e| panic!("APPARATUS: create HOME: {e}"));
+    let mut f = std::fs::File::create(home.join(".zshrc"))
+        .unwrap_or_else(|e| panic!("APPARATUS: create .zshrc: {e}"));
+    f.write_all(b"export VOX_PROOF_USER_LINE=kept\n")
+        .unwrap_or_else(|e| panic!("APPARATUS: write .zshrc: {e}"));
     let out = Command::new("sh")
         .arg(install_sh())
         .env_clear()
@@ -255,7 +260,7 @@ fn run_installer_env(
         .env("VOX_CHANNEL", channel)
         .envs(extra.iter().copied())
         .output()
-        .expect("sh ran install.sh");
+        .unwrap_or_else(|e| panic!("APPARATUS: sh could not run install.sh: {e}"));
     (
         out.status.success(),
         format!(
@@ -278,7 +283,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         .filter(|s| !s.is_empty())
         .collect();
 
-    let tree = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().expect("APPARATUS: a tempdir");
     release_tree(tree.path(), "stable", &|_| {});
     let server = match serve(tree.path()) {
         Ok(s) => s,
@@ -291,7 +296,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
 
     // ---- the happy path, observed the way a user observes it -------------------------
     {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
         let home = tmp.path();
         let (ok, text) = run_installer(&server, home, "stable");
         let version = Command::new(home.join("bin/vox"))
@@ -353,7 +358,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         ),
     ] {
         release_tree(tree.path(), channel, mangle);
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
         let home = tmp.path();
         let (ok, text) = run_installer(&server, home, channel);
         let installed = home.join("bin/vox").exists();
@@ -370,7 +375,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
     // output of the release workflow.
     if cfg!(target_os = "macos") {
         release_tree(tree.path(), "stable", &|_| {});
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
         let home = tmp.path();
         let (ok, text) =
             run_installer_env(&server, home, "stable", &[("VOX_PROOF_APPLE_VERIFY", "1")]);
@@ -387,11 +392,12 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
     // ---- a `vox` this installer did not install is never overwritten -----------------
     {
         release_tree(tree.path(), "stable", &|_| {});
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
         let home = tmp.path();
         let bin = home.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("vox"), b"#!/bin/sh\necho mine\n").unwrap();
+        std::fs::create_dir_all(&bin).unwrap_or_else(|e| panic!("APPARATUS: create bin: {e}"));
+        std::fs::write(bin.join("vox"), b"#!/bin/sh\necho mine\n")
+            .unwrap_or_else(|e| panic!("APPARATUS: plant the foreign vox: {e}"));
         let (ok, text) = run_installer(&server, home, "stable");
         let still = std::fs::read_to_string(bin.join("vox")).unwrap_or_default();
         claims.push(claim(
@@ -403,7 +409,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
 
     // ---- a second run over its own install keeps the one it replaced -----------------
     {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
         let home = tmp.path();
         let (ok1, _) = run_installer(&server, home, "stable");
         let (ok2, text) = run_installer(&server, home, "stable");
@@ -441,7 +447,7 @@ fn report(claims: &[Claim], receipts: &BTreeMap<String, String>, allowed: &[Stri
         .collect();
     assert!(
         failed.is_empty(),
-        "{} claim(s) failed:\n{}",
+        "PRODUCT: install.sh: {} claim(s) failed:\n{}",
         failed.len(),
         failed
             .iter()
@@ -451,7 +457,8 @@ fn report(claims: &[Claim], receipts: &BTreeMap<String, String>, allowed: &[Stri
     );
     assert!(
         unproven.is_empty(),
-        "{} claim(s) unproven — close the gap, or name it in VOX_PROOF_ALLOW_UNPROVEN:\n{}",
+        "CANNOT MEASURE: {} claim(s) unproven — close the gap, or name it in \
+         VOX_PROOF_ALLOW_UNPROVEN:\n{}",
         unproven.len(),
         unproven
             .iter()

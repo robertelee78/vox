@@ -119,16 +119,16 @@ impl Member {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         if let Some(text) = stdin {
             child
                 .stdin
                 .take()
                 .unwrap()
                 .write_all(text.as_bytes())
-                .unwrap();
+                .expect("APPARATUS: write vox's stdin");
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child.wait_with_output().expect("APPARATUS: wait for vox");
         let r = (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -162,15 +162,19 @@ impl Member {
             ],
             None,
         );
-        assert!(ok, "{} trusts {}: {o}{e}", self.name, other.name);
+        assert!(
+            ok,
+            "CANNOT MEASURE: {} could not trust {}: {o}{e}",
+            self.name, other.name
+        );
     }
 }
 
 fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
     let data = tmp.join(name);
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: a profile dir");
     let pass = tmp.join(format!("{name}.pass"));
-    std::fs::write(&pass, ID_PASS).unwrap();
+    std::fs::write(&pass, ID_PASS).expect("APPARATUS: the passphrase file");
     let mut m = Member {
         name,
         data,
@@ -182,10 +186,16 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         &["id", "--identity-passphrase-file", m.pass.to_str().unwrap()],
         None,
     );
-    assert!(ok, "{name}: vox id: {err}");
+    assert!(ok, "CANNOT MEASURE: {name}: vox id: {err}");
     m.fp = out.trim().to_owned();
-    assert_eq!(m.fp.len(), 52, "{name}: a fingerprint from vox id");
-    let err = std::fs::File::create(tmp.join(format!("{name}.daemon.err"))).unwrap();
+    assert_eq!(
+        m.fp.len(),
+        52,
+        "PRODUCT: {name}: `vox id` printed {:?}, not a fingerprint",
+        m.fp
+    );
+    let err_path = tmp.join(format!("{name}.daemon.err"));
+    let err = std::fs::File::create(&err_path).expect("APPARATUS: the daemon's stderr file");
     let child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
@@ -197,13 +207,15 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         .stdout(Stdio::null())
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: spawn vox daemon");
     m.daemon = Some(Proc(child));
     let deadline = Instant::now() + Duration::from_secs(90);
     while !m.vox(&["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: {name}'s daemon never answered"
+            "CANNOT MEASURE: {name}'s daemon never answered `vox room list` within 90 s; it \
+             said:\n{}",
+            std::fs::read_to_string(&err_path).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -212,17 +224,19 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
 
 fn anchor(tmp: &Path) -> (Proc, String) {
     let dir = tmp.join("anchor");
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: the anchor's dir");
     let out = tmp.join("anchor.out");
     let p = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
-            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create(&out).expect("APPARATUS: the anchor's stdout file"),
+            ))
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: spawn vox node"),
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -235,7 +249,7 @@ fn anchor(tmp: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: the anchor never printed its spec"
+            "CANNOT MEASURE: the anchor never printed its spec within 60 s; it printed: {text}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -255,7 +269,7 @@ fn posts_until_read(
     while Instant::now() < deadline {
         n += 1;
         let (ok, _, e) = author.vox(&["room", "post", room, &format!("{tag} {n}")], None);
-        assert!(ok, "{} posts: {e}", author.name);
+        assert!(ok, "PRODUCT: {} could not post: {e}", author.name);
         std::thread::sleep(Duration::from_secs(1));
         if reader.reads(room, &format!("{tag} ")) {
             return Some(n);
@@ -268,6 +282,7 @@ fn posts_until_read(
 const AFTER: u32 = 3;
 
 fn join(m: &Member, link: &str) {
+    let mut last = String::new();
     let joined = (1..=6).any(|attempt| {
         let (ok, o, e) = m.vox(
             &["room", "join", link, "--name", "team"],
@@ -278,11 +293,17 @@ fn join(m: &Member, link: &str) {
                 "[harness] {} join attempt {attempt} refused: {o}{e}",
                 m.name
             );
+            last = format!("{o}{e}");
             std::thread::sleep(Duration::from_secs(5));
         }
         ok
     });
-    assert!(joined, "CANNOT MEASURE: {} could not join the room", m.name);
+    assert!(
+        joined,
+        "PRODUCT: {} could not join the room in 6 attempts (if this is a refusal as a pending \
+         joiner, it is the open defect #217, V210-43); the last refusal: {last}",
+        m.name
+    );
 }
 
 /// Send `sig` to `pid` with `kill(1)` — by PID, never by pattern.
@@ -290,9 +311,9 @@ fn signal(pid: u32, sig: &str) {
     let ok = Command::new("kill")
         .args([sig, &pid.to_string()])
         .status()
-        .expect("run kill")
+        .expect("APPARATUS: run kill")
         .success();
-    assert!(ok, "kill {sig} {pid} failed");
+    assert!(ok, "APPARATUS: `kill {sig} {pid}` did not take");
 }
 
 /// Stop a daemon the way a service manager does and wait for it to leave, so its store is
@@ -300,7 +321,12 @@ fn signal(pid: u32, sig: &str) {
 fn stop(mut daemon: Proc) {
     signal(daemon.0.id(), "-TERM");
     let deadline = Instant::now() + Duration::from_secs(30);
-    while daemon.0.try_wait().expect("try_wait").is_none() {
+    while daemon
+        .0
+        .try_wait()
+        .expect("APPARATUS: try_wait on bob's daemon")
+        .is_none()
+    {
         assert!(
             Instant::now() < deadline,
             "CANNOT MEASURE: bob's daemon did not leave within 30s of SIGTERM"
@@ -320,21 +346,42 @@ const RECEIVERS_VERSION: u64 = 1;
 fn stored_receivers(store: &Store, channel: &[u8; 32], sek: &Sek) -> Vec<Vec<u8>> {
     let Some(seg) = store
         .get_segment(channel, SegmentKind::KeyMaterial, SEG_RECEIVERS)
-        .expect("read the receiver segment")
+        .expect("CANNOT MEASURE: the attacker could not read bob's receiver segment")
     else {
         return Vec::new();
     };
     let bytes = open_segment(sek, SegmentKind::KeyMaterial, SEG_RECEIVERS, &seg)
         .expect("CANNOT MEASURE: the receiver segment does not open under bob's SEK");
+    // The attacker's reader of bob's own format: a mismatch means it cannot read what it means
+    // to attack, so nothing below would be measured.
+    let unreadable = |what: &str| {
+        format!("CANNOT MEASURE: the attacker cannot read the receiver segment's {what}")
+    };
     let mut d = Decoder::new(&bytes);
-    assert_eq!(d.array().unwrap(), 2, "receiver segment arity");
     assert_eq!(
-        d.uint().unwrap(),
-        RECEIVERS_VERSION,
-        "receiver segment version"
+        d.array()
+            .unwrap_or_else(|e| panic!("{}: {e}", unreadable("arity"))),
+        2,
+        "{}",
+        unreadable("arity")
     );
-    let n = d.array().unwrap();
-    (0..n).map(|_| d.bytes().unwrap().to_vec()).collect()
+    assert_eq!(
+        d.uint()
+            .unwrap_or_else(|e| panic!("{}: {e}", unreadable("version"))),
+        RECEIVERS_VERSION,
+        "{}",
+        unreadable("version")
+    );
+    let n = d
+        .array()
+        .unwrap_or_else(|e| panic!("{}: {e}", unreadable("key list")));
+    (0..n)
+        .map(|_| {
+            d.bytes()
+                .unwrap_or_else(|e| panic!("{}: {e}", unreadable("keys")))
+                .to_vec()
+        })
+        .collect()
 }
 
 /// Try every held key for the message's (author, generation), each from its stored state,
@@ -366,7 +413,7 @@ fn until(what: &str, within: Duration, ok: impl Fn() -> bool) -> bool {
 #[ignore = "an anchor and three daemons with production Argon2id; CI runs it in release"]
 fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let (_anchor, spec) = anchor(tmp.path());
     let alice = member(tmp.path(), "alice", &spec);
     let bob = member(tmp.path(), "bob", &spec);
@@ -377,16 +424,17 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
         &["room", "create", "--name", "team"],
         Some(&format!("{ROOM_PASS}\n")),
     );
-    assert!(ok, "room create: {e}");
-    let room = alice
-        .vox(&["room", "list"], None)
-        .1
+    assert!(ok, "CANNOT MEASURE: room create: {e}");
+    let (_, listed, list_err) = alice.vox(&["room", "list"], None);
+    let room = listed
         .split_whitespace()
         .next()
-        .expect("the new room in `vox room list`")
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `vox room list` names no room after a create: {listed}{list_err}")
+        })
         .to_owned();
     let (ok, link, e) = alice.vox(&["room", "invite", &room], None);
-    assert!(ok, "invite: {e}");
+    assert!(ok, "CANNOT MEASURE: invite: {e}");
     join(&bob, link.trim());
     join(&carol, link.trim());
     for a in [&alice, &bob, &carol] {
@@ -425,7 +473,7 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
     signal(bob_pid, "-CONT");
     copied.expect("CANNOT MEASURE: copy bob's store.redb");
     let (ok, _, e) = alice.vox(&["room", "post", &room, "BEFORE-REMOVAL-CONTROL"], None);
-    assert!(ok, "alice posts: {e}");
+    assert!(ok, "PRODUCT: alice could not post: {e}");
     assert!(
         until(
             "bob renders BEFORE-REMOVAL-CONTROL",
@@ -447,13 +495,13 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
         ],
         None,
     );
-    assert!(ok, "alice removes bob: {o}{e}");
+    assert!(ok, "PRODUCT: `vox trust remove` on alice refused: {o}{e}");
     for n in 1..=AFTER {
         let (ok, _, e) = alice.vox(
             &["room", "post", &room, &format!("ONLY-CAROL-READS-THIS {n}")],
             None,
         );
-        assert!(ok, "alice posts: {e}");
+        assert!(ok, "PRODUCT: alice could not post: {e}");
     }
 
     // ---- carol reads every one of them ----
@@ -465,7 +513,7 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
             (1..=AFTER).all(|n| seen.contains(&format!("ONLY-CAROL-READS-THIS {n}")))
         },
     );
-    let carol_seen = carol.vox(&["room", "read", &room], None).1;
+    let (_, carol_seen, carol_err) = carol.vox(&["room", "read", &room], None);
     let carol_count = (1..=AFTER)
         .filter(|n| carol_seen.contains(&format!("ONLY-CAROL-READS-THIS {n}")))
         .count();
@@ -494,7 +542,8 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
     );
     assert!(
         carol_all && carol_count == 3,
-        "carol, still trusted, must read all of alice's messages across the rotation: read {carol_count}/3"
+        "PRODUCT: carol, still trusted, read {carol_count}/3 of alice's messages across the \
+         rotation; her `vox room read` said:\n{carol_seen}{carol_err}"
     );
     assert!(
         control.is_some(),
@@ -503,17 +552,17 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
     );
     assert_eq!(
         bob_count, 0,
-        "bob, removed from alice's ring, still reads {bob_count}/3 of what she posted afterwards: \
-         `vox trust remove` did not change the lock"
+        "PRODUCT: bob, removed from alice's ring, still reads {bob_count}/3 of what she posted \
+         afterwards: `vox trust remove` did not change the lock"
     );
     assert!(
         bob_before,
-        "what bob read before the removal is not recalled"
+        "PRODUCT: what bob read before the removal is no longer rendered to him: {bob_seen}"
     );
 
     // ---- the attacker arm: bob, on a modified node, reads his own disk ----
     let mut bob = bob;
-    stop(bob.daemon.take().expect("bob's daemon"));
+    stop(bob.daemon.take().expect("APPARATUS: bob's daemon handle"));
     let mut profile = Profile::open(Paths {
         config_dir: bob.data.join("cfg"),
         profile_dir: bob.data.join("default"),
@@ -523,7 +572,9 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
         .unlock(ID_PASS.as_bytes())
         .expect("CANNOT MEASURE: unlock bob's profile with his passphrase");
     let store = profile.store();
-    let channels = store.channels().expect("list bob's rooms");
+    let channels = store
+        .channels()
+        .expect("CANNOT MEASURE: the attacker could not list bob's rooms");
     assert_eq!(
         channels.len(),
         1,
@@ -533,10 +584,14 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
     let channel = channels[0];
     let sek = store
         .get_sek_wrap(&channel)
-        .expect("read the SEK wrap")
+        .expect("CANNOT MEASURE: the attacker could not read the SEK wrap")
         .expect("CANNOT MEASURE: bob's store has no SEK wrap for the room")
         .unwrap_sek(
-            &SignatureIdentityFactor::new(profile.signer().unwrap()),
+            &SignatureIdentityFactor::new(
+                profile
+                    .signer()
+                    .expect("CANNOT MEASURE: bob's unlocked profile has no signer"),
+            ),
             &channel,
             ROOM_PASS.as_bytes(),
         )
@@ -554,11 +609,12 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
     let mut content = Vec::new();
     for (id, seg) in store
         .segments(&channel, SegmentKind::LogDb)
-        .expect("read bob's log")
+        .expect("CANNOT MEASURE: the attacker could not read bob's log")
     {
         let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)
             .expect("CANNOT MEASURE: a log segment does not open under bob's SEK");
-        let entry = Entry::from_wire(&wire).expect("a stored log entry decodes");
+        let entry = Entry::from_wire(&wire)
+            .expect("CANNOT MEASURE: the attacker cannot decode a stored log entry");
         if let Some(msg) = entry
             .payload
             .as_deref()
@@ -613,7 +669,7 @@ fn removing_one_member_rotates_the_key_and_keeps_the_others_whole() {
     assert_eq!(
         opened.len(),
         0,
-        "a removed member on a modified node opens {}/3 of alice's post-removal posts with a key \
+        "PRODUCT: a removed member on a modified node opens {}/3 of alice's post-removal posts with a key \
          he already held ({opened:?}): `vox trust remove` wrote the revocation but did not rotate \
          the key",
         opened.len()

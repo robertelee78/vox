@@ -11,9 +11,10 @@
 //! **separate** `vox` process in the same profile reaches a room through that anchor with
 //! no `--anchor` anywhere on its command line.
 //!
-//! The mutation control is the point of the second half: the same command in a profile with
-//! **no** anchors file cannot reach the host, so what the first half proves is the file
-//! being read, not the two processes happening to find each other some other way.
+//! The negative control is the point of the second half: the same `vox serve` in a profile whose
+//! config directory holds **no** anchors file refuses to mint an address (this machine has no
+//! address a guest could reach and no anchor to relay through), so what the first half proves
+//! is the file being read, not the host finding an anchor some other way.
 
 #![cfg(unix)]
 
@@ -28,9 +29,9 @@ use std::time::{Duration, Instant};
 /// Write the room passphrase `pass` beside the profile at `dir`, for `--passphrase-file`: a
 /// room passphrase is never taken from argv or the environment (V210-72).
 fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
-    std::fs::create_dir_all(dir).unwrap();
+    std::fs::create_dir_all(dir).expect("APPARATUS: create the profile dir");
     let at = dir.join("room-passphrase");
-    std::fs::write(&at, pass).unwrap();
+    std::fs::write(&at, pass).expect("APPARATUS: write the room passphrase file");
     at.to_str().unwrap().to_owned()
 }
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
@@ -59,7 +60,7 @@ impl Proc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn {name}: {e}"));
         let out = child.stdout.take().expect("stdout");
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -96,7 +97,7 @@ impl Proc {
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !left.is_zero(),
-                "{}: timed out waiting for {what}. It said:\n{}",
+                "PRODUCT: {} never said {what} within {LINE_TIMEOUT:?}. It said:\n{}",
                 self.name,
                 self.seen.join("\n")
             );
@@ -111,7 +112,7 @@ impl Proc {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
-                    "{}: exited before saying {what}. It said:\n{}",
+                    "PRODUCT: {} exited before saying {what}. It said:\n{}",
                     self.name,
                     self.seen.join("\n")
                 ),
@@ -139,7 +140,7 @@ fn vox_once(
         .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
         .stdin(Stdio::null())
         .output()
-        .expect("run vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: run vox: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -149,7 +150,7 @@ fn vox_once(
 
 fn after_label(line: &str, label: &str) -> String {
     line.strip_prefix(label)
-        .unwrap_or_else(|| panic!("{line:?} does not start with {label:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT: {line:?} does not start with {label:?}"))
         .trim()
         .to_owned()
 }
@@ -158,7 +159,7 @@ fn after_label(line: &str, label: &str) -> String {
 #[ignore = "production Argon2id + real binaries; CI runs it in release"]
 fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     // **The config directory is machine-wide; only the data directory is per profile**
     // (`Paths::resolve` — `profile_dir` is under the data root, `config_dir` is not). That is
     // what makes decision 7 work: `vox node` writes one anchors file and every profile on the
@@ -169,8 +170,16 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
     let anchor_dir = tmp.path().join("anchor");
     let host_dir = tmp.path().join("host");
     let guest_dir = tmp.path().join("guest");
-    for d in [&shared_cfg, &other_cfg, &anchor_dir, &host_dir, &guest_dir] {
-        std::fs::create_dir_all(d).unwrap();
+    let control_dir = tmp.path().join("control");
+    for d in [
+        &shared_cfg,
+        &other_cfg,
+        &anchor_dir,
+        &host_dir,
+        &guest_dir,
+        &control_dir,
+    ] {
+        std::fs::create_dir_all(d).expect("APPARATUS: create a profile dir");
     }
 
     // `vox node` — and it must WRITE the file, not merely print a spec to paste.
@@ -184,14 +193,16 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
     let anchors_path = wrote
         .split("wrote ")
         .nth(1)
-        .expect("a path on the wrote line")
+        .unwrap_or_else(|| panic!("PRODUCT: `vox node` said it wrote no path: {wrote:?}"))
         .trim()
         .to_owned();
-    let body = std::fs::read_to_string(&anchors_path).expect("read the anchors file");
+    let body = std::fs::read_to_string(&anchors_path).unwrap_or_else(|e| {
+        panic!("PRODUCT: `vox node` said {wrote:?}, but the file cannot be read: {e}")
+    });
     assert!(
         body.lines()
             .any(|l| !l.trim_start().starts_with('#') && l.contains('@') && !l.contains("0.0.0.0")),
-        "the file must hold a dialable spec, not a wildcard bind:\n{body}"
+        "PRODUCT: the anchors file must hold a dialable spec, not a wildcard bind:\n{body}"
     );
 
     // A host in its own profile, on the same machine, with **no `--anchor`**.
@@ -218,7 +229,7 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
     );
     assert!(
         address.contains("?a=") && address.contains("&b="),
-        "the invite must carry the anchor the host learned from the file, so a guest \
+        "PRODUCT: the invite must carry the anchor the host learned from the file, so a guest \
          elsewhere can reach it: {address}"
     );
 
@@ -238,12 +249,66 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
     );
     assert!(
         ok,
-        "a client on the anchor's machine must join with NO --anchor flag.\n\
+        "PRODUCT: a client on the anchor's machine must join with NO --anchor flag.\n\
          stdout:\n{out}\nstderr:\n{err}"
     );
     assert!(
         out.contains("joined"),
-        "connect should say it joined:\n{out}"
+        "PRODUCT: connect should say it joined:\n{out}"
+    );
+
+    // The negative control: the same `vox serve`, in a profile whose config directory holds no
+    // anchors file, has no anchor to relay through and refuses. A host that served here would
+    // mean the first half's anchor did not come from the file.
+    let mut control = Command::new(VOX)
+        .args([
+            "serve",
+            "1",
+            "--at",
+            "127.0.0.1:1",
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .env("VOX_DATA_DIR", &control_dir)
+        .env("VOX_CONFIG_DIR", &other_cfg)
+        .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn the control host: {e}"));
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while control
+        .try_wait()
+        .unwrap_or_else(|e| panic!("APPARATUS: wait for the control host: {e}"))
+        .is_none()
+    {
+        if Instant::now() >= deadline {
+            let _ = control.kill();
+            let out = control
+                .wait_with_output()
+                .unwrap_or_else(|e| panic!("APPARATUS: reap the control host: {e}"));
+            panic!(
+                "PRODUCT: `vox serve` with no anchors file was still serving after 90 s, so the \
+                 first half's anchor need not have come from the file.\nstdout:\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = control
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: reap the control host: {e}"));
+    let (cout, cerr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    eprintln!("[proof] the control host with no anchors file: {cerr}");
+    assert!(
+        !out.status.success() && cerr.contains("no anchor to relay through"),
+        "PRODUCT: `vox serve` with no anchors file did not refuse for want of an anchor \
+         ({}).\nstdout:\n{cout}\nstderr:\n{cerr}",
+        out.status
     );
 
     drop(host);

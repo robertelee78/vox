@@ -115,14 +115,14 @@ impl Agent {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         child
             .stdin
             .take()
-            .unwrap()
+            .expect("APPARATUS: vox's stdin")
             .write_all(stdin.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
+            .expect("APPARATUS: write vox's stdin");
+        let out = child.wait_with_output().expect("APPARATUS: wait for vox");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -142,7 +142,7 @@ impl Agent {
             .env_remove("VOX_ROOM")
             .stdin(Stdio::null())
             .output()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -168,7 +168,7 @@ impl Agent {
             .current_dir(cwd)
             .stdin(Stdio::null())
             .output()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -187,7 +187,7 @@ impl Agent {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .expect("spawn vox")
+                .expect("APPARATUS: spawn vox")
         };
         let said = Arc::new(Mutex::new(String::new()));
         drain(child.stdout.take(), &said);
@@ -211,7 +211,7 @@ fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
         daemon: None,
     };
     let (ok, _, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
-    assert!(ok, "{name}: vox id: {err}");
+    assert!(ok, "CANNOT MEASURE: {name}: vox id: {err}");
     a.daemon = Some(a.spawn(&[
         "daemon",
         "--listen",
@@ -222,8 +222,17 @@ fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
         a.id_pass(),
     ]));
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !a.vox(&["room", "list"]).0 {
-        assert!(Instant::now() < deadline, "{name}'s daemon never answered");
+    loop {
+        let (ok, _, err) = a.vox(&["room", "list"]);
+        if ok {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: {name}'s daemon never answered `vox room list` in 60 s ({err}); \
+             the daemon said: {}",
+            a.daemon.as_ref().map(Running::said).unwrap_or_default()
+        );
         std::thread::sleep(Duration::from_millis(250));
     }
     a
@@ -251,7 +260,7 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "CANNOT MEASURE: the anchor never printed its spec in 60 s; it said: {said}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -259,7 +268,7 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
 
 fn fingerprint(a: &Agent) -> String {
     let (ok, out, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
-    assert!(ok, "vox id: {err}");
+    assert!(ok, "CANNOT MEASURE: vox id: {err}");
     out.trim().to_owned()
 }
 
@@ -274,7 +283,7 @@ fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> S
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}; last saw {last}");
+    panic!("CANNOT MEASURE: timed out waiting for {what}; last saw {last}");
 }
 
 #[test]
@@ -305,41 +314,44 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             "--identity-passphrase-file",
             who.id_pass(),
         ]);
-        assert!(ok, "trust {name}: {err}");
+        assert!(ok, "CANNOT MEASURE: trust {name}: {err}");
     }
     let (ok, _, err) = alice.vox_with(&["room", "create", "--name", "mission"], ROOM_PASS);
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "CANNOT MEASURE: vox room create: {err}");
     let label = alice
         .vox(&["room", "list"])
         .1
         .split_whitespace()
         .next()
-        .expect("a room")
+        .expect("CANNOT MEASURE: alice's new room in `vox room list`")
         .to_owned();
     let (ok, link, err) = alice.vox(&["room", "invite", &label]);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "CANNOT MEASURE: vox room invite: {err}");
     let link = link.trim().to_owned();
     let room = link
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
-        .expect("an invite link naming the room")
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: an invite link naming the room: {link:?}"))
         .to_owned();
     let mut joined = false;
+    let mut last = String::new();
     for _ in 0..6 {
-        if bob
-            .vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS)
-            .0
-        {
+        let (ok, out, err) = bob.vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS);
+        if ok {
             joined = true;
             break;
         }
+        last = format!("stdout={out:?} stderr={err:?}");
         std::thread::sleep(Duration::from_secs(5));
     }
-    assert!(joined, "bob never joined");
+    assert!(
+        joined,
+        "CANNOT MEASURE: bob's join failed 6 times; the last said {last}"
+    );
     // Each reads the other before the transfer: keys have flowed both ways.
     for (who, other, word) in [(&alice, &bob, "warm-bob"), (&bob, &alice, "warm-alice")] {
         let (ok, _, err) = other.vox(&["room", "post", &room, word]);
-        assert!(ok, "post: {err}");
+        assert!(ok, "CANNOT MEASURE: the warm-up post {word:?}: {err}");
         until(
             who,
             "each to read the other",
@@ -350,10 +362,13 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
 
     // ---- (4) nothing offered yet: asking says so ----
     let (ok, _, err) = bob.vox(&["room", "get", &room, "artifact.bin"]);
-    assert!(!ok, "collecting something nobody offered must fail");
+    assert!(
+        !ok,
+        "PRODUCT: collecting something nobody offered must fail; it succeeded: {err:?}"
+    );
     assert!(
         err.contains("no offer in this room matches"),
-        "it must say why: {err:?}"
+        "PRODUCT: it must say why: {err:?}"
     );
 
     // ---- (1) and (2) alice offers; the announcement reaches bob; bob collects ----
@@ -376,18 +391,26 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     ]);
     assert!(
         ok,
-        "bob could not collect the file: stdout={out:?} stderr={err:?}"
+        "PRODUCT: bob could not collect the file: stdout={out:?} stderr={err:?}"
     );
-    assert!(out.contains("verified"), "{out:?}");
-    let got = std::fs::read(&dest).expect("the collected file");
+    assert!(
+        out.contains("verified"),
+        "PRODUCT: `vox room get` did not say it verified the file: {out:?}"
+    );
+    let got = std::fs::read(&dest).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT: `vox room get` said ok but wrote no file at {} ({e}): stdout={out:?}",
+            dest.display()
+        )
+    });
     assert_eq!(
         got.len(),
         payload.len(),
-        "the collected file is a different length"
+        "PRODUCT: the collected file is a different length"
     );
     assert!(
         got == payload,
-        "the collected bytes differ from what was sent"
+        "PRODUCT: the collected bytes differ from what was sent"
     );
 
     // ---- (5) where it lands is the receiver's decision, never the sender's (PRD-001 D4) ----
@@ -412,18 +435,18 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     let (ok, out, err) = bob.vox_at(&["room", "get", &room, "artifact.bin"], &home, &cwd);
     assert!(
         ok,
-        "collecting into ~/Downloads: stdout={out:?} stderr={err:?}"
+        "PRODUCT: collecting into ~/Downloads: stdout={out:?} stderr={err:?}"
     );
     let now = std::fs::read(downloads.join("artifact.bin")).unwrap_or_default();
     assert!(
         now == precious,
-        "a file already in the download directory must be untouched — it holds {} bytes, it held {}",
+        "PRODUCT: a file already in the download directory must be untouched — it holds {} bytes, it held {}",
         now.len(),
         precious.len()
     );
     assert!(
         std::fs::read(downloads.join("artifact (1).bin")).is_ok_and(|b| b == payload),
-        "the collected file must land beside it under the next free name: {out:?}"
+        "PRODUCT: the collected file must land beside it under the next free name: {out:?}"
     );
 
     // (5b) a hostile sender: announcements naming a path outside the download directory,
@@ -442,7 +465,12 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
         .said()
         .split_whitespace()
         .find(|w| w.starts_with(&format!("file-{}-", &sha[..16])))
-        .expect("the offer printed its tag")
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: `vox room send` did not print its tag: {}",
+                _offer.said()
+            )
+        })
         .to_owned();
     for (hostile, lands_as) in [
         ("../../x", "x"),
@@ -456,7 +484,7 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
         })
         .to_string();
         let (ok, _, err) = alice.vox(&["room", "post", &room, &forged]);
-        assert!(ok, "alice announces {hostile:?}: {err}");
+        assert!(ok, "CANNOT MEASURE: alice announces {hostile:?}: {err}");
         until(
             &bob,
             "the hostile announcement to reach bob",
@@ -464,10 +492,13 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             |o| o.contains(hostile),
         );
         let (ok, out, err) = bob.vox_at(&["room", "get", &room, hostile], &home, &cwd);
-        assert!(ok, "collecting {hostile:?}: stdout={out:?} stderr={err:?}");
+        assert!(
+            ok,
+            "PRODUCT: collecting {hostile:?}: stdout={out:?} stderr={err:?}"
+        );
         assert!(
             !escaped.exists() && !escaped_from_downloads.exists() && !absolute.exists(),
-            "a sender-chosen name {hostile:?} must never place a file outside the download \
+            "PRODUCT: a sender-chosen name {hostile:?} must never place a file outside the download \
              directory (escaped via cwd: {}, via the download dir: {}, absolute: {})",
             escaped.exists(),
             escaped_from_downloads.exists(),
@@ -475,13 +506,18 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
         );
         assert!(
             std::fs::read(downloads.join(lands_as)).is_ok_and(|b| b == payload),
-            "{hostile:?} must land in the download directory as {lands_as:?}: {out:?}"
+            "PRODUCT: {hostile:?} must land in the download directory as {lands_as:?}: {out:?}"
         );
     }
     let listed = |dir: &std::path::Path| -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .expect("APPARATUS: list the download directory")
+            .map(|e| {
+                e.expect("APPARATUS: a download directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         names.sort();
         names
@@ -495,7 +531,7 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             "artifact.bin",
             "x"
         ],
-        "exactly the four files, and no leftover `.part`"
+        "PRODUCT: exactly the four files, and no leftover `.part`"
     );
 
     // ---- (3) a real truncation is refused, and the partial file is removed ----
@@ -532,15 +568,15 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     ]);
     assert!(
         !ok,
-        "a short transfer must be refused, not accepted silently: stdout={out:?}"
+        "PRODUCT: a short transfer must be refused, not accepted silently: stdout={out:?}"
     );
     assert!(
         err.contains("does not match what was announced"),
-        "it must say why: {err:?}"
+        "PRODUCT: it must say why: {err:?}"
     );
     assert!(
         !bad.exists(),
-        "the partial file must be removed, not left looking complete"
+        "PRODUCT: the partial file must be removed, not left looking complete: {err:?}"
     );
 
     // (3b) the same short transfer into the download directory, where a file of that name
@@ -550,22 +586,25 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     std::fs::write(downloads.join("flaky.bin"), &theirs).unwrap();
     let before = listed(&downloads);
     let (ok, out, err) = bob.vox_at(&["room", "get", &room, "flaky.bin"], &home, &cwd);
-    assert!(!ok, "a short transfer must be refused: stdout={out:?}");
+    assert!(
+        !ok,
+        "PRODUCT: a short transfer must be refused: stdout={out:?}"
+    );
     assert!(
         err.contains("does not match what was announced"),
-        "it must say why: {err:?}"
+        "PRODUCT: it must say why: {err:?}"
     );
     let now = std::fs::read(downloads.join("flaky.bin")).unwrap_or_default();
     assert!(
         now == theirs,
-        "a failed transfer must not truncate or delete the file already there — it holds {} bytes, it held {}",
+        "PRODUCT: a failed transfer must not truncate or delete the file already there — it holds {} bytes, it held {}",
         now.len(),
         theirs.len()
     );
     assert_eq!(
         listed(&downloads),
         before,
-        "a failed transfer must leave nothing behind — no partial, no `.part`"
+        "PRODUCT: a failed transfer must leave nothing behind — no partial, no `.part`"
     );
 
     // (3c) an explicit --out that already exists is refused before a byte moves.
@@ -581,12 +620,18 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
         &home,
         &cwd,
     );
-    assert!(!ok, "--out onto an existing file must be refused");
-    assert!(err.contains("never overwrites"), "it must say why: {err:?}");
+    assert!(
+        !ok,
+        "PRODUCT: --out onto an existing file must be refused: {err:?}"
+    );
+    assert!(
+        err.contains("never overwrites"),
+        "PRODUCT: it must say why: {err:?}"
+    );
     let now = std::fs::read(downloads.join("flaky.bin")).unwrap_or_default();
     assert!(
         now == theirs,
-        "--out must not touch the file it refused — it holds {} bytes, it held {}",
+        "PRODUCT: --out must not touch the file it refused — it holds {} bytes, it held {}",
         now.len(),
         theirs.len()
     );
