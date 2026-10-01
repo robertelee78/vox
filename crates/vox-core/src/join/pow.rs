@@ -372,8 +372,28 @@ pub fn solve_token_bounded(
     challenge: &ResponderNonce,
     max_nonces: u32,
 ) -> Result<PowToken> {
+    solve_token_until(
+        params,
+        challenge,
+        max_nonces,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+/// [`solve_token_bounded`] that gives up between nonces once `stop` is set (V210-94): a join
+/// ended while it grinds — a lock aborting it — does not leave a thread grinding on for nothing.
+/// The grind holds only the public challenge, so stopping it is about CPU, not secrets.
+pub fn solve_token_until(
+    params: PowParams,
+    challenge: &ResponderNonce,
+    max_nonces: u32,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<PowToken> {
     let seed = challenge.pow_seed();
     for counter in 0u32..max_nonces {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Error::JoinPowInvalid);
+        }
         let equihash_nonce = wagner::nonce_bytes(counter);
         for solution in wagner::solve(params, &seed, &equihash_nonce)? {
             let dh = difficulty_hash(&seed, &equihash_nonce, &solution);

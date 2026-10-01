@@ -9,7 +9,7 @@
 //! |---|---|---|---|
 //! | 0 | joiner → responder | `WANT` — which `(channelID, epoch)` this join is for | — |
 //! | 1 | responder → joiner | `CHALLENGE` — signed [`ResponderNonce`], the `sid`, the responder's composite key and its prekey bundle | — |
-//! | 2 | joiner → responder | `SOLVE` — [`PowToken`] + CPace share | [`join_initiate`] |
+//! | 2 | joiner → responder | `SOLVE` — [`PowToken`] + CPace share | [`join_check_challenge`], [`join_start`] |
 //! | 3 | responder → joiner | `SHARE` — CPace share | [`join_accept`] (PoW verified **before** any CPace work) |
 //! | 4 | joiner → responder | `PROOF` — sealed identity PoP | [`JoinInitiator::complete_cpace`](crate::join::session::JoinInitiator::complete_cpace) |
 //! | 5 | responder → joiner | `PROOF` — sealed identity PoP | [`JoinResponder::complete_cpace`](crate::join::session::JoinResponder::complete_cpace), [`JoinProofPending::verify_peer_sealed`](crate::join::session::JoinProofPending::verify_peer_sealed) |
@@ -67,8 +67,9 @@ use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSig
 use crate::identity::keyagreement::{PrekeyBundlePublic, X25519IdentityKey};
 use crate::join::cpace::{fresh_sid, CPACE_SHARE_LEN};
 use crate::join::pop::JoinPeerIdentity;
+use crate::join::pow::solve_token_until;
 use crate::join::pow::{Difficulty, PowToken, ResponderNonce};
-use crate::join::session::{join_accept, join_initiate, JoinContext};
+use crate::join::session::{join_accept, join_check_challenge, join_start, JoinContext};
 use crate::nat::record::JoinWitness;
 use crate::node::prekeys::{self, OneTimeUse, PrekeyRing};
 use crate::node::store::Store;
@@ -391,6 +392,16 @@ const SOLVE_BUDGET_PER_EXPECTED_SOLVE: std::time::Duration = std::time::Duration
 /// second or two. Unset, empty or unparsable is no floor.
 pub const TEST_SOLVE_AT_LEAST_ENV: &str = "VOX_TEST_SOLVE_AT_LEAST_MS";
 
+/// Tells a joiner's grind to give up when the join that started it is dropped — finished, failed,
+/// or aborted by a lock (V210-94). See the `SOLVE` step of [`run_initiator`].
+struct StopGrind(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopGrind {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// How close to the responder's patience a grind may finish and still count as in time. The
 /// responder started its clock when it sent the challenge, a one-way trip before this side started
 /// its own, so a grind that ended just inside the patience here may have ended just outside it
@@ -514,44 +525,51 @@ pub async fn run_initiator(
     };
     let challenge_sig = CompositeSignature::from_bytes(&challenge_sig)?;
 
-    // 2. SOLVE — `join_initiate` verifies the signature, the binding and the
-    //    difficulty cap before grinding, then solves and starts CPace.
+    // 2. SOLVE — the challenge is checked first: the responder's signature, the binding to this
+    //    channel and epoch, and the cap, before any work.
     //
-    //    **Ground off the runtime's worker.** The solve is Equihash — seconds of CPU — and this is
-    //    an async function, so it ran on one of the daemon's two runtime workers and took it away
-    //    from everything else scheduled there: measured through the real binary, a `vox room list`
-    //    issued during a join waited 0.8–17.5s, tracking the join's own length, although it needs
-    //    nothing but the published view. `block_in_place` moves this worker's other tasks elsewhere
-    //    for the duration. It panics on a current-thread runtime, which grinds inline as before.
-    let grind = || {
-        join_initiate(
-            ctx,
-            passphrase,
-            &sid,
-            &challenge,
-            &responder_pub,
-            &challenge_sig,
-            root,
-            ik,
-        )
-    };
+    //    **Ground on a thread that holds nothing secret** (V210-94). The solve is Equihash —
+    //    seconds of CPU, far more in a debug build — and only the challenge goes into it. It used
+    //    to run under `block_in_place` inside this task, with the room passphrase and the identity
+    //    signer held across it; no abort reaches a thread busy in `block_in_place`, so a lock
+    //    aborting this join waited out the whole grind before it could say it was done, and the
+    //    secrets lived that long. Now this task only *awaits* the grind: an abort drops it — and
+    //    everything it holds — at once, and the dropped `StopGrind` tells the thread to give up at
+    //    its next nonce. The CPace start that needs the passphrase runs after, here, briefly.
+    //    (On a current-thread runtime there is no other thread: it grinds inline, as before.)
+    join_check_challenge(&ctx, &challenge, &responder_pub, &challenge_sig)?;
     let grinding = std::time::Instant::now();
-    let grind = || {
-        let ground = grind()?;
-        let floor = std::env::var(TEST_SOLVE_AT_LEAST_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
-        std::thread::sleep(floor.saturating_sub(grinding.elapsed()));
-        Ok::<_, Error>(ground)
+    let floor = std::env::var(TEST_SOLVE_AT_LEAST_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _stop_on_drop = StopGrind(std::sync::Arc::clone(&stop));
+    let grind = {
+        let (params, challenge, stop) = (
+            ctx.pow_params,
+            challenge.clone(),
+            std::sync::Arc::clone(&stop),
+        );
+        move || {
+            let token = solve_token_until(params, &challenge, 1 << 24, &stop)?;
+            // The test-only floor on a joiner's grind (V210-87), stopped like the grind.
+            while grinding.elapsed() < floor && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(50).min(floor));
+            }
+            Ok::<_, Error>(token)
+        }
     };
-    let (initiator, token, share) = if tokio::runtime::Handle::current().runtime_flavor()
+    let token = if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
     {
-        tokio::task::block_in_place(grind)?
+        tokio::task::spawn_blocking(grind)
+            .await
+            .map_err(|_| Error::JoinPowInvalid)??
     } else {
         grind()?
     };
+    let (initiator, share) = join_start(ctx, passphrase, &sid, root, ik)?;
     let solved_in = grinding.elapsed();
     // **A grind past the responder's patience is this device's, and said so (V210-87).** The
     // responder has stopped waiting by then and its refusal arrived here as a stream that failed,
