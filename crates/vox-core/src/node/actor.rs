@@ -2399,6 +2399,9 @@ pub struct Node {
     /// have had one (V030-08; `ChannelState::own_feed_pending`).
     feed_pending: std::collections::BTreeSet<Digest32>,
     feed_known: std::collections::BTreeSet<Digest32>,
+    /// Rooms this node took off boards (V030-14) — left, or ended — with the signed withdraw, put
+    /// again on every anchor that connects. Nothing of these rooms is published again.
+    withdrawn: BTreeMap<Digest32, Vec<u8>>,
     /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
     departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// Per `(room, member)`: consecutive keys not taken, and the unix second before which the
@@ -2753,6 +2756,7 @@ impl Node {
             feed_pending: std::collections::BTreeSet::new(),
             feed_known: std::collections::BTreeSet::new(),
             departed_seen: BTreeMap::new(),
+            withdrawn: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
             keys_in_flight: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
@@ -3461,6 +3465,11 @@ impl Node {
         conn: &Arc<VoxConnection>,
         cause: PublishCause,
     ) {
+        // Taken off boards (V030-14), or a room left or ended and passed on: published nowhere
+        // again.
+        if self.withdrawn.contains_key(channel_id) || self.quiet.contains(channel_id) {
+            return;
+        }
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
@@ -4134,6 +4143,11 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
+        // Taken off boards (V030-14), or a room left or ended and passed on: published nowhere
+        // again.
+        if self.withdrawn.contains_key(channel_id) || self.quiet.contains(channel_id) {
+            return;
+        }
         // **Not deferred while a session runs.** This used to be owed until the room had no
         // session at all, because a session held the room's lock for its whole run (measured:
         // `publish waited 19.9987s for the ROOM lock`). Since 3f95b57 a session takes the lock
@@ -4160,6 +4174,9 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
+        if self.withdrawn.contains_key(channel_id) || self.quiet.contains(channel_id) {
+            return;
+        }
         // Armed before the round rather than after it: the records are signed below. **Only here**:
         // every full round (this, then every anchor) comes through here, and a round to one anchor
         // must not re-arm it, or an anchor reconnecting more often than every half-lifetime put
@@ -4655,6 +4672,9 @@ impl Node {
                     )
                     .await;
                 }
+                // An anchor that was away when a room was left or ended is told now (V030-14).
+                let withdraws: Vec<Vec<u8>> = self.withdrawn.values().cloned().collect();
+                Self::put_withdraws(&conn, withdraws);
             }
             NetEvent::BetterPath { conn } => {
                 self.adopt_connection(conn);
@@ -5855,6 +5875,8 @@ impl Node {
         // (V030-08: a member that left, forgot the room and joined again).
         channel.set_own_feed_pending(true);
         self.feed_pending.insert(parsed.channel_id);
+        // A room joined again is published again (V030-14): its withdraw is kept no longer.
+        self.withdrawn.remove(&parsed.channel_id);
         self.remember_or_say(&channel);
         self.channels.insert(
             parsed.channel_id,
@@ -9395,7 +9417,72 @@ impl Node {
             },
         );
         self.note_local_append(channel_id);
+        self.withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Member)
+            .await;
         Outcome::Done
+    }
+
+    /// Take a room off boards (V030-14): sign a withdraw — this identity's own records after a
+    /// leave, the whole room after an end — and put it on this node's board and every anchor
+    /// connected now. One that connects later is told when it does (`withdrawn`).
+    async fn withdraw_from_boards(
+        &mut self,
+        channel_id: &Digest32,
+        scope: crate::nat::withdraw::WithdrawScope,
+    ) {
+        let now = self.now();
+        let (Some(net), Some(profile)) = (self.net.as_ref().map(Arc::clone), self.profile.as_ref())
+        else {
+            return;
+        };
+        let Ok(signer) = profile.signer() else { return };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let (epoch, cert) = {
+            let ch = shared.lock().await;
+            let cert = match scope {
+                crate::nat::withdraw::WithdrawScope::Room
+                    if ch.me() != ch.genesis().creator_pubkey().fingerprint() =>
+                {
+                    ch.my_admin_cert().unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            (ch.epoch(), cert)
+        };
+        let Ok(w) =
+            crate::nat::withdraw::BoardWithdraw::build(signer, channel_id, epoch, scope, now, cert)
+        else {
+            return;
+        };
+        let wire = w.to_wire();
+        let _ = net.publish_local(&wire);
+        self.withdrawn.insert(*channel_id, wire.clone());
+        let anchors: Vec<Arc<VoxConnection>> = self
+            .anchor_ids
+            .iter()
+            .filter_map(|id| net.manager().existing(id))
+            .collect();
+        for conn in anchors {
+            Self::put_withdraws(&conn, vec![wire.clone()]);
+        }
+    }
+
+    /// Put `withdraws` on the board at `conn`, off the actor.
+    fn put_withdraws(conn: &Arc<VoxConnection>, withdraws: Vec<Vec<u8>>) {
+        if withdraws.is_empty() {
+            return;
+        }
+        let conn = Arc::clone(conn);
+        tokio::spawn(async move {
+            let Ok(mut client) = crate::nat::service::RendezvousClient::open(&conn).await else {
+                return;
+            };
+            for w in &withdraws {
+                let _ = client.put(w).await;
+            }
+        });
     }
 
     /// End a room for everyone (V030-08): its creator's signed end, passed on like a leave.
@@ -9419,6 +9506,8 @@ impl Node {
                 .insert(*channel_id, (summary_of(&ch), detail_of(&ch)));
         }
         self.note_local_append(channel_id);
+        self.withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
+            .await;
         // `tend_lifecycle` starts the wind-down: the room is ended from here on, on this node.
         let _ = self.tend_lifecycle().await;
         Outcome::Done
@@ -9542,6 +9631,8 @@ impl Node {
         self.feed_known.remove(channel_id);
         self.departed_seen.remove(channel_id);
         self.fresh_details.remove(channel_id);
+        // Kept: an anchor away now is still told when it connects. A join of the room again
+        // (`begin_join_channel`) takes it out.
         self.room_anchors.remove(channel_id);
         self.reachers.remove(channel_id);
         let Some(profile) = self.profile.as_ref() else {
@@ -9628,6 +9719,12 @@ impl Node {
                 .filter(|d| !departed.contains(d))
                 .copied()
                 .collect();
+            let newly: Vec<Digest32> = departed
+                .iter()
+                .filter(|d| !seen.contains(*d))
+                .copied()
+                .collect();
+            let ended_here = ch.ended(now_ms).is_some();
             *seen = departed.iter().copied().collect();
             if let Some(store) = store.as_ref() {
                 for b in back {
@@ -9635,6 +9732,13 @@ impl Node {
                 }
             }
             let over = ch.has_left(&me) || ch.ended(now_ms).is_some();
+            // An idle end has nobody to sign it: the creator's node takes the room off boards
+            // when it sees it run out (V030-14).
+            let idle_ended_here = me == ch.genesis().creator_pubkey().fingerprint()
+                && matches!(
+                    ch.ended(now_ms),
+                    Some(crate::node::channel::RoomEnd::Idle { .. })
+                );
             let members: Vec<Digest32> = ch.members().into_iter().filter(|m| *m != me).collect();
             let gen = ch.generation().load(std::sync::atomic::Ordering::Relaxed);
             drop(ch);
@@ -9642,6 +9746,22 @@ impl Node {
                 if self.ports.contains_key(&(cid, *d)) {
                     self.drop_port(&cid, d);
                 }
+            }
+            // This node's own board no longer offers what the room's log says is gone (V030-14):
+            // a member that left, or the whole room once it ended. A joiner reading it, or an
+            // anchor this node mirrors to, would otherwise be handed them.
+            if let Some(net) = self.net.as_ref() {
+                let now = self.now();
+                for d in &newly {
+                    net.forget_member_on_board(&cid, d, now);
+                }
+                if ended_here {
+                    net.forget_room_on_board(&cid);
+                }
+            }
+            if idle_ended_here && !self.withdrawn.contains_key(&cid) {
+                self.withdraw_from_boards(&cid, crate::nat::withdraw::WithdrawScope::Room)
+                    .await;
             }
             if !over || self.quiet.contains(&cid) {
                 continue;
