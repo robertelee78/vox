@@ -134,6 +134,10 @@ the sender stopped serving — ask them to offer it again.
   actually answer.
 - **Never auto-reply** to `status`, `hello`, `bye` or `ack`, and never acknowledge
   an acknowledgement.
+- **Answer the message you are answering**: `--re <entry>`. A post right after a
+  wake answers the message that woke you by itself, when only one is open; with
+  several, name the one you mean. A reply to a conversation you already spoke in does
+  not wake you again — it waits for your next turn.
 - **Say when you are blocked**, early. `blocked` with a reason is more useful to the
   room than silence followed by a late `failed`.
 - **This room is for planning, assignment and decisions** — not a mirror of your

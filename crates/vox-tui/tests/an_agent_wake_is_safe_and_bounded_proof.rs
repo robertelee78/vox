@@ -39,6 +39,13 @@
 //! 4. **A claim taken and lapsed between two drains is reported** at the next drain.
 //! 5. **Two session names that differ only in unsafe characters are two sessions**:
 //!    `agent.1` and `agent1` each drain a message posted after both last drained.
+//! 7. **Two sessions answering each other urgently without `--re` stop waking each other**
+//!    (V210-121). Two fresh sessions of bob's, `ping-a` and `ping-b`, answer every wake with an
+//!    urgent post to the other and no `--re`, for up to 12 rounds. The first answer carries
+//!    `re` = the message that woke it; the wakes stop within the hop budget (8); and `ping-b`,
+//!    which opened the conversation, is not woken by the answer to it, so there is exactly one
+//!    wake, and it drains that answer on its next turn. And a raw urgent envelope with no `re`, from a session with an unanswered wake, is
+//!    refused with words that say to use `--re`.
 //! 6. **Live** — a real OpenCode session, registered with bob's daemon by Vox's own plugin's
 //!    drain (the plugin `vox agent plugin opencode` prints, installed in the project), receives
 //!    the urgent message as a prompt through that plugin, and what its model was shown (read
@@ -49,7 +56,9 @@
 //!
 //! **Mutation.** Restore the defects in the product — the wake sends the bare body, the claim
 //! verb records nothing, `judge` ignores `hops` and a reply keeps the default, ended sessions
-//! are never forgotten, and `sanitize` only drops characters — and each numbered case goes red
+//! are never forgotten, `sanitize` only drops characters, a woken session's post does not
+//! inherit `re`, the daemon wakes a session already in the chain, a raw urgent envelope with
+//! no `re` is posted — and each numbered case goes red
 //! at its own assertion: every case runs and is reported before the test fails, so one mutant
 //! shows every red.
 
@@ -67,6 +76,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use support::{until, Out, Worker, VOX};
+
+/// The hop budget a message starts with (ADR-020 §9): `vox_agentcomms::envelope::DEFAULT_HOPS`.
+fn default_hops() -> usize {
+    vox_agentcomms::envelope::DEFAULT_HOPS as usize
+}
 
 /// A stand-in Claude Code messaging socket: every connection's bytes, as they are written.
 fn listen(path: &Path) -> mpsc::Receiver<String> {
@@ -495,6 +509,148 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         &mut failures,
         !forged_woke,
         "(3) a reply that writes itself a fresh budget must not wake anyone".to_owned(),
+    );
+
+    // ---- (7) two sessions answering each other urgently without --re stop waking each other ----
+    // Two fresh sessions of bob's, so no earlier wake is still open for either: `ping-a`
+    // (addressed `pinga`) and `ping-b` (addressed `pingb`), each at a socket of the test's own.
+    let mut pinged = Vec::new();
+    for (session, name) in [("ping-a", "pinga"), ("ping-b", "pingb")] {
+        let sock = tmp.path().join(format!("{session}.sock"));
+        let rx = listen(&sock);
+        let sock_s = sock.to_string_lossy().into_owned();
+        hook(
+            bob,
+            &[
+                ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
+                ("CLAUDE_CODE_MESSAGING_TOKEN", "ping-token"),
+                ("VOX_AGENT_NAME", name),
+            ],
+            &["agent", "hook", "--room", r],
+            Some(&format!(
+                r#"{{"session_id":"{session}","hook_event_name":"UserPromptSubmit"}}"#
+            )),
+        );
+        assert_eq!(
+            registered(bob, session),
+            Some(("claude".to_owned(), sock_s)),
+            "CANNOT MEASURE: {session} must be registered at the test's own socket"
+        );
+        pinged.push(rx);
+    }
+    // Each session answers every wake as an agent would: an urgent post back to the other,
+    // with no `--re`. ping-b opens; then whoever is woken answers, for up to ROUNDS wakes.
+    const ROUNDS: usize = 12;
+    let sessions = [("ping-a", "pinga"), ("ping-b", "pingb")];
+    let mut entries = vec![post(
+        bob,
+        "ping-b",
+        r,
+        &["--type", "ask", "--to", "pinga", "--urgent"],
+        "PINGPONG-0.",
+    )];
+    let mut target = 0usize; // ping-a is addressed first
+    let mut wakes = 0usize;
+    while wakes < ROUNDS {
+        let marker = format!("PINGPONG-{wakes}.");
+        let got = collect(&pinged[target], Duration::from_secs(20), |g| {
+            g.iter().any(|f| content(f).contains(&marker))
+        });
+        if !got.iter().any(|f| content(f).contains(&marker)) {
+            break;
+        }
+        wakes += 1;
+        let (session, _) = sessions[target];
+        let other = 1 - target;
+        entries.push(post(
+            bob,
+            session,
+            r,
+            &["--type", "answer", "--to", sessions[other].1, "--urgent"],
+            &format!("PINGPONG-{wakes}."),
+        ));
+        target = other;
+    }
+    let first_re =
+        envelope_with(bob, r, "PINGPONG-1.").and_then(|e| e["re"].as_str().map(str::to_owned));
+    println!(
+        "[proof] (7) urgent posts without --re between two sessions: {wakes} wake(s) of {ROUNDS} \
+         allowed rounds; the first answer's re {first_re:?}, the opening entry {}",
+        entries[0]
+    );
+    check(
+        &mut failures,
+        first_re.as_deref() == Some(entries[0].as_str()),
+        format!(
+            "(7) PRODUCT: a woken session's post with no --re must answer the message that woke \
+             it: the first answer's re is {first_re:?}, the opening entry {}",
+            entries[0]
+        ),
+    );
+    check(
+        &mut failures,
+        wakes <= default_hops(),
+        format!(
+            "(7) PRODUCT: two sessions answering each other urgently without --re must stop \
+             waking each other within the hop budget ({}): {wakes} wakes in {ROUNDS} rounds; \
+             bob's daemon:\n{}",
+            default_hops(),
+            daemon_err()
+        ),
+    );
+    check(
+        &mut failures,
+        wakes == 1,
+        format!(
+            "(7) PRODUCT: ping-b, which opened the conversation, must not be woken by the answer \
+             to it ({wakes} wakes, 1 expected: ping-a for the opening only); bob's daemon:\n{}",
+            daemon_err()
+        ),
+    );
+    // The answer that did not wake ping-b still reaches it, on its next turn.
+    let drained = drain(bob, r, "ping-b");
+    let queued = drained.contains("PINGPONG-1.");
+    println!("[proof] (7) ping-b, not woken, drains the answer on its next turn: {queued}");
+    check(
+        &mut failures,
+        queued,
+        format!(
+            "(7) PRODUCT: a session the daemon did not wake must still drain the message: \
+             {drained:?}"
+        ),
+    );
+    // A raw envelope cannot start a chain of its own from a session with an unanswered wake.
+    post(
+        alice,
+        "alice-s",
+        r,
+        &["--type", "ask", "--to", "pinga", "--urgent"],
+        "RAW-WAKE",
+    );
+    let got = collect(&pinged[0], Duration::from_secs(30), |g| {
+        g.iter().any(|f| content(f).contains("RAW-WAKE"))
+    });
+    assert!(
+        got.iter().any(|f| content(f).contains("RAW-WAKE")),
+        "CANNOT MEASURE: ping-a was never woken by alice's RAW-WAKE; bob's daemon:\n{}",
+        daemon_err()
+    );
+    let raw = r#"{"v":1,"type":"answer","to":["pingb"],"urgent":true,"body":"RAW-NO-RE"}"#;
+    let o = bob.vox_in(Some("ping-a"), &["room", "post", r, "-"], Some(raw));
+    let refused = !o.ok && o.stderr.contains("--re");
+    println!(
+        "[proof] (7) a raw urgent envelope with no re from woken ping-a: refused {refused} \
+         (exit ok {}, stderr {:?})",
+        o.ok,
+        o.stderr.trim()
+    );
+    check(
+        &mut failures,
+        refused,
+        format!(
+            "(7) PRODUCT: a raw urgent envelope with no re from a session with an unanswered \
+             wake must be refused, saying to use --re: {o:?}"
+        ),
     );
 
     // ---- (4) a claim taken and lapsed between two drains is reported ----

@@ -325,6 +325,30 @@ pub async fn post_cmd(
                     env.kind, env.kind
                 )));
             }
+            // **A raw envelope cannot start an urgent chain of its own from a woken session**
+            // (V210-121): it is posted exactly as given, so it would not inherit the `re` a
+            // structured post takes, and two agents answering each other that way woke each
+            // other for ever.
+            if env.urgent && env.re.is_none() {
+                if let Some(session) = coord::session(opts.coord.session.as_deref()) {
+                    let (mut client, cid, room_key) = open_room(paths, room).await?;
+                    let snap = coord::snapshot(&mut client, cid).await?;
+                    let open =
+                        crate::wake::open_wakes(paths, &session, &room_key, &snap.rows, &snap.me);
+                    if !open.is_empty() {
+                        return Err(AppError::Usage(format!(
+                            "refusing a raw urgent message with no `re` from session {session}: \
+                             it was woken by {} and has not answered. Reply with `--re <entry>`, \
+                             or post with the structured flags (`--type`, `--to`, `--urgent`), \
+                             which reply to the message that woke it.",
+                            open.iter()
+                                .map(|e| &e[..12.min(e.len())])
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                }
+            }
         }
         return post(paths, room, Some(&body)).await;
     }
@@ -432,16 +456,35 @@ pub async fn post_cmd(
             data.insert("attempt".into(), a);
         }
     }
+    // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
+    // chain of its own with a fresh hop budget, and two agents answering each other urgently
+    // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
+    // with several, the agent must say which.
+    let re = match &opts.re {
+        Some(re) => Some(re.clone()),
+        None => {
+            let open = crate::wake::open_wakes(paths, &session, &room_key, &snap.rows, &snap.me);
+            if let [only] = &open[..] {
+                eprintln!(
+                    "vox: replying to {} (the message that woke this session); pass --re to \
+                     answer another",
+                    &only[..12.min(only.len())]
+                );
+                Some(only.clone())
+            } else {
+                None
+            }
+        }
+    };
     let draft = Draft {
         kind,
         to: opts.to.clone(),
         urgent: opts.urgent,
-        re: opts.re.clone(),
+        re: re.clone(),
         thread: opts.thread.clone(),
         // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's
         // budget less one, so an urgent reply chain ends at zero instead of looping.
-        hops: opts
-            .re
+        hops: re
             .as_ref()
             .map(|re| crate::wake::reply_hops(re, &snap.rows)),
         body: body.trim_end().to_owned(),
