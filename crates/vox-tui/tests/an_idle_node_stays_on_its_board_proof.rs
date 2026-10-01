@@ -129,6 +129,7 @@ struct Publish {
     renewals: u64,
     rounds: u64,
     by_cause: std::collections::BTreeMap<String, u64>,
+    merged: std::collections::BTreeMap<String, u64>,
 }
 
 fn publish(data: &Path) -> Publish {
@@ -144,13 +145,37 @@ fn publish(data: &Path) -> Publish {
     Publish {
         renewals: n("renewals"),
         rounds: n("rounds"),
-        by_cause: p["by_cause"]
-            .as_object()
-            .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.by_cause: {out}"))
-            .iter()
-            .map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0)))
-            .collect(),
+        by_cause: per_cause(p, "by_cause", &out),
+        merged: per_cause(p, "merged", &out),
     }
+}
+
+fn per_cause(
+    p: &serde_json::Value,
+    what: &str,
+    out: &str,
+) -> std::collections::BTreeMap<String, u64> {
+    p[what]
+        .as_object()
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.{what}: {out}"))
+        .iter()
+        .map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0)))
+        .collect()
+}
+
+/// `after - before`, per cause, leaving out the causes that did not move.
+fn moved(
+    before: &std::collections::BTreeMap<String, u64>,
+    after: std::collections::BTreeMap<String, u64>,
+) -> std::collections::BTreeMap<String, u64> {
+    after
+        .into_iter()
+        .map(|(k, n)| {
+            let was = before.get(&k).copied().unwrap_or(0);
+            (k, n.saturating_sub(was))
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect()
 }
 
 /// `address` without the `a=<who>&b=<endpoint>` pair naming `who`: what is left names the anchor.
@@ -315,20 +340,14 @@ fn idle_then_join(churn: bool) {
     let alice_after = publish(&alice_dir);
     let renewed = alice_after.renewals.saturating_sub(alice_before.renewals);
     let rounds = alice_after.rounds.saturating_sub(alice_before.rounds);
-    // What asked for each round while everyone was idle.
-    let causes: std::collections::BTreeMap<String, u64> = alice_after
-        .by_cause
-        .into_iter()
-        .map(|(k, n)| {
-            let was = alice_before.by_cause.get(&k).copied().unwrap_or(0);
-            (k, n.saturating_sub(was))
-        })
-        .filter(|(_, n)| *n > 0)
-        .collect();
+    // What asked for each round while everyone was idle, and the asks that went out in a round
+    // another cause had already queued behind one in flight.
+    let causes = moved(&alice_before.by_cause, alice_after.by_cause);
+    let merged = moved(&alice_before.merged, alice_after.merged);
     let bob_renewed = publish(&bob_dir).renewals.saturating_sub(bob_before);
     println!(
-        "[proof] alice's publish rounds while idle, by cause: {causes:?}; bob renewed \
-         {bob_renewed} time(s)"
+        "[proof] alice's publish rounds while idle, by cause: {causes:?}; asks folded into a \
+         round already queued: {merged:?}; bob renewed {bob_renewed} time(s)"
     );
     assert_eq!(
         causes.values().sum::<u64>(),
@@ -439,10 +458,13 @@ fn idle_then_join(churn: bool) {
     // - an anchor that came back empty (`anchor_returned`): at most one per return of B;
     // - news a board passed on (`board_news`): another member's record that changed, which only
     //   bob's renewals can bring here, to each anchor.
-    // Anything else (a retry, a round queued behind one in flight, governance, a join) is work
-    // the idle room did not ask for.
+    // A round asked for while another to the same board is in flight runs when that one ends and
+    // counts under what asked for it; a second ask while it waits goes out in it, and is counted
+    // as folded in, by its own cause. Anything else (a retry, governance, a join) is work the idle
+    // room did not ask for.
     let anchors_n: u64 = if churn { 2 } else { 1 };
     let count = |cause: &str| causes.get(cause).copied().unwrap_or(0);
+    let folded = |cause: &str| merged.get(cause).copied().unwrap_or(0);
     let unasked: Vec<(&String, &u64)> = causes
         .iter()
         .filter(|(c, _)| !["renewal", "anchor_returned", "board_news"].contains(&c.as_str()))
@@ -453,9 +475,11 @@ fn idle_then_join(churn: bool) {
          {unasked:?} (all: {causes:?})"
     );
     assert!(
-        (renewed..=renewed * anchors_n).contains(&count("renewal")),
-        "alice's renewal rounds {} are not one to {anchors_n} per renewal ({renewed} renewals)",
-        count("renewal")
+        (renewed..=renewed * anchors_n).contains(&(count("renewal") + folded("renewal"))),
+        "alice's renewal rounds {} (and {} renewal asks folded into another round) are not one \
+         to {anchors_n} per renewal ({renewed} renewals)",
+        count("renewal"),
+        folded("renewal")
     );
     assert!(
         count("anchor_returned") <= reconnects,

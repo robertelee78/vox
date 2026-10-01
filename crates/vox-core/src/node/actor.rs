@@ -2186,8 +2186,9 @@ pub struct Node {
     board_authors: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
-    /// Publishes asked for while that `(room, board)` round was in flight: run when it ends.
-    publish_again: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// Publishes asked for while that `(room, board)` round was in flight: run when it ends, and
+    /// counted under the cause that asked first (several asks while one round runs are one round).
+    publish_again: BTreeMap<(Digest32, Digest32), PublishCause>,
     /// How many times in a row each board has refused one of this node's own records as stale,
     /// for [`NetEvent::RepublishTo`]'s cap. Cleared by a round that went on.
     stale_retries: BTreeMap<(Digest32, Digest32), u32>,
@@ -2435,7 +2436,7 @@ impl Node {
             held_pairwise: Vec::new(),
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
-            publish_again: std::collections::BTreeSet::new(),
+            publish_again: BTreeMap::new(),
             stale_retries: BTreeMap::new(),
             republish_pending: std::collections::BTreeSet::new(),
             stale_held: std::collections::BTreeSet::new(),
@@ -3110,7 +3111,14 @@ impl Node {
         // (room, board) at a time; a publish asked for meanwhile runs once the round ends.
         let board_id = conn.peer_id();
         if !self.publishing.insert((*channel_id, board_id)) {
-            self.publish_again.insert((*channel_id, board_id));
+            match self.publish_again.entry((*channel_id, board_id)) {
+                std::collections::btree_map::Entry::Vacant(waiting) => {
+                    waiting.insert(cause);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    crate::node::status::SyncBook::note_publish_merged(&self.sync_book, cause);
+                }
+            }
             return;
         }
         crate::node::status::SyncBook::note_publish_round(&self.sync_book, cause);
@@ -4399,10 +4407,10 @@ impl Node {
                         }
                     }
                 }
-                if self.publish_again.remove(&(channel_id, board)) {
+                if let Some(cause) = self.publish_again.remove(&(channel_id, board)) {
                     let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
                     if let Some(conn) = conn {
-                        self.publish_channel_to_anchor(&channel_id, &conn, PublishCause::Again)
+                        self.publish_channel_to_anchor(&channel_id, &conn, cause)
                             .await;
                     }
                 }
