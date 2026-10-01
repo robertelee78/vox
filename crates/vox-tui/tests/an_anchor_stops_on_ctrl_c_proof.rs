@@ -35,13 +35,17 @@
 //! The scene: one anchor, one `vox serve` host and a trusted guest that has joined (the shared
 //! `World`). Each of `vox up`, `vox forward`, `vox daemon` (holding the room), `vox room tail` and
 //! `vox room send` (through that daemon) on the guest, and `vox serve` on the host, is started,
-//! brought to where it is serving, and sent one signal — each verb once per signal, 24 stops. Each
+//! brought to where it is serving, and sent one signal — each verb once per signal, 24 stops. And
+//! `vox up` and `vox forward` are each stopped once per signal while they wait at their identity
+//! passphrase prompt on a terminal of their own (a pty), 8 stops more, 32 in all. Each
 //! must be gone within [`STOP_BOUND`], not killed by the signal's default action, and, as the
 //! person sees it:
 //! - a **server** (`vox daemon`, `vox serve`) says `stopped by <SIGNAL>` and exits 0: being stopped
 //!   is how a server ends, and a service manager counts a non-zero exit on its stop as a failure;
 //! - a **client** (`vox up`, `vox forward`, `vox room tail`, `vox room send`) says on stderr
 //!   `vox: stopped by <SIGNAL>` and exits 128 + the signal's number, as a shell reports it.
+//! - stopped at its prompt, a client also hands its terminal back with echo on: the prompt's raw
+//!   mode left behind is a shell where nothing typed shows.
 //!
 //! **A red names its side.** A verb that never reached serving, or a `kill` that failed, is
 //! APPARATUS (staging not achieved). Anything after the signal is the product's, quoting what it
@@ -49,7 +53,8 @@
 //!
 //! Mutations, one per claim: `vox serve`'s runner listening for Ctrl-C alone; `with_room`
 //! (`vox up`, `vox forward`) listening for Ctrl-C alone; `vox daemon` ignoring SIGHUP again; a
-//! stopped `vox serve` exiting 128+n as a client does. Each goes red on the stops it gets wrong.
+//! stopped `vox serve` exiting 128+n as a client does; `vox up` and `vox forward` asking for their
+//! passphrases before the stop is taken. Each goes red on the stops it gets wrong.
 
 #![cfg(unix)]
 
@@ -267,6 +272,171 @@ fn stops_cleanly(
     );
 }
 
+/// `verb` (`up` or `forward`) started on a terminal of its own — stdin and stdout on a pty, stderr
+/// on a pipe — with no identity passphrase to hand, so it asks for one; sent `sig` while it waits
+/// at that prompt. As the person sees it, it must stop as any client does (said so, 128 + n), and
+/// hand back a terminal that echoes and edits lines again: the prompt's raw mode left behind is a
+/// shell where nothing typed shows.
+fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str, &str, i32)) {
+    use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
+    use rustix::termios::LocalModes;
+    use std::io::{BufRead as _, Read as _};
+    let who = format!("`vox {verb}` at its passphrase prompt");
+    let pty = staged("a pty of its own", || {
+        let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("openpt");
+        grantpt(&controller).expect("grantpt");
+        unlockpt(&controller).expect("unlockpt");
+        let name = ptsname(&controller, Vec::new()).expect("ptsname");
+        (
+            controller,
+            name.to_str().expect("the pty's name").to_owned(),
+        )
+    });
+    let (controller, pty_name) = pty;
+    let open = || {
+        staged("open the pty", || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pty_name)
+                .expect("open")
+        })
+    };
+    let terminal = open();
+    let mut a = vec![verb.to_owned(), w.room.clone()];
+    if verb == "forward" {
+        a.extend([
+            w.host_fp.clone(),
+            w.service_port.to_string(),
+            "127.0.0.1:0".into(),
+        ]);
+    }
+    a.extend([
+        "--anchor".into(),
+        w.anchor_spec.clone(),
+        "--listen".into(),
+        "127.0.0.1:0".into(),
+    ]);
+    let mut child = staged("start it on the pty", || {
+        std::process::Command::new(world::VOX)
+            .args(&a)
+            .env("VOX_DATA_DIR", &w.guest_dir)
+            .env("VOX_CONFIG_DIR", w.guest_dir.join("cfg"))
+            .env_remove("VOX_IDENTITY_PASSPHRASE")
+            .env_remove("VOX_ROOM_PASSPHRASE")
+            .stdin(std::process::Stdio::from(open()))
+            .stdout(std::process::Stdio::from(open()))
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn")
+    });
+    // What it draws on its terminal, read as it arrives: a process whose output nobody reads
+    // cannot finish exiting on macOS.
+    let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let (mut screen, into) = (std::fs::File::from(controller), shown.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = screen.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                into.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+    }
+    let (tx, stderr) = mpsc::channel();
+    let err = child.stderr.take().expect("APPARATUS: its stderr");
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let screen = || String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
+    let echo = |t: &std::fs::File| {
+        rustix::termios::tcgetattr(t)
+            .map(|m| m.local_modes.contains(LocalModes::ECHO))
+            .unwrap_or_else(|e| panic!("APPARATUS: reading the terminal's modes: {e}"))
+    };
+    // At the prompt once it shows it and has turned echo off, so a passphrase is not shown.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !(screen().contains("identity passphrase") && !echo(&terminal)) {
+        if let Ok(Some(st)) = child.try_wait() {
+            panic!(
+                "APPARATUS: staging not achieved — {who} ended ({st}) before its prompt:\n{}",
+                screen()
+            );
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("APPARATUS: staging not achieved — {who} never waited at a prompt with echo off:\n{}", screen());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pid = child.id();
+    let sent = std::process::Command::new("kill")
+        .args([flag, &pid.to_string()])
+        .status();
+    assert!(
+        sent.as_ref().is_ok_and(std::process::ExitStatus::success),
+        "APPARATUS: `kill {flag} {pid}` could not signal {who}: {sent:?}"
+    );
+    let signalled = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().ok().flatten() {
+            break Some(st);
+        }
+        if signalled.elapsed() > STOP_BOUND {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Everything it said, to the end of its stderr.
+    let mut said = Vec::new();
+    let drained = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = drained.saturating_duration_since(Instant::now());
+        match stderr.recv_timeout(left.max(Duration::from_millis(1))) {
+            Ok(line) => said.push(line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) if left.is_zero() => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    let said = said.join("\n");
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("PRODUCT: {who} did not stop within {STOP_BOUND:?} of {name}. It said:\n{said}");
+    };
+    assert!(
+        status.signal().is_none(),
+        "PRODUCT: {who} died on {name}'s default action ({status:?}) — no clean stop, nothing said."
+    );
+    assert_eq!(
+        status.code(),
+        Some(code),
+        "PRODUCT: {who} stopped by {name} exited {status:?}, not {code}. It said:\n{said}"
+    );
+    assert!(
+        said.lines()
+            .any(|l| l.trim_end() == format!("vox: stopped by {name}")),
+        "PRODUCT: {who} did not say it was stopped by {name}. It said:\n{said}"
+    );
+    assert!(
+        echo(&terminal),
+        "PRODUCT: {who}, stopped by {name}, left its terminal without echo — a shell where nothing \
+         typed shows. It said:\n{said}"
+    );
+    println!(
+        "[proof] {who}: {name} -> said so, exit {code}, echo back on, gone in {:?}",
+        signalled.elapsed()
+    );
+}
+
 /// `vox daemon` on the profile at `dir`, holding the world's room; returns once it says so.
 fn daemon(w: &World, dir: &Path, pass_file: &Path) -> VoxProc {
     let mut d = VoxProc::spawn(
@@ -306,6 +476,14 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
     });
     let guest = w.guest_dir.clone();
     let mut stops = 0;
+
+    // ---- vox up, vox forward at their passphrase prompt, on a terminal --------------------------
+    for verb in ["up", "forward"] {
+        for sig in STOP_SIGNALS {
+            stops_cleanly_at_its_prompt(&w, verb, sig);
+            stops += 1;
+        }
+    }
 
     // ---- vox up, vox forward: the guest, while the host serves ---------------------------------
     for sig in STOP_SIGNALS {
@@ -402,5 +580,5 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
         stops_cleanly(&mut serve, "`vox serve`", SERVE, *sig);
         stops += 1;
     }
-    println!("[proof] {stops} of 24 stops were clean");
+    println!("[proof] {stops} of 32 stops were clean");
 }

@@ -180,34 +180,6 @@ where
             return ExitCode::FAILURE;
         }
     };
-    // **Not `passphrase_or_prompt`.** Removing clap's `env` from the flag — so a flag
-    // could be refused while the variable still worked — left this caller reading the
-    // flag only, and the flag is now always `None`. So `VOX_IDENTITY_PASSPHRASE` stopped
-    // working for every tunnel verb (`service`, `forward`, `up`) and they
-    // answered `Failed(WrongPassphrase)`, which sends a person to check a passphrase that
-    // was never read. One helper reads the flag, the file, the variable and the prompt,
-    // in that order; every caller uses it.
-    let identity = match crate::tunnel_cli::identity_passphrase_for(
-        &paths,
-        room.identity_passphrase.clone(),
-        room.identity_passphrase_file.clone(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let room_pp = match crate::tunnel_cli::room_passphrase_for(
-        room.passphrase.as_ref(),
-        room.passphrase_file.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -219,16 +191,66 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let target = crate::tunnel_cli::RoomTarget {
-        paths,
-        listen: room.profile.listen,
-        anchors,
-        identity_passphrase: identity,
-        room: room.room.clone(),
-        room_passphrase: room_pp,
-    };
-    let outcome = rt.block_on(async move { crate::tunnel_cli::with_room(target, body).await });
-    match outcome {
+    let listen = room.profile.listen;
+    let (outcome, stopped) = rt.block_on(async move {
+        // **The race starts before the first prompt** (V210-108), as `run_new_room_verb_with`'s
+        // does. The prompts ran before the handler was taken, so a SIGTERM or SIGHUP while
+        // `vox up` or `vox forward` waited for a passphrase took the default action: it died
+        // saying nothing, and left the terminal it was reading in raw mode, without echo. They
+        // run on a blocking thread now, inside the race, and the same listener then races the
+        // room's opening and the verb itself, so no signal falls between two listeners.
+        let stop = crate::app::stop_requested("vox");
+        tokio::pin!(stop);
+        let asking = tokio::task::spawn_blocking(move || {
+            // **Not `passphrase_or_prompt`.** Removing clap's `env` from the flag — so a flag
+            // could be refused while the variable still worked — left this caller reading the
+            // flag only, and the flag is now always `None`. So `VOX_IDENTITY_PASSPHRASE` stopped
+            // working for every tunnel verb (`service`, `forward`, `up`) and they answered
+            // `Failed(WrongPassphrase)`, which sends a person to check a passphrase that was never
+            // read. One helper reads the flag, the file, the variable and the prompt, in that
+            // order; every caller uses it.
+            let identity = crate::tunnel_cli::identity_passphrase_for(
+                &paths,
+                room.identity_passphrase.clone(),
+                room.identity_passphrase_file.clone(),
+            )?;
+            let room_pp = crate::tunnel_cli::room_passphrase_for(
+                room.passphrase.as_ref(),
+                room.passphrase_file.as_deref(),
+            )?;
+            Ok::<_, crate::app::AppError>(crate::tunnel_cli::RoomTarget {
+                paths,
+                listen,
+                anchors,
+                identity_passphrase: identity,
+                room: room.room.clone(),
+                room_passphrase: room_pp,
+            })
+        });
+        let target = tokio::select! {
+            asked = asking => match asked {
+                Ok(Ok(target)) => target,
+                Ok(Err(e)) => return (Err(e), false),
+                Err(e) => {
+                    return (
+                        Err(crate::app::AppError::Usage(format!("asking for a passphrase: {e}"))),
+                        false,
+                    )
+                }
+            },
+            signal = &mut stop => return (Err(crate::app::AppError::stopped_by(signal)), true),
+        };
+        (
+            crate::tunnel_cli::with_room(target, stop, body).await,
+            false,
+        )
+    });
+    if stopped {
+        // A prompt stopped part-way leaves the terminal in raw mode: no echo, no line editing, in
+        // the shell it hands back to.
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+    let code = match outcome {
         Ok(()) => ExitCode::SUCCESS,
         // Its own code (a stopped client verb exits 128 + the signal's number, V210-108), and
         // written without panicking: after a hangup stderr can be a terminal that is gone.
@@ -237,7 +259,13 @@ where
             let _ = writeln!(io::stderr(), "vox: {e}");
             e.exit_code()
         }
+    };
+    // Not a wait for the prompt it abandoned: dropping the runtime waits for its blocking
+    // threads, and one is still reading the terminal.
+    if stopped {
+        rt.shutdown_background();
     }
+    code
 }
 
 /// The profile's control socket path, or `None` having said why there is none.

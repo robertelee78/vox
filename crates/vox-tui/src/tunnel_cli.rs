@@ -1136,13 +1136,18 @@ pub struct RoomTarget {
 /// Ctrl-C alone: SIGTERM and SIGHUP — a service manager's stop, a closed tmux pane or ssh session —
 /// took the default action and ended them on the spot, saying nothing. A stop now ends the verb
 /// with [`AppError::stopped_by`], after the node is shut down so its peers are told it went.
-pub async fn with_room<F, Fut>(target: RoomTarget, body: F) -> Result<(), AppError>
+///
+/// `stop` is the caller's [`crate::app::stop_requested`], taken before its passphrase prompts, so
+/// one listener covers the whole run.
+pub async fn with_room<F, Fut>(
+    target: RoomTarget,
+    mut stop: std::pin::Pin<&mut impl std::future::Future<Output = crate::app::StopSignal>>,
+    body: F,
+) -> Result<(), AppError>
 where
     F: FnOnce(NodeHandle, Digest32) -> Fut,
     Fut: std::future::Future<Output = Result<(), AppError>>,
 {
-    let stop = crate::app::stop_requested("vox");
-    tokio::pin!(stop);
     let socket = target.paths.socket_file();
     let opening = open_room(
         target.paths,
