@@ -34,6 +34,8 @@
 
 use core::fmt;
 
+use zeroize::Zeroize;
+
 /// Errors from canonical CBOR encoding/decoding.
 ///
 /// Every decode-side variant represents input a correct, canonical encoder
@@ -100,6 +102,9 @@ const MAJOR_MAP: u8 = 5;
 // Low-level canonical writer
 // ---------------------------------------------------------------------------
 
+/// The longest canonical head: the initial byte and an 8-byte argument.
+const HEAD_MAX: usize = 9;
+
 /// Append the canonical CBOR head for `(major, value)` to `out`, choosing the
 /// shortest legal encoding.
 fn write_head(out: &mut Vec<u8>, major: u8, value: u64) {
@@ -124,26 +129,57 @@ fn write_head(out: &mut Vec<u8>, major: u8, value: u64) {
 /// A streaming canonical-CBOR writer. Callers emit the fields of a struct in the
 /// fixed order their ADR specifies; arrays/maps are opened with an explicit
 /// length, so only definite-length output is possible.
+///
+/// An encoder made with [`Encoder::for_secrets`] **zeroizes the storage it outgrows**: a `Vec`
+/// that grows copies its bytes to a new allocation and frees the old one as it was, so an
+/// encoding of key material left a copy of every prefix of it in freed memory, one per
+/// reallocation (V210-94). What it returns is still the caller's to wipe (`Zeroizing`).
 #[derive(Debug, Default)]
 pub struct Encoder {
     out: Vec<u8>,
+    secret: bool,
 }
 
 impl Encoder {
     /// Create an empty encoder.
     #[must_use]
     pub fn new() -> Self {
-        Self { out: Vec::new() }
+        Self::default()
+    }
+
+    /// Create an empty encoder for bytes that include a secret: see [`Encoder`].
+    #[must_use]
+    pub fn for_secrets() -> Self {
+        Self {
+            out: Vec::new(),
+            secret: true,
+        }
+    }
+
+    /// Make room for `extra` more bytes. For a secret encoder the move to a larger buffer is
+    /// made here, so the old one is wiped before it is freed.
+    fn room(&mut self, extra: usize) {
+        if !self.secret || self.out.capacity() - self.out.len() >= extra {
+            return;
+        }
+        let wanted = self.out.len().saturating_add(extra);
+        let mut grown =
+            Vec::with_capacity(wanted.max(self.out.capacity().saturating_mul(2)).max(64));
+        grown.extend_from_slice(&self.out);
+        self.out.zeroize();
+        self.out = grown;
     }
 
     /// Encode an unsigned integer (major type 0), shortest form.
     pub fn uint(&mut self, n: u64) -> &mut Self {
+        self.room(HEAD_MAX);
         write_head(&mut self.out, MAJOR_UINT, n);
         self
     }
 
     /// Encode a byte string (major type 2).
     pub fn bytes(&mut self, b: &[u8]) -> &mut Self {
+        self.room(HEAD_MAX.saturating_add(b.len()));
         write_head(&mut self.out, MAJOR_BYTES, b.len() as u64);
         self.out.extend_from_slice(b);
         self
@@ -151,6 +187,7 @@ impl Encoder {
 
     /// Encode a text string (major type 3). The input is already valid UTF-8.
     pub fn text(&mut self, s: &str) -> &mut Self {
+        self.room(HEAD_MAX.saturating_add(s.len()));
         write_head(&mut self.out, MAJOR_TEXT, s.len() as u64);
         self.out.extend_from_slice(s.as_bytes());
         self
@@ -159,6 +196,7 @@ impl Encoder {
     /// Emit an array header of `len` items. The caller then emits exactly `len`
     /// items.
     pub fn array(&mut self, len: usize) -> &mut Self {
+        self.room(HEAD_MAX);
         write_head(&mut self.out, MAJOR_ARRAY, len as u64);
         self
     }

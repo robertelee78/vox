@@ -136,7 +136,7 @@ impl OpenRooms {
     }
 
     fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
-        let mut e = Encoder::new();
+        let mut e = Encoder::for_secrets();
         e.array(2).uint(OPEN_ROOMS_VERSION).array(self.rooms.len());
         for (id, keys) in &self.rooms {
             e.array(3)
