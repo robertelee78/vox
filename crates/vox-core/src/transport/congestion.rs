@@ -505,6 +505,12 @@ impl Controller for VoxCubic {
 /// connection's lifetime minimum: quinn's `RttEstimator::min` is lifetime, and on a connection that
 /// first ran over a faster path it reads that path's round trip for as long as the connection lives.
 pub(crate) const BASE_RTT_WINDOW: Duration = Duration::from_secs(10);
+/// A round that acknowledged no more than this carried too little to queue behind itself: four
+/// 8192-byte datagrams. Its minimum round trip is the path's (see [`PathSignals::min_rtt`]), as long
+/// as it acknowledged at least two packets: a peer acknowledges every second packet at once, but a
+/// lone packet only when its delayed-acknowledgement timer fires (up to 25 ms), and these samples are
+/// `now - sent`, with that delay in them.
+pub(crate) const SMALL_ROUND_BYTES: u64 = 32 << 10;
 /// A queue is building when a round's minimum round trip exceeds the base by this much…
 ///
 /// Measured on R41's lossy arm, where no loss is congestion: at each loss, the last round's minimum
@@ -578,6 +584,8 @@ pub(crate) struct PathSignals {
     rounds: u64,
     recent: std::collections::VecDeque<RoundLoss>,
     loss_baseline: Option<f64>,
+    small_round_min: Option<Duration>,
+    round_packets: u32,
 }
 
 impl Default for PathSignals {
@@ -607,6 +615,8 @@ impl PathSignals {
             rounds: 0,
             recent: std::collections::VecDeque::with_capacity(LOSS_ROUNDS + 1),
             loss_baseline: None,
+            small_round_min: None,
+            round_packets: 0,
         }
     }
 
@@ -642,6 +652,7 @@ impl PathSignals {
         }
         self.round_min = Some(self.round_min.map_or(sample, |m| m.min(sample)));
         self.round_acked += bytes;
+        self.round_packets += 1;
     }
 
     pub(crate) fn on_end_acks(
@@ -684,6 +695,11 @@ impl PathSignals {
             self.best.pop_front();
         }
         self.last_app_limited = app_limited;
+        if self.round_acked <= SMALL_ROUND_BYTES && self.round_packets >= 2 {
+            if let Some(m) = self.round_min {
+                self.small_round_min = Some(m);
+            }
+        }
         self.last_round_min = self.round_min.or(self.last_round_min);
         self.recent.push_back(RoundLoss {
             sent: self.round_sent,
@@ -697,6 +713,7 @@ impl PathSignals {
         self.rounds += 1;
         self.round_min = None;
         self.round_acked = 0;
+        self.round_packets = 0;
         self.round_sent = 0;
         self.round_lost = 0;
         self.round_gentle = 0;
@@ -726,9 +743,24 @@ impl PathSignals {
         congestion
     }
 
-    /// The base round trip: the smallest sample of the last [`BASE_RTT_WINDOW`].
+    /// The base round trip: the smallest sample of the last [`BASE_RTT_WINDOW`], or the minimum of
+    /// the latest small round ([`SMALL_ROUND_BYTES`]), whichever is lower.
+    ///
+    /// **Why not the windowed minimum alone.** A Cubic flow on a deep buffer keeps a standing queue
+    /// for as long as it sends, and never drains it: fix-adr024-bbr's trace showed the windowed
+    /// minimum drift to 100-114 ms on a 10.6 ms link, after which overflow losses read as losses
+    /// without a queue and a clean link climbed to tier 2. A base that reads high turns congestion
+    /// into "random" loss, which is unfair; one that reads low only costs tier 2 its gain. A round
+    /// that carried little data had no queue of its own behind it (slow start's first rounds, and
+    /// the quiet moments between transfers), so its minimum is the path's round trip; it is replaced
+    /// at the next small round, not kept as a minimum, so a path whose round trip grows is followed
+    /// at its next quiet moment.
     pub(crate) fn min_rtt(&self) -> Option<Duration> {
-        self.base.front().map(|&(_, m)| m)
+        let windowed = self.base.front().map(|&(_, m)| m);
+        match (windowed, self.small_round_min) {
+            (Some(w), Some(q)) => Some(w.min(q)),
+            (w, q) => w.or(q),
+        }
     }
 
     /// The last finished round's minimum round trip.
