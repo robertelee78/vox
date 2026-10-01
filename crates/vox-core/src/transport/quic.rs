@@ -211,15 +211,20 @@ pub const STREAM_WINDOW: u32 = 16 << 20;
 /// still gets exactly this.
 pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
 
-/// How many tunnels one connection — one member's, to this node — carries at once, in both
-/// directions together. A tunnel past it is refused at once, saying so (decider, 2026-10-01).
+/// How many tunnels one member and this node carry between them at once, in both directions
+/// together and **across every connection to that member**. A tunnel past it is refused at once,
+/// saying so (decider, 2026-10-01).
 ///
 /// Without it, every tunnel a trusted member opened added a [`STREAM_WINDOW`] to what this node
 /// agreed to buffer for them, with no end: a member could hold 16 MiB of this node's memory per
-/// tunnel whose far end had stopped reading. With it, the most a member's connection can hold is
-/// [`CONNECTION_WINDOW`] plus this many stream windows (288 MiB), and every tunnel it carries is
-/// still credited a window of its own, so the room's sync never waits on them. Generous by design:
-/// past any real use, it is a bound on memory, not a quota.
+/// tunnel whose far end had stopped reading. With it, a member's tunnels hold at most this many
+/// stream windows (256 MiB), each credited on the connection it runs on, so the room's sync never
+/// waits on them. Generous by design: past any real use, it is a bound on memory, not a quota.
+///
+/// Per member, not per connection: a member has two connections at once whenever a better path
+/// replaces a relayed one (the old one stays open while its tunnels run), and a count per
+/// connection let that member open 16 more on the new one, and told a person to close a tunnel
+/// that freed nothing on the count that refused them (#272 c5).
 pub const TUNNELS_PER_PEER: u32 = 16;
 
 /// quinn's own path-MTU ceiling (`MtuDiscoveryConfig::default().upper_bound`): 1500-byte Ethernet
@@ -837,10 +842,11 @@ impl TunnelCredit {
 
 impl Drop for TunnelCredit {
     fn drop(&mut self) {
+        // One lock at a time, as `carry_tunnel` takes them.
+        lock(&LIVE).remove(&self.id);
         let mut n = lock(&self.tunnels);
         *n = n.saturating_sub(1);
         set_tunnel_window(&self.connection, *n);
-        lock(&LIVE).remove(&self.id);
     }
 }
 
@@ -862,7 +868,6 @@ pub struct LiveTunnel {
 
 /// A live tunnel's entry in [`LIVE`].
 struct Live {
-    serial: u64,
     peer: Digest32,
     service: String,
     outbound: bool,
@@ -903,9 +908,9 @@ pub fn live_tunnels() -> Vec<LiveTunnel> {
 
 /// What a person is told when a tunnel is refused at the cap: how many are open to this member,
 /// to which services, and how to free one (decider, 2026-10-01).
-fn limit_said(serial: u64) -> String {
+fn limit_said(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> String {
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for t in lock(&LIVE).values().filter(|t| t.serial == serial) {
+    for t in live.values().filter(|t| t.peer == *peer) {
         *counts.entry(t.service.clone()).or_default() += 1;
     }
     let services: Vec<String> = counts
@@ -934,8 +939,10 @@ fn set_tunnel_window(connection: &Connection, tunnels: u32) {
 }
 
 /// Whether a connection already carrying `open` tunnels must refuse one more.
-fn at_tunnel_cap(open: u32) -> bool {
-    open >= TUNNELS_PER_PEER
+/// Whether `peer` already has as many live tunnels with this node as it may, on whatever
+/// connections they run.
+fn at_tunnel_cap(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> bool {
+    live.values().filter(|t| t.peer == *peer).count() >= TUNNELS_PER_PEER as usize
 }
 
 /// The next [`VoxConnection::serial`].
@@ -946,33 +953,41 @@ impl VoxConnection {
     /// [`CONNECTION_WINDOW`], for as long as the returned guard is held — so a tunnel whose
     /// local reader has stopped cannot take the credit the room's other streams need.
     ///
-    /// [`Error::TunnelLimit`] when the connection already carries [`TUNNELS_PER_PEER`]: the
-    /// tunnel is to be refused, not carried on credit the room's sync needs.
+    /// [`Error::TunnelLimit`] when the member already has [`TUNNELS_PER_PEER`] tunnels with this
+    /// node, on this connection or any other: the tunnel is to be refused, not carried on memory
+    /// past the member's bound.
     ///
     /// Take it only for a tunnel this node authorized or opened for its own application: the
     /// credit is memory this node agrees to hold for that peer. `service` and `outbound` are what
     /// [`live_tunnels`] lists it as.
     pub fn carry_tunnel(&self, service: &str, outbound: bool) -> Result<TunnelCredit> {
-        let mut n = lock(&self.tunnels);
-        if at_tunnel_cap(*n) {
-            return Err(Error::TunnelLimit(limit_said(self.serial)));
-        }
-        *n += 1;
-        set_tunnel_window(&self.connection, *n);
         let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
         let opened = unix_now();
         let moved = Arc::new(AtomicU64::new(opened));
-        lock(&LIVE).insert(
-            id,
-            Live {
-                serial: self.serial,
-                peer: self.peer_id,
-                service: service.to_owned(),
-                outbound,
-                opened,
-                moved: Arc::clone(&moved),
-            },
-        );
+        {
+            // Counted and taken under one lock, so two tunnels asked for at once cannot both
+            // take the last place.
+            let mut live = lock(&LIVE);
+            if at_tunnel_cap(&live, &self.peer_id) {
+                return Err(Error::TunnelLimit(limit_said(&live, &self.peer_id)));
+            }
+            live.insert(
+                id,
+                Live {
+                    peer: self.peer_id,
+                    service: service.to_owned(),
+                    outbound,
+                    opened,
+                    moved: Arc::clone(&moved),
+                },
+            );
+        }
+        // This connection's own count only sizes its receive window: each tunnel's stream
+        // window is credited where it runs.
+        let mut n = lock(&self.tunnels);
+        *n += 1;
+        set_tunnel_window(&self.connection, *n);
+        drop(n);
         Ok(TunnelCredit {
             tunnels: Arc::clone(&self.tunnels),
             connection: self.connection.clone(),
@@ -981,16 +996,24 @@ impl VoxConnection {
         })
     }
 
-    /// [`Error::TunnelLimit`] if this connection already carries as many tunnels as it may
-    /// ([`TUNNELS_PER_PEER`]), so another would be refused.
+    /// [`Error::TunnelLimit`] if this connection's member already has as many tunnels with this
+    /// node as it may ([`TUNNELS_PER_PEER`]), so another would be refused.
     ///
     /// # Errors
     /// [`Error::TunnelLimit`], saying what it holds and how to free one.
     pub fn room_for_a_tunnel(&self) -> Result<()> {
-        if at_tunnel_cap(*lock(&self.tunnels)) {
-            return Err(Error::TunnelLimit(limit_said(self.serial)));
+        let live = lock(&LIVE);
+        if at_tunnel_cap(&live, &self.peer_id) {
+            return Err(Error::TunnelLimit(limit_said(&live, &self.peer_id)));
         }
         Ok(())
+    }
+
+    /// [`Error::TunnelLimit`] as this node words it, for a refusal the **host** made at the cap
+    /// (`TunnelStatus::Full`): the member's live tunnels here are the same ones it counted.
+    #[must_use]
+    pub fn tunnel_limit(&self) -> Error {
+        Error::TunnelLimit(limit_said(&lock(&LIVE), &self.peer_id))
     }
 
     /// **A name for this connection that no other connection in this process is ever given.**

@@ -95,6 +95,11 @@ pub enum TunnelStatus {
     /// The request is refused — unauthorized *or* no such service (deliberately
     /// indistinguishable, ADR-013 dark services).
     Denied,
+    /// The request was authorized, and refused because the member already has as many tunnels
+    /// with the host as it may ([`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER)).
+    /// Said apart from [`TunnelStatus::Denied`] because it reveals nothing to a member the host
+    /// already lets in, and "not trusted" sent that member after the wrong cause (#272 c5).
+    Full,
 }
 
 impl TunnelStatus {
@@ -102,12 +107,14 @@ impl TunnelStatus {
         match self {
             TunnelStatus::Accepted => 1,
             TunnelStatus::Denied => 0,
+            TunnelStatus::Full => 2,
         }
     }
     fn from_byte(b: u8) -> Result<Self> {
         match b {
             1 => Ok(TunnelStatus::Accepted),
             0 => Ok(TunnelStatus::Denied),
+            2 => Ok(TunnelStatus::Full),
             _ => Err(Error::MalformedTunnel("tunnel status byte")),
         }
     }
@@ -189,12 +196,15 @@ pub async fn request(
     };
     write_frame(send, &req.to_bytes()).await?;
     let status_frame = read_frame(recv).await?;
-    if status_frame.len() != 1
-        || TunnelStatus::from_byte(status_frame[0])? != TunnelStatus::Accepted
-    {
-        return Err(Error::TunnelDenied("dial refused"));
+    match status_frame.as_slice() {
+        [b] => match TunnelStatus::from_byte(*b)? {
+            TunnelStatus::Accepted => Ok(()),
+            // Worded by the caller, which knows the member's tunnels (`VoxConnection::tunnel_limit`).
+            TunnelStatus::Full => Err(Error::TunnelLimit(String::new())),
+            TunnelStatus::Denied => Err(Error::TunnelDenied("dial refused")),
+        },
+        _ => Err(Error::TunnelDenied("dial refused")),
     }
-    Ok(())
 }
 
 /// What the host knows about one `(channel, service)` pair a dialer named: where the
@@ -345,7 +355,12 @@ where
     let moved = match served(&req.channel_id, &req.service_tag) {
         Ok(moved) => moved,
         Err(e) => {
-            write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
+            let status = if matches!(e, Error::TunnelLimit(_)) {
+                TunnelStatus::Full
+            } else {
+                TunnelStatus::Denied
+            };
+            write_frame(&mut send, &[status.as_byte()]).await?;
             let _ = send.finish();
             return Err(e);
         }

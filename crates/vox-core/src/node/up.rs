@@ -272,7 +272,14 @@ pub async fn open_tunnel<D: HostDialer>(
                 crate::transport::streams::StreamKind::Tunnel,
             )
             .await?;
-            crate::tunnel::session::request(&mut send, &mut recv, channel_id, service_tag).await?;
+            match crate::tunnel::session::request(&mut send, &mut recv, channel_id, service_tag)
+                .await
+            {
+                // The host refused at the cap, in a race this side's own count lost: said as the
+                // cap, with this node's list of the member's tunnels (#272 c5).
+                Err(Error::TunnelLimit(_)) => return Err(conn.tunnel_limit()),
+                other => other?,
+            }
             Ok::<_, Error>((send, recv, conn, credit))
         };
         match attempt.await {

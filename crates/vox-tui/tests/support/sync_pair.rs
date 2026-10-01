@@ -22,7 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vox_core::node::ipc::{Frame, IpcClient};
+use vox_core::node::ipc::{Frame, IpcClient, Request};
 
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const ID_PASS: &str = "an identity passphrase";
