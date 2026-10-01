@@ -105,7 +105,8 @@ pub enum PublishCause {
     BoardNews,
     /// This node learned its public addresses, which its records must name.
     Addresses,
-    /// A board asked for this node's records again.
+    /// A board refused one of this node's **own** records as stale, so the node republishes its
+    /// records to that board (`NetEvent::RepublishTo`).
     AskedAgain,
     /// A round that failed, retried.
     Retry,
