@@ -52,7 +52,9 @@
 //! normally killed by its handle's `Drop` — kept running, reparented to init, after the gate
 //! was aborted. Aborted runs on 2026-09-26 left three at a time behind (V210-28), and a leak
 //! like that is how the 21-hour processes above began. So before it aborts, the watchdog
-//! kills every descendant of this process, found by parent pid, deepest first.
+//! kills every descendant of this process, found by parent pid, deepest first — and looks again
+//! until it finds none, because the test's threads go on starting processes while it dumps
+//! (V210-99).
 //!
 //! ## Why it dumps the test's children too, before it kills them
 //! Every real-binary proof spends its time waiting on `vox` child processes, so the test
@@ -63,6 +65,17 @@
 //! killed — a dead process has no stacks to show. The descendants' dumps share one bound,
 //! [`DESCENDANTS_PATIENCE`], so a tree of many processes cannot undo the watchdog's own bound.
 //!
+//! ## Why a debug build's budget is larger, by a measured amount
+//! A debug build's `vox` spends 10–100 times as long in production Argon2id and in the join's
+//! proof of work as a release build does: every unlock (any verb that opens a profile, a daemon
+//! starting, a room created) and every join. A proof that sets up a room of five members spent 548 s
+//! of its 600 s on that alone, and was aborted beside one other proof (V210-99, #295). Those costs
+//! are the product's, never weakened for a test. So a proof that pays them arms with
+//! [`arm_for`], naming how many joins and unlocks its setup makes, and a debug build adds
+//! [`DEBUG_JOIN`] per join and [`DEBUG_UNLOCK`] per unlock to the budget: the most each was
+//! measured to cost a debug build on a machine doing its ordinary concurrent work. A release
+//! build's budget is unchanged.
+//!
 //! The budget is deliberately generous: it is not a performance assertion, it is the line past
 //! which "slow" is no longer a credible explanation. Override with `VOX_TEST_WATCHDOG_SECS`,
 //! and `VOX_TEST_WATCHDOG_SECS=0` disables it — for attaching a debugger, which is the one
@@ -70,11 +83,53 @@
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 /// Past this, a gate is hung rather than slow. The longest gate observed is ~53 s.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(600);
+
+/// The most one join cost a debug build: `vox room join` returning, its proof of work solved by the
+/// joining node, measured on the equivocation proof's staging (an anchor, five daemons, four
+/// joins in turn) on a machine doing its ordinary concurrent work (V210-99): 20 joins over five
+/// runs, on three builds (bb636f78, 4abf8307, f87b50a2), median 76.6 s, least 27.8 s, most
+/// 292.0 s. Nearly all of it is the solve, whose cost varies twelvefold from one join to the next
+/// (21.9–276.9 s), with 5–15 s to seal the room's keys after it.
+#[allow(dead_code)]
+pub const DEBUG_JOIN: Duration = Duration::from_millis(291_980);
+
+/// The most one production-Argon2id unlock cost a debug build — `vox id` on a profile, measured on
+/// the same staging as [`DEBUG_JOIN`] (V210-99): 25 of them, median 7.3 s, most 17.6 s. The other
+/// verbs that unlock cost no more there: a daemon answering after it starts, at most 11.3 s of 25;
+/// a room created, at most 10.3 s of 5; a `trust add`, 11.2 s on average over the slowest 20.
+#[allow(dead_code)]
+pub const DEBUG_UNLOCK: Duration = Duration::from_millis(17_590);
+
+/// What a debug build adds to the budget, in seconds: the largest any test of this binary asked
+/// for through [`arm_for`]. Tests run in parallel threads of one process, so the largest covers
+/// every one of them.
+static DEBUG_EXTRA: AtomicU64 = AtomicU64::new(0);
+
+/// What `joins` joins and `unlocks` unlocks cost this build beyond a release build's: in a
+/// release build nothing, in a debug build their measured most ([`DEBUG_JOIN`],
+/// [`DEBUG_UNLOCK`]). For a driver's own budget that waits on them, as for the watchdog's.
+#[allow(dead_code)]
+pub fn debug_cost(joins: u32, unlocks: u32) -> Duration {
+    if cfg!(debug_assertions) {
+        DEBUG_JOIN * joins + DEBUG_UNLOCK * unlocks
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// [`arm`], for a test whose setup makes `joins` joins and `unlocks` production-Argon2id unlocks:
+/// a debug build's budget grows by their measured cost ([`debug_cost`]).
+#[allow(dead_code)]
+pub fn arm_for(joins: u32, unlocks: u32) {
+    DEBUG_EXTRA.fetch_max(debug_cost(joins, unlocks).as_secs(), Ordering::Relaxed);
+    arm();
+}
 
 /// How long the stack dump may take before the abort goes ahead without it. Symbolicating a
 /// large test binary is the slow part; a dump that itself hangs must not undo the bound.
@@ -84,7 +139,16 @@ const DUMP_PATIENCE: Duration = Duration::from_secs(90);
 /// dumped, and the kill goes ahead.
 const DESCENDANTS_PATIENCE: Duration = Duration::from_secs(180);
 
+/// How long the kill may go on finding new descendants before the abort goes ahead regardless.
+const KILL_PATIENCE: Duration = Duration::from_secs(10);
+
+/// How often the census records this process's descendants while the watchdog waits.
+const CENSUS_EVERY: Duration = Duration::from_secs(2);
+
 static ARMED: Once = Once::new();
+
+/// Every descendant [`census`] has seen: `(pid, start time)`.
+static SEEN: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
 
 /// The tests that armed the watchdog and have not finished, by libtest's thread name — which is
 /// the test's name.
@@ -125,60 +189,179 @@ pub fn arm() {
         }
     });
     ARMED.call_once(|| {
-        let budget = match std::env::var("VOX_TEST_WATCHDOG_SECS") {
+        // An explicit budget is taken as given; the default grows by what a debug build's tests
+        // asked for, read afresh on every look, since a test may arm after the first did.
+        let fixed = match std::env::var("VOX_TEST_WATCHDOG_SECS") {
             Ok(v) => match v.parse::<u64>() {
                 Ok(0) => return,
-                Ok(secs) => Duration::from_secs(secs),
-                Err(_) => DEFAULT_BUDGET,
+                Ok(secs) => Some(Duration::from_secs(secs)),
+                Err(_) => None,
             },
-            Err(_) => DEFAULT_BUDGET,
+            Err(_) => None,
+        };
+        let budget = move || {
+            fixed.unwrap_or_else(|| {
+                DEFAULT_BUDGET + Duration::from_secs(DEBUG_EXTRA.load(Ordering::Relaxed))
+            })
         };
         let started = Instant::now();
         std::thread::Builder::new()
             .name("vox-test-watchdog".to_owned())
             .spawn(move || {
-                std::thread::sleep(budget);
-                fire(started.elapsed(), budget);
+                while started.elapsed() < budget() {
+                    census();
+                    std::thread::sleep(
+                        CENSUS_EVERY.min(budget().saturating_sub(started.elapsed())),
+                    );
+                }
+                fire(started.elapsed(), budget());
             })
             .ok();
     });
 }
 
-/// Every descendant of this process, parents before children. Found with `ps`, which macOS and
-/// Linux both have, so the support code needs no platform crate.
-fn descendants() -> Vec<u32> {
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid="])
-        .output()
+/// One row of the process table.
+struct Row {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    zombie: bool,
+    /// Seconds since it started (`etime`).
+    age: u64,
+    /// When it started (`lstart`): with the pid, one process, never a later one given its pid.
+    started: String,
+}
+
+/// The whole process table, from `ps`, which macOS and Linux both have, so the support code needs
+/// no platform crate — less the `ps` itself, which is this process's child while it runs, and
+/// would otherwise be found, and "killed" after it has exited, on every look.
+fn table() -> Vec<Row> {
+    let Ok(child) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,etime=,lstart="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     else {
         return Vec::new();
     };
-    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&out.stdout)
+    let ps = child.id();
+    let Ok(out) = child.wait_with_output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace();
-            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+            let pid = it.next()?.parse().ok()?;
+            let ppid = it.next()?.parse().ok()?;
+            let pgid = it.next()?.parse().ok()?;
+            let zombie = it.next()?.starts_with('Z');
+            let age = etime_secs(it.next()?)?;
+            let started = it.collect::<Vec<_>>().join(" ");
+            (pid != ps).then_some(Row {
+                pid,
+                ppid,
+                pgid,
+                zombie,
+                age,
+                started,
+            })
         })
-        .collect();
-    // Breadth first from this process, so the list runs parents before children.
-    let mut found = vec![std::process::id()];
+        .collect()
+}
+
+/// `[[dd-]hh:]mm:ss` in seconds.
+fn etime_secs(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, etime),
+    };
+    let secs = clock
+        .split(':')
+        .try_fold(0u64, |acc, part| Some(acc * 60 + part.parse::<u64>().ok()?))?;
+    Some(days * 86_400 + secs)
+}
+
+/// Every live process this test process started, parents before children:
+///
+/// - its descendants, found by parent pid;
+/// - every process [`census`] saw as a descendant and that still runs as the same process, though
+///   its parent has since died and it was reparented to init;
+/// - every orphan (reparented to init) in this process's group that started after this process
+///   did — a process started under a `sh` that has exited, or that daemonized, before the
+///   census ever saw it;
+///
+/// and the descendants of each. A zombie is left out: it is already dead, and it stays in the
+/// table until this process — which is about to abort — reaps it, so counting it would make a
+/// kill never look finished.
+fn ours() -> Vec<u32> {
+    let rows: Vec<Row> = table().into_iter().filter(|r| !r.zombie).collect();
+    let me = std::process::id();
+    let Some(mine) = rows.iter().find(|r| r.pid == me) else {
+        return Vec::new();
+    };
+    // This process's ancestors share its group and may be orphans started before it; never them.
+    let mut ancestors = Vec::new();
+    let mut up = mine.ppid;
+    while let Some(r) = rows
+        .iter()
+        .find(|r| r.pid == up && !ancestors.contains(&r.pid))
+    {
+        ancestors.push(r.pid);
+        up = r.ppid;
+    }
+    let seen = SEEN.lock().map(|s| s.clone()).unwrap_or_default();
+    let mut found = vec![me];
+    for r in &rows {
+        let reparented = r.ppid == 1 && r.pid != me && !ancestors.contains(&r.pid);
+        let recorded = seen.iter().any(|(p, st)| *p == r.pid && *st == r.started);
+        let orphan_of_ours = r.pgid == mine.pgid && r.age <= mine.age;
+        if reparented && (recorded || orphan_of_ours) {
+            found.push(r.pid);
+        }
+    }
+    // Breadth first, so the list runs parents before children.
     let mut i = 0;
     while i < found.len() {
         let parent = found[i];
-        found.extend(
-            pairs
-                .iter()
-                .filter(|(_, pp)| *pp == parent)
-                .map(|(p, _)| *p),
-        );
+        for r in &rows {
+            if r.ppid == parent && !found.contains(&r.pid) {
+                found.push(r.pid);
+            }
+        }
         i += 1;
     }
     found.remove(0);
     found
 }
 
+/// Record every descendant this process has now, by pid and start time, for [`ours`]: a process
+/// whose parent dies is reparented to init and is no longer found by parent pid.
+fn census() {
+    let rows = table();
+    let me = std::process::id();
+    let mut found = vec![me];
+    let mut i = 0;
+    while i < found.len() {
+        let parent = found[i];
+        found.extend(rows.iter().filter(|r| r.ppid == parent).map(|r| r.pid));
+        i += 1;
+    }
+    if let Ok(mut seen) = SEEN.lock() {
+        for r in rows
+            .iter()
+            .filter(|r| r.pid != me && found.contains(&r.pid))
+        {
+            if !seen.iter().any(|(p, st)| *p == r.pid && *st == r.started) {
+                seen.push((r.pid, r.started.clone()));
+            }
+        }
+    }
+}
+
 /// Kill `pids`, deepest first (they come parents first), and say how many.
-fn kill_descendants(pids: &[u32]) -> usize {
+fn kill_all(pids: &[u32]) -> usize {
     let mut killed = 0;
     for pid in pids.iter().rev() {
         let ok = std::process::Command::new("kill")
@@ -221,14 +404,44 @@ fn fire(elapsed: Duration, budget: Duration) -> ! {
     dump_threads(std::process::id());
     // Found once, before any diagnostic runs: `ps` and `sample` are children of this process too,
     // and are waited for, so they are never in the list.
-    let children = descendants();
+    let children = ours();
     dump_descendants(&children);
     say("==================== vox test watchdog: end of thread dump; aborting ====================\n");
-    let killed = kill_descendants(&children);
+    let (killed, left) = kill_every_descendant();
     say(&format!(
-        "vox test watchdog: killed {killed} descendant process(es) before aborting\n"
+        "vox test watchdog: killed {killed} descendant process(es) before aborting; {} remain{}\n",
+        left.len(),
+        if left.is_empty() {
+            String::new()
+        } else {
+            format!(" (still running: {left:?})")
+        }
     ));
     std::process::abort();
+}
+
+/// Kill every process this test process started ([`ours`]) until a fresh look finds none, and
+/// say how many were killed and which, if any, are still there.
+///
+/// The list the dumps used is minutes old by now: the test's own threads are not stopped while
+/// the watchdog dumps, so a proof still in its setup goes on starting `vox` processes. Killing
+/// only that list left each one started since then to be reparented to init by the abort — a
+/// `vox daemon` outlived a watchdog that said it had killed 4 (V210-99). So the kill looks again
+/// after every round, until a look finds nothing, within [`KILL_PATIENCE`]. And a look is not
+/// only down the parent-pid tree: a process whose parent has died is reparented to init and
+/// leaves that tree, so [`ours`] also finds what the census recorded and this group's orphans.
+fn kill_every_descendant() -> (usize, Vec<u32>) {
+    let deadline = Instant::now() + KILL_PATIENCE;
+    let mut killed = 0;
+    loop {
+        let found = ours();
+        if found.is_empty() || Instant::now() >= deadline {
+            return (killed, found);
+        }
+        killed += kill_all(&found);
+        // Let the kernel reap them, so the next look does not count the dying.
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Dump every descendant's threads, each under a header naming its pid and command line, within

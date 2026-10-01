@@ -212,7 +212,9 @@ fn names(list: &[(String, u64)], fp: &str) -> bool {
 #[test]
 #[ignore = "real vox processes, five members and two copied profiles; CI runs it in release"]
 fn an_equivocation_is_caught_said_held_back_and_kept() {
-    watchdog::arm();
+    // Four joins; 36 unlocks: five `vox id`s, twenty `trust add`s, nine daemon starts, the room
+    // created, and carol's TUI.
+    watchdog::arm_for(4, 36);
     let tmp = tempfile::tempdir().unwrap();
     let dir = |n: &str| {
         let d = tmp.path().join(n);
@@ -524,7 +526,8 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     // Carol's real `vox tui`, on her stopped profile, in a pty (`tests/pty/tui_equivocation.py`).
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_equivocation.py");
     let (data, cfg) = (carol_dir.to_str().unwrap(), carol_dir.join("cfg"));
-    let out = pty_driver::run(
+    // The driver waits on the TUI's unlock.
+    let out = pty_driver::run_for(
         script,
         &[
             env!("CARGO_BIN_EXE_vox"),
@@ -533,6 +536,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
             cfg.to_str().unwrap(),
             "eq",
         ],
+        watchdog::debug_cost(0, 1),
     );
     eprintln!(
         "{}\n[proof] the TUI driver took {:?}; its last stage: {:?}",

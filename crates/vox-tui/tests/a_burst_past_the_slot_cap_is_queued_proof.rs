@@ -81,6 +81,12 @@ const STAGE_TRIES: usize = 5;
 /// How long Alice's row for the late-joined room must stay unchanged and idle before the timed post.
 const SETTLE: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
+/// How many of the [`ROOMS`] Bob joins at once. One in a release build, as the staging always ran.
+/// Three in a debug build, where a join's proof of work costs up to `watchdog::DEBUG_JOIN` and forty
+/// in turn were about 55 minutes of setup (V210-99): three, because a node answering fewer than
+/// four joins at once asks no more work of each (`Difficulty::ADAPT_THRESHOLD`), so no join is made
+/// harder by the others.
+const JOINS_AT_ONCE: usize = if cfg!(debug_assertions) { 3 } else { 1 };
 
 /// Print a line that reaches the log **when the test passes too**: straight to stderr, past
 /// libtest's capture, which swallows `println!` of a passing test. CI shows a green run's burst
@@ -115,7 +121,12 @@ fn backoffs(status: &serde_json::Value, peer: &str) -> Vec<String> {
 #[test]
 #[ignore = "two real daemons with production Argon2id and 40 rooms; CI runs it in release"]
 fn a_burst_past_the_slot_cap_is_queued() {
-    watchdog::arm();
+    // Bob's joins, [`JOINS_AT_ONCE`] at a time, and the late joins; unlocks: two `vox id`s, two
+    // `trust add`s, two daemons, and a room created per join.
+    watchdog::arm_for(
+        (ROOMS.div_ceil(JOINS_AT_ONCE) + STAGE_TRIES) as u32,
+        (6 + ROOMS + STAGE_TRIES) as u32,
+    );
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let alice = Member::new(root, "alice");
@@ -128,8 +139,14 @@ fn a_burst_past_the_slot_cap_is_queued() {
     let rooms: Vec<String> = (0..ROOMS)
         .map(|i| alice.create(&format!("burst{i:02}")))
         .collect();
-    for (i, room) in rooms.iter().enumerate() {
-        bob.join(&alice.invite(room), &format!("burst{i:02}"));
+    let links: Vec<String> = rooms.iter().map(|r| alice.invite(r)).collect();
+    for chunk in (0..ROOMS).collect::<Vec<_>>().chunks(JOINS_AT_ONCE) {
+        std::thread::scope(|s| {
+            for &i in chunk {
+                let (bob, link) = (&bob, &links[i]);
+                s.spawn(move || bob.join(link, &format!("burst{i:02}")));
+            }
+        });
     }
     let mut rb = bob.reader();
     let ids: Vec<_> = rooms.iter().map(|r| rb.room(r)).collect();

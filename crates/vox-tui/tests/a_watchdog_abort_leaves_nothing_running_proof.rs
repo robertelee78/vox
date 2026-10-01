@@ -17,6 +17,18 @@
 //! pid's own thread stacks, under a header naming its pid and command line, **before** it says
 //! what it killed. Mutation: kill the descendants before dumping them, and the child's section
 //! holds no stacks — red.
+//!
+//! **V210-99 (#295) — and a process started while the watchdog dumps is killed too.** The test's
+//! threads are not stopped while the watchdog dumps, so a proof still in its setup goes on
+//! starting `vox` processes for minutes. A `vox daemon` outlived an abort whose watchdog said it
+//! had killed 4: the kill used the list taken before the dumps. So the inner test starts one more
+//! `vox node` once the watchdog is dumping its descendants — after that list was taken — and it
+//! must be gone too, with the watchdog saying `0 remain`. And one `vox node` is started under a
+//! `sh` that exits at once, so it is reparented to init (launchd) **before** the abort and is no
+//! longer anyone's descendant — the way a process leaves the parent-pid tree. After the abort,
+//! every listed pid must be gone, and a count of this process group's orphans (`ps`, as `pgrep
+//! -g` would) must be 0. Mutation: the old kill (the parent-pid tree, as listed before the dumps)
+//! — the late node and the reparented one outlive the abort — red.
 
 #![cfg(unix)]
 
@@ -29,6 +41,41 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// Set by the outer test: the directory the inner one works in.
 const INNER: &str = "VOX_WATCHDOG_PROOF_INNER";
+
+/// Every process reparented to init in this process's group — the group the inner test ran in —
+/// except this process's own ancestors: what an aborted inner test left behind, counted as `pgrep
+/// -g` would, not by the pids it wrote down.
+fn group_orphans() -> Vec<u32> {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid=,stat="])
+        .output()
+        .expect("ps");
+    let rows: Vec<(u32, u32, u32, bool)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((
+                it.next()?.parse().ok()?,
+                it.next()?.parse().ok()?,
+                it.next()?.parse().ok()?,
+                it.next()?.starts_with('Z'),
+            ))
+        })
+        .collect();
+    let me = std::process::id();
+    let Some(&(_, mut up, group, _)) = rows.iter().find(|r| r.0 == me) else {
+        return Vec::new();
+    };
+    let mut ancestors = Vec::new();
+    while let Some(r) = rows.iter().find(|r| r.0 == up && !ancestors.contains(&r.0)) {
+        ancestors.push(r.0);
+        up = r.1;
+    }
+    rows.iter()
+        .filter(|r| r.2 == group && r.1 == 1 && !r.3 && r.0 != me && !ancestors.contains(&r.0))
+        .map(|r| r.0)
+        .collect()
+}
 
 fn alive(pid: u32) -> bool {
     Command::new("kill")
@@ -68,6 +115,43 @@ fn inner_a_hung_gate_with_children() {
         .env("VOX_CONFIG_DIR", dir.join("grand-cfg"))
         .spawn()
         .expect("spawn sh");
+    // A setup that goes on: once the watchdog is dumping its descendants, start one more node,
+    // as a proof's setup does while the watchdog's dumps run.
+    let (vox, late_dir) = (VOX, dir.clone());
+    std::thread::spawn(move || {
+        let said = late_dir.join("inner.stderr");
+        while !std::fs::read_to_string(&said)
+            .unwrap_or_default()
+            .contains("vox test watchdog: descendant ")
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let late = Command::new(vox)
+            .args(["node", "--listen", "127.0.0.1:0"])
+            .env("VOX_DATA_DIR", late_dir.join("late"))
+            .env("VOX_CONFIG_DIR", late_dir.join("late-cfg"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the late vox node");
+        std::fs::write(late_dir.join("late.pid"), late.id().to_string()).unwrap();
+        // Kept, like the others: only the watchdog may end it.
+        std::mem::forget(late);
+    });
+    // Reparented before the abort: `sh` starts a node in the background and exits at once.
+    let ok = Command::new("sh")
+        .args([
+            "-c",
+            "\"$VOX\" node --listen 127.0.0.1:0 >/dev/null 2>&1 & echo $! > \"$D/orphan.pid\"",
+        ])
+        .env("VOX", VOX)
+        .env("D", &dir)
+        .env("VOX_DATA_DIR", dir.join("orphan"))
+        .env("VOX_CONFIG_DIR", dir.join("orphan-cfg"))
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok, "could not start the reparented node");
     // The stand-in for a hung daemon: let it get past start-up, then stop it where it is.
     std::thread::sleep(Duration::from_secs(1));
     let stopped = Command::new("kill")
@@ -138,10 +222,22 @@ fn a_watchdog_abort_leaves_nothing_running() {
             .parse()
             .unwrap()
     };
+    assert!(
+        dir.join("late.pid").exists(),
+        "CANNOT MEASURE: the inner test never started its late node while the watchdog dumped: {said}"
+    );
     let pids = [
         ("vox node (child)", read("child.pid")),
         ("sh (child)", read("sh.pid")),
         ("vox node (grandchild)", read("grandchild.pid")),
+        (
+            "vox node (started while the watchdog dumped)",
+            read("late.pid"),
+        ),
+        (
+            "vox node (reparented to init before the abort)",
+            read("orphan.pid"),
+        ),
     ];
     // Killing is asynchronous: give the kernel a moment to reap.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -149,7 +245,19 @@ fn a_watchdog_abort_leaves_nothing_running() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let left: Vec<_> = pids.iter().filter(|(_, p)| alive(*p)).collect();
-    eprintln!("[proof] still running after the abort: {left:?}");
+    let orphans = group_orphans();
+    eprintln!(
+        "[proof] {} of {} listed processes still running after the abort: {left:?}; orphans of \
+         this process group: {} {orphans:?}",
+        left.len(),
+        pids.len(),
+        orphans.len()
+    );
+    for p in &orphans {
+        let _ = Command::new("kill")
+            .args(["-KILL", &p.to_string()])
+            .status();
+    }
     // Never leave them behind ourselves, whatever the verdict.
     for (_, p) in &left {
         let _ = Command::new("kill")
@@ -157,12 +265,17 @@ fn a_watchdog_abort_leaves_nothing_running() {
             .status();
     }
     assert!(
-        left.is_empty(),
-        "an aborted gate left processes running: {left:?}\ninner said:\n{said}"
+        left.is_empty() && orphans.is_empty(),
+        "an aborted gate left processes running: {left:?}, and orphans of its group {orphans:?}\n\
+         inner said:\n{said}"
     );
     assert!(
         said.contains("killed") && said.contains("descendant"),
         "the watchdog must say what it killed: {said}"
+    );
+    assert!(
+        said.contains("0 remain"),
+        "the watchdog must say it looked again and found none left: {said}"
     );
 
     // ---- V210-36: the hung child's own stacks are in the dump, before the kill ----

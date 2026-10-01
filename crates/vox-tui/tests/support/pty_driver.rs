@@ -59,7 +59,17 @@ impl Driven {
 }
 
 /// Run `python3 <script> <args…>`, bounded; see the module docs.
+#[allow(dead_code)]
 pub fn run(script: &str, args: &[&str]) -> Driven {
+    run_for(script, args, Duration::ZERO)
+}
+
+/// [`run`], for a driver that waits on work a debug build is slower at: its bound is [`BOUND`]
+/// plus `debug_cost` (the watchdog's `debug_cost` of that work, which is zero in a release build),
+/// and the driver's own waits grow by it too (`VOX_PTY_DEBUG_EXTRA_SECS`, `vox_pty.DEBUG_EXTRA`).
+#[allow(dead_code)]
+pub fn run_for(script: &str, args: &[&str], debug_cost: Duration) -> Driven {
+    let bound = BOUND + debug_cost;
     let t0 = Instant::now();
     let stage_file = std::env::temp_dir().join(format!(
         "vox-pty-stage-{}-{}",
@@ -71,6 +81,7 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
         .arg(script)
         .args(args)
         .env("VOX_PTY_STAGE_FILE", &stage_file)
+        .env("VOX_PTY_DEBUG_EXTRA_SECS", debug_cost.as_secs().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -97,12 +108,12 @@ pub fn run(script: &str, args: &[&str]) -> Driven {
             break Some(status);
         }
         match stopped {
-            None if t0.elapsed() >= BOUND => {
+            None if t0.elapsed() >= bound => {
                 for (pid, start) in descendants(child.id()) {
                     seen.entry(pid).or_insert(start);
                 }
                 eprintln!(
-                    "[pty] the driver still runs after {BOUND:?}: sending it SIGTERM (pid {}; it \
+                    "[pty] the driver still runs after {bound:?}: sending it SIGTERM (pid {}; it \
                      started {:?})",
                     child.id(),
                     seen.keys().collect::<Vec<_>>()
