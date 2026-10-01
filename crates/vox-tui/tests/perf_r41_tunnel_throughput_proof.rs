@@ -715,7 +715,10 @@ fn median(mut v: Vec<f64>) -> f64 {
 #[ignore = "three real vox processes, production Argon2id and ~2 GB through an emulated link; CI runs it in release"]
 fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
-    watchdog::arm();
+    // The raw-TCP links take about 4 minutes; ADR-024's arms add about 10 (each runs a settle and a
+    // judged stretch, 60 s on the congested ones). The watchdog bounds a hung run, so it gets both
+    // and a margin: at 600 s it aborted a run that had measured every arm.
+    watchdog::arm_for(Duration::from_secs(1800));
     let min_ratio = std::env::var("VOX_PERF_MIN_RATIO")
         .ok()
         .and_then(|v| v.parse().ok())
