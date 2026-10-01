@@ -2398,7 +2398,11 @@ impl Node {
             headless,
             anchor_logs,
         } = cfg;
-        let profile = if Profile::exists(&paths) {
+        // A headless node networks as its key file and holds no room, so it never opens the
+        // profile's vault — which a `vox node --serve trusted` profile has, to keep its trust
+        // list. Opening it here held the store the anchor's own logs need, and the anchor
+        // refused to start: "another vox already has this profile open".
+        let profile = if headless.is_none() && Profile::exists(&paths) {
             Some(Profile::open(paths.clone())?)
         } else {
             None
@@ -6637,9 +6641,9 @@ impl Node {
 
     /// The tick's part in sync (ADR-025 D1a, D7): retire attempts whose connection died, and every
     /// [`SYNC_INTERVAL_SECS`](crate::node::syncstream::SYNC_INTERVAL_SECS) raise the periodic
-    /// request on every port, rediscover every room and evaluate every port. Nothing else waits
-    /// for the tick: every event that changes what a port needs evaluates it when it ends (D6a),
-    /// and no proof passes because of the tick (D7).
+    /// request on every port nothing has served lately, rediscover every room and evaluate every
+    /// port. Nothing else waits for the tick: every event that changes what a port needs evaluates
+    /// it when it ends (D6a), and no proof passes because of the tick (D7).
     async fn sync_tick(&mut self) {
         let dead: Vec<((Digest32, Digest32), crate::node::ports::Token)> = self
             .ports
@@ -6661,8 +6665,16 @@ impl Node {
         let now = self.now();
         if now >= self.next_request_at {
             self.next_request_at = now + crate::node::syncstream::SYNC_INTERVAL_SECS;
+            // Every port nothing has served lately: one whose own session ran clean within half
+            // the interval, or is running now, is passed over (V210-97). Half, so an idle port,
+            // served by the previous request, is still raised by every one.
+            let at = std::time::Instant::now();
+            let fresh =
+                std::time::Duration::from_secs(crate::node::syncstream::SYNC_INTERVAL_SECS / 2);
             for port in self.ports.values_mut() {
-                port.raise();
+                if port.periodic_due(at, fresh) {
+                    port.raise();
+                }
             }
             self.discover_rooms
                 .extend(self.channels.keys().chain(self.anchored.keys()).copied());
@@ -7058,6 +7070,9 @@ impl Node {
                 // generation read with this side's `HAVE` — or that plus what it stored from the
                 // peer, when nothing else was stored meanwhile (ADR-025 D2). Monotonic.
                 port.req_done = port.req_done.max(attempt.req_at_start);
+                if attempt.dir == crate::node::ports::Dir::Out {
+                    port.last_clean_out = Some(std::time::Instant::now());
+                }
                 if let Some(g_have) = o.gen_have {
                     let n = u64::try_from(o.applied).unwrap_or(u64::MAX);
                     let credit = if o.gen_end == Some(g_have.saturating_add(n)) {
