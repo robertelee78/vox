@@ -1930,15 +1930,15 @@ impl ChannelState {
     /// like every other per-channel segment, so a restart still knows where the
     /// swarm's board is. Returns how many were new.
     pub fn add_anchors(&mut self, store: &Store, more: &BootstrapSet) -> Result<usize> {
-        let before = self.anchors.len();
-        let before_addrs: usize = self.anchors.nodes().iter().map(|n| n.endpoints.len()).sum();
+        let before = self.anchors.clone();
         // `merge_endpoints`, not `merge`: an anchor that moved is the same identity at a
         // new address, and `merge` keeps the first entry per identity and drops the rest.
         // A room would otherwise go on handing out the address its anchor had when the
         // room was made, in every invite link, for ever.
         self.anchors.merge_endpoints(more)?;
-        let after_addrs: usize = self.anchors.nodes().iter().map(|n| n.endpoints.len()).sum();
-        if self.anchors.len() == before && after_addrs == before_addrs {
+        // Compared whole, not by counting addresses: a move replaces one address with
+        // another, which leaves the count where it was (V210-75).
+        if self.anchors == before {
             return Ok(0);
         }
         let seg = seal_segment(
@@ -1956,7 +1956,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
-        Ok(self.anchors.len().saturating_sub(before))
+        Ok(self.anchors.len().saturating_sub(before.len()))
     }
 
     /// A shared handle to this channel's evaluator, for a task that must keep asking
@@ -2335,11 +2335,13 @@ impl ChannelState {
     /// Record that `target` has been delivered generation `chain_id` of this
     /// identity's sender key, so it stops being [`owed`](ChannelState::owed_rekeys).
     pub fn note_delivered(&mut self, store: &Store, target: Digest32, chain_id: u64) -> Result<()> {
-        let entry = self.delivered.entry(target).or_default();
-        if *entry >= chain_id {
+        // **Generation 0 is recorded too** (V210-95). Defaulting a missing row to 0 and comparing
+        // made a taken generation-0 key look recorded already: it was held in memory and never
+        // written, so after a restart the member was owed the room's first key again.
+        if self.delivered.get(&target).is_some_and(|d| *d >= chain_id) {
             return Ok(());
         }
-        *entry = chain_id;
+        self.delivered.insert(target, chain_id);
         self.persist_delivered(store)
     }
 
@@ -2355,6 +2357,13 @@ impl ChannelState {
         MembershipView::new(&self.evaluator)
             .readers_of(&me)
             .contains(target)
+    }
+
+    /// Everyone this identity consents to reading it here, off the log like
+    /// [`has_consented`](Self::has_consented).
+    #[must_use]
+    pub fn consented(&self) -> BTreeSet<Digest32> {
+        MembershipView::new(&self.evaluator).readers_of(&self.me())
     }
 
     /// The admitted authors in `trusted` this identity has **not yet consented

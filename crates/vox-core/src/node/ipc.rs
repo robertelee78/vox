@@ -236,6 +236,10 @@ const T_INVITE: u64 = 13;
 const T_TRUST: u64 = 14;
 const T_UNTRUST: u64 = 15;
 const T_TRUST_LIST: u64 = 16;
+// **Liveness** (V210-83). Answered by the actor and changes nothing, so a client waiting on a long
+// request can tell a node at work from a suspended or stuck one. Not a protocol bump: a node that
+// does not know it answers with an error, and any answer is proof of life.
+const T_PING: u64 = 17;
 
 /// What a client sends.
 ///
@@ -366,6 +370,8 @@ pub enum Request {
         /// The last fingerprint of the previous page, or `None` for the first.
         after: Option<Digest32>,
     },
+    /// Answered `Ok` by the node's actor, changing nothing: proof it is taking commands.
+    Ping,
 }
 
 impl Request {
@@ -376,6 +382,9 @@ impl Request {
         match self {
             Request::Subscribe => {
                 e.array(1).uint(T_SUBSCRIBE);
+            }
+            Request::Ping => {
+                e.array(1).uint(T_PING);
             }
             Request::Post { channel_id, text } => {
                 e.array(3).uint(T_POST).bytes(channel_id).text(text);
@@ -502,6 +511,11 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Subscribe)
+            }
+            (T_PING, 1) => {
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Ping)
             }
             (T_POST, 3) => {
                 let channel_id = digest(&mut d)?;
@@ -1408,6 +1422,76 @@ impl Drop for IpcServer {
     }
 }
 
+/// How long a client waits for a node to greet it, and for `vox status` to be answered. Both are
+/// served off the actor the moment they are asked, so a node that takes this long is not busy: it
+/// is suspended or stuck, and waiting longer only hides that.
+pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The error for a node that did not answer within [`ANSWER_WITHIN`].
+#[must_use]
+pub fn silent() -> Error {
+    Error::Ipc(IpcHandshake::Silent {
+        secs: ANSWER_WITHIN.as_secs(),
+    })
+}
+
+/// How long a node's actor may take to answer a [`Request::Ping`] before it is called stuck.
+///
+/// The actor reports itself busy past five seconds (`STALL_BUDGET`), and does its long work —
+/// joins, passphrase checks, dials — off itself. Twelve times that is not a busy actor.
+pub const ACTOR_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `exchange` — one request on a connection to the node at `path` — for as long as that
+/// node shows it is still answering.
+///
+/// Every [`ANSWER_WITHIN`] the exchange is still waiting, a second connection asks the node to
+/// greet (within [`ANSWER_WITHIN`]) and its actor to answer a [`Request::Ping`] (within
+/// [`ACTOR_WITHIN`]). A suspended node greets nobody; a stuck actor pings nobody back. Either
+/// fails the exchange with an error that says which, instead of the wait that never ended
+/// (V210-83). A node that is merely slow at this request answers both, and is waited for.
+async fn while_answering<T>(
+    path: &Path,
+    exchange: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::pin!(exchange);
+    loop {
+        tokio::select! {
+            // The answer wins a tie: a request answered as a check fails was answered.
+            biased;
+            out = &mut exchange => return out,
+            alive = async {
+                tokio::time::sleep(ANSWER_WITHIN).await;
+                still_answering(path).await
+            } => alive?,
+        }
+    }
+}
+
+/// Whether the node at `path` greets a new connection and its actor answers a ping, or why not.
+async fn still_answering(path: &Path) -> Result<()> {
+    let mut probe = match IpcClient::open(path).await {
+        Ok(c) => c,
+        Err(Error::Ipc(IpcHandshake::Silent { secs })) => {
+            return Err(Error::Ipc(IpcHandshake::StoppedAnswering { secs }))
+        }
+        Err(e) => return Err(e),
+    };
+    // A bare exchange, not `request`, which would check on the check.
+    let ping = async {
+        write_frame(&mut probe.stream, &Request::Ping.to_bytes()).await?;
+        read_frame(&mut probe.stream).await
+    };
+    match tokio::time::timeout(ACTOR_WITHIN, ping).await {
+        // Any answer, even an error from a node too old to know the ping, is an answer.
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Ok(None)) => Err(Error::MalformedIpc("ipc closed before reply")),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(Error::Ipc(IpcHandshake::Stuck {
+            secs: ACTOR_WITHIN.as_secs(),
+        })),
+    }
+}
+
 /// Bind the control socket at `path` and serve `handle`'s event stream to every
 /// client that connects.
 ///
@@ -1664,10 +1748,18 @@ async fn verify_operator(
         .await
     {
         crate::node::api::Outcome::Done => Ok(()),
-        _ => Err(Frame::Error {
-            reason: "the identity passphrase does not match; the trust keyring is only \
-                     editable by whoever holds it"
-                .to_owned(),
+        crate::node::api::Outcome::Failed(crate::node::api::Fault::WrongPassphrase) => {
+            Err(Frame::Error {
+                reason: "the identity passphrase does not match; the trust keyring is only \
+                         editable by whoever holds it"
+                    .to_owned(),
+            })
+        }
+        // Only a wrong passphrase is one. A node with no identity, or shutting down, or a check
+        // that failed inside, was reported as a mistyped passphrase, and the person retyped a
+        // right one (V210-83).
+        other => Err(Frame::Error {
+            reason: other.to_string(),
         }),
     }
 }
@@ -1721,6 +1813,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     match request {
         // Handled by the caller; the connection becomes a stream.
         Request::Subscribe => Frame::Ok,
+        Request::Ping => match handle.apply(crate::node::api::NodeCommand::Ping).await {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
         // The keyring, gated on the identity passphrase. The check is first and the
         // command is only issued if it passes, so a caller who cannot prove they are the
         // operator changes nothing and learns nothing.
@@ -2092,6 +2190,8 @@ async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
 pub struct IpcClient {
     stream: UnixStream,
     me: Option<Digest32>,
+    /// Where the node listens, so a request that waits can check it is still answering.
+    path: PathBuf,
 }
 
 /// Connect to the control socket at `path` only if it is this user's own (V210-72).
@@ -2178,8 +2278,17 @@ impl IpcClient {
     /// the connection into an event stream, after which no further request can be
     /// sent on it.
     pub async fn open(path: &Path) -> Result<Self> {
-        let mut stream = connect_own(path).await?;
-        let Some(hello) = read_frame(&mut stream).await? else {
+        // **Bounded** (V210-83): a node greets the moment it accepts, off its actor, and one
+        // that does not is suspended or stuck. Every verb that attaches waited for ever on it.
+        // The bound covers `connect_own` too, so the owner and peer checks (#263) stay first.
+        let (stream, hello) = tokio::time::timeout(ANSWER_WITHIN, async {
+            let mut stream = connect_own(path).await?;
+            let hello = read_frame(&mut stream).await?;
+            Ok::<_, Error>((stream, hello))
+        })
+        .await
+        .map_err(|_| silent())??;
+        let Some(hello) = hello else {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         let me = match Frame::from_bytes(&hello)? {
@@ -2192,7 +2301,11 @@ impl IpcClient {
             }
             _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
         };
-        Ok(Self { stream, me })
+        Ok(Self {
+            stream,
+            me,
+            path: path.to_owned(),
+        })
     }
 
     /// Send one request and read its answer.
@@ -2200,12 +2313,23 @@ impl IpcClient {
     /// A [`Frame::Error`] is returned as `Ok(Frame::Error { .. })`, not as an
     /// `Err`: "this room is not open" is an answer, and the connection stays
     /// usable for the next question.
+    ///
+    /// **Bounded by the node's liveness, not by a length of time** (V210-83). Only the greeting
+    /// was bounded, so a node suspended, or whose actor stuck, after it greeted left every request
+    /// waiting for ever. A join or a passphrase check may rightly take minutes, so no fixed wait
+    /// fits every request; instead, while one waits, the node is asked every [`ANSWER_WITHIN`]
+    /// whether it is still greeting and its actor still taking commands ([`ACTOR_WITHIN`]), and
+    /// the request fails, naming which, once it is not.
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
-        write_frame(&mut self.stream, &req.to_bytes()).await?;
-        let Some(body) = read_frame(&mut self.stream).await? else {
-            return Err(Error::MalformedIpc("ipc closed before reply"));
+        let Self { stream, path, .. } = self;
+        let exchange = async {
+            write_frame(stream, &req.to_bytes()).await?;
+            let Some(body) = read_frame(stream).await? else {
+                return Err(Error::MalformedIpc("ipc closed before reply"));
+            };
+            Frame::from_bytes(&body)
         };
-        Frame::from_bytes(&body)
+        while_answering(path, exchange).await
     }
 
     /// Every row after `since`, however many replies that takes — as one

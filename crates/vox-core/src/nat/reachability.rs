@@ -186,7 +186,17 @@ pub async fn local_route_ip() -> Option<IpAddr> {
 /// — a host on `[::1]` published its global IPv6 and LAN IPv4 addresses and not `::1` at all
 /// (#223). So a specific-bound socket advertises its bound address, plus whichever routable
 /// address (and that address's gateway mapping) *is* its bound address.
-pub async fn advertise_endpoints(bound: SocketAddr) -> (EndpointList, Vec<PortMapping>) {
+///
+/// **A lease still held is still advertised** (V210-75). `leased` is what the caller holds and
+/// whose lease has not run out. When the IPv4 request gets no answer this time, the held IPv4
+/// mapping's external address is advertised in its place: the gateway most likely still holds
+/// it, and withdrawing it on one lost reply made the node undialable from outside for as long as
+/// the renewal kept failing. Only what was granted *now* is returned, so the caller can tell a
+/// failed renewal from a successful one.
+pub async fn advertise_endpoints(
+    bound: SocketAddr,
+    leased: &[PortMapping],
+) -> (EndpointList, Vec<PortMapping>) {
     let bound_port = bound.port();
     let ips: Vec<IpAddr> = local_route_ips()
         .await
@@ -219,7 +229,11 @@ pub async fn advertise_endpoints(bound: SocketAddr) -> (EndpointList, Vec<PortMa
         },
     );
 
-    let list = compose_endpoints(bound, v6, v4, mapped.as_ref());
+    let held_v4 = leased
+        .iter()
+        .find(|m| m.method != crate::nat::portmap::Method::PcpV6Pinhole)
+        .filter(|_| v4.is_some());
+    let list = compose_endpoints(bound, v6, v4, mapped.as_ref().or(held_v4));
     (list, pinhole.into_iter().chain(mapped).collect())
 }
 

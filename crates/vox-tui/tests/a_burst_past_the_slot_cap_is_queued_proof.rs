@@ -10,9 +10,14 @@
 //! ## Staging
 //! Alice creates [`ROOMS`] rooms and Bob joins each; they trust each other, and Bob reads a
 //! warm-up post in every room (each timed from Alice's first warm-up post there, printed). Then
-//! Alice posts once in every room at the same instant ([`ROOMS`] concurrent `vox room post`s). Each
-//! post is timed from its own `vox room post` returning to readable on Bob's node, over his control
-//! socket as `vox room read` reads it.
+//! Bob's daemon is **paused** (SIGSTOP) and Alice posts once in every room at the same instant
+//! ([`ROOMS`] concurrent `vox room post`s). Her sessions to him open and cannot finish, so the burst
+//! meets the cap however fast the pair would otherwise drain it: unpaused, a fast runner finished
+//! each session before the next post arrived and never held more than the 4 a peer may (CI ubuntu
+//! run 36627328546: `opened 40, queued 0`). Bob resumes (SIGCONT) once Alice's status shows the cap
+//! met, or after [`PAUSE_MAX`], which is well inside a session's patience. Each post is timed from
+//! the later of its own `vox room post` returning and Bob resuming, to readable on Bob's node, over
+//! his control socket as `vox room read` reads it.
 //!
 //! Then **V210-34, staged deterministically**: one more room, joined last, while Alice posts in it
 //! every [`STAGE_EVERY`]. One of her pushes lands inside Bob's seconds-long seal of the room, which
@@ -23,7 +28,8 @@
 //! more, timed to Bob's read and to her own push opening.
 //!
 //! ## Asserted
-//! 1. Every post of the burst readable by Bob within [`BOUND`];
+//! 1. Every post of the burst readable by Bob within [`BOUND`] of the later of its post and his
+//!    resuming;
 //! 2. the post in the late-joined room readable by Bob, and **carried by Alice's own push** (her
 //!    `opened` rises), both within [`LATE_BOUND`]. Before the fix nothing released Alice's backoff
 //!    when Bob synced with her, so her push waited out the 30 s (CI run 36389831839: the burst's
@@ -63,6 +69,9 @@ const BOUND: Duration = Duration::from_secs(2);
 /// The post in the late-joined room readable by Bob within this, once he has synced with Alice
 /// there: well under the 30 s `Policy` backoff the refused push used to wait out (24 s on CI).
 const LATE_BOUND: Duration = Duration::from_secs(5);
+/// Longest Bob stays paused while the burst is posted: well inside the 5 s an outbound session's
+/// setup may take, so no session fails for the pause.
+const PAUSE_MAX: Duration = Duration::from_secs(3);
 /// How often Alice posts in the late-joined room while Bob's join of it runs.
 const STAGE_EVERY: Duration = Duration::from_millis(50);
 /// How long she keeps posting after Bob's `vox room join` returns.
@@ -72,6 +81,14 @@ const STAGE_TRIES: usize = 5;
 /// How long Alice's row for the late-joined room must stay unchanged and idle before the timed post.
 const SETTLE: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
+
+/// Print a line that reaches the log **when the test passes too**: straight to stderr, past
+/// libtest's capture, which swallows `println!` of a passing test. CI shows a green run's burst
+/// meeting the cap this way, not only a red one's (V210-90).
+fn shown(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
 
 /// Alice's ports to `peer` that are in backoff, as `room-prefix kind/failures (last failure)`.
 fn backoffs(status: &serde_json::Value, peer: &str) -> Vec<String> {
@@ -176,6 +193,9 @@ fn a_burst_past_the_slot_cap_is_queued() {
         held_back.len()
     );
 
+    // Bob paused, so Alice's sessions to him hold their slots until he resumes.
+    bob_d.signal("-STOP");
+    let paused = Instant::now();
     let barrier = std::sync::Barrier::new(ROOMS);
     let done: Vec<Instant> = std::thread::scope(|s| {
         let hs: Vec<_> = rooms
@@ -192,6 +212,20 @@ fn a_burst_past_the_slot_cap_is_queued() {
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    let met = |st: &serde_json::Value| {
+        counter(st, "skipped_at_cap", Some(&bob.fp)) + counter(st, "queued", Some(&bob.fp))
+            > counter(&before, "skipped_at_cap", Some(&bob.fp))
+                + counter(&before, "queued", Some(&bob.fp))
+    };
+    while !met(&alice.status()) && paused.elapsed() < PAUSE_MAX {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    bob_d.signal("-CONT");
+    let resumed = Instant::now();
+    shown(&format!(
+        "[proof] bob paused for {:?} while the burst was posted",
+        resumed - paused
+    ));
     let mut seen: Vec<Option<Instant>> = vec![None; ROOMS];
     let deadline = Instant::now() + Duration::from_secs(45);
     while seen.iter().any(Option::is_none) && Instant::now() < deadline {
@@ -213,7 +247,7 @@ fn a_burst_past_the_slot_cap_is_queued() {
     for i in 0..ROOMS {
         match seen[i] {
             Some(t) => {
-                let l = t.saturating_duration_since(done[i]);
+                let l = t.saturating_duration_since(done[i].max(resumed));
                 lat.push(l);
                 if l > BOUND {
                     late.push(format!("room {i}: {l:?}"));
@@ -223,7 +257,7 @@ fn a_burst_past_the_slot_cap_is_queued() {
         }
     }
     let max = lat.iter().copied().max().unwrap_or_default();
-    println!(
+    shown(&format!(
         "[proof] P2: {ROOMS} rooms posted at once; alice->bob skipped_at_cap {skipped}, queued \
          {queued}, opened {opened}, failed {failed}; crossings p50 {:?} p95 {:?} max {max:?}; {} \
          over {BOUND:?}; last failures {:?}",
@@ -231,7 +265,7 @@ fn a_burst_past_the_slot_cap_is_queued() {
         pct(&mut lat.clone(), 95.0),
         late.len(),
         failures(&after)
-    );
+    ));
     let refused: Vec<usize> = (0..ROOMS)
         .filter(|&i| {
             after["sync"].as_array().is_some_and(|rows| {
