@@ -48,6 +48,15 @@ fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
 }
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
+/// Twice the most one `vox trust add` took a debug build in case (9)'s fill (see the watchdog's
+/// `DEBUG_JOIN` for why twice), eight at a time against one daemon, each checking the passphrase with production Argon2id (#295): 2,200 of them over two
+/// runs, median 18.94 s and 20.54 s, most 56.50 s and 74.33 s, the whole fill 2,980.5 s and
+/// 3,792.7 s. Release: not counted.
+const DEBUG_FILL_ADD: Duration = Duration::from_millis(2 * 74_330);
+/// The joins (three `room join`s and `vox connect`) and the other unlocks (four `vox id`s, `serve`,
+/// two daemons, `trust remove`, `room post`, `connect`, `up` and two `forward`s) the test makes.
+const JOINS: u32 = 4;
+const UNLOCKS: u32 = 13;
 
 /// A long-running `vox`, killed by its own PID however the test ends; stdout and stderr
 /// collected separately.
@@ -220,7 +229,27 @@ fn free_tcp_port() -> u16 {
 #[test]
 #[ignore = "four real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn every_common_failure_names_its_cause() {
-    watchdog::arm();
+    // A debug build's budget: its joins and unlocks at twice their measured most, and the fill's
+    // 138 rounds of eight `trust add`s, each at twice its measured most (#295). A release
+    // build's: 600 s.
+    let rounds = 1_100u32.div_ceil(8);
+    let fill = if cfg!(debug_assertions) {
+        DEBUG_FILL_ADD * rounds
+    } else {
+        Duration::ZERO
+    };
+    let budget = Duration::from_secs(600) + watchdog::debug_cost(JOINS, UNLOCKS) + fill;
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[watchdog] debug build: budget {}s = 600s + {}s for {JOINS} join(s) and {UNLOCKS} \
+             unlock(s) + {rounds} fill round(s) x {:.1}s (twice the most of 2,200 measured adds, \
+             74.33s)",
+            budget.as_secs(),
+            watchdog::debug_cost(JOINS, UNLOCKS).as_secs(),
+            DEBUG_FILL_ADD.as_secs_f64()
+        );
+    }
+    watchdog::arm_for(budget);
     let tmp = tempfile::tempdir().unwrap();
     let dir = |n: &str| {
         let d = tmp.path().join(n);
@@ -235,6 +264,9 @@ fn every_common_failure_names_its_cause() {
         dir("spare"),
     );
     let quick = Duration::from_secs(90);
+    // A join grinds a production proof of work before it is answered, right or wrong: a debug
+    // build's measured join cost on top of `quick` (zero in release, where this bound counts).
+    let join_quick = quick + watchdog::debug_cost(1, 0);
 
     // A real service to offer: an echo server.
     let service = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -302,7 +334,7 @@ fn every_common_failure_names_its_cause() {
         &joiner_dir,
         &["room", "join", &address, "--name", "svc"],
         "not the passphrase\n",
-        quick,
+        join_quick,
     );
     assert!(!ok, "a wrong passphrase must not join");
     assert_says(
@@ -316,7 +348,7 @@ fn every_common_failure_names_its_cause() {
         &joiner_dir,
         &["room", "join", &address, "--name", "svc"],
         &format!("{passphrase}\n"),
-        quick,
+        join_quick,
     );
     assert!(
         ok,
@@ -326,7 +358,7 @@ fn every_common_failure_names_its_cause() {
         &joiner_dir,
         &["room", "join", &address, "--name", "svc-again"],
         &format!("{passphrase}\n"),
-        quick,
+        join_quick,
     );
     assert!(!ok, "joining a room already held must fail");
     assert_says("join, already held", &said, &["already holds that room"]);
@@ -343,40 +375,50 @@ fn every_common_failure_names_its_cause() {
     // passphrase check no longer runs on the node's actor (V210-26); one at a time, it
     // took longer than the test watchdog allows.
     let tried = 1_100usize;
-    let refusals: Vec<String> = std::thread::scope(|scope| {
+    let fill = Instant::now();
+    let (refusals, mut took): (Vec<String>, Vec<Duration>) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..8usize)
             .map(|t| {
                 let joiner_dir = &joiner_dir;
                 scope.spawn(move || {
-                    let mut refused = Vec::new();
+                    let (mut refused, mut took) = (Vec::new(), Vec::new());
                     for n in (t..tried).step_by(8) {
                         let mut id = [0u8; 32];
                         id[..8].copy_from_slice(&(n as u64 + 1).to_be_bytes());
                         id[31] = 0x5A;
                         let fp = vox_core::node::link::b32_encode(&id);
-                        let (ok, said, _) = vox(
+                        let (ok, said, elapsed) = vox(
                             joiner_dir,
                             &["trust", "add", &fp, "--name", &format!("filler-{n}")],
                             "",
                             quick,
                         );
+                        took.push(elapsed);
                         if !ok {
                             refused.push(said);
                         }
                     }
-                    refused
+                    (refused, took)
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect()
+        let (mut refused, mut took) = (Vec::new(), Vec::new());
+        for h in handles {
+            let (r, t) = h.join().unwrap();
+            refused.extend(r);
+            took.extend(t);
+        }
+        (refused, took)
     });
+    took.sort_unstable();
     let trusted = tried - refusals.len();
     eprintln!(
-        "[keyring] {trusted} of {tried} trusted, {} refused",
-        refusals.len()
+        "[keyring] {trusted} of {tried} trusted, {} refused, in {:.1?}; one `trust add`, eight \
+         at a time: median {:.2?}, most {:.2?}",
+        refusals.len(),
+        fill.elapsed(),
+        took[took.len() / 2],
+        took[took.len() - 1]
     );
     assert!(
         trusted >= 1_000,
@@ -438,7 +480,7 @@ fn every_common_failure_names_its_cause() {
             "127.0.0.1:0",
         ],
         "",
-        Duration::from_secs(180),
+        Duration::from_secs(180) + watchdog::debug_cost(1, 0),
     );
     assert!(ok, "CANNOT MEASURE (4, 5, 7): vox connect failed: {said}");
 
