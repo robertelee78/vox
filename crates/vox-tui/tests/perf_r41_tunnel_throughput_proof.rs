@@ -874,7 +874,6 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         !circuit_lines(&anchor).last().is_some_and(|l| carried_line(l)),
         "CANNOT MEASURE a direct path: the anchor still carried a circuit 120 s after the forward came up"
     );
-    let before = circuit_lines(&anchor).len();
 
     // Unshaped first: the raw-efficiency figure. The tunnel still crosses the emulator here, so this
     // is a floor on Vox's efficiency, not a ceiling. (An unpaced blast through the emulator overruns
@@ -977,22 +976,16 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         &mut cannot,
     );
     *link.lock().unwrap() = None;
-    let later: Vec<String> = circuit_lines(&anchor)
-        .into_iter()
-        .skip(before)
-        .filter(|l| carried_line(l))
-        .collect();
     for line in &report {
         shown(&format!("R41: {line}"));
     }
     shown(&format!("uptime at end: {}", uptime()));
-    assert!(
-        later.is_empty(),
-        "CANNOT MEASURE: the tunnel fell back to a relay during the timed transfers: {later:?}\n\
-         host said:\n{}\nforward said:\n{}",
-        host.said().join("\n"),
-        forward.said().join("\n")
-    );
+    // No check of the anchor's circuit count here: every link's transfers (`measure`) and every
+    // ADR-024 arm (`crossed_fault`) assert that the tunnel's own bytes crossed its emulated link,
+    // which a relay fallback would fail. The anchor's count also counts a joiner's raced duplicate
+    // connection that lost the tie-break to the direct one and lingers for its 60 s grace, and it
+    // called that a fallback while the tunnel stayed direct (host: "a new connection ... lost the
+    // tie-break to the one held ... Direct against Relayed; retired, closed in 60s").
     assert!(
         failed.is_empty(),
         "R41 (PRODUCT): the tunnel throttles the link it runs over: {failed:?}\nand CANNOT MEASURE \
