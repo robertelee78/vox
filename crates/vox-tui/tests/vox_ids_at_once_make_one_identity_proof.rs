@@ -42,8 +42,12 @@ const TRIALS: usize = 20;
 const AT_ONCE: usize = 3;
 /// What the loser of the race says.
 const CONCURRENT: &str = "another vox created this profile's identity at the same time";
-/// What a run says that finds the winner still holding the profile.
-const BUSY: &str = "a vox is already running for this profile";
+/// What a run says that finds the winner still holding the profile: one serving it, or one that
+/// has not finished.
+const BUSY: [&str; 2] = [
+    "a vox is already running for this profile",
+    "another vox is still using this profile",
+];
 
 /// A child killed and reaped by its own handle when dropped, never by a name pattern.
 struct Proc(Option<Child>);
@@ -146,7 +150,7 @@ fn vox_ids_started_at_once_make_one_identity_and_report_only_it() {
                 }
             } else if err.contains(CONCURRENT) {
                 concurrent += 1;
-            } else if err.contains(BUSY) {
+            } else if BUSY.iter().any(|b| err.contains(b)) {
                 busy += 1;
             } else {
                 unnamed.push(format!("trial {trial}: {err:?}"));

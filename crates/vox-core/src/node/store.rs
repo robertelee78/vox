@@ -83,6 +83,11 @@ pub const TEST_REPLACE_PAUSE_ENV: &str = "VOX_TEST_REPLACE_PAUSE_MS";
 pub struct Store {
     db: RwLock<Backing>,
     path: PathBuf,
+    /// The profile directory's lock, when this store is a profile's (V210-100). Declared after
+    /// `db` so it is released only after the database is closed: the store goes with its last
+    /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
+    /// store the other was still closing and be refused.
+    _lock: Option<std::fs::File>,
 }
 
 /// How the store's file is open.
@@ -138,6 +143,7 @@ impl Store {
         let store = Self {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
+            _lock: None,
         };
         store.init_schema()?;
         Ok(store)
@@ -159,6 +165,7 @@ impl Store {
         let store = Self {
             db: RwLock::new(Backing::ReadOnly(db)),
             path: path.to_owned(),
+            _lock: None,
         };
         if store.schema_is_current()? {
             Ok(store)
@@ -166,6 +173,14 @@ impl Store {
             drop(store);
             Self::open(path)
         }
+    }
+
+    /// Keep `lock` (the profile directory's) for as long as this store is open, releasing it only
+    /// after the database is closed (V210-100).
+    #[must_use]
+    pub fn keep_lock(mut self, lock: std::fs::File) -> Self {
+        self._lock = Some(lock);
+        self
     }
 
     /// Reopen a read-only store writable; a no-op for one that already is.
