@@ -49,7 +49,8 @@
 //! and per-round figures.
 //!
 //! Mutation knob (test-side only): `VOX_PERF_MIN_RATIO` replaces the target ratio. Diagnostic knob:
-//! `VOX_PERF_ONLY=<text>` runs only the links whose name contains it.
+//! `VOX_PERF_ONLY=<text>` runs only the links and arms whose name contains it, or any of several
+//! texts separated by `|`.
 
 #![cfg(unix)]
 
@@ -875,9 +876,8 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
 
     let mut failed = Vec::new();
     // Diagnostic knob (test-side only): `VOX_PERF_ONLY` runs just the links whose name contains it.
-    let only = std::env::var("VOX_PERF_ONLY").ok();
     for l in LINKS {
-        if only.as_deref().is_some_and(|o| !l.name.contains(o)) {
+        if !perf_only(l.name) {
             continue;
         }
         let windows = calibrate_windows(Some(l));
@@ -1118,6 +1118,14 @@ const RECOVER_WITHIN: Duration = Duration::from_secs(5);
 /// tier 2, then tier 3's trial), as ADR-024's thresholds set it.
 const CLIMB_WITHIN: Duration = Duration::from_secs(8);
 
+/// Does `VOX_PERF_ONLY` (unset: everything) select the link or arm called `name`? It holds one text,
+/// or several separated by `|`, and selects a name that contains any of them.
+fn perf_only(name: &str) -> bool {
+    std::env::var("VOX_PERF_ONLY")
+        .ok()
+        .is_none_or(|o| o.split('|').any(|t| name.contains(t)))
+}
+
 /// The changing arm's name for a lossy phase on `lossy`.
 fn changing_name(lossy: &Link) -> String {
     format!(
@@ -1355,8 +1363,7 @@ fn taper_arms(
     failed: &mut Vec<String>,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    let only = std::env::var("VOX_PERF_ONLY").ok();
-    let wanted = |name: &str| only.as_deref().is_none_or(|o| name.contains(o));
+    let wanted = perf_only;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
