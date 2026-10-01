@@ -23,6 +23,9 @@
 //!   reply — a lie a client cannot detect.
 //! - **Removing a service cuts the sessions it is carrying** (R22). Only untrusting a
 //!   member used to; removing the service changed the stored offer and nothing else.
+//! - **A quiet session is not dropped** (RP-09). quinn's defaults are a 30 s idle timeout and
+//!   no keep-alive, so on defaults an `ssh` session through a forward dies while its person
+//!   reads.
 //!
 //! ## Why it is `#[ignore]`d
 //!
@@ -46,6 +49,10 @@ use world::{
     args, echo_service, read_to_end_within, resetting_service, round_trip, socks5_connect,
     vox_once, Ending, World, PARTIAL,
 };
+
+/// How long the idle session says nothing: past quinn's 30 s default idle timeout and past
+/// Vox's own 60 s one, so the session survives only if something keeps its connection alive.
+const QUIET: Duration = Duration::from_secs(75);
 
 #[test]
 #[ignore = "production Argon2id profiles + a real PoW + a QUIC idle timeout, driving the real binary; CI runs it in release"]
@@ -96,6 +103,63 @@ fn a_forward_carries_a_new_connection_after_its_host_restarts() {
     assert!(
         fwd.child.try_wait().unwrap().is_none(),
         "the forward process must still be the one that started"
+    );
+    drop(fwd);
+    drop(w);
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW + 75 s of quiet, driving the real binary; CI runs it in release"]
+fn a_quiet_session_still_carries_bytes() {
+    watchdog::arm();
+    let w = World::new(echo_service(), true);
+    let guest_dir = w.guest_dir.clone();
+    let (mut fwd, at) = w.forward("forward", &guest_dir);
+
+    // Step 1: the session carries bytes, so what follows measures the quiet and not a path
+    // that never worked.
+    let mut s = TcpStream::connect(at).expect("APPARATUS: connect to the forward's own port");
+    s.set_read_timeout(Some(
+        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
+    ))
+    .expect("APPARATUS: set a read timeout");
+    s.write_all(b"before the quiet")
+        .expect("CANNOT MEASURE: the session never took a first write");
+    let mut back = [0u8; 16];
+    if let Err(e) = s.read_exact(&mut back) {
+        panic!(
+            "CANNOT MEASURE: the session never carried bytes ({e}), so whether it survives a \
+             quiet cannot be measured. The forward said:\n{}",
+            fwd.transcript()
+        );
+    }
+    assert_eq!(
+        &back, b"before the quiet",
+        "PRODUCT: bytes must cross unchanged"
+    );
+    eprintln!("[test] step 1: the session echoed {} bytes", back.len());
+
+    // Step 2: nobody types.
+    std::thread::sleep(QUIET);
+
+    // Step 3: the same session, on the same socket, still carries bytes.
+    let t0 = Instant::now();
+    let wrote = s.write_all(b"after the quiet");
+    // An echo on a live connection takes milliseconds; a dead session ends sooner than this.
+    let (got, ending) = read_to_end_within(&mut s, Duration::from_secs(10));
+    let waited = t0.elapsed();
+    eprintln!(
+        "[test] step 3: after {QUIET:?} of quiet the session took the write ({wrote:?}), gave {} \
+         bytes, then {ending:?} after {waited:?}",
+        got.len()
+    );
+    assert!(
+        got == b"after the quiet" && ending == Ending::StillOpen,
+        "PRODUCT: a session quiet for {QUIET:?} must still carry bytes and stay open (RP-09): \
+         an idle ssh session must not drop while its person reads. The write gave {wrote:?}; \
+         the session gave {:?} and ended {ending:?} after {waited:?}. The forward said:\n{}",
+        String::from_utf8_lossy(&got),
+        fwd.transcript()
     );
     drop(fwd);
     drop(w);
