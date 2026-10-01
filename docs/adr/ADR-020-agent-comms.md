@@ -966,6 +966,17 @@ Both unknowns are already spiked; neither remains open.
   > client's `promptAsync`; `opencode_plugin_proof` interrupts a plain, hand-opened `opencode` mid-tool
   > through `vox daemon`.
 
+  > **Named defect, 2026-10-01 (V210-112): a woken OpenCode session was given the message twice.**
+  > The relayed wake is a user message, so the plugin's drain ran on it and read the same message
+  > into the same prompt; that read also showed every agent message as its raw envelope JSON. Fixed
+  > 2026-10-01 for v0.2.10: the daemon's `prompt` frame names its entry, the plugin passes the entries
+  > it has relayed to `vox agent hook --woken`, and the drain skips them until its cursor passes them
+  > (measured: OpenCode runs the wake's `chat.message` before `promptAsync` returns, so the plugin also
+  > matches the prompt by its text); the drain renders an envelope's `body`. `opencode_plugin_proof`
+  > reads the session as OpenCode stored it and asserts one copy of the woken message, one of a
+  > message that woke nothing, and no envelope JSON. A Claude Code wake is not covered: whether its
+  > drain runs on a socket-delivered message is unmeasured.
+
   > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, then reproduced through the real
   > `vox daemon`; fix proposed in #16.** `vox daemon`
   > decides on `NodeEvent::NewEntry`, which the node emits only for its **own** appends (ADR-021 F13's
