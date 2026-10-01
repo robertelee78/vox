@@ -17,8 +17,10 @@
 //! rows on a page, so the read takes about [`POSTS`] / 8 pages: enough for the copy per page to
 //! show at a room size a proof can stage in minutes.
 //!
-//! **Asserted.** `vox room read` returns every one of the [`POSTS`] messages, in order, and takes
-//! less than [`READ_BOUND`]. `CANNOT MEASURE` if fewer than [`POSTS`] posts could be staged.
+//! **Asserted.** `vox room read` returns every one of the [`POSTS`] messages exactly once, in
+//! order, and takes less than [`READ_BOUND`]. "In order" is what the staging fixes: the shells post
+//! at once, so the room interleaves them, but each shell posts its own messages one after another,
+//! so each shell's messages must read in the order it posted them. `CANNOT MEASURE` if fewer than [`POSTS`] posts could be staged.
 //!
 //! **Measured, to set the bound** (release, a shared 18-core machine under other agents' load):
 //! 12,000 rows, about 188 MiB and 1,715 pages. The candidate read it in 0.69 s, and the mutant
@@ -220,6 +222,23 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         "`vox room read` returned {} distinct of the {POSTS} messages",
         sorted.len()
     );
+    assert_eq!(
+        seen.len(),
+        POSTS,
+        "`vox room read` returned {} rows for {POSTS} messages: some more than once",
+        seen.len()
+    );
+    // Each shell posted messages `w, w + WRITERS, w + 2·WRITERS, …` one after another, so they
+    // must read in that order however the shells interleaved.
+    for w in 0..WRITERS {
+        let mine: Vec<usize> = seen.iter().copied().filter(|i| i % WRITERS == w).collect();
+        let out_of_order = mine.windows(2).find(|p| p[0] >= p[1]);
+        assert!(
+            out_of_order.is_none(),
+            "`vox room read` returned shell {w}'s messages out of the order it posted them: \
+             {out_of_order:?}"
+        );
+    }
     assert!(
         took < READ_BOUND,
         "`vox room read` of a room of {POSTS} messages of {TEXT_LEN} bytes took {took:?} (bound \
