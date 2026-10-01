@@ -69,6 +69,20 @@
 //! `unknown`) goes red at (1) and (3); the plugin taking the wake and never relaying it goes
 //! red at (3).
 //!
+//! ## The wake directory goes with the session, however the person quits (ADR-021 F17)
+//!
+//! The plugin's socket lives in a `vox-oc-*` directory of the temp directory. Every OpenCode in
+//! this proof runs with this run's own `TMPDIR`, so the directories counted are exactly its own.
+//! The person quits that session by closing its terminal (SIGHUP), then opens three more plain
+//! `opencode`s:
+//!
+//! 5. each quit — terminal closed, ctrl+C, `/exit` — **removes that session's directory**;
+//! 6. one SIGKILLed together with the helper that removes its directory leaves it, as a crash
+//!    does, and **the next `opencode` opened removes it**;
+//! 7. after every OpenCode of the run has exited, **no `vox-oc-*` is left** in its `TMPDIR`.
+//!
+//! Mutation-checked: no cleanup helper goes red at (5); no sweep at start goes red at (6).
+//!
 //! OpenCode absent, or no usable credential, is reported **unproven and fails** —
 //! an absent prover is missing evidence, not evidence of correctness. Set
 //! `VOX_PROOF_ALLOW_UNPROVEN=opencode` to accept that gap deliberately and visibly.
@@ -310,14 +324,13 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     //    dir is tied to a path that ceases to exist, and nothing of the operator's
     //    is touched.
     let plugin_log = tmp.path().join("plugin.log");
-    // **A persistent fixture directory, not a fresh one per run.** OpenCode installs
-    // a `node_modules` tree into BOTH `.opencode/` in the project and
-    // `$XDG_CONFIG_HOME/opencode/`, and until both exist the plugin is loaded but
-    // its `chat.message` hook never fires — the turn answers with no injection. A
-    // fresh temp directory every run means that install never completes in time,
-    // and the proof concludes the plugin does not work. It reproduces the state any
-    // real project is in after its first turn.
-    let fixture = std::env::temp_dir().join("vox-opencode-proof");
+    // **This run's own fixture**, so two runs at once never share a project. OpenCode
+    // installs a `node_modules` tree into `.opencode/` in the project and
+    // `$XDG_CONFIG_HOME/opencode/` the first time it is used there, and until it has, the
+    // plugin may load while its `chat.message` never fires: the warm-up turns below take
+    // the fresh project through that, to the state any real project is in after its first
+    // turn.
+    let fixture = tmp.path().join("oc");
     let oc_cfg = fixture.join("config");
     let project = fixture.join("project");
     std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
@@ -337,7 +350,23 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     // The credential is only *located* through the real data dir; nothing is copied.
     let _ = &auth;
 
+    // Every OpenCode here runs with this run's own `TMPDIR`, where its plugin makes its wake
+    // directory: (7) counts exactly this run's. Short, because a Unix socket's path is.
+    let oc_tmp = tmp.path().join("t");
+    std::fs::create_dir_all(&oc_tmp).unwrap();
+    let wake_dirs = || {
+        std::fs::read_dir(&oc_tmp)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("vox-oc-"))
+                    .map(|e| e.path().display().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    println!("[proof] vox-oc-* in this run's TMPDIR before it: {}", wake_dirs().len());
     let env: Vec<(&str, &std::ffi::OsStr)> = vec![
+        ("TMPDIR", oc_tmp.as_os_str()),
         ("XDG_CONFIG_HOME", oc_cfg.as_os_str()),
         ("VOX_DATA_DIR", data.as_os_str()),
         ("VOX_CONFIG_DIR", cfg.as_os_str()),
@@ -423,6 +452,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             project.to_str().unwrap(),
             oc_cfg.to_str().unwrap(),
             plugin_log.to_str().unwrap(),
+            oc_tmp.to_str().unwrap(),
             "wake",
         ],
     );
@@ -479,5 +509,34 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     assert_eq!(
         turn, "completed",
         "(4) the interrupt must queue into the running turn, not abort its tool: {said}"
+    );
+
+    // ---- each session's wake directory goes with it (F17) ----
+    for how in ["hup", "ctrl+c", "/exit"] {
+        let quit = line(&format!("QUIT {how}"));
+        println!("[proof] quit by {how}: its wake directory {quit}");
+        assert!(
+            quit.starts_with("removed "),
+            "(5) a hand-opened `opencode` quit by {how} must take its wake directory with it; \
+             it was {quit}{}",
+            plugin_diag("quits")
+        );
+    }
+    let swept = line("SWEPT");
+    println!("[proof] killed with its cleanup, then another opened: its wake directory {swept}");
+    assert!(
+        swept.starts_with("removed "),
+        "(6) the next `opencode` opened must remove a wake directory whose OpenCode was killed \
+         with its cleanup; it was {swept}{}",
+        plugin_diag("sweep")
+    );
+    let left = wake_dirs();
+    println!(
+        "[proof] vox-oc-* in this run's TMPDIR after it: {}",
+        left.len()
+    );
+    assert!(
+        left.is_empty(),
+        "(7) no wake directory may outlive the OpenCode that made it; this run left {left:?}"
     );
 }
