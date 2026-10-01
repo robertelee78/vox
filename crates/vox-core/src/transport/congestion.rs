@@ -530,6 +530,14 @@ pub(crate) const GENTLE_LOSS_CAP: f64 = 0.05;
 /// own, in `taper.rs`.
 pub(crate) const LOSS_RISE_FACTOR: f64 = 1.5;
 pub(crate) const TIER2_LOSS_RISE: f64 = 0.005;
+/// The trend is judged over the last this-many bytes sent, never over [`LOSS_ROUNDS`]: at 8192-byte
+/// datagrams eight rounds hold a couple of hundred packets, and 1% random loss over that many reads
+/// above 1.5% by chance often enough to cost tier 2 its gain (measured: 1.62x a Cubic flow instead of
+/// 2.8x). 32 MiB is about four thousand such packets.
+pub(crate) const TREND_BYTES: u64 = 32 << 20;
+/// How many finished rounds are kept for the trend: enough for [`TREND_BYTES`] at any rate a round
+/// can carry.
+const TREND_ROUNDS: usize = 4096;
 /// How many recent rounds the loss counts cover.
 pub(crate) const LOSS_ROUNDS: usize = 8;
 /// How long the best delivery rate is remembered.
@@ -683,7 +691,7 @@ impl PathSignals {
             gentle_losses: self.round_gentle,
             queued_losses: self.round_queued,
         });
-        while self.recent.len() > LOSS_ROUNDS {
+        while self.recent.len() > TREND_ROUNDS {
             self.recent.pop_front();
         }
         self.rounds += 1;
@@ -709,6 +717,7 @@ impl PathSignals {
             || self
                 .loss_baseline
                 .is_some_and(|b| self.loss_risen(b, TIER2_LOSS_RISE));
+        // `loss_share` (the cap) covers the last LOSS_ROUNDS; the trend covers TREND_BYTES.
         if congestion {
             self.round_queued += 1;
         } else {
@@ -782,10 +791,11 @@ impl PathSignals {
         self.recent.iter().rev().take(rounds).map(|r| r.queued_losses).sum()
     }
 
-    /// Record the loss share now as the baseline that [`Self::on_loss`] compares against: the taper
-    /// calls it on entering tier 2, from tier 1's sending.
+    /// Record the loss share now, over the last [`TREND_BYTES`] (or all there is), as the baseline
+    /// that [`Self::on_loss`] compares against: the taper calls it on entering tier 2, from tier 1's
+    /// sending.
     pub(crate) fn mark_loss_baseline(&mut self) {
-        self.loss_baseline = Some(self.loss_share());
+        self.loss_baseline = Some(self.trend_share());
     }
 
     /// Forget the baseline (back in tier 1, every loss is Cubic's anyway).
@@ -793,9 +803,36 @@ impl PathSignals {
         self.loss_baseline = None;
     }
 
-    /// Has the loss share risen past `max(LOSS_RISE_FACTOR × baseline, baseline + rise)`?
+    /// Has the loss share over the last [`TREND_BYTES`] risen past
+    /// `max(LOSS_RISE_FACTOR × baseline, baseline + rise)`? Never over fewer bytes than that: a
+    /// shorter window is noise. Right after a switch the window still holds the previous tier's
+    /// rounds, which delays the answer and never hastens it.
     pub(crate) fn loss_risen(&self, baseline: f64, rise: f64) -> bool {
-        self.loss_share() > (LOSS_RISE_FACTOR * baseline).max(baseline + rise)
+        let (sent, _) = self.trend_bytes();
+        sent >= TREND_BYTES && self.trend_share() > (LOSS_RISE_FACTOR * baseline).max(baseline + rise)
+    }
+
+    /// Bytes sent and lost over the last [`TREND_BYTES`] (or all there is), newest rounds first.
+    fn trend_bytes(&self) -> (u64, u64) {
+        let (mut sent, mut lost) = (self.round_sent, self.round_lost);
+        for r in self.recent.iter().rev() {
+            if sent >= TREND_BYTES {
+                break;
+            }
+            sent += r.sent;
+            lost += r.lost;
+        }
+        (sent, lost)
+    }
+
+    /// Bytes lost over bytes sent across the last [`TREND_BYTES`].
+    pub(crate) fn trend_share(&self) -> f64 {
+        let (sent, lost) = self.trend_bytes();
+        if sent == 0 {
+            0.0
+        } else {
+            lost as f64 / sent as f64
+        }
     }
 
     /// Bytes lost over bytes sent, across the last [`LOSS_ROUNDS`] finished rounds and this one.
@@ -803,6 +840,8 @@ impl PathSignals {
         let (sent, lost) = self
             .recent
             .iter()
+            .rev()
+            .take(LOSS_ROUNDS)
             .fold((self.round_sent, self.round_lost), |(s, l), r| (s + r.sent, l + r.lost));
         if sent == 0 {
             0.0
