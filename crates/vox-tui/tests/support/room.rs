@@ -176,7 +176,7 @@ impl Worker {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().expect("spawn vox");
+        let mut child = cmd.spawn().expect("APPARATUS: could not spawn vox");
         if let Some(input) = stdin {
             child
                 .stdin
@@ -185,7 +185,9 @@ impl Worker {
                 .write_all(input.as_bytes())
                 .unwrap();
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: could not collect vox's output");
         let o = Out {
             ok: out.status.success(),
             code: out.status.code(),
@@ -467,6 +469,10 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
 /// Poll a `vox` invocation until its output satisfies `ok`, or fail naming what it
 /// last said. Something posted on one node reaches another through the log, so "has
 /// it arrived yet" has no synchronous answer.
+///
+/// **The red names its side** from the last answer: `vox` refusing (a non-zero exit) or
+/// answering without what was awaited is PRODUCT, quoting it; `vox` giving no answer at
+/// all (killed, no exit status) is APPARATUS.
 pub fn until(
     w: &Worker,
     session: Option<&str>,
@@ -484,7 +490,26 @@ pub fn until(
         last = Some(o);
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}; last saw {last:?}");
+    let secs = TIMEOUT.as_secs();
+    match last {
+        Some(o) if o.code.is_none() => panic!(
+            "APPARATUS (no answer): waiting {secs}s for {what}, `{}` never exited with a \
+             status: {o:?}",
+            o.argv
+        ),
+        Some(o) if !o.ok => panic!(
+            "PRODUCT: waiting {secs}s for {what}, vox refused `{}` (exit {}): {}\nlast saw \
+             {o:?}",
+            o.argv,
+            o.code.unwrap_or_default(),
+            o.stderr.trim()
+        ),
+        Some(o) => panic!(
+            "PRODUCT: waiting {secs}s for {what}, vox answered `{}` without it: {o:?}",
+            o.argv
+        ),
+        None => panic!("APPARATUS: waiting for {what}, the deadline passed before one try"),
+    }
 }
 
 /// A resource's entry in a `vox.room.board/1` object, if it has one.
@@ -601,13 +626,12 @@ pub fn vox_accepted(
     }
 }
 
-/// [`until`] for something `vox` already accepted with exit 0: its never arriving is the
-/// product's failure, and the red says so.
+/// [`until`] for something `vox` already accepted with exit 0, which the red says.
 pub fn arrives(w: &Worker, what: &str, args: &[&str], ok: impl Fn(&Out) -> bool) -> Out {
     until(
         w,
         None,
-        &format!("{what} (PRODUCT: vox accepted it with exit 0, and it never arrived)"),
+        &format!("{what}, which vox accepted with exit 0"),
         args,
         ok,
     )
