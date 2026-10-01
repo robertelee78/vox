@@ -98,12 +98,14 @@ pub fn address_levels(ip: IpAddr) -> [Digest32; 3] {
 }
 
 /// The source keys of whoever is at the far end of `conn`: its address, or, over a circuit, the
-/// origin recorded for it. A circuit with no origin recorded counts as its relay's — one source.
+/// origin recorded for it. A circuit with **no origin recorded** is one source, the same for every
+/// such circuit: nothing about it says where it comes from, and keying it on anything the far end
+/// chooses — its identity, which is free — would hand every stranger a source of its own.
 #[must_use]
 pub fn source_levels(conn: &VoxConnection) -> [Digest32; 3] {
     if conn.via_circuit() {
         return conn.circuit_origin().unwrap_or_else(|| {
-            let key = domain_hash("vox/join-source/circuit", conn.peer_id().as_ref());
+            let key = domain_hash("vox/join-source/relayed-unknown", &[]);
             [key, key, key]
         });
     }
