@@ -111,7 +111,10 @@ fn signal(pid: u32, sig: &str, what: &str) {
         .args([sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(sent, "APPARATUS: CANNOT MEASURE (6): `kill {sig}` {what} failed");
+    assert!(
+        sent,
+        "APPARATUS: CANNOT MEASURE (6): `kill {sig}` {what} failed"
+    );
 }
 
 /// The claims of `r` in a `room read --json`, in that node's local order, as
@@ -119,7 +122,9 @@ fn signal(pid: u32, sig: &str, what: &str) {
 fn claims_in_local_order(o: &Out, r: &str) -> Vec<(String, String, u64)> {
     o.ndjson()
         .iter()
-        .filter(|row| row["envelope"]["type"] == "claim" && row["envelope"]["data"]["resource"] == r)
+        .filter(|row| {
+            row["envelope"]["type"] == "claim" && row["envelope"]["data"]["resource"] == r
+        })
         .map(|row| {
             (
                 row["entry_hash"].as_str().unwrap_or_default().to_owned(),
@@ -397,7 +402,11 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     );
     let held: Vec<serde_json::Value> = [alice, bob]
         .iter()
-        .map(|w| resource(&board(w, None, r), "h-order").cloned().unwrap_or_default())
+        .map(|w| {
+            resource(&board(w, None, r), "h-order")
+                .cloned()
+                .unwrap_or_default()
+        })
         .collect();
     assert_eq!(
         held[0], held[1],
@@ -409,7 +418,10 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         "PRODUCT: the earlier claim (alice/a1) must hold h-order on every node; both say {}",
         held[0]
     );
-    eprintln!("[proof] (6) identical h-order on two nodes from opposite local orders: {}", held[0]);
+    eprintln!(
+        "[proof] (6) identical h-order on two nodes from opposite local orders: {}",
+        held[0]
+    );
 
     // ---- every node computed the same state ----
     // Both nodes must have seen every operation before their boards can be compared.
