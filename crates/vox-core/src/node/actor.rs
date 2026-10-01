@@ -2315,8 +2315,8 @@ pub struct Node {
     /// Creates and joins answered once their room's publish rounds have ended: see
     /// `answer_when_published`.
     publish_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, Outcome)>,
-    /// `(room, board)` pairs a publish round **finished** to since the network came up: the boards
-    /// that hold the room, which an address may name (V210-96; see `Node::begin_invite`).
+    /// `(room, board)` pairs whose last publish round left the board holding the room (`holds_room`),
+    /// until it reconnects: the boards an address may name (V210-96; see `Node::begin_invite`).
     on_board: std::collections::BTreeSet<(Digest32, Digest32)>,
     /// What the last failed publish round to each `(room, board)` said, for an address withheld
     /// because of it (V210-96).
@@ -5246,8 +5246,8 @@ impl Node {
     /// probes; in 11 of 18 ordered runs the host connected to its anchor after printing the
     /// address. `vox room create` answered the same way until 0f39449e.
     ///
-    /// So the link is minted once a publish round to one of the anchors it names has finished (or
-    /// at once when it names no anchor: this node's own board holds the room), and the answer
+    /// So the link is minted once a publish round has left one of the anchors it names holding the
+    /// room (or at once when it names no anchor: this node's own board holds the room), and the answer
     /// waits for that — for the connection too — up to [`ADDRESS_PATIENCE`]. Past it the address
     /// is withheld and the reason given, board by board: an address that leads nowhere is worse
     /// than none, because the person hands it out and only learns later.
@@ -5283,8 +5283,8 @@ impl Node {
             .collect()
     }
 
-    /// Whether `room` can be joined through its link now: a publish round to an anchor the link
-    /// names has finished, or the link names none and this node's own board holds it.
+    /// Whether `room` can be joined through its link now: an anchor the link names holds it (see
+    /// `on_board`), or the link names none and this node's own board holds it.
     async fn room_on_a_named_board(&self, room: &Digest32) -> bool {
         let named = self.named_anchors(room).await;
         named.is_empty() || named.iter().any(|b| self.on_board.contains(&(*room, *b)))
