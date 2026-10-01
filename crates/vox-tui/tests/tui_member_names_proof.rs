@@ -49,9 +49,10 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
         ),
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
         _ if !out.has_verdict("cargo") => panic!(
-            "CANNOT MEASURE: the TUI proof's driver was stopped before it gave a verdict — by its \
-             faulthandler backstop, or from outside — at stage {:?} (exit {:?}; its stack is \
-             above, on stderr): {said}",
+            "CANNOT MEASURE: APPARATUS: the TUI driver gave no verdict after {:?} at stage {:?} \
+             (exit {:?}): stopped from outside at the wrapper's 1290 s bound, by its faulthandler \
+             backstop, or crashed; its stack or traceback is above, on stderr: {said}",
+            out.took,
             out.stage.as_deref().unwrap_or("(before its first stage)"),
             out.code
         ),
@@ -63,8 +64,10 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
              keyring)\": {said}"
         ),
         _ => panic!(
-            "CANNOT MEASURE: the TUI proof's driver ended with exit {:?} and no verdict this \
-             wrapper knows: {said}",
+            "CANNOT MEASURE: APPARATUS: the TUI driver ended after {:?} at stage {:?} with exit \
+             {:?} and no verdict this wrapper knows: {said}",
+            out.took,
+            out.stage.as_deref().unwrap_or("(before its first stage)"),
             out.code
         ),
     }
