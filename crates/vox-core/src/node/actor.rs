@@ -56,9 +56,9 @@ struct Initiated {
     /// The hello that lets the peer accept it; `None` for a session opened on the join
     /// path, which the join protocol itself delivered.
     initial: Option<InitialMessage>,
-    /// Whether that hello has reached the peer. Until it has, every delivery over the
-    /// session carries it again — a peer cannot open anything sealed under a session it
-    /// was never offered.
+    /// Whether the peer holds that hello: it took a key sealed under the session (V210-89).
+    /// Until it has, every delivery over the session carries it again — a peer cannot open
+    /// anything sealed under a session it was never offered.
     hello_delivered: bool,
 }
 
@@ -709,6 +709,8 @@ enum NetEvent {
         peer: Digest32,
         /// The generation it took.
         chain_id: u64,
+        /// The serial of the session the key was sealed under: the peer holds it (V210-89).
+        session: Option<u64>,
         /// Whether it was one of the keys of the history `peer` was owed.
         history: bool,
         /// The [`Node::delivery_epoch`] its watcher started in.
@@ -1226,6 +1228,29 @@ pub const TEST_STOPPED_DELAY_ENV: &str = "VOX_TEST_STOPPED_DELAY_MS";
 
 fn test_stopped_delay_ms() -> Option<u64> {
     std::env::var(TEST_STOPPED_DELAY_ENV).ok()?.parse().ok()
+}
+
+/// **For proofs only.** When set to `N`, the node loses the first `N` pairwise streams that
+/// carry a hello: it resets them unread, as a stream lost with its connection is, so the sender
+/// learns only that its key was not taken. The simultaneous-session proof uses it to force what a
+/// duplicate-connection close did by chance (V210-89): each member's hello lost after it was
+/// written. Nothing a person runs sets it; unset, nothing changes.
+pub const TEST_LOSE_HELLOS_ENV: &str = "VOX_TEST_LOSE_HELLOS";
+
+/// Whether this inbound hello is one [`TEST_LOSE_HELLOS_ENV`] says to lose.
+fn test_lose_hello() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LEFT: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    LEFT.get_or_init(|| {
+        AtomicU64::new(
+            std::env::var(TEST_LOSE_HELLOS_ENV)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        )
+    })
+    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+    .is_ok()
 }
 
 /// How many inbound handshakes may run at once.
@@ -4439,10 +4464,17 @@ impl Node {
                 channel_id,
                 peer,
                 chain_id,
+                session,
                 history,
                 epoch,
             } => {
                 self.key_backoff.remove(&(channel_id, peer));
+                // Taken under the session still held: the peer holds its hello (V210-89).
+                if session.is_some()
+                    && self.session_serial.get(&(channel_id, peer)).copied() == session
+                {
+                    self.hello_delivered(&channel_id, peer);
+                }
                 // The key was taken, and is recorded so whenever it answered. What is in flight,
                 // and so a whole history batch, is counted only by a watcher of this epoch.
                 let fresh = epoch == self.delivery_epoch;
@@ -5433,9 +5465,6 @@ impl Node {
             Ok(sent) => sent,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
-        if hello.is_some() {
-            self.hello_delivered(channel_id, target);
-        }
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(channel_id).map(Arc::clone),
@@ -6029,9 +6058,6 @@ impl Node {
                     all_sent = false;
                     break;
                 };
-                if hello.is_some() {
-                    self.hello_delivered(channel_id, target);
-                }
                 // Each key's own generation: a refusal re-owes exactly what was refused, and it is
                 // recorded as delivered only once taken (V210-88).
                 self.watch_delivery(sent, *channel_id, target, key.body.chain_id, owes_history);
@@ -7510,8 +7536,9 @@ impl Node {
             .await
             .is_ok()
             {
+                // Offered, not delivered: an `Open` is never answered, so the hello counts as
+                // held only once a key sealed under the session is taken (V210-89).
                 self.reopen.remove(&(channel_id, peer));
-                self.hello_delivered(&channel_id, peer);
             }
         }
     }
@@ -7522,7 +7549,18 @@ impl Node {
         self.session_serial.insert(key, self.last_session_serial);
     }
 
-    /// Record that the peer now holds the hello for a session this node opened.
+    /// Record that the peer now holds the hello for a session this node opened: it took a key
+    /// sealed under it, which it cannot open without the hello (V210-89).
+    ///
+    /// Written is not delivered. A hello used to count as delivered once it was written, and the
+    /// stream can be lost with its connection before the peer reads it. Measured through the real
+    /// binaries: two members who trusted each other at once dialled each other at the same
+    /// moment, each wrote its hello and key over the connection it dialled, and both streams came
+    /// back `connection lost`. Each then held its own session, counted its hello delivered, and
+    /// sent every later key without one; the peer, holding its own, refused each with "the key
+    /// did not open under the session it holds", and neither ever read the other. Counted only
+    /// once taken, every key until then carries the hello, and [`incoming_session_wins`] settles
+    /// the pair at both ends however the two opens interleaved.
     fn hello_delivered(&mut self, channel_id: &Digest32, peer: Digest32) {
         if let Some(i) = self.initiated.get_mut(&(*channel_id, peer)) {
             i.hello_delivered = true;
@@ -7564,6 +7602,7 @@ impl Node {
                         channel_id,
                         peer: target,
                         chain_id,
+                        session,
                         history,
                         epoch,
                     },
@@ -7744,7 +7783,7 @@ impl Node {
     async fn take_inbound_skdm(
         &mut self,
         peer: Digest32,
-        send: quinn::SendStream,
+        mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
     ) {
         use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
@@ -7765,6 +7804,12 @@ impl Node {
         // ordering back. `JoinerDone` replays whatever was held.
         if self.joining.contains(&room) && !self.channels.contains_key(&room) {
             self.held_pairwise.push((room, peer, first, send, recv));
+            return;
+        }
+        if matches!(first, PairwiseFrame::Hello { .. }) && test_lose_hello() {
+            eprintln!("vox: {TEST_LOSE_HELLOS_ENV}: an inbound hello was lost, unread");
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            let _ = recv.stop(quinn::VarInt::from_u32(0));
             return;
         }
         self.handle_pairwise(peer, first, send, recv).await;
