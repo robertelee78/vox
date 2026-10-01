@@ -23,13 +23,19 @@ The screen is read through pyte, as the person sees it. Prints, each on its own 
 - `<tag> TURN: completed|never completed` — whether the tool that was running when the wake
   arrived still ran to its end (its output, `SLEPT-42`, reached the screen): an interrupt queues
   into the running turn, and must not abort it;
+- `<tag> RECEIVED: woken=<n> other=<n> envelope=yes|no` — once the turn the wake started has
+  answered, what the model was given, from the session as OpenCode stored it (`opencode export`;
+  a user message is stored as the plugin left it): how many times the message addressed to bobby
+  appears in it (the wake's own text is one), how many times the one addressed to carol does
+  (only a `<vox-room>` read carries it), and whether any of it is a message's envelope JSON
+  rather than its words; `<tag> RECEIVED: never` if that turn never answered;
 - `<tag> SCREEN:` and the screen, whenever anything above is not clean.
 
 Exit 0 = it ran to the end (the caller judges the lines); 2 = apparatus (pyte missing, the TUI
 never drew, the turn never started, a post failed); 1 = the driver hung (`HUNG at <stage>`,
 `vox_pty.py`). OpenCode is stopped by its PID, with bounded waits.
 """
-import glob, json, os, shutil, subprocess, sys, time
+import glob, json, os, re, shutil, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -78,16 +84,39 @@ def post(to, body):
 
 def registered():
     """The wake channels the daemon's profile holds for sessions this driver did not find there:
-    (harness, endpoint) for each."""
+    (harness, endpoint, session) for each."""
     regs = []
     for path in sorted(set(glob.glob(os.path.join(DATA, "*", "sessions", "*.json"))) - BEFORE):
         try:
             with open(path) as f:
                 r = json.load(f)
-            regs.append((r.get("harness", ""), r.get("endpoint", "")))
+            regs.append((r.get("harness", ""), r.get("endpoint", ""), r.get("session", "")))
         except (OSError, ValueError):
             pass
     return regs
+
+
+# A message's envelope as `vox room post` writes it, rather than its words.
+ENVELOPE = re.compile(r'"v"\s*:\s*1\b|"type"\s*:\s*"ask"')
+
+
+def received(session):
+    """What the model was given in `session`, once the turn the wake started has answered: the
+    text of every user message, as OpenCode stored it — after the plugin rewrote it — or `None`
+    while that turn has not answered yet. `--pure`: reading the session needs no plugin."""
+    out = subprocess.run([opencode, "export", "--pure", session], env=env, cwd=PROJECT,
+                         capture_output=True, text=True, timeout=60)
+    try:
+        messages = json.loads(out.stdout[out.stdout.index("{"):])["messages"]
+    except (ValueError, KeyError):
+        return None
+    users = [" ".join(p.get("text", "") for p in m["parts"] if p.get("type") == "text")
+             for m in messages if m["info"]["role"] == "user"]
+    last = messages[-1]["info"] if messages else {}
+    woke = any(WAKE in u for u in users)
+    if not woke or last.get("role") != "assistant" or not last.get("time", {}).get("completed"):
+        return None
+    return users
 
 
 BEFORE = set(glob.glob(os.path.join(DATA, "*", "sessions", "*.json")))  # earlier sessions
@@ -113,7 +142,7 @@ try:
         print(f"{TAG} SCREEN:\n{tui.text()}")
         sys.exit(2)
     regs = registered()
-    print(f"{TAG} REGISTERED: " + "; ".join(f"{h} {e}" for h, e in regs))
+    print(f"{TAG} REGISTERED: " + "; ".join(f"{h} {e}" for h, e, _ in regs))
     t_turn = time.time()
 
     stage("post an urgent message addressed to someone else")
@@ -143,6 +172,25 @@ try:
     print(f"{TAG} TURN: {'completed' if finished else 'never completed'}")
     if not finished:
         print(f"{TAG} SCREEN:\n{tui.text()}")
+
+    stage("let the woken turn answer, and read what the model was given")
+    users = None
+    end = time.time() + 120
+    while users is None and time.time() < end and regs:
+        users = received(regs[0][2])
+        if users is None:
+            tui.pump(2)
+    if users is None:
+        print(f"{TAG} RECEIVED: never")
+        print(f"{TAG} SCREEN:\n{tui.text()}")
+    else:
+        given = "\n".join(users)
+        woken, others = given.count(WAKE), given.count(OTHER)
+        envelope = ENVELOPE.search(given) is not None
+        print(f"{TAG} RECEIVED: woken={woken} other={others} "
+              f"envelope={'yes' if envelope else 'no'}")
+        if woken != 1 or others != 1 or envelope:
+            print(f"{TAG} GIVEN:\n" + "\n----\n".join(users))
     code = 0
 except Hung as h:
     print(f"{TAG} HUNG at {h}")

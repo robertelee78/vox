@@ -65,9 +65,18 @@
 //! 4. and the tool that was running **still runs to its end** (its output reaches the screen):
 //!    the interrupt queues into the running turn, never aborts it.
 //!
+//! Then, once the turn the wake started has answered, what the model was **given** — the
+//! session's user messages as OpenCode stored them, after the plugin rewrote them (V210-112):
+//!
+//! 5. the message that woke it appears **once**, as the wake itself: the `<vox-room>` read that
+//!    follows does not repeat it; and the one addressed to someone else, which woke nothing,
+//!    appears exactly once, in that read;
+//! 6. and every message is shown as its words, never as its envelope JSON.
+//!
 //! Mutation-checked: `vox agent hook` not registering the plugin's socket (the session stays
 //! `unknown`) goes red at (1) and (3); the plugin taking the wake and never relaying it goes
-//! red at (3).
+//! red at (3); the drain re-emitting a woken message goes red at (5); the text format printing
+//! a message's raw envelope goes red at (6).
 //!
 //! OpenCode absent, or no usable credential, is reported **unproven and fails** —
 //! an absent prover is missing evidence, not evidence of correctness. Set
@@ -452,11 +461,12 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             .unwrap_or("(no line)")
             .to_owned()
     };
-    let (registered, other, wake, turn) = (
+    let (registered, other, wake, turn, given) = (
         line("REGISTERED"),
         line("OTHER"),
         line("WAKE"),
         line("TURN"),
+        line("RECEIVED"),
     );
     println!(
         "[proof] hand-opened `opencode`: registered {registered:?}; addressed to someone else: \
@@ -479,5 +489,32 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     assert_eq!(
         turn, "completed",
         "(4) the interrupt must queue into the running turn, not abort its tool: {said}"
+    );
+    println!("[proof] what the model was given: {given}");
+    let count = |key: &str| {
+        given
+            .split_whitespace()
+            .find_map(|f| f.strip_prefix(&format!("{key}=")))
+            .unwrap_or("(none)")
+            .to_owned()
+    };
+    if given == "never" || count("woken") == "(none)" {
+        panic!(
+            "CANNOT MEASURE: the turn the wake started never answered, so what the model was \
+             given could not be read: {said}"
+        );
+    }
+    assert!(
+        count("woken") == "1" && count("other") == "1",
+        "(5) the message that woke the session must reach the model once — as the wake, not \
+         again in the room read that follows — and the one that woke nothing exactly once; the \
+         model was given woken={} other={}: {said}",
+        count("woken"),
+        count("other")
+    );
+    assert_eq!(
+        count("envelope"),
+        "no",
+        "(6) the room read must show each message as written, never as its envelope JSON: {said}"
     );
 }
