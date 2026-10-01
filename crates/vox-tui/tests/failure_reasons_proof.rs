@@ -49,9 +49,10 @@ fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
 /// The most one `vox trust add` took a debug build in case (9)'s fill, eight at a time against one
-/// daemon, each checking the passphrase with production Argon2id (#295): 1,100 of them in one run,
-/// median 18.94 s, most 56.50 s, the whole fill 2,980.5 s. Release: not counted.
-const DEBUG_FILL_ADD: Duration = Duration::from_millis(56_500);
+/// daemon, each checking the passphrase with production Argon2id (#295): 2,200 of them over two
+/// runs, median 18.94 s and 20.54 s, most 56.50 s and 74.33 s, the whole fill 2,980.5 s and
+/// 3,792.7 s. Release: not counted.
+const DEBUG_FILL_ADD: Duration = Duration::from_millis(74_330);
 /// The joins (three `room join`s and `vox connect`) and the other unlocks (four `vox id`s, `serve`,
 /// two daemons, `trust remove`, `room post`, `connect`, `up` and two `forward`s) the test makes.
 const JOINS: u32 = 4;
