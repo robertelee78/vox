@@ -1411,6 +1411,8 @@ pub async fn read_frame(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     }
     let mut body = vec![0u8; len];
     if s.read_exact(&mut body).await.is_err() {
+        // What did arrive may be part of a passphrase (V210-94).
+        zeroize::Zeroize::zeroize(&mut body);
         return Ok(None);
     }
     Ok(Some(body))
