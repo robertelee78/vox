@@ -1111,7 +1111,7 @@ pub struct RoomTarget {
     pub paths: Paths,
     /// Where the node binds while the verb runs.
     pub listen: SocketAddr,
-    /// The anchors to reach the swarm through.
+    /// The anchors, if any, that bridge this node to peers it cannot reach directly.
     pub anchors: vox_core::nat::bootstrap::BootstrapSet,
     /// The identity passphrase.
     pub identity_passphrase: String,
