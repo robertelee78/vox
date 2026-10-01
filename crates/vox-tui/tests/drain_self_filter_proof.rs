@@ -24,6 +24,10 @@
 //! requires its `from` to be OpenCode's own session id — which is what makes the
 //! filter (and per-session ownership) work for OpenCode at all — and then requires
 //! that session's drain to omit that post while showing a message from H′.
+//!
+//! Each red of the live half names its side: the model never running the command is
+//! CANNOT PROVE (the apparatus); `vox` refusing it is PRODUCT, quoting the refusal; and a
+//! post `vox` accepted that never lands is PRODUCT.
 
 #![cfg(unix)]
 
@@ -176,23 +180,14 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     .unwrap();
     let bin_dir = fixture.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    // **What the model's shell runs is recorded**, so a turn in which the model never
-    // ran the operator's command is told apart from one in which Vox failed it. The
-    // `vox` on the model's PATH is a wrapper that logs its arguments and runs the real
-    // binary; the plugin calls `VOX_BIN` directly, so only the model's commands land here.
+    // **What the model's shell runs is recorded, with how `vox` answered it**, so a turn in
+    // which the model never ran the operator's command (the apparatus) is told apart from one
+    // in which Vox refused it (the product). The `vox` on the model's PATH is a recording
+    // wrapper around the real binary; the plugin calls `VOX_BIN` directly, so only the model's
+    // commands land here.
     let calls = fixture.join("model-shell-calls.log");
     let shim = bin_dir.join("vox");
-    let _ = std::fs::remove_file(&shim);
-    std::fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
-            calls.display(),
-            VOX
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    support::model_shim(&bin_dir, &calls);
 
     let turn = |prompt: &str| -> String {
         let mut cmd = Command::new("opencode");
@@ -249,10 +244,12 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     // each other's `vox`), which the per-tree fixture removed. Neither says anything about the drain, so
     // neither is reported as a product red — and neither is retried until green. It
     // fails as CANNOT PROVE, by name, unless that gap is accepted deliberately.
-    let ran = std::fs::read_to_string(&calls)
-        .unwrap_or_default()
-        .lines()
-        .any(|l| l.contains("room post") && l.contains(&codeword));
+    // **Vox refusing the model's post is the product failing** (a plugin that names no
+    // session gets "no session: … set VOX_SESSION"), and is a PRODUCT red quoting the refusal,
+    // not a wait for a row that can never land.
+    let ran = support::vox_accepted(&calls, "the model", "`vox room post`", |a| {
+        a.contains("room post") && a.contains(&codeword)
+    });
     if !ran {
         // Two different apparatus failures, told apart by the turn's own transcript
         // (OpenCode prints each shell command it runs as `$ <command>`):
@@ -304,9 +301,8 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
         eprintln!("[unproven] {what}; the live half proves nothing");
         return;
     }
-    let rows = until(
+    let rows = support::arrives(
         h,
-        None,
         "the model's post to land",
         &["room", "read", r, "--json"],
         |o: &Out| o.ok && o.stdout.contains(&codeword),

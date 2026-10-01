@@ -841,6 +841,13 @@ that proves it.**
   - a `failed` attempt leaves the item retryable;
   - **the operator runs no command.**
 
+  The second and third assertions (`release` is never Done; `result` reaches Acceptance at most) are
+  **the stub tracker's own rules, not product proofs**: Vox has no Work phase, so only the stub's own
+  code can move an item past Acceptance, and no change to Vox can turn them red or green (verifier-261c6
+  found no mutant for them, 2026-10-01). They test the stand-in tracker only. What Vox contributes to
+  them — the typed `result` row with its attempt and evidence, and the board after a `release` — is
+  proved by the other assertions. The proof names a red on them APPARATUS.
+
   *Mutation*: `--pure` models, which must turn it red.
 
   > **DONE 2026-09-24** (proof `tracker_rehearsal_proof`). Two real OpenCode sessions on two nodes do
