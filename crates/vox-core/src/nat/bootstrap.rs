@@ -1,8 +1,10 @@
 //! The user-controlled bootstrap / rendezvous / relay set (ADR-012 §"Bootstrap").
 //!
 //! Cold-start onto the swarm uses "a configurable bootstrap set the user
-//! controls": by default the user's own always-on node, optionally augmented with a
-//! community/volunteer set. Crucially, **bootstrap nodes only introduce peers** —
+//! controls": typically the user's own always-on node, optionally augmented with a
+//! community/volunteer set. The set may be empty: an anchor only bridges hosts that
+//! cannot otherwise reach each other, and peers that can reach each other directly
+//! need none (ADR-012). Crucially, **bootstrap nodes only introduce peers** —
 //! they can neither read traffic nor forge membership (ADR-012) — so a hostile or
 //! absent bootstrap degrades availability but never confidentiality or
 //! authenticity. This type is therefore plain, user-owned configuration: an ordered

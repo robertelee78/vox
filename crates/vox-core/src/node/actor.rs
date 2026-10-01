@@ -419,8 +419,10 @@ pub struct NodeConfig {
     pub bind: Option<Bind>,
     /// An override for the ADR-005 PoW parameters a join binds (tests reduce them).
     pub pow_params: Option<crate::join::pow::PowParams>,
-    /// The anchors this node publishes to, reads from, climbs its ladder through and
-    /// names in invite links (ADR-012 §"Bootstrap": the user's own always-on node).
+    /// The anchors, if any, that bridge this node to peers it cannot reach directly
+    /// (ADR-012): it publishes to, reads from, climbs its ladder through and names in invite
+    /// links whichever it has. Empty is a whole configuration: peers that can reach each
+    /// other directly need no anchor.
     pub anchors: BootstrapSet,
     /// A **headless** identity (ADR-016 `vox node`): a transport identity that is not
     /// a vault. With one, the node networks the moment it is spawned — there is no
@@ -2115,6 +2117,31 @@ impl Joiner {
         }
     }
 
+    /// Every board this join tried, each named as the room's host or an anchor, with the
+    /// addresses it was dialled at — for a person whose join reached none (V210-107). The words
+    /// for that failure blamed "the anchor" and sent them to `vox node`, when the link of a host
+    /// with no anchor names only the host.
+    fn boards_tried(&self) -> String {
+        self.routes
+            .iter()
+            .map(|(id, endpoints)| {
+                let who = if self.parsed.responder == Some(*id) {
+                    "the room's host"
+                } else {
+                    "anchor"
+                };
+                let at: Vec<String> = endpoints.addrs().iter().map(ToString::to_string).collect();
+                let at = if at.is_empty() {
+                    "its open connection".to_owned()
+                } else {
+                    at.join(", ")
+                };
+                format!("{who} {} at {at}", crate::node::network::short_id(*id))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// The network half of a join, and the room key's seal: the old inline `join_channel` from
     /// reaching a board to the end of the exchange, unchanged in order and in its refusals.
     async fn run(self) -> std::result::Result<JoinerWon, JoinerLost> {
@@ -2142,7 +2169,11 @@ impl Joiner {
         // kept for a join whose board answered and whose members did not.
         let Some(board) = self.reach_a_board().await else {
             steps.took("board (unreached)", t);
-            return Err(JoinerLost::of(Fault::BoardUnreachable));
+            return Err(JoinerLost {
+                fault: Fault::BoardUnreachable,
+                why: vec![format!("no answer from {}", self.boards_tried())],
+                steps: JoinSteps::default(),
+            });
         };
         steps.took("board", t);
         let t = std::time::Instant::now();
@@ -2159,7 +2190,22 @@ impl Joiner {
             },
             t,
         );
-        let mut set = fetched.map_err(|e| JoinerLost::of(on_the_board(fault_of(&e))))?;
+        let mut set = fetched.map_err(|e| {
+            let fault = on_the_board(fault_of(&e));
+            let mut lost = JoinerLost::of(fault);
+            if fault == Fault::BoardUnreachable {
+                let who = if parsed.responder == Some(board.peer_id()) {
+                    "the room's host"
+                } else {
+                    "anchor"
+                };
+                lost.why.push(format!(
+                    "{who} {} answered, then its connection closed before the room was fetched: {e}",
+                    crate::node::network::short_id(board.peer_id())
+                ));
+            }
+            lost
+        })?;
         // **A board that does not hold the room is not a malformed address.** The link parsed and
         // named a room; the board we reached has nothing for it. That is either a room its host has
         // not published there yet, or a room id mistyped into another valid one (a link carries no
@@ -2613,9 +2659,9 @@ pub struct Node {
     /// Live forwards by their bound local address (ADR-013 Dial, M16.1). Dropping one
     /// stops its listener.
     forwards: BTreeMap<std::net::SocketAddr, crate::node::tunnel::Forward>,
-    /// The anchors this node is configured with (ADR-012 §"Bootstrap", ADR-016
-    /// M15.1): dialled when the network starts, given the `Anchor` class, published
-    /// to, and named in every invite link.
+    /// The anchors, if any, that bridge this node to peers it cannot reach directly
+    /// (ADR-012, ADR-016 M15.1): dialled when the network starts, given the `Anchor`
+    /// class, published to, and named in invite links beside this node's own addresses.
     anchors: BootstrapSet,
     /// Every identity this node treats as an anchor: the configured set plus the
     /// anchors of each open channel. The peer policy is rebuilt from channel
@@ -3911,6 +3957,9 @@ impl Node {
     /// found nothing: perf_r40_relayed_chat_gate, `bob's join failed: Failed(BadLink)`, 2 of 2.
     /// The reply now waits for the room's rounds, bounded by `ANCHOR_PUBLISH_PATIENCE` each, and
     /// the actor serves everyone else meanwhile.
+    ///
+    /// **A node with no anchor answers at once:** it has no round to wait for, and its own board
+    /// holds the room for anyone who reaches it directly (V210-107).
     async fn answer_when_published(
         &mut self,
         room: Digest32,
@@ -4962,9 +5011,27 @@ impl Node {
                 self.anchor_window.remove(&peer);
                 // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
                 // whose forward said it dialled and then nothing).
+                //
+                // **Named for what it is** (V210-107). A room's own host is dialled the same way —
+                // its link entry is a board too — and was noted "connected to this anchor", which
+                // told a person reaching a host directly that they were using an anchor. An anchor
+                // is one this node was given (`--anchor`, the anchors file) or a room names that is
+                // not one of its members.
+                let anchor = self.anchors.get(&peer).is_some()
+                    || self
+                        .room_anchors
+                        .values()
+                        .any(|set| set.get(&peer).is_some());
                 if let Some(net) = self.net.as_ref() {
-                    net.manager()
-                        .note(peer, "connected to this anchor".to_owned());
+                    net.manager().note(
+                        peer,
+                        if anchor {
+                            "connected to this anchor"
+                        } else {
+                            "connected to this room host's board"
+                        }
+                        .to_owned(),
+                    );
                 }
                 self.anchor_ids.insert(peer);
                 self.adopt_connection(Arc::clone(&conn));
@@ -5816,7 +5883,8 @@ impl Node {
         });
     }
 
-    /// Produce an invite link naming this node as anchor and responder.
+    /// Produce an invite link naming this node, and any anchors the room uses, as where to
+    /// reach the room, with this node as responder.
     async fn invite(&mut self, channel_id: &Digest32) -> Outcome {
         let Some(net) = self.net.as_ref() else {
             return Outcome::Failed(Fault::NotNetworked);
@@ -5868,9 +5936,10 @@ impl Node {
     /// Interval between rounds. A board that is ready costs a joiner one dial.
     const BOARD_RETRY: Duration = Duration::from_millis(250);
 
-    /// Join a channel from an invite link (ADR-016 §"Join over the network"): resolve
-    /// the anchor, read the board, announce a pre-join record, run the ADR-005 join,
-    /// then build local channel state and publish our own records.
+    /// Join a channel from an invite link (ADR-016 §"Join over the network"): reach a
+    /// board (the link's entries, the room's host among them, and this node's anchors), read
+    /// it, announce a pre-join record, run the ADR-005 join, then build local channel state
+    /// and publish our own records.
     /// Begin joining a room: capture what the join needs here, run the network half and the
     /// Argon2id seal in a task, and answer through `NetEvent::JoinerDone`.
     ///
@@ -5958,6 +6027,13 @@ impl Node {
             }
         }
         if routes.is_empty() {
+            // Nothing was tried, so say so rather than leave the person to read "did not answer"
+            // about a board nobody dialled (V210-107).
+            let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                reason: "the address names only this node, and this node has no anchor: there \
+                         was no board to ask"
+                    .to_owned(),
+            });
             let _ = reply.send(Outcome::Failed(Fault::BoardUnreachable));
             return;
         }
