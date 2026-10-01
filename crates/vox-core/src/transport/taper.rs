@@ -4,7 +4,7 @@
 //! | Tier | Controller |
 //! |---|---|
 //! | 1 | [`VoxCubic`]: every loss is congestion |
-//! | 2 | [`VoxCubic`], loss-aware: a loss with no queue building is a gentle cut (M24.3) |
+//! | 2 | [`VoxCubic`], loss-aware: a loss that [`PathSignals`] does not judge congestion is cut gently (M24.3) |
 //! | 3 | [`VoxBbr`]: quinn's BBR, owned by Vox |
 //!
 //! Every connection starts in tier 1 and moves **one tier at a time, both ways** (ADR-024 rules 1
@@ -13,26 +13,37 @@
 //!
 //! # Decisions, evaluated once per round trip
 //! - **Climb 1 → 2** when the last [`CLIMB_1_ROUNDS`] rounds held at least [`CLIMB_1_LOSSES`]
-//!   losses with no queue building: Cubic is backing off for loss that is not congestion. A
-//!   drop-tail sawtooth loses with its queue full, so it does not count.
-//! - **Climb 2 → 3** when, for [`STARVED_ROUNDS`] consecutive rounds and [`STARVED_TIME`], the
-//!   loss-aware Cubic still delivered under [`STARVED_FRACTION`] of the best rate the path showed
-//!   in the last 10 s, no queue built, and those rounds held at least [`STARVED_LOSSES`] losses
-//!   with no queue. **The loss is the clean-LAN guard:** a link that loses nothing is never
-//!   starved by this test, however its rate wanders, so a clean LAN never reaches BBR, the tier
-//!   both measured BBRs collapse on (ADR-024 Context).
+//!   losses with no queue building, no sooner than [`TIER_1_DWELL`] in tier 1: Cubic is backing
+//!   off for loss that is not congestion.
+//! - **Climb 2 → 3, on trial**, when for [`STARVED_ROUNDS`] consecutive rounds and
+//!   [`STARVED_TIME`] the loss share stayed at or above [`GENTLE_LOSS_CAP`] (where tier 2 stops
+//!   reading loss as random), no queue built, the rate stayed under [`STARVED_FRACTION`] of the
+//!   best rate, and at least [`STARVED_LOSSES`] rounds lost something. **The loss is the clean-LAN
+//!   guard:** a clean link loses only when its queue overflows, so it never holds a loss share of
+//!   5% round after round, and never reaches BBR, the tier both measured BBRs collapse on.
+//! - **The trial.** A shallow buffer under congestion shows the same entry signal as random loss.
+//!   They part once Vox sends harder: random loss stays flat with the rate, congestion loss climbs.
+//!   So for its first [`TRIAL_ROUNDS`] rounds and [`TRIAL_TIME`], tier 3 falls back to tier 2 at
+//!   once if the loss share rises past `max(TRIAL_RISE_FACTOR × entry, entry + TRIAL_RISE_ABS)`,
+//!   and tier 3 is then locked out for a back-off: [`BACKOFF_FIRST`], doubling with each failed
+//!   trial up to [`BACKOFF_MAX`], and forgotten after [`BACKOFF_RESET`] without one.
 //! - **Descend 3 → 2 at once** when a queue has been building for [`QUEUE_ROUNDS`] consecutive
-//!   rounds (rule 3: BBR must never hold a congested path). This is the one move without a dwell.
-//! - **Descend 3 → 2 and 2 → 1** after a quiet stretch: [`QUIET_ROUNDS`] consecutive rounds and
+//!   rounds (rule 3: BBR must never hold a congested path). In tier 3 the queue test is a round's
+//!   minimum round trip [`BBR_QUEUE_SHARE`] of the base above it: BBR's window is twice the
+//!   bandwidth-delay product, so BBR alone can stand up to one base round trip of queue, and a
+//!   lower test reads BBR's own queue as congestion (measured: half the base took tier 3 out
+//!   within a second, every time, on a path with no other flow).
+//! - **Descend 3 → 2 when the loss is gone:** the loss share under half [`GENTLE_LOSS_CAP`] for
+//!   [`QUIET_ROUNDS`] rounds and [`QUIET_TIME`].
+//! - **Descend 2 → 1** after a quiet stretch: [`QUIET_ROUNDS`] consecutive rounds and
 //!   [`QUIET_TIME`] with no loss, no queue, and delivery at least [`HOLDING_FRACTION`] of the best
-//!   rate. Each step down needs its own stretch, counted from the switch.
-//! - **Hysteresis.** Climbing takes a few losses without a queue; descending takes none at all
-//!   for longer, and one loss restarts the stretch. A link losing 1% at random keeps meeting the
-//!   first and, at any rate worth a tunnel, never meets the second.
-//! - **Dwell.** Tier 1 is left no sooner than [`TIER_1_DWELL`] after it was entered; tiers 2 and 3
-//!   no sooner than [`DWELL_ROUNDS`] rounds and [`DWELL_TIME`] (except by rule 3).
+//!   rate.
+//! - **Hysteresis.** Each climb and its descent test different things, and a descent needs a
+//!   longer stretch than a climb. **Dwell:** tiers 2 and 3 are left no sooner than
+//!   [`DWELL_ROUNDS`] rounds and [`DWELL_TIME`], except by rule 3 or a failed trial.
 //!
-//! Application-limited rounds are no evidence either way: the path was not asked for more.
+//! A round that was application-limited, or has no rate sample (`delivery_rate()` of 0), is no
+//! evidence either way.
 //!
 //! # Hand-off (rule 5)
 //! A switch hands the connection's rate on, so it never pays slow start again:
@@ -51,7 +62,7 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Controller, ControllerMetrics};
 use quinn_proto::RttEstimator;
 
-use super::congestion::{PathSignals, VoxCubic};
+use super::congestion::{PathSignals, VoxCubic, GENTLE_LOSS_CAP};
 use super::vox_bbr::{RateSeed, VoxBbr};
 
 /// The rounds a climb from tier 1 looks back over…
@@ -66,13 +77,32 @@ pub(crate) const STARVED_FRACTION: f64 = 0.5;
 pub(crate) const STARVED_ROUNDS: u32 = 20;
 /// …spanning at least this long…
 pub(crate) const STARVED_TIME: Duration = Duration::from_secs(2);
-/// …and holding at least this many losses with no queue building.
+/// …in which at least this many rounds lost something.
 pub(crate) const STARVED_LOSSES: u32 = 3;
+/// Tier 3's trial lasts this many rounds…
+pub(crate) const TRIAL_ROUNDS: u32 = 20;
+/// …and this long.
+pub(crate) const TRIAL_TIME: Duration = Duration::from_secs(2);
+/// A trial fails when the loss share rises past this multiple of the share at entry…
+pub(crate) const TRIAL_RISE_FACTOR: f64 = 1.5;
+/// …or this much above it, whichever is larger.
+pub(crate) const TRIAL_RISE_ABS: f64 = 0.03;
+/// Tier 3 is locked out this long after a first failed trial…
+pub(crate) const BACKOFF_FIRST: Duration = Duration::from_secs(30);
+/// …doubling with each further one, up to this…
+pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(480);
+/// …and back to the first after this long without one.
+pub(crate) const BACKOFF_RESET: Duration = Duration::from_secs(300);
 /// Consecutive rounds of a queue building that take tier 3 straight to tier 2.
 pub(crate) const QUEUE_ROUNDS: u32 = 2;
+/// In tier 3, a round's minimum round trip this many base round trips above the base is a queue
+/// another flow is building (see the module docs).
+pub(crate) const BBR_QUEUE_SHARE: f64 = 1.5;
+/// …and never less than this above it.
+pub(crate) const BBR_QUEUE_FLOOR: Duration = Duration::from_millis(4);
 /// A quiet round delivers at least this share of the best rate.
 pub(crate) const HOLDING_FRACTION: f64 = 0.8;
-/// Consecutive quiet rounds to descend a tier…
+/// Consecutive rounds of a stretch that descends a tier…
 pub(crate) const QUIET_ROUNDS: u32 = 40;
 /// …spanning at least this long.
 pub(crate) const QUIET_TIME: Duration = Duration::from_secs(4);
@@ -129,10 +159,10 @@ struct Streak {
 }
 
 impl Streak {
-    fn extend(&mut self, now: Instant, losses: u32) {
+    fn extend(&mut self, now: Instant, lossy: bool) {
         self.rounds += 1;
         self.since.get_or_insert(now);
-        self.losses += losses;
+        self.losses += u32::from(lossy);
     }
     fn reset(&mut self) {
         *self = Self::default();
@@ -140,6 +170,33 @@ impl Streak {
     fn lasted(&self, now: Instant) -> Duration {
         self.since
             .map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
+    }
+}
+
+/// Tier 3's lockout after failed trials.
+#[derive(Debug, Clone, Copy, Default)]
+struct Backoff {
+    /// The lockout the next failed trial imposes.
+    next: Option<Duration>,
+    until: Option<Instant>,
+    last_failure: Option<Instant>,
+}
+
+impl Backoff {
+    fn locked(&self, now: Instant) -> bool {
+        self.until.is_some_and(|t| now < t)
+    }
+    fn fail(&mut self, now: Instant) {
+        if self
+            .last_failure
+            .is_some_and(|t| now.saturating_duration_since(t) >= BACKOFF_RESET)
+        {
+            self.next = None;
+        }
+        let lockout = self.next.unwrap_or(BACKOFF_FIRST);
+        self.until = Some(now + lockout);
+        self.next = Some((lockout * 2).min(BACKOFF_MAX));
+        self.last_failure = Some(now);
     }
 }
 
@@ -152,8 +209,12 @@ pub(crate) struct Tapered {
     mtu: u16,
     entered_at: Instant,
     rounds_in_tier: u32,
+    /// The loss share when tier 3 was entered: its trial's baseline.
+    entry_share: f64,
+    backoff: Backoff,
     starved: Streak,
     quiet: Streak,
+    loss_gone: Streak,
     queue: Streak,
 }
 
@@ -167,8 +228,11 @@ impl Tapered {
             mtu: current_mtu,
             entered_at: now,
             rounds_in_tier: 0,
+            entry_share: 0.0,
+            backoff: Backoff::default(),
             starved: Streak::default(),
             quiet: Streak::default(),
+            loss_gone: Streak::default(),
             queue: Streak::default(),
         }
     }
@@ -176,37 +240,58 @@ impl Tapered {
     /// One round has finished: update the streaks, and switch tier if they say so.
     fn on_round(&mut self, now: Instant) {
         self.rounds_in_tier = self.rounds_in_tier.saturating_add(1);
-        if self.signals.app_limited() {
+        if self.signals.app_limited() || self.signals.delivery_rate() == 0 {
             return;
         }
         let rate = self.signals.delivery_rate() as f64;
         let best = self.signals.best_rate(now) as f64;
+        let share = self.signals.loss_share();
         let queued = self.signals.queue_building();
-        let losses = self.signals.losses_without_queue_in_last(1);
-        let lost = losses > 0 || self.signals.loss_with_queue();
+        let bbr_queued = match (self.signals.round_min_rtt(), self.signals.min_rtt()) {
+            (Some(round_min), Some(base)) => {
+                round_min >= base + BBR_QUEUE_FLOOR.max(base.mul_f64(BBR_QUEUE_SHARE))
+            }
+            _ => false,
+        };
+        let lossy =
+            self.signals.losses_without_queue_in_last(1) > 0 || self.signals.loss_with_queue();
 
-        if queued {
-            self.queue.extend(now, 0);
-        } else {
-            self.queue.reset();
-        }
-        if !queued && rate < STARVED_FRACTION * best {
-            self.starved.extend(now, losses);
-        } else {
-            self.starved.reset();
-        }
-        if !queued && !lost && rate >= HOLDING_FRACTION * best {
-            self.quiet.extend(now, 0);
-        } else {
-            self.quiet.reset();
-        }
+        let streak = |s: &mut Streak, holds: bool, lossy: bool| {
+            if holds {
+                s.extend(now, lossy);
+            } else {
+                s.reset();
+            }
+        };
+        streak(&mut self.queue, bbr_queued, false);
+        streak(
+            &mut self.starved,
+            share >= GENTLE_LOSS_CAP && !queued && rate < STARVED_FRACTION * best,
+            lossy,
+        );
+        streak(
+            &mut self.quiet,
+            !queued && !lossy && rate >= HOLDING_FRACTION * best,
+            false,
+        );
+        streak(&mut self.loss_gone, share < GENTLE_LOSS_CAP / 2.0, false);
 
         let in_tier = now.saturating_duration_since(self.entered_at);
         let dwelt = self.rounds_in_tier >= DWELL_ROUNDS && in_tier >= DWELL_TIME;
-        let quiet = self.quiet.rounds >= QUIET_ROUNDS && self.quiet.lasted(now) >= QUIET_TIME;
+        let in_trial = self.rounds_in_tier < TRIAL_ROUNDS || in_tier < TRIAL_TIME;
+        let trial_limit =
+            (self.entry_share * TRIAL_RISE_FACTOR).max(self.entry_share + TRIAL_RISE_ABS);
+        let stretch = |s: &Streak| s.rounds >= QUIET_ROUNDS && s.lasted(now) >= QUIET_TIME;
         let decision = match self.tier_id {
             TierId::Three if self.queue.rounds >= QUEUE_ROUNDS => {
                 Some((TierId::Two, "a queue is building"))
+            }
+            TierId::Three if in_trial && share > trial_limit => {
+                self.backoff.fail(now);
+                Some((TierId::Two, "trial failed: the loss rose with the rate"))
+            }
+            TierId::Three if dwelt && stretch(&self.loss_gone) => {
+                Some((TierId::Two, "the loss is gone"))
             }
             TierId::One
                 if in_tier >= TIER_1_DWELL
@@ -217,14 +302,14 @@ impl Tapered {
             }
             TierId::Two
                 if dwelt
+                    && !self.backoff.locked(now)
                     && self.starved.rounds >= STARVED_ROUNDS
                     && self.starved.lasted(now) >= STARVED_TIME
                     && self.starved.losses >= STARVED_LOSSES =>
             {
                 Some((TierId::Three, "starved by loss without a queue"))
             }
-            TierId::Two if dwelt && quiet => Some((TierId::One, "quiet")),
-            TierId::Three if dwelt && quiet => Some((TierId::Two, "quiet")),
+            TierId::Two if dwelt && stretch(&self.quiet) => Some((TierId::One, "quiet")),
             _ => None,
         };
         if let Some((to, reason)) = decision {
@@ -279,20 +364,26 @@ impl Tapered {
             window_after = self.tier.controller().window(),
             rate = self.signals.delivery_rate(),
             best_rate = self.signals.best_rate(now),
+            loss_share = self.signals.loss_share(),
+            entry_share = self.entry_share,
             min_rtt_us = min_rtt.as_micros() as u64,
+            round_min_rtt_us = self.signals.round_min_rtt().map_or(0, |d| d.as_micros() as u64),
             srtt_us = self.signals.srtt().as_micros() as u64,
-            losses_without_queue_last_8 = self.signals.losses_without_queue_in_last(CLIMB_1_ROUNDS),
             starved_rounds = self.starved.rounds,
             quiet_rounds = self.quiet.rounds,
             queue_rounds = self.queue.rounds,
             rounds_in_tier = self.rounds_in_tier,
             "congestion tier switch"
         );
+        if to == TierId::Three {
+            self.entry_share = self.signals.loss_share();
+        }
         self.tier_id = to;
         self.entered_at = now;
         self.rounds_in_tier = 0;
         self.starved.reset();
         self.quiet.reset();
+        self.loss_gone.reset();
         self.queue.reset();
     }
 }
@@ -347,12 +438,13 @@ impl Controller for Tapered {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
-        let queued = self.signals.queue_building();
-        self.signals
+        // PathSignals judges whether this loss is congestion, in one place for every tier.
+        let congestion = self
+            .signals
             .on_loss(now, lost_bytes, is_persistent_congestion);
         match &mut self.tier {
             Tier::Cubic(cubic) => {
-                cubic.on_loss(now, sent, is_persistent_congestion, lost_bytes, queued)
+                cubic.on_loss(now, sent, is_persistent_congestion, lost_bytes, congestion)
             }
             Tier::Bbr(bbr) => {
                 bbr.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes)
