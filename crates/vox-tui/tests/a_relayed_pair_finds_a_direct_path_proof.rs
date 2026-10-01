@@ -77,7 +77,6 @@ fn is_still_relayed(l: &str) -> bool {
 #[test]
 #[ignore = "production Argon2id + a real PoW, a relayed pair held across two 60 s retries; run in release"]
 fn a_relayed_pair_finds_a_direct_path_once_one_becomes_possible() {
-    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let mut w = ForwardedWorld::new(false);
     eprintln!(

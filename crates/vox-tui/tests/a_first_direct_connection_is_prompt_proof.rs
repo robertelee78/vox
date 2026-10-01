@@ -91,7 +91,6 @@ fn stats(label: &str, samples: &[Duration]) -> Duration {
 #[test]
 #[ignore = "production Argon2id + a real PoW, a dozen cold `vox up` processes; run in release"]
 fn a_first_direct_connection_completes_in_under_two_seconds() {
-    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let w = ForwardedWorld::new(true);
     eprintln!(
