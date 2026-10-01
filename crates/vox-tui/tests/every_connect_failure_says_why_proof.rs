@@ -25,9 +25,9 @@
 //!    within [`CLOSED_WITHIN`] of the signal — a stop that just exited left the anchor and the host
 //!    counting it until their idle timeout.
 //! 2. **A join its host never answers** (left to run out): exit status 1, and the reason names the
-//!    host and the step that did not complete — the join exchange. The exchange's timeout used to
-//!    name nobody: the join ended on advice about members that could not be reached, for one that
-//!    had been reached and then went quiet.
+//!    host and the step that did not complete — the join exchange — and the advice says the host
+//!    was reached and did not answer. It ended on advice about members that could not be reached
+//!    ("ask a member to come online"), for one that had been reached and then went quiet.
 //! 3. **Refused** (a wrong room passphrase, checked by the live host): exit status 1, `cannot join:
 //!    …`, the refusal, and the steps. The refusal is the host's own answer over the circuit, so it
 //!    is also the control: this world's joins reach the host and are answered.
@@ -66,9 +66,9 @@
 //! before the handler is taken (case 5 dies by the signal); SIGQUIT or SIGHUP not taken (cases 1,
 //! 6 and 7 die by it); a stop that exits without closing (case 1's anchor counts the connect until
 //! its idle timeout); the terminal not handed back (case 5, still raw); the joiner not announcing
-//! its steps (case 1 names no join step); the exchange's timeout naming nobody (case 2); a stop
-//! that waits for the runtime's blocking work (case 1 outlives [`STOPS_WITHIN`] in a debug build,
-//! where the solve is long).
+//! its steps (case 1 names no join step); the advice for an exchange that ran out saying no member
+//! could be reached (case 2); a stop that waits for the runtime's blocking work (case 5: a prompt
+//! still reading holds the exit past [`STOPS_WITHIN`]).
 //!
 //! `#[ignore]`d: production Argon2id and a real PoW. Run it in release.
 
@@ -136,6 +136,11 @@ const JOIN_STEPS: [&str; 8] = [
     "sealing the room key",
     "making the room here",
 ];
+
+/// What `vox connect` says of a member it reached whose join exchange then ran out.
+const MEMBER_SILENT: &str = "a member was reached, but did not answer the join exchange in time";
+/// What it says when no member could be reached at all: never right for a member it reached.
+const NONE_REACHED: &str = "no member it knows could be reached";
 
 /// The join's steps that wait on one member, and name it.
 const MEMBER_STEPS: [&str; 3] = [
@@ -462,6 +467,14 @@ fn a_connect_stopped_by_a_signal_or_never_answered_says_why() {
          on.\n{}",
         e.describe()
     );
+    // And it says the member was reached and went quiet, not that no member could be reached:
+    // that advice sent a person to bring online a member that was online.
+    assert!(
+        e.stderr.contains(MEMBER_SILENT) && !e.stderr.contains(NONE_REACHED),
+        "never answered: the advice does not say the host was reached and did not answer \
+         ({MEMBER_SILENT:?}), or says no member could be reached ({NONE_REACHED:?}).\n{}",
+        e.describe()
+    );
     eprintln!(
         "[proof] ({PROFILE}) never answered: status {} in {:.1}s, the reason names the host",
         e.status,
@@ -490,7 +503,7 @@ fn a_refused_connect_and_one_without_its_host_say_why() {
     // that outlasts its patience: in a debug build on a loaded machine the solve alone has taken
     // 185 s. Then the passphrase was never checked, and the refusal cannot be measured — the
     // product still said why, which `failed_join` holds it to either way.
-    if !e.stderr.contains("refused") && e.stderr.contains(": the join exchange: ") {
+    if !e.stderr.contains("refused") && e.stderr.contains(MEMBER_SILENT) {
         failed_join(
             &e,
             "refused (a wrong passphrase)",

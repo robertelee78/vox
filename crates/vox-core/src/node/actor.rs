@@ -1823,13 +1823,6 @@ impl Joiner {
                     } else {
                         why.push(format!("{short}: exchange: {e}"));
                     }
-                    // **A member reached and then silent is not a member never reached**
-                    // (V210-85). The exchange's timeout said nothing of whom it waited on, so the
-                    // join ended on advice about members that could not be reached, for one that
-                    // had been — and had stopped answering a proof of work that outlasted it.
-                    if last_fault == Fault::Unreachable {
-                        why.push(format!("{short}: the join exchange: {e}"));
-                    }
                     if !worth_another_responder(last_fault) {
                         return Err(JoinerLost {
                             fault: last_fault,
