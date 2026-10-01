@@ -21,6 +21,15 @@ path = "src/lib.rs"
 name = "vox"
 path = "src/main.rs"
 
+# Optional proofs: expensive real-binary proofs of user-facing claims, run by hand and blocking
+# nothing. Without the feature each one compiles a stand-in instead, ignored with the reason
+# "OPTIONAL PROOF NOT RUN" (tests/support/optional_proof.rs), so it is never silent and never red
+# in CI. Run one with
+# `cargo test --release -p vox-tui --features optional-proofs --test <name> -- --ignored`.
+[features]
+optional-proofs = []
+heavy-proofs = ["optional-proofs"]
+
 [dependencies]
 vox-core = { path = "../vox-core" }
 # The app tier (ADR-020 §1). `vox room claim|release|handoff|board` are this crate's

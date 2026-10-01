@@ -25,7 +25,9 @@
 //! 8. a room that is not there → "nothing here matches";
 //! 9. `vox trust add` when the keyring already holds its 1,024 identities → the keyring is
 //!    full, and how to make room. It used to say "that is longer than this field allows"
-//!    (the generic size fault), which sent a person looking at the petname.
+//!    (the generic size fault), which sent a person looking at the petname. It runs in every
+//!    release build; in a debug build only with `--features optional-proofs`, since its 1,100
+//!    production-Argon2id `trust add`s take most of an hour there (#295), and the run says so.
 
 #![cfg(unix)]
 
@@ -57,6 +59,23 @@ const DEBUG_FILL_ADD: Duration = Duration::from_millis(2 * 74_330);
 /// two daemons, `trust remove`, `room post`, `connect`, `up` and two `forward`s) the test makes.
 const JOINS: u32 = 4;
 const UNLOCKS: u32 = 13;
+/// Whether case (9) runs: in every release build, and in a debug build only with the
+/// `optional-proofs` feature. A debug build's fill is 1,100 `trust add`s, each a production
+/// Argon2id check, and took 2,980.5 s and 3,792.7 s on its own; a heavy proof is opt-in, never in
+/// every run (the decider, 2026-09-30). Every other case still blocks in a debug build.
+const KEYRING_FILL: bool = !cfg!(debug_assertions) || cfg!(feature = "optional-proofs");
+/// The slowest of four whole debug runs of this proof with case (9): 3,265.6 s, 3,408.0 s,
+/// 3,566.5 s and 4,225.4 s (#295).
+const SLOWEST_DEBUG_RUN: Duration = Duration::from_millis(4_225_400);
+
+/// Say, past the test harness's capture, that `what` was not run, so a green run never reads as
+/// having proven it.
+fn not_run(what: &str) {
+    let _ = writeln!(
+        std::io::stderr(),
+        "OPTIONAL PROOF NOT RUN: {what}; it blocks nothing"
+    );
+}
 
 /// A long-running `vox`, killed by its own PID however the test ends; stdout and stderr
 /// collected separately.
@@ -229,27 +248,23 @@ fn free_tcp_port() -> u16 {
 #[test]
 #[ignore = "four real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn every_common_failure_names_its_cause() {
-    // A debug build's budget: its joins and unlocks at twice their measured most, and the fill's
-    // 138 rounds of eight `trust add`s, each at twice its measured most (#295). A release
-    // build's: 600 s.
-    let rounds = 1_100u32.div_ceil(8);
-    let fill = if cfg!(debug_assertions) {
-        DEBUG_FILL_ADD * rounds
+    if KEYRING_FILL {
+        if cfg!(debug_assertions) {
+            // Opted in: the debug fill alone is most of an hour (#295), so the budget is sized on
+            // the whole run, not summed from per-add maxima.
+            watchdog::arm_for_debug_total(SLOWEST_DEBUG_RUN, 4);
+        } else {
+            watchdog::arm();
+        }
     } else {
-        Duration::ZERO
-    };
-    let budget = Duration::from_secs(600) + watchdog::debug_cost(JOINS, UNLOCKS) + fill;
-    if cfg!(debug_assertions) {
-        eprintln!(
-            "[watchdog] debug build: budget {}s = 600s + {}s for {JOINS} join(s) and {UNLOCKS} \
-             unlock(s) + {rounds} fill round(s) x {:.1}s (twice the most of 2,200 measured adds, \
-             74.33s)",
-            budget.as_secs(),
-            watchdog::debug_cost(JOINS, UNLOCKS).as_secs(),
-            DEBUG_FILL_ADD.as_secs_f64()
+        // A debug build without case (9): its joins and unlocks at twice their measured most.
+        watchdog::arm_for_setup(JOINS, UNLOCKS);
+        not_run(
+            "case (9), the keyring-full refusal, in a debug build: its 1,100 production-Argon2id \
+             `trust add`s take most of an hour there; it runs in every release build, or here \
+             with --features optional-proofs",
         );
     }
-    watchdog::arm_for(budget);
     let tmp = tempfile::tempdir().unwrap();
     let dir = |n: &str| {
         let d = tmp.path().join(n);
@@ -377,73 +392,75 @@ fn every_common_failure_names_its_cause() {
     assert!(!ok, "removing a trust that does not exist must fail");
     assert_says("trust remove, never trusted", &said, &["never trusted"]);
 
-    // ---- (9) trust past the keyring's limit ----
-    // 1,100 distinct identities, eight at a time: more than the keyring holds, whatever it
-    // held already. Enough must be trusted to fill it, at least one must be refused, and
-    // every refusal must say the keyring is full. Eight at a time is possible because a
-    // passphrase check no longer runs on the node's actor (V210-26); one at a time, it
-    // took longer than the test watchdog allows.
-    let tried = 1_100usize;
-    let fill = Instant::now();
-    let (refusals, mut took): (Vec<String>, Vec<Duration>) = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..8usize)
-            .map(|t| {
-                let joiner_dir = &joiner_dir;
-                scope.spawn(move || {
-                    let (mut refused, mut took) = (Vec::new(), Vec::new());
-                    for n in (t..tried).step_by(8) {
-                        let mut id = [0u8; 32];
-                        id[..8].copy_from_slice(&(n as u64 + 1).to_be_bytes());
-                        id[31] = 0x5A;
-                        let fp = vox_core::node::link::b32_encode(&id);
-                        let (ok, said, elapsed) = vox(
-                            joiner_dir,
-                            &["trust", "add", &fp, "--name", &format!("filler-{n}")],
-                            "",
-                            add_quick,
-                        );
-                        took.push(elapsed);
-                        if !ok {
-                            refused.push(said);
+    if KEYRING_FILL {
+        // ---- (9) trust past the keyring's limit ----
+        // 1,100 distinct identities, eight at a time: more than the keyring holds, whatever it
+        // held already. Enough must be trusted to fill it, at least one must be refused, and
+        // every refusal must say the keyring is full. Eight at a time is possible because a
+        // passphrase check no longer runs on the node's actor (V210-26); one at a time, it
+        // took longer than the test watchdog allows.
+        let tried = 1_100usize;
+        let fill = Instant::now();
+        let (refusals, mut took): (Vec<String>, Vec<Duration>) = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8usize)
+                .map(|t| {
+                    let joiner_dir = &joiner_dir;
+                    scope.spawn(move || {
+                        let (mut refused, mut took) = (Vec::new(), Vec::new());
+                        for n in (t..tried).step_by(8) {
+                            let mut id = [0u8; 32];
+                            id[..8].copy_from_slice(&(n as u64 + 1).to_be_bytes());
+                            id[31] = 0x5A;
+                            let fp = vox_core::node::link::b32_encode(&id);
+                            let (ok, said, elapsed) = vox(
+                                joiner_dir,
+                                &["trust", "add", &fp, "--name", &format!("filler-{n}")],
+                                "",
+                                add_quick,
+                            );
+                            took.push(elapsed);
+                            if !ok {
+                                refused.push(said);
+                            }
                         }
-                    }
-                    (refused, took)
+                        (refused, took)
+                    })
                 })
-            })
-            .collect();
-        let (mut refused, mut took) = (Vec::new(), Vec::new());
-        for h in handles {
-            let (r, t) = h.join().unwrap();
-            refused.extend(r);
-            took.extend(t);
-        }
-        (refused, took)
-    });
-    took.sort_unstable();
-    let trusted = tried - refusals.len();
-    eprintln!(
-        "[keyring] {trusted} of {tried} trusted, {} refused, in {:.1?}; one `trust add`, eight \
-         at a time: median {:.2?}, most {:.2?}",
-        refusals.len(),
-        fill.elapsed(),
-        took[took.len() / 2],
-        took[took.len() - 1]
-    );
-    assert!(
-        trusted >= 1_000,
-        "only {trusted} identities were trusted before the refusals began; the keyring \
-         cannot have been full"
-    );
-    assert!(
-        !refusals.is_empty(),
-        "CANNOT MEASURE (9): {tried} identities were trusted and the keyring never filled"
-    );
-    for said in &refusals {
-        assert_says(
-            "trust add, keyring full",
-            said,
-            &["keyring is full", "vox trust remove"],
+                .collect();
+            let (mut refused, mut took) = (Vec::new(), Vec::new());
+            for h in handles {
+                let (r, t) = h.join().unwrap();
+                refused.extend(r);
+                took.extend(t);
+            }
+            (refused, took)
+        });
+        took.sort_unstable();
+        let trusted = tried - refusals.len();
+        eprintln!(
+            "[keyring] {trusted} of {tried} trusted, {} refused, in {:.1?}; one `trust add`, eight \
+             at a time: median {:.2?}, most {:.2?}",
+            refusals.len(),
+            fill.elapsed(),
+            took[took.len() / 2],
+            took[took.len() - 1]
         );
+        assert!(
+            trusted >= 1_000,
+            "only {trusted} identities were trusted before the refusals began; the keyring \
+             cannot have been full"
+        );
+        assert!(
+            !refusals.is_empty(),
+            "CANNOT MEASURE (9): {tried} identities were trusted and the keyring never filled"
+        );
+        for said in &refusals {
+            assert_says(
+                "trust add, keyring full",
+                said,
+                &["keyring is full", "vox trust remove"],
+            );
+        }
     }
 
     // ---- (8) a room that is not there ----
