@@ -78,6 +78,24 @@
 //! on the next run), and a hang is minutes or hours over, so the headroom costs the watchdog
 //! nothing. A release build's budget is unchanged.
 //!
+//! ## Why it does not say "hung"
+//! It used to say "It is hung, not slow … the runtime is not making progress" every time. In a
+//! real-binary proof the test process is only waiting on its children, and a runner that stopped
+//! scheduling it — or a machine that slept — looks the same from here. So it says what it can
+//! measure (V210-106): how long the process ran by the monotonic and the wall clock, how far its
+//! own sleeps overran (a stall of this process), and how much CPU this process and each one it
+//! started used over the last two seconds (a spinning or a waiting product) — and from that, which
+//! side the budget was exceeded on: a PRODUCT HANG, an APPARATUS STALL, or NO RESULT.
+//!
+//! ## Why its verdict is the first red line, and the process ends by its abort
+//! Killing a proof's processes kills the `vox` verb a test thread is waiting on. That thread used
+//! to panic on the verb's empty stderr ("bob joins: ", or "ipc closed before reply" when it was the
+//! daemon under the join that died), and libtest exited 101 — an ordinary red with no cause, or a
+//! false one — before the kill had looked again (V210-99, 4 of 5 staged aborts). So once it fires,
+//! a test thread that panics parks, and a process exit (libtest's on a red, or `main` returning)
+//! waits: nothing but the watchdog's abort ends the process, and nothing but its verdict and dumps
+//! precedes it.
+//!
 //! The budget is deliberately generous: it is not a performance assertion, it is the line past
 //! which "slow" is no longer a credible explanation. Override with `VOX_TEST_WATCHDOG_SECS`,
 //! and `VOX_TEST_WATCHDOG_SECS=0` disables it — for attaching a debugger, which is the one
@@ -87,10 +105,15 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, Once};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-/// Past this, a gate is hung rather than slow. The longest gate observed is ~53 s.
+/// Past this, a gate is stuck — a product hang or an apparatus stall — rather than slow. The
+/// longest gate observed is ~53 s.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(600);
+
+/// A sleep of the watchdog's that overran by more than this means this process was not scheduled
+/// for that long — the runner stalled it, or the machine slept.
+const STALL: Duration = Duration::from_secs(5);
 
 /// Twice the most one join cost a debug build: `vox room join` returning, its proof of work solved by the
 /// joining node, measured on the equivocation proof's staging (an anchor, five daemons, four
@@ -190,7 +213,7 @@ static ARMED: Once = Once::new();
 /// (see [`arm_for`]).
 static FIRING: AtomicBool = AtomicBool::new(false);
 
-/// Every descendant [`census`] has seen: `(pid, start time)`.
+/// Every descendant [`record_descendants`] has seen: `(pid, start time)`.
 static SEEN: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
 
 /// The tests that armed the watchdog and have not finished, by libtest's thread name — which is
@@ -255,36 +278,62 @@ pub fn arm_for(default_budget: Duration) {
         let budget = move || {
             fixed.unwrap_or_else(|| Duration::from_secs(BUDGET_SECS.load(Ordering::Relaxed)))
         };
-        // **Once the watchdog fires, the test cannot end the process first** (#295). Killing a
-        // proof's processes kills the `vox` verb a test thread is waiting on; that thread then
-        // panicked on the verb's empty stderr, libtest exited 101 as an ordinary red with no
-        // cause, and the kill loop never finished. So while it fires, a panicking test thread
-        // parks: the first red line is the watchdog's own, every descendant is looked for until
-        // none is left, and the abort is SIGABRT.
+        // **Once the watchdog fires, the test cannot end the process first** (#295; see the
+        // module's docs). A test thread that panics parks instead of reporting, and an exit —
+        // libtest's `exit(101)` on a red, or `main` returning — waits for the abort.
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let watchdog = std::thread::current().name() == Some("vox-test-watchdog");
             if FIRING.load(Ordering::SeqCst) && !watchdog {
-                loop {
-                    std::thread::park();
-                }
+                hold();
             }
             previous(info);
         }));
+        // SAFETY: `atexit` is the C library's, which every Rust program on these platforms links;
+        // `hold_exit` takes no arguments, never unwinds, and touches only an atomic.
+        unsafe {
+            atexit(hold_exit);
+        }
         let started = Instant::now();
+        let wall = SystemTime::now();
         std::thread::Builder::new()
             .name("vox-test-watchdog".to_owned())
             .spawn(move || {
+                // Its own clock: the largest overrun of one of its sleeps, and when it happened.
+                let mut overslept = (Duration::ZERO, Duration::ZERO);
                 while started.elapsed() < budget() {
-                    census();
-                    std::thread::sleep(
-                        CENSUS_EVERY.min(budget().saturating_sub(started.elapsed())),
-                    );
+                    record_descendants();
+                    let ask = CENSUS_EVERY.min(budget().saturating_sub(started.elapsed()));
+                    let asked = Instant::now();
+                    std::thread::sleep(ask);
+                    let over = asked.elapsed().saturating_sub(ask);
+                    if over > overslept.0 {
+                        overslept = (over, started.elapsed());
+                    }
                 }
-                fire(started.elapsed(), budget());
+                let by_wall = wall.elapsed().unwrap_or_default();
+                fire(started.elapsed(), by_wall, overslept, budget());
             })
             .ok();
     });
+}
+
+extern "C" {
+    fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+}
+
+/// Run at the process's exit: while the watchdog fires, the exit waits for its abort.
+extern "C" fn hold_exit() {
+    if FIRING.load(Ordering::SeqCst) {
+        hold();
+    }
+}
+
+/// Park this thread for good: the watchdog's abort ends the process.
+fn hold() -> ! {
+    loop {
+        std::thread::park();
+    }
 }
 
 /// One row of the process table.
@@ -353,8 +402,8 @@ fn etime_secs(etime: &str) -> Option<u64> {
 /// Every live process this test process started, parents before children:
 ///
 /// - its descendants, found by parent pid;
-/// - every process [`census`] saw as a descendant and that still runs as the same process, though
-///   its parent has since died and it was reparented to init;
+/// - every process [`record_descendants`] saw as a descendant and that still runs as the same
+///   process, though its parent has since died and it was reparented to init;
 /// - every orphan (reparented to init) in this process's group that started after this process
 ///   did — a process started under a `sh` that has exited, or that daemonized, before the
 ///   census ever saw it;
@@ -405,7 +454,7 @@ fn ours() -> Vec<u32> {
 
 /// Record every descendant this process has now, by pid and start time, for [`ours`]: a process
 /// whose parent dies is reparented to init and is no longer found by parent pid.
-fn census() {
+fn record_descendants() {
     let rows = table();
     let me = std::process::id();
     let mut found = vec![me];
@@ -440,23 +489,75 @@ fn kill_all(pids: &[u32]) -> usize {
     killed
 }
 
-/// Say why, dump every thread, and abort.
-fn fire(elapsed: Duration, budget: Duration) -> ! {
+/// Say what is known, dump every thread, and abort.
+fn fire(
+    elapsed: Duration,
+    by_wall: Duration,
+    (overslept, overslept_at): (Duration, Duration),
+    budget: Duration,
+) -> ! {
     FIRING.store(true, Ordering::SeqCst);
     let running = RUNNING
         .lock()
         .map(|r| r.join("\n    "))
         .unwrap_or_else(|_| "<unknown: the list's lock was poisoned>".to_owned());
+    let stalled = overslept > STALL;
+    let stall = if stalled {
+        format!(
+            "THIS PROCESS STALLED: one {CENSUS_EVERY:?} sleep came back {overslept:?} late, \
+             {overslept_at:?} in.\n  The runner did not schedule it for that long, so an \
+             APPARATUS STALL is likely."
+        )
+    } else {
+        format!(
+            "this process was scheduled throughout: no {CENSUS_EVERY:?} sleep came back more than \
+             {overslept:?} late."
+        )
+    };
+    let slept = by_wall.saturating_sub(elapsed);
+    let asleep = slept > STALL;
+    let slept = if asleep {
+        format!(
+            "THE MACHINE SLEPT: the wall clock ran {slept:?} ahead of the monotonic one. A run that \
+             overlapped a sleep is NO RESULT."
+        )
+    } else {
+        format!(
+            "the wall clock agrees with the monotonic one (within {slept:?}): no machine sleep."
+        )
+    };
+    // The side, from what was measured: a machine that slept or a process that was not scheduled
+    // is the apparatus's; a process that ran throughout on an awake machine and still did not
+    // finish was held up by what it waits on — the product it drives.
+    let verdict = if asleep {
+        "NO RESULT: the machine slept during the run (below), so the budget measured nothing."
+    } else if stalled {
+        "APPARATUS STALL: this process was not scheduled for longer than the stall line (below)."
+    } else {
+        "PRODUCT HANG: this process was scheduled throughout and the machine did not sleep, so\n\
+         the time went to what it waits on — the `vox` processes it started (CPU below:\n\
+         one near 100% is spinning, one near 0 is stuck waiting)."
+    };
+    // Found once, before any diagnostic runs: `ps` and `sample` are children of this process too,
+    // and are waited for, so they are never in the list.
+    let children = ours();
+    let cpu = cpu_census(&children);
     say(&format!(
         "\n\
          ==================== vox test watchdog ====================\n\
-         This test process has been running for {elapsed:?} and is being aborted.\n\
+         This test process has run for {elapsed:?} ({by_wall:?} by the wall clock) against a\n\
+         budget of {budget:?}, and is being aborted.\n\
          \n\
-         APPARATUS: the test's budget is exceeded ({budget:?}). This is not yet a\n\
-         product verdict: it is a product hang OR an apparatus stall (a `vox` it\n\
-         started stuck, the test itself not making progress, or a machine too\n\
-         slow for the budget). The dumps below say which: a test process only\n\
-         waiting on its children points at the descendant that is busy or stuck.\n\
+         BUDGET EXCEEDED. {verdict}\n\
+         \n\
+         What this watchdog measured:\n\
+         \n\
+         - {stall}\n\
+         - {slept}\n\
+         - CPU over the last 2 s, this test process and every process it started (a\n  \
+         product near 0 is waiting on something; one near 100% is spinning; a\n  \
+         process in state T was stopped by the proof itself):\n\
+         {cpu}\n\
          \n\
          Tests still running:\n    {running}\n\
          \n\
@@ -471,9 +572,6 @@ fn fire(elapsed: Duration, budget: Duration) -> ! {
          ===========================================================\n"
     ));
     dump_threads(std::process::id());
-    // Found once, before any diagnostic runs: `ps` and `sample` are children of this process too,
-    // and are waited for, so they are never in the list.
-    let children = ours();
     dump_descendants(&children);
     say("==================== vox test watchdog: end of thread dump; aborting ====================\n");
     let (killed, left) = kill_every_descendant();
@@ -487,6 +585,67 @@ fn fire(elapsed: Duration, budget: Duration) -> ! {
         }
     ));
     std::process::abort();
+}
+
+/// One line per process — this one, then `pids` — with its state, its CPU over the last 2 s, and
+/// its command line, from two `ps` samples 2 s apart.
+fn cpu_census(pids: &[u32]) -> String {
+    let all: Vec<u32> = std::iter::once(std::process::id())
+        .chain(pids.iter().copied())
+        .collect();
+    let sample = || -> Vec<(u32, String, Option<f64>, String)> {
+        let list = all.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let Ok(out) = Command::new("ps")
+            .args(["-o", "pid=,state=,time=,command=", "-p", &list])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut w = l.split_whitespace();
+                let pid = w.next()?.parse().ok()?;
+                let state = w.next()?.to_owned();
+                let time = cpu_secs(w.next()?);
+                Some((pid, state, time, w.collect::<Vec<_>>().join(" ")))
+            })
+            .collect()
+    };
+    let before = sample();
+    std::thread::sleep(Duration::from_secs(2));
+    let after = sample();
+    if after.is_empty() {
+        return "    (ps reported nothing: CPU unknown)".to_owned();
+    }
+    after
+        .iter()
+        .map(|(pid, state, time, command)| {
+            let was = before.iter().find(|(p, ..)| p == pid).and_then(|b| b.2);
+            let used = match (was, time) {
+                (Some(a), Some(b)) => format!("{:>5.0}%", (b - a).max(0.0) / 2.0 * 100.0),
+                _ => "    ?%".to_owned(),
+            };
+            let command: String = command.chars().take(100).collect();
+            format!("    {pid:>7} {state:<4} {used}  {command}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `ps`'s cumulative CPU time in seconds: `[[dd-]hh:]mm:ss[.ff]`.
+fn cpu_secs(t: &str) -> Option<f64> {
+    let (days, rest) = match t.split_once('-') {
+        Some((d, r)) => (d.parse::<f64>().ok()?, r),
+        None => (0.0, t),
+    };
+    let mut secs = days * 86_400.0;
+    let mut unit = 1.0;
+    for part in rest.rsplit(':') {
+        secs += part.parse::<f64>().ok()? * unit;
+        unit *= 60.0;
+    }
+    Some(secs)
 }
 
 /// Kill every process this test process started ([`ours`]) until a fresh look finds none, and
