@@ -239,8 +239,9 @@ pub enum NodeCommand {
         /// The text.
         text: String,
     },
-    /// Produce a `vox://` invite link for a channel this node holds open, naming
-    /// this node as anchor and responder. The link arrives as
+    /// Produce a `vox://` invite link for a channel this node holds open, naming this
+    /// node, and any anchors the room uses, as where to reach the room, with this node as
+    /// responder. The link arrives as
     /// [`NodeEvent::InviteLink`]; it carries no secret (ADR-016).
     Invite {
         /// The channel to invite to.
@@ -454,14 +455,14 @@ pub enum Fault {
     /// board was reached after 20s, held nothing for the room, and the advice pointed at the
     /// address.
     RoomNotOnBoard,
-    /// A join could not reach any board: every anchor it knew of (the link's, and this node's
-    /// own) failed to answer within the join's patience, or stopped answering while it read the
-    /// room. No member was asked anything.
+    /// A join could not reach any board: every board it knew of — the link's entries, the room's
+    /// host among them, and this node's anchors — failed to answer within the join's patience,
+    /// or stopped answering while it read the room. No member was asked anything.
     ///
     /// **Not [`Fault::Unreachable`].** A join reported both as one, and the CLI's words for it
     /// said "every member the board knows is offline" — a claim about members, made when the
-    /// board itself was never reached (#192). The two need different fixes: an anchor that is
-    /// down, or a member that is.
+    /// board itself was never reached (#192). The two need different fixes: a host (or the anchor
+    /// it uses) that is down or out of reach, or a member that is.
     BoardUnreachable,
     /// A peer could not be reached (no live endpoint, or the dial failed).
     Unreachable,
@@ -574,7 +575,7 @@ impl Fault {
                 "the board holds nothing for that room\n       either its host has not published it there yet (the host must be online; then try again)\n       or the room part of the address is wrong: check it against the address you were sent"
             }
             Fault::BoardUnreachable => {
-                "the anchor could not be reached, so no member was asked\n       check that the anchor is running and that this node can reach its address"
+                "no board the join tried could be read — the room's host, or an anchor if one was tried — so no member was asked\n       check that the host is running and that this machine can reach its address"
             }
             Fault::Unreachable => {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
@@ -870,6 +871,21 @@ pub enum NodeEvent {
         peer: Digest32,
         /// What happened, for the operator.
         note: String,
+    },
+    /// More peers dialled this node at once than it runs handshakes for, and the ones past the
+    /// cap waited for a slot or were refused (V210-86): said once per burst, when none is left
+    /// waiting, so an operator can see a burst was absorbed, or how many were turned away.
+    HandshakesQueued {
+        /// How many attempts waited for a slot.
+        waited: usize,
+        /// The most that waited at once.
+        most_waiting: usize,
+        /// The most handshakes that ran at once meanwhile: never more than the cap.
+        most_running: usize,
+        /// How many were refused: no place left to wait, or no slot in time.
+        refused: usize,
+        /// The longest any waited, in milliseconds.
+        longest_ms: u64,
     },
     /// A join failed, with what each responder that was tried reported.
     ///

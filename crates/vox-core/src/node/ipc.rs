@@ -73,9 +73,10 @@ pub const MAX_FRAME: usize = 256 * 1024;
 pub const ROWS_BUDGET: usize = MAX_FRAME / 2;
 
 /// The environment variable [`frame_limit`] reads. **Test-only.**
+#[cfg(feature = "test-knobs")]
 pub const TEST_MAX_FRAME_ENV: &str = "VOX_TEST_MAX_FRAME";
 
-/// The smallest frame [`TEST_MAX_FRAME_ENV`] may set: half of it still carries the largest room
+/// The smallest frame `VOX_TEST_MAX_FRAME` may set: half of it still carries the largest room
 /// or trusted-identity entry, so a listing still pages.
 pub const MIN_TEST_FRAME: usize = 4 * 1024;
 
@@ -91,6 +92,7 @@ pub const MIN_TEST_FRAME: usize = 4 * 1024;
 /// [`MIN_TEST_FRAME`]..=[`MAX_FRAME`]; unset, empty or unparsable is [`MAX_FRAME`]. Under it, a
 /// single row larger than half the frame (a long message) is refused, so a proof that sets it
 /// keeps its rows small.
+#[cfg(feature = "test-knobs")]
 #[must_use]
 pub fn frame_limit() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -100,6 +102,14 @@ pub fn frame_limit() -> usize {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map_or(MAX_FRAME, |n| n.clamp(MIN_TEST_FRAME, MAX_FRAME))
     })
+}
+
+/// The largest frame accepted: [`MAX_FRAME`]. The proof-only lower limit is not compiled in
+/// without the `test-knobs` feature (V210-105).
+#[cfg(not(feature = "test-knobs"))]
+#[must_use]
+pub const fn frame_limit() -> usize {
+    MAX_FRAME
 }
 
 /// What one reply may carry in force: half of [`frame_limit`] ([`ROWS_BUDGET`] unless a proof
@@ -174,6 +184,8 @@ const T_PUBLISH_REFUSED: u64 = 1717;
 const T_PUBLISH_CURED: u64 = 2091;
 /// `NodeEvent::ConnectionNote` (#229's diagnostics). Additive, beside `T_PUBLISH_CURED`.
 const T_CONNECTION_NOTE: u64 = 2092;
+/// `NodeEvent::HandshakesQueued` (V210-86). Additive, away from the tags beside it.
+const T_HANDSHAKES_QUEUED: u64 = 2186;
 /// `NodeEvent::AddressWithheld` (V210-96). Additive, away from the sequential range and the tags
 /// other lines use.
 const T_ADDRESS_WITHHELD: u64 = 2296;
@@ -971,6 +983,21 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::ConnectionNote { peer, note } => {
             e.array(3).uint(T_CONNECTION_NOTE).bytes(peer).text(note);
         }
+        NodeEvent::HandshakesQueued {
+            waited,
+            most_waiting,
+            most_running,
+            refused,
+            longest_ms,
+        } => {
+            e.array(6)
+                .uint(T_HANDSHAKES_QUEUED)
+                .uint(*waited as u64)
+                .uint(*most_waiting as u64)
+                .uint(*most_running as u64)
+                .uint(*refused as u64)
+                .uint(*longest_ms);
+        }
         NodeEvent::SyncFailed {
             channel_id,
             peer,
@@ -1282,6 +1309,23 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedIpc("ipc room not remembered why"))?
                 .to_owned(),
         },
+        (T_HANDSHAKES_QUEUED, 6) => {
+            let mut count = |what| {
+                d.uint()
+                    .ok()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or(Error::MalformedIpc(what))
+            };
+            NodeEvent::HandshakesQueued {
+                waited: count("ipc handshakes waited")?,
+                most_waiting: count("ipc handshakes most waiting")?,
+                most_running: count("ipc handshakes most running")?,
+                refused: count("ipc handshakes refused")?,
+                longest_ms: d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc handshakes longest"))?,
+            }
+        }
         (T_ADDRESS_NOTE, 3) => NodeEvent::AddressNote {
             channel_id: digest(d)?,
             note: d

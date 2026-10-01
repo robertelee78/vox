@@ -531,8 +531,17 @@ impl ConnectionManager {
     /// Replace `peer`'s silent (or closed) primary with a retired connection to the same peer
     /// that is still being heard from, if there is one. The dead primary is closed: if anything
     /// is still behind it the close tells it which connection this end chose, and if nothing is
-    /// there it costs a packet. Among several candidates the lowest [`tie_key`] wins, the same
-    /// order the far end uses.
+    /// there it costs a packet. Among several candidates the best [`PathClass`] wins and then the
+    /// lowest [`tie_key`], the order filing uses and so the one the far end kept.
+    ///
+    /// **Path class first (V210-110, #306).** By tie key alone, a node whose primary to a peer
+    /// had died promoted the relayed connection a join started on over the direct one both ends
+    /// had settled on, because its key happened to be lower. Its sessions to that peer then ran
+    /// through the anchor while the peer used the direct path: measured with three real daemons,
+    /// bob promoted relayed `34eff6fe` over direct `3d6af8fa`, which carol held, and when the
+    /// anchor stopped, bob's session to carol waited out its 5 s setup, and carol read none of
+    /// what bob held until the anchor came back. An anchor only bridges hosts that cannot
+    /// otherwise reach each other (ADR-012).
     ///
     /// This is the half of the rule the filing cannot do alone. A restarted peer's connection
     /// arrives while the old one has been silent only a few seconds, so it goes to the
@@ -551,7 +560,9 @@ impl ConnectionManager {
             .iter()
             .enumerate()
             .filter(|(_, (c, _))| c.peer_id() == *peer && is_live(c) && !self.is_dead(c))
-            .min_by_key(|(_, (c, _))| tie_key(c))
+            .min_by_key(|(_, (c, _))| {
+                (std::cmp::Reverse(path_class(&self.endpoint, c)), tie_key(c))
+            })
             .map(|(i, _)| i)?;
         let (conn, _) = retiring.swap_remove(best);
         drop(retiring);
@@ -1038,18 +1049,6 @@ impl ConnectionManager {
             }
         });
         before - retiring.len()
-    }
-
-    /// Retire `conn` as [`Self::file`] would when a better path displaces it. For proofs of
-    /// the retirement rule, which otherwise needs two real paths to the same peer.
-    #[doc(hidden)]
-    pub fn retire_for_test(&self, conn: &Arc<VoxConnection>) {
-        // Exactly what `file` does: the displaced connection leaves the per-peer map and
-        // moves to the retiring list. Leaving it in the map would keep a reference of the
-        // manager's own, which is not what "still carried" means.
-        lock(&self.conns).retain(|_, c| !Arc::ptr_eq(c, conn));
-        let at = (self.clock)().saturating_add(self.retire_grace_secs);
-        lock(&self.retiring).push((Arc::clone(conn), at));
     }
 
     /// How many displaced connections are still within their grace.

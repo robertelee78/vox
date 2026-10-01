@@ -262,6 +262,16 @@ pub enum Error {
     #[error("peer unreachable — {0}")]
     LadderExhausted(String),
 
+    /// A QUIC handshake failed for a reason other than authentication: the peer refused or
+    /// closed the connection, never answered, or this node's endpoint is closing.
+    ///
+    /// Every handshake failure used to be [`Self::SignatureInvalid`], so a peer that was shutting
+    /// down, or a dial nobody answered, reached the operator as "signature verification failed" —
+    /// an alarm about keys for what is a closed door (V210-81). A failure of authentication itself
+    /// still is `SignatureInvalid`.
+    #[error("the connection could not be set up: {0}")]
+    Handshake(String),
+
     /// This node could not listen on a local address it was told to use.
     ///
     /// Carried whole rather than as a `&'static str`: "quic endpoint bind" was the only thing
@@ -346,17 +356,18 @@ pub enum Error {
     MalformedAnchor(&'static str),
 
     /// The anchors file names no anchor that can be used — every line of it was skipped — and
-    /// no `--anchor` was given (V210-75). A verb that needs an anchor refuses to start rather
-    /// than run with none: with every line skipped, the node would reach nobody it cannot dial
-    /// directly, and say nothing about why.
+    /// no `--anchor` was given (V210-75). **Said, never a refusal** (V210-107): the file is
+    /// named and skipped, and the verb runs anchorless, reaching whoever it can reach directly.
+    /// An anchor only bridges hosts that cannot otherwise reach each other (ADR-012), so a verb
+    /// that truly needs one fails where it needs it, not here.
     #[error(
-        "the anchors file {path} names no usable anchor ({skipped} line(s) skipped, said above); \
-         fix it, or give --anchor"
+        "the anchors file {path} names no usable anchor ({skipped} skipped, each said above); \
+         a peer this machine can reach directly needs none"
     )]
     AnchorsFileUnusable {
         /// The anchors file.
         path: String,
-        /// How many of its lines were skipped.
+        /// How many of its lines were skipped; 1 for a file that cannot be read at all.
         skipped: usize,
     },
 

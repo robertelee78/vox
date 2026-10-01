@@ -345,6 +345,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
         NetEvent::LockSettled => "answering a lock that has settled",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
+        NetEvent::HandshakesQueued { .. } => "saying how a burst of connection attempts went",
         NetEvent::Stopped { .. } => "shutting the network down",
     }
 }
@@ -427,8 +428,10 @@ pub struct NodeConfig {
     pub bind: Option<Bind>,
     /// An override for the ADR-005 PoW parameters a join binds (tests reduce them).
     pub pow_params: Option<crate::join::pow::PowParams>,
-    /// The anchors this node publishes to, reads from, climbs its ladder through and
-    /// names in invite links (ADR-012 §"Bootstrap": the user's own always-on node).
+    /// The anchors, if any, that bridge this node to peers it cannot reach directly
+    /// (ADR-012): it publishes to, reads from, climbs its ladder through and names in invite
+    /// links whichever it has. Empty is a whole configuration: peers that can reach each
+    /// other directly need no anchor.
     pub anchors: BootstrapSet,
     /// A **headless** identity (ADR-016 `vox node`): a transport identity that is not
     /// a vault. With one, the node networks the moment it is spawned — there is no
@@ -550,6 +553,16 @@ impl NodeConfig {
 /// identity, which the anchor still knew by its dead predecessor's connection — had no helper
 /// for up to 30 s (CI run 36418572653: a first relayed connection in 30065 ms, 55 attempts).
 const ANCHOR_REDIAL_SECS: u64 = 30;
+
+/// The longest an anchor whose **dial failed** waits before the next (V210-86, #278). Every
+/// second of it is a second a member stays away after its anchor is back: doubled to
+/// [`ANCHOR_REDIAL_SECS`], a member whose dials failed while its anchor restarted could come back
+/// up to 30 s after it. A dial that failed never became a connection, so what a shorter wait costs
+/// the anchor is bounded by its handshake cap and queue (`HANDSHAKES_IN_FLIGHT`,
+/// `HANDSHAKES_WAITING`). At the cap the wait is 1 or 2 s at random, so a room's members do not
+/// redial in step. A connection lost as soon as it is made (a flap, [`ANCHOR_FLAP_SECS`]) still
+/// backs off to [`ANCHOR_REDIAL_SECS`]: each of those was a whole handshake.
+const ANCHOR_UNREACHED_REDIAL_SECS: u64 = 2;
 
 /// The most addresses one dial of an anchor tries (V210-75): four rooms' worth of the
 /// [`MAX_ENDPOINTS`](crate::nat::multiaddr::MAX_ENDPOINTS) one room may name for it. An anchor
@@ -998,6 +1011,20 @@ enum NetEvent {
         conn: Arc<crate::transport::quic::VoxConnection>,
         /// The authorized stream.
         inbound: Inbound,
+    },
+    /// A burst of inbound attempts that waited for a handshake slot, or were refused, is over
+    /// (V210-86).
+    HandshakesQueued {
+        /// How many waited.
+        waited: usize,
+        /// The most that waited at once.
+        most_waiting: usize,
+        /// The most handshakes that ran at once meanwhile.
+        most_running: usize,
+        /// How many were refused.
+        refused: usize,
+        /// The longest any waited.
+        longest: Duration,
     },
     /// The accept loop stopped (the endpoint closed).
     Stopped {
@@ -1498,47 +1525,101 @@ struct PairwiseIn {
 /// duplicate pairs disagreed before the tie-break became order-independent, 0 of 28 after.
 ///
 /// # The bound, and what a flood costs
-/// At most [`HANDSHAKES_IN_FLIGHT`] handshakes run at once. At the cap an attempt is never
-/// queued — queueing would put the wait back into this loop:
+/// At most [`HANDSHAKES_IN_FLIGHT`] handshakes run at once. An attempt past the cap never waits
+/// in this loop — that would put the wait back into it:
 ///
 /// - an attempt whose source address is **not yet validated** gets `retry()`, a QUIC Retry
 ///   packet that makes the client prove it can receive at the address it claims before
 ///   anything is allocated. A spoofed flood cannot answer one; a real peer pays one round
 ///   trip. Before this, one spoofed packet cost an attacker a packet and cost the node a
 ///   handshake slot.
-/// - an attempt that **is** validated gets `refuse()`, because for a peer that has proven
-///   itself the honest answer is "not now", not another round trip.
+/// - an attempt that **is** validated waits for a slot on a task of its own, up to
+///   [`HANDSHAKE_WAIT`], with at most [`HANDSHAKES_WAITING`] waiting at once; past either it
+///   gets `refuse()`. It used to be refused at once (V210-86, #278): a peer that has proven
+///   itself was told "not now", which its dialler cannot tell from a failed dial and backs off
+///   like one — 1, 2, 4… seconds, doubling to half a minute. After an anchor restart every
+///   member redials within the same second, so every one past the 64th was sent away:
+///   measured against the shipped `vox node`, 300 identities dialling at once got 107–188 in,
+///   and all 511 failures were `CONNECTION_REFUSED`. A short wait costs a slot nothing, and
+///   those members are in within the burst instead of on a backoff.
+///
+/// Waiting holds a pending attempt (its first packets, which quinn bounds), not a handshake.
+/// When a burst has waited or been refused, the node says how it went
+/// ([`NodeEvent::HandshakesQueued`]).
 ///
 /// **Residual, stated rather than implied:** 64 *validated* handshakes that stall still
 /// deny service for up to `HANDSHAKE_TIMEOUT` each. Bounded, and far better than a single
 /// slot, but not nothing.
+///
+/// [`NodeEvent::HandshakesQueued`]: crate::node::api::NodeEvent::HandshakesQueued
 fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     let gone = Arc::downgrade(&net);
     tokio::spawn(async move {
         let gate = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_IN_FLIGHT));
+        let queue = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_WAITING));
+        let burst = Arc::new(std::sync::Mutex::new(Burst::default()));
         loop {
             let Some(incoming) = net.manager().accept_incoming().await else {
                 break;
             };
-            let Ok(permit) = Arc::clone(&gate).try_acquire_owned() else {
-                if incoming.remote_address_validated() {
-                    incoming.refuse();
-                } else {
-                    // `Err` means this attempt is already a retried one; retrying it again
-                    // would loop, so it is simply dropped.
-                    let _ = incoming.retry();
+            if let Ok(permit) = Arc::clone(&gate).try_acquire_owned() {
+                lock_burst(&burst).ran(&gate);
+                spawn_handshake(Arc::clone(&net), tx.clone(), permit, incoming);
+                continue;
+            }
+            if !incoming.remote_address_validated() {
+                // `Err` means this attempt is already a retried one; retrying it again
+                // would loop, so it is simply dropped.
+                let _ = incoming.retry();
+                continue;
+            }
+            let Ok(place) = Arc::clone(&queue).try_acquire_owned() else {
+                let over = {
+                    let mut b = lock_burst(&burst);
+                    b.refused += 1;
+                    b.over()
+                };
+                incoming.refuse();
+                // Without waiting: this loop never waits (see above), and a report lost to a full
+                // queue costs nothing but the report.
+                if let Some(over) = over {
+                    let _ = tx.try_send(over);
                 }
                 continue;
             };
-            let net = Arc::clone(&net);
-            let tx = tx.clone();
+            lock_burst(&burst).enter(&gate);
+            let (net, tx, gate, burst) = (
+                Arc::clone(&net),
+                tx.clone(),
+                Arc::clone(&gate),
+                Arc::clone(&burst),
+            );
             tokio::spawn(async move {
-                let _permit = permit;
-                if let Some(filed) = finish_one(&net, incoming).await {
-                    let _ = serve_filed(&net, &tx, filed).await;
+                let since = std::time::Instant::now();
+                let slot = tokio::time::timeout(HANDSHAKE_WAIT, Arc::clone(&gate).acquire_owned())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                drop(place);
+                let over = {
+                    let mut b = lock_burst(&burst);
+                    if slot.is_some() {
+                        b.ran(&gate);
+                    } else {
+                        b.refused += 1;
+                    }
+                    b.leave(since.elapsed())
+                };
+                match slot {
+                    Some(permit) => spawn_handshake(Arc::clone(&net), tx.clone(), permit, incoming),
+                    None => incoming.refuse(),
+                }
+                if let Some(over) = over {
+                    let _ = tx.send(over).await;
                 }
             });
         }
+        #[cfg(feature = "test-knobs")]
         if let Some(ms) = test_stopped_delay_ms() {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
@@ -1549,9 +1630,12 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
 /// **For proofs only.** When set, the accept loop waits this many milliseconds between stopping
 /// and saying so (`NetEvent::Stopped`), which stands for an actor queue that is full or a task that
 /// is scheduled late. The lock-and-unlock proof uses it to land the event after an unlock started
-/// a new network. Nothing a person runs sets it; unset, nothing changes.
+/// a new network. Nothing a person runs sets it; unset, nothing changes. Not compiled in without
+/// the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_STOPPED_DELAY_ENV: &str = "VOX_TEST_STOPPED_DELAY_MS";
 
+#[cfg(feature = "test-knobs")]
 fn test_stopped_delay_ms() -> Option<u64> {
     std::env::var(TEST_STOPPED_DELAY_ENV).ok()?.parse().ok()
 }
@@ -1559,7 +1643,9 @@ fn test_stopped_delay_ms() -> Option<u64> {
 /// **For proofs only.** When set, each blocking task that holds a secret (`secret_blocking`)
 /// waits this many milliseconds, holding what it was given, before it starts its work: a stand-in
 /// for a slow Argon2id or a large room, so a proof can lock while one runs (V210-94). Nothing a
-/// person runs sets it; unset, nothing changes.
+/// person runs sets it; unset, nothing changes. Not compiled in without the `test-knobs` feature
+/// (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_SECRET_WORK_DELAY_ENV: &str = "VOX_TEST_SECRET_WORK_DELAY_MS";
 
 /// Run `work`, which holds a secret, on a blocking thread, and hold a read guard of `secret_work`
@@ -1577,12 +1663,14 @@ async fn secret_blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
     let held = Arc::clone(secret_work).read_owned().await;
+    #[cfg(feature = "test-knobs")]
     let delay = std::env::var(TEST_SECRET_WORK_DELAY_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
     let (done, result) = oneshot::channel();
     tokio::task::spawn_blocking(move || {
         let _held = held;
+        #[cfg(feature = "test-knobs")]
         if let Some(ms) = delay {
             std::thread::sleep(Duration::from_millis(ms));
         }
@@ -1624,14 +1712,32 @@ async fn seal_off_actor(
     Ok((sek, wrap))
 }
 
+/// Run one inbound handshake on its own task, holding `permit` for as long as it runs.
+fn spawn_handshake(
+    net: Arc<NodeNet>,
+    tx: mpsc::Sender<NetEvent>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    incoming: quinn::Incoming,
+) {
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Some(filed) = finish_one(&net, incoming).await {
+            let _ = serve_filed(&net, &tx, filed).await;
+        }
+    });
+}
+
 /// **For proofs only.** When set to `N`, the node loses the first `N` pairwise streams that
 /// carry a hello: it resets them unread, as a stream lost with its connection is, so the sender
 /// learns only that its key was not taken. The simultaneous-session proof uses it to force what a
 /// duplicate-connection close did by chance (V210-89): each member's hello lost after it was
-/// written. Nothing a person runs sets it; unset, nothing changes.
+/// written. Nothing a person runs sets it; unset, nothing changes. Not compiled in without the
+/// `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_LOSE_HELLOS_ENV: &str = "VOX_TEST_LOSE_HELLOS";
 
 /// Whether this inbound hello is one [`TEST_LOSE_HELLOS_ENV`] says to lose.
+#[cfg(feature = "test-knobs")]
 fn test_lose_hello() -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LEFT: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
@@ -1653,6 +1759,84 @@ fn test_lose_hello() -> bool {
 /// [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough that an
 /// attacker cannot make a node hold unbounded state.
 const HANDSHAKES_IN_FLIGHT: usize = 64;
+
+/// How many validated attempts may wait for a handshake slot at once; past it, one is refused.
+/// Twice the members of a large room (PRD-001), so a whole room redialling a restarted anchor
+/// waits rather than being turned away, and still a bound on what a flood can make a node hold.
+const HANDSHAKES_WAITING: usize = 1024;
+
+/// How long a validated attempt may wait for a handshake slot before it is refused: half of what
+/// a dialler gives one attempt (`nat::reachability::PER_ATTEMPT_TIMEOUT`, 10 s), so an attempt
+/// given a slot still has a dialler waiting for it.
+const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
+
+/// One burst of inbound attempts that had to wait for a handshake slot, from the first that
+/// waited until none is waiting.
+#[derive(Default)]
+struct Burst {
+    /// Attempts waiting now.
+    waiting: usize,
+    /// The most that waited at once.
+    most_waiting: usize,
+    /// How many waited in all.
+    waited: usize,
+    /// The most handshakes seen running at once.
+    most_running: usize,
+    /// How many were refused: no place to wait, or no slot within [`HANDSHAKE_WAIT`].
+    refused: usize,
+    /// The longest any waited.
+    longest: Duration,
+}
+
+impl Burst {
+    /// A handshake took a slot of `gate`.
+    fn ran(&mut self, gate: &tokio::sync::Semaphore) {
+        if self.waiting > 0 {
+            self.most_running = self
+                .most_running
+                .max(HANDSHAKES_IN_FLIGHT - gate.available_permits());
+        }
+    }
+
+    /// An attempt starts waiting for a slot of `gate`.
+    fn enter(&mut self, gate: &tokio::sync::Semaphore) {
+        self.most_running = self
+            .most_running
+            .max(HANDSHAKES_IN_FLIGHT - gate.available_permits());
+        self.waiting += 1;
+        self.waited += 1;
+        self.most_waiting = self.most_waiting.max(self.waiting);
+    }
+
+    /// An attempt stops waiting after `waited`. When it was the last, the burst is over and
+    /// what it came to is returned, to be said.
+    fn leave(&mut self, waited: Duration) -> Option<NetEvent> {
+        self.waiting -= 1;
+        self.longest = self.longest.max(waited);
+        self.over()
+    }
+
+    /// When nothing is left waiting, the burst is over: what it came to, to be said. A refusal
+    /// with nothing waiting is a burst of its own, so no refusal goes unsaid.
+    fn over(&mut self) -> Option<NetEvent> {
+        (self.waiting == 0).then(|| {
+            let b = std::mem::take(self);
+            NetEvent::HandshakesQueued {
+                waited: b.waited,
+                most_waiting: b.most_waiting,
+                most_running: b.most_running,
+                refused: b.refused,
+                longest: b.longest,
+            }
+        })
+    }
+}
+
+fn lock_burst(burst: &std::sync::Mutex<Burst>) -> std::sync::MutexGuard<'_, Burst> {
+    burst
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Phase two for one connection: complete the handshake and admission, or drop it.
 async fn finish_one(
@@ -2039,6 +2223,31 @@ impl Joiner {
         }
     }
 
+    /// Every board this join tried, each named as the room's host or an anchor, with the
+    /// addresses it was dialled at — for a person whose join reached none (V210-107). The words
+    /// for that failure blamed "the anchor" and sent them to `vox node`, when the link of a host
+    /// with no anchor names only the host.
+    fn boards_tried(&self) -> String {
+        self.routes
+            .iter()
+            .map(|(id, endpoints)| {
+                let who = if self.parsed.responder == Some(*id) {
+                    "the room's host"
+                } else {
+                    "anchor"
+                };
+                let at: Vec<String> = endpoints.addrs().iter().map(ToString::to_string).collect();
+                let at = if at.is_empty() {
+                    "its open connection".to_owned()
+                } else {
+                    at.join(", ")
+                };
+                format!("{who} {} at {at}", crate::node::network::short_id(*id))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// The network half of a join, and the room key's seal: the old inline `join_channel` from
     /// reaching a board to the end of the exchange, unchanged in order and in its refusals.
     async fn run(self) -> std::result::Result<JoinerWon, JoinerLost> {
@@ -2066,7 +2275,11 @@ impl Joiner {
         // kept for a join whose board answered and whose members did not.
         let Some(board) = self.reach_a_board().await else {
             steps.took("board (unreached)", t);
-            return Err(JoinerLost::of(Fault::BoardUnreachable));
+            return Err(JoinerLost {
+                fault: Fault::BoardUnreachable,
+                why: vec![format!("no answer from {}", self.boards_tried())],
+                steps: JoinSteps::default(),
+            });
         };
         steps.took("board", t);
         let t = std::time::Instant::now();
@@ -2101,11 +2314,23 @@ impl Joiner {
                     .await?
             }
             Err(e) => {
-                let why = vec![format!(
-                    "board {} could not be read: {e}",
-                    short(board.peer_id())
-                )];
                 let fault = on_the_board(fault_of(&e));
+                // #302's wording, which `tunnel_cli::board_unreachable_advice` reads: a board that
+                // answered and then closed before the room was fetched.
+                let why = vec![if fault == Fault::BoardUnreachable {
+                    let who = if parsed.responder == Some(board.peer_id()) {
+                        "the room's host"
+                    } else {
+                        "anchor"
+                    };
+                    format!(
+                        "{who} {} answered, then its connection closed before the room was \
+                         fetched: {e}",
+                        short(board.peer_id())
+                    )
+                } else {
+                    format!("board {} could not be read: {e}", short(board.peer_id()))
+                }];
                 self.another_board_with_the_room(&tried, why, fault, steps)
                     .await?
             }
@@ -2593,9 +2818,9 @@ pub struct Node {
     /// Live forwards by their bound local address (ADR-013 Dial, M16.1). Dropping one
     /// stops its listener.
     forwards: BTreeMap<std::net::SocketAddr, crate::node::tunnel::Forward>,
-    /// The anchors this node is configured with (ADR-012 §"Bootstrap", ADR-016
-    /// M15.1): dialled when the network starts, given the `Anchor` class, published
-    /// to, and named in every invite link.
+    /// The anchors, if any, that bridge this node to peers it cannot reach directly
+    /// (ADR-012, ADR-016 M15.1): dialled when the network starts, given the `Anchor`
+    /// class, published to, and named in invite links beside this node's own addresses.
     anchors: BootstrapSet,
     /// Every identity this node treats as an anchor: the configured set plus the
     /// anchors of each open channel. The peer policy is rebuilt from channel
@@ -3932,6 +4157,9 @@ impl Node {
     /// found nothing: perf_r40_relayed_chat_gate, `bob's join failed: Failed(BadLink)`, 2 of 2.
     /// The reply now waits for the room's rounds, bounded by `ANCHOR_PUBLISH_PATIENCE` each, and
     /// the actor serves everyone else meanwhile.
+    ///
+    /// **A node with no anchor answers at once:** it has no round to wait for, and its own board
+    /// holds the room for anyone who reaches it directly (V210-107).
     async fn answer_when_published(
         &mut self,
         room: Digest32,
@@ -4626,6 +4854,21 @@ impl Node {
                     let _ = reply.send(Outcome::Done);
                 }
             }
+            NetEvent::HandshakesQueued {
+                waited,
+                most_waiting,
+                most_running,
+                refused,
+                longest,
+            } => {
+                let _ = self.event_tx.send(NodeEvent::HandshakesQueued {
+                    waited,
+                    most_waiting,
+                    most_running,
+                    refused,
+                    longest_ms: u64::try_from(longest.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
             NetEvent::Stopped { net } => {
                 // Only the network that stopped. A lock takes the network down and an unlock
                 // starts a new one, and this event, sent from the old accept loop, can arrive
@@ -4907,8 +5150,8 @@ impl Node {
             }
             NetEvent::ReachFailed { peer, why } => {
                 // An anchor that failed to connect waits before its next dial, doubling to
-                // `ANCHOR_REDIAL_SECS` (V210-57), a room's own as well as a configured one
-                // (V210-75).
+                // `ANCHOR_UNREACHED_REDIAL_SECS` (V210-57, V210-86), jittered once it is there, a
+                // room's own as well as a configured one (V210-75).
                 if self.is_kept_anchor(&peer) {
                     // A union too large for one dial tries its next window next time (V210-75).
                     if self.anchors.get(&peer).is_none() {
@@ -4917,7 +5160,13 @@ impl Node {
                     let wait = self
                         .anchor_backoff
                         .get(&peer)
-                        .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
+                        .map_or(1, |(_, w)| (w * 2).min(ANCHOR_UNREACHED_REDIAL_SECS));
+                    let wait = if wait == ANCHOR_UNREACHED_REDIAL_SECS {
+                        let coin = crate::identity::rng::random_array::<1>().map_or(0, |b| b[0]);
+                        wait - u64::from(coin & 1)
+                    } else {
+                        wait
+                    };
                     self.anchor_backoff.insert(peer, (self.now() + wait, wait));
                     if let Some(net) = self.net.as_ref() {
                         net.manager().note(
@@ -4968,9 +5217,27 @@ impl Node {
                 self.anchor_window.remove(&peer);
                 // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
                 // whose forward said it dialled and then nothing).
+                //
+                // **Named for what it is** (V210-107). A room's own host is dialled the same way —
+                // its link entry is a board too — and was noted "connected to this anchor", which
+                // told a person reaching a host directly that they were using an anchor. An anchor
+                // is one this node was given (`--anchor`, the anchors file) or a room names that is
+                // not one of its members.
+                let anchor = self.anchors.get(&peer).is_some()
+                    || self
+                        .room_anchors
+                        .values()
+                        .any(|set| set.get(&peer).is_some());
                 if let Some(net) = self.net.as_ref() {
-                    net.manager()
-                        .note(peer, "connected to this anchor".to_owned());
+                    net.manager().note(
+                        peer,
+                        if anchor {
+                            "connected to this anchor"
+                        } else {
+                            "connected to this room host's board"
+                        }
+                        .to_owned(),
+                    );
                 }
                 self.anchor_ids.insert(peer);
                 // A new connection may be to a board that restarted and lost what it held: what it
@@ -5857,7 +6124,8 @@ impl Node {
         });
     }
 
-    /// Produce an invite link naming this node as anchor and responder.
+    /// Produce an invite link naming this node, and any anchors the room uses, as where to
+    /// reach the room, with this node as responder.
     async fn invite(&mut self, channel_id: &Digest32) -> Outcome {
         let Some(net) = self.net.as_ref() else {
             return Outcome::Failed(Fault::NotNetworked);
@@ -6175,9 +6443,10 @@ impl Node {
     /// Interval between rounds. A board that is ready costs a joiner one dial.
     const BOARD_RETRY: Duration = Duration::from_millis(250);
 
-    /// Join a channel from an invite link (ADR-016 §"Join over the network"): resolve
-    /// the anchor, read the board, announce a pre-join record, run the ADR-005 join,
-    /// then build local channel state and publish our own records.
+    /// Join a channel from an invite link (ADR-016 §"Join over the network"): reach a
+    /// board (the link's entries, the room's host among them, and this node's anchors), read
+    /// it, announce a pre-join record, run the ADR-005 join, then build local channel state
+    /// and publish our own records.
     /// Begin joining a room: capture what the join needs here, run the network half and the
     /// Argon2id seal in a task, and answer through `NetEvent::JoinerDone`.
     ///
@@ -6265,6 +6534,13 @@ impl Node {
             }
         }
         if routes.is_empty() {
+            // Nothing was tried, so say so rather than leave the person to read "did not answer"
+            // about a board nobody dialled (V210-107).
+            let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                reason: "the address names only this node, and this node has no anchor: there \
+                         was no board to ask"
+                    .to_owned(),
+            });
             let _ = reply.send(Outcome::Failed(Fault::BoardUnreachable));
             return;
         }
@@ -7872,6 +8148,15 @@ impl Node {
         let token = self.next_token;
         self.next_token += 1;
         let fence = crate::transport::stream_transport::Fence::new();
+        let running = crate::node::status::Running::start(
+            &self.sync_book,
+            channel_id,
+            peer,
+            token,
+            true,
+            crate::node::status::SyncStep::Setup,
+        );
+        let stepper = running.stepper();
         port.out = Some(crate::node::ports::Attempt {
             token,
             dir: crate::node::ports::Dir::Out,
@@ -7880,6 +8165,7 @@ impl Node {
             started: std::time::Instant::now(),
             abort: None,
             fence: Arc::clone(&fence),
+            running,
         });
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| c.opened += 1);
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
@@ -7953,6 +8239,7 @@ impl Node {
                 }
                 SessionTarget::Anchored(state) => state.lock().await.epoch(),
             };
+            stepper.step(crate::node::status::SyncStep::Opening);
             // 2. Open the stream. Also a round trip. **A stream that will not open still
             //    reports**: every exit from this task sends `SyncDone`.
             let handle = tokio::runtime::Handle::current();
@@ -7973,6 +8260,7 @@ impl Node {
                         return;
                     }
                 };
+            stepper.step(crate::node::status::SyncStep::Exchanging);
             // 3. Run the session on a blocking thread, which **holds the slot** until it exits
             //    (ADR-025 D1a): an abort stops this task, not the worker, so the worker is fenced
             //    instead and the slot bounds running workers.
@@ -8034,6 +8322,14 @@ impl Node {
         let token = self.next_token;
         self.next_token += 1;
         let fence = crate::transport::stream_transport::Fence::new();
+        let running = crate::node::status::Running::start(
+            &self.sync_book,
+            channel_id,
+            peer,
+            token,
+            false,
+            crate::node::status::SyncStep::Exchanging,
+        );
         port.inbound.insert(
             token,
             crate::node::ports::Attempt {
@@ -8044,6 +8340,7 @@ impl Node {
                 started: std::time::Instant::now(),
                 abort: None,
                 fence: Arc::clone(&fence),
+                running,
             },
         );
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
@@ -8955,6 +9252,7 @@ impl Node {
             self.held_pairwise.push((room, stream));
             return;
         }
+        #[cfg(feature = "test-knobs")]
         if matches!(stream.first, PairwiseFrame::Hello { .. }) && test_lose_hello() {
             eprintln!("vox: {TEST_LOSE_HELLOS_ENV}: an inbound hello was lost, unread");
             let PairwiseIn {

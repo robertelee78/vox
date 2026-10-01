@@ -41,6 +41,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -654,6 +657,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 #[test]
 #[ignore = "three real vox processes, production Argon2id and ~2 GB through an emulated link; CI runs it in release"]
 fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let min_ratio = std::env::var("VOX_PERF_MIN_RATIO")
         .ok()

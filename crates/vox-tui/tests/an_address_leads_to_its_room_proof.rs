@@ -78,6 +78,9 @@ mod relay;
 #[path = "support/port_forward.rs"]
 mod port_forward;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::mpsc::RecvTimeoutError;
@@ -558,6 +561,7 @@ fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
 #[test]
 #[ignore = "real anchors, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn d_a_join_asks_every_board_the_address_names() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
@@ -684,6 +688,7 @@ fn d_a_join_asks_every_board_the_address_names() {
 #[test]
 #[ignore = "a real host, production Argon2id; CI runs it in release"]
 fn e_an_address_that_would_lead_nowhere_is_withheld_and_why_is_said() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
@@ -766,6 +771,7 @@ fn signal(pid: u32, signal: &str) {
 #[test]
 #[ignore = "a real anchor, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
+    test_knobs::require(&["VOX_TEST_RECORD_TTL_SECS"]);
     watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
