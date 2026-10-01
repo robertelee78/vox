@@ -219,6 +219,20 @@ pub async fn open_profile(
         node.apply(NodeCommand::CreateIdentity { passphrase: secret })
             .await
     };
+    // **Another vox made it first** (V210-91): there was no identity when this one looked,
+    // and there is one now, so it was created by a vox started at the same moment. Nothing
+    // was created here; saying only "already has an identity" read as a stale profile.
+    if !existed && out == Outcome::Failed(Fault::IdentityExists) {
+        return Err(AppError::Usage(
+            "another vox created this profile's identity at the same time; nothing was \
+             created here.\n\
+             \x20      Run `vox id` again to see the identity it made."
+                .into(),
+        ));
+    }
+    if out == Outcome::Failed(Fault::ProfileBusy) {
+        return Err(profile_busy(&socket));
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot open this profile's identity: {out}"
@@ -248,6 +262,9 @@ async fn open_room(
             passphrase: Secret::new(identity_passphrase.as_bytes().to_vec()),
         })
         .await;
+    if out == Outcome::Failed(Fault::ProfileBusy) {
+        return Err(profile_busy(&socket));
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot unlock this profile: {out}"
