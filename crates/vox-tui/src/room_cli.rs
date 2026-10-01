@@ -2454,8 +2454,11 @@ pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Invite { channel_id }).await {
-        Ok(Frame::Link { url }) => {
+        Ok(Frame::Link { url, note }) => {
             println!("{url}");
+            if !note.is_empty() {
+                eprintln!("vox: {note}");
+            }
             eprintln!("vox: send the passphrase by a different channel than this address");
             eprintln!("     joining grants nothing — use `vox trust add` to decide who reads you");
             Ok(())

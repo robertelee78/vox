@@ -1,48 +1,54 @@
-//! V210-96 (#292) — **an address is printed only once its room can be joined through it**, and **a
-//! join asks every board the address names** before it says the room is not there. Driven through
-//! the shipped `vox` binary.
+//! V210-96 (#292) — **an address leads to its room the moment it is printed**, and **a join asks
+//! every route the address names** before it says the room is not there. Driven through the shipped
+//! `vox` binary, as a person runs it.
 //!
-//! **The defect.** `vox serve` printed its address the moment the room was made. The room's first
-//! publish round ran on its own task, and went only to an anchor the node already held a connection
-//! to — which a node `vox serve` has just started often does not. A guest who joined at once
-//! reached the anchor and was told "board … has nothing for room …": CI macOS at 1a648c9, the R42
-//! proof's setup (`a_first_direct_connection_is_prompt_proof`), and 1 of 77 local probes; in 11 of
-//! 18 ordered runs the host said it had connected to its anchor *after* printing the address. And
-//! the join stopped at that first board, although the address named others — the host's own last,
-//! which always holds its room.
+//! **The defect.** `vox serve` printed its address while the room's first publish round to its
+//! anchor had not landed, and a guest who reached the anchor was told "board … has nothing for room
+//! …" — CI macOS at 1a648c9 (`a_first_direct_connection_is_prompt_proof`'s setup), 1 of 77 local
+//! probes — and the join stopped there, although the address named the host itself, whose own
+//! board always holds its room.
 //!
-//! **Arm 1, the address waits for its board.** One anchor on `[::]`, **stopped** before the host
-//! starts; a `vox serve` host on `127.0.0.1` naming it. The anchor stays stopped until the host's
-//! room exists (`vox room list`, asked of the host's own control socket, names one) and [`HOLD`]
-//! after, then is started again (same identity, same port). Tied to the room rather than a clock,
-//! so a slow (debug) host cannot pass merely by not having reached its address yet. The guest is on
-//! `[::1]`, so the anchor is the only board it can reach (the host's own addresses are IPv4). Every
-//! line the host prints is read as it comes, so **when** the address was printed is known. The
-//! instant it is, the guest runs `vox connect`. Asserted: the address was not printed while the
-//! anchor was stopped, and the guest's join got in.
+//! **The rule** (the decider, 2026-10-01; ADR-012): an anchor bridges hosts that cannot otherwise
+//! find each other, and nothing else needs one. So the address is printed at once whenever it names
+//! a route of the host's own, with a note saying which anchors have not taken the room yet (and,
+//! later, that they have); a guest who can reach the host goes direct; a guest who cannot waits for
+//! the anchor, which the host says when it has.
 //!
-//! **Arm 2, the join asks the other boards.** Two anchors: `A4` on `127.0.0.1` only, `A6` on `[::1]`
-//! only. The host on `127.0.0.1` names both and reaches only `A4`, so only `A4` holds the room. It
-//! advertises a port forward on `[::1]` (`support/port_forward.rs`), its only address a guest on
-//! `[::1]` can reach, and the forward starts **closed**. The guest on `[::1]`, with `A6` as its own
-//! anchor, cannot reach `A4` and cannot yet reach the host, so the board its search takes is `A6` —
-//! which has nothing for the room. The forward opens [`FORWARD_OPENS`] after the guest's first
-//! datagram reaches it, long after `A6` (a loopback handshake) was taken, and well inside the 30 s a
-//! dial is given. Asserted: the join got in (through the host's own board), and its steps say
-//! another board was asked.
+//! **Arms**, each the way a person meets it:
+//! - **A, no anchor at all.** `vox serve` and `vox connect` with no anchor and the default
+//!   `--listen`: the host prints an address naming itself, and the guest gets in.
+//! - **B, the anchors are down.** Four anchors, all stopped, given to a host on `127.0.0.1`: the
+//!   address is printed anyway, names the host (a link holds four boards, and the host must not be
+//!   the one dropped), the host says which anchors have not taken the room, and a guest on
+//!   `127.0.0.1` with no anchor gets in.
+//! - **C, a guest who can reach only the anchor.** The anchor is stopped; the host on `127.0.0.1`
+//!   prints its address at once and says the anchor has not taken the room. While the anchor stays
+//!   stopped the host must not say it has. The anchor comes back; the instant the host says it took
+//!   the room, a guest on `[::1]` — which can reach the anchor and not the host — joins, and gets in.
+//! - **D, a join asks the other routes.** Two anchors: `A4` on `127.0.0.1` only, `A6` on `[::1]`
+//!   only. The host on `127.0.0.1` names both, reaches only `A4`, and advertises a port forward on
+//!   `[::1]` (`support/port_forward.rs`) that starts **closed**. The guest on `[::1]`, with `A6` as
+//!   its anchor, can reach `A6` but not `A4`, and not yet the host, so its board search takes `A6`,
+//!   which has nothing for the room. The forward opens [`FORWARD_OPENS`] after the guest first
+//!   knocks on it, inside the 30 s a dial is given. Asserted: the join gets in, and its steps say
+//!   another board was asked.
 //!
-//! **Arm 3, an address that would lead nowhere is not handed out.** The anchor is stopped for the
-//! whole run. Asserted: the host prints no address, exits failing, and says why, naming the anchor.
+//! **Every red names which it is** (the decider: a test that cannot tell a broken product from a
+//! broken test is not a valid test). `PRODUCT:` — `vox` did the wrong thing, and what it said is
+//! quoted. `APPARATUS:` — the staging was not achieved or a precondition is unmet (a setup verb
+//! failed, an anchor printed no spec, the guest never reached the closed forward), so nothing about
+//! the claim was measured. The watchdog (`support/watchdog.rs`) names itself when it fires.
 //!
-//! **Every red names which it is** (the decider's rule: a test that cannot tell a broken product
-//! from a broken test is not a valid test). `PRODUCT:` — `vox` did the wrong thing, and what it
-//! said is quoted. `APPARATUS:` — the staging was not achieved or a precondition is unmet (a setup
-//! verb failed, an anchor printed no spec, the guest never reached the closed forward), so nothing
-//! about the claim was measured. The watchdog (`support/watchdog.rs`) names itself when it fires.
+//! **Mutations that must turn it red:** `vox serve` refusing without an anchor or public address
+//! (A); minting the address before the host knows an address of its own (A); not counting the
+//! host's own board, so a down anchor holds the address back (B, C); capping the link's boards
+//! after adding the host (B); saying an anchor took the room before it did (C); stopping the join
+//! at the first board's "nothing for room" (D).
 //!
-//! **Mutations that must turn it red:** answering `Invite` at once (arms 1 and 3: the address is
-//! printed while the anchor is stopped), and stopping the join at the first board's "nothing for
-//! room" (arm 2: the join fails naming only `A6`).
+//! **Why a file of its own:** no existing proof starts `vox serve` without an anchor or with its
+//! anchor down — the old refusal made that impossible — and the join journeys
+//! (`a_room_not_on_the_board_is_named_proof`) stage a board without the room only where no other
+//! route can hold it, which is the failure this fix keeps.
 
 #![cfg(unix)]
 
@@ -66,19 +72,28 @@ use std::time::{Duration, Instant};
 
 use world::{after_label, args, room_pass_file, vox_once, VoxProc};
 
-/// How long the anchor stays stopped once the host's room exists. An address answered at once is
-/// printed within milliseconds of the room existing; this is the host's chance to do that.
+/// How long the anchor stays stopped after the host has said it has not taken the room (arm C): the
+/// host's chance to claim otherwise.
 const HOLD: Duration = Duration::from_secs(3);
-/// How long the host may take to make its room: production Argon2id, in either profile.
+/// How long the host may take to make its room and print the address: production Argon2id, in
+/// either profile, and address discovery on a wildcard bind.
 const ROOM_WITHIN: Duration = Duration::from_secs(300);
-/// How long the host may take to print its address once the anchor is back: its redial, the
-/// connection and the first publish round.
-const PRINT_WITHIN: Duration = Duration::from_secs(120);
-/// How long after the guest's first datagram reaches the closed forward it opens (arm 2).
+/// How long the host may take to say it printed which anchors have not taken the room.
+const NOTE_WITHIN: Duration = Duration::from_secs(20);
+/// How long the host may take to say the anchor took the room once it is back (arm C): its redial,
+/// the connection and the first publish round.
+const TAKEN_WITHIN: Duration = Duration::from_secs(120);
+/// How long after the guest's first datagram reaches the closed forward it opens (arm D).
 const FORWARD_OPENS: Duration = Duration::from_secs(3);
-/// How long the host may take to give up on an address no board holds (arm 3): its 30 s wait,
-/// after making its room, with headroom.
-const WITHHELD_WITHIN: Duration = Duration::from_secs(400);
+
+/// An anchor's short id as `vox` prints it: the first 12 characters of its fingerprint.
+fn short(spec: &str) -> String {
+    spec.split_once('@')
+        .map_or("", |(fp, _)| fp)
+        .chars()
+        .take(12)
+        .collect()
+}
 
 /// A `vox node` anchor on `listen`, and the `fp@/ip…/udp/port` spec that names it on `family`.
 fn anchor_on(dir: &Path, listen: &str, v6: bool) -> (VoxProc, String) {
@@ -160,14 +175,14 @@ impl DualAnchor {
     }
 }
 
-/// A guest and a host with identities, the host trusting the guest.
-fn two_identities(guest: &Path, host: &Path) {
+/// A guest and a host with identities, the host trusting the guest. Returns the host's fingerprint.
+fn two_identities(guest: &Path, host: &Path) -> String {
     for d in [guest, host] {
         std::fs::create_dir_all(d.join("cfg")).unwrap();
     }
     let (ok, guest_fp, err) = vox_once(guest, &args(&["id"]));
     assert!(ok, "APPARATUS: setup verb `vox id` (guest) failed: {err}");
-    let (ok, _, err) = vox_once(host, &args(&["id"]));
+    let (ok, host_fp, err) = vox_once(host, &args(&["id"]));
     assert!(ok, "APPARATUS: setup verb `vox id` (host) failed: {err}");
     let (ok, out, err) = vox_once(
         host,
@@ -177,39 +192,7 @@ fn two_identities(guest: &Path, host: &Path) {
         ok,
         "APPARATUS: setup verb `vox trust add` failed: {out}\n{err}"
     );
-}
-
-/// Read what `host` prints, as it comes, until `until` says stop or `within` passes; record when an
-/// `address ` line was first seen. Returns that, and whether `until` was met.
-fn watch_host(
-    host: &mut VoxProc,
-    started: Instant,
-    within: Duration,
-    mut until: impl FnMut() -> bool,
-) -> (Option<Duration>, bool) {
-    let deadline = Instant::now() + within;
-    let mut address_at = None;
-    let mut poll_at = Instant::now();
-    while Instant::now() < deadline {
-        match host.lines.recv_timeout(Duration::from_millis(50)) {
-            Ok(line) => {
-                eprintln!("[host] {line}");
-                if line.starts_with("address ") && address_at.is_none() {
-                    address_at = Some(started.elapsed());
-                }
-                host.seen.push(line);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return (address_at, false),
-        }
-        if Instant::now() >= poll_at {
-            if until() {
-                return (address_at, true);
-            }
-            poll_at = Instant::now() + Duration::from_millis(250);
-        }
-    }
-    (address_at, false)
+    host_fp.trim().to_owned()
 }
 
 /// The first line `p` prints (or has printed) that matches `pred`, within `within`; `None` if it
@@ -252,15 +235,145 @@ fn passphrase_of(host: &mut VoxProc) -> String {
     )
 }
 
-/// Whether the host's running node holds a room yet, asked of its own control socket.
-fn host_has_a_room(host_dir: &Path) -> bool {
-    let (ok, out, _) = vox_once(host_dir, &args(&["room", "list"]));
-    ok && !out.trim().is_empty() && !out.contains("no rooms")
+#[test]
+#[ignore = "real host and guest, production Argon2id and a real PoW; CI runs it in release"]
+fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
+    let host_fp = two_identities(&guest_dir, &host_dir);
+    // No --anchor, no --listen: as a person on a LAN runs it.
+    let mut host = VoxProc::spawn("host", &host_dir, &args(&["serve", "22"]));
+    let address = line_within(&mut host, ROOM_WITHIN, |l| l.starts_with("address "));
+    let address = after_label(
+        &address.unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: `vox serve` with no anchor printed no address within {ROOM_WITHIN:?}; a \
+                 host a guest can reach directly needs none. It said:\n{}",
+                host.transcript()
+            )
+        }),
+        "address",
+    );
+    let passphrase = passphrase_of(&mut host);
+    assert!(
+        address.contains(&host_fp),
+        "PRODUCT: the address `vox serve` printed with no anchor does not name the host \
+         ({host_fp}), so it names nowhere at all: {address}\nIt said:\n{}",
+        host.transcript()
+    );
+    let t = Instant::now();
+    let (joined, out, err) = vox_once(
+        &guest_dir,
+        &args(&[
+            "connect",
+            &address,
+            "--passphrase-file",
+            &room_pass_file(&guest_dir, &passphrase),
+        ]),
+    );
+    eprintln!(
+        "[proof] arm A: no anchor; the guest's join {} after {:.2}s",
+        if joined { "got in" } else { "failed" },
+        t.elapsed().as_secs_f64()
+    );
+    assert!(
+        joined,
+        "PRODUCT: a guest on the host's machine, with no anchor, was refused the address `vox \
+         serve` printed. `vox connect` said:\n{out}\n{err}\nhost:\n{}",
+        host.transcript()
+    );
 }
 
 #[test]
 #[ignore = "real anchors, host and guest, production Argon2id and a real PoW; CI runs it in release"]
-fn an_address_is_printed_only_once_a_board_it_names_holds_the_room() {
+fn b_anchors_that_are_down_do_not_hold_back_the_address() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap();
+    let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
+    // Four anchors — a link's whole capacity — each started for its identity, then stopped by PID.
+    let mut specs = Vec::new();
+    for i in 0..4 {
+        let (mut a, spec) = anchor_on(&tmp.path().join(format!("a{i}")), "127.0.0.1:0", false);
+        let _ = a.child.kill();
+        let _ = a.child.wait();
+        specs.push(spec);
+    }
+    let host_fp = two_identities(&guest_dir, &host_dir);
+    let mut serve = vec!["serve", "22", "--listen", "127.0.0.1:0"];
+    for spec in &specs {
+        serve.extend(["--anchor", spec.as_str()]);
+    }
+    let started = Instant::now();
+    let mut host = VoxProc::spawn("host", &host_dir, &args(&serve));
+    let address = line_within(&mut host, ROOM_WITHIN, |l| l.starts_with("address "));
+    let printed = started.elapsed();
+    let address = after_label(
+        &address.unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: `vox serve` printed no address while its four anchors were down, \
+                 although the address names the host itself, which a guest can reach. It \
+                 said:\n{}",
+                host.transcript()
+            )
+        }),
+        "address",
+    );
+    let passphrase = passphrase_of(&mut host);
+    assert!(
+        address.contains(&host_fp),
+        "PRODUCT: with four anchors, the address `vox serve` printed does not name the host \
+         ({host_fp}) — only anchors, all down: {address}"
+    );
+    // The host says, of each anchor, that it has not taken the room.
+    let shorts: Vec<String> = specs.iter().map(|s| short(s)).collect();
+    let _ = line_within(&mut host, NOTE_WITHIN, |l| {
+        l.contains("not taken") && shorts.iter().all(|s| l.contains(s.as_str()))
+    });
+    let said = host.transcript();
+    let unnamed: Vec<&String> = shorts
+        .iter()
+        .filter(|s| {
+            !said
+                .lines()
+                .any(|l| l.contains("not taken") && l.contains(s.as_str()))
+        })
+        .collect();
+    assert!(
+        unnamed.is_empty(),
+        "PRODUCT: `vox serve` printed its address without saying that anchor(s) {unnamed:?} have \
+         not taken the room; a guest who cannot reach the host directly must be told. It \
+         said:\n{said}"
+    );
+    let t = Instant::now();
+    let (joined, out, err) = vox_once(
+        &guest_dir,
+        &args(&[
+            "connect",
+            &address,
+            "--passphrase-file",
+            &room_pass_file(&guest_dir, &passphrase),
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+    );
+    eprintln!(
+        "[proof] arm B: four anchors down; the address was printed at +{:.2}s; the guest's join {} \
+         after {:.2}s",
+        printed.as_secs_f64(),
+        if joined { "got in" } else { "failed" },
+        t.elapsed().as_secs_f64()
+    );
+    assert!(
+        joined,
+        "PRODUCT: a guest who can reach the host directly was refused while the host's anchors \
+         were down. `vox connect` said:\n{out}\n{err}\nhost:\n{said}"
+    );
+}
+
+#[test]
+#[ignore = "a real anchor, host and guest, production Argon2id and a real PoW; CI runs it in release"]
+fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let (anchor_dir, host_dir, guest_dir) = (
@@ -270,8 +383,7 @@ fn an_address_is_printed_only_once_a_board_it_names_holds_the_room() {
     );
     let mut anchor = DualAnchor::start(&anchor_dir, 0);
     two_identities(&guest_dir, &host_dir);
-
-    // The anchor stops before the host starts, by its own handle.
+    let a = short(&anchor.v4_spec);
     anchor.stop();
     let started = Instant::now();
     let mut host = VoxProc::spawn(
@@ -286,36 +398,50 @@ fn an_address_is_printed_only_once_a_board_it_names_holds_the_room() {
             "127.0.0.1:0",
         ]),
     );
-    // Until the host's room exists, then HOLD more, the anchor stays stopped.
-    let (early, has_room) = watch_host(&mut host, started, ROOM_WITHIN, || {
-        host_has_a_room(&host_dir)
-    });
-    assert!(
-        has_room || early.is_some(),
-        "PRODUCT: `vox serve` made no room within {ROOM_WITHIN:?} (its own control socket listed \
-         none, and it printed no address). It said:\n{}",
-        host.transcript()
-    );
-    let room_at = started.elapsed();
-    let (held, _) = watch_host(&mut host, started, HOLD, || false);
-    let printed_while_down = early.or(held);
-    anchor.restart(&anchor_dir);
-    let back = started.elapsed();
-    let address = line_within(&mut host, PRINT_WITHIN, |l| l.starts_with("address "));
-    let printed = started.elapsed();
+    let address = line_within(&mut host, ROOM_WITHIN, |l| l.starts_with("address "));
     let address = after_label(
         &address.unwrap_or_else(|| {
             panic!(
-                "PRODUCT: the anchor came back at +{:.2}s and `vox serve` printed no address within \
-                 {PRINT_WITHIN:?} of it. It said:\n{}",
-                back.as_secs_f64(),
+                "PRODUCT: `vox serve` printed no address while its anchor was down, although the \
+                 address names the host itself. It said:\n{}",
                 host.transcript()
             )
         }),
         "address",
     );
     let passphrase = passphrase_of(&mut host);
-    // At once, as a person pasting it (or an agent handed it) would.
+    let taken = |l: &str| l.contains(a.as_str()) && l.contains("has taken");
+    let not_yet = line_within(&mut host, NOTE_WITHIN, |l| {
+        l.contains(a.as_str()) && l.contains("not taken")
+    });
+    assert!(
+        not_yet.is_some(),
+        "PRODUCT: `vox serve` printed its address without saying that anchor {a}, which was \
+         down, has not taken the room. It said:\n{}",
+        host.transcript()
+    );
+    // While the anchor stays stopped, the host must not say it took the room.
+    let early = line_within(&mut host, HOLD, taken);
+    let back_from = started.elapsed();
+    assert!(
+        early.is_none(),
+        "PRODUCT: `vox serve` said anchor {a} took the room while it was stopped (until +{:.2}s): \
+         {early:?}. It said:\n{}",
+        back_from.as_secs_f64(),
+        host.transcript()
+    );
+    anchor.restart(&anchor_dir);
+    let back = started.elapsed();
+    let said_taken = line_within(&mut host, TAKEN_WITHIN, taken);
+    let told = started.elapsed();
+    assert!(
+        said_taken.is_some(),
+        "PRODUCT: anchor {a} came back at +{:.2}s and `vox serve` never said it took the room \
+         within {TAKEN_WITHIN:?}. It said:\n{}",
+        back.as_secs_f64(),
+        host.transcript()
+    );
+    // At once, as a person told "it can be joined through the anchor now" would.
     let t = Instant::now();
     let (joined, out, err) = vox_once(
         &guest_dir,
@@ -331,39 +457,24 @@ fn an_address_is_printed_only_once_a_board_it_names_holds_the_room() {
         ]),
     );
     eprintln!(
-        "[proof] arm 1: the room existed at +{:.2}s; the anchor was stopped from +0s to +{:.2}s; \
-         the address was printed at +{:.2}s{}; the guest's join {} after {:.2}s",
-        room_at.as_secs_f64(),
+        "[proof] arm C: the anchor was stopped until +{:.2}s; the host said it took the room at \
+         +{:.2}s; the guest's join {} after {:.2}s",
         back.as_secs_f64(),
-        printed.as_secs_f64(),
-        printed_while_down.map_or(String::new(), |d| format!(
-            " (first seen at +{:.2}s, while the anchor was stopped)",
-            d.as_secs_f64()
-        )),
+        told.as_secs_f64(),
         if joined { "got in" } else { "failed" },
         t.elapsed().as_secs_f64()
     );
     assert!(
-        printed_while_down.is_none(),
-        "PRODUCT: `vox serve` printed its address at +{:.2}s, while the only board a guest on [::1] can reach \
-         was stopped (until +{:.2}s): an address must be printed only once a board it names holds \
-         the room.\nhost:\n{}",
-        printed_while_down.unwrap_or_default().as_secs_f64(),
-        back.as_secs_f64(),
-        host.transcript()
-    );
-    assert!(
         joined,
-        "PRODUCT: a guest that ran `vox connect` the instant the address was printed was refused: \
-         the address must lead to its room when it is printed. `vox connect` said:\n{out}\n{err}\n\
-         host:\n{}",
+        "PRODUCT: a guest who can reach only the anchor was refused the instant the host said the \
+         anchor took the room. `vox connect` said:\n{out}\n{err}\nhost:\n{}",
         host.transcript()
     );
 }
 
 #[test]
 #[ignore = "real anchors, host and guest, production Argon2id and a real PoW; CI runs it in release"]
-fn a_join_asks_every_board_the_address_names() {
+fn d_a_join_asks_every_board_the_address_names() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let (a4_dir, a6_dir, host_dir, guest_dir) = (
@@ -375,7 +486,7 @@ fn a_join_asks_every_board_the_address_names() {
     let (_a4, a4_spec) = anchor_on(&a4_dir, "127.0.0.1:0", false);
     let (_a6, a6_spec) = anchor_on(&a6_dir, "[::1]:0", true);
     two_identities(&guest_dir, &host_dir);
-
+    // A guest on [::1] can reach A6 and the forward; A4 and the host's own addresses are IPv4.
     let host_port = port_forward::free_v4_udp_port();
     let host_addr: SocketAddr = format!("127.0.0.1:{host_port}").parse().unwrap();
     let forward = port_forward::PortForward::start(host_addr, false);
@@ -395,7 +506,7 @@ fn a_join_asks_every_board_the_address_names() {
         ]),
         &[("VOX_TEST_ADVERTISE", advertise.as_str())],
     );
-    // A4 is up and reachable by the host, so the address is due as soon as the room is on it.
+    // The host's own route (the forward) is in the address, so it is printed at once.
     let address = line_within(&mut host, ROOM_WITHIN, |l| l.starts_with("address "));
     let address = after_label(
         &address.unwrap_or_else(|| {
@@ -478,83 +589,5 @@ fn a_join_asks_every_board_the_address_names() {
          was asked, so the first board it took held the room and the fallback was never needed \
          (the forward was closed for {FORWARD_OPENS:?} after the guest first knocked). `vox \
          connect` said:\n{err}"
-    );
-}
-
-#[test]
-#[ignore = "a real anchor and host, production Argon2id; CI runs it in release"]
-fn an_address_no_board_holds_the_room_for_is_not_handed_out() {
-    watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
-    let (anchor_dir, host_dir, guest_dir) = (
-        tmp.path().join("anchor"),
-        tmp.path().join("host"),
-        tmp.path().join("guest"),
-    );
-    let mut stopped = DualAnchor::start(&anchor_dir, 0);
-    two_identities(&guest_dir, &host_dir);
-    stopped.stop();
-    let anchor_fp = stopped
-        .v4_spec
-        .split_once('@')
-        .map_or("", |(fp, _)| fp)
-        .to_owned();
-    assert!(
-        !anchor_fp.is_empty(),
-        "APPARATUS: the anchor's spec {:?} has no fp@addr",
-        stopped.v4_spec
-    );
-
-    let started = Instant::now();
-    let mut host = VoxProc::spawn(
-        "host",
-        &host_dir,
-        &args(&[
-            "serve",
-            "22",
-            "--anchor",
-            &stopped.v4_spec,
-            "--listen",
-            "127.0.0.1:0",
-        ]),
-    );
-    let (printed, _) = watch_host(&mut host, started, WITHHELD_WITHIN, || false);
-    let ended = started.elapsed();
-    // Its output closed or the wait ran out: give an exiting process a moment to be reaped.
-    let status = (0..100).find_map(|_| {
-        let s = host.child.try_wait().ok().flatten();
-        if s.is_none() {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        s
-    });
-    let said = host.transcript();
-    eprintln!(
-        "[proof] arm 3: the host {} at +{:.2}s{}",
-        match status {
-            Some(s) => format!("exited ({s})"),
-            None => "was still running".to_owned(),
-        },
-        ended.as_secs_f64(),
-        printed.map_or(String::new(), |d| format!(
-            ", having printed an address at +{:.2}s",
-            d.as_secs_f64()
-        ))
-    );
-    assert!(
-        printed.is_none(),
-        "PRODUCT: `vox serve` printed an address while its only anchor was stopped for the whole \
-         run: an address no board holds the room for must not be handed out. It said:\n{said}"
-    );
-    assert!(
-        status.is_some_and(|s| !s.success()),
-        "PRODUCT: `vox serve` neither printed an address nor failed within {WITHHELD_WITHIN:?} \
-         ({status:?}); it must give up on an address no board holds, and say so. It said:\n{said}"
-    );
-    let short: String = anchor_fp.chars().take(8).collect();
-    assert!(
-        said.contains("would lead nowhere") && said.contains(&short),
-        "PRODUCT: `vox serve` withheld the address but did not say why, naming the anchor \
-         {short}. It said:\n{said}"
     );
 }

@@ -171,10 +171,11 @@ async fn by<T>(
 /// live board answers each put in milliseconds. See `publish_channel_to_anchor`.
 const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
 
-/// How long a verb that hands out a room's address waits for the room to be on a board the address
-/// names (V210-96): the connection to an anchor that is coming up, then its first publish round. The
-/// same wait a joiner gives a board (`Node::BOARD_PATIENCE`), since the address is no use to one
-/// before then. Past it the address is withheld, and why is said (`NodeEvent::AddressWithheld`).
+/// How long a verb that hands out a room's address waits when the address would name **no route of
+/// this node's own** — its addresses not yet discovered — for that discovery, or for an anchor to
+/// take the room (V210-96). The same wait a joiner gives a board (`Node::BOARD_PATIENCE`). Past it
+/// the address is withheld, and why is said (`NodeEvent::AddressWithheld`). Also how long an anchor
+/// the address names has to take the room before this node says it has not.
 const ADDRESS_PATIENCE: Duration = Node::BOARD_PATIENCE;
 
 /// How long a join's board search keeps preferring the room's own anchors once some other route
@@ -310,6 +311,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::StaleGraceOver { .. } => "naming a refusal no republish cured",
         NetEvent::PublishRetry { .. } => "retrying a publish round that failed",
         NetEvent::AddressWaitOver { .. } => "withholding an address no board holds the room for",
+        NetEvent::AnchorNoteDue { .. } => "saying which anchors never took a room",
         NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
@@ -765,6 +767,14 @@ enum NetEvent {
         /// The room.
         channel_id: Digest32,
         /// Which wait this ends.
+        serial: u64,
+    },
+    /// The anchors an address handed out at `serial` named, and had not taken its room then, have
+    /// had [`ADDRESS_PATIENCE`]: each that still has not is named, with why (V210-96).
+    AnchorNoteDue {
+        /// The room.
+        channel_id: Digest32,
+        /// Which address this is about.
         serial: u64,
     },
     /// A failed publish round's backoff is up: try that `(room, board)` again.
@@ -1478,26 +1488,32 @@ impl JoinSteps {
 }
 
 impl Joiner {
-    /// A board holding the room, when `first` — the board `reach_a_board` chose — has nothing for
-    /// it: every other board the join's routes name, asked at once, and the first that holds it.
+    /// A board holding the room, when the boards in `tried` — starting with the one
+    /// `reach_a_board` chose — had nothing for it, could not be read, or took no pre-join record:
+    /// every other board the join's routes name, asked at once, and the first that holds it.
     ///
     /// **A board that does not hold the room is not a malformed address.** The link parsed and
     /// named a room; a board we reached has nothing for it. That is a room its host has not
     /// published there yet, or a room id mistyped into another valid one (a link carries no
     /// checksum), and the board cannot tell which. The join used to stop at the first such board,
     /// while the link named others — the host's own last, which always holds its room (V210-96).
-    /// Only when none has it does the join fail, and then it names every board it asked and what
-    /// each said, so the person can check each and the room.
+    /// Only when none has it does the join fail — with `fault`, what the first board's failure
+    /// meant — and then it names every board it asked and what each said (`why` carries what the
+    /// boards in `tried` said), so the person can check each and the room. The same holds when the
+    /// first board could not be read or took no pre-join record (C2): a board that failed is not
+    /// the room failing, while the link names a host that holds it.
     async fn another_board_with_the_room(
         &self,
-        first: &Arc<VoxConnection>,
+        tried: &std::collections::BTreeSet<Digest32>,
+        mut why: Vec<String>,
+        fault: Fault,
         steps: &mut JoinSteps,
     ) -> std::result::Result<(Arc<VoxConnection>, crate::nat::service::RecordSet), JoinerLost> {
         use crate::node::network::short_id;
         let room = self.parsed.channel_id;
         let t = std::time::Instant::now();
         let mut asked = tokio::task::JoinSet::new();
-        let mut seen: std::collections::BTreeSet<Digest32> = [first.peer_id()].into();
+        let mut seen = tried.clone();
         for (at, (id, endpoints)) in self.routes.iter().enumerate() {
             if !seen.insert(*id) {
                 continue;
@@ -1524,11 +1540,6 @@ impl Joiner {
                 (at, said)
             });
         }
-        let mut why = vec![format!(
-            "board {} has nothing for room {}",
-            short_id(first.peer_id()),
-            short_id(room)
-        )];
         let mut others: Vec<(usize, String)> = Vec::new();
         while let Some(done) = asked.join_next().await {
             match done {
@@ -1544,7 +1555,7 @@ impl Joiner {
         why.extend(others.into_iter().map(|(_, said)| said));
         steps.took("the other boards (none held the room)", t);
         Err(JoinerLost {
-            fault: Fault::RoomNotOnBoard,
+            fault,
             why,
             steps: JoinSteps::default(),
         })
@@ -1690,15 +1701,71 @@ impl Joiner {
             },
             t,
         );
-        let set = fetched.map_err(|e| JoinerLost::of(on_the_board(fault_of(&e))))?;
-        // **A board that does not hold the room is not the last word** (V210-96): the link names
-        // others, the host's own board among them, and the host always holds its room. So they are
-        // asked too before the join gives up; see `another_board_with_the_room`.
-        let (board, mut set) = if set.genesis.is_some() {
-            (board, set)
-        } else {
-            self.another_board_with_the_room(&board, steps).await?
+        // **A board that does not hold the room, or could not be read, is not the last word**
+        // (V210-96): the link names others, the host's own board among them, and the host always
+        // holds its room. So they are asked too before the join gives up; see
+        // `another_board_with_the_room`.
+        let short = crate::node::network::short_id;
+        let mut tried: std::collections::BTreeSet<Digest32> = [board.peer_id()].into();
+        let (mut board, mut set) = match fetched {
+            Ok(set) if set.genesis.is_some() => (board, set),
+            Ok(_) => {
+                let why = vec![format!(
+                    "board {} has nothing for room {}",
+                    short(board.peer_id()),
+                    short(parsed.channel_id)
+                )];
+                self.another_board_with_the_room(&tried, why, Fault::RoomNotOnBoard, steps)
+                    .await?
+            }
+            Err(e) => {
+                let why = vec![format!(
+                    "board {} could not be read: {e}",
+                    short(board.peer_id())
+                )];
+                let fault = on_the_board(fault_of(&e));
+                self.another_board_with_the_room(&tried, why, fault, steps)
+                    .await?
+            }
         };
+        let prejoin_wire = {
+            let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
+            let ring = self.ring.lock().await;
+            let bundle = ring
+                .bundle(&crate::identity::composite::RootSigner::public_key(signer))
+                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+            let endpoints = net
+                .local_endpoints()
+                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+            crate::nat::record::PreJoinRecord::build(
+                signer,
+                &parsed.channel_id,
+                bundle,
+                endpoints,
+                self.seq,
+                self.now,
+            )
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?
+            .to_wire()
+        };
+        // A board that takes no pre-join record is another board's turn too (C2).
+        let mut refused: Vec<String> = Vec::new();
+        loop {
+            let t = std::time::Instant::now();
+            let Err(e) = announce(&board, &prejoin_wire).await else {
+                break;
+            };
+            steps.took("announce to the board (failed)", t);
+            refused.push(format!(
+                "board {} took no pre-join record: {e}",
+                short(board.peer_id())
+            ));
+            tried.insert(board.peer_id());
+            let fault = on_the_board(fault_of(&e));
+            (board, set) = self
+                .another_board_with_the_room(&tried, refused.clone(), fault, steps)
+                .await?;
+        }
         let Some(genesis) = set.genesis.clone() else {
             return Err(JoinerLost::of(Fault::RoomNotOnBoard));
         };
@@ -1735,32 +1802,7 @@ impl Joiner {
             ordered.truncate(MAX_JOIN_RESPONDERS);
             ordered
         };
-        let prejoin_wire = {
-            let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
-            let ring = self.ring.lock().await;
-            let bundle = ring
-                .bundle(&crate::identity::composite::RootSigner::public_key(signer))
-                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
-            let endpoints = net
-                .local_endpoints()
-                .map_err(|e| JoinerLost::of(fault_of(&e)))?;
-            crate::nat::record::PreJoinRecord::build(
-                signer,
-                &parsed.channel_id,
-                bundle,
-                endpoints,
-                self.seq,
-                self.now,
-            )
-            .map_err(|e| JoinerLost::of(fault_of(&e)))?
-            .to_wire()
-        };
-        let t = std::time::Instant::now();
-        let announced = announce(&board, &prejoin_wire).await;
-        if announced.is_err() {
-            steps.took("announce to the board (failed)", t);
-        }
-        announced.map_err(|e| JoinerLost::of(on_the_board(fault_of(&e))))?;
+
         let mut why: Vec<String> = Vec::new();
         let mut last_fault = Fault::Unreachable;
         let mut joined_outcome = None;
@@ -1772,7 +1814,31 @@ impl Joiner {
                 .map(|r| r.endpoints.clone())
                 .unwrap_or_default();
             let short = crate::node::network::short_id(responder);
+            // **The link's own address for it first** (V210-96, C7): the link names the host and
+            // where to reach it, and a board with no current address record for it sent the join
+            // to poll that board for up to `JOIN_ADDRESS_PATIENCE` instead. The board is asked
+            // only if that address fails.
+            let mut linked: Option<Arc<VoxConnection>> = None;
             if responder_endpoints.is_empty() && board.peer_id() != responder {
+                if let Some((_, from_link)) = self
+                    .routes
+                    .iter()
+                    .find(|(id, e)| *id == responder && !e.is_empty())
+                {
+                    let t = std::time::Instant::now();
+                    match self.dial(responder, from_link, false).await {
+                        Ok(c) => {
+                            steps.took(&format!("{short}: dial (the link's address)"), t);
+                            linked = Some(c);
+                        }
+                        Err(e) => {
+                            steps.took(&format!("{short}: dial (the link's address, failed)"), t);
+                            why.push(format!("{short}: the link's address: {e}"));
+                        }
+                    }
+                }
+            }
+            if linked.is_none() && responder_endpoints.is_empty() && board.peer_id() != responder {
                 let t = std::time::Instant::now();
                 let mut polls = 0u32;
                 let deadline = tokio::time::Instant::now() + JOIN_ADDRESS_PATIENCE;
@@ -1810,9 +1876,15 @@ impl Joiner {
             let conn = if board.peer_id() == responder {
                 Arc::clone(&board)
             } else {
-                let t = std::time::Instant::now();
-                let dialled = self.dial(responder, &responder_endpoints, false).await;
-                steps.took(&format!("{short}: dial"), t);
+                let dialled = match linked {
+                    Some(c) => Ok(c),
+                    None => {
+                        let t = std::time::Instant::now();
+                        let dialled = self.dial(responder, &responder_endpoints, false).await;
+                        steps.took(&format!("{short}: dial"), t);
+                        dialled
+                    }
+                };
                 match dialled {
                     Ok(c) => {
                         if let Err(e) = announce(&c, &prejoin_wire).await {
@@ -2326,6 +2398,10 @@ pub struct Node {
     address_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, u64)>,
     /// The serial of the last address wait begun.
     address_serial: u64,
+    /// `(room, anchor)` pairs an address was handed out naming before that anchor held the room,
+    /// with the address's serial: said when the anchor takes it, or when [`ADDRESS_PATIENCE`]
+    /// passes without (`NetEvent::AnchorNoteDue`) (V210-96).
+    anchor_owed: BTreeMap<(Digest32, Digest32), u64>,
     /// When a background dial to each member was last started: see `reach_member`.
     member_dialed_at: BTreeMap<Digest32, u64>,
     /// Explicit consents waiting on the network: for a member's dial (answered on `Dialed` by
@@ -2568,6 +2644,7 @@ impl Node {
             publish_trouble: BTreeMap::new(),
             address_waiters: Vec::new(),
             address_serial: 0,
+            anchor_owed: BTreeMap::new(),
             member_dialed_at: BTreeMap::new(),
             pending_consents: Vec::new(),
             fresh_details: BTreeMap::new(),
@@ -4285,6 +4362,12 @@ impl Node {
                     self.publish_channel_to_anchors(&channel_id, PublishCause::Addresses)
                         .await;
                 }
+                // An address waiting for this node's own routes can name them now (V210-96).
+                let waiting: std::collections::BTreeSet<Digest32> =
+                    self.address_waiters.iter().map(|(r, _, _)| *r).collect();
+                for room in waiting {
+                    self.answer_addresses(room).await;
+                }
             }
             NetEvent::ReachFailed { peer, why } => {
                 // An anchor that failed to connect waits before its next dial, doubling to
@@ -4558,6 +4641,18 @@ impl Node {
                 self.report_publish(&channel_id, board, outcomes);
                 self.note_publish_round(channel_id, board, failed);
                 self.answer_addresses(channel_id).await;
+                if holds_room && self.anchor_owed.remove(&(channel_id, board)).is_some() {
+                    let short = crate::node::network::short_id;
+                    let _ = self.event_tx.send(NodeEvent::AddressNote {
+                        channel_id,
+                        note: format!(
+                            "anchor {} has taken room {}: a guest who cannot reach this host \
+                             directly can join through it now",
+                            short(board),
+                            short(channel_id)
+                        ),
+                    });
+                }
                 if !self.publishing.iter().any(|(room, _)| *room == channel_id) {
                     let (ready, waiting): (Vec<_>, Vec<_>) =
                         std::mem::take(&mut self.publish_waiters)
@@ -4583,6 +4678,9 @@ impl Node {
             }
             NetEvent::AddressWaitOver { channel_id, serial } => {
                 self.withhold_address(channel_id, serial).await;
+            }
+            NetEvent::AnchorNoteDue { channel_id, serial } => {
+                self.say_anchors_that_never_took(channel_id, serial);
             }
             NetEvent::PublishRetry { channel_id, board } => {
                 // **Cancelled if the room or the board has gone.** A room closed since, or a board
@@ -5225,38 +5323,45 @@ impl Node {
                 anchors.push(n.clone());
             }
         }
-        if let Ok(own) = net.local_endpoints() {
-            if !anchors.iter().any(|a| a.id == net.local_id()) {
-                if let Ok(me) = BootstrapNode::new(net.local_id(), own) {
-                    anchors.push(me);
-                }
-            }
-        }
-        anchors.truncate(crate::node::link::MAX_LINK_ANCHORS);
+        // **This node always survives the cap** (V210-96, C6): it was appended last and then
+        // truncated with the rest, so four anchors left the link naming no route to the host itself,
+        // which always holds its room, and a guest who could reach it directly had no way to.
+        anchors.retain(|a| a.id != net.local_id());
+        let me = net
+            .local_endpoints()
+            .ok()
+            .and_then(|own| BootstrapNode::new(net.local_id(), own).ok());
+        anchors.truncate(crate::node::link::MAX_LINK_ANCHORS - usize::from(me.is_some()));
+        anchors.extend(me);
         anchors
     }
 
-    /// **An address is handed out only once its room can be joined through it** (V210-96).
+    /// **An address is handed out at once whenever a guest could find the host through it**
+    /// (V210-96), and says what it leaves out.
     ///
-    /// `vox serve` printed its address the moment the room was made, while the room's first
-    /// publish round was still on its own task — or had not started, since a round goes only to an
-    /// anchor this node is already connected to, and a node `vox serve` has just started often is
-    /// not. A guest who joined at once reached the anchor and was told "board … has nothing for
-    /// room …": CI macOS at 1a648c9, `a_first_direct_connection_is_prompt_proof`, and 1 of 77
-    /// probes; in 11 of 18 ordered runs the host connected to its anchor after printing the
-    /// address. `vox room create` answered the same way until 0f39449e.
+    /// `vox serve` printed its address while the room's first publish round to its anchor had not
+    /// landed, or not started (a round goes only to an anchor this node is already connected to),
+    /// and a guest who reached the anchor was told "board … has nothing for room …": CI macOS at
+    /// 1a648c9, `a_first_direct_connection_is_prompt_proof`, 1 of 77 probes. That join could have
+    /// reached the host itself — the link names it — and now does (`another_board_with_the_room`).
     ///
-    /// So the link is minted once a publish round has left one of the anchors it names holding the
-    /// room (or at once when it names no anchor: this node's own board holds the room), and the answer
-    /// waits for that — for the connection too — up to [`ADDRESS_PATIENCE`]. Past it the address
-    /// is withheld and the reason given, board by board: an address that leads nowhere is worse
-    /// than none, because the person hands it out and only learns later.
+    /// **An anchor bridges hosts that cannot otherwise find each other, and nothing else needs
+    /// one** (the decider, 2026-10-01). This node's own board always holds its room and the link
+    /// names it, so an address that names any route of this node's own — a public address, a
+    /// router's mapping, the local network or this machine — is handed out at once, and a note
+    /// says which kinds it carries and which named anchors have not taken the room yet (and later,
+    /// whether they did: `anchor_owed`). This node cannot know where its guests are.
+    ///
+    /// Only an address naming **no** route of this node's own — its addresses not yet discovered —
+    /// waits: for that discovery, or for an anchor to take the room, up to [`ADDRESS_PATIENCE`].
+    /// Past it the address is withheld and the reason given, board by board: an address that
+    /// leads nowhere is worse than none, because the person hands it out and only learns later.
     async fn begin_invite(&mut self, channel_id: Digest32, reply: oneshot::Sender<Outcome>) {
         if self.net.is_none()
             || !self.channels.contains_key(&channel_id)
             || self.room_on_a_named_board(&channel_id).await
         {
-            let outcome = self.invite(&channel_id).await;
+            let outcome = self.hand_out_address(channel_id).await;
             let _ = reply.send(outcome);
             return;
         }
@@ -5283,14 +5388,115 @@ impl Node {
             .collect()
     }
 
-    /// Whether `room` can be joined through its link now: an anchor the link names holds it (see
-    /// `on_board`), or the link names none and this node's own board holds it.
-    async fn room_on_a_named_board(&self, room: &Digest32) -> bool {
-        let named = self.named_anchors(room).await;
-        named.is_empty() || named.iter().any(|b| self.on_board.contains(&(*room, *b)))
+    /// The routes of this node's own an address would name: what it advertises.
+    fn own_routes(&self) -> Vec<crate::nat::multiaddr::Multiaddr> {
+        self.net
+            .as_ref()
+            .and_then(|n| n.local_endpoints().ok())
+            .map(|e| e.addrs().to_vec())
+            .unwrap_or_default()
     }
 
-    /// Hand out every address waiting on `room`, if it is on a board its link names now.
+    /// Whether `room` can be found through its link now: the link names a route of this node's
+    /// own — whose board always holds the room — or an anchor it names holds it (see `on_board`).
+    /// Neither, and the link would name nowhere a guest could find the room (C5: before address
+    /// discovery, a node bound to a wildcard knows no address of its own).
+    async fn room_on_a_named_board(&self, room: &Digest32) -> bool {
+        if !self.own_routes().is_empty() {
+            return true;
+        }
+        let named = self.named_anchors(room).await;
+        named.iter().any(|b| self.on_board.contains(&(*room, *b)))
+    }
+
+    /// What kinds of route of this node's own an address carries, in plain words, each once. This
+    /// node can classify an address; it cannot confirm that anyone outside can reach it.
+    fn route_kinds(&self, routes: &[crate::nat::multiaddr::Multiaddr]) -> Vec<&'static str> {
+        let mut kinds: Vec<&'static str> = Vec::new();
+        for sa in routes
+            .iter()
+            .filter_map(crate::nat::multiaddr::Multiaddr::socket_addr)
+        {
+            let ip = sa.ip().to_canonical();
+            let kind = if ip.is_loopback() {
+                "this machine"
+            } else if self
+                .port_mappings
+                .iter()
+                .any(|m| m.external_ip == Some(ip) && m.external_port == sa.port())
+            {
+                "a port mapping the router granted (nobody has confirmed it reachable)"
+            } else if crate::nat::reachability::is_routable(&ip) {
+                "a public address"
+            } else {
+                "the local network"
+            };
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+        kinds
+    }
+
+    /// Mint the address, then say what it carries: which kinds of route to this node, and which
+    /// anchors it names that have not taken the room yet — each said again when it does, or when
+    /// [`ADDRESS_PATIENCE`] passes without (`NetEvent::AnchorNoteDue`).
+    async fn hand_out_address(&mut self, room: Digest32) -> Outcome {
+        let outcome = self.invite(&room).await;
+        if !outcome.is_done() {
+            return outcome;
+        }
+        let short = crate::node::network::short_id;
+        let routes = self.own_routes();
+        let pending: Vec<Digest32> = self
+            .named_anchors(&room)
+            .await
+            .into_iter()
+            .filter(|b| !self.on_board.contains(&(room, *b)))
+            .collect();
+        let mut note = if routes.is_empty() {
+            "this node does not know an address of its own yet, so the address names only its \
+             anchors"
+                .to_owned()
+        } else {
+            format!(
+                "the address names this host directly — {} — and a guest who can reach that joins \
+                 without an anchor",
+                self.route_kinds(&routes).join(", ")
+            )
+        };
+        if !pending.is_empty() {
+            let names: Vec<String> = pending.iter().map(|b| short(*b)).collect();
+            note.push_str(&format!(
+                "; anchor {} has not taken room {} yet, so a guest who cannot reach this host \
+                 directly must wait for it (this node will say when it has)",
+                names.join(", "),
+                short(room)
+            ));
+            self.address_serial += 1;
+            let serial = self.address_serial;
+            for b in pending {
+                self.anchor_owed.insert((room, b), serial);
+            }
+            let tx = self.net_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(ADDRESS_PATIENCE).await;
+                let _ = tx
+                    .send(NetEvent::AnchorNoteDue {
+                        channel_id: room,
+                        serial,
+                    })
+                    .await;
+            });
+        }
+        let _ = self.event_tx.send(NodeEvent::AddressNote {
+            channel_id: room,
+            note,
+        });
+        outcome
+    }
+
+    /// Hand out every address waiting on `room`, if a guest could find the room through it now.
     async fn answer_addresses(&mut self, room: Digest32) {
         if !self.address_waiters.iter().any(|(r, _, _)| *r == room)
             || !self.room_on_a_named_board(&room).await
@@ -5302,13 +5508,54 @@ impl Node {
             .partition(|(r, _, _)| *r == room);
         self.address_waiters = waiting;
         for (_, reply, _) in ready {
-            let outcome = self.invite(&room).await;
+            let outcome = self.hand_out_address(room).await;
             let _ = reply.send(outcome);
         }
     }
 
-    /// Withhold the address waited on since `serial`, if it is still waiting, and say why: for each
-    /// anchor its link names, whether this node reached it and what its last publish round said.
+    /// Why `board` does not hold `room`, as far as this node knows.
+    fn why_not_on(&self, room: Digest32, board: Digest32) -> String {
+        let connected = self
+            .net
+            .as_ref()
+            .is_some_and(|n| n.manager().existing(&board).is_some());
+        match (connected, self.publish_trouble.get(&(room, board))) {
+            (_, Some(trouble)) => format!("its publish round failed: {trouble}"),
+            (true, None) => "connected, and no publish round to it has finished".to_owned(),
+            (false, None) => "this node has not reached it".to_owned(),
+        }
+    }
+
+    /// Name each anchor an address handed out at `serial` named that has still not taken `room`.
+    fn say_anchors_that_never_took(&mut self, room: Digest32, serial: u64) {
+        let late: Vec<Digest32> = self
+            .anchor_owed
+            .iter()
+            .filter(|((r, _), s)| *r == room && **s == serial)
+            .map(|((_, b), _)| *b)
+            .collect();
+        let short = crate::node::network::short_id;
+        for b in late {
+            // Kept, as said: the anchor taking the room later is still worth saying (serial 0
+            // matches no wait).
+            self.anchor_owed.insert((room, b), 0);
+            let _ = self.event_tx.send(NodeEvent::AddressNote {
+                channel_id: room,
+                note: format!(
+                    "anchor {} has not taken room {} after {}s ({}): only a guest who can reach \
+                     this host directly can join",
+                    short(b),
+                    short(room),
+                    ADDRESS_PATIENCE.as_secs(),
+                    self.why_not_on(room, b)
+                ),
+            });
+        }
+    }
+
+    /// Withhold the address waited on since `serial`, if it is still waiting, and say why: this
+    /// node has no address of its own to put in it, and for each anchor it names, whether this node
+    /// reached it and what its last publish round said.
     async fn withhold_address(&mut self, room: Digest32, serial: u64) {
         let Some(at) = self
             .address_waiters
@@ -5323,26 +5570,15 @@ impl Node {
             .named_anchors(&room)
             .await
             .into_iter()
-            .map(|b| {
-                let connected = self
-                    .net
-                    .as_ref()
-                    .is_some_and(|n| n.manager().existing(&b).is_some());
-                let said = match (connected, self.publish_trouble.get(&(room, b))) {
-                    (_, Some(trouble)) => format!("its publish round failed: {trouble}"),
-                    (true, None) => "connected, and no publish round to it has finished".to_owned(),
-                    (false, None) => "this node has not reached it".to_owned(),
-                };
-                format!("board {}: {said}", short(b))
-            })
+            .map(|b| format!("board {}: {}", short(b), self.why_not_on(room, b)))
             .collect();
         let _ = self.event_tx.send(NodeEvent::AddressWithheld {
             channel_id: room,
             reason: format!(
-                "no board the address of room {} names holds the room after {}s, so it would lead \
-                 nowhere — {}",
-                short(room),
+                "after {}s this node still knows no address of its own to put in the address of \
+                 room {}, and no anchor it names holds the room, so it would lead nowhere — {}",
                 ADDRESS_PATIENCE.as_secs(),
+                short(room),
                 boards.join("; ")
             ),
         });
@@ -8322,6 +8558,7 @@ impl Node {
         // asked for meanwhile is not handed out by a locked node (V210-96).
         self.on_board.clear();
         self.publish_trouble.clear();
+        self.anchor_owed.clear();
         for (_, reply, _) in std::mem::take(&mut self.address_waiters) {
             let _ = reply.send(Outcome::Failed(Fault::Locked));
         }
@@ -8705,6 +8942,7 @@ impl Node {
                 // And no address to it is handed out now (V210-96).
                 self.on_board.retain(|(r, _)| r != channel_id);
                 self.publish_trouble.retain(|(r, _), _| r != channel_id);
+                self.anchor_owed.retain(|(r, _), _| r != channel_id);
                 let (closed, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.address_waiters)
                     .into_iter()
                     .partition(|(r, _, _)| r == channel_id);
