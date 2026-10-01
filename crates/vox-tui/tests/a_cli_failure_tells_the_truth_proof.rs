@@ -762,7 +762,12 @@ fn assert_says_stopped(e: &Ended, case: &str, name: &str, code: i32) {
         "{case}: `vox connect` died by the signal instead of ending with a reason.\n{}",
         e.describe()
     );
-    assert_eq!(e.status.code(), Some(code), "{case}: exit status\n{}", e.describe());
+    assert_eq!(
+        e.status.code(),
+        Some(code),
+        "{case}: exit status\n{}",
+        e.describe()
+    );
     assert!(
         !e.stderr.trim().is_empty(),
         "{case}: `vox connect` ended with status {code} and SAID NOTHING on stderr.\n{}",
@@ -860,13 +865,24 @@ fn a_connect_stopped_by_a_signal_says_why() {
     assert!(ok, "CANNOT MEASURE: vox id (host): {said}");
     let host_fp = said
         .split_whitespace()
-        .find(|w| w.len() == 52 && w.chars().all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)))
+        .find(|w| {
+            w.len() == 52
+                && w.chars()
+                    .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c))
+        })
         .unwrap_or_else(|| panic!("CANNOT MEASURE: no fingerprint in `vox id`: {said}"))
         .to_owned();
     let host = Proc::spawn(
         "host",
         &host_dir,
-        &["serve", &service_port, "--anchor", &spec, "--listen", "127.0.0.1:0"],
+        &[
+            "serve",
+            &service_port,
+            "--anchor",
+            &spec,
+            "--listen",
+            "127.0.0.1:0",
+        ],
         "",
     );
     let field = |label: &str| {
@@ -983,7 +999,11 @@ fn a_connect_stopped_by_a_signal_says_why() {
             std::thread::sleep(Duration::from_millis(20));
         }
         let (status, after) = exited
-            .or_else(|| connect.exit_within(STOPS_WITHIN).map(|(s, _)| (s, sent.elapsed())))
+            .or_else(|| {
+                connect
+                    .exit_within(STOPS_WITHIN)
+                    .map(|(s, _)| (s, sent.elapsed()))
+            })
             .unwrap_or_else(|| {
                 panic!(
                     "{case}: `vox connect` had not ended {STOPS_WITHIN:?} after the signal.\n\
@@ -1076,7 +1096,10 @@ impl OnTerminal {
         grantpt(&controller).unwrap_or_else(|e| apparatus("grantpt", &e));
         unlockpt(&controller).unwrap_or_else(|e| apparatus("unlockpt", &e));
         let name = ptsname(&controller, Vec::new()).unwrap_or_else(|e| apparatus("ptsname", &e));
-        let name = name.to_str().unwrap_or_else(|e| apparatus("the pty's name", &e)).to_owned();
+        let name = name
+            .to_str()
+            .unwrap_or_else(|e| apparatus("the pty's name", &e))
+            .to_owned();
         let open = || {
             std::fs::OpenOptions::new()
                 .read(true)
@@ -1086,7 +1109,10 @@ impl OnTerminal {
         };
         let terminal: std::os::fd::OwnedFd = open().into();
         // Nothing reads this address before both prompts are answered: the stop lands first.
-        let mut a = vec!["connect".to_owned(), "vox://not-read-before-the-prompts".to_owned()];
+        let mut a = vec![
+            "connect".to_owned(),
+            "vox://not-read-before-the-prompts".to_owned(),
+        ];
         if let Some(f) = room_file {
             a.push("--passphrase-file".to_owned());
             a.push(f.to_str().unwrap().to_owned());
@@ -1194,7 +1220,10 @@ impl OnTerminal {
             stdout: self.shown(),
             stderr: stderr.join("\n"),
         };
-        eprintln!("[connect] {}", ended.describe().replace('\n', "\n[connect] "));
+        eprintln!(
+            "[connect] {}",
+            ended.describe().replace('\n', "\n[connect] ")
+        );
         (ended, modes)
     }
 }
@@ -1211,7 +1240,9 @@ impl Drop for OnTerminal {
 fn assert_terminal_handed_back(modes: &rustix::termios::Termios, case: &str, e: &Ended) {
     use rustix::termios::LocalModes;
     assert!(
-        modes.local_modes.contains(LocalModes::ECHO | LocalModes::ICANON),
+        modes
+            .local_modes
+            .contains(LocalModes::ECHO | LocalModes::ICANON),
         "{case}: the terminal was left without echo or line editing (local modes {:?}) — the \
          prompt's raw mode, handed back to the shell.\n{}",
         modes.local_modes,
@@ -1230,7 +1261,10 @@ fn stopped_at_prompt(
     let (sig, name, code) = stop;
     let mut c = OnTerminal::start(profile, room_file);
     c.until_prompted(prompt);
-    assert!(signal(sig, c.child.id()), "CANNOT MEASURE: `kill -{sig}` failed");
+    assert!(
+        signal(sig, c.child.id()),
+        "CANNOT MEASURE: `kill -{sig}` failed"
+    );
     let (e, modes) = c.finish();
     let case = format!("{name} at the {prompt:?} prompt");
     assert_says_stopped(&e, &case, name, code);
@@ -1241,7 +1275,10 @@ fn stopped_at_prompt(
         e.describe()
     );
     assert_terminal_handed_back(&modes, &case, &e);
-    eprintln!("[proof] {case}: {}, waited for {waited_for:?}, terminal handed back", e.status);
+    eprintln!(
+        "[proof] {case}: {}, waited for {waited_for:?}, terminal handed back",
+        e.status
+    );
 }
 
 /// V210-85, claim 8 — **a `vox connect` stopped at a passphrase prompt says why** — the room
@@ -1263,7 +1300,10 @@ fn a_connect_stopped_at_a_passphrase_prompt_says_why() {
     let tmp = tempfile::tempdir().unwrap();
     let profile = tmp.path().join("guest");
     std::fs::create_dir_all(profile.join("cfg")).unwrap();
-    let (ok, said, _) = must("vox id", vox(&profile, &["id"], "", Duration::from_secs(90)));
+    let (ok, said, _) = must(
+        "vox id",
+        vox(&profile, &["id"], "", Duration::from_secs(90)),
+    );
     assert!(ok, "CANNOT MEASURE: vox id: {said}");
     let room_file = tmp.path().join("room-passphrase");
     std::fs::write(&room_file, "a room passphrase").unwrap();
@@ -1292,9 +1332,19 @@ fn a_connect_stopped_at_a_passphrase_prompt_says_why() {
     let case = "Ctrl-C at the identity passphrase prompt";
     {
         use std::os::unix::process::ExitStatusExt;
-        assert_eq!(e.status.signal(), None, "{case}: died by a signal.\n{}", e.describe());
+        assert_eq!(
+            e.status.signal(),
+            None,
+            "{case}: died by a signal.\n{}",
+            e.describe()
+        );
     }
-    assert_eq!(e.status.code(), Some(1), "{case}: exit status\n{}", e.describe());
+    assert_eq!(
+        e.status.code(),
+        Some(1),
+        "{case}: exit status\n{}",
+        e.describe()
+    );
     assert!(
         e.stderr.contains("cancelled"),
         "{case}: stderr does not say it was cancelled.\n{}",
