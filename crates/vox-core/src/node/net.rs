@@ -1234,7 +1234,7 @@ impl ConnectionManager {
         goodbye_to(relayed, patience).await + goodbye_to(direct, patience).await
     }
 
-        /// Close every connection (node shutdown).
+    /// Close every connection (node shutdown).
     pub fn close_all(&self) {
         for (conn, _) in lock(&self.retiring).drain(..) {
             conn.close(WireError::ShuttingDown);
