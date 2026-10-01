@@ -65,8 +65,9 @@
 // Every failure path is silent and injects nothing. A hook that breaks the turn it
 // rides on is worse than one that does nothing.
 
-import { appendFileSync, mkdtempSync, rmSync } from "node:fs"
-import { createServer } from "node:net"
+import { appendFileSync, lstatSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync } from "node:fs"
+import { spawn } from "node:child_process"
+import { connect, createServer } from "node:net"
 import { randomBytes, timingSafeEqual } from "node:crypto"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -98,8 +99,87 @@ function log(line) {
  *   {"type":"prompt","session":"ses_…","text":"…"}
  *
  * answered with one line: `{"ok":true}`, or `{"error":"…"}` with `"gone":true`
- * when this OpenCode does not know the session.
+ * when this OpenCode does not know the session. A connection that has not sent both
+ * frames within `AUTH_IDLE_MS`, or sends more than `MAX_FRAMES_BYTES` before them, is
+ * closed unanswered.
+ *
+ * ## The directory is removed when OpenCode exits, however it exits (ADR-021 F17)
+ *
+ * In a hand-opened `opencode` this plugin runs in a **worker thread**, and OpenCode ends
+ * the process without telling it: measured against 1.18.34, neither `process.on("exit")`
+ * nor a SIGINT, SIGTERM or SIGHUP handler, nor any plugin `event`, runs when the person
+ * quits by ctrl+C, `/exit` or closing the terminal. So nothing in this process can clean
+ * up. A one-line `/bin/sh` does it instead: started in its own session (so closing the
+ * terminal does not signal it), it blocks reading a pipe whose only writer is this
+ * process. When OpenCode exits by any route — a SIGKILL included — the kernel closes
+ * that pipe, the read returns, and it removes the socket and the directory.
+ *
+ * Should that helper itself be killed, `sweep` removes the directory at the next start.
  */
+const AUTH_IDLE_MS = 5000
+const MAX_FRAMES_BYTES = 1 << 20 // a wake carries at most one 64 KiB message, escaped
+const WAKE_DIR = /^vox-oc-[A-Za-z0-9]{6}$/
+const SWEEP_MIN_AGE_MS = 10_000
+
+/**
+ * Remove what an earlier OpenCode's wake channel left in the temp directory: a
+ * directory of this plugin's naming, owned by this user and private to them, whose
+ * socket **refuses a connection** — nobody is listening, so its OpenCode is gone. A
+ * live session's socket accepts, and is left alone. Only the socket and the then-empty
+ * directory are removed, never anything else; a directory holding anything more is
+ * left as it is.
+ */
+function sweep(own) {
+  let names
+  try {
+    names = readdirSync(tmpdir())
+  } catch {
+    return
+  }
+  const uid = process.getuid?.()
+  for (const name of names) {
+    if (!WAKE_DIR.test(name)) continue
+    const dir = join(tmpdir(), name)
+    if (dir === own) continue
+    try {
+      const st = lstatSync(dir)
+      if (!st.isDirectory() || st.uid !== uid || (st.mode & 0o077) !== 0) continue
+      const sock = join(dir, "wake.sock")
+      const so = lstatSync(sock)
+      // A socket made in the last moments may be bound and not yet listening.
+      if (!so.isSocket() || Date.now() - so.mtimeMs < SWEEP_MIN_AGE_MS) continue
+      const probe = connect(sock)
+      probe.on("connect", () => probe.destroy())
+      probe.on("error", (e) => {
+        if (e?.code !== "ECONNREFUSED") return
+        try {
+          unlinkSync(sock)
+          rmdirSync(dir)
+          log("wake: swept " + dir + ", whose OpenCode is gone")
+        } catch {}
+      })
+    } catch {}
+  }
+}
+
+/**
+ * Remove `dir` and its socket once this process has exited (see above). A helper that
+ * cannot start leaves the directory to the next start's `sweep`.
+ */
+function removeOnExit(dir) {
+  try {
+    const helper = spawn(
+      "/bin/sh",
+      ["-c", 'read _; rm -f -- "$1/wake.sock"; rmdir -- "$1"', "vox-oc-cleanup", dir],
+      { detached: true, stdio: ["pipe", "ignore", "ignore"] },
+    )
+    helper.on("error", (e) => log("wake: no cleanup helper: " + e))
+    helper.unref()
+  } catch (e) {
+    log("wake: no cleanup helper: " + e)
+  }
+}
+
 function wakeChannel(client) {
   try {
     // `mkdtemp` makes the directory 0700, so only this user can reach the socket;
@@ -118,9 +198,19 @@ function wakeChannel(client) {
         } catch {}
       }
       conn.on("error", () => {})
+      // Unanswered and closed: a connection that never sends its frames, or sends
+      // more than any wake can be. Only this user can reach the socket, but nothing
+      // of theirs may pin a connection or its memory here.
+      conn.setTimeout(AUTH_IDLE_MS, () => {
+        if (!done) conn.destroy()
+      })
       conn.on("data", async (chunk) => {
         if (done) return
         buf += chunk.toString()
+        if (buf.length > MAX_FRAMES_BYTES) {
+          done = true
+          return conn.destroy()
+        }
         const lines = buf.split("\n")
         if (lines.length < 3) return
         done = true
@@ -156,13 +246,10 @@ function wakeChannel(client) {
     server.on("error", (e) => log("wake: socket error: " + e))
     server.listen(path)
     // Bun's `listen` on a Unix path binds before it returns; `unref` so the socket
-    // never keeps OpenCode alive, and the directory goes with the process.
+    // never keeps OpenCode alive.
     server.unref?.()
-    process.on("exit", () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {}
-    })
+    removeOnExit(dir)
+    sweep(dir)
     log("wake: listening at " + path)
     return { path, token }
   } catch (e) {
