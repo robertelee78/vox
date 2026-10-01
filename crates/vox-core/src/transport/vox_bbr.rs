@@ -2,29 +2,45 @@
 //!
 //! # What this is
 //! quinn-proto 0.11.18's BBR (`congestion/bbr/{mod,bw_estimation,min_max}.rs`), ported into Vox. The
-//! model, the gains, the gain cycle, ProbeRtt, recovery and the bandwidth filter are quinn's,
-//! unchanged; quinn-proto 0.11.19, the newest release, carries the same files byte for byte. quinn
-//! is untouched: the decider's rule is that Vox does not patch others' software, and owning the
+//! model, the gains, the gain cycle, ProbeRtt, recovery and the min-max filter are quinn's;
+//! quinn-proto 0.11.19, the newest release, carries the same files byte for byte. quinn is
+//! untouched: the decider's rule is that Vox does not patch others' software, and owning the
 //! controller is what lets the tapered controller hand a running connection's rate to it.
 //!
-//! # What is Vox's
+//! # Where it departs from quinn's, and why
+//! quinn's BBR ran a clean 1 Gbit/s LAN at 28% of raw (ADR-024 Context). Two of its estimators
+//! were wrong, and both are replaced here:
+//! - **The minimum round trip is BBR's own 10-second windowed minimum** of the connection's
+//!   samples (`now - sent` per acknowledged packet), as the BBR draft defines `min_rtt`. quinn's
+//!   reads `RttEstimator::min()`, the connection's *lifetime* minimum. Measured through the shipped
+//!   binary after a warm-up on loopback, it read 0 µs on a 10 ms path for the whole transfer, so
+//!   every bandwidth-delay product BBR computed from it was the floor.
+//! - **The bandwidth estimate is the BBR draft's delivery-rate sampling**
+//!   (draft-cheng-iccrg-delivery-rate-estimation), with every sample fed to the max filter. quinn's
+//!   took the smaller of the last send interval's and the last acknowledgement interval's rates and
+//!   fed the filter only samples above its maximum, so an overshoot never decayed. Measured on a
+//!   200 Mbit/s, 10 ms path with 1% loss: its estimate passed the link rate and the window grew to
+//!   eight bandwidth-delay products. See `BandwidthEstimation` below.
+//!
+//! With both, measured once each through the shipped binary on emulated links: a clean 1 Gbit/s,
+//! 2 ms LAN at 962, 962 and 940 Mbit/s against tier 1's 983, 988 and 983; a 200 Mbit/s, 10 ms path
+//! with 1% loss at 195.8 Mbit/s, 3.1 times a stock-Cubic flow on the same link.
+//!
+//! **quinn paces from the window, not from `pacing_rate`.** quinn-proto 0.11.18 reads a
+//! controller's pacing rate only for its metrics; its pacer runs from the window and the smoothed
+//! round trip. So BBR's gain cycle acts here only through the window (`cwnd_gain`), and BBR is
+//! window-bound: it can stand up to one bandwidth-delay product of queue by itself. The tapered
+//! controller's tier-3 queue test allows for that (`taper`).
+//!
+//! # What else is Vox's
 //! - [`VoxBbr::seeded`]: a BBR that starts from the rate, minimum round trip and window the
 //!   connection has already shown, in ProbeBw, instead of in Startup at the initial window
 //!   (ADR-024 rule 5: a switch does not restart the connection's ramp).
 //! - [`VoxBbr::delivery_rate`] and [`VoxBbr::min_rtt`], so the tapered controller can hand the
 //!   rate back when it leaves tier 3.
-//! - **The minimum round trip is BBR's own 10-second windowed minimum** of the connection's
-//!   samples (`now - sent` per acknowledged packet), as the BBR draft defines `min_rtt`. quinn's
-//!   BBR reads `RttEstimator::min()`, the connection's *lifetime* minimum, which never rises again
-//!   and, measured through the shipped binary after a warm-up on loopback, read 0 µs on a 10 ms
-//!   path for the whole transfer: every bandwidth-delay product BBR computes from it is then the
-//!   floor. ProbeRtt still refreshes the minimum every ten seconds, as quinn's does.
 //! - The gain cycle's random offset is drawn from the operating system (`getrandom`) once per
 //!   ProbeBw entry, instead of from a `rand_pcg` generator seeded the same way; Vox does not
 //!   otherwise depend on `rand`.
-//! - **The bandwidth estimator is the BBR draft's delivery-rate sampling**, not quinn's
-//!   `bw_estimation.rs`; see the comment at `BandwidthEstimation` for what quinn's did when
-//!   measured.
 //! - quinn's `#[cfg(test)]` check of the min-max filter is not carried (Vox has no in-crate tests,
 //!   ADR-018).
 //!
