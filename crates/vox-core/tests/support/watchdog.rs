@@ -68,10 +68,10 @@
 //! ## Why a debug build's budget is larger, by a measured amount
 //! A debug build's `vox` spends 10–100 times as long in production Argon2id and in the join's
 //! proof of work as a release build does: every unlock (any verb that opens a profile, a daemon
-//! starting, a room created) and every join. A proof that sets up a room of five members spent 548 s
-//! of its 600 s on that alone, and was aborted beside one other proof (V210-99, #295). Those costs
-//! are the product's, never weakened for a test. So a proof that pays them arms with
-//! [`arm_for`], naming how many joins and unlocks its setup makes, and a debug build adds
+//! starting, a room created) and every join. A proof that sets up a room of five members passed in
+//! 500 s of its 600 s on one tree, and was aborted 3 runs of 3 on the next (V210-99, #295), with
+//! nothing wrong but that cost. Those costs are the product's, never weakened for a test. So a
+//! proof that pays them arms with [`arm_for_setup`], naming how many joins and unlocks its setup makes, and a debug build adds
 //! [`DEBUG_JOIN`] per join and [`DEBUG_UNLOCK`] per unlock to the budget: the most each was
 //! measured to cost a debug build on a machine doing its ordinary concurrent work. A release
 //! build's budget is unchanged.
@@ -92,25 +92,25 @@ const DEFAULT_BUDGET: Duration = Duration::from_secs(600);
 
 /// The most one join cost a debug build: `vox room join` returning, its proof of work solved by the
 /// joining node, measured on the equivocation proof's staging (an anchor, five daemons, four
-/// joins in turn) on a machine doing its ordinary concurrent work (V210-99): 20 joins over five
-/// runs, on three builds (bb636f78, 4abf8307, f87b50a2), median 76.6 s, least 27.8 s, most
-/// 292.0 s. Nearly all of it is the solve, whose cost varies twelvefold from one join to the next
-/// (21.9–276.9 s), with 5–15 s to seal the room's keys after it.
+/// joins in turn) on a machine doing its ordinary concurrent work, at load 10 to 77 (V210-99): 36
+/// joins over nine runs, on three builds (bb636f78, 4abf8307, and this branch) side by side, median
+/// 47.8 s, least 26.0 s, most 142.0 s. Nearly all of it is the solve, whose cost is random: it
+/// varied fivefold from one join to the next within one run.
 #[allow(dead_code)]
-pub const DEBUG_JOIN: Duration = Duration::from_millis(291_980);
+pub const DEBUG_JOIN: Duration = Duration::from_millis(142_000);
 
-/// The most one production-Argon2id unlock cost a debug build — `vox id` on a profile, measured on
-/// the same staging as [`DEBUG_JOIN`] (V210-99): 25 of them, median 7.3 s, most 17.6 s. The other
-/// verbs that unlock cost no more there: a daemon answering after it starts, at most 11.3 s of 25;
-/// a room created, at most 10.3 s of 5; a `trust add`, 11.2 s on average over the slowest 20.
+/// The most one production-Argon2id unlock cost a debug build — `vox id` on a profile, measured in
+/// the same nine runs as [`DEBUG_JOIN`] (V210-99): 45 of them, median 6.5 s, most 14.1 s. The other
+/// verbs that unlock cost no more there: a daemon answering after it starts, at most 12.7 s of 45,
+/// and a `trust add`, at most 9.9 s on average over a run's 20.
 #[allow(dead_code)]
-pub const DEBUG_UNLOCK: Duration = Duration::from_millis(17_590);
+pub const DEBUG_UNLOCK: Duration = Duration::from_millis(14_100);
 
 /// What [`DEBUG_JOIN`] rests on, printed when a debug build arms for its setup.
-const DEBUG_JOIN_MEASURED: &str = "PENDING-MEASUREMENT";
+const DEBUG_JOIN_MEASURED: &str = "a join: 36 measured, median 47.8s, most 142.0s";
 
 /// What [`DEBUG_UNLOCK`] rests on, printed when a debug build arms for its setup.
-const DEBUG_UNLOCK_MEASURED: &str = "PENDING-MEASUREMENT";
+const DEBUG_UNLOCK_MEASURED: &str = "an unlock: 45 measured, median 6.5s, most 14.1s";
 
 /// The budget, in seconds: the largest any test of this binary asked for through [`arm_for`] or
 /// [`arm_for_setup`], and never less than [`DEFAULT_BUDGET`]. Tests run in parallel threads of one

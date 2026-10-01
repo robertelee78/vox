@@ -191,7 +191,10 @@ fn alive(p: &mut Proc) -> bool {
 #[test]
 #[ignore = "real vox daemons under the syscall interposer, production Argon2id; CI runs it in release"]
 fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
-    watchdog::arm();
+    // At most one join per kill point; unlocks: alice's `vox id`, daemon and room, and per kill
+    // point bob's `vox id`, `trust add` and daemon, alice's `trust add`, and after a kill both
+    // daemons again, alice's `trust list` and her `trust add` once more.
+    watchdog::arm_for_setup(MAX_POINTS as u32, 3 + 8 * MAX_POINTS as u32);
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let alice = root.join("alice");
