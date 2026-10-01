@@ -206,24 +206,25 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
     // `vox room send` closes the file as soon as it has read all of it; the collector already
     // holds bytes read from it, so a file no longer open was read to its end (nothing has
     // stopped the offer, and a read error is not staged here).
-    let read = loop {
-        let read: u64 = match read_offsets(send.0.id(), &offered) {
-            Some(offsets) if offsets.is_empty() => FILE_BYTES as u64,
-            Some(offsets) => offsets.iter().sum(),
-            None => 0,
+    let (read, open) = loop {
+        let (read, open): (u64, &str) = match read_offsets(send.0.id(), &offered) {
+            Some(offsets) if offsets.is_empty() => (FILE_BYTES as u64, "closed"),
+            Some(offsets) => (offsets.iter().sum(), "open"),
+            None => (0, "not listed"),
         };
         if read >= FILE_BYTES as u64 || t2.elapsed() > Duration::from_secs(10) {
-            break read;
+            break (read, open);
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    eprintln!(
+        "[proof] attempt {n}: the sender read {read} of {FILE_BYTES} (its file {open}); the \
+         collector held {held} at the freeze"
+    );
     // Let the daemon read the rest of the file and finish the tunnel's stream.
     std::thread::sleep(Duration::from_secs(1));
     if read < FILE_BYTES as u64 || held >= FILE_BYTES as u64 {
-        eprintln!(
-            "[proof] attempt {n}: not staged: the sender read {read} of {FILE_BYTES}, the \
-             collector held {held}"
-        );
+        eprintln!("[proof] attempt {n}: not staged");
         bob_d.signal("-CONT");
         return None;
     }
