@@ -106,10 +106,16 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         pipe.write_all(text.as_bytes()).expect("write stdin");
     }
     let out = child.wait_with_output().expect("wait");
+    let mut err = String::from_utf8_lossy(&out.stderr).into_owned();
+    // A process ended by a signal says nothing on stderr: say how it ended, so a verb killed by
+    // the watchdog's abort is not read as a verb that failed without a cause (#295).
+    if !out.status.success() {
+        err.push_str(&format!(" [vox {}: {}]", args.join(" "), out.status));
+    }
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        err,
     )
 }
 
