@@ -18,8 +18,12 @@
 //! Real child processes of the shipped `vox` binary, three separate profiles, and a real
 //! TCP service:
 //!
-//! 1. a **real TCP echo service** on loopback — standing in for `sshd`, and enough,
-//!    because what is under test is whether bytes cross the overlay untouched;
+//! 1. a **real TCP service** on loopback — standing in for `sshd`, and enough, because what
+//!    is under test is whether bytes cross the overlay untouched. It records what it
+//!    received and answers with a different, fixed reply, so **each direction is checked on
+//!    its own against bytes held outside the overlay** (RP-42). An echo could not do that: a
+//!    corruption applied the same way on both legs (a byte flipped by each end's splice) was
+//!    undone on the way back, and the echo came home intact;
 //! 2. `vox node` — the headless anchor, whose printed `<fingerprint>@<addr>` line this
 //!    test **parses and uses**, so an unusable spec (defect 2 above) fails here;
 //! 3. `vox serve <port>` — the host. Its printed room id, `vox://` address and
@@ -28,8 +32,9 @@
 //! 4. `vox connect <address>` — the guest joining with that passphrase, one-shot;
 //! 5. `vox up <room>` — the guest's SOCKS5 entry point, whose bound address is parsed;
 //! 6. a **real SOCKS5 client** in this test, sending the `.vox` hostname (`socks5h`
-//!    style, the name not an address), then real bytes through it, which must come back
-//!    byte-identical.
+//!    style, the name not an address), then real bytes through it: the service must have
+//!    received exactly what was sent, and the client must receive exactly what the service
+//!    replied.
 //!
 //! Nothing here reaches into `vox_core`. If a person could not do it from a shell, this
 //! test does not do it either.
@@ -184,24 +189,69 @@ fn after_label(line: &str, label: &str) -> String {
         .to_owned()
 }
 
-/// A real TCP echo service on loopback: `sshd`'s stand-in. Returns its port.
-fn echo_service() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind echo");
+/// The bytes the client sends: [`REQUEST_LEN`] of them, several of the tunnel's 16 KiB splice
+/// chunks, from a fixed seed.
+const REQUEST_LEN: usize = 64 * 1024;
+/// The bytes the service answers with: different from the request, so a reply is never the
+/// request carried back.
+const REPLY_LEN: usize = 48 * 1024;
+
+/// `len` deterministic, non-repeating bytes from `seed` (xorshift).
+fn pattern(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+fn request() -> Vec<u8> {
+    pattern(0x5eed_5eed_5eed_5eed, REQUEST_LEN)
+}
+
+fn reply() -> Vec<u8> {
+    pattern(0x0dd0_ba11_c0de_0001, REPLY_LEN)
+}
+
+/// A real TCP service on loopback: `sshd`'s stand-in. Each connection: read
+/// [`REQUEST_LEN`] bytes, hand them to the returned receiver (outside the overlay, for the
+/// proof to compare), then answer with [`reply`]. Returns its port.
+fn recording_service() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the service");
     let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
+            let tx = tx.clone();
             std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = s.read(&mut buf) {
-                    if n == 0 || s.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
+                let mut got = vec![0u8; REQUEST_LEN];
+                if s.read_exact(&mut got).is_err() {
+                    return;
                 }
+                let _ = tx.send(got);
+                let _ = s.write_all(&reply());
+                // Held open until the client closes: the reply is not cut short by our side.
+                let _ = s.read(&mut [0u8; 1]);
             });
         }
     });
-    port
+    (port, rx)
+}
+
+/// Where two byte strings first differ, for a red that says what changed.
+fn first_difference(got: &[u8], want: &[u8]) -> String {
+    match got.iter().zip(want).position(|(a, b)| a != b) {
+        Some(i) => format!(
+            "first difference at byte {i}: got {:#04x}, sent {:#04x}",
+            got[i], want[i]
+        ),
+        None => format!("lengths differ: got {}, sent {}", got.len(), want.len()),
+    }
 }
 
 /// Speak RFC 1928 to `proxy`, asking it to CONNECT to `host:port` **by name** — which is
@@ -271,7 +321,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     }
 
     // 1. the service a person is actually trying to reach
-    let service_port = echo_service();
+    let (service_port, service_got) = recording_service();
 
     // 2. `vox node` — the anchor. Its printed --anchor spec is what everything else uses,
     //    so a spec nobody can dial fails right here.
@@ -436,7 +486,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         .expect("a socket address");
 
     // 6. A real SOCKS5 client, the `.vox` NAME (not an address), and real bytes.
-    let payload = b"the product works or it does not";
+    let payload = request();
     // **One CONNECT, first try, no retry loop** — and that is an assertion about the
     // product, not test convenience.
     //
@@ -455,16 +505,33 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
          between `vox up` and their first `ssh`",
         t0.elapsed()
     );
+    // Each direction against bytes held outside the overlay (RP-42): what the service
+    // received is compared with what was sent, and what came back with what the service sent.
     stream
-        .write_all(payload)
-        .expect("write through the overlay");
-    let mut back = vec![0u8; payload.len()];
-    stream
-        .read_exact(&mut back)
-        .expect("read the echo back through the overlay");
-    assert_eq!(
-        back, payload,
-        "bytes must cross the overlay unchanged — this is the whole feature"
+        .write_all(&payload)
+        .unwrap_or_else(|e| panic!("PRODUCT: the overlay did not take the request's bytes: {e}"));
+    let received = service_got
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or_else(|_| {
+            panic!(
+                "PRODUCT: the service never received the {REQUEST_LEN} bytes sent through the \
+                 overlay within 60 s"
+            )
+        });
+    assert!(
+        received == payload,
+        "PRODUCT: bytes must cross the overlay unchanged, toward the service — this is the whole \
+         feature; {}",
+        first_difference(&received, &payload)
+    );
+    let mut back = vec![0u8; REPLY_LEN];
+    stream.read_exact(&mut back).unwrap_or_else(|e| {
+        panic!("PRODUCT: the service's reply did not come back through the overlay: {e}")
+    });
+    assert!(
+        back == reply(),
+        "PRODUCT: bytes must cross the overlay unchanged, back from the service; {}",
+        first_difference(&back, &reply())
     );
 
     // And the host reports who reached it, which is the only place attribution can come
