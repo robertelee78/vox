@@ -900,6 +900,12 @@ impl VoxConnection {
 
     /// Close the connection with an application code + reason.
     pub fn close(&self, err: WireError) {
+        // **A connection already closed keeps the reason it closed with** (V210-93): closing it
+        // again here made quinn report it as closed locally, so a peer that said "stopped" was
+        // reported as a connection this end gave up on.
+        if self.connection.close_reason().is_some() {
+            return;
+        }
         let _ = self.closed_here.set(err);
         self.connection
             .close(close_code(err), err.to_string().as_bytes());

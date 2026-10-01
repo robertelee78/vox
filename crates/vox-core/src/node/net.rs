@@ -349,6 +349,9 @@ pub const SILENCE_IS_DEATH: Duration = Duration::from_secs(KEEP_ALIVE.as_secs() 
 /// ack-eliciting.
 const PROBE_BYTE: u8 = 0;
 
+/// The least time between two probes [`ConnectionManager::close_if_unanswering`] counts.
+const PROBE_SPACING: Duration = Duration::from_millis(900);
+
 /// How often a probe checks whether anything came back.
 const PROBE_POLL: Duration = Duration::from_millis(10);
 
@@ -404,6 +407,9 @@ pub struct ConnectionManager {
     /// Not keyed by quinn's stable id, which a new connection can reuse from a freed one and
     /// so inherit its silence.
     heard: Mutex<HashMap<u64, (u64, Instant)>>,
+    /// Per connection (by serial) that [`Self::close_if_unanswering`] is probing: how many probes
+    /// have gone unanswered, and when the last was counted.
+    probing: Mutex<HashMap<u64, (u32, Instant)>>,
     retire_grace_secs: u64,
     clock: Clock,
     /// Where [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote)s go,
@@ -435,6 +441,7 @@ impl ConnectionManager {
             conns: Mutex::new(HashMap::new()),
             retiring: Mutex::new(Vec::new()),
             heard: Mutex::new(HashMap::new()),
+            probing: Mutex::new(HashMap::new()),
             retire_grace_secs: grace_secs,
             clock,
             notes: Mutex::new(None),
@@ -479,19 +486,41 @@ impl ConnectionManager {
         conn: &VoxConnection,
         probe_after: Duration,
         loss_after: Duration,
+        probes_needed: u32,
     ) -> Option<Duration> {
         if !is_live(conn) {
             return None;
         }
         let silent = self.silent_for(conn);
         if silent < probe_after {
+            lock(&self.probing).remove(&conn.serial());
             return None;
         }
-        let probed = conn
+        if conn
             .quinn()
             .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
-            .is_ok();
-        if probed && silent >= loss_after {
+            .is_err()
+        {
+            return None;
+        }
+        // **Silence counts only across probes sent while this node was running** (V210-93). A node
+        // that was itself stalled — a debug build's proof of work holds its runtime for a minute —
+        // read nothing in that time, and its first look afterwards saw a long silence that was its
+        // own. So a verdict also needs `probes_needed` probes, at most one a `PROBE_SPACING`, all
+        // unanswered: a live peer answers the first one sent after the stall within a round trip,
+        // and that resets the count.
+        let now = Instant::now();
+        let mut probing = lock(&self.probing);
+        let (sent, last) = probing
+            .entry(conn.serial())
+            .or_insert((0, now.checked_sub(PROBE_SPACING).unwrap_or(now)));
+        if now.saturating_duration_since(*last) >= PROBE_SPACING {
+            *sent += 1;
+            *last = now;
+        }
+        if *sent >= probes_needed && silent >= loss_after {
+            probing.remove(&conn.serial());
+            drop(probing);
             conn.close(WireError::Unresponsive);
             return Some(silent);
         }
@@ -673,6 +702,7 @@ impl ConnectionManager {
             .chain(retired.iter().map(|c| c.serial()))
             .collect();
         lock(&self.heard).retain(|id, _| present.contains(id));
+        lock(&self.probing).retain(|id, _| present.contains(id));
         changed
     }
 
@@ -910,6 +940,15 @@ impl ConnectionManager {
         for (dead, before) in unanswered {
             if is_live(&dead) && dead.quinn().stats().udp_rx.datagrams == before {
                 dead.close(WireError::Unresponsive);
+                self.note(
+                    dead.peer_id(),
+                    format!(
+                        "the connection {} did not answer a probe while a new one {} was filed, \
+                         and is closed",
+                        conn_tag(&dead),
+                        conn_tag(&conn)
+                    ),
+                );
             }
         }
         // **A newcomer from another process of the identity supersedes every connection to the

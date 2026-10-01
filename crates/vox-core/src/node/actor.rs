@@ -544,6 +544,11 @@ const ANCHOR_PROBE_AFTER: Duration = Duration::from_secs(3);
 /// so a loaded anchor slow to ACK one is not buried. A loss is said within this and a tick.
 const ANCHOR_SILENCE_IS_LOSS: Duration = Duration::from_secs(8);
 
+/// How many probes, counted at most one a tick while this node runs, must go unanswered before
+/// an anchor is taken for gone (V210-93): so a node's own stall is never read as its anchor's
+/// silence.
+const ANCHOR_PROBES_BEFORE_LOSS: u32 = 5;
+
 /// Why an anchor's connection closed, as a person reads it (V210-93). A stopping node closes
 /// with [`WireError::ShuttingDown`]: that is "the anchor stopped", not a fault.
 fn anchor_close_reason(
@@ -3637,10 +3642,12 @@ impl Node {
         // probed once it falls quiet, and closed here when nothing answers.
         let mut silent: BTreeMap<Digest32, Duration> = BTreeMap::new();
         for (id, conn) in &self.anchors_up {
-            if let Some(s) =
-                net.manager()
-                    .close_if_unanswering(conn, ANCHOR_PROBE_AFTER, ANCHOR_SILENCE_IS_LOSS)
-            {
+            if let Some(s) = net.manager().close_if_unanswering(
+                conn,
+                ANCHOR_PROBE_AFTER,
+                ANCHOR_SILENCE_IS_LOSS,
+                ANCHOR_PROBES_BEFORE_LOSS,
+            ) {
                 silent.insert(*id, s);
             }
         }
