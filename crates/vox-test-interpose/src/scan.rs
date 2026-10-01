@@ -166,9 +166,19 @@ fn scan(needles: &[(String, Vec<u8>)]) -> String {
                         for i in find_all(chunk, needle) {
                             counts[k] += 1;
                             if hits.len() < MAX_HITS {
+                                // What surrounds the copy, masked so the report holds no needle
+                                // itself: 32 bytes before it and 8 after, within this chunk. It
+                                // tells a copy's container apart (a frame, a string, a key).
+                                let from = i.saturating_sub(32);
+                                let to = (i + needle.len() + 8).min(chunk.len());
+                                let around: String = chunk[from..to]
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b ^ MASK))
+                                    .collect();
                                 hits.push(format!(
-                                    "hit\t{label}\t{:#x}\t{user_tag}\t{protection}",
-                                    at + i as u64
+                                    "hit\t{label}\t{:#x}\t{user_tag}\t{protection}\t{}:{around}",
+                                    at + i as u64,
+                                    i - from
                                 ));
                             }
                         }
