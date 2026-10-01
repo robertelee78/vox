@@ -57,7 +57,7 @@ pub struct IdleRestartConfig;
 impl ControllerFactory for IdleRestartConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         Box::new(IdleRestart {
-            inner: Box::new(super::taper::Tapered::new(now, current_mtu)),
+            inner: super::taper::Tapered::new(now, current_mtu),
             mtu: current_mtu,
             last_sent: None,
             srtt: Duration::ZERO,
@@ -65,9 +65,10 @@ impl ControllerFactory for IdleRestartConfig {
     }
 }
 
-/// Cubic, rebuilt from scratch when the connection goes idle. See the module docs.
+/// The tapered controller, rebuilt at tier 1 when the connection goes idle (keeping only its tier-3
+/// lockout). See the module docs.
 struct IdleRestart {
-    inner: Box<dyn Controller>,
+    inner: super::taper::Tapered,
     mtu: u16,
     last_sent: Option<Instant>,
     srtt: Duration,
@@ -80,7 +81,11 @@ impl Controller for IdleRestart {
             .last_sent
             .is_some_and(|t| now.saturating_duration_since(t) > idle)
         {
-            self.inner = Box::new(super::taper::Tapered::new(now, self.mtu));
+            self.inner = super::taper::Tapered::with_tier3_backoff(
+                now,
+                self.mtu,
+                self.inner.tier3_backoff(),
+            );
         }
         self.last_sent = Some(now);
         self.inner.on_sent(now, bytes, last_packet_number);
@@ -135,7 +140,7 @@ impl Controller for IdleRestart {
 
     fn clone_box(&self) -> Box<dyn Controller> {
         Box::new(Self {
-            inner: self.inner.clone_box(),
+            inner: self.inner.clone(),
             mtu: self.mtu,
             last_sent: self.last_sent,
             srtt: self.srtt,
