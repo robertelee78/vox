@@ -24,6 +24,10 @@
 //! The unknown and different stamps are written onto the control socket as exactly the
 //! bytes a foreign binary would write — a `hello` carrying that version — because this
 //! build cannot be made to *be* another version.
+//!
+//! Every red names its side: `PRODUCT:` quotes what `vox` said, `CANNOT MEASURE:` is a
+//! staging step that did not happen (the published binary's claim, a precondition), and
+//! `APPARATUS:` is the proof's own fault (the download, its SHA-256, the runtime).
 
 #![cfg(unix)]
 
@@ -50,35 +54,40 @@ fn triple() -> &'static str {
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("macos", "x86_64") => "x86_64-apple-darwin",
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        other => panic!("no published vox for {other:?}"),
+        other => panic!("CANNOT MEASURE: no published vox for {other:?}"),
     }
 }
 
 /// The published release binary, fetched once and verified against its published
-/// SHA-256. `None` when it cannot be fetched.
+/// SHA-256 on every run, cached copy included. `None` when it cannot be fetched.
 fn published_vox() -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(format!("vox-published-v{PUBLISHED}"));
     let bin = dir.join("vox");
-    if bin.is_file() {
-        return Some(bin);
-    }
-    std::fs::create_dir_all(&dir).ok()?;
-    let base = format!(
-        "https://github.com/{REPO}/releases/download/v{PUBLISHED}/vox-{}",
-        triple()
-    );
-    let fetch = |url: &str, out: &std::path::Path| {
-        std::process::Command::new("curl")
-            .args(["-fsSL", "-o"])
-            .arg(out)
-            .arg(url)
-            .status()
-            .is_ok_and(|s| s.success())
-    };
-    let part = dir.join("vox.part");
     let sum = dir.join("vox.sha256");
-    if !fetch(&base, &part) || !fetch(&format!("{base}.sha256"), &sum) {
-        return None;
+    if !(bin.is_file() && sum.is_file()) {
+        std::fs::create_dir_all(&dir).ok()?;
+        let base = format!(
+            "https://github.com/{REPO}/releases/download/v{PUBLISHED}/vox-{}",
+            triple()
+        );
+        let fetch = |url: &str, out: &std::path::Path| {
+            std::process::Command::new("curl")
+                .args(["-fsSL", "-o"])
+                .arg(out)
+                .arg(url)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let part = dir.join("vox.part");
+        if !fetch(&base, &part) || !fetch(&format!("{base}.sha256"), &sum) {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).ok()?;
+        }
+        std::fs::rename(&part, &bin).ok()?;
     }
     let want = std::fs::read_to_string(&sum)
         .ok()?
@@ -87,22 +96,20 @@ fn published_vox() -> Option<std::path::PathBuf> {
         .to_owned();
     let got = {
         use sha2::{Digest as _, Sha256};
-        let bytes = std::fs::read(&part).ok()?;
+        let bytes = std::fs::read(&bin).ok()?;
         Sha256::digest(&bytes)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     };
     assert_eq!(
-        got, want,
-        "the published v{PUBLISHED} binary does not match its published SHA-256"
+        got,
+        want,
+        "APPARATUS: {} does not match the published v{PUBLISHED} SHA-256 (a bad download \
+         or a changed cache); delete {} to fetch it again",
+        bin.display(),
+        dir.display()
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).ok()?;
-    }
-    std::fs::rename(&part, &bin).ok()?;
     Some(bin)
 }
 
@@ -111,14 +118,16 @@ fn published_vox() -> Option<std::path::PathBuf> {
 /// "0.2.9" matches, coordination is rightly allowed, and the proof waited for a refusal that
 /// could not come (CI 869d8f0).
 fn another_version() -> String {
-    let mut parts = VERSION
-        .split('.')
-        .map(|p| p.parse::<u64>().expect("a numeric version"));
-    let (major, minor, patch) = (
-        parts.next().unwrap(),
-        parts.next().unwrap(),
-        parts.next().unwrap(),
-    );
+    let mut parts = VERSION.split('.').map(|p| {
+        p.parse::<u64>()
+            .expect("APPARATUS: this build's version is not numeric")
+    });
+    let mut next = || {
+        parts
+            .next()
+            .unwrap_or_else(|| panic!("APPARATUS: this build's version {VERSION} is not x.y.z"))
+    };
+    let (major, minor, patch) = (next(), next(), next());
     format!("{major}.{minor}.{}", patch + 1)
 }
 
@@ -135,11 +144,15 @@ fn runs(stamp: &str, is_version: bool) -> String {
 }
 
 fn refused_naming(o: &Out, who: &Worker, what: &str) {
-    assert_eq!(o.code, Some(3), "a version refusal must exit 3: {o:?}");
+    assert_eq!(
+        o.code,
+        Some(3),
+        "PRODUCT: a version refusal must exit 3: {o:?}"
+    );
     for needle in [&who.b32()[..12], what, &format!("required {VERSION}")] {
         assert!(
             o.stderr.contains(needle),
-            "the refusal must name {needle:?}: {}",
+            "PRODUCT: the refusal must name {needle:?}: {}",
             o.stderr
         );
     }
@@ -147,7 +160,7 @@ fn refused_naming(o: &Out, who: &Worker, what: &str) {
 
 fn claims_by(w: &Worker, reader: &Worker, r: &str) -> usize {
     let o = reader.vox(None, &["room", "read", r, "--json"]);
-    assert!(o.ok, "{o:?}");
+    assert!(o.ok, "PRODUCT: `vox room read --json` failed: {o:?}");
     o.ndjson()
         .iter()
         .filter(|x| x["author"] == w.b32() && x["envelope"]["type"] == "claim")
@@ -161,9 +174,13 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let Some(old) = published_vox() else {
         assert!(
             allow_unproven("published-release"),
-            "UNPROVEN: the published v{PUBLISHED} binary could not be fetched, so the \
+            "CANNOT MEASURE: the published v{PUBLISHED} binary could not be fetched, so the \
              missing-stamp case cannot be measured. Set \
              VOX_PROOF_ALLOW_UNPROVEN=published-release to accept that gap deliberately."
+        );
+        eprintln!(
+            "CANNOT MEASURE (accepted by VOX_PROOF_ALLOW_UNPROVEN): the published \
+             v{PUBLISHED} binary could not be fetched; nothing was proved"
         );
         return;
     };
@@ -171,22 +188,23 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let v = std::process::Command::new(&old)
         .arg("--version")
         .output()
-        .expect("old vox runs");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run {old} --version: {e}"));
     eprintln!(
         "[receipt] {old} --version -> {}",
         String::from_utf8_lossy(&v.stdout).trim()
     );
     assert!(
         String::from_utf8_lossy(&v.stdout).contains(PUBLISHED),
-        "not the published binary"
+        "APPARATUS: {old} --version said {:?}, not v{PUBLISHED}",
+        String::from_utf8_lossy(&v.stdout)
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot build the runtime: {e}"));
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: tempdir: {e}"));
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
@@ -196,6 +214,11 @@ fn a_worker_on_another_version_is_refused_by_name() {
     eprintln!(
         "[receipt] published v{PUBLISHED} claim -> exit {:?}",
         o.code
+    );
+    assert!(
+        o.ok,
+        "CANNOT MEASURE: the published v{PUBLISHED} binary's claim failed, so the missing-stamp \
+         case was never staged: {o:?}"
     );
     until(
         alice,
@@ -212,14 +235,14 @@ fn a_worker_on_another_version_is_refused_by_name() {
     assert_eq!(
         claims_by(alice, alice, r),
         0,
-        "precondition: alice has never claimed"
+        "CANNOT MEASURE: precondition: alice has never claimed"
     );
     let o = alice.vox(Some("a1"), &["room", "claim", r, "new-work"]);
     refused_naming(&o, bob, "no version");
     assert_eq!(
         claims_by(alice, alice, r),
         0,
-        "a refused claim must never be posted"
+        "PRODUCT: a refused claim must never be posted"
     );
 
     // ---- (3) post --work, board --json and the drain hook all refuse ----
@@ -241,14 +264,18 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let b = alice
         .vox(Some("a1"), &["room", "board", r, "--json"])
         .json();
-    assert_eq!(b["coordination"], "refused", "{b}");
+    assert_eq!(
+        b["coordination"], "refused",
+        "PRODUCT: board --json must say refused: {b}"
+    );
     let p = b["participants"]
         .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["author"] == bob.b32())
-        .expect("bob in the table");
-    assert_eq!(p["stamp"], "missing", "{b}");
+        .and_then(|ps| ps.iter().find(|p| p["author"] == bob.b32()))
+        .unwrap_or_else(|| panic!("PRODUCT: board --json has no participants row for bob: {b}"));
+    assert_eq!(
+        p["stamp"], "missing",
+        "PRODUCT: board --json must say bob's stamp is missing: {b}"
+    );
     let hook = alice.vox(
         Some("a1"),
         &[
@@ -264,7 +291,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
     );
     assert!(
         hook.stdout.contains("work coordination refused") && hook.stdout.contains(&bob.b32()[..12]),
-        "the drain hook must say it plainly: {hook:?}"
+        "PRODUCT: the drain hook must say it plainly: {hook:?}"
     );
 
     // ---- (4) conversation survives ----
@@ -333,7 +360,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let o = bob.vox(Some("b1"), &["room", "claim", r, "bob-work"]);
     assert!(
         o.ok && o.stdout.contains("you hold bob-work"),
-        "a current worker among current workers coordinates: {o:?}"
+        "PRODUCT: a current worker among current workers coordinates: {o:?}"
     );
     let o = until(
         alice,
@@ -342,9 +369,15 @@ fn a_worker_on_another_version_is_refused_by_name() {
         &["room", "claim", r, "new-work"],
         |o: &Out| o.ok,
     );
-    assert!(o.stdout.contains("you hold new-work"), "{o:?}");
+    assert!(
+        o.stdout.contains("you hold new-work"),
+        "PRODUCT: alice's claim after recovery must hold new-work: {o:?}"
+    );
     let b = alice
         .vox(Some("a1"), &["room", "board", r, "--json"])
         .json();
-    assert_eq!(b["coordination"], "ok", "{b}");
+    assert_eq!(
+        b["coordination"], "ok",
+        "PRODUCT: board --json must say ok once everyone is current: {b}"
+    );
 }
