@@ -7,9 +7,8 @@ and is now genuinely built, with a real-binary proof. Decisions 1, 3, 4, 8, 9,
 10 and 11 are **proposed and not built**; what ships today implements the withdrawn model and is a live
 vulnerability until M17.6–M17.13 land.
 **Date**: 2026-09-21
-**Updated**: 2026-10-01 — anchor wording brought in line with ADR-012's restated anchor principle (an anchor only bridges hosts both behind NAT; nothing else requires one): decision 8's reachability table, and what "cannot be reached" means for `vox serve`'s refusal.
-**Updated**: 2026-09-24 — PRD-001: refusals through `vox up`/`vox forward` are honest, removing a service cuts its live sessions, and forwards survive a host restart (ADR-013 "Tunnel honesty").
-**Updated**: 2026-09-21 (third revision, then revised again the same day after independent review) —
+**Updated**: 2026-10-01 — anchor wording brought in line with ADR-012's restated anchor principle (an anchor only bridges hosts both behind NAT; nothing else requires one): decision 8's reachability table, and what "cannot be reached" means for `vox serve`'s refusal. 2026-09-24 — PRD-001: refusals through `vox up`/`vox forward` are honest, removing a service cuts its live sessions, and forwards survive a host restart (ADR-013 "Tunnel honesty"). 2026-09-21 (third revision, then revised again the same day after independent review) — capability-bearing rooms are withdrawn (see the note below).
+**Note, 2026-09-21 (third revision, then revised again the same day after independent review)** —
 **capability-bearing rooms are withdrawn.** Decision 3 held that *"'may this member dial it' and 'is this
 person a member' are the same question, asked once."* That is refuted: admission to a room is passphrase +
 proof-of-work, so under it any party who obtains an address and a passphrase — or, via the vouching path,

@@ -2,9 +2,9 @@
 
 **Status**: accepted (2026-09-19) — **M13 (single-device node), M14 (two machines chat), M15 (anchors: symmetric-NAT swarm formation *and* convergence between members never online together) and M16.1 (a TCP service reached across the overlay) are all gated in `crates/vox-core/tests/` and run in CI's release step**; the person-facing service surface moves to ADR-017
 **Date**: 2026-09-19
-**Updated**: 2026-10-01 — anchor wording brought in line with ADR-012's restated anchor principle (an anchor only bridges hosts both behind NAT; nothing else requires one): No DHT, the invite link, the bootstrap set, the network join, M14.7e item 4 and M15.1's board-first join.
+**Updated**: 2026-10-01 — anchor wording brought in line with ADR-012's restated anchor principle (an anchor only bridges hosts both behind NAT; nothing else requires one): No DHT, the invite link, the bootstrap set, the network join, M14.7e item 4 and M15.1's board-first join. 2026-09-22 (second note) — an open defect: a cross-process join through an anchor fails roughly half the time, at the responder dial (see the second note below). 2026-09-22 — a join no longer reports "I do not know your address yet" as "you are unreachable" (see the note below).
 
-**Updated**: 2026-09-22 (second note) — **OPEN DEFECT: a cross-process join through an anchor fails roughly
+**Note, 2026-09-22 (second note)** — **OPEN DEFECT: a cross-process join through an anchor fails roughly
 half the time, at the responder dial.** Named here rather than left as a flaky gate, because it is a product
 defect and the gate is telling the truth.
 
@@ -40,7 +40,7 @@ Two related items, neither blocking: a user's **first** `ssh` into a fresh room 
 the dial ladder reports `Unreachable` **without naming which rung failed**, which is ADR-018 §8b and is why
 this took instrumentation to narrow at all.
 
-**Updated**: 2026-09-22 — **a join no longer reports "I do not know your address yet" as "you are unreachable."**
+**Note, 2026-09-22** — **a join no longer reports "I do not know your address yet" as "you are unreachable."**
 Two fixes to `join_channel`, one of which was a real ~40% failure on `main`:
 
 1. *The responder's address record.* The joiner read the responder's endpoints from the board with

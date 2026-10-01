@@ -3,7 +3,7 @@
 **Status**: accepted (2026-09-21) — the policy is in force from this change; the harness lands with it
 and grows per capability
 **Date**: 2026-09-21
-**Updated**: 2026-10-01 — "What may block a release, what is optional, what is deleted" added: a valid proof (the shipped binary, used as a person would, whose red names product or test) blocks; an optional test is opt-in and never blocks; everything else, report-only checks included, is deleted. Later the same day: an optional proof is fully optional (it blocks neither CI nor the release gate, sits behind the one cargo feature `optional-proofs`, is compiled by CI and listed in `docs/release/optional-proofs.md`), and a proof is run once and repeated only on smoke. The live-model OpenCode proofs and R40/R41/R42 are ruled fully optional, so a tag is no longer blocked by them (§3, "Publish only what CI proved" and "Only real use" amended). "Publish only what CI proved" amended where it allowed a report-only arm. Also 2026-10-01 — M18.3's journey gains an anchorless arm, and `BoardUnreachable` is described as the board (the host's own or an anchor's), per ADR-012's restated anchor principle. 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
+**Updated**: 2026-10-01 — "What may block a release, what is optional, what is deleted" added: a valid proof (the shipped binary, used as a person would, whose red names product or test) blocks; an optional test is opt-in and never blocks; everything else, report-only checks included, is deleted. Later the same day: an optional proof is fully optional (it blocks neither CI nor the release gate, sits behind the one cargo feature `optional-proofs`, is compiled by CI and listed in `docs/release/optional-proofs.md`), a proof is run once and repeated only on smoke, and test knobs are compiled out of the shipped binary. The live-model OpenCode proofs and R40/R41/R42 are ruled fully optional, so a tag is no longer blocked by them (§3, "Publish only what CI proved" and "Only real use" amended). "Publish only what CI proved" amended where it allowed a report-only arm. Also 2026-10-01 — M18.3's journey gains an anchorless arm, and `BoardUnreachable` is described as the board (the host's own or an anchor's), per ADR-012's restated anchor principle. 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
 work, and the two obligations they cannot yet meet are recorded in §3's accepted-gaps table rather
 than skipped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -874,7 +874,8 @@ one accepted gap left is `opencode`. The five live-model proofs need OpenCode an
 decider chose (2026-09-26) that they run on the local macOS release gate with the decider's account,
 and that **a tag is not cut unless they are green there**. CI keeps the exception, and says why in
 ci.yml. **Amended 2026-10-01 (the decider's ruling):** these proofs are now "Fully optional": a tag is no longer blocked by them, on
-CI or on the local release gate (§3).
+CI or on the local release gate (§3). Until the release-gate change lands, `scripts/release-gate.sh`
+still requires them.
 
 **§5 is stale, not current.** Its in-source suites (`governance/vectors.rs`, `cpace`, `cbor`, the UPnP
 mock, `deniable/tests.rs`, the Argon2id timing spike) no longer exist in the tree: there are no
@@ -900,14 +901,14 @@ proofs (`support/watchdog.rs`, `support/raw_sync.rs`) stay.
 **Decision (the decider, 2026-10-01).** This sharpens "Only real use of the product is a test" into
 three classes, so that every test in the tree is exactly one of them. In the decider's words:
 
-- "I am religiously opposed to unit tests/gates in principle because they're worthless."
+- "I am religiously opposed to unit tests/gates in principle because they're worthless".
 - "gates that increase CI without proving a product/feature actually works for a user, invalid";
   "yet we still build bullshit tests".
 - "If I cannot tell the difference between a broken product and a broken test, it's not a valid
   test."
 - "Valid proofs block; rest optional."
 - "spike tests are valid"; "optional tests are valid".
-- On report-only, informational and warning checks: "you know how I feel about fake tests."
+- On report-only, informational and warning checks: "you know how I feel about fake tests".
 - On optional proofs: "Fully optional"; "those types of tests are great to have at the ready for
   troubleshooting".
 - On repetition: "it feels wasteful to test the same things 2398439487398327492847239847234 times";
@@ -924,18 +925,23 @@ prove nothing a person depends on.
 
 1. **A valid proof blocks.** A test MAY block a release only if it proves a feature works **for a
    user**: it MUST drive the shipped `vox` binary as a person would, and MUST assert what that person
-   sees or gets. Every failure path in it MUST say whether the product failed a person or the
-   apparatus failed to measure. A test whose red does not say which MUST NOT block.
-2. **An optional proof is fully optional.** It MUST block nothing: not CI and not the release gate.
-   It exists to be at the ready for troubleshooting. There MUST be one mechanism for it, the cargo
-   feature `optional-proofs`: an optional proof MUST be compiled only with that feature, CI MUST
-   compile it (without running it) so that it stays ready, and `docs/release/optional-proofs.md`
-   MUST list every optional proof. A proof that did not run MUST NOT read as a pass (§3). A spike is
-   valid in the same way: it MUST be run and its result reported, and it MUST NOT be committed to the
-   gate.
+   sees or gets. Every red MUST name either a PRODUCT verdict, quoting what the product did, or an
+   APPARATUS fault (staging not achieved, precondition unmet, watchdog, emulator late, harness
+   error). An unattributed red is a proof defect, and the verifier MUST reject it. A test whose red
+   does not say which MUST NOT block.
+2. **An optional proof is fully optional.** Expensive user-facing claims become optional proofs. An
+   optional proof MUST block nothing: not CI and not the release gate. It exists to be at the ready
+   for troubleshooting. Its one mechanism is the cargo feature `optional-proofs`. It MUST be loud
+   when not run: it MUST say that it did not run (for example `NOT RUN (opt-in: …)`), never a silent
+   `ok`, and MUST NOT read as a pass (§3). *Planned, not decided rules:* CI is to compile optional
+   proofs without running them, so they stay ready, and `docs/release/optional-proofs.md` is to list
+   them (#301). A spike is valid in the same way: it MUST be run and its result reported in the post,
+   and it MUST NOT be committed to the gate. Where a fix has no user-facing proof, there is no test:
+   it rests on review plus such a spike.
 3. **Everything else is deleted.** A unit test, an in-process library test, a test of an internal
    value, and a gate that adds CI time without proving a feature works for a user MUST NOT exist in
-   the tree.
+   the tree. A verifier MUST reject a candidate that adds a harness, mechanism, counter or
+   non-user-visible-timing test.
 
 **Rules that follow.**
 
@@ -943,12 +949,18 @@ prove nothing a person depends on.
   proof, runs as an opt-in optional test, or is deleted. Reporting a result without the power to
   fail is a fake test.
 - A new claim SHOULD extend an existing user-journey proof rather than add a test file, because the
-  journey crosses the handoffs between commands where every defect in §1 lived.
+  journey crosses the handoffs between commands where every defect in §1 lived. A new test file MUST
+  justify itself.
 - A fix MUST delete the tests it makes redundant, in the same change.
-- A proof SHOULD be run **once**. It MUST be repeated only on smoke: a red, a flake someone has seen,
-  a timing near its bound, or a claim that is itself a rate. Callers' proofs MUST be run only where
-  the diff plausibly reaches them. A verifier MUST NOT re-run the fixer's greens, and nobody SHOULD
-  run locally what CI already runs.
+- A proof SHOULD be run **once**, in the profile CI uses. It MUST be repeated only on smoke (a red, a
+  flake someone has seen, a timing near its bound, or a claim that is itself a rate), and whoever
+  repeats it MUST say why. Callers' proofs MUST be run only where the diff plausibly reaches them, in
+  one profile. A verifier MUST NOT re-run the fixer's greens: one mutant per claim, run once, plus
+  probes where there is smoke. After a clean re-merge, only what the conflict touched is re-run. CI
+  runs the suite on push, and a CI red is the smoke; nobody SHOULD run locally what CI already runs.
+- The shipped binary MUST NOT contain test knobs: `VOX_TEST_*` knobs are compiled out of what users
+  install, a proof that needs one builds `vox` with the cargo feature `test-knobs`, and the packaged
+  release artifact MUST hold none (the decider, 2026-10-01; #300, V210-105).
 - Every proof MUST have a mutant: the product broken on purpose, under which the proof goes red **on
   the assertion that makes its claim**. A CANNOT MEASURE is not a red and MUST NOT be counted as the
   mutant's result (§7, and "Prove the escalation, not the refusal").

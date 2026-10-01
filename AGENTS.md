@@ -7,43 +7,56 @@ decider's own. Each rule names the ADR section that holds the full record.
 
 - **A test exists only to prove a feature works for a user.** It drives the shipped `vox` binary
   the way a person would and asserts what that person sees or gets. "I am religiously opposed to
-  unit tests/gates in principle because they're worthless." (ADR-018, "Only real use of the product
-  is a test")
+  unit tests/gates in principle because they're worthless". Otherwise there is no test: the fix
+  rests on review plus a spike that is run and reported in the post, not committed. (ADR-018, "Only
+  real use of the product is a test")
 - **No unit tests and no in-process library tests.** No `#[test]` in `src/`, no in-process `Node`,
   no assertion on an internal value or a proxy for what a person sees. Why: a red from real use has
   one meaning, and any other red has three. (ADR-018, same section)
 - **A gate that grows CI without proving a feature works for a user is invalid.** "gates that
   increase CI without proving a product/feature actually works for a user, invalid"; "yet we still
-  build bullshit tests". Do not add one. (ADR-018, "What may block a release, what is optional,
-  what is deleted (2026-10-01)")
+  build bullshit tests". Do not add one. A verifier rejects a candidate that adds a harness,
+  mechanism, counter or non-user-visible-timing test. (ADR-018, "What may block a release, what is
+  optional, what is deleted (2026-10-01)")
 - **Every red names product or test.** "If I cannot tell the difference between a broken product
-  and a broken test, it's not a valid test." Each failure path says whether the product failed a
-  person or the apparatus failed to measure. (ADR-018, 2026-10-01 section; §8b)
+  and a broken test, it's not a valid test." Each red names a PRODUCT verdict (quoting what the
+  product did) or an APPARATUS fault (staging not achieved, precondition unmet, watchdog, emulator
+  late, harness error). An unattributed red is a proof defect, and the verifier rejects it.
+  (ADR-018, 2026-10-01 section; §8b)
 - **Only valid proofs block; everything else is optional or deleted.** "Valid proofs block; rest
   optional." (ADR-018, 2026-10-01 section)
   - "spike tests are valid": run them and report the result; never commit them to the gate.
-  - "optional tests are valid", and "Fully optional": they block nothing, not CI and not the
-    release gate. "those types of tests are great to have at the ready for troubleshooting". One
-    mechanism only: the cargo feature `optional-proofs`. CI compiles them without running them, so
-    they stay ready, and `docs/release/optional-proofs.md` lists them. A proof that did not run
-    never reads as a pass. The live-model OpenCode proofs and R40, R41 and R42 are optional: they
-    never block a tag. (ADR-018, 2026-10-01 section)
+  - "optional tests are valid", and "Fully optional": an optional proof blocks nothing, not CI and
+    not the release gate, and is loud when not run: it prints that it did not run, never a silent
+    `ok`, and never reads as a pass. "those types of tests are great to have at the ready for
+    troubleshooting". One mechanism: the cargo feature `optional-proofs`. Expensive user-facing
+    claims are optional proofs; the live-model OpenCode proofs and R40, R41 and R42 are fully
+    optional and never block a tag. Planned, not yet built (#301): CI is to compile optional proofs
+    without running them, and `docs/release/optional-proofs.md` is to list them.
 - **Run a proof once; repeat only on smoke.** "it feels wasteful to test the same things
-  2398439487398327492847239847234 times"; "test when you find smoke"; "not just for funzies". Smoke
-  is a red, a flake someone has seen, a timing near its bound, or a claim that is itself a rate.
-  Run callers' proofs only where the diff plausibly reaches them. A verifier does not re-run the
-  fixer's greens. Do not run locally what CI already runs. (ADR-018, 2026-10-01 section)
-- **No report-only, informational or warning checks.** "you know how I feel about fake tests." A
-  check either blocks as a valid proof, runs as an opt-in optional test, or is deleted. (ADR-018,
+  2398439487398327492847239847234 times"; "test when you find smoke"; "not just for funzies". (ADR-018,
   2026-10-01 section)
-- **Extend an existing user-journey proof rather than adding a file.** Why: one journey shows the
-  handoffs between commands, where the defects live. (ADR-018 §1)
-- **A fix deletes the tests it makes redundant.** Why: a test that proves nothing new only adds CI
-  time and another way to be red. (ADR-018, 2026-10-01 section)
-- **Every proof has a mutant that turns it red on its own assertion.** Break the product, run the
-  proof, and see it fail on the line that makes the claim. A CANNOT MEASURE is not a red and does
-  not count as the mutant's result. Why: a green gate is not evidence, and a gate can assert the
-  bug. (ADR-018 §7)
+  - Run a proof once, in the profile CI uses.
+  - Repeat only on smoke (a red, a flake someone has seen, a timing near its bound, a claim that is
+    itself a rate), and say why.
+  - Run callers' proofs only where the diff plausibly reaches them, in one profile.
+  - Verifiers don't re-run the fixer's greens: one mutant per claim, run once, plus probes where
+    there is smoke.
+  - After a clean re-merge, re-run only what the conflict touched. CI runs the suite on push; a CI
+    red is the smoke. Do not duplicate CI locally.
+- **No report-only, informational or warning checks.** "you know how I feel about fake tests". A
+  check that can't fail is a fake test: it blocks as a valid proof, runs as an optional proof, or is
+  deleted. (ADR-018, 2026-10-01 section)
+- **Extend before adding.** Extend an existing user-journey proof rather than adding a file; a new
+  test file must justify itself. Why: one journey shows the handoffs between commands, where the
+  defects live. (ADR-018 §1, 2026-10-01 section)
+- **A fix deletes the tests it makes redundant.** (ADR-018, 2026-10-01 section)
+- **Every proof has a mutant that turns it red on its own assertion.** A CANNOT MEASURE is not a
+  red and does not count as the mutant's result. Why: a green gate is not evidence, and a gate can
+  assert the bug. (ADR-018 §7)
+- **No test knobs in the shipped binary.** `VOX_TEST_*` knobs are compiled out of what users
+  install: a proof that needs one builds `vox` with the cargo feature `test-knobs`, and the packaged
+  release artifact holds none (the decider, 2026-10-01; #300, V210-105).
 
 ## Anchors
 
@@ -55,8 +68,10 @@ been the design since the first line of code (ADR-012).
 - "an anchor is only required for the initial Rendezvous for two hosts that are both behind NAT --
   it shouldn't strictly always be required to join/create a room"
 
-Never make an anchor a precondition for creating or joining a room, and never call an anchor
-unreachable when it was reached. When the anchor is missing, say truthfully what that costs.
+Never wait on, fail on, or blame an anchor that wasn't needed. Nothing may wait on, fail on, or
+refuse because of an absent anchor when the peer is directly reachable (a link address, a port
+mapping, the same LAN): not create, serve, invite, join or connect. Never call an anchor
+unreachable when it was reached. When an anchor is missing, say truthfully what that costs.
 (ADR-012, "The anchor principle, restated (2026-10-01)")
 
 ## Releases
@@ -82,3 +97,4 @@ unreachable when it was reached. When the anchor is missing, say truthfully what
 
 - Write whitelist and blacklist, in code, comments, docs and messages. Never allow-list or
   deny-list. This is a standing ruling of the decider's.
+- Never state planned work as done: write "is to" or "must" until it has landed.
