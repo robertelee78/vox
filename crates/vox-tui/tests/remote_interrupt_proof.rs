@@ -28,8 +28,9 @@
 //! 1. addressed to bob and urgent — bob's session is woken, exactly once;
 //! 2. urgent but addressed to someone else — nothing;
 //! 3. addressed to bob but not urgent — nothing;
-//! 4. a wedged session (an OpenCode endpoint, registered by `vox agent hook --session` with
-//!    `OPENCODE_SERVER_URL`, that accepts and never answers) does not stall bob's wakes.
+//! 4. a wedged session (an OpenCode plugin's wake socket, registered by `vox agent hook
+//!    --session` with `VOX_OPENCODE_WAKE_SOCKET`/`_TOKEN`, that accepts and never answers) does
+//!    not stall bob's wakes.
 //!
 //! **Mutation.** Put the pre-F15 loop back — the daemon judges only `NewEntry`, treating
 //! `Synced`/`SenderKeyReceived` and its two-second sweep as nothing to do — and this goes red
@@ -254,9 +255,11 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     );
 
     // ---- (4) a wedged session must not stall anybody else's wake ----
-    // An OpenCode endpoint that accepts and never answers: its wake would wait for ever.
-    let wedge = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let wedge_url = format!("http://{}", wedge.local_addr().unwrap());
+    // An OpenCode plugin's wake socket that accepts and never answers: its wake would wait
+    // for ever.
+    let wedge_path = tmp.path().join("wedge.sock");
+    let wedge = UnixListener::bind(&wedge_path).expect("bind the wedged session socket");
+    let wedge_url = wedge_path.to_str().unwrap().to_owned();
     std::thread::spawn(move || {
         let mut held = Vec::new();
         for s in wedge.incoming().flatten() {
@@ -266,7 +269,8 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     hook(
         bob,
         &[
-            ("OPENCODE_SERVER_URL", wedge_url.as_str()),
+            ("VOX_OPENCODE_WAKE_SOCKET", wedge_url.as_str()),
+            ("VOX_OPENCODE_WAKE_TOKEN", "wedge-token"),
             ("VOX_AGENT_NAME", "bob"),
         ],
         &[
