@@ -1132,7 +1132,8 @@ const SETTLE: Duration = Duration::from_secs(12);
 const MEASURE: Duration = Duration::from_secs(15);
 /// How long each congested arm measures, past the settle: long enough that tier 3's trials (2 s each,
 /// then a back-off of 30 s or more) run and fail inside it, so the share judged is the whole run's,
-/// trials included, not a steady state between them.
+/// trials included, not a steady state between them. The 2 s windows are printed as a DIAGNOSTIC
+/// line only: no claim is made about any window shorter than the run.
 const CONGESTED_MEASURE: Duration = Duration::from_secs(60);
 /// The window a person's speed is read in.
 const WINDOW: Duration = Duration::from_secs(1);
@@ -1580,16 +1581,21 @@ fn taper_arms(
         } else {
             format!("fair ({FAIR_LOW:.1}x-{FAIR_HIGH:.1}x)")
         };
-        // The cost of a failed tier-3 trial, made visible: the 2 s windows furthest from fair.
+        // DIAGNOSTIC, not a verdict: the 2 s windows furthest from fair, where a failed tier-3 trial
+        // would show. ADR-024 makes no claim about any window shorter than the whole run.
         let pairs: Vec<f64> = w
             .windows(2)
             .map(|p| (p[0].vox + p[1].vox) / (p[0].other + p[1].other).max(1.0))
             .collect();
-        let worst_high = pairs.iter().copied().fold(0.0, f64::max);
-        let worst_low = pairs.iter().copied().fold(f64::INFINITY, f64::min);
+        shown(&format!(
+            "R41 DIAGNOSTIC (not a verdict) {}: 2 s windows from {:.2}x to {:.2}x",
+            congested.name,
+            pairs.iter().copied().fold(f64::INFINITY, f64::min),
+            pairs.iter().copied().fold(0.0, f64::max)
+        ));
         note(report, format!(
-            "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.2}x over {} s — {verdict}; worst 2 s \
-             windows {worst_low:.2}x and {worst_high:.2}x; per-second vox {:?}, Cubic {:?}",
+            "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.2}x over {} s — {verdict}; \
+             per-second vox {:?}, Cubic {:?}",
             congested.name,
             vm / 1e6,
             cm / 1e6,
