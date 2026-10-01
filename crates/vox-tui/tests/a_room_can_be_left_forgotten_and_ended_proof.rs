@@ -227,6 +227,12 @@ fn a_forgotten_room_leaves_nothing_on_the_node() {
         t.elapsed().as_secs_f64(),
         o.stdout.trim()
     );
+    // Checked the moment it answers: a forget that says it is done is done.
+    assert!(
+        !holds(&store),
+        "PRODUCT: `vox room forget` answered, and alice's store.redb still holds the room's id,          which keys every one of its rows: {}",
+        store.display()
+    );
     let (gone, o2) = poll(bob, &["room", "roster", &id], WITHIN, |o| {
         o.ok && !o.stdout.contains(&alice.b32())
     });
@@ -239,12 +245,6 @@ fn a_forgotten_room_leaves_nothing_on_the_node() {
         listed(alice, &id).is_none(),
         "PRODUCT: `vox room list` still names the forgotten room: {:?}",
         listed(alice, &id)
-    );
-    assert!(
-        !holds(&store),
-        "PRODUCT: alice's store.redb still holds the forgotten room's id, which keys every one \
-         of its rows: {}",
-        store.display()
     );
 
     // A daemon that restarts does not bring it back.
