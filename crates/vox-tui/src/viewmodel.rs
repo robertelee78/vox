@@ -230,6 +230,11 @@ pub enum UiError {
     NoIdentity,
     /// The profile already has an identity.
     IdentityExists,
+    /// The profile had no identity when this TUI started, and another vox created one since:
+    /// nothing was created here (V210-100, the CLI's V210-91 refusal).
+    IdentityMadeElsewhere,
+    /// Another vox holds this profile open for writing.
+    ProfileBusy,
     /// The app is locked (`:unlock`).
     Locked,
     /// The channel is not open (select it and enter its passphrase).
@@ -293,6 +298,12 @@ impl UiError {
             UiError::Transport => "connection error",
             UiError::NoIdentity => "no identity yet — :init to create one",
             UiError::IdentityExists => "an identity already exists in this profile",
+            UiError::IdentityMadeElsewhere => {
+                "another vox created this profile's identity at the same time; nothing was created here — restart vox tui to unlock it"
+            }
+            UiError::ProfileBusy => {
+                "another vox holds this profile open — stop it, then try again"
+            }
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",

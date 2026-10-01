@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use secrecy::{ExposeSecret, SecretString};
 use vox_core::hash::Digest32;
-use vox_core::node::actor::NodeHandle;
+use vox_core::node::actor::{EventStreamItem, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, NodeView, Outcome, Secret};
 
 use crate::app::CoreHandle;
@@ -91,6 +91,36 @@ impl LiveCore {
 
     fn secret(s: &SecretString) -> Secret {
         Secret::new(s.expose_secret().as_bytes().to_vec())
+    }
+
+    /// [`LiveCore::send`] that also watches the node's events while the command runs, calling
+    /// `waiting` (on this thread, between polls) when the node says it is waiting for another vox
+    /// holding the profile.
+    fn send_noting(&self, cmd: NodeCommand, waiting: &mut dyn FnMut()) -> CommandStatus {
+        let node = &self.node;
+        let out = self.rt.block_on(async {
+            let mut events = node.subscribe();
+            let apply = node.apply(cmd);
+            tokio::pin!(apply);
+            let mut said = false;
+            loop {
+                tokio::select! {
+                    out = &mut apply => break out,
+                    ev = events.next(), if !said => match ev {
+                        Some(EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
+                            waiting();
+                            said = true;
+                        }
+                        Some(_) => {}
+                        None => said = true,
+                    },
+                }
+            }
+        });
+        match out {
+            Outcome::Done | Outcome::Bound(_) => CommandStatus::Done,
+            Outcome::Failed(f) => CommandStatus::Failed(ui_error(f)),
+        }
     }
 
     fn send(&self, cmd: NodeCommand) -> CommandStatus {
@@ -286,6 +316,7 @@ pub fn ui_error(f: Fault) -> UiError {
     match f {
         Fault::NoIdentity => UiError::NoIdentity,
         Fault::IdentityExists => UiError::IdentityExists,
+        Fault::ProfileBusy => UiError::ProfileBusy,
         Fault::Locked => UiError::Locked,
         Fault::WrongPassphrase => UiError::WrongPassphrase,
         Fault::UnknownChannel | Fault::ChannelNotOpen => UiError::ChannelNotOpen,
@@ -326,13 +357,34 @@ impl CoreHandle for LiveCore {
     }
 
     fn apply(&mut self, command: Command) -> CommandStatus {
+        self.apply_noting(command, &mut || {})
+    }
+
+    fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
         match command {
-            Command::CreateIdentity { passphrase } => self.send(NodeCommand::CreateIdentity {
-                passphrase: Self::secret(&passphrase),
-            }),
-            Command::Unlock { passphrase } => self.send(NodeCommand::Unlock {
-                passphrase: Self::secret(&passphrase),
-            }),
+            Command::CreateIdentity { passphrase } => {
+                // **Another vox made it first** (V210-100, as the CLI says since V210-91): this
+                // node holds no identity, so one that exists now was created by another vox
+                // after this one started. "Already exists" read as a stale profile.
+                let had = self.node.view().identity.is_some();
+                match self.send_noting(
+                    NodeCommand::CreateIdentity {
+                        passphrase: Self::secret(&passphrase),
+                    },
+                    waiting,
+                ) {
+                    CommandStatus::Failed(UiError::IdentityExists) if !had => {
+                        CommandStatus::Failed(UiError::IdentityMadeElsewhere)
+                    }
+                    other => other,
+                }
+            }
+            Command::Unlock { passphrase } => self.send_noting(
+                NodeCommand::Unlock {
+                    passphrase: Self::secret(&passphrase),
+                },
+                waiting,
+            ),
             Command::Lock => {
                 self.active = None;
                 self.send(NodeCommand::Lock)

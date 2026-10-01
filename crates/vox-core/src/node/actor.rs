@@ -2480,7 +2480,11 @@ impl Node {
             headless,
             anchor_logs,
         } = cfg;
-        let profile = if Profile::exists(&paths) {
+        // A headless node networks as its key file and holds no room, so it never opens the
+        // profile's vault — which a `vox node --serve trusted` profile has, to keep its trust
+        // list. Opening it here held the store the anchor's own logs need, and the anchor
+        // refused to start: "another vox already has this profile open".
+        let profile = if headless.is_none() && Profile::exists(&paths) {
             Some(Profile::open(paths.clone())?)
         } else {
             None
@@ -2987,7 +2991,11 @@ impl Node {
             return Outcome::Failed(Fault::IdentityExists);
         }
         let now = self.now();
-        match Profile::create_with_profile(self.paths.clone(), passphrase, now, self.argon2) {
+        let events = self.event_tx.clone();
+        let waiting = move || {
+            let _ = events.send(NodeEvent::WaitingForProfile);
+        };
+        match Profile::create_noting(self.paths.clone(), passphrase, now, self.argon2, &waiting) {
             Ok(p) => {
                 self.profile = Some(p);
                 // A fresh identity gets its prekey ring immediately: without it the
@@ -3008,7 +3016,11 @@ impl Node {
         let Some(profile) = self.profile.as_mut() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        match profile.unlock(passphrase) {
+        let events = self.event_tx.clone();
+        let waiting = move || {
+            let _ = events.send(NodeEvent::WaitingForProfile);
+        };
+        match profile.unlock_noting(passphrase, &waiting) {
             Ok(()) => {
                 let now = self.now();
                 if let Err(e) = self.load_prekeys(now) {
@@ -6336,15 +6348,6 @@ impl Node {
         self.renew_mappings_at = due;
     }
 
-    /// Re-run the ladder's publish side when the granted mappings are halfway through
-    /// their lifetime, so a node that outlives a two-hour mapping stays dialable.
-    ///
-    /// Nothing happens while the network is down: the renewal instant is left in place
-    /// so the next unlock's discovery supersedes it.
-    ///
-    /// The re-request runs on its own task (it talks to a gateway) and lands back as
-    /// [`NetEvent::AddressesDiscovered`], which republishes the address records too —
-    /// a renewal that came back with a *different* external port must be advertised.
     /// Renew each open room's own records when half their lifetime has passed (V210-68, #258).
     ///
     /// A node's address record lives two hours on a board ([`crate::nat::store::MAX_TTL_SECS`]),
@@ -6385,6 +6388,15 @@ impl Node {
             .insert(*room, self.now().saturating_add(half.max(1)));
     }
 
+    /// Re-run the ladder's publish side when the granted mappings are halfway through
+    /// their lifetime, so a node that outlives a two-hour mapping stays dialable.
+    ///
+    /// Nothing happens while the network is down: the renewal instant is left in place
+    /// so the next unlock's discovery supersedes it.
+    ///
+    /// The re-request runs on its own task (it talks to a gateway) and lands back as
+    /// [`NetEvent::AddressesDiscovered`], which republishes the address records too —
+    /// a renewal that came back with a *different* external port must be advertised.
     fn renew_mappings_if_due(&mut self) {
         let Some(due) = self.renew_mappings_at else {
             return;
@@ -9398,6 +9410,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::Profile("no such channel in this profile") => Fault::UnknownChannel,
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
         Error::AtRestLocked => Fault::Locked,
+        Error::ProfileBusy => Fault::ProfileBusy,
         // Before the general size arm: a full keyring is not an input that was too long.
         Error::SizeLimitExceeded("trusted identities") => Fault::KeyringFull,
         Error::SizeLimitExceeded(_) => Fault::TooLong,

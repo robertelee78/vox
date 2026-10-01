@@ -423,6 +423,10 @@ pub enum Fault {
     KeyringFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
+    /// Another vox holds this profile's store open for writing, and only one at a time may.
+    /// Not [`Fault::Internal`], which is how an unlock that met one was reported (V210-100):
+    /// nothing was wrong with vox or the profile, and stopping the other one is the remedy.
+    ProfileBusy,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -543,6 +547,9 @@ impl Fault {
             Fault::Storage => {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
             }
+            Fault::ProfileBusy => {
+                "another vox holds this profile open, and only one at a time may write it\n       stop that one to run this, or use the `vox room …` verbs, which ask a running node"
+            }
             Fault::IdentityFileUnwritable => {
                 "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
             }
@@ -647,6 +654,12 @@ impl std::fmt::Display for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeEvent {
+    /// Creating or unlocking the identity has waited more than a second for another vox that
+    /// holds this profile's lock (it is creating the identity, or migrating a v0.2.9 profile, or
+    /// it is stopped while doing so). Sent once per wait; the command goes on when the lock is
+    /// free. Each front end says it in its own place: the CLI on stderr, the TUI in its status
+    /// line (V210-100).
+    WaitingForProfile,
     /// A new rendered entry in a channel.
     NewEntry {
         /// The channel.
