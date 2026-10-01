@@ -262,6 +262,12 @@ pub enum UiError {
     AddressInUse,
     /// A join named a room this profile already holds.
     AlreadyMember,
+    /// The room has ended: it takes no new message (V030-08).
+    RoomEnded,
+    /// This identity left the room (V030-08).
+    LeftRoom,
+    /// Only the room's creator may do that (V030-08).
+    NotCreator,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
@@ -317,6 +323,9 @@ impl UiError {
             UiError::NotNetworked => "not connected (unlock first)",
             UiError::AddressInUse => "a local port it needs is in use — pick another --listen",
             UiError::AlreadyMember => "you already hold that room — it is in your list",
+            UiError::RoomEnded => "this room has ended — it takes no new message (:forget deletes it)",
+            UiError::LeftRoom => "you left this room — :forget deletes what is still here",
+            UiError::NotCreator => "only the room's creator may end it",
             UiError::Internal => "internal error",
         }
     }
@@ -387,6 +396,21 @@ pub enum Command {
     },
     /// Close an open channel (wipes its SEK from memory).
     CloseChannel {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// Leave a room (V030-08): the other members stop syncing with this node.
+    LeaveRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// Forget a room (V030-08): delete everything this node holds of it, leaving it first.
+    ForgetRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// End a room for everyone (V030-08); its creator only.
+    EndRoom {
         /// The channelID.
         channel_id: Digest32,
     },

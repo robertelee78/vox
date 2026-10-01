@@ -449,6 +449,42 @@ impl Store {
         Ok(existed)
     }
 
+    /// Delete **everything this store holds of one channel** (V030-08 `vox room forget`): every
+    /// sealed segment of every kind and its SEK wrap, in one durable transaction. Returns how
+    /// many rows went. The freed pages still hold the old bytes until the space is reused; a
+    /// caller that must leave none follows with [`Store::rewrite_fresh`].
+    pub fn purge_channel(&self, channel: &Digest32) -> Result<usize> {
+        let txn = self.begin_write()?;
+        let mut gone = 0usize;
+        {
+            let mut t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
+            let lo: SegmentKey = (*channel, 0, 0);
+            let hi: SegmentKey = (*channel, u8::MAX, u64::MAX);
+            let keys: Vec<SegmentKey> = t
+                .range(lo..=hi)
+                .map_err(storage("range segments"))?
+                .map(|item| item.map(|(k, _)| k.value()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(storage("iterate segments"))?;
+            for k in keys {
+                if t.remove(k).map_err(storage("delete segment"))?.is_some() {
+                    gone += 1;
+                }
+            }
+            let mut w = txn
+                .open_table(SEK_WRAPS)
+                .map_err(storage("open sek_wraps"))?;
+            if w.remove(*channel)
+                .map_err(storage("delete sek wrap"))?
+                .is_some()
+            {
+                gone += 1;
+            }
+        }
+        txn.commit().map_err(storage("commit"))?;
+        Ok(gone)
+    }
+
     /// Persist a channel's double-locked SEK wrap (its own durable transaction).
     pub fn put_sek_wrap(&self, channel: &Digest32, wrap: &SekWrap) -> Result<()> {
         let mut b = self.batch()?;

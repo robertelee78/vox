@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::governance::cert::{AdminCert, AdminRevocation};
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::genesis::Genesis;
+use crate::governance::lifecycle::RoomLifecycle;
 use crate::governance::policy::PolicyUpdate;
 use crate::governance::rotation::PassphraseRotation;
 use crate::governance::servicegrant::ServiceGrantExclusion;
@@ -69,6 +70,9 @@ pub enum GovBody {
     PolicyUpdate(Box<PolicyUpdate>),
     /// A passphrase-rotation / epoch bump (tag `0x0006`, body kind = rotation).
     PassphraseRotation(Box<PassphraseRotation>),
+    /// A room-lifecycle fact (tag `0x0017`): a member leaving, the creator ending the room, or
+    /// the creator's idle end (V030-08).
+    Lifecycle(Box<RoomLifecycle>),
 }
 
 impl GovBody {
@@ -96,6 +100,9 @@ impl GovBody {
             StructTag::ServiceGrantExclusion => Ok(GovBody::ServiceGrantExclusion(Box::new(
                 ServiceGrantExclusion::from_wire(bytes)?,
             ))),
+            StructTag::RoomLifecycle => Ok(GovBody::Lifecycle(Box::new(RoomLifecycle::from_wire(
+                bytes,
+            )?))),
             StructTag::PolicyRotation => {
                 // 0x0006 is shared: try policy-update, then passphrase-rotation.
                 if let Ok(pu) = PolicyUpdate::from_wire(bytes) {
@@ -123,6 +130,7 @@ impl GovBody {
             GovBody::ServiceGrantExclusion(x) => (x.body.channel_id, x.body.epoch),
             GovBody::PolicyUpdate(p) => (p.body.channel_id, p.body.epoch),
             GovBody::PassphraseRotation(r) => (r.body.channel_id, r.body.old_epoch),
+            GovBody::Lifecycle(l) => (l.body.channel_id, l.body.epoch),
         }
     }
 
@@ -139,6 +147,7 @@ impl GovBody {
             GovBody::ServiceGrantExclusion(x) => x.body.issuer_id,
             GovBody::PolicyUpdate(p) => p.body.issuer_id,
             GovBody::PassphraseRotation(r) => r.body.issuer_id,
+            GovBody::Lifecycle(l) => l.body.issuer_id,
         }
     }
 }

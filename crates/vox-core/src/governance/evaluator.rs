@@ -185,6 +185,20 @@ pub struct Evaluator {
     /// Members whose genesis-conferred capabilities have been withdrawn by an
     /// authorized [`ServiceGrantExclusion`](crate::governance::servicegrant::ServiceGrantExclusion).
     excluded: BTreeSet<Digest32>,
+    /// The room's lifecycle as its log states it (V030-08): who has left, whether the creator
+    /// ended it, and the idle end the creator chose.
+    lifecycle: Lifecycle,
+}
+
+/// What a room's lifecycle facts say (V030-08), folded from the log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lifecycle {
+    /// The members who have left, each by its own signed leave, with that leave's log entry.
+    pub departed: BTreeMap<Digest32, Digest32>,
+    /// The log entry in which the creator ended the room, if it has.
+    pub ended_by: Option<Digest32>,
+    /// The idle end the creator chose, in seconds; `None` when it chose none.
+    pub idle_end_secs: Option<u64>,
 }
 
 impl Evaluator {
@@ -270,6 +284,7 @@ impl Evaluator {
         let policy = resolver.resolve_policy(genesis)?;
         let consent = resolver.resolve_consent()?;
         let excluded = resolver.resolve_service_grant_exclusions()?;
+        let lifecycle = resolver.resolve_lifecycle();
 
         Ok(Self {
             channel_id,
@@ -282,6 +297,7 @@ impl Evaluator {
             service_grant: genesis.body.service_grant.clone(),
             members,
             excluded,
+            lifecycle,
         })
     }
 
@@ -297,6 +313,7 @@ impl Evaluator {
             GovBody::ServiceGrantExclusion(x) => x.verify(author_key),
             GovBody::PolicyUpdate(p) => p.verify(author_key),
             GovBody::PassphraseRotation(r) => r.verify(author_key),
+            GovBody::Lifecycle(l) => l.verify(author_key),
         }
     }
 
@@ -433,6 +450,13 @@ impl Evaluator {
     #[must_use]
     pub fn is_excluded(&self, key: &Digest32) -> bool {
         self.excluded.contains(key)
+    }
+
+    /// The room's lifecycle as its log states it: who has left, whether its creator ended it,
+    /// and the idle end its creator chose (V030-08).
+    #[must_use]
+    pub fn lifecycle(&self) -> &Lifecycle {
+        &self.lifecycle
     }
 
     /// Whether `reader` currently has consent to read `author` (outbound axis
@@ -819,6 +843,37 @@ impl<'a> Resolver<'a> {
     /// changes their mind issues an explicit certificate instead (which the grant term
     /// in [`Evaluator::grants`] deliberately does not suppress), and a new epoch clears
     /// every exclusion along with every certificate.
+    /// Fold the room-lifecycle facts (V030-08). A leave counts only from the member it names,
+    /// which the signature already binds (`issuer_id` is the signer, and the signer is the
+    /// entry's author). An end or an idle end counts only from the root admin — the creator,
+    /// not a delegate. None is epoch-bound: a passphrase rotation brings no member back and
+    /// reopens no room. The last idle end in canonical order wins.
+    fn resolve_lifecycle(&self) -> Lifecycle {
+        use crate::governance::lifecycle::LifecycleKind;
+        let mut out = Lifecycle::default();
+        for e in &self.causality.order {
+            let GovBody::Lifecycle(l) = &e.body else {
+                continue;
+            };
+            if l.body.issuer_id != e.author_id {
+                continue;
+            }
+            match l.body.kind {
+                LifecycleKind::Leave => {
+                    out.departed.entry(l.body.issuer_id).or_insert(e.entry_hash);
+                }
+                LifecycleKind::End if l.body.issuer_id == self.root_admin => {
+                    out.ended_by.get_or_insert(e.entry_hash);
+                }
+                LifecycleKind::IdleEnd(secs) if l.body.issuer_id == self.root_admin => {
+                    out.idle_end_secs = Some(secs);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     fn resolve_service_grant_exclusions(&mut self) -> Result<BTreeSet<Digest32>> {
         let mut excluded = BTreeSet::new();
         let order: Vec<&GovEntry> = self.causality.order.clone();

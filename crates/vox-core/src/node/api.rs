@@ -42,6 +42,9 @@ pub struct ChannelSummary {
     pub open: bool,
     /// Number of accepted log entries (0 while closed).
     pub entries: u64,
+    /// Whether the room is over for this node, in plain words (V030-08): this identity left it,
+    /// or it ended. `None` while it is going on, and while it is closed.
+    pub over: Option<String>,
 }
 
 /// A rendered, render-gated message.
@@ -247,6 +250,33 @@ pub enum NodeCommand {
     CloseChannel {
         /// The channelID.
         channel_id: Digest32,
+    },
+    /// Leave a room (V030-08): append this identity's signed leave. The room stays here, quiet
+    /// and readable, until it is forgotten; the other members stop syncing with this node and
+    /// delivering to it once they hold the leave, which this node passes on first.
+    LeaveRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// Forget a room (V030-08): delete everything this node holds of it. A room this identity
+    /// is still a member of is left first, and forgotten once the leave has been passed on
+    /// (or the hand-over's bound runs out): [`NodeEvent::RoomForgotten`] says when.
+    ForgetRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// End a room for everyone (V030-08). Only its creator may.
+    EndRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// Choose a room's idle end (V030-08): it ends after `idle_secs` with nothing said in it.
+    /// Only its creator may; `vox room create --idle-end` is where it does.
+    ChooseIdleEnd {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The idle end, in seconds (more than 0).
+        idle_secs: u64,
     },
     /// Author a text message in an open channel.
     SendText {
@@ -554,6 +584,14 @@ pub enum Fault {
     /// The change is the room admin's to make — a holder of the `policy` capability — and
     /// this identity is not one (PRD-001 R7: setting a room's retention).
     NotAdmin,
+    /// The room is over: its creator ended it, or its idle end ran out (V030-08). It takes no
+    /// new message.
+    RoomEnded,
+    /// This identity has left the room (V030-08): it says nothing more there, and the other
+    /// members no longer sync with it.
+    LeftRoom,
+    /// Only the room's creator may do that — end the room, or choose its idle end (V030-08).
+    NotCreator,
     /// The room's stored log was written by vox before v0.3.0, whose message format changed;
     /// v0.3.0 does not read it, and the room is made again (decider, 2026-09-29, #226).
     RoomFromBeforeV030,
@@ -657,6 +695,15 @@ impl Fault {
             Fault::NotAdmin => {
                 "only the room's admin may change that, and this identity is not its admin\n       the admin is whoever created the room; ask them"
             }
+            Fault::RoomEnded => {
+                "this room has ended — its creator ended it, or nothing was said in it for the idle end its creator chose — so it takes no new message\n       what was said stays readable here until you `vox room forget` it"
+            }
+            Fault::LeftRoom => {
+                "this identity has left that room, so it says nothing more there\n       `vox room forget` deletes what this node still holds of it"
+            }
+            Fault::NotCreator => {
+                "only the room's creator may do that, and this identity did not create it"
+            }
             Fault::RoomFromBeforeV030 => {
                 "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and invite its members"
             }
@@ -740,6 +787,22 @@ pub enum NodeEvent {
     /// A channel was closed.
     ChannelClosed {
         /// The channel.
+        channel_id: Digest32,
+    },
+    /// A room this node left or holds ended has been passed on and gone quiet (V030-08):
+    /// `handed` of `members` members were synced with after the fact; the rest learn it from
+    /// them, or from an anchor.
+    RoomQuiet {
+        /// The room.
+        channel_id: Digest32,
+        /// Members synced with after the leave or the end.
+        handed: usize,
+        /// Members it had to pass it to.
+        members: usize,
+    },
+    /// Everything this node held of a room was deleted (V030-08 `vox room forget`).
+    RoomForgotten {
+        /// The room.
         channel_id: Digest32,
     },
     /// A peer completed an ADR-005 join against this node, which verified its

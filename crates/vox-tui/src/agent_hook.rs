@@ -552,7 +552,7 @@ async fn drain(
         Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
-    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
+    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _)| *id).collect();
     let channel_id = resolve_prefix(room_arg, &ids)?;
     let room_key = b32_encode(&channel_id);
     let label: String = room_key.chars().take(12).collect();

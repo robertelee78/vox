@@ -354,6 +354,9 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::NotNetworked => UiError::NotNetworked,
         Fault::AddressInUse => UiError::AddressInUse,
         Fault::AlreadyMember => UiError::AlreadyMember,
+        Fault::RoomEnded => UiError::RoomEnded,
+        Fault::LeftRoom => UiError::LeftRoom,
+        Fault::NotCreator => UiError::NotCreator,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
     }
@@ -424,6 +427,14 @@ impl CoreHandle for LiveCore {
                     self.active = None;
                 }
                 self.send(NodeCommand::CloseChannel { channel_id })
+            }
+            Command::LeaveRoom { channel_id } => self.send(NodeCommand::LeaveRoom { channel_id }),
+            Command::EndRoom { channel_id } => self.send(NodeCommand::EndRoom { channel_id }),
+            Command::ForgetRoom { channel_id } => {
+                if self.active == Some(channel_id) {
+                    self.active = None;
+                }
+                self.send(NodeCommand::ForgetRoom { channel_id })
             }
             Command::SelectChannel { channel_id } => {
                 self.active = channel_id;

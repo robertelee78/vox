@@ -111,6 +111,22 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// connection died and raises the periodic request (D7).
 const TICK: Duration = Duration::from_secs(1);
 
+/// How long a room this node left or holds ended keeps syncing to pass that on, when some
+/// member cannot be reached (V030-08). Each member synced with after the fact counts as passed
+/// on at once; a member still unreachable past this learns it from the others, or an anchor.
+const WIND_DOWN: Duration = Duration::from_secs(60);
+
+/// A room passing on that it was left or ended, before it goes quiet (V030-08).
+struct Winding {
+    /// The room's generation once it held the leave or the end: a member's port credited
+    /// with it has been passed the fact.
+    gen: u64,
+    /// When this node started passing it on.
+    since: std::time::Instant,
+    /// Whether to forget the room once it is quiet (`vox room forget` of a room still held).
+    forget: bool,
+}
+
 /// How often automatic work (a rotation's rekeys, a trusted member's consent) may start a background
 /// dial to one member it cannot currently reach. See `reach_member`.
 const MEMBER_REDIAL_SECS: u64 = 30;
@@ -138,7 +154,20 @@ fn summary_of(ch: &ChannelState) -> ChannelSummary {
         local_name: Some(ch.local_name().to_owned()),
         open: true,
         entries: ch.entry_count() as u64,
+        over: over_of(ch),
     }
+}
+
+/// Whether a room is over for this node, in plain words (V030-08). Read on the wall clock: it is
+/// what a person is shown, and the idle end runs on the room's own entries' clock either way.
+fn over_of(ch: &ChannelState) -> Option<String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    if let Some(end) = ch.ended(now_ms) {
+        return Some(format!("ended: {end}"));
+    }
+    ch.has_left(&ch.me()).then(|| "left".to_owned())
 }
 
 /// A room's detail for the view, from its state.
@@ -283,6 +312,9 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::Up { .. } => "bringing the proxy up",
         NodeCommand::Forward { .. } => "opening a forward",
         NodeCommand::Unlock { .. } => "unlocking the identity",
+        NodeCommand::LeaveRoom { .. } => "leaving a room",
+        NodeCommand::ForgetRoom { .. } => "forgetting a room",
+        NodeCommand::EndRoom { .. } => "ending a room",
         _ => "a client command",
     }
 }
@@ -2356,6 +2388,12 @@ pub struct Node {
     /// entry is removed once a view reads the room under its lock, since that read includes the
     /// write: an entry here is therefore always newer than the published one.
     fresh_details: BTreeMap<Digest32, (ChannelSummary, ChannelDetail)>,
+    /// Rooms this node left or holds ended, passing that on before they go quiet (V030-08).
+    winding: BTreeMap<Digest32, Winding>,
+    /// Rooms this node left or holds ended that have been passed on: nothing is synced, dialled
+    /// or published for them any more (V030-08). Not persisted: a reopened one winds down again,
+    /// which costs one session per member.
+    quiet: std::collections::BTreeSet<Digest32>,
     /// Per `(room, member)`: consecutive keys not taken, and the unix second before which the
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
@@ -2703,6 +2741,8 @@ impl Node {
             member_dialed_at: BTreeMap::new(),
             pending_consents: Vec::new(),
             fresh_details: BTreeMap::new(),
+            winding: BTreeMap::new(),
+            quiet: std::collections::BTreeSet::new(),
             key_backoff: BTreeMap::new(),
             keys_in_flight: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
@@ -2933,6 +2973,7 @@ impl Node {
                         self.refresh_network_view().await;
                     }
                     self.redial_anchors_if_due();
+                    self.tend_lifecycle().await;
                     // A rotation's re-keys go out as the remaining consenters become
                     // reachable, which is why they are retried here and not only at
                     // the moment of rotation (M18.1).
@@ -3046,6 +3087,13 @@ impl Node {
                 passphrase,
             } => self.open_channel(&channel_id, &passphrase).await,
             NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id).await,
+            NodeCommand::LeaveRoom { channel_id } => self.leave_room(&channel_id, false).await,
+            NodeCommand::ForgetRoom { channel_id } => self.forget_room(&channel_id).await,
+            NodeCommand::EndRoom { channel_id } => self.end_room(&channel_id).await,
+            NodeCommand::ChooseIdleEnd {
+                channel_id,
+                idle_secs,
+            } => self.choose_idle_end(&channel_id, idle_secs).await,
             NodeCommand::SendText { channel_id, text } => self.send_text(&channel_id, &text).await,
             NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
             // Answered through `begin_join_channel`, which the run loop calls instead of this; a
@@ -4171,7 +4219,7 @@ impl Node {
                 return;
             };
             let members: BTreeMap<Digest32, CompositePublicKey> = ch
-                .author_keys()
+                .member_keys()
                 .into_iter()
                 .map(|k| (k.fingerprint(), k))
                 .collect();
@@ -5400,7 +5448,7 @@ impl Node {
         for (cid, shared) in &self.channels {
             let authors: Vec<Digest32> = {
                 let ch = shared.lock().await;
-                ch.author_fingerprints()
+                ch.members()
             };
             for peer in authors {
                 let Some(conn) = net.manager().existing(&peer) else {
@@ -6726,6 +6774,13 @@ impl Node {
             .filter(|(room, at)| **at <= now && self.channels.contains_key(*room))
             .map(|(room, _)| *room)
             .collect();
+        // A room left or ended and passed on is renewed nowhere (V030-08): its records lapse.
+        self.records_renew_at
+            .retain(|room, _| !self.quiet.contains(room));
+        let due: Vec<Digest32> = due
+            .into_iter()
+            .filter(|room| !self.quiet.contains(room))
+            .collect();
         for room in due {
             self.records_renew_at.remove(&room);
             crate::node::status::SyncBook::note_renewal(&self.sync_book);
@@ -6837,6 +6892,10 @@ impl Node {
     /// board before it is in the author table, and skipping it for that lost posts made right
     /// after a join.
     async fn shares_room(&mut self, channel_id: &Digest32, peer: &Digest32) -> bool {
+        // A room left or ended and passed on is synced with nobody (V030-08).
+        if self.quiet.contains(channel_id) {
+            return false;
+        }
         if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
             let epoch = shared.lock().await.epoch();
             return self.may_sync(channel_id, peer, epoch).await;
@@ -7771,7 +7830,11 @@ impl Node {
         if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
             {
                 let channel = shared.lock().await;
-                if channel.is_author(peer)
+                // A member that left is nobody this node syncs with (V030-08).
+                if channel.has_left(peer) {
+                    return false;
+                }
+                if channel.is_member(peer)
                     || channel.anchors().nodes().iter().any(|a| a.id == *peer)
                 {
                     return true;
@@ -7797,7 +7860,7 @@ impl Node {
                 now,
             )
             .await;
-            return channel.is_author(peer);
+            return channel.is_member(peer);
         }
         if let Some(state) = self.anchored.get(channel_id) {
             return state.lock().await.is_author(peer);
@@ -8177,8 +8240,9 @@ impl Node {
         };
         let ctx = {
             let channel = shared.lock().await;
-            // Only a member we have admitted may open a session to us.
-            if !channel.is_author(&peer) {
+            // Only a member we have admitted may open a session to us, and not one that left
+            // (V030-08).
+            if !channel.is_member(&peer) {
                 return false;
             }
             match channel.join_context() {
@@ -8388,6 +8452,9 @@ impl Node {
     /// a restart needs to find them again (`node::peer_book`). `reach_member` dials off the
     /// actor, and a connection it makes is adopted with a sync due at once.
     async fn reach_members_of(&mut self, channel_id: &Digest32) {
+        if self.quiet.contains(channel_id) {
+            return;
+        }
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
@@ -9239,6 +9306,256 @@ impl Node {
         }
     }
 
+    /// Leave a room (V030-08): append this identity's signed leave and start passing it on.
+    /// `forget` deletes the room once that is done.
+    async fn leave_room(&mut self, channel_id: &Digest32, forget: bool) -> Outcome {
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let gen = {
+            let mut ch = shared.lock().await;
+            if let Err(e) = ch.leave(profile, now) {
+                return Outcome::Failed(fault_of(&e));
+            }
+            self.fresh_details
+                .insert(*channel_id, (summary_of(&ch), detail_of(&ch)));
+            ch.generation().load(std::sync::atomic::Ordering::Relaxed)
+        };
+        self.quiet.remove(channel_id);
+        self.winding.insert(
+            *channel_id,
+            Winding {
+                gen,
+                since: std::time::Instant::now(),
+                forget,
+            },
+        );
+        self.note_local_append(channel_id);
+        Outcome::Done
+    }
+
+    /// End a room for everyone (V030-08): its creator's signed end, passed on like a leave.
+    async fn end_room(&mut self, channel_id: &Digest32) -> Outcome {
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        {
+            let mut ch = shared.lock().await;
+            if ch.ended((self.millis_clock)()).is_some() {
+                return Outcome::Failed(Fault::RoomEnded);
+            }
+            if let Err(e) = ch.end(profile, now) {
+                return Outcome::Failed(fault_of(&e));
+            }
+            self.fresh_details
+                .insert(*channel_id, (summary_of(&ch), detail_of(&ch)));
+        }
+        self.note_local_append(channel_id);
+        // `tend_lifecycle` starts the wind-down: the room is ended from here on, on this node.
+        self.tend_lifecycle().await;
+        Outcome::Done
+    }
+
+    /// Choose a room's idle end (V030-08).
+    async fn choose_idle_end(&mut self, channel_id: &Digest32, idle_secs: u64) -> Outcome {
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        {
+            let mut ch = shared.lock().await;
+            if let Err(e) = ch.choose_idle_end(profile, idle_secs, now) {
+                return Outcome::Failed(fault_of(&e));
+            }
+            self.fresh_details
+                .insert(*channel_id, (summary_of(&ch), detail_of(&ch)));
+        }
+        self.note_local_append(channel_id);
+        Outcome::Done
+    }
+
+    /// Forget a room (V030-08): delete everything this node holds of it. A room this identity
+    /// is still a member of — not left, not ended — is left first, and forgotten once the leave
+    /// has been passed on; [`NodeEvent::RoomForgotten`] says when.
+    async fn forget_room(&mut self, channel_id: &Digest32) -> Outcome {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            // A room this node holds closed has to be opened first: forgetting it unopened
+            // would leave its members counting this node in for good, with nobody to say
+            // otherwise.
+            return Outcome::Failed(
+                if self
+                    .profile
+                    .as_ref()
+                    .is_some_and(|p| p.store().get_sek_wrap(channel_id).ok().flatten().is_some())
+                {
+                    Fault::ChannelNotOpen
+                } else {
+                    Fault::UnknownChannel
+                },
+            );
+        };
+        let (still_in, ended) = {
+            let ch = shared.lock().await;
+            (
+                !ch.has_left(&ch.me()),
+                ch.ended((self.millis_clock)()).is_some(),
+            )
+        };
+        if let Some(w) = self.winding.get_mut(channel_id) {
+            w.forget = true;
+            return Outcome::Done;
+        }
+        if still_in && !ended {
+            return self.leave_room(channel_id, true).await;
+        }
+        self.purge_room(channel_id).await
+    }
+
+    /// Delete everything this node holds of a room, now (V030-08): its state, every stored row
+    /// and its key, its place among the rooms reopened at unlock, the consents pending in it,
+    /// and then the store is rewritten so none of the deleted bytes stay in the file.
+    async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
+        if let Some(shared) = self.channels.remove(channel_id) {
+            shared.lock().await.lock_now();
+        }
+        self.reopening.remove(channel_id);
+        if let Err(e) = self.forget_open(channel_id) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        if let Some(net) = self.net.as_ref() {
+            net.membership().clear_channel(channel_id);
+        }
+        let peers: Vec<Digest32> = self
+            .ports
+            .keys()
+            .filter(|(r, _)| r == channel_id)
+            .map(|(_, p)| *p)
+            .collect();
+        for peer in peers {
+            self.drop_port(channel_id, &peer);
+        }
+        self.winding.remove(channel_id);
+        self.quiet.remove(channel_id);
+        self.fresh_details.remove(channel_id);
+        self.room_anchors.remove(channel_id);
+        self.reachers.remove(channel_id);
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        if self.consent_keys.forget_room(channel_id) {
+            if let Ok(signer) = profile.signer() {
+                let _ = self.consent_keys.save(profile.store(), signer);
+            }
+        }
+        if let Err(e) = profile.store().purge_channel(channel_id) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        if let Err(e) = profile.store().rewrite_fresh() {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.refresh_network_view().await;
+        let _ = self.event_tx.send(NodeEvent::RoomForgotten {
+            channel_id: *channel_id,
+        });
+        Outcome::Done
+    }
+
+    /// Tend every room's lifecycle (V030-08), each tick and after a leave or an end:
+    /// - a member that left is synced with no more, and loses the keys this identity gave it:
+    ///   its consent is withdrawn, which rotates the sender key, as a revocation does;
+    /// - a room this node left or holds ended passes that on — each member synced with after it
+    ///   counts — then goes quiet: no session, dial or publish for it any more. A room left with
+    ///   `vox room forget` is deleted then.
+    async fn tend_lifecycle(&mut self) {
+        let now_ms = (self.millis_clock)();
+        let rooms: Vec<(Digest32, Arc<tokio::sync::Mutex<ChannelState>>)> = self
+            .channels
+            .iter()
+            .map(|(c, s)| (*c, Arc::clone(s)))
+            .collect();
+        for (cid, shared) in rooms {
+            let Ok(ch) = shared.try_lock() else {
+                continue; // a session holds it; the next tick tends it
+            };
+            let me = ch.me();
+            let departed: Vec<Digest32> = ch
+                .author_fingerprints()
+                .into_iter()
+                .filter(|a| *a != me && ch.has_left(a))
+                .collect();
+            let unconsent: Vec<Digest32> = departed
+                .iter()
+                .copied()
+                .filter(|d| ch.has_consented(d))
+                .collect();
+            let over = ch.has_left(&me) || ch.ended(now_ms).is_some();
+            let members: Vec<Digest32> = ch.members().into_iter().filter(|m| *m != me).collect();
+            let gen = ch.generation().load(std::sync::atomic::Ordering::Relaxed);
+            drop(ch);
+            for d in &departed {
+                if self.ports.contains_key(&(cid, *d)) {
+                    self.drop_port(&cid, d);
+                }
+            }
+            for d in unconsent {
+                let _ = self.revoke(&cid, d).await;
+            }
+            if !over || self.quiet.contains(&cid) {
+                continue;
+            }
+            let winding = self.winding.entry(cid).or_insert(Winding {
+                gen,
+                since: std::time::Instant::now(),
+                forget: false,
+            });
+            let (want, since, forget) = (winding.gen, winding.since, winding.forget);
+            let mut handed = 0usize;
+            for m in &members {
+                if self.ensure_port(&cid, m).await
+                    && self
+                        .ports
+                        .get(&(cid, *m))
+                        .is_some_and(|p| p.done_gen >= want)
+                {
+                    handed += 1;
+                }
+            }
+            if handed < members.len() && since.elapsed() < WIND_DOWN {
+                continue;
+            }
+            self.winding.remove(&cid);
+            self.quiet.insert(cid);
+            let peers: Vec<Digest32> = self
+                .ports
+                .keys()
+                .filter(|(r, _)| *r == cid)
+                .map(|(_, p)| *p)
+                .collect();
+            for peer in peers {
+                self.drop_port(&cid, &peer);
+            }
+            let _ = self.event_tx.send(NodeEvent::RoomQuiet {
+                channel_id: cid,
+                handed,
+                members: members.len(),
+            });
+            if forget {
+                let _ = self.purge_room(&cid).await;
+            }
+        }
+    }
+
     /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). The `bind:`
     /// capability is checked by the channel, so a node cannot offer what the log does
     /// not let it offer.
@@ -9784,7 +10101,7 @@ impl Node {
             let next: std::collections::BTreeSet<Digest32> = trusted
                 .iter()
                 .copied()
-                .filter(|fp| ch.is_author(fp))
+                .filter(|fp| ch.is_member(fp))
                 .collect();
             let slot = self
                 .reachers
@@ -9979,6 +10296,7 @@ impl Node {
                 local_name: None,
                 open: false,
                 entries: 0,
+                over: None,
             })
             .collect();
         // A headless node is networked before its first view is published, and a
@@ -10118,6 +10436,7 @@ impl Node {
                             local_name: None,
                             open: true,
                             entries: 0,
+                            over: None,
                         }),
                 },
                 None => ChannelSummary {
@@ -10125,6 +10444,7 @@ impl Node {
                     local_name: None,
                     open: false,
                     entries: 0,
+                    over: None,
                 },
             });
         }
@@ -10371,6 +10691,15 @@ fn fault_of(e: &Error) -> Fault {
         Error::MalformedGovernance("only the room's admin may set its retention") => {
             Fault::NotAdmin
         }
+        // A room's lifecycle (V030-08): said as what it is, not as an internal fault.
+        Error::Profile("this room has ended") => Fault::RoomEnded,
+        Error::Profile(
+            "this identity has left the room" | "this identity has already left the room",
+        ) => Fault::LeftRoom,
+        Error::Profile(
+            "only the room's creator may end it"
+            | "only the room's creator may choose its idle end",
+        ) => Fault::NotCreator,
         Error::Storage { .. } | Error::Path { .. } => Fault::Storage,
         // A join refused before the challenge (the responder does not hold that
         // channel open) reaches the joiner as a malformed exchange; report it as the

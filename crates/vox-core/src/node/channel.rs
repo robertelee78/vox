@@ -458,6 +458,31 @@ pub enum Accepted {
     Checkpoint,
 }
 
+/// Why a room is over (V030-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomEnd {
+    /// Its creator ended it for everyone.
+    ByCreator,
+    /// Nothing was said in it for the idle end its creator chose.
+    Idle {
+        /// The idle end, in seconds.
+        idle_secs: u64,
+    },
+}
+
+impl std::fmt::Display for RoomEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoomEnd::ByCreator => f.write_str("its creator ended it"),
+            RoomEnd::Idle { idle_secs } => write!(
+                f,
+                "nothing was said in it for {}, the idle end its creator chose",
+                crate::node::retention::describe(*idle_secs)
+            ),
+        }
+    }
+}
+
 /// A rendered (decrypted, render-gated) message in the timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
@@ -2874,6 +2899,7 @@ impl ChannelState {
             .keys()
             .copied()
             .filter(|a| *a != me)
+            .filter(|a| !self.has_left(a))
             .filter(|a| trusted.contains(a))
             .filter(|a| !already.contains(a))
             .collect()
@@ -2895,6 +2921,7 @@ impl ChannelState {
             .readers_of(&me)
             .into_iter()
             .filter(|t| *t != me)
+            .filter(|t| !self.has_left(t))
             .filter(|t| self.delivered.get(t).is_none_or(|d| *d < current))
             .collect()
     }
@@ -3273,7 +3300,7 @@ impl ChannelState {
         let readers = MembershipView::new(&self.evaluator).readers_of(&me);
         self.history
             .iter()
-            .filter(|(t, _)| **t != me && readers.contains(*t))
+            .filter(|(t, _)| **t != me && readers.contains(*t) && !self.has_left(t))
             .map(|(t, f)| (*t, *f))
             .collect()
     }
@@ -4897,6 +4924,14 @@ impl ChannelState {
                 "this identity is not an author of the channel",
             ));
         }
+        // An ended room takes no new message, and a member that left says nothing more
+        // (V030-08). The actor says which to the person; this is the backstop.
+        if self.ended(now_millis).is_some() {
+            return Err(Error::Profile("this room has ended"));
+        }
+        if self.has_left(&me) {
+            return Err(Error::Profile("this identity has left the room"));
+        }
         let content = Content::text(now_millis, text)?;
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
@@ -5077,10 +5112,116 @@ impl ChannelState {
         &self.timeline
     }
 
-    /// Known authors (M13: the creator), in fingerprint order.
+    /// The room's members, in fingerprint order: its admitted authors, less every one that has
+    /// left (V030-08). A member that left stays an author — its entries are still the room's
+    /// history — but it is nobody this node syncs with, delivers to or dials.
     #[must_use]
     pub fn members(&self) -> Vec<Digest32> {
-        self.authors.keys().copied().collect()
+        self.authors
+            .keys()
+            .filter(|a| !self.has_left(a))
+            .copied()
+            .collect()
+    }
+
+    /// Whether `fingerprint` is a member: an admitted author that has not left (V030-08).
+    #[must_use]
+    pub fn is_member(&self, fingerprint: &Digest32) -> bool {
+        self.is_author(fingerprint) && !self.has_left(fingerprint)
+    }
+
+    /// The members' keys (see [`Self::members`]), in fingerprint order.
+    #[must_use]
+    pub fn member_keys(&self) -> Vec<CompositePublicKey> {
+        self.authors
+            .iter()
+            .filter(|(a, _)| !self.has_left(a))
+            .map(|(_, k)| k.clone())
+            .collect()
+    }
+
+    /// Whether `who` has left this room, by its own signed leave (V030-08).
+    #[must_use]
+    pub fn has_left(&self, who: &Digest32) -> bool {
+        self.evaluator.lifecycle().departed.contains_key(who)
+    }
+
+    /// Whether this room is over, and why (V030-08): its creator ended it, or the idle end its
+    /// creator chose has run out — no entry for that long, by the room's own clock, at `now_ms`.
+    #[must_use]
+    pub fn ended(&self, now_ms: u64) -> Option<RoomEnd> {
+        let lifecycle = self.evaluator.lifecycle();
+        if lifecycle.ended_by.is_some() {
+            return Some(RoomEnd::ByCreator);
+        }
+        let idle = lifecycle.idle_end_secs?;
+        let last = self
+            .dag
+            .newest_clock()
+            .unwrap_or_else(|| self.created().saturating_mul(1_000));
+        let at = last.saturating_add(idle.saturating_mul(1_000));
+        (now_ms >= at).then_some(RoomEnd::Idle { idle_secs: idle })
+    }
+
+    /// The idle end this room's creator chose, in seconds, if any (V030-08).
+    #[must_use]
+    pub fn idle_end(&self) -> Option<u64> {
+        self.evaluator.lifecycle().idle_end_secs
+    }
+
+    /// Leave the room (V030-08): append this identity's signed leave. The other members stop
+    /// syncing with it and delivering to it once they hold it. Leaving twice is refused.
+    pub fn leave(&mut self, profile: &Profile, now_secs: u64) -> Result<Digest32> {
+        let signer = profile.signer()?;
+        if self.has_left(&signer.fingerprint()) {
+            return Err(Error::Profile("this identity has already left the room"));
+        }
+        let fact = crate::governance::lifecycle::RoomLifecycle::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            crate::governance::lifecycle::LifecycleKind::Leave,
+        )?;
+        self.append_governance(profile, &fact.to_wire(), now_secs)
+    }
+
+    /// End the room for everyone (V030-08). Only its creator may: anyone else is refused here
+    /// rather than writing an entry every other node would ignore.
+    pub fn end(&mut self, profile: &Profile, now_secs: u64) -> Result<Digest32> {
+        let signer = profile.signer()?;
+        if signer.fingerprint() != self.evaluator.root_admin() {
+            return Err(Error::Profile("only the room's creator may end it"));
+        }
+        let fact = crate::governance::lifecycle::RoomLifecycle::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            crate::governance::lifecycle::LifecycleKind::End,
+        )?;
+        self.append_governance(profile, &fact.to_wire(), now_secs)
+    }
+
+    /// Choose the room's idle end (V030-08): it ends after `idle_secs` with nothing said in it.
+    /// Only its creator may, and `vox room create` is where it does.
+    pub fn choose_idle_end(
+        &mut self,
+        profile: &Profile,
+        idle_secs: u64,
+        now_secs: u64,
+    ) -> Result<Digest32> {
+        let signer = profile.signer()?;
+        if signer.fingerprint() != self.evaluator.root_admin() {
+            return Err(Error::Profile(
+                "only the room's creator may choose its idle end",
+            ));
+        }
+        let fact = crate::governance::lifecycle::RoomLifecycle::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            crate::governance::lifecycle::LifecycleKind::IdleEnd(idle_secs),
+        )?;
+        self.append_governance(profile, &fact.to_wire(), now_secs)
     }
 
     /// Number of accepted log entries.

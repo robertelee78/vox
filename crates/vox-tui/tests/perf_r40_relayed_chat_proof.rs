@@ -267,7 +267,7 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms
             .iter()
-            .map(|(id, _, _)| *id)
+            .map(|(id, _, _, _)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(&room))
             .expect("the room on bob's node"),
         other => panic!("rooms: {other:?}"),

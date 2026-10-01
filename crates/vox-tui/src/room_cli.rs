@@ -77,8 +77,10 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
     })
 }
 
-/// Ask the node for its rooms, as `(id, local name, open)`.
-async fn rooms_of(client: &mut IpcClient) -> Result<Vec<(Digest32, String, bool)>, AppError> {
+/// Ask the node for its rooms, as `(id, local name, open, over)`.
+async fn rooms_of(
+    client: &mut IpcClient,
+) -> Result<Vec<(Digest32, String, bool, String)>, AppError> {
     match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
@@ -164,12 +166,12 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
             "this node holds no rooms yet — join or create one first".into(),
         ));
     }
-    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
+    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _)| *id).collect();
     let id = resolve_prefix(prefix, &ids)?;
     // A closed room's name is sealed in its manifest, so a node that has not opened it does
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
     // Named by the id the operator typed a prefix of, and by its name only when there is one.
-    if let Some((_, name, false)) = rooms.iter().find(|(r, _, _)| *r == id) {
+    if let Some((_, name, false, _)) = rooms.iter().find(|(r, _, _, _)| *r == id) {
         let which = if name.is_empty() {
             format!("room {}", b32_encode(&id))
         } else {
@@ -205,12 +207,17 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
         println!("no rooms");
         return Ok(());
     }
-    for (id, name, open) in rooms {
+    for (id, name, open, over) in rooms {
         println!(
-            "{}  {}{}",
+            "{}  {}{}{}",
             short(&id),
             if name.is_empty() { "(unnamed)" } else { &name },
-            if open { "" } else { "  [closed]" }
+            if open { "" } else { "  [closed]" },
+            if over.is_empty() {
+                String::new()
+            } else {
+                format!("  [{over}]")
+            }
         );
     }
     Ok(())
@@ -2557,9 +2564,33 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
 ///
 /// # Errors
 /// If the node cannot be reached or the create is refused.
-pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
+pub async fn create(
+    paths: &Paths,
+    local_name: &str,
+    idle_end: Option<&str>,
+) -> Result<(), AppError> {
+    // Checked before anything is made: a typo must not leave a room with no idle end behind.
+    let idle_secs = match idle_end {
+        None => None,
+        Some(text) => match vox_core::node::retention::parse_duration(text) {
+            Some(s) if s > 0 => Some(s),
+            _ => {
+                return Err(AppError::Usage(format!(
+                    "{text:?} is not an idle end: use 1h, 1w, 1m (a month), or a number of seconds"
+                )))
+            }
+        },
+    };
     let passphrase = passphrase_from_stdin("a passphrase for the new room")?;
     let mut client = attach(paths).await?;
+    let before: Vec<Digest32> = match idle_secs {
+        Some(_) => rooms_of(&mut client)
+            .await?
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect(),
+        None => Vec::new(),
+    };
     match client
         .request(&Request::Create {
             local_name: local_name.to_owned(),
@@ -2569,6 +2600,40 @@ pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
     {
         Ok(Frame::Ok) => {
             println!("vox: created {local_name}");
+            if let Some(idle_secs) = idle_secs {
+                let made = rooms_of(&mut client)
+                    .await?
+                    .into_iter()
+                    .map(|(id, _, _, _)| id)
+                    .find(|id| !before.contains(id))
+                    .ok_or_else(|| {
+                        AppError::Usage(
+                            "the room was created, but this node does not list it, so its idle                              end was not set"
+                                .into(),
+                        )
+                    })?;
+                match client
+                    .request(&Request::IdleEnd {
+                        channel_id: made,
+                        idle_secs,
+                    })
+                    .await
+                {
+                    Ok(Frame::Ok) => println!(
+                        "     it ends by itself after {} with nothing said in it",
+                        vox_core::node::retention::describe(idle_secs)
+                    ),
+                    Ok(Frame::Error { reason }) => {
+                        return Err(AppError::Usage(format!(
+                            "the room was created, but its idle end was not set: {reason}"
+                        )))
+                    }
+                    Ok(other) => {
+                        return Err(AppError::Usage(format!("unexpected reply: {other:?}")))
+                    }
+                    Err(e) => return Err(AppError::Usage(e.to_string())),
+                }
+            }
             println!("     `vox room list` shows its id; that id is what agents pass as --room");
             Ok(())
         }
@@ -2825,4 +2890,124 @@ pub async fn print_identity(paths: &Paths) -> Result<(), AppError> {
     // The whole fingerprint, alone on the line, so it pipes and pastes without editing.
     println!("{}", vox_core::node::link::b32_encode(&me));
     Ok(())
+}
+
+/// Find a room by prefix among every room this node holds, closed ones too.
+async fn any_room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
+    let ids: Vec<Digest32> = rooms_of(client)
+        .await?
+        .into_iter()
+        .map(|(id, _, _, _)| id)
+        .collect();
+    if ids.is_empty() {
+        return Err(AppError::Usage("this node holds no rooms".into()));
+    }
+    resolve_prefix(prefix, &ids)
+}
+
+/// `vox room leave` — leave a room (V030-08).
+///
+/// # Errors
+/// An unreachable node, an unknown or closed room, or a room this identity already left.
+pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client.request(&Request::Leave { channel_id }).await {
+        Ok(Frame::Ok) => {
+            println!("vox: left {}", short(&channel_id));
+            println!(
+                "     the other members stop syncing with this node once they have it; this node \
+                 passes it on, then goes quiet in the room"
+            );
+            println!("     what was said stays readable here until `vox room forget`");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot leave: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox room end` — end a room for everyone; its creator only (V030-08).
+///
+/// # Errors
+/// An unreachable node, an unknown or closed room, an ended room, or a caller who did not
+/// create it.
+pub async fn end(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client.request(&Request::End { channel_id }).await {
+        Ok(Frame::Ok) => {
+            println!("vox: ended {} for everyone", short(&channel_id));
+            println!(
+                "     every member's node takes no new message in it once it has this; what was \
+                 said stays readable until each forgets the room"
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot end: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox room forget` — delete everything this node holds of a room (V030-08), and the read
+/// cursors agent sessions kept for it here.
+///
+/// # Errors
+/// An unreachable node, an unknown room, or a closed room this identity has not left.
+pub async fn forget(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = any_room_of(&mut client, room).await?;
+    let name = rooms_of(&mut client)
+        .await?
+        .into_iter()
+        .find(|(id, _, _, _)| *id == channel_id)
+        .map(|(_, name, _, _)| name)
+        .unwrap_or_default();
+    match client.request(&Request::Forget { channel_id }).await {
+        Ok(Frame::Ok) => {
+            let cursors = forget_cursors(paths, &channel_id, &name);
+            println!("vox: forgot {}", short(&channel_id));
+            println!(
+                "     nothing of it is left on this node{}",
+                if cursors > 0 {
+                    format!(", and {cursors} read cursor(s) kept for it were deleted")
+                } else {
+                    String::new()
+                }
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot forget: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// Delete the read cursors (and held-claim records) agent sessions kept for a room: each is
+/// filed under the room as the session named it — its id, a prefix of it of 8 characters or
+/// more, or its local name. Returns how many went.
+fn forget_cursors(paths: &Paths, channel_id: &Digest32, name: &str) -> usize {
+    let id = b32_encode(channel_id);
+    let names_it = |file: &str| -> bool {
+        let Some((room, _session)) = file.split_once('-') else {
+            return false;
+        };
+        (room.len() >= 8 && id.starts_with(room))
+            || (!name.is_empty() && file.starts_with(&format!("{name}-")))
+    };
+    let mut gone = 0usize;
+    for dir in [paths.cursor_dir(), paths.cursor_dir().join("held")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let file = e.file_name().to_string_lossy().into_owned();
+            if e.path().is_file() && names_it(&file) && std::fs::remove_file(e.path()).is_ok() {
+                gone += 1;
+            }
+        }
+    }
+    gone
 }

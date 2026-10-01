@@ -1043,6 +1043,9 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
         "NoSuchForward" => Fault::NoSuchForward,
         "NotAdmin" => Fault::NotAdmin,
         "RoomFromBeforeV030" => Fault::RoomFromBeforeV030,
+        "RoomEnded" => Fault::RoomEnded,
+        "LeftRoom" => Fault::LeftRoom,
+        "NotCreator" => Fault::NotCreator,
         "Internal" => Fault::Internal,
         _ => return None,
     })

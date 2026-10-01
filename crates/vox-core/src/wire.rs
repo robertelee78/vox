@@ -83,11 +83,14 @@ pub enum StructTag {
     /// member and posted to the room's log, so any member that replicates the log carries it
     /// to a recipient who is never online with its sender.
     KeyPackage = 0x0016,
+    /// `0x0017` — room lifecycle (V030-08): a member leaving, the creator ending the room for
+    /// everyone, or the creator's chosen idle end.
+    RoomLifecycle = 0x0017,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 22] = [
+    pub const ALL: [StructTag; 23] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -110,6 +113,7 @@ impl StructTag {
         StructTag::JoinWitness,
         StructTag::Checkpoint,
         StructTag::KeyPackage,
+        StructTag::RoomLifecycle,
     ];
 
     /// The 2-byte tag value.
@@ -120,7 +124,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 22-element table: trivial and avoids an
+        // Linear scan over a 23-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -156,6 +160,7 @@ impl StructTag {
             StructTag::JoinWitness => "vox/join-witness/v1",
             StructTag::Checkpoint => "vox/checkpoint/v1",
             StructTag::KeyPackage => "vox/key-package/v1",
+            StructTag::RoomLifecycle => "vox/room-lifecycle/v1",
         }
     }
 }

@@ -91,6 +91,13 @@ impl PendingConsents {
         self.entries.remove(&(*channel_id, *target)).is_some()
     }
 
+    /// A room was forgotten (V030-08): forget every pending consent in it.
+    pub fn forget_room(&mut self, channel_id: &Digest32) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|(room, _), _| room != channel_id);
+        self.entries.len() != before
+    }
+
     /// `target` was removed from the keyring: forget every pending consent to it, in every room.
     pub fn forget(&mut self, target: &Digest32) -> bool {
         let before = self.entries.len();
