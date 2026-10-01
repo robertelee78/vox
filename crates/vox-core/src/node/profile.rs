@@ -83,6 +83,12 @@ impl Profile {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
+        // **One creation at a time per profile** (V210-91). Two `vox id`s started together
+        // both saw no vault, and the second moved the first's store aside and renamed its own
+        // vault over the first's: both printed a fingerprint, and one of them was gone. The
+        // directory is locked across the whole create, so the check below and the files it
+        // guards are one step; whoever comes second finds the vault and is refused.
+        let _creating = lock_dir(&paths.profile_dir)?;
         if Self::exists(&paths) {
             return Err(Error::Profile("identity already exists in this profile"));
         }
@@ -363,6 +369,21 @@ impl Profile {
     pub fn paths(&self) -> &Paths {
         &self.paths
     }
+}
+
+/// Take an exclusive lock on the directory `dir`, waiting for any other holder; it is
+/// released when the returned handle drops (or the process exits, however it exits).
+///
+/// The directory itself is locked rather than a lock file beside the vault, so creating a
+/// profile leaves no file behind that is not the profile's own.
+fn lock_dir(dir: &std::path::Path) -> Result<std::fs::File> {
+    let fail = |e: std::io::Error| Error::Path {
+        op: "lock the profile to create its identity",
+        detail: format!("{}: {e}", dir.display()),
+    };
+    let handle = std::fs::File::open(dir).map_err(fail)?;
+    handle.lock().map_err(fail)?;
+    Ok(handle)
 }
 
 /// An owned passphrase check (see [`Profile::passphrase_verifier`]).
