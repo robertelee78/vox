@@ -150,8 +150,10 @@ function sweep(own) {
       if (!so.isSocket() || Date.now() - so.mtimeMs < SWEEP_MIN_AGE_MS) continue
       const probe = connect(sock)
       probe.on("connect", () => probe.destroy())
+      // Node says ECONNREFUSED; OpenCode's Bun says ENOENT for a socket file that is
+      // there with nobody listening (measured, 1.18.34).
       probe.on("error", (e) => {
-        if (e?.code !== "ECONNREFUSED") return
+        if (e?.code !== "ECONNREFUSED" && e?.code !== "ENOENT") return
         try {
           unlinkSync(sock)
           rmdirSync(dir)
