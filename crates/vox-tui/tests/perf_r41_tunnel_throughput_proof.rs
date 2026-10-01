@@ -1126,8 +1126,9 @@ const SHARED_KEEP: f64 = 0.90;
 /// carried 0.0 Mbit/s there and left the flow its whole rate).
 const SHARED_VOX_FLOOR: f64 = 0.5;
 /// How long each half of the lossy shared arm (the Cubic flow alone, then both) is judged: long
-/// enough that a loss-limited flow's mean is steady to a few percent.
-const SHARED_MEASURE: Duration = Duration::from_secs(30);
+/// enough that a loss-limited flow's mean is steady to a few percent. At 30 s, Cubic beside Cubic
+/// read 89.8% of its solo rate on the 6% link, with the link far from full.
+const SHARED_MEASURE: Duration = Duration::from_secs(60);
 const CONGESTED_LAN: Link = Link {
     name: "congested LAN-like, 400 Mbit/s, 2 ms RTT, 1-BDP queue, shared with a Cubic flow",
     bits_per_sec: 4e8,
