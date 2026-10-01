@@ -86,12 +86,15 @@ impl Proc {
             }
             assert!(
                 !matches!(self.child.try_wait(), Ok(Some(_))),
-                "`vox app listen` exited before listening: {}",
+                "CANNOT MEASURE: staging not achieved — `vox app listen` exited before listening: {}",
                 self.said()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("the listener never registered: {}", self.said());
+        panic!(
+            "CANNOT MEASURE: staging not achieved — the listener never registered: {}",
+            self.said()
+        );
     }
 }
 
@@ -131,14 +134,16 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("CANNOT MEASURE: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("CANNOT MEASURE: vox's stdin")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("CANNOT MEASURE: write to vox's stdin");
+    let out = child
+        .wait_with_output()
+        .expect("CANNOT MEASURE: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -169,7 +174,7 @@ impl Member {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("CANNOT MEASURE: spawn vox");
         let said = Arc::new(Mutex::new(String::new()));
         drain_into(child.stderr.take(), &said);
         Proc { child, said }
@@ -178,7 +183,11 @@ impl Member {
     /// A one-shot verb that must succeed; its stdout.
     fn run(&self, argv: &[&str]) -> String {
         let (ok, out, err) = vox_once(&self.data, &args(argv));
-        assert!(ok, "{}: vox {argv:?} failed: {out}{err}", self.name);
+        assert!(
+            ok,
+            "CANNOT MEASURE: staging not achieved — {}: vox {argv:?} failed: {out}{err}",
+            self.name
+        );
         out
     }
 
@@ -190,13 +199,30 @@ impl Member {
     /// The node's own report, `vox status --json`.
     fn status(&self) -> Value {
         let out = self.run(&["status", "--json"]);
-        serde_json::from_str(&out)
-            .unwrap_or_else(|e| panic!("{}: status did not parse ({e}): {out}", self.name))
+        serde_json::from_str(&out).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: {}'s `vox status --json` did not parse ({e}): {out}",
+                self.name
+            )
+        })
     }
 
     /// The app layer's counters from `vox status --json`.
     fn app(&self) -> App {
         App(self.status()["app"].clone())
+    }
+
+    /// The same counters, or what `vox status --json` said when it gave none. For a case
+    /// whose claim is that the node keeps answering, so a node that stops answering is
+    /// that claim's red, not the scene's.
+    fn try_app(&self) -> Result<App, String> {
+        let (ok, out, err) = vox_once(&self.data, &args(&["status", "--json"]));
+        if !ok {
+            return Err(format!("`vox status --json` failed: {out}{err}"));
+        }
+        let v: Value = serde_json::from_str(&out)
+            .map_err(|e| format!("`vox status --json` did not parse ({e}): {out}"))?;
+        Ok(App(v["app"].clone()))
     }
 }
 
@@ -209,7 +235,7 @@ impl App {
         self.0
             .get(k)
             .and_then(Value::as_u64)
-            .unwrap_or_else(|| panic!("the status report has no app.{k}: {}", self.0))
+            .unwrap_or_else(|| panic!("PRODUCT: the status report has no app.{k}: {}", self.0))
     }
 
     /// App streams handed to a listening program. The report does not print this count;
@@ -233,11 +259,14 @@ impl std::fmt::Debug for App {
 /// `vox daemon` serving it that answers `vox room list`.
 fn member(tmp: &Path, name: &str) -> Member {
     let data = tmp.join(name);
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("CANNOT MEASURE: a profile directory");
     let pass = tmp.join("identity-passphrase");
-    std::fs::write(&pass, IDENTITY).unwrap();
+    std::fs::write(&pass, IDENTITY).expect("CANNOT MEASURE: the passphrase file");
     let (ok, out, err) = vox_once(&data, &args(&["id"]));
-    assert!(ok, "{name}: vox id: {out}{err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging not achieved — {name}: vox id: {out}{err}"
+    );
     let fp = out.trim().to_owned();
     let mut daemon = VoxProc::spawn(
         name,
@@ -247,7 +276,7 @@ fn member(tmp: &Path, name: &str) -> Member {
             "--listen",
             "127.0.0.1:0",
             "--passphrase-file",
-            pass.to_str().unwrap(),
+            pass.to_str().expect("CANNOT MEASURE: a UTF-8 path"),
         ]),
     );
     let until = Instant::now() + SETUP;
@@ -263,7 +292,7 @@ fn member(tmp: &Path, name: &str) -> Member {
         std::thread::sleep(Duration::from_millis(250));
     }
     panic!(
-        "{name}'s daemon never answered `vox room list`:\n{}",
+        "CANNOT MEASURE: staging not achieved — {name}'s daemon never answered `vox room list`:\n{}",
         daemon.transcript()
     );
 }
@@ -275,7 +304,11 @@ fn join(who: &Member, link: &str) {
         &["room", "join", link, "--name", "calls"],
         ROOM_PASS,
     );
-    assert!(ok, "{} joins: {out}{err}", who.name);
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging not achieved — {} joins: {out}{err}",
+        who.name
+    );
 }
 
 /// A room alice created and bob joined, each on its own daemon. Nobody trusts anybody
@@ -289,7 +322,7 @@ struct Scene {
 }
 
 fn scene() -> Scene {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("CANNOT MEASURE: a temporary directory");
     let alice = member(tmp.path(), "alice");
     let bob = member(tmp.path(), "bob");
     let (ok, out, err) = vox_in(
@@ -297,13 +330,18 @@ fn scene() -> Scene {
         &["room", "create", "--name", "calls"],
         ROOM_PASS,
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging not achieved — vox room create: {out}{err}"
+    );
     let list = alice.run(&["room", "list"]);
     let room = list
         .lines()
         .find(|l| l.contains("calls"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("the room is not listed: {list}"))
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: staging not achieved — the room is not listed: {list}")
+        })
         .to_owned();
     let link = alice.run(&["room", "invite", &room]).trim().to_owned();
     join(&bob, &link);
@@ -813,6 +851,17 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
 /// The listener that never accepts is a real `vox app listen`, suspended (`SIGSTOP`, a
 /// person's Ctrl-Z) once it is listening: its node announces every stream to it and none
 /// is ever taken. The 200 are 200 `vox app open` processes, started together.
+///
+/// **Reds.** The scene (the room, the trust, the listener, its suspension, alice's `vox room
+/// tail`) failing is CANNOT MEASURE. Everything after the 200 opens start is PRODUCT: the
+/// message arriving late or not at all, alice's node no longer answering `vox status`, the
+/// 200 not reaching alice's gate, and the per-peer limit's counts. The message is asserted
+/// first, so a node starved by app streams reds on the claim itself, with the counts of the
+/// app streams it was starved by.
+///
+/// Mutation-checked (V030-07): serving each inbound app stream on alice's actor, awaited, in
+/// place of a task of its own lets 16 stalled streams hold the actor for 5 s each, and this
+/// case goes red on the message.
 #[test]
 #[ignore = "real vox daemons and 200 app streams; CI runs it in release"]
 fn stalled_app_streams_do_not_hold_up_a_room_message() {
@@ -825,7 +874,7 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
         .args(["-STOP", &never.child.id().to_string()])
         .status()
         .is_ok_and(|st| st.success());
-    assert!(ok, "kill -STOP the listener");
+    assert!(ok, "CANNOT MEASURE: kill -STOP the listener");
     // What alice sees arrive, as a person watching the room would.
     let mut tail = VoxProc::spawn(
         "alice-tail",
@@ -833,6 +882,12 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
         &args(&["room", "tail", &s.room]),
     );
     std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        matches!(tail.child.try_wait(), Ok(None)),
+        "CANNOT MEASURE: staging not achieved — alice's `vox room tail` ended before the \
+         opens: {}",
+        tail.transcript()
+    );
 
     let open_count: usize = 200;
     let started = Instant::now();
@@ -842,12 +897,17 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
     let spawned = started.elapsed();
     // Once all 200 have reached alice's gate. If the app streams were holding the
     // connection's stream slots, they would also hold up their own arrival, and this
-    // would not come.
+    // would not come. A `vox status` that fails here is recorded, not a red yet: the
+    // message is the claim, and it is asserted first.
     let until = Instant::now() + Duration::from_secs(10);
-    let mut at_post = s.alice.app();
-    while at_post.n("inbound") < open_count as u64 && Instant::now() < until {
+    let mut at_post = s.alice.try_app();
+    while at_post
+        .as_ref()
+        .map_or(true, |a| a.n("inbound") < open_count as u64)
+        && Instant::now() < until
+    {
         std::thread::sleep(Duration::from_millis(20));
-        at_post = s.alice.app();
+        at_post = s.alice.try_app();
     }
     let arrived_after = started.elapsed();
     let sent = Instant::now();
@@ -855,7 +915,7 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
     let arrived = tail
         .line_within(Duration::from_secs(10), |l| l.contains("still here"))
         .map(|_| sent.elapsed());
-    let still_waiting = s.alice.app();
+    let still_waiting = s.alice.try_app();
     // Every opener ends: refused busy, or refused once nobody accepted in time.
     let mut outcomes = std::collections::BTreeMap::<String, usize>::new();
     for o in &mut opens {
@@ -870,16 +930,19 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
         };
         *outcomes.entry(key).or_default() += 1;
     }
-    let end = s.alice.app();
+    let end = s.alice.try_app();
+    let counts = |a: &Result<App, String>| match a {
+        Ok(a) => format!("{a:?} (announced {})", a.announced()),
+        Err(e) => format!("no answer: {e}"),
+    };
     eprintln!(
-        "200 opens spawned in {spawned:?}, all at alice's gate after {arrived_after:?}; the \
-         message crossed in {arrived:?}; alice at the post {at_post:?} (announced {}); while \
-         waiting {still_waiting:?}; at the end {end:?} (announced {}); the 200 opens ended \
-         as {outcomes:?}",
-        at_post.announced(),
-        end.announced()
+        "{open_count} opens spawned in {spawned:?}; the gate wait ended after \
+         {arrived_after:?}; the message crossed in {arrived:?}\nalice at the post: {}\nwhile \
+         waiting: {}\nat the end: {}\nthe {open_count} opens ended as {outcomes:?}",
+        counts(&at_post),
+        counts(&still_waiting),
+        counts(&end),
     );
-    let took = arrived.expect("the room message must arrive at all");
     // One actor tick plus half a second. A local append is pushed within one tick
     // (`TICK`, 1 s) by design, so even with no app streams at all a message takes
     // anywhere from ~30 ms to ~1.03 s here (measured, three runs). ADR-022's "under
@@ -889,22 +952,42 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
     // **Temporary.** The tick is itself a defect against PRD-001 R40 (a chat message
     // arrives in under 1 s). When R40's fix to the sync scheduling lands, this bound
     // returns to 1 s.
+    let took = arrived.unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: a room message from bob never reached alice's `vox room tail` within 10 s \
+             while {open_count} app streams were opened to her stalled listener; alice at the \
+             post: {}; at the end: {}\nalice's tail said:\n{}",
+            counts(&at_post),
+            counts(&end),
+            tail.transcript()
+        )
+    });
     assert!(
         took < Duration::from_millis(1500),
-        "a room message took {took:?} behind 200 stalled app streams"
+        "PRODUCT: a room message took {took:?} behind {open_count} stalled app streams; alice \
+         at the post: {}",
+        counts(&at_post)
     );
+    let answered = |a: Result<App, String>, when: &str| {
+        a.unwrap_or_else(|e| {
+            panic!("PRODUCT: alice's node did not answer `vox status` {when}: {e}")
+        })
+    };
+    let at_post = answered(at_post, "while the app streams waited");
+    let end = answered(end, "once the opens had ended");
     assert_eq!(
         at_post.n("inbound"),
         200,
-        "all 200 app streams must have reached alice's gate before the message: {at_post:?}"
+        "PRODUCT: all 200 app streams must have reached alice's gate before the message: \
+         {at_post:?}"
     );
     assert!(
         at_post.announced() > at_post.n("refused_unaccepted") + at_post.n("accepted"),
-        "some app streams must still be waiting when the message is sent: {at_post:?}"
+        "PRODUCT: some app streams must still be waiting when the message is sent: {at_post:?}"
     );
     assert!(
         end.announced() <= 16 && end.n("refused_busy") >= 184,
-        "at most 16 may wait on one peer's behalf, the rest refused busy: {end:?}"
+        "PRODUCT: at most 16 may wait on one peer's behalf, the rest refused busy: {end:?}"
     );
     assert_eq!(
         (
@@ -913,16 +996,17 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
             end.n("accepted")
         ),
         (0, 0, 0),
-        "every stream was trusted, found the listener, and none was accepted: {end:?}"
+        "PRODUCT: every stream was trusted, found the listener, and none was accepted: {end:?}"
     );
     assert_eq!(
         end.announced() + end.n("refused_busy"),
         200,
-        "every one of the 200 accounted for: {end:?}"
+        "PRODUCT: every one of the 200 accounted for: {end:?}"
     );
+    // Every opener is to end, refused busy or refused unaccepted: none may hang.
     assert_eq!(
-        outcomes.values().sum::<usize>(),
-        200,
-        "every opener accounted for: {outcomes:?}"
+        outcomes.get("still running"),
+        None,
+        "PRODUCT: every `vox app open` must end within 30 s of the message: {outcomes:?}"
     );
 }
