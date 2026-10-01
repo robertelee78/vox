@@ -261,8 +261,15 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
             .collect();
         v.sort_by_key(|x| {
             (
-                x["created_millis"].as_u64().unwrap(),
-                x["entry_hash"].as_str().unwrap().to_owned(),
+                x["created_millis"].as_u64().unwrap_or_else(|| {
+                    panic!("PRODUCT: a row of `room read --json` has no created_millis: {x}")
+                }),
+                x["entry_hash"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("PRODUCT: a row of `room read --json` has no entry_hash: {x}")
+                    })
+                    .to_owned(),
             )
         });
         v
@@ -279,13 +286,19 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         failed3.ok,
         "PRODUCT: the holder's `failed` was refused: {failed3:?}"
     );
-    let first_failed = failed3.json()["entry_hash"].as_str().unwrap().to_owned();
-    let text = rows(alice, r)
+    let first_failed = failed3.json()["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: `room post --json` named no entry_hash: {failed3:?}"))
+        .to_owned();
+    let row = rows(alice, r)
         .into_iter()
         .find(|x| x["entry_hash"] == first_failed.as_str())
-        .expect("the posted `failed` is in the log")["text"]
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `room read` does not return the `failed` that `room post` accepted: {failed3:?}")
+        });
+    let text = row["text"]
         .as_str()
-        .unwrap()
+        .unwrap_or_else(|| panic!("PRODUCT: a row of `room read --json` has no text: {row}"))
         .to_owned();
     std::thread::sleep(std::time::Duration::from_millis(20)); // the copy lands later
     rt.block_on(post_raw(alice, room.cid, &text));
@@ -309,10 +322,10 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         "[proof] retried failed: first {first_failed}, copy {}; next post seeded {seeded}",
         retried[1]["entry_hash"]
     );
-    assert_eq!(
-        seeded,
-        first_failed.as_str(),
-        "PRODUCT: a retried `failed` must seed from its FIRST entry, never the duplicate"
+    assert!(
+        seeded == first_failed.as_str(),
+        "PRODUCT: a retried `failed` must seed from its FIRST entry {first_failed}, never the \
+         duplicate; the next post seeded {seeded}"
     );
 
     let void = post_as(
@@ -334,15 +347,20 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         void.ok,
         "PRODUCT: the holder's `failed` was refused: {void:?}"
     );
-    let mut racing = vox_agentcomms::envelope::Envelope::parse(
-        rows(alice, r)
-            .into_iter()
-            .find(|x| x["entry_hash"] == void.json()["entry_hash"])
-            .expect("the posted `failed` is in the log")["text"]
-            .as_str()
-            .unwrap(),
-    )
-    .expect("the posted `failed` parses");
+    let row = rows(alice, r)
+        .into_iter()
+        .find(|x| x["entry_hash"] == void.json()["entry_hash"])
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `room read` does not return the `failed` that `room post` accepted: {void:?}")
+        });
+    let text = row["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: a row of `room read --json` has no text: {row}"));
+    let mut racing = vox_agentcomms::envelope::Envelope::parse(text).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT: `room post` wrote a `failed` its own envelope parser refuses ({e}): {text}"
+        )
+    });
     racing.body = "failed: disk full".into();
     racing.data["reason"] = "disk full".into();
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -365,10 +383,9 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         "[proof] void failed: {} and {}; next post seeded {seeded}",
         voided[0]["entry_hash"], voided[1]["entry_hash"]
     );
-    assert_eq!(
-        seeded,
-        first_failed.as_str(),
+    assert!(
+        seeded == first_failed.as_str(),
         "PRODUCT: a `failed` whose operation is void must seed nothing: the id stays the last \
-         real failure's"
+         real failure's, {first_failed}; the next post seeded {seeded}"
     );
 }
