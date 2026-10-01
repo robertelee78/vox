@@ -3,7 +3,7 @@
 **Status**: accepted (2026-09-21) — the policy is in force from this change; the harness lands with it
 and grows per capability
 **Date**: 2026-09-21
-**Updated**: 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
+**Updated**: 2026-10-01 — "What may block a release, what is optional, what is deleted" added: a valid proof (the shipped binary, used as a person would, whose red names product or test) blocks; an optional test is opt-in, never blocks and is loud when not run; everything else, report-only checks included, is deleted. "Publish only what CI proved" amended where it allowed a report-only arm. 2026-09-26 — §6a: the 21-hour hang is found — `connect_direct`'s hot spin, reproduced on the M15.1 gate and pinned by a real-binary proof — and the watchdog now writes its stacks into the log instead of into a capture buffer an aborted process never prints. 2026-09-21 — §7 added: a green gate is not evidence — six gates were asserting the defect ADR-017 M17.6 removed, or measuring something other than their own label, and all six were passing. Earlier the same day — §6 added: a hung proof is a failing proof. Two gate processes ran 21 hours unnoticed; the in-test `tokio` timeouts cannot bound a spinning runtime, so every gate now carries a process-level watchdog that aborts (for the thread stacks) and every CI job a `timeout-minutes`. The underlying hang is unreproduced and recorded as latent. 2026-09-21 — M18.2a: `update_proof` and `install_sh_proof` landed with the distribution
 work, and the two obligations they cannot yet meet are recorded in §3's accepted-gaps table rather
 than skipped.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -804,7 +804,8 @@ and R42 is proved by RP-22/23/24 in `build-test`). Both are blocking. No proof i
 (2026-09-27): `cross_process_join_proof` runs in `build-test`, and the reporting-only `flaky-watch` job
 that held it is removed. On the macOS runner R41's WAN link is reported rather than gated
 (`VOX_PERF_REPORT_ONLY=WAN`, a decider decision); it is gated on ubuntu and on real hardware by
-`scripts/release-gate.sh`. Every `cargo test` runs `--no-fail-fast`, so one red cannot hide the rest.
+`scripts/release-gate.sh`. **Amended 2026-10-01:** a report-only arm is not permitted ("What may block a release, what is
+optional, what is deleted"); this one is to become blocking or opt-in. Every `cargo test` runs `--no-fail-fast`, so one red cannot hide the rest.
 
 **Re-running.** If CI on the tagged commit fails and a re-run of that CI run passes, re-run the
 release workflow (its `ci-passed` job reads the run's latest conclusion). Nothing is re-tagged.
@@ -883,6 +884,58 @@ starts a node in-process (checked: no `Node::spawn`, `NodeHandle` or `Node::star
 in a proxy for what a person sees. A proof that needs an instrument (the R41 link emulator) keeps the
 instrument honest in its own output, and a CANNOT MEASURE names its cause. Helpers shared by real
 proofs (`support/watchdog.rs`, `support/raw_sync.rs`) stay.
+
+## What may block a release, what is optional, what is deleted (2026-10-01)
+
+**Decision (the decider, 2026-10-01).** This sharpens "Only real use of the product is a test" into
+three classes, so that every test in the tree is exactly one of them. In the decider's words:
+
+- "I am religiously opposed to unit tests/gates in principle because they're worthless."
+- "gates that increase CI without proving a product/feature actually works for a user, invalid";
+  "yet we still build bullshit tests".
+- "If I cannot tell the difference between a broken product and a broken test, it's not a valid
+  test."
+- "Valid proofs block; rest optional."
+- "spike tests are valid"; "optional tests are valid".
+- On report-only, informational and warning checks: "you know how I feel about fake tests."
+
+**Why.** The previous section removed tests that never ran the binary. The tests that remained still
+included some whose reds could not say which side had failed, and checks that ran in CI without the
+power to block anything. The gate audit of 2026-10-01 (`docs/release/gate-audit-v0.2.10.md` on
+branch `docs/gate-audit-v0.2.10`) found 5 of 157 blocking tests valid by that measure, 130 fixable
+and 22 invalid. A check that cannot block and a red that cannot be attributed both cost time and
+prove nothing a person depends on.
+
+**The three classes.**
+
+1. **A valid proof blocks.** A test MAY block a release only if it proves a feature works **for a
+   user**: it MUST drive the shipped `vox` binary as a person would, and MUST assert what that person
+   sees or gets. Every failure path in it MUST say whether the product failed a person or the
+   apparatus failed to measure. A test whose red does not say which MUST NOT block.
+2. **An optional test is opt-in.** An optional test MUST be off unless a person asks for it, MUST
+   NOT block a release, and MUST say loudly, by name, that it did not run when it is not enabled. A
+   skipped optional test MUST NOT read as a pass (§3). A spike is valid in the same way: it MUST be
+   run and its result reported, and it MUST NOT be committed to the gate.
+3. **Everything else is deleted.** A unit test, an in-process library test, a test of an internal
+   value, and a gate that adds CI time without proving a feature works for a user MUST NOT exist in
+   the tree.
+
+**Rules that follow.**
+
+- There MUST NOT be report-only, informational or warning checks. A check either blocks as a valid
+  proof, runs as an opt-in optional test, or is deleted. Reporting a result without the power to
+  fail is a fake test.
+- A new claim SHOULD extend an existing user-journey proof rather than add a test file, because the
+  journey crosses the handoffs between commands where every defect in §1 lived.
+- A fix MUST delete the tests it makes redundant, in the same change.
+- Every proof MUST have a mutant: the product broken on purpose, under which the proof goes red **on
+  the assertion that makes its claim**. A CANNOT MEASURE is not a red and MUST NOT be counted as the
+  mutant's result (§7, and "Prove the escalation, not the refusal").
+
+**What this amends.** "Publish only what CI proved" (above) says R41's WAN link on the macOS runner
+is reported rather than gated (`VOX_PERF_REPORT_ONLY=WAN`). That is a report-only arm, which this
+section forbids; it is amended below to say so. The arm is to become a blocking proof or an opt-in
+optional one; until that change lands, CI still sets the variable.
 
 ## Links
 
