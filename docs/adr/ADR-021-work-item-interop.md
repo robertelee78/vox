@@ -727,12 +727,17 @@ that proves it.**
     `claim` by Carol succeeds.
   - **expiry**: the sender's claim had **no TTL**. The handoff's deadline still lapses, and the item is
     `Free`. A recipient's `claim` after the deadline is an ordinary claim on a free item.
+  - **order**: the two nodes log the same two claims of one item in **opposite local orders** (each
+    claims while the other's daemon is stopped, the anchor stopped with Alice's), and both boards
+    show the earlier claim holding. Precondition, else CANNOT MEASURE: `room read --json` shows the
+    two claims in different orders on the two nodes.
 
   *Mutations*:
   - restore `resolve(.., |_| None)` — "handoff did not move ownership";
   - resolve by the local petname instead of `to_fp` — the two nodes' boards must disagree;
   - inherit the holding's expiry — the no-TTL case never lapses;
-  - make a pending item return to the sender on decline.
+  - make a pending item return to the sender on decline;
+  - fold in local order instead of `(created_millis, entry_hash)` — the two boards must disagree.
 
   > **DONE 2026-09-24** (`ca267d5`). `work_handoff_proof` passes. **One change from the plan:** it runs
   > on **two nodes with five sessions**, not three nodes, because of open defect F12 (two joiners cannot
