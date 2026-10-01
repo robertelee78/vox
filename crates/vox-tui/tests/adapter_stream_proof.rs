@@ -31,7 +31,8 @@
 //!
 //! What it asserts: the union of every row the consumer emitted, after the starting
 //! cursor, **equals** the room's log after that cursor — no gap — and every duplicate
-//! is explained by a restart. Then, separately: `board --json` shows what a person expects
+//! is explained by a restart, and while one consumer runs every row synced to it is emitted
+//! **once** (V210-113). Then, separately: `board --json` shows what a person expects
 //! of the claims made through the CLI — the contested resource held by alice's session, the
 //! handed-off one by bob's, the lapsed claim gone.
 //!
@@ -447,12 +448,31 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     // LIVENESS, not just completeness: rows synced from another node must reach a
     // consumer while it runs. A stream that only delivered them after a restart would
     // still have no gap — the defect `tail` shipped with — so this is its own assertion.
-    let live = consume(&run, 200, idle, &mut cursor, &mut seen);
+    let mut live_seen: BTreeMap<String, u32> = BTreeMap::new();
+    let live = consume(&run, 200, idle, &mut cursor, &mut live_seen);
     assert_eq!(
         live, 200,
         "PRODUCT: rows synced from another node must reach a LIVE consumer, not only a \
          restarted one"
     );
+    // **ONCE each, within one run** (V210-113). The tail reads from where it last read rather
+    // than re-reading the whole room on every `Synced`, so nothing it has emitted may come
+    // again. With no restart in between, a row emitted twice in this phase, or one the
+    // consumer had already processed (up to its persisted cursor, or in this run's backlog),
+    // is the tail's own repeat.
+    let again: Vec<(&String, &u32)> = live_seen
+        .iter()
+        .filter(|(h, c)| **c > 1 || seen.contains_key(*h))
+        .collect();
+    assert!(
+        again.is_empty(),
+        "PRODUCT: one running `vox room tail` emitted {} rows it had already emitted: {:?}",
+        again.len(),
+        &again[..again.len().min(5)]
+    );
+    for (h, c) in live_seen {
+        *seen.entry(h).or_default() += c;
+    }
     kill(&mut run, &mut restarts, &cursor, &seen);
     // Run 3: stall under another synced burst, then die.
     let mut run = start(bob, &r, &cursor, &stderr);
