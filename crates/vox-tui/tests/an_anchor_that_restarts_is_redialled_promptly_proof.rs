@@ -322,19 +322,55 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     if host_too {
         // The forward holds its host, which it names as an anchor too, over the only path it has
         // to it: a circuit through the anchor about to be stopped (the families are split, so its
-        // own dials of the host find no direct candidate). It says both.
-        let said = fwd.transcript();
-        let reached = said
-            .lines()
-            .any(|l| l.contains(&format!("reached {host12}")));
-        let relayed = said
-            .lines()
-            .any(|l| l.contains(&format!("still relayed to {host12}")));
-        assert!(
-            reached && relayed,
-            "CANNOT MEASURE: the forward did not say it reached its host over the relay (reached: \
-             {reached}, still relayed: {relayed})\n{said}"
-        );
+        // own dials of the host find no direct candidate). It says it reached the host over the
+        // relay; and once it holds that connection as the host's, it stops redialling it — the
+        // last "dialling this anchor failed …; the next try is in N s" goes N s and more without a
+        // "dialling this anchor again". Until then the host is not held as an anchor and there is
+        // nothing of it for the stop to end: CANNOT MEASURE, not a verdict.
+        let about_host = format!("connection to {host12} — dialling this anchor");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let _ = fwd.transcript();
+            let timed: Vec<(Instant, String)> = fwd
+                .timed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let reached = timed
+                .iter()
+                .any(|(_, l)| l.contains(&format!("reached {host12}")));
+            let relayed = timed
+                .iter()
+                .any(|(_, l)| l.contains(&format!("still relayed to {host12}")));
+            let host_line = format!("connection to {host12} — ");
+            let last = timed.iter().rev().find(|(_, l)| {
+                l.contains(&about_host) || (l.contains(&host_line) && l.contains(CONNECTED))
+            });
+            let settled = match last {
+                None => true,
+                Some((_, l)) if l.contains(CONNECTED) => true,
+                Some((at, l)) => {
+                    // "… the next try is in N s": that try is due N s on, and did not come.
+                    let due = l
+                        .split("the next try is in ")
+                        .nth(1)
+                        .and_then(|r| r.split('s').next())
+                        .and_then(|n| n.trim().parse::<u64>().ok());
+                    due.is_some_and(|n| at.elapsed() > Duration::from_secs(n + 2))
+                }
+            };
+            if reached && relayed && settled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE: the forward never held its host as an anchor over the relay \
+                 (reached: {reached}, still relayed: {relayed}, redialling it: {})\n{}",
+                !settled,
+                fwd.transcript()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
     let before = fwd
         .transcript()
