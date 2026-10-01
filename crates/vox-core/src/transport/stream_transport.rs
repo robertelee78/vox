@@ -262,8 +262,14 @@ impl Transport for QuicStreamTransport {
         let task = self.handle.spawn(async move {
             let outcome = {
                 let work = async {
+                    #[cfg(feature = "mutant-sender")]
+                    let pace = crate::log::sync::mutant::pace();
+                    #[cfg(not(feature = "mutant-sender"))]
+                    let pace: Option<std::time::Duration> = None;
                     for f in &frames {
-                        if std::time::Instant::now() >= deadline {
+                        if let Some(gap) = pace {
+                            tokio::time::sleep(gap).await;
+                        } else if std::time::Instant::now() >= deadline {
                             break;
                         }
                         tokio::time::timeout(bound, write_frame(&mut send, f))

@@ -852,7 +852,7 @@ async fn judge(
         .open_channels
         .iter()
         .find(|d| d.channel_id == *channel_id)
-        .map_or(&[][..], |d| d.timeline.as_slice());
+        .map_or(&[][..], |d| &d.timeline[..]);
     if crate::wake::hops_left(&envelope, timeline) == 0 {
         eprintln!(
             "vox daemon: not interrupting anyone for {}: its hop budget is spent; it waits for \
@@ -1381,7 +1381,7 @@ pub fn run_daemon(
                     // someone is copied out to be judged.
                     let mut fresh = Vec::new();
                     for d in &view.open_channels {
-                        for r in &d.timeline {
+                        for r in d.timeline.iter() {
                             if seen.insert(r.entry_hash) && may_wake(&r.text) {
                                 fresh.push((d.channel_id, r.clone()));
                             }
