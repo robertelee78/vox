@@ -163,13 +163,38 @@ impl Drop for Proc {
     }
 }
 
-/// A passphrase no other run, and nothing else in the process, can hold.
+/// A passphrase no other run, and nothing else in the process, can hold — **nor any 6-byte piece
+/// of** (V210-94). Its letters come only from a rare alphabet and in no word, drawn from the clock,
+/// the process and `tag` and stirred, so two passphrases in one run share no piece: one built on a
+/// tag like `reopen-rp` and the process id matched heap text and its sibling passphrase.
 fn unique(tag: &str) -> String {
+    const ALPHABET: &[u8; 16] = b"QXJZKVWYqxjzkvwy";
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .staged()
         .as_nanos();
-    format!("{tag}-{:x}-{nanos:x}", std::process::id())
+    let mut state = (nanos as u64)
+        ^ u64::from(std::process::id()).rotate_left(32)
+        ^ tag.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
+    // splitmix64, one draw per 16 letters.
+    let mut next = || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let mut out = String::with_capacity(32);
+    for _ in 0..2 {
+        let mut word = next();
+        for _ in 0..16 {
+            out.push(char::from(ALPHABET[(word & 0xf) as usize]));
+            word >>= 4;
+        }
+    }
+    out
 }
 
 fn command(dir: &Path, args: &[&str], identity: &str) -> Command {
