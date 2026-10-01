@@ -728,20 +728,31 @@ that proves it.**
     `claim` by Carol succeeds.
   - **expiry**: the sender's claim had **no TTL**. The handoff's deadline still lapses, and the item is
     `Free`. A recipient's `claim` after the deadline is an ordinary claim on a free item.
+  - **order**: the two nodes log the same two claims of one item in **opposite local orders** (each
+    claims while the other's daemon is stopped, the anchor stopped with Alice's), and both boards
+    show the earlier claim holding. Precondition, else CANNOT MEASURE: `room read --json` shows the
+    two claims in different orders on the two nodes.
 
   *Mutations*:
   - restore `resolve(.., |_| None)` — "handoff did not move ownership";
   - resolve by the local petname instead of `to_fp` — the two nodes' boards must disagree;
   - inherit the holding's expiry — the no-TTL case never lapses;
-  - make a pending item return to the sender on decline.
+  - make a pending item return to the sender on decline;
+  - fold in local order instead of `(created_millis, entry_hash)` — the two boards must disagree.
 
   > **DONE 2026-09-24** (`ca267d5`). `work_handoff_proof` passes. **One change from the plan:** it runs
   > on **two nodes with five sessions**, not three nodes, because of open defect F12 (two joiners cannot
   > read each other); the reason is written at the top of the proof. The nodes name each other by
   > petnames the other never uses, and their folded boards are compared field by field. Five mutations
   > caught: the handoff inert (F1), `to_session` ignored, a no-TTL holding's expiry inherited, a decline
-  > returning to the sender, and the owner compared by author only (F3). Also `agentcomms_gate` (17
-  > tests) folds every permutation — 120 orders of a contested claim plus handoff — to one state.
+  > returning to the sender, and the owner compared by author only (F3).
+  >
+  > **2026-10-01:** the order claim had no proof. `agentcomms_gate`, cited here for "folds every
+  > permutation", was deleted with the non-product tests (V29-17), and every step of
+  > `work_handoff_proof` waits for the other node, so both nodes logged every row in the same order
+  > and a fold in local order stayed green. Case (6), **order**, now stages opposite local orders
+  > through the shipped binary; the local-order fold mutant goes red on it as PRODUCT ("alice and bob
+  > fold different boards for h-order").
 
 - **M21.3 — renewal bound to one acquisition.**
 
