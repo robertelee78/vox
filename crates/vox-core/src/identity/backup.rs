@@ -157,7 +157,7 @@ impl IdentityBackup {
     /// The returned `Vec` holds secrets; callers must zeroize it after use.
     #[must_use]
     pub fn to_canonical_vec(&self) -> Vec<u8> {
-        let mut e = Encoder::new();
+        let mut e = Encoder::for_secrets();
         e.array(6)
             .uint(BACKUP_BUNDLE_VERSION)
             .bytes(&self.ed25519_seed)

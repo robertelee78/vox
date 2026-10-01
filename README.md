@@ -41,9 +41,11 @@ Mainstream secure messengers force trade-offs Vox refuses to make:
   newcomer, forever if they never consent. Visibility fills in monotonically, per sender. No single
   wrong add can expose the room. *(ADR-007)*
 - **No privileged server.** There is no account system, no directory and no operator who can add a
-  member or read a room. There *is* infrastructure: reaching a peer behind symmetric NAT needs an
-  always-on **anchor**, which is a `vox node` you run yourself — it serves the rendezvous board and
-  relays encrypted packets, and by construction holds no room key and can read nothing. Discovery is
+  member or read a room. There *can* be infrastructure, and only for one case: when two hosts are
+  **both** behind NAT and cannot otherwise find or reach each other, an always-on **anchor** bridges
+  them. An anchor is a `vox node` you run yourself; it serves the rendezvous board and relays
+  encrypted packets, and by construction holds no room key and can read nothing. When either host can
+  be reached directly (a public address, a working port mapping, the same LAN), no anchor is needed. Discovery is
   magnet-link style over a P2P swarm. *(ADR-012, ADR-016)*
 - **The channel is the unit.** Every message is appended to its author's own hash-linked log, and
   the logs replicate channel-wide as a causal Merkle-DAG; a 1:1 chat is simply a two-member channel.
@@ -125,9 +127,9 @@ holistic adversary — that would require all of the above. See ADR-001 for the 
 
 Availability is emergent, with no always-on infrastructure required: a two-member channel needs both
 members reachable; a 3+-member channel needs any two online to propagate the log; a lone online
-member is an outbox. A strictly zero-infrastructure overlay is provably impossible for cold-start
-discovery and worst-case NAT, so Vox reduces the unavoidable minimum to a decentralized, user-runnable
-bootstrap/rendezvous any node can provide. See ADR-001 and ADR-012.
+member is an outbox. A strictly zero-infrastructure overlay is impossible for one case: two
+hosts both behind NAT that cannot otherwise find each other. For that case only, Vox's minimum is a
+user-runnable anchor any node can provide. Every other case connects directly. See ADR-001 and ADR-012.
 
 ## Architecture decisions
 
@@ -226,7 +228,10 @@ member individually consents (`:grant`), which is the point of ADR-007.
 
 ### Reach a machine's port from anywhere (`ssh` over Vox)
 
-Four commands, no port forwarding, no public IP, no privilege. On the machine with the service:
+This example runs an anchor, which is the case where both machines are behind NAT and neither can
+reach the other directly: then it takes four commands, no port forwarding, no public IP, no privilege.
+If the guest can reach the host directly, the anchor step and both `--anchor` flags are not needed
+(see "Do you need an anchor?" below). On the machine with the service:
 
 ```
 vox node --listen 0.0.0.0:0          # once, on a host that is always up: your anchor.
@@ -259,10 +264,24 @@ For a tool with no proxy support, `vox forward` binds a local port instead.
 
 ### Do you need an anchor?
 
-Only for reachability. Two peers that can already reach each other do not need one. If either is
-behind a symmetric NAT — most home and mobile networks — something stable must introduce them, and
-in Vox that is a `vox node` **you** run. It serves the rendezvous board, coordinates hole punching,
-and relays QUIC packets it cannot read: it holds no room key, and its own log is ciphertext.
+Only as a bridge. Creating, serving, inviting, joining and connecting are not meant to require one:
+if one of the two hosts can be reached directly (a public address, a router that granted a port
+mapping, the same LAN), the other dials it and no anchor is involved. If **both** are behind NAT,
+something both can reach must introduce them the first time, and in Vox that is a `vox node` **you**
+run. It serves the rendezvous board and coordinates hole punching; if both NATs are symmetric, it
+also relays QUIC packets it cannot read. It holds no room key, and its own log is ciphertext.
+
+Known departures in the shipped binary, being fixed in v0.2.10: `vox serve` with no anchor refuses
+on a host whose only addresses are private (a LAN), and an anchors file whose every line is unusable
+stops `vox serve`, `connect`, `up`, `forward`, `daemon` and the TUI instead of carrying on without
+one.
+
+By default an anchor serves any room published to it, and relays only between members of the same
+room. To serve only rooms made by people you trust, give the anchor's profile an identity and a
+trust list (`vox id`, then `vox trust add <fingerprint>` for each) and run
+`vox node --serve trusted` with that identity's passphrase (`--identity-passphrase-file` or
+`VOX_IDENTITY_PASSPHRASE`). A `serve` file in the config directory holding `anyone` or `trusted`
+sets the same thing without the flag. The list is read once at start.
 
 ## Building
 

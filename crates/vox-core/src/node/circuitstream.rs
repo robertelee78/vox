@@ -15,7 +15,7 @@
 //! | frame | direction | meaning |
 //! |---|---|---|
 //! | `OPEN <peer>` | initiator → relay | "carry a circuit to this peer" |
-//! | `INCOMING <peer>` | relay → target | "a circuit from that peer" |
+//! | `INCOMING <peer> <origin>` | relay → target | "a circuit from that peer, which is there" |
 //! | `OPENED` | either → its counterpart | the circuit is up; `DATAGRAM` frames follow |
 //! | `REFUSED <reason>` | either → its counterpart | it is not, and why |
 //! | `DATAGRAM <bytes>` | end to end | one QUIC packet, opaque to the relay |
@@ -28,6 +28,14 @@
 //! relay also bounds it: at most [`MAX_RELAYED_CIRCUITS`] at once, at most
 //! [`MAX_CIRCUITS_PER_ASKER`] for any one peer, and a circuit idle for
 //! [`CIRCUIT_IDLE_TIMEOUT`] is closed. A relay is a last resort, not a service.
+//!
+//! ## Where the asker is
+//!
+//! A circuit's address at the target is made up per circuit, so it says nothing about who is
+//! behind it. `INCOMING` therefore carries the asker's **origin** as the relay sees it on its own
+//! connection: three tags for its address, coarse to fine ([`origin_tags`]), so the target can
+//! weigh a relayed join by where it comes from (V210-92, `node::joinslots`). They are keyed per
+//! relay process, so the target can tell two origins apart and never learns either address.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -111,6 +119,8 @@ pub enum CircuitFrame {
     Incoming {
         /// The peer that asked for the circuit.
         peer: Digest32,
+        /// Where the relay sees that peer, as [`origin_tags`] gives it.
+        origin: [[u8; 16]; 3],
     },
     /// The circuit is up.
     Opened,
@@ -135,8 +145,11 @@ impl CircuitFrame {
             CircuitFrame::Open { peer } => {
                 e.array(2).uint(OP_OPEN).bytes(peer);
             }
-            CircuitFrame::Incoming { peer } => {
-                e.array(2).uint(OP_INCOMING).bytes(peer);
+            CircuitFrame::Incoming { peer, origin } => {
+                e.array(3)
+                    .uint(OP_INCOMING)
+                    .bytes(peer)
+                    .bytes(&origin.concat());
             }
             CircuitFrame::Opened => {
                 e.array(1).uint(OP_OPENED);
@@ -161,8 +174,9 @@ impl CircuitFrame {
             (OP_OPEN, 2) => CircuitFrame::Open {
                 peer: fingerprint(&mut d)?,
             },
-            (OP_INCOMING, 2) => CircuitFrame::Incoming {
+            (OP_INCOMING, 3) => CircuitFrame::Incoming {
                 peer: fingerprint(&mut d)?,
+                origin: origin(&mut d)?,
             },
             (OP_OPENED, 1) => CircuitFrame::Opened,
             (OP_REFUSED, 2) => CircuitFrame::Refused {
@@ -183,6 +197,48 @@ impl CircuitFrame {
 fn fingerprint(d: &mut Decoder<'_>) -> Result<Digest32> {
     let raw = d.bytes()?;
     Digest32::try_from(raw).map_err(|_| Error::Unreachable("circuit: fingerprint length"))
+}
+
+fn origin(d: &mut Decoder<'_>) -> Result<[[u8; 16]; 3]> {
+    let raw = d.bytes()?;
+    if raw.len() != 48 {
+        return Err(Error::Unreachable("circuit: origin length"));
+    }
+    let mut tags = [[0u8; 16]; 3];
+    for (tag, chunk) in tags.iter_mut().zip(raw.chunks_exact(16)) {
+        tag.copy_from_slice(chunk);
+    }
+    Ok(tags)
+}
+
+/// **Where the peer at the far end of `asker` is, as this relay says it to a target**: the
+/// asker's three source keys (`nat::source::Source::of_conn`), each keyed with a secret this
+/// process drew at random and cut to 16 bytes. Two asks from one place give the same tags and two
+/// from different places different ones, so the target can group what this relay carries by where
+/// it comes from; the keys are never sent and are new every run, so the target cannot work the
+/// address back out of them.
+///
+/// # Errors
+/// If the OS CSPRNG is unavailable, the first time the key is drawn.
+pub fn origin_tags(asker: &VoxConnection) -> Result<[[u8; 16]; 3]> {
+    use hmac::{Hmac, Mac};
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let key = match KEY.get() {
+        Some(key) => key,
+        None => {
+            let drawn: [u8; 32] = crate::identity::rng::random_array()?;
+            KEY.get_or_init(|| drawn)
+        }
+    };
+    let levels = crate::nat::source::Source::of_conn(asker).0;
+    let mut tags = [[0u8; 16]; 3];
+    for (tag, level) in tags.iter_mut().zip(levels.iter()) {
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key)
+            .map_err(|_| Error::Unreachable("circuit: origin key"))?;
+        mac.update(level.as_ref());
+        tag.copy_from_slice(&mac.finalize().into_bytes()[..16]);
+    }
+    Ok(tags)
 }
 
 async fn send_frame(send: &mut SendStream, frame: &CircuitFrame) -> Result<()> {
@@ -276,10 +332,16 @@ impl Drop for CircuitSlot {
 /// circuit runs: that is what marks those connections as carrying, so a retired one is
 /// not closed under a live circuit. `connected` resolves a fingerprint to a live
 /// connection (the relay's own peer table); `endpoint` is where a circuit terminating
-/// here is attached.
+/// here is attached. `shares_room` says whether two peers share a room this node serves: a
+/// relay is only ever carried between them (see `NodeNet::relays_between`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each is a separate authority the relay consults; bundling them would hide which"
+)]
 pub async fn serve_circuit<F>(
     carrier: &Arc<VoxConnection>,
     classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
+    shares_room: &(dyn Fn(&Digest32, &Digest32) -> bool + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
     connected: F,
@@ -292,7 +354,10 @@ where
     let peer = carrier.peer_id();
     match opening_answer(&mut recv).await? {
         CircuitFrame::Open { peer: target } => {
-            if !relays_for(classify(&peer)) || !relays_for(classify(&target)) {
+            if !relays_for(classify(&peer))
+                || !relays_for(classify(&target))
+                || !shares_room(&peer, &target)
+            {
                 refuse(&mut send, CircuitRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused(
                     "circuit: peer may not ask for a relay",
@@ -308,7 +373,8 @@ where
             };
             let (mut target_send, mut target_recv) =
                 open_typed(&target_conn, StreamKind::Circuit).await?;
-            send_frame(&mut target_send, &CircuitFrame::Incoming { peer }).await?;
+            let origin = origin_tags(carrier)?;
+            send_frame(&mut target_send, &CircuitFrame::Incoming { peer, origin }).await?;
             match opening_answer(&mut target_recv).await? {
                 CircuitFrame::Opened => {}
                 CircuitFrame::Refused { reason } => {
@@ -322,15 +388,32 @@ where
             tokio::spawn(relay(slot, carriers, send, recv, target_send, target_recv));
             Ok(())
         }
-        CircuitFrame::Incoming { peer: origin } => {
+        CircuitFrame::Incoming {
+            peer: origin,
+            origin: tags,
+        } => {
             // The same rule as a relayed punch session, anchor's vouching included:
             // a circuit is how an anchor introduces a peer nothing else can reach.
-            if !accepts_relayed(classify(&peer), classify(&origin)) {
+            let relay = classify(&peer);
+            if !accepts_relayed(relay, classify(&origin)) {
                 refuse(&mut send, CircuitRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused("circuit: peer may not relay to us"));
             }
+            // **Where the peer behind it is** (V210-92, V210-70). An anchor or a member is trusted to
+            // say, under its own network: what it carries is filed first by where the relay itself
+            // connects from, which it cannot choose, then by the tags it gives. On an anchor that
+            // serves anyone, a member is anyone who put a genesis, so keying by the relay's
+            // identity let a stranger mint a source per relay it made. Any other relay — a pending
+            // joiner, a stranger like any other — is not trusted to say: what it carries counts as
+            // coming from the relay itself.
+            let relay_source = crate::nat::source::Source::of_conn(carrier);
+            let source = if matches!(relay, PeerClass::Anchor | PeerClass::Member) {
+                crate::nat::source::Source::relayed_by(&relay_source, &tags).0
+            } else {
+                relay_source.0
+            };
             send_frame(&mut send, &CircuitFrame::Opened).await?;
-            let port = endpoint.attach_circuit(&origin)?;
+            let port = endpoint.attach_inbound_circuit(&origin, source)?;
             tokio::spawn(terminate(port, Arc::clone(carrier), send, recv));
             Ok(())
         }

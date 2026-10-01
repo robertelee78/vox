@@ -20,7 +20,7 @@ use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::node::link::{merge_anchor_spec, merge_anchors_file};
 use vox_core::node::paths::{Paths, DEFAULT_PROFILE};
 
-use crate::app::{run_live, run_node};
+use crate::app::{run_live, run_node, AppError};
 
 /// Profile selection shared by the interactive commands.
 #[derive(Args, Debug, Clone)]
@@ -265,6 +265,43 @@ where
     F: FnOnce(vox_core::node::actor::NodeHandle, BootstrapSet) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
 {
+    run_new_room_verb_with(
+        profile,
+        needs,
+        identity_passphrase,
+        identity_passphrase_file,
+        None,
+        || Ok(()),
+        move |node, anchors, ()| body(node, anchors),
+    )
+}
+
+/// [`run_new_room_verb`] for a verb that says what it was waiting for when a signal stops it
+/// (`vox connect`, V210-85): with `waiting`, the whole run races
+/// [`crate::app::stop_requested`], and a stop ends with
+/// [`crate::tunnel_cli::Waiting::stopped_by`]. `ask` collects what the verb needs from the person
+/// before the identity is unlocked — `connect`'s room passphrase — and its answer is handed to
+/// `body`.
+///
+/// **The race starts before the first prompt.** The prompts ran before the handler was taken, so a
+/// connect stopped while it waited at one — reading a passphrase from a pipe, or a terminal closed
+/// under it — still died on the signal and said nothing. They run on a blocking thread now, inside
+/// the race.
+fn run_new_room_verb_with<A, T, F, Fut>(
+    profile: ProfileArgs,
+    needs: AnchorUse,
+    identity_passphrase: Option<String>,
+    identity_passphrase_file: Option<std::path::PathBuf>,
+    waiting: Option<std::sync::Arc<crate::tunnel_cli::Waiting>>,
+    ask: A,
+    body: F,
+) -> ExitCode
+where
+    A: FnOnce() -> Result<T, crate::app::AppError> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(vox_core::node::actor::NodeHandle, BootstrapSet, T) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
+{
     let paths = match profile.paths() {
         Ok(p) => p,
         Err(e) => {
@@ -274,17 +311,6 @@ where
     };
     let anchors = match profile.anchors_for(needs) {
         Ok(a) => a,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let identity = match crate::tunnel_cli::identity_passphrase_for(
-        &paths,
-        identity_passphrase,
-        identity_passphrase_file,
-    ) {
-        Ok(p) => p,
         Err(e) => {
             eprintln!("vox: {e}");
             return ExitCode::FAILURE;
@@ -303,18 +329,94 @@ where
     };
     let listen = profile.listen;
     let anchors_for_body = anchors.clone();
-    let outcome = rt.block_on(async move {
+    let unlocking = waiting.clone();
+    // The node, once there is one, for a stop to shut down: see below.
+    let opened: std::sync::Arc<std::sync::Mutex<Option<vox_core::node::actor::NodeHandle>>> =
+        std::sync::Arc::default();
+    let opening = std::sync::Arc::clone(&opened);
+    let work = async move {
+        let asking = unlocking.clone();
+        let paths_for_asking = paths.clone();
+        let (asked, identity) = tokio::task::spawn_blocking(move || {
+            let asked = ask()?;
+            if let Some(w) = &asking {
+                w.on("this profile's identity passphrase");
+            }
+            let identity = crate::tunnel_cli::identity_passphrase_for(
+                &paths_for_asking,
+                identity_passphrase,
+                identity_passphrase_file,
+            )?;
+            Ok::<_, crate::app::AppError>((asked, identity))
+        })
+        .await
+        .map_err(|e| crate::app::AppError::Usage(format!("asking for a passphrase: {e}")))??;
+        if let Some(w) = &unlocking {
+            w.on("this profile's identity to unlock");
+        }
         let node = crate::tunnel_cli::open_profile(paths, listen, anchors, &identity).await?;
-        body(node, anchors_for_body).await
+        if let Ok(mut slot) = opening.lock() {
+            *slot = Some(node.clone());
+        }
+        body(node, anchors_for_body, asked).await
+    };
+    let (outcome, stopped) = rt.block_on(async move {
+        match waiting {
+            None => (work.await, false),
+            Some(waiting) => {
+                // Taken here, before the work is first polled, so before its first prompt.
+                let stop = crate::app::stop_requested("vox");
+                tokio::select! {
+                    signal = stop => {
+                        let why = waiting.stopped_by(signal);
+                        // **Its peers are told it went** (V210-85). Stopped mid-join, it left its
+                        // connections to the anchor and the host unclosed, and both counted it as
+                        // connected until their idle timeout. A shutdown closes each with a
+                        // reason; bounded, because what it abandoned must not hold the exit.
+                        let node = opened.lock().ok().and_then(|n| n.clone());
+                        if let Some(node) = node {
+                            let _ = tokio::time::timeout(
+                                STOP_CLOSE_PATIENCE,
+                                node.apply(vox_core::node::api::NodeCommand::Shutdown),
+                            )
+                            .await;
+                        }
+                        (Err(why), true)
+                    }
+                    done = work => (done, false),
+                }
+            }
+        }
     });
-    match outcome {
+    if stopped {
+        // A prompt stopped part-way leaves the terminal in raw mode: no echo, no line editing, in
+        // the shell it hands back to. Nothing to undo when no prompt was open.
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+    let code = match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("vox: {e}");
-            ExitCode::FAILURE
+            // Not `eprintln!`: after a hangup stderr can be a terminal that is gone, and a write
+            // that fails there must not turn the reason into a panic.
+            use std::io::Write as _;
+            let _ = writeln!(io::stderr(), "vox: {e}");
+            e.exit_code()
         }
+    };
+    // **A stop is not a wait for the work it abandoned.** Dropping the runtime waits for its
+    // blocking threads, and one of them can be the join's proof of work: measured, a stopped
+    // `vox connect` printed why at once and then stayed alive past 15 s in a debug build,
+    // until the solve it no longer wanted finished. A prompt still reading is another. Nothing it
+    // was doing is kept either way — the store commits atomically, and survives a kill as it must.
+    if stopped {
+        rt.shutdown_background();
     }
+    code
 }
+
+/// How long a stopped `vox connect` waits for its node to close its connections before it exits
+/// anyway. The closes go out first thing in a shutdown; the rest of it is not worth waiting for.
+const STOP_CLOSE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Whether a node is already serving this profile.
 fn node_answers(profile: &ProfileArgs) -> bool {
@@ -957,6 +1059,115 @@ pub struct IdentityArgs {
     pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
+/// Which rooms `vox node` serves (`--serve`).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Serve {
+    /// Any room published to this anchor.
+    Anyone,
+    /// Only rooms made by someone in this profile's `vox trust` list.
+    Trusted,
+}
+
+/// `vox node`
+#[derive(Args, Debug, Clone)]
+pub struct NodeArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// Which rooms this anchor serves: `anyone` (the default) serves any room published to
+    /// it; `trusted` serves only rooms made by someone in this profile's `vox trust` list.
+    /// `trusted` needs this profile's identity passphrase to read that list, and reads it once
+    /// at start. Give it with `--identity-passphrase-file`: `VOX_IDENTITY_PASSPHRASE` also
+    /// works, but it stays in the anchor's environment for as long as it runs, where any
+    /// process of the same user can read it (`ps -E`). Without the flag, the `serve` file in
+    /// the config directory (`anyone` or `trusted`) decides.
+    #[arg(long, env = "VOX_SERVE", value_enum)]
+    pub serve: Option<Serve>,
+    /// **Refused**, as for every verb: a command line is world-readable while the process
+    /// runs. Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`, or let it prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line). Only `--serve trusted`
+    /// needs it: the trust list is sealed under this profile's identity.
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
+}
+
+impl NodeArgs {
+    /// The `--serve` choice: the flag (or `VOX_SERVE`), else the config directory's `serve`
+    /// file, else `anyone`. A `serve` file that says anything else is refused, not guessed at.
+    fn serve(&self, paths: &Paths) -> Result<Serve, AppError> {
+        if let Some(serve) = self.serve {
+            return Ok(serve);
+        }
+        let path = paths.serve_file();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Serve::Anyone),
+            Err(e) => return Err(AppError::Usage(format!("reading {}: {e}", path.display()))),
+        };
+        match text.lines().map(str::trim).find(|l| !l.is_empty()) {
+            None | Some("anyone") => Ok(Serve::Anyone),
+            Some("trusted") => Ok(Serve::Trusted),
+            Some(other) => Err(AppError::Usage(format!(
+                "{} says {other:?}; it must say `anyone` or `trusted`",
+                path.display()
+            ))),
+        }
+    }
+
+    /// For `--serve trusted`, the creators whose rooms this anchor serves: the profile's
+    /// `vox trust` list, read once with the identity passphrase. `None` for `anyone`.
+    fn serve_only(
+        &self,
+        paths: &Paths,
+    ) -> Result<Option<std::collections::BTreeSet<vox_core::hash::Digest32>>, AppError> {
+        if self.serve(paths)? == Serve::Anyone {
+            return Ok(None);
+        }
+        let refuse = |why: String| {
+            AppError::Usage(format!(
+                "--serve trusted: {why}. It serves only rooms made by someone in this profile's \
+                 `vox trust` list, so it will not start without it"
+            ))
+        };
+        // Two different failures, and each needs different advice: a profile with no identity
+        // has no trust list to read and needs one made; a profile that has one but cannot be
+        // opened has a list this process cannot get at, and remaking it would not help.
+        if !vox_core::node::profile::Profile::exists(paths) {
+            return Err(refuse(format!(
+                "this profile has no identity, so no `vox trust` list to read; make one with \
+                 `vox id` and `vox trust add <fingerprint>` in the profile at {}",
+                paths.profile_dir.display()
+            )));
+        }
+        let mut profile = vox_core::node::profile::Profile::open(paths.clone()).map_err(|e| {
+            refuse(format!(
+                "this profile's identity and `vox trust` list exist but could not be opened \
+                 ({e}); check that the files in {} belong to and are readable by the user \
+                 running `vox node`, and that no other vox has this profile open",
+                paths.profile_dir.display()
+            ))
+        })?;
+        // Held only for the one unlock, and wiped when it goes: an anchor runs for months, and
+        // nothing it does after start needs the passphrase again.
+        let passphrase = zeroize::Zeroizing::new(crate::tunnel_cli::identity_passphrase_for(
+            paths,
+            self.identity_passphrase.clone(),
+            self.identity_passphrase_file.clone(),
+        )?);
+        profile
+            .unlock(passphrase.as_bytes())
+            .map_err(|e| refuse(format!("the identity did not unlock ({e})")))?;
+        drop(passphrase);
+        let signer = profile
+            .signer()
+            .map_err(|e| refuse(format!("the identity did not unlock ({e})")))?;
+        let keyring = vox_core::node::trust::Keyring::load(profile.store(), signer)
+            .map_err(|e| refuse(format!("the trust list did not open ({e})")))?;
+        Ok(Some(keyring.trusted()))
+    }
+}
+
 /// `vox trust`
 #[derive(Subcommand)]
 enum TrustCmd {
@@ -1143,7 +1354,7 @@ enum Cmd {
     /// hole punches and carries circuits for your rooms. It holds no room and can
     /// read nothing; its identity is a key file in the profile directory, created on
     /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
-    Node(ProfileArgs),
+    Node(NodeArgs),
     /// Run this profile's node without a terminal, so agent sessions can attach
     /// (ADR-020 §12).
     ///
@@ -1304,7 +1515,8 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Node(args) => {
+        Cmd::Node(node_args) => {
+            let args = &node_args.profile;
             let paths = match args.paths() {
                 Ok(p) => p,
                 Err(e) => {
@@ -1324,7 +1536,14 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match run_node(paths, args.listen, anchors) {
+            let serve_only = match node_args.serve_only(&paths) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("vox node: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match run_node(paths, args.listen, anchors, serve_only) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox node: {e}");
@@ -1351,28 +1570,27 @@ pub fn run() -> ExitCode {
             )
         }
         Cmd::Connect(args) => {
-            let room_pp = match crate::tunnel_cli::room_passphrase_for(
-                args.passphrase.as_ref(),
-                args.passphrase_file.as_deref(),
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
             let Some(socket) = socket_of(&args.profile) else {
                 return ExitCode::FAILURE;
             };
             let a = args.clone();
-            run_new_room_verb(
+            let waiting = crate::tunnel_cli::Waiting::new("the room was not joined");
+            let steps = std::sync::Arc::clone(&waiting);
+            let asking = std::sync::Arc::clone(&waiting);
+            let (given, file) = (args.passphrase.clone(), args.passphrase_file.clone());
+            run_new_room_verb_with(
                 args.profile.clone(),
                 AnchorUse::Needed,
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
-                move |node, _anchors| async move {
+                Some(waiting),
+                move || {
+                    asking.on("the room passphrase");
+                    crate::tunnel_cli::room_passphrase_for(given.as_ref(), file.as_deref())
+                },
+                move |node, _anchors, room_pp| async move {
                     let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
-                    crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp).await
+                    crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp, &steps).await
                 },
             )
         }

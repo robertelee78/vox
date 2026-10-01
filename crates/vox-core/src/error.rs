@@ -377,6 +377,17 @@ pub enum Error {
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
 
+    /// Every one of the responder's join slots was held, so it refused before the exchange began
+    /// (V210-92). The passphrase was never checked.
+    #[error("a member is busy answering other joins")]
+    JoinResponderBusy,
+
+    /// This node ended a join it was answering, to give its slot to a joiner from a lighter source
+    /// (V210-92): every slot was held and this join's source was the heaviest. Its joiner is told
+    /// the member is busy, as at the cap.
+    #[error("ended to answer a join from elsewhere: every join slot was held")]
+    JoinEndedForNewcomer,
+
     /// This joiner's proof of work took longer than the responder waits for it, so the responder
     /// had stopped waiting before the solution arrived (V210-87). Both sides derive the wait from
     /// the same signed difficulty, so the joiner can say this rather than a refusal it cannot name.
@@ -452,6 +463,16 @@ pub enum Error {
     PeerRefused(crate::wire::WireError),
 }
 
+/// Why a node hung up, for [`IpcHandshake::HungUp`]'s message.
+fn hung_up_why(still_running: bool) -> &'static str {
+    if still_running {
+        "it is still running, so it ended this request itself; its log says why"
+    } else {
+        "it is no longer running: it stopped, crashed or was stopped while answering. Start it \
+         again"
+    }
+}
+
 /// How an attach to a node's control socket failed ([`Error::Ipc`]).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -465,6 +486,20 @@ pub enum IpcHandshake {
     /// Something accepted the connection and closed it without greeting.
     #[error("the node closed the connection before greeting")]
     ClosedBeforeHello,
+    /// The node greeted, took a request and closed the connection before replying (V210-101).
+    /// Nothing was malformed: the connection ended. Whether the node is still running is asked
+    /// with a fresh connection when the reply goes missing, because the two need different
+    /// remedies — a node that is gone is started again, one that is still running has a log that
+    /// says why it ended the request.
+    #[error("the node closed the connection before replying: {}", hung_up_why(*still_running))]
+    HungUp {
+        /// Whether a fresh connection to the same socket was taken when the reply went missing.
+        still_running: bool,
+    },
+    /// The connection ended under a write (V210-101). A client names it [`Self::HungUp`], once
+    /// it has asked whether the node is still running; the node's side says this.
+    #[error("the other end closed the control-socket connection")]
+    Cut,
     /// The node greeted in another control protocol: the two are different vox versions.
     #[error(
         "the node speaks a different control protocol (this vox is protocol {mine}, the node is \
