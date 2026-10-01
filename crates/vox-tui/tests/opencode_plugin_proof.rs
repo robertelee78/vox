@@ -506,15 +506,16 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     }
     assert!(
         count("woken") == "1" && count("other") == "1",
-        "(5) the message that woke the session must reach the model once — as the wake, not \
-         again in the room read that follows — and the one that woke nothing exactly once; the \
-         model was given woken={} other={}: {said}",
+        "PRODUCT: (5) the message that woke the session must reach the model once — as the wake, \
+         not again in the room read that follows — and the one that woke nothing exactly once; \
+         the model was given woken={} other={}: {said}",
         count("woken"),
         count("other")
     );
     assert_eq!(
         count("envelope"),
         "no",
-        "(6) the room read must show each message as written, never as its envelope JSON: {said}"
+        "PRODUCT: (6) the room read must show each message as written, never as its envelope \
+         JSON: {said}"
     );
 }
