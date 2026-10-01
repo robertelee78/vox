@@ -20,10 +20,12 @@
 //! loopback, as a raw-efficiency figure, not the bar. The emulator is userspace, so its own ceiling
 //! bounds the 10 Gbit/s figure; that is reported with it, not hidden.
 //!
-//! **ADR-024's arms** (the decider, 2026-10-01; see `taper_arms`): on a 200 Mbit/s, 10 ms Wi-Fi-like
+//! **ADR-024's arms** (the decider, 2026-10-01; see `taper_arms`): on a clean 400 Mbit/s, 2 ms
+//! LAN-like link, which the emulator carries under ordinary load, every second is at the clean bar
+//! (90% of raw); on a 200 Mbit/s, 10 ms Wi-Fi-like
 //! link at 1% and at 5% loss the tunnel carries at least [`LOSSY_WIN`] of a Cubic flow on the same
 //! loss; on a link it shares with a Cubic flow (200 Mbit/s through a one-BDP and a quarter-BDP queue,
-//! and a 1 Gbit/s, 2 ms LAN through a one-BDP queue, each over [`CONGESTED_MEASURE`]), its rate is
+//! and a 400 Mbit/s, 2 ms LAN-like link through a one-BDP queue, each over [`CONGESTED_MEASURE`]), its rate is
 //! between [`FAIR_LOW`] and [`FAIR_HIGH`] of that flow's; and on a link that goes clean, lossy and
 //! clean again under one transfer, every second of each clean phase (past [`RECOVER_WITHIN`] after
 //! the loss) is at the clean bar and the lossy phase clears the lossy bar. These are judged by the
@@ -950,6 +952,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
             late.as_millis()
         ));
     }
+    let mut cannot = Vec::new();
     taper_arms(
         tunnel,
         &link,
@@ -958,6 +961,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         &done,
         &mut report,
         &mut failed,
+        &mut cannot,
     );
     *link.lock().unwrap() = None;
     let later: Vec<String> = circuit_lines(&anchor)
@@ -976,6 +980,13 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     assert!(
         failed.is_empty(),
         "R41 (PRODUCT): the tunnel throttles the link it runs over: {failed:?}\n{}",
+        report.join("\n")
+    );
+    assert!(
+        cannot.is_empty(),
+        "R41: CANNOT MEASURE (APPARATUS) on {} arm(s), and no product red on the arms that measured: \
+         {cannot:?}\n{}",
+        cannot.len(),
         report.join("\n")
     );
     drop(forward);
@@ -1070,12 +1081,14 @@ const CONGESTED: Link = Link {
     gated: true,
     queue_bdps: Some(1.0),
 };
-/// A congested LAN: 1 Gbit/s, 2 ms, one-BDP queue (250 KB) shared with the Cubic flow. A full queue
-/// here is only 2 ms of delay, under tier 2's delay test, so only the loss signals can see this
-/// congestion: tier 2 alone took 2.56x the Cubic flow here (ADR-024 M24.1).
+/// A congested LAN-like link: 400 Mbit/s, 2 ms, one-BDP queue (100 KB) shared with the Cubic flow. A
+/// full queue here is only 2 ms of delay, under tier 2's delay test, so only the loss signals can see
+/// this congestion: at 1 Gbit/s, 2 ms, tier 2 without the loss trend took 2.56x the Cubic flow
+/// (ADR-024 M24.1). 400 Mbit/s rather than 1 Gbit/s because the userspace emulator holds that rate
+/// on a machine doing ordinary work; at 1 Gbit/s it ran up to 53 ms late.
 const CONGESTED_LAN: Link = Link {
-    name: "congested LAN, 1 Gbit/s, 2 ms RTT, 1-BDP queue, shared with a Cubic flow",
-    bits_per_sec: 1e9,
+    name: "congested LAN-like, 400 Mbit/s, 2 ms RTT, 1-BDP queue, shared with a Cubic flow",
+    bits_per_sec: 4e8,
     one_way: Duration::from_millis(1),
     loss: 0.0,
     gated: true,
@@ -1090,6 +1103,20 @@ const CONGESTED_SHALLOW: Link = Link {
     queue_bdps: Some(0.25),
     ..CONGESTED
 };
+
+/// A clean LAN-like link at a rate the userspace emulator carries on a machine doing ordinary work
+/// (the 1 Gbit/s LAN above often cannot calibrate under load): a clean link must never be held in a
+/// tier that slows it, and BBR measured 28% of raw on a clean LAN.
+const CLEAN_LAN: Link = Link {
+    name: "clean LAN-like, 400 Mbit/s, 2 ms RTT",
+    bits_per_sec: 4e8,
+    one_way: Duration::from_millis(1),
+    loss: 0.0,
+    gated: true,
+    queue_bdps: None,
+};
+/// How long the clean LAN-like arm is judged, every second of it.
+const CLEAN_MEASURE: Duration = Duration::from_secs(30);
 
 /// The decider: on the lossy link Vox must carry at least twice the comparison flow.
 const LOSSY_WIN: f64 = 2.0;
@@ -1190,19 +1217,27 @@ fn mbit(w: &[Window], f: impl Fn(&Window) -> f64) -> Vec<String> {
     w.iter().map(|x| format!("{:.0}", f(x) / 1e6)).collect()
 }
 
-/// A run measured the emulator, not vox, if the emulator ran late in any window judged.
-fn assert_on_time(arm: &str, w: &[Window]) {
+/// An arm measured the emulator, not vox, if the emulator ran late in any window judged: the CANNOT
+/// MEASURE for that arm, or `None` when the emulator was on time.
+fn late_fault(arm: &str, w: &[Window]) -> Option<String> {
     let late = w.iter().map(|x| x.late).max().unwrap_or_default();
-    assert!(
-        late <= MAX_EMULATOR_LATENESS,
-        "CANNOT MEASURE {arm} (APPARATUS): the emulator was {} ms late in a judged window (at most \
-         {} ms measures the link), so this run measured the emulator, not vox; per-window lateness \
-         {:?} ms; load: {}",
-        late.as_millis(),
-        MAX_EMULATOR_LATENESS.as_millis(),
-        w.iter().map(|x| x.late.as_millis()).collect::<Vec<_>>(),
-        uptime()
-    );
+    (late > MAX_EMULATOR_LATENESS).then(|| {
+        format!(
+            "CANNOT MEASURE {arm} (APPARATUS): the emulator was {} ms late in a judged window (at \
+             most {} ms measures the link), so this arm measured the emulator, not vox; per-window \
+             lateness {:?} ms; load: {}",
+            late.as_millis(),
+            MAX_EMULATOR_LATENESS.as_millis(),
+            w.iter().map(|x| x.late.as_millis()).collect::<Vec<_>>(),
+            uptime()
+        )
+    })
+}
+
+/// Record an arm's line as it is measured, so an arm that ends the run early leaves the others'.
+fn note(report: &mut Vec<String>, line: String) {
+    shown(&format!("R41: {line}"));
+    report.push(line);
 }
 
 /// The comparison flow's TLS: any certificate (it carries nothing secret, and runs only between
@@ -1343,16 +1378,17 @@ fn competitor_sender(
 }
 
 /// The comparison flow must have run, or there was nothing to compare with.
-fn assert_competed(arm: &str, w: &[Window]) {
-    assert!(
-        mean_of(w, |x| x.other) > 0.0,
-        "CANNOT MEASURE {arm} (APPARATUS): the comparison flow carried nothing (harness error: its \
-         QUIC connection never ran), so there is nothing to compare vox with"
-    );
+fn competed_fault(arm: &str, w: &[Window]) -> Option<String> {
+    (mean_of(w, |x| x.other) <= 0.0).then(|| {
+        format!(
+            "CANNOT MEASURE {arm} (APPARATUS): the comparison flow carried nothing (harness error: \
+             its QUIC connection never ran), so there is nothing to compare vox with"
+        )
+    })
 }
 
-/// ADR-024's three arms, on the running tunnel. Each PRODUCT verdict goes into `failed`, each figure
-/// into `report`; an APPARATUS fault panics as CANNOT MEASURE.
+/// ADR-024's arms, on the running tunnel. Each PRODUCT verdict goes into `failed`, each APPARATUS
+/// fault into `cannot` (that arm only: the others still measure), each figure into `report`.
 fn taper_arms(
     tunnel: SocketAddr,
     link: &Shared,
@@ -1361,6 +1397,7 @@ fn taper_arms(
     done: &mpsc::Receiver<(Instant, Instant)>,
     report: &mut Vec<String>,
     failed: &mut Vec<String>,
+    cannot: &mut Vec<String>,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     let wanted = perf_only;
@@ -1377,6 +1414,74 @@ fn taper_arms(
         SEED_COMPETITOR,
     );
     let settle_and_measure = SETTLE + MEASURE;
+
+    // The clean LAN-like link: every second at the clean bar, so no tier slows a clean link.
+    'clean: {
+        if !wanted(CLEAN_LAN.name) {
+            break 'clean;
+        }
+        let windows_cal = calibrate_windows(Some(CLEAN_LAN));
+        let pct: Vec<String> = windows_cal
+            .iter()
+            .map(|w| format!("{:.1}%", w * 8.0 / CLEAN_LAN.bits_per_sec * 100.0))
+            .collect();
+        let fidelity =
+            windows_cal.iter().copied().fold(f64::INFINITY, f64::min) * 8.0 / CLEAN_LAN.bits_per_sec;
+        if fidelity < EMULATOR_FIDELITY {
+            cannot.push(format!(
+                "CANNOT MEASURE {} (APPARATUS): the emulator itself delivered only {:.1}% of the \
+                 link's rate in a calibration window (windows {pct:?}; each must reach {:.0}%), so \
+                 this arm would measure the emulator, not vox (load: {})",
+                CLEAN_LAN.name,
+                fidelity * 100.0,
+                EMULATOR_FIDELITY * 100.0,
+                uptime()
+            ));
+            break 'clean;
+        }
+        *link.lock().unwrap() = Some(CLEAN_LAN);
+        std::thread::sleep(Duration::from_millis(500));
+        let raw_rate = transfer(raw, done) * 8.0;
+        let bar = raw_rate * MIN_RATIO;
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = stream_to(tunnel, Arc::clone(&stop));
+        let all = windows(SETTLE + CLEAN_MEASURE, |_| {});
+        stop.store(true, Relaxed);
+        let _ = pump.join();
+        std::thread::sleep(Duration::from_secs(1));
+        let w = &all[SETTLE.as_secs() as usize..];
+        if let Some(e) = late_fault(CLEAN_LAN.name, w) {
+            cannot.push(e);
+            break 'clean;
+        }
+        let below = w.iter().filter(|x| x.vox < bar).count();
+        let verdict = if below == 0 {
+            "ok".to_owned()
+        } else {
+            failed.push(format!(
+                "{}: the emulator carried the link (calibration windows {pct:?}) and was on time; \
+                 {below} of {} seconds were under the clean bar of {:.1} Mbit/s ({:.0}% of raw \
+                 {:.1}), slowest {:.1} Mbit/s: vox slows a clean link",
+                CLEAN_LAN.name,
+                w.len(),
+                bar / 1e6,
+                MIN_RATIO * 100.0,
+                raw_rate / 1e6,
+                w.iter().map(|x| x.vox).fold(f64::INFINITY, f64::min) / 1e6
+            ));
+            "BELOW".to_owned()
+        };
+        note(report, format!(
+            "{}: clean bar {:.1} Mbit/s ({:.0}% of raw {:.1}); vox mean {:.1} Mbit/s, {below} seconds \
+             below — {verdict}; calibration {pct:?}; per-second {:?}",
+            CLEAN_LAN.name,
+            bar / 1e6,
+            MIN_RATIO * 100.0,
+            raw_rate / 1e6,
+            mean_of(w, |x| x.vox) / 1e6,
+            mbit(w, |x| x.vox)
+        ));
+    }
     let judged = |w: &[Window]| w[w.len() - MEASURE.as_secs() as usize..].to_vec();
 
     // The lossy link: Vox alone, then the comparison flow alone, each over the same loss.
@@ -1398,9 +1503,13 @@ fn taper_arms(
         let c = judged(&windows(settle_and_measure, |_| {}));
         stop.store(true, Relaxed);
         std::thread::sleep(Duration::from_secs(1));
-        assert_on_time(lossy.name, &v);
-        assert_on_time(lossy.name, &c);
-        assert_competed(lossy.name, &c);
+        if let Some(e) = late_fault(lossy.name, &v)
+            .or_else(|| late_fault(lossy.name, &c))
+            .or_else(|| competed_fault(lossy.name, &c))
+        {
+            cannot.push(e);
+            continue;
+        }
         let (vm, cm) = (mean_of(&v, |x| x.vox), mean_of(&c, |x| x.other));
         lossy_bars.push((lossy.name, cm * LOSSY_WIN));
         let ratio = vm / cm;
@@ -1417,7 +1526,7 @@ fn taper_arms(
             ));
             format!("BELOW {LOSSY_WIN:.1}x")
         };
-        report.push(format!(
+        note(report, format!(
             "{}: vox {:.1} Mbit/s, Cubic on the same loss {:.1} Mbit/s, {ratio:.2}x — {verdict}; \
              per-second vox {:?}, Cubic {:?}",
             lossy.name,
@@ -1442,8 +1551,12 @@ fn taper_arms(
         stop.store(true, Relaxed);
         let _ = pump.join();
         std::thread::sleep(Duration::from_secs(1));
-        assert_on_time(congested.name, &w);
-        assert_competed(congested.name, &w);
+        if let Some(e) =
+            late_fault(congested.name, &w).or_else(|| competed_fault(congested.name, &w))
+        {
+            cannot.push(e);
+            continue;
+        }
         let (vm, cm) = (mean_of(&w, |x| x.vox), mean_of(&w, |x| x.other));
         let ratio = vm / cm;
         let verdict = if ratio < FAIR_LOW {
@@ -1474,7 +1587,7 @@ fn taper_arms(
             .collect();
         let worst_high = pairs.iter().copied().fold(0.0, f64::max);
         let worst_low = pairs.iter().copied().fold(f64::INFINITY, f64::min);
-        report.push(format!(
+        note(report, format!(
             "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.2}x over {} s — {verdict}; worst 2 s \
              windows {worst_low:.2}x and {worst_high:.2}x; per-second vox {:?}, Cubic {:?}",
             congested.name,
@@ -1502,11 +1615,17 @@ fn taper_arms(
         std::thread::sleep(Duration::from_millis(500));
         let raw_rate = transfer(raw, done) * 8.0;
         let bar = raw_rate * MIN_RATIO;
-        let lossy_bar = lossy_bars
+        let Some(lossy_bar) = lossy_bars
             .iter()
             .find(|(n, _)| *n == lossy_link.name)
             .map(|&(_, b)| b)
-            .expect("the lossy arm for this link runs first");
+        else {
+            cannot.push(format!(
+                "CANNOT MEASURE {name} (APPARATUS): the lossy arm it is judged against did not \
+                 measure (precondition unmet)"
+            ));
+            continue;
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let pump = stream_to(tunnel, Arc::clone(&stop));
         let l = Arc::clone(link);
@@ -1523,7 +1642,10 @@ fn taper_arms(
             &all[s + n..s + 2 * n],
             &all[s + 2 * n..s + 3 * n],
         );
-        assert_on_time(&name, &all[s..]);
+        if let Some(e) = late_fault(&name, &all[s..]) {
+            cannot.push(e);
+            continue;
+        }
         let below = |w: &[Window]| w.iter().filter(|x| x.vox < bar).count();
         let r = RECOVER_WITHIN.as_secs() as usize;
         let lossy_mean = mean_of(&lossy[CLIMB_WITHIN.as_secs() as usize..], |x| x.vox);
@@ -1560,7 +1682,7 @@ fn taper_arms(
             ));
             "BELOW".to_owned()
         };
-        report.push(format!(
+        note(report, format!(
             "{name}: clean bar {:.1} Mbit/s ({:.0}% of raw {:.1}), lossy bar {:.1} Mbit/s; \
              per-second clean {:?}, lossy {:?}, clean {:?} — {verdict}",
             bar / 1e6,
