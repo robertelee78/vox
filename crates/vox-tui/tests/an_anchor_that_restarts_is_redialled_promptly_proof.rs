@@ -320,16 +320,20 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
     let fwd = w.fwd.as_mut().unwrap();
     if host_too {
-        // The forward holds its host as an anchor too, over the only path it has to it: a circuit
-        // through the anchor about to be stopped (the families are split).
-        let held = fwd
-            .transcript()
+        // The forward holds its host, which it names as an anchor too, over the only path it has
+        // to it: a circuit through the anchor about to be stopped (the families are split, so its
+        // own dials of the host find no direct candidate). It says both.
+        let said = fwd.transcript();
+        let reached = said
             .lines()
-            .any(|l| l.contains(&format!("connection to {host12}")) && l.contains(CONNECTED));
+            .any(|l| l.contains(&format!("reached {host12}")));
+        let relayed = said
+            .lines()
+            .any(|l| l.contains(&format!("still relayed to {host12}")));
         assert!(
-            held,
-            "CANNOT MEASURE: the forward never connected to its host as an anchor\n{}",
-            fwd.transcript()
+            reached && relayed,
+            "CANNOT MEASURE: the forward did not say it reached its host over the relay (reached: \
+             {reached}, still relayed: {relayed})\n{said}"
         );
     }
     let before = fwd
