@@ -26,7 +26,9 @@
 //! link at 1% and at 6% loss the tunnel carries at least [`LOSSY_WIN`] of a Cubic flow on the same
 //! loss; on a link it shares with a Cubic flow (200 Mbit/s through a one-BDP and a quarter-BDP queue,
 //! and a 400 Mbit/s, 2 ms LAN-like link through a one-BDP queue, each over [`CONGESTED_MEASURE`]), its rate is
-//! between [`FAIR_LOW`] and [`FAIR_HIGH`] of that flow's; and on a link that goes clean, lossy and
+//! between [`FAIR_LOW`] and [`FAIR_HIGH`] of that flow's; on a lossy link shared with a Cubic flow
+//! (1% and 6% loss, one-BDP queue) that flow keeps at least [`SHARED_KEEP`] of its solo rate; and on
+//! a link that goes clean, lossy and
 //! clean again under one transfer, every second of each clean phase (past [`RECOVER_WITHIN`] after
 //! the loss) is at the clean bar and the lossy phase clears the lossy bar. These are judged by the
 //! speed a person sees, never by which controller the tunnel is running. The comparison flow is
@@ -1099,6 +1101,29 @@ const CONGESTED: Link = Link {
 /// this congestion: at 1 Gbit/s, 2 ms, tier 2 without the loss trend took 2.56x the Cubic flow
 /// (ADR-024 M24.1). 400 Mbit/s rather than 1 Gbit/s because the userspace emulator holds that rate
 /// on a machine doing ordinary work; at 1 Gbit/s it ran up to 53 ms late.
+/// The lossy links shared with the Cubic flow through a one-BDP queue: at 1% (tier 2's case) and at
+/// 6% (tier 3's). The decider (2026-10-01): Vox never pushes a competing flow below its solo rate on
+/// such a link; the Cubic flow keeps at least [`SHARED_KEEP`] of what it carries alone there. Vox
+/// taking many times a loss-limited Cubic flow's rate is fair, as long as that flow keeps its own.
+const LOSSY_SHARED: [Link; 2] = [
+    Link {
+        name: "lossy shared, 200 Mbit/s, 10 ms RTT, 1% loss, 1-BDP queue, with a Cubic flow",
+        loss: 0.01,
+        queue_bdps: Some(1.0),
+        ..WIFI
+    },
+    Link {
+        name: "lossy shared, 200 Mbit/s, 10 ms RTT, 6% loss, 1-BDP queue, with a Cubic flow",
+        loss: 0.06,
+        queue_bdps: Some(1.0),
+        ..WIFI
+    },
+];
+/// The decider: on a lossy shared link the Cubic flow keeps at least this share of its solo rate.
+const SHARED_KEEP: f64 = 0.90;
+/// How long each half of the lossy shared arm (the Cubic flow alone, then both) is judged: long
+/// enough that a loss-limited flow's mean is steady to a few percent.
+const SHARED_MEASURE: Duration = Duration::from_secs(30);
 const CONGESTED_LAN: Link = Link {
     name: "congested LAN-like, 400 Mbit/s, 2 ms RTT, 1-BDP queue, shared with a Cubic flow",
     bits_per_sec: 4e8,
@@ -1654,6 +1679,68 @@ fn taper_arms(
             lateness(&c),
             mbit(&v, |x| x.vox),
             mbit(&c, |x| x.other)
+        ));
+    }
+
+    // The lossy shared links: the Cubic flow alone, then with Vox, on the same link.
+    for shared in LOSSY_SHARED {
+        if !wanted(shared.name) {
+            continue;
+        }
+        *link.lock().unwrap() = Some(shared);
+        let stop = Arc::new(AtomicBool::new(false));
+        competitor_sender(&rt, competitor, Arc::clone(&stop));
+        let alone = windows(SETTLE + SHARED_MEASURE, |_| {});
+        let alone = alone[SETTLE.as_secs() as usize..].to_vec();
+        let pump = stream_to(tunnel, Arc::clone(&stop));
+        let both = windows(SETTLE + SHARED_MEASURE, |_| {});
+        let both = both[SETTLE.as_secs() as usize..].to_vec();
+        stop.store(true, Relaxed);
+        let _ = pump.join();
+        std::thread::sleep(Duration::from_secs(1));
+        if let Some(e) = late_fault(shared.name, &alone)
+            .or_else(|| late_fault(shared.name, &both))
+            .or_else(|| crossed_fault(shared.name, &both))
+            .or_else(|| competed_fault(shared.name, &alone))
+        {
+            cant(cannot, e);
+            continue;
+        }
+        let (solo, kept, vm) = (
+            mean_of(&alone, |x| x.other),
+            mean_of(&both, |x| x.other),
+            mean_of(&both, |x| x.vox),
+        );
+        let share = kept / solo;
+        let verdict = if share >= SHARED_KEEP {
+            format!("ok (kept >= {:.0}%)", SHARED_KEEP * 100.0)
+        } else {
+            failed.push(format!(
+                "{}: the emulator was on time; the Cubic flow carried {:.1} Mbit/s alone and {:.1} with \
+                 vox beside it, {:.1}% of its solo rate, under {:.0}%; vox carried {:.1}: vox pushes a \
+                 competing flow below its own rate on a lossy shared link",
+                shared.name,
+                solo / 1e6,
+                kept / 1e6,
+                share * 100.0,
+                SHARED_KEEP * 100.0,
+                vm / 1e6
+            ));
+            format!("BELOW {:.0}%", SHARED_KEEP * 100.0)
+        };
+        note(report, format!(
+            "{}: the Cubic flow alone {:.1} Mbit/s, beside vox {:.1} ({:.1}%), vox {:.1} — {verdict}; \
+             alone: {}; both: {}; per-second Cubic alone {:?}, Cubic beside vox {:?}, vox {:?}",
+            shared.name,
+            solo / 1e6,
+            kept / 1e6,
+            share * 100.0,
+            vm / 1e6,
+            lateness(&alone),
+            lateness(&both),
+            mbit(&alone, |x| x.other),
+            mbit(&both, |x| x.other),
+            mbit(&both, |x| x.vox)
         ));
     }
 
