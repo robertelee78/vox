@@ -194,7 +194,7 @@ fn a_cut_session_is_reset_not_hung() {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(ok, "kill {sig} vox room send");
+        assert!(ok, "CANNOT MEASURE: kill {sig} of vox room send failed");
         let cut = Instant::now();
         let held = bytes_in(&dir);
         let end = loop {
