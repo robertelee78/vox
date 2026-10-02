@@ -1099,6 +1099,8 @@ impl NodeNet {
             let label = format!("circuit via {}", short_id(relay.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
+            let store = Arc::clone(self.service.store());
+            let record_now = self.now();
             set.spawn(async move {
                 let started = tokio::time::Instant::now();
                 let deadline = started + DIRECT_HEAD_START;
@@ -1141,9 +1143,16 @@ impl NodeNet {
                             )),
                         );
                     }
-                    // This ladder's direct rung failed or there was none, and no dial elsewhere
-                    // was under way: nothing direct is coming.
-                    if *failed.borrow() && !dialling {
+                    // **Nor while the peer's board record is unread** (#321 c5's verdict): a reach
+                    // with no candidate that holds no record for the peer does not know whether a
+                    // direct address exists, and a `vox forward` has no link entry whose dial the
+                    // counter could see. A forward reached before its board read asked the anchor
+                    // at 0 ms while a direct path was coming (1 of 36 forwards, load 81).
+                    let unread =
+                        candidates_none && !lock(&store).holds_member_anywhere(&peer, record_now);
+                    // This ladder's direct rung failed or there was none, no dial elsewhere was
+                    // under way, and the peer's record has been read: nothing direct is coming.
+                    if *failed.borrow() && !dialling && !unread {
                         break;
                     }
                     if tokio::time::Instant::now() >= deadline {
@@ -1171,6 +1180,10 @@ impl NodeNet {
                         },
                         if elsewhere {
                             "; a direct dial elsewhere in this node held it back"
+                        } else if candidates_none
+                            && !lock(&store).holds_member_anywhere(&peer, record_now)
+                        {
+                            "; the peer's board record was still unread"
                         } else {
                             ""
                         }

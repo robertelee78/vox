@@ -738,6 +738,16 @@ impl RendezvousStore {
             .filter(|r| now < member_expiry(r))
     }
 
+    /// Whether a current member record for `author_id` is held for any room (V210-122): a node
+    /// that holds none has not read that member's board record yet, so it does not know whether a
+    /// direct address for it exists.
+    #[must_use]
+    pub fn holds_member_anywhere(&self, author_id: &Digest32, now: u64) -> bool {
+        self.members
+            .values()
+            .any(|b| b.get(author_id).is_some_and(|r| now < member_expiry(r)))
+    }
+
     /// The current, non-expired member bundle records for `(channelID, epoch)`, in
     /// unspecified order — the material a newcomer needs to seal its SKDM to each
     /// consenting member (ADR-016 M14).
