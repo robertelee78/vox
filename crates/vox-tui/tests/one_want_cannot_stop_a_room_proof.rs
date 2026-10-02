@@ -30,7 +30,7 @@
 //! said; a `vox` step of the setup that failed (an identity, a room, a staging post) is
 //! `PRODUCT (staging):`, and so is a session the victim never answers; a fault of this proof's own
 //! is `APPARATUS:`. The bound is read against an **apparatus clock** that is only the apparatus:
-//! the time to start a `vox --version` right after any slow post. The [`HELD`] staging posts are
+//! the time to run `/usr/bin/true`, not vox, right after any slow post. The [`HELD`] staging posts are
 //! the product's baseline, never part of that clock: one that fails, or misses [`PATIENCE`] while
 //! the clock is within [`APPARATUS_BUDGET`], is `PRODUCT (staging):`. A post or read during the
 //! attack over [`PATIENCE`] while the clock was over [`APPARATUS_BUDGET`] is `CANNOT MEASURE`;
@@ -66,31 +66,39 @@ use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 const PATIENCE: Duration = Duration::from_secs(5);
 /// Posts the victim makes before the attack, so there is something to serve.
 const HELD: usize = 50;
-/// The most a `vox --version` may take on a runner that can time a [`PATIENCE`] bound.
+/// The most `/usr/bin/true` may take to run on a runner that can time a [`PATIENCE`] bound.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
-/// The apparatus clock: how long this machine takes, now, to start a `vox` that does nothing
-/// (`vox --version` on the profile at `data`). A stalled runner stalls this too.
-fn apparatus_spawn(data: &Path) -> Duration {
-    let (ok, took, said) = vox_timed(data, &["--version"], PATIENCE * 6);
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
+    let t = std::time::Instant::now();
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
         ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {said}"
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
-    took
+    t.elapsed()
 }
 
 /// Red if a timed verb missed [`PATIENCE`]: `CANNOT MEASURE` when the apparatus clock taken
 /// right after it is over [`APPARATUS_BUDGET`], otherwise `side` (the product's).
-fn within_patience(data: &Path, side: &str, what: &str, ok: bool, took: Duration, said: &str) {
+fn within_patience(side: &str, what: &str, ok: bool, took: Duration, said: &str) {
     if ok && took < PATIENCE {
         return;
     }
-    let apparatus = apparatus_spawn(data);
+    let apparatus = apparatus_spawn();
     assert!(
         // A verb that failed before its cap answered: that is the product's, whatever the clock.
         apparatus <= APPARATUS_BUDGET || (!ok && took < PATIENCE * 6),
-        "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+        "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
          {APPARATUS_BUDGET:?}) right after {what} took {took:?}, so the runner, not the node, may \
          be slow. It said: {said}"
     );
@@ -121,7 +129,7 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .take()
         .expect("APPARATUS: vox's stdin")
         .write_all(stdin.as_bytes())
-        .expect("APPARATUS: write vox's stdin");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
@@ -301,7 +309,6 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
             PATIENCE * 6,
         );
         within_patience(
-            &victim_dir,
             "PRODUCT (staging)",
             &format!("staging post {i}, with no attack at all,"),
             ok,
@@ -438,7 +445,6 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
     let (ok, took, said) = vox_timed(&victim_dir, &["room", "post", &room, text], PATIENCE * 6);
     println!("[proof] post during the attack: ok={ok} in {took:?} (quiet {quiet:?})");
     within_patience(
-        &victim_dir,
         "PRODUCT",
         &format!(
             "a post into the room on the victim, while one member's WANT (author, 1, u64::MAX) \
@@ -454,7 +460,6 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         read.contains(text)
     );
     within_patience(
-        &victim_dir,
         "PRODUCT",
         "the victim's `vox room read` during the attack",
         ok,

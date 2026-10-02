@@ -107,7 +107,7 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
             .take()
             .expect("APPARATUS: the hook's stdin")
             .write_all(input.as_bytes())
-            .unwrap_or_else(|e| panic!("APPARATUS: write the hook's stdin: {e}"));
+            .unwrap_or_else(|e| panic!("PRODUCT (staging): `vox agent hook` exited without reading its stdin (the write failed: {e})"));
     }
     let out = child
         .wait_with_output()

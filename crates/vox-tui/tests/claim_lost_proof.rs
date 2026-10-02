@@ -101,27 +101,40 @@ fn claim(w: &Worker, session: &str, r: &str, res: &str, ttl: &str) {
 /// follows cannot be measured. Timed from before the claim was made, which the TTL starts after.
 const SHORT_TTL: Duration = Duration::from_secs(2);
 
-/// The most a `vox --version` may take on a runner that can stage a claim inside [`SHORT_TTL`].
+/// The most `/usr/bin/true` may take to run on a runner that can stage a claim inside [`SHORT_TTL`].
 const APPARATUS_BUDGET: Duration = Duration::from_secs(1);
+
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
+    let t = std::time::Instant::now();
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
+    assert!(
+        ok,
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
+    );
+    t.elapsed()
+}
 
 /// Red if the claim and its drain took past [`SHORT_TTL`]. They are `vox` verbs, so a slow one is
 /// `PRODUCT (staging)`; it is `CANNOT MEASURE` only when the apparatus clock taken right after
-/// (`vox --version`, which asks no node anything) is over [`APPARATUS_BUDGET`].
-fn recorded_within_ttl(w: &Worker, since: Instant, what: &str) {
+/// (`/usr/bin/true`, not vox) is over [`APPARATUS_BUDGET`].
+fn recorded_within_ttl(since: Instant, what: &str) {
     let took = since.elapsed();
     if took < SHORT_TTL {
         return;
     }
-    let t = Instant::now();
-    let o = w.vox(None, &["--version"]);
-    let apparatus = t.elapsed();
-    assert!(
-        o.ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {o:?}"
-    );
+    let apparatus = apparatus_spawn();
     assert!(
         apparatus <= APPARATUS_BUDGET,
-        "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+        "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
          {APPARATUS_BUDGET:?}) right after claiming {what} and recording it in a drain took \
          {took:?}, so the runner, not the node, may be slow"
     );
@@ -152,7 +165,7 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     claim(alice, "s1", r, "lapses", "2");
     let _ = drain(alice, r, "s1"); // records what s1 holds
     let quiet = drain(alice, r, "s1");
-    recorded_within_ttl(alice, t, "`lapses` and draining twice");
+    recorded_within_ttl(t, "`lapses` and draining twice");
     assert!(
         !quiet.contains("no longer hold"),
         "PRODUCT: a session whose claims did not change must be told nothing: {quiet:?}"
@@ -179,7 +192,7 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let t = Instant::now();
     claim(alice, "s1", r, "taken", "2");
     let _ = drain(alice, r, "s1");
-    recorded_within_ttl(alice, t, "`taken`");
+    recorded_within_ttl(t, "`taken`");
     std::thread::sleep(Duration::from_secs(4));
     until(
         bob,
@@ -210,7 +223,7 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let t = Instant::now();
     claim(alice, "s1", r, "reserved", "2");
     let _ = drain(alice, r, "s1");
-    recorded_within_ttl(alice, t, "`reserved`");
+    recorded_within_ttl(t, "`reserved`");
     std::thread::sleep(Duration::from_secs(4));
     until(
         bob,
@@ -261,7 +274,7 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let t = Instant::now();
     claim(alice, "s1", r, "gone", "2");
     let _ = drain(alice, r, "s1");
-    recorded_within_ttl(alice, t, "`gone`");
+    recorded_within_ttl(t, "`gone`");
     let o = alice.vox(Some("s1"), &["room", "release", r, "mine"]);
     assert!(o.ok, "PRODUCT: alice's release of `mine` failed: {o:?}");
     std::thread::sleep(Duration::from_secs(4));

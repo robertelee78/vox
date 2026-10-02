@@ -24,7 +24,7 @@
 //! `vox` step of the setup that failed is `PRODUCT (staging):`. Before the fetch, bob makes the
 //! same posts with no fetch running: the product's baseline, never part of the apparatus clock,
 //! so one that fails or misses [`ANSWER_WITHIN`] is `PRODUCT (staging):`. The **apparatus clock**
-//! is only the apparatus: the time to start a `vox --version` right after any slow post. A slow
+//! is only the apparatus: the time to run `/usr/bin/true`, not vox, right after any slow post. A slow
 //! post is `CANNOT MEASURE` only while that clock is over [`APPARATUS_BUDGET`].
 //!
 //! Mutation: the dial back on the actor (the parent of this change) — (2) and (3) go red.
@@ -116,7 +116,7 @@ impl Agent {
             .take()
             .expect("APPARATUS: vox's stdin")
             .write_all(stdin.as_bytes())
-            .expect("APPARATUS: write vox's stdin");
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         let out = child.wait_with_output().expect("APPARATUS: wait for vox");
         (
             out.status.success(),
@@ -261,17 +261,24 @@ fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> S
 
 /// How long the daemon may take to take a post while a fetch dials.
 const ANSWER_WITHIN: Duration = Duration::from_secs(2);
-/// The most a `vox --version` may take on a runner that can time an [`ANSWER_WITHIN`] bound.
+/// The most `/usr/bin/true` may take to run on a runner that can time an [`ANSWER_WITHIN`] bound.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(1);
 
-/// The apparatus clock: how long this machine takes, now, to start a `vox` that does nothing
-/// (`vox --version` in `who`'s profile). A stalled runner stalls this too.
-fn apparatus_spawn(who: &Agent) -> Duration {
-    let t = Instant::now();
-    let (ok, out, err) = who.vox(&["--version"]);
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
+    let t = std::time::Instant::now();
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
         ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {out}{err}"
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }
@@ -279,15 +286,15 @@ fn apparatus_spawn(who: &Agent) -> Duration {
 /// Red if a post missed [`ANSWER_WITHIN`]: `CANNOT MEASURE` when the apparatus clock taken right
 /// after it is over [`APPARATUS_BUDGET`], otherwise `side` (the product's). A post that failed
 /// is the product's, whatever the clock.
-fn answered_within(who: &Agent, side: &str, what: &str, ok: bool, took: Duration, said: &str) {
+fn answered_within(side: &str, what: &str, ok: bool, took: Duration, said: &str) {
     assert!(ok, "{side}: {what} failed in {took:?}: {said}");
     if took < ANSWER_WITHIN {
         return;
     }
-    let apparatus = apparatus_spawn(who);
+    let apparatus = apparatus_spawn();
     assert!(
         apparatus <= APPARATUS_BUDGET,
-        "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+        "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
          {APPARATUS_BUDGET:?}) right after {what} took {took:?}, so the runner, not the node, may \
          be slow"
     );
@@ -359,7 +366,6 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
         let (ok, _, err) = bob.vox(&["room", "post", &room, &format!("before {n}")]);
         let t = asked.elapsed();
         answered_within(
-            &bob,
             "PRODUCT (staging)",
             &format!("bob's post {n}, with no fetch running,"),
             ok,
@@ -447,7 +453,6 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
     let all = answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>();
     for (t, ok, err) in &answers {
         answered_within(
-            &bob,
             "PRODUCT",
             &format!(
                 "bob's daemon taking a post while a fetch dialled — the dial held its actor (#215); \

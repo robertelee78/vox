@@ -115,8 +115,11 @@ fn vox_in(
         .unwrap_or_else(|e| panic!("APPARATUS: spawn vox: {e}"));
     if let Some(text) = input {
         let mut pipe = child.stdin.take().expect("APPARATUS: vox stdin");
-        pipe.write_all(text.as_bytes())
-            .unwrap_or_else(|e| panic!("APPARATUS: write vox's stdin: {e}"));
+        pipe.write_all(text.as_bytes()).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT (staging): vox exited without reading its stdin (the write failed: {e})"
+            )
+        });
         drop(pipe);
     }
     let out = child
@@ -212,7 +215,7 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         .as_mut()
         .expect("APPARATUS: the daemon's stdin")
         .write_all(b"the wrong passphrase\n")
-        .unwrap_or_else(|e| panic!("APPARATUS: write the daemon's stdin: {e}"));
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): the daemon exited without reading its passphrases (the write failed: {e})"));
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("APPARATUS: wait for the daemon: {e}"));
@@ -241,7 +244,7 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         .as_mut()
         .expect("APPARATUS: the daemon's stdin")
         .write_all(format!("{IDENTITY}\n{} {ROOMPASS}\n", &room[..12]).as_bytes())
-        .unwrap_or_else(|e| panic!("APPARATUS: write the daemon's stdin: {e}"));
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): the daemon exited without reading its passphrases (the write failed: {e})"));
     // Closing stdin is what a pipe does; the daemon must not need it held open.
     drop(child.stdin.take());
     let pid = child.id();
@@ -319,7 +322,7 @@ fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
         .take()
         .expect("APPARATUS: the setup daemon's stdin");
     pipe.write_all(format!("{IDENTITY}\n").as_bytes())
-        .unwrap_or_else(|e| panic!("APPARATUS: write the setup daemon's stdin: {e}"));
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): the setup daemon exited without reading its passphrase (the write failed: {e})"));
     drop(pipe);
     let pid = setup.id();
     let said = Arc::new(Mutex::new(String::new()));

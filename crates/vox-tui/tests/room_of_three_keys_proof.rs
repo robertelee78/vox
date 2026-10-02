@@ -95,7 +95,7 @@ impl Member {
                 .take()
                 .expect("APPARATUS: vox's stdin")
                 .write_all(s.as_bytes())
-                .unwrap_or_else(|e| panic!("APPARATUS: write vox's stdin: {e}"));
+                .unwrap_or_else(|e| panic!("PRODUCT (staging): vox exited without reading its stdin (the write failed: {e})"));
         }
         let out = child
             .wait_with_output()

@@ -272,7 +272,7 @@ impl Disk {
     fn store(&self) -> Store {
         Store::open_read_only(&self.store_file).unwrap_or_else(|e| match e {
             vox_core::Error::ProfileBusy => panic!(
-                "APPARATUS: a vox process the test stopped still holds {}",
+                "PRODUCT: a vox process the test stopped still holds {}",
                 self.store_file.display()
             ),
             e => panic!(

@@ -122,7 +122,7 @@ fn vox_in(
     if let Some(text) = input {
         let mut pipe = child.stdin.take().expect("APPARATUS: vox's stdin");
         pipe.write_all(text.as_bytes())
-            .expect("APPARATUS: write vox's stdin");
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(pipe);
     }
     let out = child.wait_with_output().expect("APPARATUS: wait for vox");
@@ -181,7 +181,7 @@ fn daemon(data: &std::path::Path, cfg: &std::path::Path, stdin_lines: &str) -> D
     // like a daemon that failed to start.
     let mut pipe = child.stdin.take().expect("APPARATUS: the daemon's stdin");
     pipe.write_all(stdin_lines.as_bytes())
-        .expect("APPARATUS: write the daemon's passphrases");
+        .expect("PRODUCT (staging): the daemon exited without reading its passphrases");
     drop(pipe);
     Daemon(child)
 }

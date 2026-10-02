@@ -121,7 +121,7 @@ impl Agent {
             .take()
             .expect("APPARATUS: vox's stdin")
             .write_all(stdin.as_bytes())
-            .expect("APPARATUS: write vox's stdin");
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         let out = child.wait_with_output().expect("APPARATUS: wait for vox");
         (
             out.status.success(),
