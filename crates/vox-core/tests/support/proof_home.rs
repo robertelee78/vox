@@ -15,9 +15,10 @@
 //!
 //! Two things keep their real locations, and both are tools rather than anything under test:
 //! `CARGO_HOME` and `RUSTUP_HOME` are pinned to the real ones when unset, so a toolchain shim on
-//! PATH still finds its toolchains. And [`real_home`] answers the few lookups whose whole point is
-//! the operator's real HOME: the OpenCode credential a live-model proof copies into its sandbox,
-//! and the canary that proves the sandbox keeps a model out of it.
+//! PATH still finds its toolchains. And [`real_home`] answers the two lookups whose whole point is
+//! the operator's real HOME, both in live-model proofs only and never in a blocking one: reading
+//! the OpenCode credential copied into the sandbox, and the canary that proves the sandbox keeps a
+//! model out of it.
 //!
 //! **It checks itself once.** A child shell reports its HOME and writes a sentinel there; the HOME
 //! must be the temporary one, and the sentinel must land there and not in the real HOME. A
@@ -35,9 +36,6 @@ static REAL_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// The operator's `XDG_DATA_HOME`, as it was before [`isolate`] replaced it.
 static REAL_DATA_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-/// The operator's `XDG_CONFIG_HOME`, as it was before [`isolate`] replaced it.
-static REAL_CONFIG_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
-
 /// The temporary HOME every child of this process gets.
 static PROOF_HOME: OnceLock<PathBuf> = OnceLock::new();
 
@@ -53,7 +51,6 @@ pub fn isolate() {
         let real = std::env::var_os("HOME").map(PathBuf::from);
         let _ = REAL_HOME.set(real.clone());
         let _ = REAL_DATA_HOME.set(std::env::var_os("XDG_DATA_HOME").map(PathBuf::from));
-        let _ = REAL_CONFIG_HOME.set(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from));
         // Toolchain shims on PATH find their toolchains through HOME unless told; tell them where
         // they really are, so moving HOME breaks no tool. Only when unset: an explicit value stays.
         if let Some(real) = &real {
@@ -93,8 +90,11 @@ pub fn proof_home() -> Option<&'static Path> {
     PROOF_HOME.get().map(PathBuf::as_path)
 }
 
-/// The operator's real HOME, for the lookups that exist to reach it (a credential to copy into a
-/// sandbox, a canary to keep a model away from). Never hand it to a child of the proof.
+/// The operator's real HOME, for the two lookups that exist to reach it, both in
+/// `support/oc_sandbox.rs` and both reached only from live-model proofs (feature
+/// `live-model-sandbox`): **reading** OpenCode's credential to copy into the sandbox, and planting
+/// and probing the canary the sandbox must keep a model away from. **Never from a blocking proof**,
+/// and never handed to a child of the proof.
 pub fn real_home() -> Option<PathBuf> {
     match REAL_HOME.get() {
         Some(real) => real.clone(),
@@ -104,23 +104,13 @@ pub fn real_home() -> Option<PathBuf> {
 }
 
 /// The operator's real data directory (`XDG_DATA_HOME`, else `~/.local/share` under
-/// [`real_home`]), for the same lookups as [`real_home`] and nothing else.
+/// [`real_home`]), only to **read** OpenCode's credential for a live-model proof's sandbox.
 pub fn real_data_home() -> Option<PathBuf> {
     let set = match REAL_DATA_HOME.get() {
         Some(d) => d.clone(),
         None => std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
     };
     set.or_else(|| real_home().map(|h| h.join(".local/share")))
-}
-
-/// The operator's real configuration directory (`XDG_CONFIG_HOME`, else `~/.config` under
-/// [`real_home`]), for a tool's own login (`gh`) and nothing else.
-pub fn real_config_home() -> Option<PathBuf> {
-    let set = match REAL_CONFIG_HOME.get() {
-        Some(d) => d.clone(),
-        None => std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-    };
-    set.or_else(|| real_home().map(|h| h.join(".config")))
 }
 
 /// A child reports its HOME and writes the sentinel there: it must be `home`, and the sentinel

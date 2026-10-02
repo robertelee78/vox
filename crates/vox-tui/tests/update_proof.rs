@@ -187,15 +187,10 @@ fn published_version(triple: &str) -> Option<String> {
 /// when it is absent or unauthenticated the journey claim is reported unproven, not skipped.
 fn earlier_release(newest: &str) -> Result<String, String> {
     let asset = format!("vox-{}", target_triple());
-    let mut gh = Command::new("gh");
-    // `gh` is a tool of this proof, not the product: it may use the operator's own login, which
-    // the temporary HOME every child gets would otherwise hide (V210-157). Only its config dir.
-    if std::env::var_os("GH_CONFIG_DIR").is_none() {
-        if let Some(c) = watchdog::proof_home::real_config_home() {
-            gh.env("GH_CONFIG_DIR", c.join("gh"));
-        }
-    }
-    let out = gh
+    // `gh` runs with the proof's temporary HOME like every child (V210-157), so it is
+    // authenticated only by `GH_TOKEN`, which CI sets for this proof; never by the operator's
+    // own login.
+    let out = Command::new("gh")
         .args([
             "api",
             "--paginate",
