@@ -910,6 +910,14 @@ pub struct AgentHookArgs {
     /// stdin. So the id arrives as a flag instead.
     #[arg(long)]
     pub session: Option<String>,
+    /// An entry this session was already shown by a wake, so the drain does not show it again.
+    /// Repeatable.
+    ///
+    /// A wake arrives as the harness's own prompt, and the drain then runs on that prompt. The
+    /// OpenCode plugin relays wakes itself, so it knows which entries it delivered and passes
+    /// them here.
+    #[arg(long, value_name = "ENTRY")]
+    pub woken: Vec<String>,
 }
 
 /// Naming a room on a running node. No passphrase: the node is already unlocked.
@@ -1792,6 +1800,7 @@ pub fn run() -> ExitCode {
                 args.room.as_deref(),
                 format,
                 args.session.as_deref(),
+                &args.woken,
             ));
             // Always success: a hook that fails must not break the turn.
             ExitCode::SUCCESS

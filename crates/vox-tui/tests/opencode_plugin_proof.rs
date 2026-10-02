@@ -65,9 +65,18 @@
 //! 4. and the tool that was running **still runs to its end** (its output reaches the screen):
 //!    the interrupt queues into the running turn, never aborts it.
 //!
+//! Then, once the turn the wake started has answered, what the model was **given** — the
+//! session's user messages as OpenCode stored them, after the plugin rewrote them (V210-112):
+//!
+//! 5. the message that woke it appears **once**, as the wake itself: the `<vox-room>` read that
+//!    follows does not repeat it; and the one addressed to someone else, which woke nothing,
+//!    appears exactly once, in that read;
+//! 6. and every message is shown as its words, never as its envelope JSON.
+//!
 //! Mutation-checked: `vox agent hook` not registering the plugin's socket (the session stays
 //! `unknown`) goes red at (1) and (3); the plugin taking the wake and never relaying it goes
-//! red at (3).
+//! red at (3); the drain re-emitting a woken message goes red at (5); the text format printing
+//! a message's raw envelope goes red at (6).
 //!
 //! ## The wake directory goes with the session, however the person quits (ADR-021 F17)
 //!
@@ -511,6 +520,36 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
              turn {turn}: {said}"
         );
     }
+    if let Some(given) = seen("RECEIVED") {
+        println!("[proof] what the model was given: {given}");
+        let count = |key: &str| {
+            given
+                .split_whitespace()
+                .find_map(|f| f.strip_prefix(&format!("{key}=")))
+                .unwrap_or("(none)")
+                .to_owned()
+        };
+        if given == "never" || count("woken") == "(none)" {
+            panic!(
+                "CANNOT MEASURE: the turn the wake started never answered, so what the model was \
+                 given could not be read: {said}"
+            );
+        }
+        assert!(
+            count("woken") == "1" && count("other") == "1",
+            "PRODUCT (5): the message that woke the session must reach the model once — as the \
+             wake, not again in the room read that follows — and the one that woke nothing \
+             exactly once; the model was given woken={} other={}: {said}",
+            count("woken"),
+            count("other")
+        );
+        assert!(
+            count("envelope") == "no",
+            "PRODUCT (6): the room read must show each message as written, never as its envelope \
+             JSON; envelope={}: {said}",
+            count("envelope")
+        );
+    }
     // Only the plugin makes a wake directory, so a session that has none is the product's.
     if let Some(nodir) = seen("NODIR") {
         panic!(
@@ -537,7 +576,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             panic!("APPARATUS: the driver exited 0 without its `wake {key}:` line: {said}")
         })
     };
-    for key in ["REGISTERED", "OTHER", "WAKE", "TURN"] {
+    for key in ["REGISTERED", "OTHER", "WAKE", "TURN", "RECEIVED"] {
         line(key);
     }
 

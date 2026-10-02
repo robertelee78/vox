@@ -221,11 +221,11 @@ impl std::fmt::Display for WakeError {
     }
 }
 
-/// Wake one session with `text`.
+/// Wake one session with `text`, which carries the room entry `entry` (its full base32 hash).
 ///
 /// # Errors
 /// If the harness has no implemented wake path, or delivery fails.
-pub async fn wake(session: &Session, text: &str) -> Result<(), WakeError> {
+pub async fn wake(session: &Session, entry: &str, text: &str) -> Result<(), WakeError> {
     match session.harness.as_str() {
         "claude" => wake_claude(Path::new(&session.endpoint), &session.token, text).await,
         "opencode" => {
@@ -233,6 +233,7 @@ pub async fn wake(session: &Session, text: &str) -> Result<(), WakeError> {
                 Path::new(&session.endpoint),
                 &session.token,
                 &session.session,
+                entry,
                 text,
             )
             .await
@@ -293,16 +294,26 @@ async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), WakeE
 
 /// The Vox OpenCode plugin's wake socket: an `auth` frame, then a `prompt` frame for
 /// `session`, answered with one line saying whether OpenCode took it.
+///
+/// The frame names the `entry` it carries, so the plugin can tell the session's drain that
+/// this message was delivered already, and the drain does not give it to the model a second
+/// time (V210-112).
 async fn wake_opencode(
     socket: &Path,
     token: &str,
     session: &str,
+    entry: &str,
     text: &str,
 ) -> Result<(), WakeError> {
     use tokio::io::AsyncBufReadExt as _;
     let mut stream = connect(socket).await?;
     let auth = serde_json::json!({ "type": "auth", "token": token });
-    let prompt = serde_json::json!({ "type": "prompt", "session": session, "text": text });
+    let prompt = serde_json::json!({
+        "type": "prompt",
+        "session": session,
+        "entry": entry,
+        "text": text,
+    });
     send(&mut stream, &[auth, prompt]).await?;
     let mut line = String::new();
     tokio::io::BufReader::new(stream)

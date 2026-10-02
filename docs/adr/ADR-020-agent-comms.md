@@ -966,6 +966,25 @@ Both unknowns are already spiked; neither remains open.
   > client's `promptAsync`; `opencode_plugin_proof` interrupts a plain, hand-opened `opencode` mid-tool
   > through `vox daemon`.
 
+  > **Named defect, 2026-10-01 (V210-112): a woken OpenCode session was given the message twice.**
+  > The relayed wake is a user message, so the plugin's drain ran on it and read the same message
+  > into the same prompt; that read also showed every agent message as its raw envelope JSON. Fixed
+  > 2026-10-01 for v0.2.10: the daemon's `prompt` frame names its entry, the plugin passes the entries
+  > it has relayed to `vox agent hook --woken`, and the drain skips them until its cursor passes them
+  > (measured: OpenCode runs the wake's `chat.message` before `promptAsync` returns, so the plugin also
+  > matches the prompt by its text); the drain renders an envelope's `body`. `opencode_plugin_proof`
+  > reads the session as OpenCode stored it and asserts one copy of the woken message, one of a
+  > message that woke nothing, and no envelope JSON. **A Claude Code wake had the same defect:**
+  > measured against a live Claude Code 2.1.287, a message written to its messaging socket runs
+  > `UserPromptSubmit` with that message as `prompt`, so the drain read the woken message into the
+  > same turn. The drain now recognises its own wake in the `prompt` it runs on (the wake's opening, its
+  > room's label, the entry and every word) and skips that entry; `remote_interrupt_proof` (5) runs the
+  > hook on the wake its stand-in socket received and asserts the room read leaves it out. That spike
+  > also showed Claude Code presenting the wake as a message "from another Claude session … a
+  > teammate's request", so the wake now opens by saying plainly it is a Vox room message: who sent
+  > it, in which room, relayed by Vox, and not a request from another agent session (the decider,
+  > 2026-10-01). V210-79's sentence that follows it is unchanged.
+
   > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, then reproduced through the real
   > `vox daemon`; fix proposed in #16.** `vox daemon`
   > decides on `NodeEvent::NewEntry`, which the node emits only for its **own** appends (ADR-021 F13's
