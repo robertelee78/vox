@@ -258,6 +258,12 @@ const LAG_PAD: usize = 8 * 1024;
 #[ignore = "two networked nodes, production Argon2id and a 1,800-message burst; CI runs it in release"]
 fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     watchdog::arm();
+    let t0 = std::time::Instant::now();
+    macro_rules! mark {
+        ($n:expr) => {
+            eprintln!("[phase] {:>7.1}s {}", t0.elapsed().as_secs_f64(), $n)
+        };
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -267,6 +273,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let mut room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
+    mark!("room ready");
 
     // ---- the fold half: a contested claim, a completed handoff, a lapse ----
     let o = alice.vox(Some("a1"), &["room", "claim", &r, "contested"]);
@@ -367,6 +374,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         "PRODUCT: board --json still shows a claim whose ttl lapsed: {board}"
     );
     eprintln!("[proof] board --json: {from_board:?}");
+    mark!("fold half done");
 
     // ---- the stream half ----
     let start_cursor = rows.last().unwrap()["entry_hash"]
@@ -434,6 +442,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     signal(&run, "-STOP"); // frozen: it reads nothing, so only the kernel buffer absorbs
     burst(bob, 899, LAG_PAD);
+    mark!("run1 burst 899 posted");
     // **A wedged client cannot stall the node** (RP-45): while the first is still frozen,
     // the second receives every one of bob's 900 appends.
     let during = steady.wait_for(900, 60);
@@ -447,18 +456,21 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     signal(&run, "-CONT");
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     consume(&run, 300, idle, &mut cursor, &mut seen);
+    mark!("run1 consumed 300");
     kill(&mut run, &mut restarts, &cursor, &seen);
     // Run 2: die in the middle of a synced burst from the other node.
     let mut run = start(bob, &r, &cursor, &stderr);
     // First drain the backlog run 1 left, so every row counted below is one that
     // arrived by sync WHILE this consumer was running.
     while consume(&run, 1000, Duration::from_secs(3), &mut cursor, &mut seen) > 0 {}
+    mark!("run2 backlog drained");
     burst(alice, 300, 0);
     // LIVENESS, not just completeness: rows synced from another node must reach a
     // consumer while it runs. A stream that only delivered them after a restart would
     // still have no gap — the defect `tail` shipped with — so this is its own assertion.
     let mut live_seen: BTreeMap<String, u32> = BTreeMap::new();
     let live = consume(&run, 200, idle, &mut cursor, &mut live_seen);
+    mark!("run2 live 200");
     assert_eq!(
         live, 200,
         "PRODUCT: rows synced from another node must reach a LIVE consumer, not only a \
@@ -486,14 +498,17 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     // Run 3: stall under another synced burst, then die.
     let mut run = start(bob, &r, &cursor, &stderr);
     consume(&run, 50, idle, &mut cursor, &mut seen);
+    mark!("run3 consumed 50");
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     burst(alice, 300, 0);
     std::thread::sleep(Duration::from_secs(2));
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     consume(&run, 250, idle, &mut cursor, &mut seen);
+    mark!("run3 consumed 250");
     kill(&mut run, &mut restarts, &cursor, &seen);
     // The rest, while nobody is listening.
     burst(alice, 300, 0);
+    mark!("all bursts posted");
 
     let all = until(
         bob,
@@ -526,6 +541,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         "CANNOT MEASURE: staging not achieved — the log after the starting cursor is not the \
          1,800-message burst"
     );
+    mark!("log holds 1800");
 
     let mut run = start(bob, &r, &cursor, &stderr);
     let expected: BTreeSet<&String> = after.iter().collect();
@@ -538,6 +554,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     }
     let _ = run.child.kill();
     let _ = run.child.wait();
+    mark!("final drain done");
 
     // **One client dying disturbs no other** (RP-18): the second consumer, attached
     // throughout, survived the first's three SIGKILLs and holds every message.
