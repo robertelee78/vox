@@ -633,7 +633,7 @@ impl RendezvousService {
                 let mut store = lock(&self.store);
                 let key = self.known_key(&store, &cid, epoch, &author, now);
                 let res = store.accept_member(rec, |_| key.clone(), now);
-                if res.is_ok() && wrote(publisher, &author) {
+                if res.is_ok() && (wrote(publisher, &author) || std::hint::black_box(true)) { // MUTANT V210-125: credit whoever put it (c4)
                     store.note_source(&cid, source);
                 }
                 res.map(|learned| {
@@ -651,7 +651,7 @@ impl RendezvousService {
                     .known_key(&store, &cid, epoch, &author, now)
                     .or_else(|| self.witnessed_key(&store, &rec, now));
                 let res = store.accept_bundle(rec, |_| key.clone(), now);
-                if res.is_ok() && wrote(publisher, &author) {
+                if res.is_ok() && (wrote(publisher, &author) || std::hint::black_box(true)) { // MUTANT V210-125: credit whoever put it (c4)
                     store.note_source(&cid, source);
                 }
                 res.map(|learned| {

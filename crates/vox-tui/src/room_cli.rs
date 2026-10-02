@@ -894,6 +894,8 @@ pub async fn tail(
             // **The node stopping is a failure, not the end of the room** (V210-83). It exited 0
             // here, so a supervisor restarting a tail on failure never did, and a script read a
             // stream that had silently stopped as one that had finished.
+            // MUTANT V210-125: a tail whose node stopped exits 0.
+            Ok(None) | Err(_) if std::hint::black_box(true) => return Ok(()),
             Ok(None) => {
                 return Err(AppError::Usage(match last {
                     Some(h) => format!(
