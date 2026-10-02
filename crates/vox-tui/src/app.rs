@@ -970,8 +970,12 @@ fn tend(
         let ahead = crate::agent_hook::delivered_ahead(paths, &session.room, &session.session);
         let (urgent, replies) = crate::wake::unread(&detail.timeline, me, &session, cursor, &ahead);
         let before = n.clone();
-        // **What landed while the daemon was down is owed too**: its rows are history to the
-        // wake loop, so nothing new marks them. At start every session is counted from its cursor.
+        // **At start every session is counted from its cursor.** This guards one window only: a
+        // daemon killed after a row reached its store and before the wake loop looked at it (the
+        // next sweep, at most 2 s). Such a row is history to the restarted loop, so nothing new
+        // marks it. Rows that land while the daemon is down arrive by sync after it starts and are
+        // judged as new without this. The window cannot be staged through the shipped binary
+        // (`vox room post` needs a running node), so this is unproven by mutant: a review-only guard.
         if starting && !urgent.is_empty() {
             n.urgent_due = true;
         }

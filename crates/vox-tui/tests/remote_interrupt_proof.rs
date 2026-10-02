@@ -68,7 +68,10 @@
 //! 8. `vox agent plugin claude` prints the `UserPromptSubmit`, `Stop` and `SessionEnd` entries;
 //! 9. **what lands while the daemon is down is announced when it starts**: bob's daemon stopped,
 //!    alice answers an idle session's question and sends it an urgent message; once the daemon
-//!    is back, both are counted in a notice.
+//!    is back, both are counted in a notice. They reach bob's node by sync after it starts, so
+//!    this does not exercise the daemon's startup count (which guards only a crash between a row
+//!    landing and the next sweep, and is unproven by mutant); it goes red if what arrives after a
+//!    restart is not announced.
 //!
 //! (8) of the first test: sixty older messages and one urgent, more than one turn's 50: the turn
 //! the wake starts shows the urgent one first and 49 others, a second urgent wake counts only the

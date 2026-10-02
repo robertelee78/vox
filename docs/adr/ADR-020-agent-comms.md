@@ -471,8 +471,11 @@ or announced again. The daemon **recounts** the unread urgent addressed rows pas
 cursor just before it wakes and sends nothing when there are none. A session has **at most one
 notice outstanding**: none more until its cursor moves or `agent_wake_hold` (10 minutes) passes,
 which dedupes and drops nothing. A notice that does not arrive (the endpoint fails or times out)
-stays owed and is tried again once the hold passes or the cursor moves. When the daemon starts,
-every session is counted from its cursor, so what landed while it was down is owed too. The
+stays owed and is tried again once the hold passes or the cursor moves. Messages that land
+while the daemon is down reach its node by sync once it starts, and are announced as any new
+message is. When the daemon starts it also counts every session from its cursor: that guards only
+a daemon killed between a message reaching its store and the wake loop's next look (at most 2 s),
+a window no real-binary proof can stage, so this guard is unproven by mutant. The
 cursor and the set shown ahead of it are one file, written whole, so the daemon never reads one
 without the other. Codex is unchanged: it has no wake path.
 
