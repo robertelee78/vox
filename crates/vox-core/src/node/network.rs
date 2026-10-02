@@ -91,8 +91,9 @@ pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 /// **500 ms, not 250** (#321, attempt 3). A direct dial's first answer cannot come before the peer
 /// has done its post-quantum handshake crypto, and on a loaded machine that is most of the time:
 /// a CI runner's direct dial over a 30 ms path took 271 ms and lost to the circuit at 250 ms
-/// (run 36968701360). 500 ms is the top of the range the plan gave; a pair that cannot reach each
-/// other directly pays it once per reach. Waiting on the peer's first answer instead does not help:
+/// (run 36968701360). 500 ms is the top of the range the plan gave. A reach pays it only while a
+/// direct dial to the peer is under way: one with no direct address and no dial elsewhere asks for
+/// its circuit at once. Waiting on the peer's first answer instead does not help:
 /// the dialling side's handshake finishes as soon as that answer arrives.
 ///
 /// RFC 8305's connection-attempt delay, as for a join's board search. Measured: a direct join over
@@ -1030,17 +1031,21 @@ impl NodeNet {
         // **Direct first, by a head start** (V210-122, ADR-012): every circuit waits
         // [`DIRECT_HEAD_START`] before it asks a relay for anything, and gives way at once to a
         // direct connection to the peer — this ladder's own direct rung, a dial elsewhere in the
-        // node, or the peer's own connection **inbound**. It starts sooner only if this ladder's
-        // direct rung failed.
+        // node, or the peer's own connection inbound. It starts sooner once nothing direct is
+        // under way: this ladder's direct rung failed, or there was none, and no dial elsewhere
+        // in the node is still running.
         //
-        // **Whatever this reach knows of the peer's address.** Two reaches with no direct
-        // candidate asked for a circuit at once, and each raced a direct path that was already
-        // coming: a node that had not read the peer's board record yet, while it dialled the
-        // peer's invite-link address (3 of 12 cold `vox up`s), and a host that cannot dial a
-        // guest at all, while the guest's own direct connection was arriving (4 of 9 runs, the
-        // anchor carrying the host's circuit). Not knowing an address is not knowing there is no
-        // direct path, so they wait the head start too.
-        let (direct_failed, failed) = tokio::sync::watch::channel(false);
+        // **A dial elsewhere counts.** A node that had not read the peer's board record yet asked
+        // for a circuit at once while it dialled the peer's invite-link address (3 of 12 cold
+        // `vox up`s); that dial holds the circuits back too.
+        //
+        // **Nothing direct under way, no wait.** Every circuit waited the whole head start even
+        // with no direct dial anywhere, so a pair that can only be relayed paid it on every reach:
+        // a relayed `vox forward` restart took 253–271 ms, against 7–9 ms before (V210-57's bound
+        // is 150 ms). A host that cannot dial its guest may then bridge while the guest's own
+        // connection is arriving; the decider rules those circuits legitimate (2026-10-02).
+        let candidates_none = candidates.is_empty();
+        let (direct_failed, failed) = tokio::sync::watch::channel(candidates_none);
         if !candidates.is_empty() {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
@@ -1056,7 +1061,39 @@ impl NodeNet {
                 (label, result)
             });
         }
-        for relay in self.helpers(peer) {
+        // **Nobody to carry a circuit yet, but somebody being dialled** (V210-57). A one-shot verb
+        // reaches its host the moment its room is open, and a restarted `vox forward` did so before
+        // its anchor connection existed: no candidate, no helper, "no peer is connected to carry a
+        // circuit" — and the forward's next attempt came 500 ms later (restarts of 556 and 617 ms
+        // against V210-57's 150 ms). While a direct dial is under way anywhere in this node, a reach
+        // with no candidate and no helper waits for it, for at most [`DIRECT_HEAD_START`].
+        let mut helpers = self.helpers(peer);
+        if candidates_none && helpers.is_empty() {
+            let began = tokio::time::Instant::now();
+            let until = began + DIRECT_HEAD_START;
+            while helpers.is_empty()
+                && self.manager.existing(&peer).is_none()
+                && self.manager.any_direct_dial_under_way()
+                && tokio::time::Instant::now() < until
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                helpers = self.helpers(peer);
+            }
+            let waited = began.elapsed().as_millis();
+            if waited > 0 {
+                self.manager.note(
+                    peer,
+                    format!(
+                        "nobody to carry a circuit yet; waited {waited} ms for a dial under way"
+                    ),
+                );
+            }
+            if let Some(conn) = self.manager.existing(&peer) {
+                return Ok(conn);
+            }
+            helpers = self.helpers(peer);
+        }
+        for relay in helpers {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
             let label = format!("circuit via {}", short_id(relay.peer_id()));
@@ -1065,11 +1102,12 @@ impl NodeNet {
             set.spawn(async move {
                 let started = tokio::time::Instant::now();
                 let deadline = started + DIRECT_HEAD_START;
+                let mut elsewhere = false;
                 loop {
-                    // This ladder's direct rung failed: nothing direct is coming from it.
-                    if *failed.borrow() {
-                        break;
-                    }
+                    // Read before the win is looked for: a dial elsewhere files its connection
+                    // before it stops counting, so a dial seen ended here has filed whatever it won.
+                    let dialling = manager.direct_dial_under_way(&peer);
+                    elsewhere |= dialling;
                     // Its sender is dropped when the rung ends, failed or not: a rung that failed
                     // sent `true` first, so read the value again rather than take the drop for a
                     // win (`has_changed` errs on a dropped sender whatever it last sent).
@@ -1081,6 +1119,11 @@ impl NodeNet {
                                 "not asked for: a direct connection answered first",
                             )),
                         );
+                    }
+                    // This ladder's direct rung failed or there was none, and no dial elsewhere
+                    // was under way: nothing direct is coming.
+                    if *failed.borrow() && !dialling {
+                        break;
                     }
                     if tokio::time::Instant::now() >= deadline {
                         break;
@@ -1095,13 +1138,20 @@ impl NodeNet {
                 manager.note(
                     peer,
                     format!(
-                        "asking {} for a circuit {} ms into the reach; its direct dial {}",
+                        "asking {} for a circuit {} ms into the reach; its direct dial {}{}",
                         short_id(relay.peer_id()),
                         started.elapsed().as_millis(),
-                        if *failed.borrow() {
+                        if candidates_none {
+                            "there was none"
+                        } else if *failed.borrow() {
                             "failed"
                         } else {
-                            "had not finished (or there was none)"
+                            "had not finished"
+                        },
+                        if elsewhere {
+                            "; a direct dial elsewhere in this node held it back"
+                        } else {
+                            ""
                         }
                     ),
                 );
