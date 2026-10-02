@@ -238,7 +238,6 @@ pub(crate) struct VoxCubic {
     round_min: Option<Duration>,
     round_samples: u32,
     loss_aware: bool,
-    hold_growth: bool,
 }
 
 impl VoxCubic {
@@ -256,7 +255,6 @@ impl VoxCubic {
             round_min: None,
             round_samples: 0,
             loss_aware: false,
-            hold_growth: false,
         }
     }
 
@@ -282,18 +280,6 @@ impl VoxCubic {
     /// 0.85) per such loss held Vox at 1.01x a Cubic flow on the same loss, where no cut reached
     /// 2.77x. What stops Vox overrunning the path is the classification: the queue it builds shows as
     /// delay, and past [`GENTLE_LOSS_CAP`] every loss is congestion.
-    /// Tier 2 only: hold the window where it is while the path shows even a small standing queue
-    /// ([`PathSignals::holding`]). Tier 2 makes no cut on a loss without a queue, so on a lossy link
-    /// its window does not fall, and growth past a bandwidth-delay product adds queue, not
-    /// throughput. That queue lengthens every flow's round trip, and a Cubic flow limited by random
-    /// loss slows in proportion: sharing a 1%-loss link, tier 2 held round minimums 2-3 ms over a
-    /// 10.6 ms base with its window at about one bandwidth-delay product, and the Cubic flow kept
-    /// 85-87% of its solo rate, under the decider's 90% (fix-adr024-bbr's trace). The tier-2 queue
-    /// test alone could not see it: Vox alone on the same link held 2.0 ms at the median.
-    pub(crate) fn set_hold_growth(&mut self, on: bool) {
-        self.hold_growth = on;
-    }
-
     pub(crate) fn set_loss_aware(&mut self, on: bool) {
         self.loss_aware = on;
     }
@@ -421,9 +407,6 @@ impl Controller for VoxCubic {
         {
             return;
         }
-        if self.loss_aware && self.hold_growth {
-            return;
-        }
 
         if self.window < self.ssthresh {
             if self.phase != Phase::Done {
@@ -537,13 +520,6 @@ pub(crate) const SMALL_ROUND_BYTES: u64 = 32 << 10;
 pub(crate) const QUEUE_DELAY_MIN: Duration = Duration::from_millis(4);
 /// …or by this share of the base, whichever is larger.
 pub(crate) const QUEUE_DELAY_SHARE: f64 = 0.4;
-/// Tier 2 stops growing its window while a round's minimum round trip exceeds the base by this
-/// much… (see [`PathSignals::holding`]; at a 10 ms base this keeps a Cubic flow's round trip within
-/// about 2.5% of what it is alone: at 0.5 ms, 5% the Cubic flow kept 89.7% of its solo rate, under
-/// the decider's 90%)
-pub(crate) const HOLD_DELAY_MIN: Duration = Duration::from_micros(250);
-/// …or by this share of the base, whichever is larger.
-pub(crate) const HOLD_DELAY_SHARE: f64 = 0.025;
 /// Past this share of the bytes sent over the last [`LOSS_ROUNDS`], a loss is congestion whatever
 /// the delay says: a queue too shallow to show as delay, or a policer.
 ///
@@ -768,17 +744,6 @@ impl PathSignals {
         };
         let rise = round.saturating_sub(base);
         rise >= QUEUE_DELAY_MIN.max(base.mul_f64(QUEUE_DELAY_SHARE))
-    }
-
-    /// Should tier 2 hold its window? The last finished round's minimum round trip stands above the
-    /// base by at least [`HOLD_DELAY_MIN`] or [`HOLD_DELAY_SHARE`] of it, whichever is larger: a
-    /// standing queue far smaller than [`Self::queue_building`]'s, which only stops growth (see
-    /// [`VoxCubic::set_hold_growth`]).
-    pub(crate) fn holding(&self) -> bool {
-        let (Some(base), Some(round)) = (self.min_rtt(), self.last_round_min) else {
-            return false;
-        };
-        round.saturating_sub(base) >= HOLD_DELAY_MIN.max(base.mul_f64(HOLD_DELAY_SHARE))
     }
 
     pub(crate) fn rounds(&self) -> u64 {
