@@ -420,8 +420,6 @@ fn net_event_name(e: &NetEvent) -> &'static str {
     }
 }
 
-/// Bound on the internal network→actor queue. Inbound streams are back-pressured
-/// rather than dropped: a full queue slows the accept loop, it never loses work.
 /// A step of the actor's whose future is large, **boxed where it is made** (V210-127, #341): only
 /// the box's pointer sits in the frame of the step that awaits it.
 ///
@@ -433,6 +431,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
 /// its body's future in its own frame and boxes it, so its callers hold a pointer instead.
 type Boxed<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
+/// Bound on the internal network→actor queue. Inbound streams are back-pressured
+/// rather than dropped: a full queue slows the accept loop, it never loses work.
 const NET_QUEUE: usize = 64;
 
 /// Put a pre-join record on the board at `conn`. A **refusal is fine**: it means our
