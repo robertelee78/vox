@@ -19,6 +19,10 @@
 //!    the leg drops stays lost (so nothing waits behind its retransmission); the gaps and
 //!    latencies are recorded. Relayed path only: it is a property of the relay.
 //! 6. **TCP and UDP on the same port** both answer, each its own service.
+//! 7. **A circuit across legs of different sizes** — when one relay leg carries no datagram
+//!    over 1200 bytes and the other carries far more, the relayed UDP flow still carries
+//!    small and oversize payloads intact (ADR-022 5.4, `CIRCUIT_DATAGRAM_MAX`). Relayed path
+//!    only.
 //!
 //! and M22.4's SOCKS5 `UDP ASSOCIATE` in `vox up`: `.vox` destinations only, `FRAG ≠ 0`
 //! dropped, and the association gone with its TCP control connection.
@@ -47,7 +51,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use world::{args, lossy_proxy, vox_once, PathKind, Setup, VoxProc, World};
+use world::{
+    args, lossy_proxy, size_limited_proxy, vox_once, PathKind, Setup, VoxProc, World,
+};
 
 /// What the test DNS responder answers every `A` query with.
 const ANSWER: [u8; 4] = [10, 53, 0, 1];
@@ -770,4 +776,77 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
         "a relay must lose what the lossy leg drops, not recover it: {lost} lost for \
          {carrying_drops} datagram-carrying packets dropped on the leg"
     );
+}
+
+/// Proof 7: the guest's leg to the relay carries no datagram over 1200 bytes, the host's leg
+/// (IPv6 loopback) carries far more. Neither end can see the other's leg, so each must size
+/// its circuit datagrams for the smaller one (ADR-022 5.4): without that, what the host sends
+/// fits its own leg, the relay cannot pass it on to the guest, and nothing comes back.
+#[test]
+#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+fn a_circuit_crosses_legs_of_different_datagram_sizes() {
+    watchdog::arm();
+    const LEG_MAX: usize = 1200;
+    let (dual, dual_seen) = dual_echo();
+    let clamp: Arc<Mutex<Option<Arc<AtomicU64>>>> = Arc::default();
+    let clamp_in = Arc::clone(&clamp);
+    let mut w = World::build(&Setup {
+        specs: vec![format!("{dual}/udp")],
+        trusted: true,
+        path: PathKind::Relayed,
+        guest_leg: Some(Box::new(move |anchor| {
+            let (addr, dropped) = size_limited_proxy(anchor, LEG_MAX);
+            *clamp_in.lock().unwrap() = Some(dropped);
+            Some(addr)
+        })),
+    });
+    let guest = w.guest_dir.clone();
+    let (_fwd, at) = w.forward_vox("forward", &guest, &format!("{dual}/udp"));
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut buf = vec![0u8; 65_535];
+    let mut ask = |data: &[u8]| -> Option<Vec<u8>> {
+        client.send_to(data, at).unwrap();
+        let (n, _) = client.recv_from(&mut buf).ok()?;
+        Some(buf[..n].to_vec())
+    };
+    // The first datagram opens the flow; allow it a while, as proof 1 does.
+    let t0 = Instant::now();
+    let mut first = None;
+    while first.is_none() && t0.elapsed() < Duration::from_secs(120) {
+        first = ask(b"small");
+    }
+    let mut results = vec![(5usize, first.as_deref() == Some(&b"UDP:small"[..]))];
+    for size in [1400usize, 4000] {
+        let payload: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let got = (0..3).find_map(|_| ask(&payload));
+        let ok = got
+            .as_ref()
+            .is_some_and(|g| g.len() == size + 4 && g[..4] == *b"UDP:" && g[4..] == payload[..]);
+        results.push((size, ok));
+    }
+    let dropped = clamp
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(0, |d| d.load(Ordering::Relaxed));
+    eprintln!(
+        "[test] proof 7: payloads (size, intact) {results:?}; the guest's leg dropped {dropped} \
+         datagram(s) over {LEG_MAX} bytes; the service saw {} packet(s); first answer after {:?}",
+        dual_seen.load(Ordering::Relaxed),
+        t0.elapsed()
+    );
+    assert!(
+        dropped > 0,
+        "CANNOT MEASURE: nothing over {LEG_MAX} bytes was offered to the guest's leg, so its \
+         size limit was never the smaller leg"
+    );
+    assert!(
+        results.iter().all(|(_, ok)| *ok),
+        "PRODUCT: a relayed UDP flow must carry every payload intact across legs of different sizes: \
+         {results:?}"
+    );
+    check_path(&mut w);
 }
