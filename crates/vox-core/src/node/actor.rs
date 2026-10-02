@@ -3507,6 +3507,9 @@ pub struct Node {
     /// happens, not only when it is next redialled (#229's diagnostics). The connection, not
     /// only the anchor: one lost and replaced between two looks is still a loss (V210-93).
     anchors_up: BTreeMap<Digest32, Arc<VoxConnection>>,
+    /// Per anchor this node keeps and did not hold a connection to at the last look: since when
+    /// (unix seconds). What `vox status` and the notifier read (PRD-001 R37).
+    anchor_unreached_since: BTreeMap<Digest32, u64>,
     /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
     sync_dials: BTreeSet<Digest32>,
     /// When the granted mappings must be renewed (unix seconds), or `None` when there
@@ -4023,6 +4026,7 @@ impl Node {
             anchor_window: BTreeMap::new(),
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeMap::new(),
+            anchor_unreached_since: BTreeMap::new(),
             sync_dials: BTreeSet::new(),
             renew_mappings_at: None,
             records_renew_at: BTreeMap::new(),
@@ -5490,6 +5494,14 @@ impl Node {
             self.say_anchor_lost(&net, id, &conn, silent.get(&id).copied());
         }
         self.anchors_up = watched;
+        let me = net.local_id();
+        self.anchor_unreached_since
+            .retain(|id, _| known.iter().any(|(k, _)| k == id) && !up.contains_key(id));
+        for (id, _) in &known {
+            if *id != me && !up.contains_key(id) {
+                self.anchor_unreached_since.entry(*id).or_insert(now);
+            }
+        }
         for (id, candidates) in known {
             if id == net.local_id() || up.contains_key(&id) {
                 continue;
@@ -12848,6 +12860,16 @@ impl Node {
                 host: f.host,
                 service_tag: f.service_tag.clone(),
                 local: f.local,
+            })
+            .collect();
+        let me_net = self.net.as_ref().map(|n| n.local_id());
+        report.anchors = self
+            .kept_anchors()
+            .into_iter()
+            .filter(|(id, _)| Some(*id) != me_net)
+            .map(|(id, _)| crate::node::status::AnchorStatus {
+                id,
+                unreached_since: self.anchor_unreached_since.get(&id).copied(),
             })
             .collect();
         report.diagnose();
