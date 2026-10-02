@@ -14,7 +14,7 @@ mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use std::io::BufRead as _;
+use std::io::{BufRead as _, Read as _};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -41,8 +41,8 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: build the test's runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
@@ -54,17 +54,24 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
         .env("VOX_CONFIG_DIR", &bob.cfg)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     for v in HARNESS_SESSION_VARS {
         cmd.env_remove(v);
     }
-    let mut tail = cmd.spawn().expect("tail");
+    let mut tail = cmd.spawn().expect("APPARATUS: spawn `vox room tail`");
     let (tx, rx) = std::sync::mpsc::channel();
-    let so = tail.stdout.take().unwrap();
+    let so = tail.stdout.take().expect("APPARATUS: tail's stdout");
     std::thread::spawn(move || {
         for l in std::io::BufReader::new(so).lines().map_while(Result::ok) {
             let _ = tx.send(l);
         }
+    });
+    // Tail's stderr, so a tail that dies can say why.
+    let mut se = tail.stderr.take().expect("APPARATUS: tail's stderr");
+    let tail_err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = se.read_to_string(&mut s);
+        s
     });
     std::thread::sleep(Duration::from_secs(1));
 
@@ -74,7 +81,10 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
         &bob.b32()[..12]
     );
     let o = alice.vox_in(Some("a1"), &["room", "post", r, "-"], Some(&payload));
-    assert!(o.ok, "{o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT (staging): alice could not post the forged message: {o:?}"
+    );
 
     // ---- read ----
     let read = until(
@@ -88,19 +98,20 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
     assert_eq!(
         row_starts(&read.stdout),
         entries,
-        "`vox room read` printed a row per entry plus a forged one:\n{}",
+        "PRODUCT: `vox room read` printed a row per entry plus a forged one:\n{}",
         read.stdout
     );
     assert!(
         read.stdout
             .lines()
             .any(|l| l.starts_with("  | ") && l.contains(&forged_hash)),
-        "the forged line must be shown, indented as a continuation:\n{}",
+        "PRODUCT: the forged line must be shown, indented as a continuation:\n{}",
         read.stdout
     );
     assert!(
         !read.stdout.contains('\x1b'),
-        "a raw escape sequence reached the terminal"
+        "PRODUCT: a raw escape sequence reached the terminal via read:\n{:?}",
+        read.stdout
     );
 
     // ---- tail ----
@@ -111,16 +122,29 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
             lines.push(l);
         }
     }
+    // Whether tail was still running when the wait ended: a tail that exited printed what it
+    // printed and said why on stderr.
+    let exited = tail.try_wait().expect("APPARATUS: wait for tail");
     let _ = tail.kill();
     let _ = tail.wait();
+    let said = tail_err.join().unwrap_or_default();
     let got = lines.join("\n");
+    assert!(
+        lines.iter().any(|l| l.contains(&forged_hash)),
+        "PRODUCT: `vox room tail` never printed the message in 30 s (it {}); it printed:\n{got}\n\
+         and said on stderr: {said}",
+        match exited {
+            Some(status) => format!("exited, {status}"),
+            None => "was still running".to_owned(),
+        }
+    );
     assert_eq!(
         row_starts(&got),
         1,
-        "`vox room tail` printed a forged row:\n{got}"
+        "PRODUCT: `vox room tail` printed a forged row:\n{got}"
     );
     assert!(
         !got.contains('\x1b'),
-        "a raw escape sequence reached the terminal via tail"
+        "PRODUCT: a raw escape sequence reached the terminal via tail:\n{got:?}"
     );
 }

@@ -17,14 +17,24 @@
 //!
 //! **Asserted.**
 //! 1. The victim **answers** mallory's session — `HELLO`, then a `HAVE` listing its feed — and
-//!    the hostile `WANT` is on the wire before the post starts. A refused session would make
-//!    the timing measure nothing, so it is `CANNOT MEASURE`.
+//!    the hostile `WANT` is on the wire before the post starts. A session the victim never
+//!    answers is `PRODUCT (staging)`: the timing below would measure nothing.
 //! 2. The `WANT` is 1,000 copies of `(victim, 1, u64::MAX)`, plus one feed the victim does not
 //!    hold and one inverted range. While it is being served, **`vox room post` into the same
 //!    room on the victim returns in under 5 s**, and the victim's `vox room read` shows it.
 //! 3. Mallory is served each entry the victim holds **exactly once**: no repeats, and between
 //!    the feed's length when the session began and that plus the one post made during the
 //!    attack. The session ends cleanly.
+//!
+//! **Which side a red names.** A failed or slow post or read is `PRODUCT:` and quotes what vox
+//! said; a `vox` step of the setup that failed (an identity, a room, a staging post) is
+//! `PRODUCT (staging):`, and so is a session the victim never answers; a fault of this proof's own
+//! is `APPARATUS:`. The bound is read against an **apparatus clock** that is only the apparatus:
+//! the time to run `/usr/bin/true`, not vox, right after any slow post. The [`HELD`] staging posts are
+//! the product's baseline, never part of that clock: one that fails, or misses [`PATIENCE`] while
+//! the clock is within [`APPARATUS_BUDGET`], is `PRODUCT (staging):`. A post or read during the
+//! attack over [`PATIENCE`] while the clock was over [`APPARATUS_BUDGET`] is `CANNOT MEASURE`;
+//! otherwise it is the product's.
 //!
 //! **Mutation that must turn it red.** Put the per-number loop back in
 //! `log::sync::entries_for_wants` (`for seq in from_seq..=to_seq { feed.get(seq) }` over the
@@ -56,6 +66,47 @@ use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 const PATIENCE: Duration = Duration::from_secs(5);
 /// Posts the victim makes before the attack, so there is something to serve.
 const HELD: usize = 50;
+/// The most `/usr/bin/true` may take to run on a runner that can time a [`PATIENCE`] bound.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
+
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
+    let t = std::time::Instant::now();
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
+    assert!(
+        ok,
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
+    );
+    t.elapsed()
+}
+
+/// Red if a timed verb missed [`PATIENCE`]: `CANNOT MEASURE` when the apparatus clock taken
+/// right after it is over [`APPARATUS_BUDGET`], otherwise `side` (the product's).
+fn within_patience(side: &str, what: &str, ok: bool, took: Duration, said: &str) {
+    if ok && took < PATIENCE {
+        return;
+    }
+    let apparatus = apparatus_spawn();
+    assert!(
+        // A verb that failed before its cap answered: that is the product's, whatever the clock.
+        apparatus <= APPARATUS_BUDGET || (!ok && took < PATIENCE * 6),
+        "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
+         {APPARATUS_BUDGET:?}) right after {what} took {took:?}, so the runner, not the node, may \
+         be slow. It said: {said}"
+    );
+    panic!(
+        "{side}: {what} took {took:?} (ok={ok}; bound {PATIENCE:?}; apparatus {apparatus:?}). \
+         It said: {said}"
+    );
+}
 /// Copies of the absurd range in the `WANT`.
 const DUPLICATES: usize = 1_000;
 const SETUP: Duration = Duration::from_secs(120);
@@ -72,14 +123,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: spawn vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: vox's stdin")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -100,17 +151,19 @@ fn vox_timed(data: &Path, argv: &[&str], cap: Duration) -> (bool, Duration, Stri
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(&out_file).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(&out_file).expect("APPARATUS: create vox's output file"),
+        ))
         .stderr(Stdio::from(
             std::fs::OpenOptions::new()
                 .append(true)
                 .open(&out_file)
-                .unwrap(),
+                .expect("APPARATUS: open vox's output file"),
         ))
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: spawn vox");
     let ok = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.try_wait().expect("APPARATUS: wait for vox") {
             break status.success();
         }
         if t0.elapsed() >= cap {
@@ -136,7 +189,7 @@ struct Rt(Option<tokio::runtime::Runtime>);
 impl std::ops::Deref for Rt {
     type Target = tokio::runtime::Runtime;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
+        self.0.as_ref().expect("APPARATUS: the test's runtime")
     }
 }
 
@@ -150,9 +203,9 @@ impl Drop for Rt {
 
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
+        .expect("APPARATUS: bind a free UDP port")
         .local_addr()
-        .unwrap()
+        .expect("APPARATUS: the free UDP port's address")
         .port()
 }
 
@@ -167,7 +220,7 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file.to_str().expect("APPARATUS: a UTF-8 temp path"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -177,7 +230,7 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 /// Stop a process with SIGTERM by its PID and reap it.
@@ -197,24 +250,25 @@ fn stop(mut p: VoxProc) {
 
 fn fingerprint(data: &Path) -> [u8; 32] {
     let (ok, out, err) = vox_once(data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
-    vox_core::node::link::b32_decode(out.trim(), "fingerprint")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: vox id printed no fingerprint ({e:?}): {out}"))
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
+    vox_core::node::link::b32_decode(out.trim(), "fingerprint").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): vox id printed no fingerprint ({e:?}): {out}")
+    })
 }
 
 #[test]
 #[ignore = "real vox processes, production Argon2id and a real join; run in release"]
 fn an_absurd_want_does_not_stop_the_room_it_names() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging dir");
         d
     };
     let (anchor_dir, victim_dir, mallory_dir) = (dir("anchor"), dir("victim"), dir("mallory"));
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
 
     // ---- staging, all through the shipped binary ----------------------------------------
     let mut anchor = VoxProc::spawn(
@@ -226,7 +280,7 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .unwrap()
+        .expect("PRODUCT: the anchor's spec line holds no dialable spec")
         .to_owned();
     let victim_id = fingerprint(&victim_dir);
     let _ = fingerprint(&mallory_dir);
@@ -239,36 +293,45 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         &["room", "create", "--name", "team"],
         ROOM_PASS,
     );
-    assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, list, _) = vox_once(&victim_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
         .next()
-        .expect("CANNOT MEASURE: the new room in `vox room list`")
+        .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
+    // The product's baseline: each staging post must answer inside the bound, with no attack.
+    let mut quiet = Duration::ZERO;
     for i in 1..=HELD {
-        let (ok, _, err) = vox_once(
+        let (ok, took, said) = vox_timed(
             &victim_dir,
-            &args(&["room", "post", &prefix, &format!("held {i}")]),
+            &["room", "post", &prefix, &format!("held {i}")],
+            PATIENCE * 6,
         );
-        assert!(ok, "CANNOT MEASURE: post {i}: {err}");
+        within_patience(
+            "PRODUCT (staging)",
+            &format!("staging post {i}, with no attack at all,"),
+            ok,
+            took,
+            &said,
+        );
+        quiet = quiet.max(took);
     }
+    println!("[proof] baseline: the slowest of {HELD} staging posts took {quiet:?}");
     let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "CANNOT MEASURE: room invite: {err}");
+    assert!(ok, "PRODUCT (staging): room invite: {err}");
     let link = link.trim().to_owned();
-    let joined = (1..=6).any(|attempt| {
-        let (ok, out, err) = vox_in(
-            &mallory_dir,
-            &["room", "join", &link, "--name", "team"],
-            ROOM_PASS,
-        );
-        if !ok {
-            eprintln!("[proof] mallory's join attempt {attempt} refused: {out} {err}");
-            std::thread::sleep(Duration::from_secs(5));
-        }
-        ok
-    });
-    assert!(joined, "CANNOT MEASURE: mallory could not join the room");
+    // One join, no retry: a join that fails is the product's failure, and #217's busy-host
+    // refusal is fixed (V210-43), so nothing known excuses one.
+    let (ok, out, err) = vox_in(
+        &mallory_dir,
+        &["room", "join", &link, "--name", "team"],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room join` failed for mallory.\nstdout: {out}\nstderr: {err}"
+    );
     let (_, rows, _) = vox_once(&victim_dir, &args(&["room", "read", &prefix, "--json"]));
     let room = rows
         .lines()
@@ -279,8 +342,10 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
                 .as_str()
                 .map(str::to_owned)
         })
-        .expect("CANNOT MEASURE: the victim's read names its room");
-    let cid = vox_core::node::link::b32_decode(&room, "room id").expect("a room id");
+        .expect("PRODUCT (staging): the victim's read names its room");
+    let cid = vox_core::node::link::b32_decode(&room, "room id").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): the victim's read named room {room:?} ({e:?})")
+    });
 
     // Mallory's node goes; her identity stays, in the profile the binary wrote.
     stop(mallory);
@@ -290,7 +355,7 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
             .worker_threads(4)
             .enable_all()
             .build()
-            .unwrap(),
+            .expect("APPARATUS: build the test's runtime"),
     ));
     let _enter = rt.enter();
     let mallory_paths = Paths::resolve(
@@ -298,13 +363,19 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         Some(&mallory_dir),
         Some(&mallory_dir.join("cfg")),
     )
-    .unwrap();
+    .expect("APPARATUS: resolve mallory's profile paths");
     let (_endpoint, conn) = rt.block_on(async {
         let endpoint = raw_sync::endpoint_as_member(&mallory_paths, IDENTITY.as_bytes()).await;
         let conn = endpoint
-            .connect(victim_listen.parse().unwrap(), victim_id, raw_sync::now())
+            .connect(
+                victim_listen
+                    .parse()
+                    .expect("APPARATUS: the test-chosen victim address"),
+                victim_id,
+                raw_sync::now(),
+            )
             .await
-            .expect("CANNOT MEASURE: mallory's identity did not connect to the victim");
+            .expect("PRODUCT (staging): mallory's identity did not connect to the victim");
         (endpoint, Arc::new(conn))
     });
     let _answered = raw_sync::answer_victim(Arc::clone(&conn));
@@ -354,12 +425,13 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         }
         eprintln!(
             "[proof] session attempt {attempt} ended before the WANT: {:?}",
-            rt.block_on(task).unwrap()
+            rt.block_on(task)
+                .expect("APPARATUS: the test-side sync client panicked")
         );
         std::thread::sleep(Duration::from_millis(250));
     }
     let attack = attack.expect(
-        "CANNOT MEASURE: the victim never answered mallory's session far enough to take a WANT, \
+        "PRODUCT (staging): the victim never answered mallory's session far enough to take a WANT, \
          so the timing below would measure nothing",
     );
     println!(
@@ -371,29 +443,44 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
     // ---- 2. the room still works --------------------------------------------------------
     let text = "posted while the WANT was being served";
     let (ok, took, said) = vox_timed(&victim_dir, &["room", "post", &room, text], PATIENCE * 6);
-    println!("[proof] post during the attack: ok={ok} in {took:?}");
-    assert!(
-        ok && took < PATIENCE,
-        "a post into the room on the victim took {took:?} (ok={ok}; bound {PATIENCE:?}) while \
-         one member's WANT (author, 1, u64::MAX) was being served — one request stops the room \
-         (PRD-001 D2/R4). It said: {said}"
+    println!("[proof] post during the attack: ok={ok} in {took:?} (quiet {quiet:?})");
+    within_patience(
+        "PRODUCT",
+        &format!(
+            "a post into the room on the victim, while one member's WANT (author, 1, u64::MAX) \
+             was being served (one request stops the room, PRD-001 D2/R4; quiet {quiet:?}),"
+        ),
+        ok,
+        took,
+        &said,
     );
     let (ok, t, read) = vox_timed(&victim_dir, &["room", "read", &room], PATIENCE * 6);
     println!(
         "[proof] read: ok={ok} in {t:?}, shows the post: {}",
         read.contains(text)
     );
+    within_patience(
+        "PRODUCT",
+        "the victim's `vox room read` during the attack",
+        ok,
+        t,
+        &read,
+    );
     assert!(
-        ok && t < PATIENCE && read.contains(text),
-        "the victim's `vox room read` took {t:?} (ok={ok}) and did not show the post made \
-         during the attack:\n{read}"
+        read.contains(text),
+        "PRODUCT: the victim's `vox room read` did not show the post made during the attack:\n{read}"
     );
 
     // ---- 3. what was served: each held entry once ---------------------------------------
+    // The test-side client only reads: it ends when the victim finishes serving and closes the
+    // session, so a session still open at 60 s is the victim still serving.
     let y: Yield = rt
         .block_on(async { tokio::time::timeout(Duration::from_secs(60), attack).await })
-        .expect("mallory's session did not end within 60 s")
-        .unwrap();
+        .expect(
+            "PRODUCT: the victim was still serving mallory's WANT 60 s after it was sent \
+             (the test-side client was waiting for the victim to finish the session)",
+        )
+        .expect("APPARATUS: the test-side sync client panicked");
     let feed = y
         .have
         .iter()
@@ -403,25 +490,28 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         "[proof] mallory's session: hello={} feed={feed} served={} distinct={} ended={:?}",
         y.hello, y.entries, y.distinct, y.ended
     );
-    assert!(y.hello, "CANNOT MEASURE: the session was not answered");
+    assert!(y.hello, "PRODUCT (staging): the session was not answered");
     assert!(
         feed >= HELD as u64,
-        "CANNOT MEASURE: the victim's HAVE lists {feed} entries in its feed, fewer than the \
+        "PRODUCT (staging): the victim's HAVE lists {feed} entries in its feed, fewer than the \
          {HELD} it posted"
     );
     assert_eq!(
         y.distinct,
         y.entries,
-        "the WANT must serve each entry once — {DUPLICATES} duplicate ranges merged — but {} of \
+        "PRODUCT: the WANT must serve each entry once — {DUPLICATES} duplicate ranges merged — but {} of \
          the {} entries served were repeats",
         y.entries - y.distinct,
         y.entries
     );
     assert!(
         (feed..=feed + 1).contains(&(y.entries as u64)),
-        "the WANT must be served the {feed} entries held, plus at most the one posted during \
+        "PRODUCT: the WANT must be served the {feed} entries held, plus at most the one posted during \
          the attack — got {}",
         y.entries
     );
-    assert_eq!(y.ended, None, "the session must end cleanly");
+    assert_eq!(
+        y.ended, None,
+        "PRODUCT: the victim's session with mallory must end cleanly"
+    );
 }
