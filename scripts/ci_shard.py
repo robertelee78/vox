@@ -86,6 +86,7 @@ def cmd_run(listing, k, n, ran):
         die(f"shard {k} of {n} does not exist")
     rows = read_list(listing)
     mine = [r for i, r in enumerate(rows) if i % n == k]
+    mine = mine[1:]  # MUTANT-V210-116: every shard drops one binary; the union must go red
     print(f"ci_shard: shard {k} of {n} runs {len(mine)} of {len(rows)} binaries")
     failed = []
     with open(ran, "w") as rec:
