@@ -12,7 +12,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
             lines): m-011 is the first line shown, not m-001 still;
   consent   Carol, whom Bob never trusted, is not shown "trusted"; Alice, whom he did, is;
-  verify    `:verify` on Carol does not show her "verified" (the node has nothing to compare);
+  unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
+            the help line names none of them: the TUI offers only what vox supports (V210-155);
   sync      the status bar says how many peers the node is connected to: the anchor and at least
             one member, so 2 or more (it said "idle" always);
   reach     back on the channel list, the room reads "● online" while Bob's node is connected to
@@ -230,17 +231,23 @@ try:
     claim("consent", "trusted" not in carol_label,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
 
-    stage("select carol")
-    for _ in range(8):
-        if label_of("carol")[1]:
-            break
-        tui.key("\x1b[B", 0.5)  # Down
-    if not label_of("carol")[1]: apparatus("could not put the marker on carol:\n" + "\n".join(pane()))
-
-    stage("verify")
-    tui.key(":verify\r", 2)
-    v = label_of("carol")[0]
-    claim("verify", "verified" in v and "unverified" in v and "✓" not in v, f"carol after :verify: {v.strip()!r}")
+    stage("unknown")
+    # Each answer is read after `:invite`, a command vox supports, has replaced the status line, so
+    # an "unknown command" seen is this command's answer and not the one before it.
+    def bottom():
+        return "\n".join(r.rstrip() for r in tui.display()[-3:])
+    REMOVED = ("show", "hide", "block", "unblock", "verify")
+    answers = {}
+    for c in REMOVED:
+        tui.key(":invite\r", 2)
+        if "unknown command" in bottom():
+            apparatus(f":invite left the status line saying unknown command, so :{c}'s answer shows nothing:\n{bottom()}")
+        tui.key(f":{c}\r", 2)
+        answers[c] = bottom().split("\n")[-1].strip()
+    screen = "\n".join(tui.display())
+    named = [c for c in REMOVED if f":{c}" in screen]
+    claim("unknown", all("unknown command" in v for v in answers.values()) and not named,
+          f"answers: {answers!r}; the help line names: {named!r}")
 
     stage("sync")
     def peers():

@@ -14,7 +14,7 @@ use secrecy::SecretString;
 use vox_core::hash::Digest32;
 use zeroize::Zeroizing;
 
-use crate::viewmodel::{Command, InboundVisibility, Verification, ViewModel};
+use crate::viewmodel::{Command, ViewModel};
 
 /// How many lines PageUp/PageDown scroll the timeline.
 pub const TIMELINE_PAGE: usize = 10;
@@ -482,7 +482,6 @@ impl UiState {
                 Action::Dispatch(Command::CreateChannel {
                     local_name: name,
                     passphrase: secret(&p.fields[1]),
-                    deniable: false,
                 })
             }
             PromptKind::JoinChannel => {
@@ -610,35 +609,11 @@ impl UiState {
         Action::Redraw
     }
 
-    /// The fingerprint of the currently-selected member, if it is still in the pane.
-    #[must_use]
-    pub fn selected_member_id(&self, vm: &ViewModel) -> Option<Digest32> {
-        let id = self.selected_member?;
-        vm.active
-            .as_ref()
-            .filter(|c| c.members.iter().any(|m| m.id == id))
-            .map(|_| id)
-    }
-
     /// The channelID of the active channel, if one is open.
     #[must_use]
     pub fn active_channel_id(&self, vm: &ViewModel) -> Option<Digest32> {
         vm.active.as_ref().map(|c| c.channel_id)
     }
-}
-
-/// The local verification-state transition (ADR-015 acceptance state machine):
-/// a successful scan/compare → `Verified`; a key change always → `KeyChanged`
-/// (must re-verify), regardless of prior state.
-#[must_use]
-pub fn on_verified(_current: Verification) -> Verification {
-    Verification::Verified
-}
-
-/// A key change resets verification to `KeyChanged` from any prior state.
-#[must_use]
-pub fn on_key_change(_current: Verification) -> Verification {
-    Verification::KeyChanged
 }
 
 /// A navigation action issuable by a typed command (the command-equivalents of the
@@ -680,8 +655,7 @@ pub enum Parsed {
 /// - `open` / `back` / `focus` / `up` / `down` — navigation
 ///
 /// Channel-scoped verbs require an active channel:
-/// - `send <text…>`, `invite`, `show` / `hide`,
-///   `block` / `unblock`, `verify` (acts on the selected member).
+/// - `send <text…>`, `invite`.
 ///
 /// **Create / join / unlock / init are not one-line palette commands.** They require
 /// a passphrase, which ADR-015 mandates be entered through a **masked** prompt and
@@ -733,28 +707,6 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         // The link is public; it can be produced by a one-line command.
         "invite" => Command::Invite {
             channel_id: channel,
-        },
-        "show" => Command::SetVisibility {
-            channel_id: channel,
-            member: ui.selected_member_id(vm)?,
-            visibility: InboundVisibility::Visible,
-        },
-        "hide" => Command::SetVisibility {
-            channel_id: channel,
-            member: ui.selected_member_id(vm)?,
-            visibility: InboundVisibility::Hidden,
-        },
-        "block" => Command::Block {
-            channel_id: channel,
-            member: ui.selected_member_id(vm)?,
-        },
-        "unblock" => Command::Unblock {
-            channel_id: channel,
-            member: ui.selected_member_id(vm)?,
-        },
-        "verify" => Command::MarkVerified {
-            channel_id: channel,
-            member: ui.selected_member_id(vm)?,
         },
         _ => return None,
     };

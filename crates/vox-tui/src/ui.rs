@@ -19,8 +19,7 @@ use ratatui::Frame;
 
 use crate::state::{Focus, Mode, Prompt, Screen, UiState};
 use crate::viewmodel::{
-    InboundVisibility, MemberView, MessageView, OutboundConsent, Reachability, SyncStatus,
-    Verification, ViewModel,
+    MemberView, MessageView, OutboundConsent, Reachability, SyncStatus, Verification, ViewModel,
 };
 
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
@@ -36,17 +35,12 @@ pub fn verification_label(v: Verification) -> &'static str {
     }
 }
 
-/// A label for the combined consent/visibility/block state of a member.
+/// A label for whether a member reads you here: whether you trust it (V210-148).
 #[must_use]
 pub fn consent_label(m: &MemberView) -> &'static str {
-    if m.blocked {
-        return "⊘ blocked";
-    }
-    match (m.outbound, m.inbound) {
-        (OutboundConsent::Granted, InboundVisibility::Visible) => "↔ trusted",
-        (OutboundConsent::Granted, InboundVisibility::Hidden) => "→ out-only",
-        (OutboundConsent::Revoked, InboundVisibility::Visible) => "← in-only",
-        (OutboundConsent::Revoked, InboundVisibility::Hidden) => "· none",
+    match m.outbound {
+        OutboundConsent::Granted => "↔ trusted",
+        OutboundConsent::Revoked => "← in-only",
     }
 }
 

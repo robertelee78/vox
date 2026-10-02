@@ -39,16 +39,6 @@ pub enum OutboundConsent {
     Revoked,
 }
 
-/// Your **inbound** visibility preference for a member (ADR-007): whether you want
-/// to render *their* messages. Independent of consent and verification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InboundVisibility {
-    /// You render this member's messages.
-    Visible,
-    /// You have opted out of rendering this member's messages.
-    Hidden,
-}
-
 /// A member as surfaced to the UI (ADR-015 member pane). Fingerprints and nicknames
 /// only — no key material.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,11 +51,6 @@ pub struct MemberView {
     pub verification: Verification,
     /// Your outbound consent toward this member.
     pub outbound: OutboundConsent,
-    /// Your inbound visibility for this member.
-    pub inbound: InboundVisibility,
-    /// `true` if you have Blocked this member (revoked outbound + hidden inbound).
-    /// Block is **not** removal — the member stays listed (ADR-007/ADR-015).
-    pub blocked: bool,
     /// The grouped-decimal safety code for verifying this member (ADR-015).
     pub safety_code: String,
 }
@@ -250,8 +235,6 @@ pub enum UiError {
     KeyringFull,
     /// Persisting to the store failed; reopen the channel.
     Storage,
-    /// This action needs the network milestone (M14) — not available yet.
-    NotAvailableYet,
     /// The other side refused: the channel passphrase is wrong, or it is not
     /// accepting joins for that channel. Deliberately coarse — the responder does not
     /// say which, so neither does this (ADR-005).
@@ -323,7 +306,6 @@ impl UiError {
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
-            UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",
             UiError::AddressInUse => {
@@ -419,8 +401,6 @@ pub enum Command {
         local_name: String,
         /// The channel passphrase (out-of-band; redacted/zeroized).
         passphrase: SecretString,
-        /// Whether authorship is deniable (genesis-immutable; default attributable).
-        deniable: bool,
     },
     /// Join a channel from a `vox://` invite link plus the passphrase, which travels
     /// out of band and is deliberately **not** in the link (ADR-016).
@@ -444,36 +424,6 @@ pub enum Command {
         channel_id: Digest32,
         /// The plaintext to send (becomes ciphertext in the core).
         text: String,
-    },
-    /// Set inbound visibility for a member.
-    SetVisibility {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member.
-        member: Digest32,
-        /// The desired visibility.
-        visibility: InboundVisibility,
-    },
-    /// Block a member (revoke outbound + hide inbound); not removal.
-    Block {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to block.
-        member: Digest32,
-    },
-    /// Unblock a member (restore your outbound consent + your inbound preference).
-    Unblock {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to unblock.
-        member: Digest32,
-    },
-    /// Mark a member verified after a successful scan/compare.
-    MarkVerified {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The verified member.
-        member: Digest32,
     },
     /// Lock the app now (zeroize SEK + identity root, require re-auth).
     Lock,
