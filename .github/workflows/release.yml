@@ -7,8 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # No proof runs in this workflow: the gates run in CI on the same commit (see `ci-passed`), so
-  # the accepted gaps (`VOX_PROOF_ALLOW_UNPROVEN`) are set in ci.yml alone.
+  # No proof runs in this workflow: the gates run in CI on the same commit (see `ci-passed`).
 
 jobs:
   # ADR-018 §6: nothing is published from a tree the gates have not passed on. The tag is the

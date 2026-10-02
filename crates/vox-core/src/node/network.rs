@@ -86,6 +86,18 @@ impl std::fmt::Debug for SharedPolicy {
 #[cfg(feature = "test-knobs")]
 pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 
+/// How long a reach gives its direct dial before it asks any peer to carry a circuit (V210-122):
+/// RFC 8305's connection-attempt delay, as for a join's board search. Measured: a direct join over
+/// a LAN address dials its board in under 5 ms, so a reachable peer answers well inside it, and a
+/// peer that cannot be reached directly costs this much and no more — its circuits start the moment
+/// this reach's own direct dial fails, if that is sooner.
+///
+/// **Why there is one.** The ladder raced every rung at once. A host reached directly still had a
+/// circuit asked of the anchor on the same instant; the circuit lost the tie-break, was retired,
+/// and the anchor carried it for its 60 s grace — an anchor working for a pair that never needed
+/// it, which is everything ADR-012's anchor principle says it must not do.
+pub const DIRECT_HEAD_START: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[cfg(feature = "test-knobs")]
 fn test_advertise() -> Option<EndpointList> {
     let value = std::env::var(TEST_ADVERTISE_ENV).ok()?;
@@ -585,7 +597,20 @@ impl NodeNet {
         conn: &quinn::Connection,
         peer: Digest32,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
-        let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
+        let typed = accept_typed_on(conn).await?;
+        self.authorize_typed(peer, typed)
+    }
+
+    /// Authorize a stream whose kind has been read: refused, with the coded answer, when `peer`
+    /// may not open that kind (see [`Self::classify`]).
+    ///
+    /// # Errors
+    /// [`crate::error::Error::StreamRefused`] when the peer may not open that kind.
+    pub fn authorize_typed(
+        &self,
+        peer: Digest32,
+        (kind, mut send, mut recv): (StreamKind, SendStream, RecvStream),
+    ) -> Result<(StreamKind, SendStream, RecvStream)> {
         let class = self.classify(&peer);
         if !PeerPolicy::allows(class, kind) {
             crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
@@ -994,6 +1019,20 @@ impl NodeNet {
         // opposite next steps.
         let mut set: JoinSet<(String, Result<VoxConnection>)> = JoinSet::new();
         let candidates = direct_candidates(endpoints);
+        // **Direct first, by a head start** (V210-122, ADR-012): every circuit waits
+        // [`DIRECT_HEAD_START`] before it asks a relay for anything, and gives way at once to a
+        // direct connection to the peer — this ladder's own direct rung, a dial elsewhere in the
+        // node, or the peer's own connection **inbound**. It starts sooner only if this ladder's
+        // direct rung failed.
+        //
+        // **Whatever this reach knows of the peer's address.** Two reaches with no direct
+        // candidate asked for a circuit at once, and each raced a direct path that was already
+        // coming: a node that had not read the peer's board record yet, while it dialled the
+        // peer's invite-link address (3 of 12 cold `vox up`s), and a host that cannot dial a
+        // guest at all, while the guest's own direct connection was arriving (4 of 9 runs, the
+        // anchor carrying the host's circuit). Not knowing an address is not knowing there is no
+        // direct path, so they wait the head start too.
+        let (direct_failed, failed) = tokio::sync::watch::channel(false);
         if !candidates.is_empty() {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
@@ -1002,17 +1041,46 @@ impl NodeNet {
             // what distinguishes a stale board record from a blocked path.
             let label = format!("direct to {}", join_addrs(&candidates));
             set.spawn(async move {
-                (
-                    label,
-                    connect_direct(endpoint, &candidates, peer, now).await,
-                )
+                let result = connect_direct(endpoint, &candidates, peer, now).await;
+                if result.is_err() {
+                    let _ = direct_failed.send(true);
+                }
+                (label, result)
             });
         }
         for relay in self.helpers(peer) {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
             let label = format!("circuit via {}", short_id(relay.peer_id()));
+            let mut failed = failed.clone();
+            let manager = Arc::clone(&self.manager);
             set.spawn(async move {
+                let deadline = tokio::time::Instant::now() + DIRECT_HEAD_START;
+                loop {
+                    // This ladder's direct rung failed: nothing direct is coming from it.
+                    if *failed.borrow() {
+                        break;
+                    }
+                    // Its sender is dropped when the rung ends, failed or not: a rung that failed
+                    // sent `true` first, so read the value again rather than take the drop for a
+                    // win (`has_changed` errs on a dropped sender whatever it last sent).
+                    let rung_won = failed.has_changed().is_err() && !*failed.borrow();
+                    if rung_won || manager.existing(&peer).is_some() {
+                        return (
+                            label,
+                            Err(Error::Unreachable(
+                                "not asked for: a direct connection answered first",
+                            )),
+                        );
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = failed.changed() => {}
+                        () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                    }
+                }
                 (
                     label,
                     circuitstream::connect_through(&relay, peer, &endpoint, now).await,
@@ -1035,6 +1103,10 @@ impl NodeNet {
                 Ok((rung, Err(e))) => why.push(format!("{rung}: {e}")),
                 Err(_) => why.push("a rung was cancelled".to_owned()),
             }
+        }
+        // A direct dial elsewhere that landed while the circuits held back is this reach's answer.
+        if let Some(conn) = self.manager.existing(&peer) {
+            return Ok(conn);
         }
         why.sort(); // a reason a person compares between runs must not reorder itself
         Err(Error::LadderExhausted(why.join("; ")))

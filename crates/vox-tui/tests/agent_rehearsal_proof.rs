@@ -67,7 +67,15 @@
 //! - Key the hook's cursor by room alone, ignoring the session: red at (3), `s2` is shown
 //!   nothing because `s1` already read it.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(two_agent_sessions_and_an_operator_share_one_room);
 
 #[path = "support/room.rs"]
 mod support;
@@ -82,13 +90,6 @@ use support::{until, Worker, VOX};
 fn model() -> String {
     std::env::var("VOX_PROOF_OPENCODE_MODEL")
         .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
-}
-
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
 }
 
 fn which(bin: &str) -> Option<std::path::PathBuf> {
@@ -171,18 +172,16 @@ fn nonce(tag: &str) -> String {
     format!("{tag}-{}{:06}", std::process::id(), nanos % 1_000_000)
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "an anchor, two vox daemons, live model turns; CI runs it in release"]
+#[ignore = "an anchor, two vox daemons, live model turns; optional, run it in release"]
 fn two_agent_sessions_and_an_operator_share_one_room() {
     watchdog::arm();
-    if which("opencode").is_none() || !auth_present() {
-        assert!(
-            allow_unproven("opencode"),
-            "UNPROVEN: the rehearsal needs a real harness and a usable credential. Set \
-             VOX_PROOF_ALLOW_UNPROVEN=opencode to accept that gap deliberately."
-        );
-        return;
-    }
+    assert!(
+        which("opencode").is_some() && auth_present(),
+        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH and a usable credential \
+         (~/.local/share/opencode/auth.json)"
+    );
 
     // A persistent fixture: OpenCode installs a `node_modules` tree into both the
     // project and the config directory on first use, and until it has, the plugin

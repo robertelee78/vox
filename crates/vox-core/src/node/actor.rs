@@ -121,25 +121,57 @@ const MEMBER_REDIAL_SECS: u64 = 30;
 const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
 
 /// How long stopping the network waits for its connections' closes to leave (see `stop_network`).
-/// They leave on the endpoint driver's next turns; this is a ceiling for one that cannot.
-const CLOSE_FLUSH: Duration = Duration::from_secs(1);
+/// They leave on the endpoint driver's next turns; this is a ceiling for one that cannot. A term
+/// of the stop's budget (see `STOP_ACK_BOUND`).
+const CLOSE_FLUSH: Duration = Duration::from_millis(600);
 
 /// How long stopping the network waits for its peers to confirm they heard it is stopping (see
 /// `ConnectionManager::say_goodbye`), in each of its two rounds (relayed connections, then the
 /// rest). A live peer confirms within a round trip; this is spent only on one that does not
-/// answer, and is a ceiling, not a wait.
-const GOODBYE_PATIENCE: Duration = Duration::from_millis(500);
+/// answer, and is a ceiling, not a wait. A term, twice, of the stop's budget (see
+/// `STOP_ACK_BOUND`).
+const GOODBYE_PATIENCE: Duration = Duration::from_millis(400);
 
 /// How long a stopping node waits for tunnels that finished their stream to have their last bytes
-/// acknowledged before it closes its connections (see `stop_network`).
+/// acknowledged before it closes its connections (see `stop_network`). The bound still covers a
+/// reply of several MiB draining over a slow path.
 ///
-/// **Shorter than `vox daemon`'s 5 s stop patience**, on purpose. The daemon gives its node that
-/// long to stop and then leaves, dropping the node's tasks; at an equal bound, a stop that waited
-/// the whole of it (a peer that vanished holding unacknowledged bytes) raced the daemon's leaving
-/// with its connection closes, and a close that lost left every other peer to learn of the stop
-/// only by its idle timeout. The bound still covers a reply of several MiB draining over a slow
-/// path.
+/// **The budget for the whole stop.** This is the first of the stop's waits, and all of them
+/// together must end inside `vox daemon`'s 5 s stop patience. The daemon gives its node that long
+/// and then leaves, dropping the node's tasks, so a stop still under way is cut short, and the
+/// peers whose closes were cut learn of the stop only by inference (V210-93). Every wait spent to
+/// its ceiling (a peer that vanished holding a finished tunnel's unacknowledged bytes, and peers
+/// that answer neither the goodbye nor the close):
+///
+/// | term | bound |
+/// |---|---|
+/// | finished tunnels' last bytes acknowledged (this bound) | 3 s |
+/// | the goodbye, relayed connections then the rest (2 × [`GOODBYE_PATIENCE`]) | 0.8 s |
+/// | relayed closes' lead over their carriers ([`RELAYED_CLOSE_LEAD`]) | 0.05 s |
+/// | the closes leaving ([`CLOSE_FLUSH`]) | 0.6 s |
+/// | **sum** ([`STOP_WORST_CASE`]) | **4.45 s**, against 5 s |
+///
+/// The last term is the one a patience too short cuts: by then the goodbye is said and the closes
+/// are queued, but a stop whose closes have not left has not finished. With the goodbye at 0.5 s a
+/// round and the flush at 1 s, the sum was 5.05 s, and the patience ran out inside that flush. The
+/// half second left over is for the daemon itself under load. A bound raised here must come out of
+/// another term.
 const STOP_ACK_BOUND: Duration = Duration::from_secs(3);
+
+/// **The longest a node's network can take to stop** (`stop_network`): the sum of the whole stop's
+/// budget, set out term by term in `STOP_ACK_BOUND`'s doc (4.45 s). Held at 4.5 s or less here,
+/// and `vox daemon` checks at compile time that its 5 s `SHUTDOWN_PATIENCE` leaves at least half a
+/// second beyond it.
+pub const STOP_WORST_CASE: Duration = Duration::from_millis(
+    (STOP_ACK_BOUND.as_millis()
+        + 2 * GOODBYE_PATIENCE.as_millis()
+        + RELAYED_CLOSE_LEAD.as_millis()
+        + CLOSE_FLUSH.as_millis()) as u64,
+);
+const _: () = assert!(
+    STOP_WORST_CASE.as_millis() <= 4_500,
+    "a stop's budget is at most 4.5 s"
+);
 
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
@@ -871,6 +903,9 @@ enum NetEvent {
         chain_id: u64,
         /// What the recipient's side said.
         why: String,
+        /// Whether the recipient answered (a refusal it made), rather than the key being lost
+        /// on its way (see `pairwise_stream::refused`).
+        answered: bool,
         /// The serial of the session the key was sealed under (V210-78).
         session: Option<u64>,
         /// Whether it was one of the keys of the history `peer` was owed.
@@ -1149,206 +1184,309 @@ fn spawn_stream_loop(
         // The loop ends when the connection itself is gone — or after this many
         // consecutive failures, which cannot happen without the connection being
         // unusable and which keeps a pathological peer from spinning this task.
-        const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 16;
-        let mut failures = 0;
-        // This connection's pairwise reader, started with its first pairwise stream.
-        let mut pairwise: Option<mpsc::Sender<(quinn::SendStream, quinn::RecvStream)>> = None;
-        loop {
-            // **The kinds this node serves to completion get a task each.** `accept_stream`
-            // served them inline — `dispatch`'s own doc says to put it on its own task when
-            // accepting in a loop, and this loop did not — so while one was being served no other
-            // stream from this peer was even accepted. A rendezvous stream holds its server until
-            // the client finishes or a 20s frame read gives up; a circuit's opening exchange waits
-            // on the *target* peer's answer, which is another node's loop. On an anchor that put a
-            // member's next board `put` behind whatever that member's last stream was waiting for,
-            // 20s at a time, and the member's actor — which awaits its puts — answered nobody for
-            // 30s, 60s, 80s, measured through the real binaries.
-            //
-            // Only these three. Every other kind is handed on in the order it arrived, as before:
-            // a pairwise hello and the key that follows it are separate streams, and reordering
-            // them is exactly the race F12 was.
-            let (kind, send, recv) = match net.accept_authorized_on(&quic, peer).await {
-                Ok(accepted) => accepted,
-                // **A refusal is not a failure.** The stream was typed and answered; the peer
-                // may not open that kind *yet* — a joiner syncing before it is a member, a
-                // responder pushing before the room is held here — and it will be allowed once
-                // the view catches up. Counted, sixteen of those ended this loop while the
-                // connection stayed filed, and every stream the peer opened after that, allowed
-                // or not, went unserved for the connection's life (V210-80). It cannot spin:
-                // each one is a stream the peer opened.
-                Err(crate::error::Error::StreamRefused(_)) => continue,
-                Err(_) => {
-                    if quic.close_reason().is_some() {
-                        break; // the peer or the network closed it
-                    }
-                    failures += 1;
-                    if failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
-                        // Closed, not only abandoned: a connection nobody serves must not stay
-                        // filed as this peer's, or both ends go on using it for nothing.
-                        quic.close(
-                            crate::transport::quic::close_code(
-                                crate::wire::WireError::TransportFailed,
-                            ),
-                            b"stream failures",
-                        );
-                        break;
-                    }
-                    continue;
+        let mut state = StreamLoop::default();
+        // **Each stream's kind is read on a task of its own** (V210-80). Read here, in the loop,
+        // a peer that opened a stream and withheld its kind frame held every stream it opened
+        // after that for `FRAME_PATIENCE` (30 s) — its sync, its keys, its board puts — one
+        // withheld stream at a time, for ever.
+        //
+        // **Still handed on in the order they arrived.** A pairwise hello and the key that
+        // follows it are separate streams, and reordering them is exactly the race F12 was. So
+        // a typed stream waits for the streams accepted before it — but only for
+        // [`KIND_ORDER_GRACE`]. An honest peer writes a stream's kind with the stream itself
+        // (`open_typed`), so its streams are all typed within a scheduling delay and keep their
+        // order exactly; a stream still untyped past the grace stops holding the ones behind it,
+        // and is served whenever its kind does arrive, or dropped when its read gives up.
+        let mut readers = tokio::task::JoinSet::new();
+        let mut typed: BTreeMap<u64, crate::error::Result<Typed>> = BTreeMap::new();
+        let mut untyped_since: BTreeMap<u64, tokio::time::Instant> = BTreeMap::new();
+        let (mut accepted, mut next) = (0u64, 0u64);
+        'streams: loop {
+            // Whatever is typed at the head of the arrival order goes on, in order.
+            while let Some(stream) = typed.remove(&next) {
+                next += 1;
+                if serve_typed(&net, &conn, &tx, &quic, peer, stream, &mut state).await
+                    == Flow::Stop
+                {
+                    break 'streams;
                 }
-            };
-            // Nobody holds the connection any more: the node has let it go, and a stream
-            // arriving on it has nothing to be served against.
-            let Some(conn) = conn.upgrade() else {
-                break;
-            };
-            if matches!(
-                kind,
-                crate::transport::streams::StreamKind::Rendezvous
-                    | crate::transport::streams::StreamKind::Coord
-                    | crate::transport::streams::StreamKind::Circuit
-            ) {
-                failures = 0;
-                let net = Arc::clone(&net);
-                let conn = Arc::clone(&conn);
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    // A coordination stream can end by handing the actor a punch to run.
-                    if let Ok(inbound @ Inbound::Punch { .. }) =
-                        net.dispatch(&conn, kind, send, recv).await
-                    {
-                        let _ = tx
-                            .send(NetEvent::Stream {
-                                conn: Arc::clone(&conn),
-                                inbound,
-                            })
-                            .await;
-                    }
-                });
-                continue;
             }
-            match net.dispatch(&conn, kind, send, recv).await {
-                Ok(
-                    Inbound::ServedRendezvous { .. }
-                    | Inbound::ServedCoord { .. }
-                    | Inbound::ServedCircuit { .. }
-                    | Inbound::ServedGoodbye { .. },
-                ) => failures = 0,
-                // A sync stream's preamble is read **here, on a task of its own**, and the
-                // actor is told only once the request is in hand.
-                //
-                // The actor is a single task and the only writer of channel state, so
-                // anything it awaits inline stops the whole node: commands, the tick, and —
-                // once the network queue fills — accepting connections at all. Awaiting an
-                // untrusted peer's first frame there meant one stream carrying zero bytes
-                // stopped a node permanently, from any peer holding a valid identity, with an
-                // anchor the worst target because it is always addressable. The connection's
-                // keep-alive is no defence: quinn PINGs the connection for ever while a
-                // stream on it stays silent.
-                //
-                // A task per stream, rather than reading in this loop, so a silent stream does
-                // not even hold up the other streams on its own connection. The read is
-                // bounded by `framing::FRAME_PATIENCE`. Every state mutation still happens in
-                // the actor, in order.
-                // A join request is read here for the same reason a sync preamble is, and the
-                // exposure is worse: a peer needs only a valid identity and a `.vox` name.
-                // `Unknown` may open a `Rendezvous` stream, publish a self-signed pre-join
-                // record naming itself for any channel this board serves, and is then
-                // classified `PendingJoiner` — which may open `Join`. So the read that used to
-                // sit in the actor was reachable by anyone who had ever seen an invite link.
-                Ok(Inbound::Join { peer, send, recv }) => {
-                    failures = 0;
-                    let tx = tx.clone();
-                    let conn = Arc::clone(&conn);
-                    tokio::spawn(async move {
-                        let mut recv = recv;
-                        let Ok((channel_id, epoch)) =
-                            crate::node::joinstream::read_join_request(&mut recv).await
-                        else {
-                            crate::node::joinstream::refuse_join(send).await;
-                            return;
-                        };
-                        let _ = tx
-                            .send(NetEvent::JoinRequest {
-                                conn,
-                                peer,
-                                channel_id,
-                                epoch,
-                                send,
-                                recv,
-                            })
-                            .await;
-                    });
-                }
-                Ok(Inbound::Sync { peer, send, recv }) => {
-                    failures = 0;
-                    let tx = tx.clone();
-                    let conn = Arc::clone(&conn);
-                    tokio::spawn(async move {
-                        let mut recv = recv;
-                        let Ok((channel_id, epoch)) =
-                            crate::node::syncstream::read_sync_request(&mut recv).await
-                        else {
-                            return;
-                        };
-                        let _ = tx
-                            .send(NetEvent::SyncRequest {
-                                conn,
-                                peer,
-                                channel_id,
-                                epoch,
-                                send,
-                                recv,
-                            })
-                            .await;
-                    });
-                }
-                // A pairwise stream's frames are read **here too, off the actor** (V210-71), and
-                // for the same reason as a sync preamble: acting on them needs the actor, waiting
-                // for them must not. The actor used to read them inline, `FRAME_PATIENCE` per
-                // frame and two frames behind a hello, so a member that opened a pairwise stream
-                // and sent nothing held the whole node for 30-60 s, and could do it again.
-                //
-                // One reader per connection rather than a task per stream, because the order of a
-                // peer's pairwise streams is load-bearing: a hello and the key that follows it can
-                // be separate streams, and reordering them is the race F12 was. So a silent stream
-                // holds back only the pairwise streams its own peer opened after it.
-                Ok(Inbound::Pairwise { peer, send, recv }) => {
-                    failures = 0;
-                    let queue = pairwise.get_or_insert_with(|| {
-                        let (q, rx) = mpsc::channel(PAIRWISE_QUEUE);
-                        tokio::spawn(read_pairwise_streams(peer, rx, tx.clone()));
-                        q
-                    });
-                    // Back-pressure on this peer's own connection only: a full queue means this
-                    // peer has that many unread pairwise streams outstanding.
-                    if queue.send((send, recv)).await.is_err() {
-                        return; // the reader ended with the actor
-                    }
-                }
-                Ok(inbound) => {
-                    failures = 0;
-                    let event = NetEvent::Stream {
-                        conn: Arc::clone(&conn),
-                        inbound,
-                    };
-                    if tx.send(event).await.is_err() {
-                        return; // the actor is gone
-                    }
-                }
-                Err(_) => {
-                    if quic.close_reason().is_some() {
+            let head_due = untyped_since.get(&next).map(|at| *at + KIND_ORDER_GRACE);
+            tokio::select! {
+                stream = quic.accept_bi() => {
+                    let Ok((send, recv)) = stream else {
                         break; // the peer or the network closed it
+                    };
+                    let n = accepted;
+                    accepted += 1;
+                    untyped_since.insert(n, tokio::time::Instant::now());
+                    readers.spawn(async move {
+                        (n, crate::transport::streams::read_kind(send, recv).await)
+                    });
+                }
+                Some(read) = readers.join_next(), if !readers.is_empty() => {
+                    let Ok((n, stream)) = read else { continue };
+                    untyped_since.remove(&n);
+                    if n < next {
+                        // Its turn was given up at the grace: served now, out of order.
+                        if serve_typed(&net, &conn, &tx, &quic, peer, stream, &mut state).await
+                            == Flow::Stop
+                        {
+                            break 'streams;
+                        }
+                    } else {
+                        typed.insert(n, stream);
                     }
-                    failures += 1;
-                    if failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
-                        break;
-                    }
+                }
+                () = tokio::time::sleep_until(head_due.unwrap_or_else(tokio::time::Instant::now)),
+                    if head_due.is_some() =>
+                {
+                    // The head is still untyped past the grace: the streams behind it go on.
+                    untyped_since.remove(&next);
+                    next += 1;
                 }
             }
         }
         // This peer's report of our address dies with its connection.
         net.forget_observed(&peer);
     })
+}
+
+/// A stream whose kind has been read: the kind and both halves.
+type Typed = (
+    crate::transport::streams::StreamKind,
+    quinn::SendStream,
+    quinn::RecvStream,
+);
+
+/// How long a stream accepted on a connection may stay untyped before the streams accepted after
+/// it stop waiting for it (see `spawn_stream_loop`). An honest peer's kind arrives with the stream,
+/// so this is only ever reached by a peer that withholds it, or on a path slow enough that order
+/// between its streams is the least of its problems.
+const KIND_ORDER_GRACE: Duration = Duration::from_secs(2);
+
+/// What one connection's stream loop keeps between streams (see `spawn_stream_loop`).
+#[derive(Default)]
+struct StreamLoop {
+    /// Consecutive streams that failed.
+    failures: u32,
+    /// This connection's pairwise reader, started with its first pairwise stream.
+    pairwise: Option<mpsc::Sender<(quinn::SendStream, quinn::RecvStream)>>,
+}
+
+/// Whether the stream loop goes on.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Go,
+    Stop,
+}
+
+/// Serve one stream of `peer`'s whose kind has been read: authorize it and hand it on, as the
+/// stream loop always has (see `spawn_stream_loop`). `state.failures` counts consecutive failures, and
+/// [`Flow::Stop`] ends the loop.
+async fn serve_typed(
+    net: &Arc<NodeNet>,
+    conn: &std::sync::Weak<crate::transport::quic::VoxConnection>,
+    tx: &mpsc::Sender<NetEvent>,
+    quic: &quinn::Connection,
+    peer: Digest32,
+    stream: crate::error::Result<Typed>,
+    state: &mut StreamLoop,
+) -> Flow {
+    // One stream failing is **not** the connection failing. A refused kind, a malformed frame or
+    // a peer that abandons a stream must not stop the others being served: a peer that opens a
+    // bad `coord` stream would otherwise take its own sync path down with it, and the node would
+    // go quiet until it reconnected. The loop ends when the connection itself is gone — or after
+    // this many consecutive failures, which cannot happen without the connection being unusable
+    // and which keeps a pathological peer from spinning this task.
+    const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 16;
+    let (kind, send, recv) = match stream.and_then(|t| net.authorize_typed(peer, t)) {
+        Ok(accepted) => accepted,
+        // **A refusal is not a failure.** The stream was typed and answered; the peer may not
+        // open that kind *yet* — a joiner syncing before it is a member, a responder pushing
+        // before the room is held here — and it will be allowed once the view catches up.
+        // Counted, sixteen of those ended this loop while the connection stayed filed, and every
+        // stream the peer opened after that, allowed or not, went unserved for the connection's
+        // life (V210-80). It cannot spin: each one is a stream the peer opened.
+        Err(crate::error::Error::StreamRefused(_)) => return Flow::Go,
+        Err(_) => {
+            if quic.close_reason().is_some() {
+                return Flow::Stop; // the peer or the network closed it
+            }
+            state.failures += 1;
+            if state.failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
+                // Closed, not only abandoned: a connection nobody serves must not stay filed as
+                // this peer's, or both ends go on using it for nothing.
+                quic.close(
+                    crate::transport::quic::close_code(crate::wire::WireError::TransportFailed),
+                    b"stream failures",
+                );
+                return Flow::Stop;
+            }
+            return Flow::Go;
+        }
+    };
+    // Nobody holds the connection any more: the node has let it go, and a stream
+    // arriving on it has nothing to be served against.
+    let Some(conn) = conn.upgrade() else {
+        return Flow::Stop;
+    };
+    // **The kinds this node serves to completion get a task each.** `accept_stream` served them
+    // inline — `dispatch`'s own doc says to put it on its own task when accepting in a loop, and
+    // this loop did not — so while one was being served no other stream from this peer was even
+    // accepted. A rendezvous stream holds its server until the client finishes or a 20s frame read
+    // gives up; a circuit's opening exchange waits on the *target* peer's answer, which is another
+    // node's loop. On an anchor that put a member's next board `put` behind whatever that member's
+    // last stream was waiting for, 20s at a time, and the member's actor — which awaits its puts —
+    // answered nobody for 30s, 60s, 80s, measured through the real binaries.
+    //
+    // Only these three. Every other kind is handed on in the order it arrived, as before: a
+    // pairwise hello and the key that follows it are separate streams, and reordering them is
+    // exactly the race F12 was.
+    if matches!(
+        kind,
+        crate::transport::streams::StreamKind::Rendezvous
+            | crate::transport::streams::StreamKind::Coord
+            | crate::transport::streams::StreamKind::Circuit
+    ) {
+        state.failures = 0;
+        let net = Arc::clone(net);
+        let conn = Arc::clone(&conn);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            // A coordination stream can end by handing the actor a punch to run.
+            if let Ok(inbound @ Inbound::Punch { .. }) = net.dispatch(&conn, kind, send, recv).await
+            {
+                let _ = tx
+                    .send(NetEvent::Stream {
+                        conn: Arc::clone(&conn),
+                        inbound,
+                    })
+                    .await;
+            }
+        });
+        return Flow::Go;
+    }
+    match net.dispatch(&conn, kind, send, recv).await {
+        Ok(
+            Inbound::ServedRendezvous { .. }
+            | Inbound::ServedCoord { .. }
+            | Inbound::ServedCircuit { .. }
+            | Inbound::ServedGoodbye { .. },
+        ) => state.failures = 0,
+        // A sync stream's preamble is read **here, on a task of its own**, and the
+        // actor is told only once the request is in hand.
+        //
+        // The actor is a single task and the only writer of channel state, so
+        // anything it awaits inline stops the whole node: commands, the tick, and —
+        // once the network queue fills — accepting connections at all. Awaiting an
+        // untrusted peer's first frame there meant one stream carrying zero bytes
+        // stopped a node permanently, from any peer holding a valid identity, with an
+        // anchor the worst target because it is always addressable. The connection's
+        // keep-alive is no defence: quinn PINGs the connection for ever while a
+        // stream on it stays silent.
+        //
+        // A task per stream, rather than reading in this loop, so a silent stream does
+        // not even hold up the other streams on its own connection. The read is
+        // bounded by `framing::FRAME_PATIENCE`. Every state mutation still happens in
+        // the actor, in order.
+        // A join request is read here for the same reason a sync preamble is, and the
+        // exposure is worse: a peer needs only a valid identity and a `.vox` name.
+        // `Unknown` may open a `Rendezvous` stream, publish a self-signed pre-join
+        // record naming itself for any channel this board serves, and is then
+        // classified `PendingJoiner` — which may open `Join`. So the read that used to
+        // sit in the actor was reachable by anyone who had ever seen an invite link.
+        Ok(Inbound::Join { peer, send, recv }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok((channel_id, epoch)) =
+                    crate::node::joinstream::read_join_request(&mut recv).await
+                else {
+                    crate::node::joinstream::refuse_join(send).await;
+                    return;
+                };
+                let _ = tx
+                    .send(NetEvent::JoinRequest {
+                        conn,
+                        peer,
+                        channel_id,
+                        epoch,
+                        send,
+                        recv,
+                    })
+                    .await;
+            });
+        }
+        Ok(Inbound::Sync { peer, send, recv }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok((channel_id, epoch)) =
+                    crate::node::syncstream::read_sync_request(&mut recv).await
+                else {
+                    return;
+                };
+                let _ = tx
+                    .send(NetEvent::SyncRequest {
+                        conn,
+                        peer,
+                        channel_id,
+                        epoch,
+                        send,
+                        recv,
+                    })
+                    .await;
+            });
+        }
+        // A pairwise stream's frames are read **here too, off the actor** (V210-71), and for the
+        // same reason as a sync preamble: acting on them needs the actor, waiting for them must
+        // not. The actor used to read them inline, `FRAME_PATIENCE` per frame and two frames
+        // behind a hello, so a member that opened a pairwise stream and sent nothing held the
+        // whole node for 30-60 s, and could do it again.
+        //
+        // One reader per connection rather than a task per stream, because the order of a peer's
+        // pairwise streams is load-bearing: a hello and the key that follows it can be separate
+        // streams, and reordering them is the race F12 was. So a silent stream holds back only
+        // the pairwise streams its own peer opened after it.
+        Ok(Inbound::Pairwise { peer, send, recv }) => {
+            state.failures = 0;
+            let queue = state.pairwise.get_or_insert_with(|| {
+                let (q, rx) = mpsc::channel(PAIRWISE_QUEUE);
+                tokio::spawn(read_pairwise_streams(peer, rx, tx.clone()));
+                q
+            });
+            // Back-pressure on this peer's own connection only: a full queue means this peer has
+            // that many unread pairwise streams outstanding.
+            if queue.send((send, recv)).await.is_err() {
+                return Flow::Stop; // the reader ended with the actor
+            }
+        }
+        Ok(inbound) => {
+            state.failures = 0;
+            let event = NetEvent::Stream {
+                conn: Arc::clone(&conn),
+                inbound,
+            };
+            if tx.send(event).await.is_err() {
+                return Flow::Stop; // the actor is gone
+            }
+        }
+        Err(_) => {
+            if quic.close_reason().is_some() {
+                return Flow::Stop; // the peer or the network closed it
+            }
+            state.failures += 1;
+            if state.failures >= MAX_CONSECUTIVE_STREAM_FAILURES {
+                return Flow::Stop;
+            }
+        }
+    }
+    Flow::Go
 }
 
 /// Sealed pairwise frames for one stream to one member, and what their delivery decides.
@@ -1439,6 +1577,7 @@ async fn write_pairwise_jobs(
                     peer,
                     chain_id,
                     why: e.to_string(),
+                    answered: false,
                     session,
                     history,
                     epoch,
@@ -1480,12 +1619,13 @@ fn watch_delivery(tx: mpsc::Sender<NetEvent>, sent: quinn::RecvStream, w: Watche
         epoch,
     } = w;
     tokio::spawn(async move {
-        let event = match crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE).await {
-            Some(why) => NetEvent::SkdmRefused {
+        let event = match crate::node::pairwise_stream::refusal(sent, KEY_DELIVERY_PATIENCE).await {
+            Some((why, answered)) => NetEvent::SkdmRefused {
                 channel_id,
                 peer: target,
                 chain_id,
                 why,
+                answered,
                 session,
                 history,
                 epoch,
@@ -1706,6 +1846,37 @@ pub const TEST_STOPPED_DELAY_ENV: &str = "VOX_TEST_STOPPED_DELAY_MS";
 #[cfg(feature = "test-knobs")]
 fn test_stopped_delay_ms() -> Option<u64> {
     std::env::var(TEST_STOPPED_DELAY_ENV).ok()?.parse().ok()
+}
+
+/// **For proofs only.** When set, this node keeps its own member **address** record off every
+/// board for this many milliseconds after it first publishes a room's records (its bundle still
+/// goes), which stands for an address record still on its way. V210-43's proof uses it to make a
+/// just-joined member sync with its anchor while the anchor knows it only by its pre-join record
+/// and the bundle that admits it: the window in which it must be told "not a member yet", never
+/// refused as a stranger. Nothing a person runs sets it; unset, nothing changes. Not compiled in
+/// without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_ADDRESS_ENV: &str = "VOX_TEST_HOLD_ADDRESS_MS";
+
+/// Whether [`TEST_HOLD_ADDRESS_ENV`] still keeps this node's address record for `channel_id` off
+/// the boards: its time counts from the first call for that room.
+#[cfg(feature = "test-knobs")]
+fn test_hold_address(channel_id: &Digest32) -> bool {
+    static FIRST: std::sync::Mutex<BTreeMap<Digest32, std::time::Instant>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let Some(ms) = std::env::var(TEST_HOLD_ADDRESS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let mut first = FIRST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let since = *first
+        .entry(*channel_id)
+        .or_insert_with(std::time::Instant::now);
+    since.elapsed() < Duration::from_millis(ms)
 }
 
 /// **For proofs only.** When set, each blocking task that holds a secret (`secret_blocking`)
@@ -3114,6 +3285,12 @@ pub struct Node {
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
     key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
+    /// Set when this node adopted a peer's session over its own (ADR-021 F12): what it owes that
+    /// peer goes out as soon as the stream that carried the hello is answered, not on the tick.
+    redeliver_now: bool,
+    /// Per `(room, member)`: a member that has just handed over a generation new to us, so is
+    /// offered ours again once its stream is answered (V210-118).
+    reoffer: BTreeSet<(Digest32, Digest32)>,
     /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
     /// key cut off by a crash is owed again after the restart; see [`Node::watch_delivery`].
     keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
@@ -3355,6 +3532,8 @@ impl Node {
             pending_consents: Vec::new(),
             fresh_details: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
+            redeliver_now: false,
+            reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
@@ -4095,11 +4274,16 @@ impl Node {
         // The ordering above still holds whenever the board answers. A board that answers nothing within
         // `ANCHOR_PUBLISH_PATIENCE` is given up on for this round. A transport error ends the round,
         // since the rest would ride the same dead stream; a refusal does not.
-        let own = [
+        #[cfg_attr(not(feature = "test-knobs"), allow(unused_mut))]
+        let mut own = vec![
             ("the room's genesis", genesis_wire),
             ("our member bundle", bundle.to_wire()),
             ("our address", address.to_wire()),
         ];
+        #[cfg(feature = "test-knobs")]
+        if test_hold_address(channel_id) {
+            own.pop();
+        }
         let mirrored = net.board_records(channel_id, epoch);
         // **Off the actor, and still in order.** The round awaits a board's answers, which on a
         // connection that died without saying so is `ANCHOR_PUBLISH_PATIENCE` of waiting, and that
@@ -4895,7 +5079,13 @@ impl Node {
             stamp,
             admission,
         ) {
-            let _ = net.publish_local(&address.to_wire());
+            #[cfg(feature = "test-knobs")]
+            let held = test_hold_address(channel_id);
+            #[cfg(not(feature = "test-knobs"))]
+            let held = false;
+            if !held {
+                let _ = net.publish_local(&address.to_wire());
+            }
             let _ = net.publish_local(&bundle.to_wire());
         }
     }
@@ -4998,6 +5188,7 @@ impl Node {
                     self.channels
                         .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
                     self.mark_decisions_on_open(&channel_id).await;
+                    self.forget_untrusted_keys(&channel_id).await;
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
                     self.publish_channel_locally(&channel_id).await;
@@ -5461,6 +5652,7 @@ impl Node {
                 peer,
                 chain_id,
                 why,
+                answered,
                 session,
                 history,
                 epoch,
@@ -5491,6 +5683,14 @@ impl Node {
                     }) {
                         let _ = channel.owe_history(profile.store(), peer, chain_id);
                     }
+                    // **Refused because its owner does not trust us** (V210-118): the member holds
+                    // none of what it refused, and by the time it trusts us the generation refused
+                    // may be retired. Everything it is entitled to is owed again, so the re-key
+                    // round, which retries until taken, delivers the retired generations too.
+                    use crate::node::pairwise_stream::KeyRefusal;
+                    if why == KeyRefusal::describe(KeyRefusal::NotTrusted.code().into_inner()) {
+                        let _ = channel.owe_entitled_history(profile.store(), &peer);
+                    }
                 }
                 // **The member holds no session with us** (V210-78): it restarted or locked, and
                 // sessions live only in memory. Ours is dead at its end, and resending under it is
@@ -5506,6 +5706,19 @@ impl Node {
                 // fresh one is the cure, as for no session at all.
                 use crate::node::pairwise_stream::KeyRefusal;
                 let key = (channel_id, peer);
+                // **Refused under a session already superseded** (V210-80): this node has adopted
+                // the peer's since it sealed the key (two members trusting each other at once),
+                // so the refusal says nothing about the session held now. Resend at once, under
+                // it, with no backoff.
+                if session.is_some() && self.session_serial.get(&key).copied() != session {
+                    let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                        channel_id,
+                        peer,
+                        why,
+                    });
+                    self.deliver_owed_consents(None).await;
+                    return;
+                }
                 let dead_session = [KeyRefusal::NoSession, KeyRefusal::CannotOpen]
                     .iter()
                     .any(|r| why == KeyRefusal::describe(r.code().into_inner()));
@@ -5519,12 +5732,37 @@ impl Node {
                     self.reopen.remove(&key);
                     self.session_serial.remove(&key);
                 }
+                // **Lost, not refused** (V210-80): the key never reached the member's decision —
+                // its connection closed under it (a tie-break retiring one of two crossed
+                // connections does exactly that), or no answer came. Nothing says the member
+                // would refuse it, so it is resent on the next tick over the connection held
+                // then, with no backoff. A backoff here held two members who had just connected
+                // 2 s and then 4 s more, seen through the shipped binary as a read at 6.2 s.
+                if !answered {
+                    let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                        channel_id,
+                        peer,
+                        why,
+                    });
+                    return;
+                }
                 // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
                 // from the board) is retried promptly, and one that does not stops costing a
                 // stream every second.
+                //
+                // A refused hello is cured by the peer's own, which it offers on its next tick,
+                // and adopting it resends at once (`accept_hello`). Should that offer be lost
+                // with its connection, the retry here is what brings the next one: it stays at
+                // the first step rather than doubling, so one lost offer costs 2 s, not 2 + 4 + 8.
                 let now = self.now();
+                let hello_refused =
+                    why == KeyRefusal::describe(KeyRefusal::HelloRefused.code().into_inner());
                 let entry = self.key_backoff.entry((channel_id, peer)).or_insert((0, 0));
-                entry.0 = entry.0.saturating_add(1);
+                entry.0 = if hello_refused {
+                    1
+                } else {
+                    entry.0.saturating_add(1)
+                };
                 entry.1 = now.saturating_add(1u64 << entry.0.min(6));
                 let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
                     channel_id,
@@ -7320,6 +7558,23 @@ impl Node {
             .mark_decisions_on_open(profile.store(), &order);
     }
 
+    /// Drop, in a room just opened, every sender key held from a member this owner does not trust
+    /// (V210-118): one stopped being trusted while the room was closed, or a key taken before this
+    /// node refused untrusted keys. Rendered messages stay; nothing more of theirs opens.
+    async fn forget_untrusted_keys(&mut self, channel_id: &Digest32) {
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return;
+        };
+        let trusted = self.trust.trusted();
+        let _ = shared
+            .lock()
+            .await
+            .forget_keys_except(profile.store(), &trusted);
+    }
+
     /// Trust `fingerprint` node-wide under `petname` (ADR-020 §3), then act on it
     /// at once so the operator does not wait a tick to see the effect.
     async fn trust_identity(&mut self, fingerprint: Digest32, petname: &str) -> Outcome {
@@ -7397,6 +7652,18 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
+        // nothing it posts from now opens on this node. A closed room drops them when it opens.
+        // What was already read stays read. A re-trust is offered its key again, as any member
+        // whose key this node does not hold.
+        let trusted = self.trust.trusted();
+        let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
+        for ch in shared {
+            let _ = ch
+                .lock()
+                .await
+                .forget_keys_except(profile.store(), &trusted);
+        }
         // Before the rotation, not after: rotation talks to the network and may be slow,
         // and the removal must bite the moment it is decided (M17.11).
         self.refresh_reachers().await;
@@ -9076,9 +9343,13 @@ impl Node {
         self.accepted_hello.insert(key, hello_hash);
         if replaces {
             // Whatever this node sent under the session it just dropped was sealed where
-            // the peer cannot open it: forget that it was delivered, so the tick re-sends
-            // the current key over the session both ends now hold.
+            // the peer cannot open it: forget that it was delivered, and send the current
+            // key over the session both ends now hold at once. A backoff earned by a key
+            // sealed under the dropped session is not this one's (V210-80): it held the
+            // resend back 2 s, and more after a second refusal.
             self.forget_delivery(&channel_id, &peer).await;
+            self.key_backoff.remove(&key);
+            self.redeliver_now = true;
         }
         true
     }
@@ -9494,6 +9765,34 @@ impl Node {
                 let _ = send.finish();
             }
         }
+        // The race between two sessions is resolved: send what is owed under the one both ends
+        // now hold, rather than leave it to a tick and a backoff that were for the dropped one.
+        if std::mem::take(&mut self.redeliver_now) {
+            self.deliver_owed_consents(None).await;
+        }
+        // After the answer, never before it: the sender waits on that answer, and this goes to the
+        // network. Offered again at once, its backoff cleared, rather than up to a minute later on
+        // the tick: a member just trusted reads from the moment its owner decided (V210-118).
+        let owed: Vec<(Digest32, Digest32)> =
+            std::mem::take(&mut self.reoffer).into_iter().collect();
+        for (channel_id, member) in owed {
+            let (Some(profile), Some(shared)) = (
+                self.profile.as_ref(),
+                self.channels.get(&channel_id).map(Arc::clone),
+            ) else {
+                continue;
+            };
+            if shared
+                .lock()
+                .await
+                .reoffer(profile.store(), &member)
+                .is_err()
+            {
+                continue;
+            }
+            self.key_backoff.remove(&(channel_id, member));
+            let _ = self.deliver_rekeys_for(&channel_id, false).await;
+        }
     }
 
     /// Act on a pairwise stream whose first frame has been read: `Some(Ok)` if it carried a key
@@ -9561,20 +9860,40 @@ impl Node {
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
             return Some(Err(KeyRefusal::CannotOpen));
         };
+        // **A node reads only the members its owner trusts** (V210-118). Trust is decided by each
+        // node for itself: the author trusting us releases its key, and that alone must not make
+        // it readable here. A key from an author this owner has not trusted is refused, so nothing
+        // of theirs opens anywhere on this node; the author's re-key round offers it again, and it
+        // is taken once the owner trusts them. A locked node holds no keyring, and is refused as
+        // not accepting rather than read as trusting nobody.
+        let author = skdm.body.author_id;
+        if !self.profile.as_ref().is_some_and(Profile::is_unlocked) {
+            return Some(Err(KeyRefusal::NotAccepted));
+        }
+        if !self.trust.is_trusted(&author) {
+            return Some(Err(KeyRefusal::NotTrusted));
+        }
+        let mut fresh = false;
         let backfilled = match (
             self.profile.as_ref(),
             self.channels.get(&channel_id).map(Arc::clone),
         ) {
-            (Some(profile), Some(shared)) => shared
-                .lock()
-                .await
-                .accept_skdm(profile.store(), &skdm, now)
-                .ok(),
+            (Some(profile), Some(shared)) => {
+                let mut channel = shared.lock().await;
+                fresh = !channel.holds_generation(&author, skdm.body.chain_id);
+                channel.accept_skdm(profile.store(), &skdm, now).ok()
+            }
             _ => None,
         };
         let Some(n) = backfilled else {
             return Some(Err(KeyRefusal::NotAccepted));
         };
+        // A generation new to us: the author may have refused ours while we were untrusted, or
+        // dropped it when its owner stopped trusting us. Ours is offered again once this stream
+        // is answered (see `handle_pairwise`).
+        if fresh {
+            self.reoffer.insert((channel_id, author));
+        }
         let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
             channel_id,
             peer,
@@ -10123,6 +10442,7 @@ impl Node {
         self.channels
             .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         self.mark_decisions_on_open(&channel_id).await;
+        self.forget_untrusted_keys(&channel_id).await;
         self.adopt_channel_anchors(&channel_id, None).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&channel_id).await;

@@ -266,6 +266,20 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
     assert!(ok, "CANNOT MEASURE: vox room invite: {err}");
     let link = link.trim().to_owned();
 
+    // The recorder's positive control: alice's daemon has opened its store by now, so a log with
+    // no `open` is a recorder that records nothing, and every kill point below would be unarmed.
+    let opens = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.split('\t').nth(2) == Some("open"))
+        .count();
+    assert!(
+        opens > 0,
+        "CANNOT MEASURE: the syscall recorder (vox-test-interpose under DYLD_INSERT_LIBRARIES) \
+         recorded no `open` by alice's daemon in {}: it is not recording",
+        log.display()
+    );
+
     // ---- one trial per kill point ----------------------------------------------------------
     let mut made: Vec<String> = Vec::new();
     let mut kills = 0u64;

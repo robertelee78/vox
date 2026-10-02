@@ -440,7 +440,7 @@ impl VoxEndpoint {
         self.mux.is_circuit(addr)
     }
 
-    /// The address `peer`'s live circuit stands at, if it has one. Circuit addresses are
+    /// The address `peer`'s newest live circuit stands at, if it has one. Circuit addresses are
     /// allocated, so this is the only way to get from a peer to its circuit.
     #[must_use]
     pub fn circuit_addr_of(&self, peer: &Digest32) -> Option<std::net::SocketAddr> {
@@ -968,7 +968,6 @@ fn set_tunnel_window(connection: &Connection, tunnels: u32) {
     connection.set_receive_window(quinn::VarInt::from_u64(window).unwrap_or(quinn::VarInt::MAX));
 }
 
-/// Whether a connection already carrying `open` tunnels must refuse one more.
 /// Whether `peer` already has as many live tunnels with this node as it may, on whatever
 /// connections they run.
 fn at_tunnel_cap(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> bool {

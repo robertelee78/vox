@@ -860,7 +860,7 @@ impl ConnectionManager {
     }
 
     /// **Ask the connections held for a peer whether anyone is there**, before a newcomer for
-    /// the same peer is filed against them — and close each one nobody answers on.
+    /// the same peer is filed against them — and retire each one nobody answers on.
     ///
     /// Silence ([`SILENCE_IS_DEATH`]) tells a dead connection from a live one, but only after
     /// 30s, and a restarted peer's new connection usually arrives within a second or two of the
@@ -874,8 +874,8 @@ impl ConnectionManager {
     /// datagram frame is ack-eliciting, so a live peer ACKs it within its ACK delay (25ms)
     /// whether or not anything reads datagrams. Anything at all arriving on a held connection
     /// within [`probe_patience`] of its probe is an answer. Nothing is a connection whose far
-    /// end is gone: it is closed, and [`Self::file_inner`] then files the newcomer against no
-    /// rival.
+    /// end is gone, or busy: it is retired (V210-104, see [`Self::file_inner`]), and the newcomer
+    /// is then filed against no rival.
     ///
     /// Measured against `a_restarted_host_is_reached_through_its_anchor` (real nodes, a relayed
     /// client, the host crashed and restarted): reachable again within 0.1s of being back, where
@@ -953,18 +953,43 @@ impl ConnectionManager {
     fn file_inner(&self, conn: VoxConnection, serve_loser: bool, unanswered: Unanswered) -> Filed {
         let peer = conn.peer_id();
         let mut map = lock(&self.conns);
+        // **Unanswered is retired, not closed** (V210-104). Only a connection to the newcomer's own
+        // process is probed (see [`Self::probe_held`]), and that process has just completed a
+        // handshake: it is alive. A probe it did not answer in time is a busy process or a path
+        // that has gone, and closing on it reset whatever was in flight there. Measured: an anchor
+        // dialling a room's hundreds of offline members answered late, its joiners closed the
+        // connection their room fetch was riding, and 1–2% of joins into a 200-member room failed
+        // `quic stream: closed by the peer`; both ends did it to each other. Retired, the
+        // connection leaves the newcomer's way exactly as a close did, and what it carries
+        // finishes; [`Self::retire_expired`] closes it once nothing does.
         for (dead, before) in unanswered {
             if is_live(&dead) && dead.quinn().stats().udp_rx.datagrams == before {
-                dead.close(WireError::Unresponsive);
-                self.note(
-                    dead.peer_id(),
-                    format!(
-                        "the connection {} did not answer a probe while a new one {} was filed, \
-                         and is closed",
-                        conn_tag(&dead),
-                        conn_tag(&conn)
-                    ),
-                );
+                let held = map.get(&peer).is_some_and(|c| Arc::ptr_eq(c, &dead));
+                if held {
+                    map.remove(&peer);
+                    let retire_at = (self.clock)().saturating_add(self.retire_grace_secs);
+                    lock(&self.retiring).push((Arc::clone(&dead), retire_at));
+                    self.note(
+                        peer,
+                        format!(
+                            "the connection held {} did not answer a probe in time when a new one \
+                             {} arrived; retired, not closed, so what it carries finishes",
+                            conn_tag(&dead),
+                            conn_tag(&conn)
+                        ),
+                    );
+                } else {
+                    // Said, not silent (V210-93, #287): it is already retiring, and stays so.
+                    self.note(
+                        dead.peer_id(),
+                        format!(
+                            "the connection {} did not answer a probe when a new one {} arrived; \
+                             it is already retiring, and is left to finish",
+                            conn_tag(&dead),
+                            conn_tag(&conn)
+                        ),
+                    );
+                }
             }
         }
         // **A newcomer from another process of the identity supersedes every connection to the

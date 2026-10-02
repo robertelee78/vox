@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use vox_core::atrest::vault::IdentityVault;
 
 use previous_release::previous_release;
-use syscalls::{interposer, parse, published_durably, recorded};
+use syscalls::{assert_the_recorder_saw_vox, interposer, parse, published_durably, recorded};
 use world::{args, VoxProc, IDENTITY, VOX};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
@@ -154,6 +154,7 @@ fn a_file_that_holds_the_identity_is_published_durably() {
         });
     }
     let events = parse(&std::fs::read_to_string(&log).unwrap_or_default());
+    assert_the_recorder_saw_vox(&events, "a headless `vox node`");
     let headless = published_durably(&events, &node.join("default/node-identity.key"));
     verdict("a headless node's node-identity.key", &headless);
 

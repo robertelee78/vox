@@ -2,7 +2,7 @@
 """tui_room_truth.py <vox> <tag> — V210-82 (#273), through the shipped `vox tui`.
 
 Alice creates a room; Bob and Carol join it, all through real daemons. Alice and Bob trust each
-other, so each consents to the other; nobody trusts Carol. Alice posts 70 lines, more than Bob's
+other, so each consents to the other; nobody trusts Carol, and Carol trusts Bob. Alice posts 70 lines, more than Bob's
 timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in a pty (pyte at
 160x50). Each claim prints one `CLAIM <name> ok|RED` line:
 
@@ -153,7 +153,9 @@ try:
             raise
         if p.returncode != 0: apparatus(f"{w} join: {err.strip()}")
     print(f"{TAG} bob's and carol's joins took {time.time() - t_join:.1f} s")
-    for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob")):
+    # Carol trusts Bob, so what `delivers` and `revoke` measure is Bob's consent alone: a node reads
+    # only whom its owner trusts (V210-118).
+    for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob"), ("carol", "bob", "bob")):
         t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
         if t.returncode != 0: apparatus(f"{w} trust add: {t.stderr}")
     stage("alice posts")
