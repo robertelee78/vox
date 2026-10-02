@@ -3,7 +3,7 @@
 //! would (ADR-018, "Only real use of the product is a test"). The room is made the way a
 //! person makes it: an anchor (`vox node`), `vox id`, `vox trust add`, `vox daemon`,
 //! `vox room create`, `vox room invite`, `vox room join`; then the daemons stop and each
-//! member runs `vox lan up <room> --allow 5000 --stats-file …`.
+//! member runs `vox lan up <room> --allow 5000 --stats-file … --metrics 127.0.0.1:0`.
 //!
 //! **The one piece that is not the shipped binary is root's.** `vox lan up` asks a helper,
 //! over a Unix socket, for an interface, and the real helper (`sudo vox lan helper`) creates a
@@ -27,10 +27,10 @@
 //! 1. **One plan.** All four nodes compute the same addresses: four distinct IPv4 hosts in
 //!    one /24 of `100.64.0.0/10`, four IPv6 addresses in one `fd…/64`.
 //! 2. **Links follow the gate.** alice, bob and dave each link to the other two; carol
-//!    links to nobody, though she dials all three. (alice's app layer counts carol's
-//!    refusals, but a `vox lan up` reports no app counters — it serves no control socket or
-//!    metrics — so what is asserted here is carol's links, watched for longer than her
-//!    longest redial interval.)
+//!    links to nobody, though she dials all three, watched for longer than her longest
+//!    redial interval; and alice's running `vox lan up` answers `vox status --json` on its
+//!    control socket (V030-04, #236) with carol's dials counted as refused as untrusted,
+//!    and its `--metrics` endpoint answers with them counted among the refused app streams.
 //! 3. **Unicast reaches the member holding the address, unchanged** — UDP over IPv4 and
 //!    IPv6, a TCP segment, an ICMP echo, 1280-byte packets — and no member receives a
 //!    packet addressed to another.
@@ -44,10 +44,10 @@
 //! 7. **Floods are capped**: 1000 mDNS packets at once deliver at most the burst plus the
 //!    rate, and the rest are counted as capped.
 //! 8. **Withdrawing trust ends the link**: once alice untrusts bob, nothing crosses between
-//!    them, while dave still hears alice. A running `vox lan up` holds alice's profile and
-//!    serves no control socket, so `vox trust remove` cannot reach it: as a person must,
-//!    alice stops her LAN (Ctrl-C), removes bob with `vox trust remove`, and starts it again,
-//!    while bob's, which still trusts her, keeps running and redialling.
+//!    them, while dave still hears alice. alice runs `vox trust remove` while her LAN runs:
+//!    the running `vox lan up` serves her profile's control socket (V030-04, #236), so the
+//!    removal reaches it and ends the link **without a restart**, while bob's, which still
+//!    trusts her, keeps running and redialling.
 //! 9. **Only whitelisted ports are reachable** (the decider's rule, 2026-09-25). Every
 //!    member runs with `--allow 5000`, so everything above goes to port 5000, and the
 //!    floods in (4) go to ports 5353, 1900 and 9999, which are *not* listed. So discovery
@@ -271,6 +271,22 @@ fn daemon(name: &str, data: &Path, port: u16, anchor: &str, pass_file: &Path) ->
     panic!("{name}'s daemon never answered `vox room list`");
 }
 
+/// `GET /metrics` from a `vox --metrics` endpoint at `addr`: the body.
+fn scrape(addr: &str) -> String {
+    use std::io::Read as _;
+    let mut s = std::net::TcpStream::connect(addr)
+        .unwrap_or_else(|e| panic!("PRODUCT: nothing answers at the metrics address {addr}: {e}"));
+    s.set_read_timeout(Some(TIMEOUT)).ok();
+    // One write, as a scraper sends it: `write!` would send it in pieces.
+    s.write_all(format!("GET /metrics HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
+        .unwrap_or_else(|e| panic!("PRODUCT: the metrics endpoint at {addr} took no request: {e}"));
+    let mut got = String::new();
+    s.read_to_string(&mut got)
+        .unwrap_or_else(|e| panic!("PRODUCT: the metrics endpoint at {addr} did not answer: {e}"));
+    got.split_once("\r\n\r\n")
+        .map_or(got.clone(), |(_, body)| body.to_owned())
+}
+
 /// Send `sig` to `p` by its PID and wait for it to exit, as a person's Ctrl-C or a service
 /// manager's stop would; `Drop` kills it by PID if it has not.
 fn stop(p: &mut VoxProc, sig: &str) {
@@ -445,6 +461,8 @@ struct Host {
     stats_file: PathBuf,
     os: Os,
     lan: Option<VoxProc>,
+    /// Where its running `vox lan up --metrics` serves its counters, as it printed it.
+    metrics: Option<String>,
     v4: Ipv4Addr,
     v6: Ipv6Addr,
 }
@@ -469,12 +487,14 @@ impl Host {
             stats_file: tmp.path().join(format!("{name}.json")),
             os,
             lan: None,
+            metrics: None,
             v4: Ipv4Addr::UNSPECIFIED,
             v6: Ipv6Addr::UNSPECIFIED,
         }
     }
 
-    /// `vox lan up <room> --allow 5000`, until it says it is up and has written its stats.
+    /// `vox lan up <room> --allow 5000 --metrics 127.0.0.1:0`, until it says it is up and has
+    /// written its stats.
     fn up(&mut self, anchor: &str, room: &str) {
         let _ = std::fs::remove_file(&self.stats_file);
         port_free(self.port);
@@ -515,21 +535,23 @@ impl Host {
                 self.stats_file.to_str().unwrap(),
                 "--allow",
                 &allow,
+                "--metrics",
+                "127.0.0.1:0",
             ]),
         );
         p.expect_within(SETUP, "vox lan up to come up", |l| {
             l.starts_with("vox lan up on ")
         });
+        // Printed before the LAN comes up, so it is among the lines already read.
+        self.metrics = p.seen.iter().find_map(|l| {
+            l.strip_prefix("vox lan: metrics http://")
+                .and_then(|r| r.strip_suffix("/metrics"))
+                .map(str::to_owned)
+        });
         handing_over.store(false, Ordering::Relaxed);
         churn.join().expect("the socket churn");
         self.lan = Some(p);
         let _ = self.stats();
-    }
-
-    /// Ctrl-C, as a person stops it.
-    fn down(&mut self) {
-        let mut p = self.lan.take().expect("running");
-        stop(&mut p, "-INT");
     }
 
     /// The stats file `vox lan up` writes twice a second.
@@ -833,6 +855,40 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         watched.elapsed()
     );
     assert!(c.links().is_empty(), "carol linked to {:?}", c.links());
+    // alice's running LAN answers for her profile, and counts carol's dials as refused.
+    let (ok, out, err) = vox_once(&a.dir, &args(&["status", "--json"]));
+    assert!(
+        ok,
+        "PRODUCT: `vox status --json` while alice's LAN runs was refused: {out}{err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|e| panic!("PRODUCT: alice's `vox status --json` is not JSON: {e}\n{out}"));
+    let untrusted = status["app"]["refused_untrusted"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("PRODUCT: no app.refused_untrusted in alice's status:\n{out}"));
+    eprintln!("[links] alice's `vox status --json`: app.refused_untrusted = {untrusted}");
+    assert!(
+        untrusted >= 1,
+        "PRODUCT: alice counted none of carol's dials as refused as untrusted:\n{out}"
+    );
+    // And its metrics endpoint answers, with the same refusals counted.
+    let at = a.metrics.clone().unwrap_or_else(|| {
+        panic!("PRODUCT: alice's `vox lan up --metrics 127.0.0.1:0` never said where it serves metrics")
+    });
+    let scraped = scrape(&at);
+    let refused = scraped
+        .lines()
+        .find_map(|l| l.strip_prefix("vox_app_streams_refused_total "))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: alice's metrics at {at} have no vox_app_streams_refused_total:\n{scraped}")
+        });
+    eprintln!("[links] alice's metrics at {at}: vox_app_streams_refused_total = {refused}");
+    assert!(
+        refused >= untrusted,
+        "PRODUCT: alice's metrics count {refused} refused app streams, fewer than the {untrusted} \
+         her status counts as refused as untrusted"
+    );
 
     // ---- 3. unicast reaches the member holding the address, unchanged ----
     let mut sent: Vec<(String, Vec<u8>, &'static str)> = Vec::new();
@@ -1110,19 +1166,17 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
     assert!(capped as f64 >= 1000.0 - bound);
 
     // ---- 8. withdrawing trust ends the link ----
-    // A running `vox lan up` holds the profile and serves no control socket; this is the
-    // receipt of what `vox trust remove` says to a person who tries it anyway.
-    let (live, _, said) = vox_once(&a.dir, &args(&["trust", "remove", &b.id]));
+    // alice's LAN keeps running: the removal reaches it through its control socket.
+    let (live, out, said) = vox_once(&a.dir, &args(&["trust", "remove", &b.id]));
     eprintln!(
-        "[withdrawn] `vox trust remove` while alice's LAN runs: ok={live}: {}",
+        "[withdrawn] `vox trust remove` while alice's LAN runs: ok={live}: {}{}",
+        out.trim(),
         said.trim()
     );
-    a.down();
-    if !live {
-        let (ok, out, err) = vox_once(&a.dir, &args(&["trust", "remove", &b.id]));
-        assert!(ok, "vox trust remove bob: {out}{err}");
-    }
-    a.up(&spec, &room);
+    assert!(
+        live,
+        "PRODUCT: `vox trust remove` did not reach alice's running LAN: {out}{said}"
+    );
     until(
         "alice to link with dave again, and alice and bob not at all",
         || a.links() == want(&[&d.id]) && !b.links().contains(&a.id),
