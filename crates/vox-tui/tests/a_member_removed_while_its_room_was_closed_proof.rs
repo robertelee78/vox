@@ -215,7 +215,8 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     let read_before = until(Duration::from_secs(120), || {
         n += 1;
         post(&alice, &room, &format!("ALICE-BEFORE {n}"));
-        reads(&bob, &room, &format!("ALICE-BEFORE {n}"))
+        // Any of them: the one just posted has not had time to arrive.
+        count(&bob, &room, "ALICE-BEFORE") > 0
     });
     assert!(
         read_before,
