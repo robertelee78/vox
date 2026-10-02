@@ -23,10 +23,20 @@
 //!    complete nor decline it; the named session completes it;
 //! 4. a decline frees the item — it does **not** return to the sender — and a fresh
 //!    claim by a third session then succeeds;
-//! 5. a handoff of a claim that had **no TTL** still lapses at its own deadline.
+//! 5. a handoff of a claim that had **no TTL** still lapses at its own deadline;
+//! 6. **the same rows logged in different orders fold to the same board.** Each node logs
+//!    its own post when it is made and a peer's when it arrives, so two claims of one item
+//!    made while the nodes cannot reach each other sit in opposite local orders: bob's
+//!    daemon is stopped (SIGSTOP) while alice claims, alice's and the anchor's (it holds
+//!    the room's entries too) while bob claims, then all resume. The earlier claim must
+//!    hold on both nodes. Precondition (else APPARATUS, CANNOT MEASURE): `room read
+//!    --json` shows the two claims in different orders on the two nodes — without that,
+//!    a fold in local order and the canonical fold give the same board.
 //!
-//! No assertion depends on causal order between two authors: every step waits until
-//! the node that acts next has *seen* what it acts on.
+//! Cases 1–5 depend on no causal order between two authors: every step waits until the
+//! node that acts next has *seen* what it acts on. That is also why they cannot catch a
+//! fold that follows local order — both nodes log every row in the same order — and why
+//! case 6 exists.
 //!
 //! ## Why two nodes, not three — an open defect, not a limitation
 //!
@@ -93,6 +103,36 @@ fn held_by<'a>(fp: &'a str, session: &'a str) -> impl Fn(Option<&serde_json::Val
             r["state"] == "held" && r["owner_fp"] == fp && r["owner_session"] == session
         })
     }
+}
+
+/// Send `sig` to `pid`, the process `what` names.
+fn signal(pid: u32, sig: &str, what: &str) {
+    let sent = std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(
+        sent,
+        "APPARATUS: CANNOT MEASURE (6): `kill {sig}` {what} failed"
+    );
+}
+
+/// The claims of `r` in a `room read --json`, in that node's local order, as
+/// `(entry_hash, author, created_millis)`.
+fn claims_in_local_order(o: &Out, r: &str) -> Vec<(String, String, u64)> {
+    o.ndjson()
+        .iter()
+        .filter(|row| {
+            row["envelope"]["type"] == "claim" && row["envelope"]["data"]["resource"] == r
+        })
+        .map(|row| {
+            (
+                row["entry_hash"].as_str().unwrap_or_default().to_owned(),
+                row["author"].as_str().unwrap_or_default().to_owned(),
+                row["created_millis"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -308,6 +348,81 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         );
     }
 
+    // ---- (6) the same claims, logged in opposite orders, fold to one board ----
+    let alice_d = alice.daemon_pid().expect("alice's daemon runs");
+    let bob_d = bob.daemon_pid().expect("bob's daemon runs");
+    let anchor_d = room.anchor_pid();
+    signal(bob_d, "-STOP", "bob's daemon");
+    let first = alice.vox(Some("a1"), &["room", "claim", r, "h-order"]);
+    // The anchor holds the room's entries too, and would serve bob alice's claim.
+    signal(alice_d, "-STOP", "alice's daemon");
+    signal(anchor_d, "-STOP", "the anchor");
+    signal(bob_d, "-CONT", "bob's daemon");
+    let second = bob.vox(Some("b1"), &["room", "claim", r, "h-order"]);
+    signal(alice_d, "-CONT", "alice's daemon");
+    signal(anchor_d, "-CONT", "the anchor");
+    assert!(
+        first.ok && first.stdout.contains("you hold h-order"),
+        "alice/a1 claimed h-order first, with nobody else claiming it: {first:?}"
+    );
+    let orders: Vec<Vec<(String, String, u64)>> = [alice, bob]
+        .iter()
+        .map(|w| {
+            let o = until(
+                w,
+                None,
+                &format!("{} to log both claims of h-order", w.name),
+                &["room", "read", r, "--json"],
+                |o: &Out| o.ok && claims_in_local_order(o, "h-order").len() == 2,
+            );
+            claims_in_local_order(&o, "h-order")
+        })
+        .collect();
+    let hashes = |v: &[(String, String, u64)]| v.iter().map(|c| c.0.clone()).collect::<Vec<_>>();
+    eprintln!(
+        "[proof] (6) local order of the h-order claims: alice {:?}, bob {:?}; bob's claim said: {}{}",
+        hashes(&orders[0]),
+        hashes(&orders[1]),
+        second.stdout.trim(),
+        second.stderr.trim()
+    );
+    assert!(
+        hashes(&orders[0]) != hashes(&orders[1]),
+        "APPARATUS: CANNOT MEASURE (6): both nodes logged the two claims of h-order in the \
+         same order {:?} (bob had alice's claim before he made his), so this case cannot tell \
+         a canonical fold from one in local order",
+        orders[0]
+    );
+    let by = |author: &str| orders[0].iter().find(|c| c.1 == author).map(|c| c.2);
+    assert!(
+        matches!((by(&a_fp), by(&b_fp)), (Some(a), Some(b)) if a < b),
+        "APPARATUS: CANNOT MEASURE (6): the two claims are not alice's then bob's, \
+         stamped in that order: {:?}",
+        orders[0]
+    );
+    let held: Vec<serde_json::Value> = [alice, bob]
+        .iter()
+        .map(|w| {
+            resource(&board(w, None, r), "h-order")
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        held[0], held[1],
+        "PRODUCT: alice and bob fold different boards for h-order from the same two claims, \
+         logged in different orders"
+    );
+    assert!(
+        held_by(&a_fp, "a1")(Some(&held[0])),
+        "PRODUCT: the earlier claim (alice/a1) must hold h-order on every node; both say {}",
+        held[0]
+    );
+    eprintln!(
+        "[proof] (6) identical h-order on two nodes from opposite local orders: {}",
+        held[0]
+    );
+
     // ---- every node computed the same state ----
     // Both nodes must have seen every operation before their boards can be compared.
     let last = board(alice, None, r)["position"]["entries"].clone();
@@ -322,7 +437,10 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         .iter()
         .map(|w| agreed(&board(w, None, r)))
         .collect();
-    assert_eq!(boards[0], boards[1], "alice and bob fold different boards");
+    assert_eq!(
+        boards[0], boards[1],
+        "PRODUCT: alice and bob fold different boards"
+    );
     eprintln!(
         "[proof] identical folded boards on two nodes: {}",
         boards[0]

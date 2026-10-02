@@ -372,8 +372,11 @@ impl RendezvousStore {
             true
         };
 
-        // 5. Admit: replace the author's current record (one current per author).
-        bucket.insert(record.author_id, record);
+        // 5. Admit: replace the author's current record (one current per author). A member is no
+        //    longer waiting to join, so its pre-join record goes (V210-102).
+        let (channel_id, author_id) = (record.channel_id, record.author_id);
+        bucket.insert(author_id, record);
+        self.forget_prejoin(&channel_id, &author_id);
         Ok(learned)
     }
 
@@ -434,7 +437,12 @@ impl RendezvousStore {
             true
         };
 
-        // 5. Admit: one current bundle per author.
+        // 5. Admit: one current bundle per author. **Its pre-join stays** (V210-102): this board
+        //    counts a member by its address record (`NodeNet::peer_is_member_on_board`), not by a
+        //    bundle, and an admitting member's bundle for a joiner can land before the joiner's own
+        //    address. Dropped here, the joiner was neither a member nor a pending joiner in that
+        //    gap, and its sync was refused as "authenticator invalid" (V210-43). The address
+        //    record's admission drops it.
         bucket.insert(record.author_id, record);
         Ok(learned)
     }
@@ -760,6 +768,21 @@ impl RendezvousStore {
             .get(&(*channel_id, epoch))
             .and_then(|b| b.get(author_id))
             .filter(|r| now < bundle_expiry(r))
+    }
+
+    /// Drop the pre-join record `id` holds for `channel_id`, if any, because `id` is no longer
+    /// waiting to join: it is a member (V210-102). A pre-join record lived out its two hours after
+    /// its joiner was admitted, so an anchor's `vox node` counted every member who joined in that
+    /// time as still waiting (`301m/256p` for a room of 301). Returns whether there was one.
+    pub fn forget_prejoin(&mut self, channel_id: &Digest32, id: &Digest32) -> bool {
+        let Some(bucket) = self.prejoins.get_mut(channel_id) else {
+            return false;
+        };
+        let held = bucket.remove(id).is_some();
+        if bucket.is_empty() {
+            self.prejoins.remove(channel_id);
+        }
+        held
     }
 
     /// The current, non-expired pre-join records for `channelID`, in unspecified

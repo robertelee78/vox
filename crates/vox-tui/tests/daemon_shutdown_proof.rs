@@ -20,16 +20,39 @@
 //! Mutations: the unbounded `node.apply(Shutdown)` this replaced turns it red at ~60 s; a
 //! daemon that leaves something holding its store's lock past its own exit turns it red at
 //! the `vox trust list`, which is refused with "another vox already has this profile open".
+//!
+//! ## And when a finished transfer's last bytes are unacknowledged (V210-81, #272)
+//! [`a_stop_waits_out_last_bytes_within_its_patience`]: a stopping node waits, up to
+//! `STOP_ACK_BOUND`, for tunnels that finished their stream to have their last bytes
+//! acknowledged, then closes its connections. With that bound equal to the daemon's 5 s
+//! patience, a stop that waited out an unacknowledged tail ran into the patience: the daemon
+//! printed "the node did not stop within 5s … stopping anyway" and left with its ordered stop
+//! cut short. Staging, all real processes: Alice and Bob are `vox daemon`s in one room; Alice
+//! offers a [`FILE_BYTES`]-byte file (under a tunnel's window) with `vox room send`, Bob starts
+//! `vox room get`, and at its first bytes Bob's daemon is frozen (SIGSTOP), so Alice's tunnel
+//! finishes its stream with the tail unacknowledged; then Alice's daemon gets SIGINT.
+//! Asserted: it exits within [`PATIENCE`] and never says it gave up. Preconditions (else the
+//! attempt is staged again, up to [`ATTEMPTS`] times, then CANNOT MEASURE): Alice's
+//! `vox room send` read the whole file (it closes the file once it has), the collector did
+//! not have it, and the stop took at least [`WAITED`] (a tail acknowledged before the stop
+//! makes it immediate). Mutation: `STOP_ACK_BOUND` back at 5 s — the daemon exits after about
+//! 5.04 s saying "the node did not stop within 5s": red.
 
 #![cfg(unix)]
+
+#[path = "support/sync_pair.rs"]
+mod sync_pair;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use sync_pair::{Member, ID_PASS};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
@@ -250,4 +273,256 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     let remaining = pids.iter().filter(|p| alive(**p)).count();
     assert_eq!(remaining, 0, "processes still running: {pids:?}");
     eprintln!("[shutdown] {remaining} processes remain");
+}
+
+/// Less than a tunnel's 16 MiB stream window, so the whole file leaves Alice's `vox room send`
+/// with Bob frozen.
+const FILE_BYTES: usize = 12 << 20;
+/// `vox daemon`'s `SHUTDOWN_PATIENCE`.
+const PATIENCE: Duration = Duration::from_secs(5);
+/// What the daemon prints when it abandons its node's stop.
+const GAVE_UP: &str = "did not stop within";
+/// A stop that waited on an unacknowledged tail takes at least this long.
+const WAITED: Duration = Duration::from_secs(2);
+const ATTEMPTS: usize = 4;
+
+struct Kid(Child);
+
+impl Drop for Kid {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_member(m: &Member, args: &[&str], out: &Path) -> Kid {
+    let child = Command::new(VOX)
+        .args(args)
+        .env("VOX_DATA_DIR", &m.dir)
+        .env("VOX_CONFIG_DIR", m.dir.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", ID_PASS)
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .env_remove("VOX_SESSION")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            std::fs::File::create(out).expect("APPARATUS: create the stdout file"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(out.with_extension("err"))
+                .expect("APPARATUS: create the stderr file"),
+        ))
+        .spawn()
+        .expect("APPARATUS: spawn vox");
+    Kid(child)
+}
+
+fn bytes_in(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// How far `pid`'s open descriptors of `name` have read, from the shipped `lsof`; `None` when
+/// `lsof` listed no descriptor of `pid` at all (so it saw nothing, not a closed file).
+fn read_offsets(pid: u32, name: &str) -> Option<Vec<u64>> {
+    let out = Command::new("lsof")
+        .args([
+            "-n",
+            "-P",
+            "-o",
+            "-o",
+            "0",
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-F",
+            "fon",
+        ])
+        .output()
+        .expect("APPARATUS: run lsof");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut offset, mut offsets, mut listed) = (None, Vec::new(), false);
+    for line in text.lines() {
+        if let Some(o) = line.strip_prefix('o') {
+            offset = o
+                .strip_prefix("0t")
+                .and_then(|d| d.parse().ok())
+                .or_else(|| {
+                    o.strip_prefix("0x")
+                        .and_then(|h| u64::from_str_radix(h, 16).ok())
+                });
+        } else if let Some(n) = line.strip_prefix('n') {
+            if n.ends_with(name) {
+                offsets.extend(offset);
+            }
+        } else if line.starts_with('f') {
+            offset = None;
+            listed = true;
+        }
+    }
+    listed.then_some(offsets)
+}
+
+/// One staging. `None` when a precondition did not hold; else how long Alice's daemon took to
+/// exit after SIGINT, and what it said.
+fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
+    let alice = Member::new(&root.join(format!("a{n}")), "alice");
+    let bob = Member::new(&root.join(format!("b{n}")), "bob");
+    alice.trust(&bob);
+    bob.trust(&alice);
+    let mut alice_d = alice.daemon(None);
+    let bob_d = bob.daemon(None);
+    let room = alice.create("pair");
+    bob.join(&alice.invite(&room), "pair");
+    let mut rb = bob.reader();
+    let cb = rb.room(&room);
+
+    let name = "tail.bin";
+    let file = root.join(format!("{n}-{name}"));
+    {
+        let mut f = std::fs::File::create(&file).expect("APPARATUS: create the offered file");
+        let chunk: Vec<u8> = (0..1 << 20)
+            .map(|i: u32| (i.wrapping_mul(7).wrapping_add(n as u32) % 251) as u8)
+            .collect();
+        for _ in 0..FILE_BYTES >> 20 {
+            f.write_all(&chunk)
+                .expect("APPARATUS: write the offered file");
+        }
+    }
+    let send_out = root.join(format!("send{n}.out"));
+    let send = spawn_member(
+        &alice,
+        &[
+            "room",
+            "send",
+            &room,
+            file.to_str().expect("APPARATUS: a UTF-8 path"),
+        ],
+        &send_out,
+    );
+    let offered = format!("{n}-{name}");
+    let t0 = Instant::now();
+    while !rb.texts(cb).iter().any(|t| t.contains(&offered)) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "CANNOT MEASURE: Bob never read the offer"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let dir = root.join(format!("get{n}"));
+    std::fs::create_dir_all(&dir).expect("APPARATUS: create the download directory");
+    let get_out = root.join(format!("get{n}.out"));
+    let _get = spawn_member(
+        &bob,
+        &[
+            "room",
+            "get",
+            &room,
+            &offered,
+            "--out",
+            dir.join(&offered)
+                .to_str()
+                .expect("APPARATUS: a UTF-8 path"),
+        ],
+        &get_out,
+    );
+    let t1 = Instant::now();
+    while bytes_in(&dir) == 0 {
+        assert!(
+            t1.elapsed() < Duration::from_secs(60),
+            "CANNOT MEASURE: the collector received nothing"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Nothing more Alice sends is acknowledged from here on.
+    bob_d.signal("-STOP");
+    let held = bytes_in(&dir);
+    // Alice's `vox room send` writes the whole file into her daemon, and closes.
+    let t2 = Instant::now();
+    // `vox room send` closes the file as soon as it has read all of it; the collector already
+    // holds bytes read from it, so a file no longer open was read to its end (nothing has
+    // stopped the offer, and a read error is not staged here).
+    let (read, open) = loop {
+        let (read, open): (u64, &str) = match read_offsets(send.0.id(), &offered) {
+            Some(offsets) if offsets.is_empty() => (FILE_BYTES as u64, "closed"),
+            Some(offsets) => (offsets.iter().sum(), "open"),
+            None => (0, "not listed"),
+        };
+        if read >= FILE_BYTES as u64 || t2.elapsed() > Duration::from_secs(10) {
+            break (read, open);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    eprintln!(
+        "[proof] attempt {n}: the sender read {read} of {FILE_BYTES} (its file {open}); the \
+         collector held {held} at the freeze"
+    );
+    // Let the daemon read the rest of the file and finish the tunnel's stream.
+    std::thread::sleep(Duration::from_secs(1));
+    if read < FILE_BYTES as u64 || held >= FILE_BYTES as u64 {
+        eprintln!("[proof] attempt {n}: not staged");
+        bob_d.signal("-CONT");
+        return None;
+    }
+
+    let stop = Instant::now();
+    alice_d.signal("-INT");
+    let took = loop {
+        if alice_d
+            .child
+            .try_wait()
+            .expect("APPARATUS: poll Alice's daemon's exit")
+            .is_some()
+        {
+            break stop.elapsed();
+        }
+        assert!(
+            stop.elapsed() < Duration::from_secs(30),
+            "PRODUCT: Alice's daemon did not exit within 30 s of SIGINT:\n{}",
+            alice_d.transcript()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // The output threads read to the end of the pipes once the process is gone.
+    std::thread::sleep(Duration::from_millis(200));
+    let said = alice_d.transcript();
+    bob_d.signal("-CONT");
+    eprintln!(
+        "[proof] attempt {n}: the collector held {held} of {FILE_BYTES} at the freeze; Alice's \
+         daemon exited {took:?} after SIGINT"
+    );
+    if took < WAITED {
+        eprintln!("[proof] attempt {n}: not staged: the tail was acknowledged before the stop");
+        return None;
+    }
+    Some((took, said))
+}
+
+#[test]
+#[ignore = "real daemons with production Argon2id; CI runs it in release"]
+fn a_stop_waits_out_last_bytes_within_its_patience() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let root = tmp.path();
+    let (took, said) = (0..ATTEMPTS)
+        .find_map(|n| attempt(root, n))
+        .unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE: none of {ATTEMPTS} attempts left a finished tunnel's tail \
+                 unacknowledged at the stop"
+            )
+        });
+    let gave_up = said.lines().find(|l| l.contains(GAVE_UP));
+    eprintln!("[proof] Alice's daemon exited {took:?} after SIGINT; gave up: {gave_up:?}");
+    assert!(
+        gave_up.is_none() && took < PATIENCE,
+        "PRODUCT: a daemon stopped with a finished tunnel's tail unacknowledged must finish its own stop \
+         within its {PATIENCE:?} patience: it exited {took:?} after SIGINT and said {gave_up:?}"
+    );
 }

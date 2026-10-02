@@ -109,7 +109,6 @@ fn reachable_from_v6_loopback(a: &SocketAddr) -> bool {
 #[test]
 #[ignore = "production Argon2id + a real PoW, a relayed pair; run in release"]
 fn a_guest_bound_to_v6_loopback_never_dials_an_ipv4_mapped_candidate() {
-    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let w = ForwardedWorld::new(false);
     eprintln!(
