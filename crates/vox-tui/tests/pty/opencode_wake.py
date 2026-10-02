@@ -34,7 +34,10 @@ terminal (SIGHUP), and three more plain `opencode`s are opened, each with no tur
   that would have removed its directory, so the directory is left as a crash leaves it; the next
   `opencode` opened must remove it when it starts.
 
-Exit 0 = it ran to the end (the caller judges the lines); 2 = apparatus (pyte missing, the TUI
+- `<tag> NODIR: <where>` — the plugin made no wake directory, where one was due; the driver
+  stops there, and the caller judges it as the product's.
+
+Exit 0 = it ran to the end, or to a NODIR (the caller judges the lines); 2 = apparatus (pyte missing, the TUI
 never drew, the turn never started, a post failed); 1 = the driver hung (`HUNG at <stage>`,
 `vox_pty.py`). OpenCode is stopped by its PID, with bounded waits.
 """
@@ -53,7 +56,8 @@ SLEEP = 45  # long enough that the wake is posted and relayed while the tool sti
 SLEPT = "SLEPT-42"
 nonce = f"{int(time.time() * 1000) % 100000:05d}"
 OTHER = f"OTHERADDR-{nonce}"
-WAKE = f"WAKEMARK-{nonce}"
+# Not ASCII, so the wake is shown only if every multi-byte character survives the relay.
+WAKE = f"WAKEMARK-çüé-{nonce}"
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
     sys.exit(2)
@@ -151,6 +155,10 @@ def helper_of(d):
     return None
 
 
+class NoDir(Exception):
+    """The plugin made no wake directory: the product's failure, reported as `NODIR`."""
+
+
 BEFORE = set(glob.glob(os.path.join(DATA, "*", "sessions", "*.json")))  # earlier sessions
 code = 2
 tui = None
@@ -208,9 +216,7 @@ try:
     # ---- the person quits, and each session's wake directory goes with it ----
     stage("close the terminal of the session above")
     if first is None:
-        print(f"{TAG} APPARATUS: no wake directory of the first session's could be told apart "
-              f"in {TMP}: {sorted(wake_dirs())}")
-        sys.exit(2)
+        raise NoDir(f"the first session's plugin made none in {TMP}: {sorted(wake_dirs())}")
     if not quit(tui, "hup"):
         print(f"{TAG} APPARATUS: opencode outlived its terminal closing")
         sys.exit(2)
@@ -220,9 +226,8 @@ try:
         stage(f"open a plain opencode and quit it by {how}")
         tui, d = open_plain(wake_dirs())
         if d is None:
-            print(f"{TAG} APPARATUS: the plugin of the opencode to quit by {how} opened no wake "
-                  f"directory in {TMP} within 60s: {sorted(wake_dirs())}")
-            sys.exit(2)
+            raise NoDir(f"the plugin of the opencode to quit by {how} made none in {TMP} within "
+                        f"60s: {sorted(wake_dirs())}")
         tui.pump(3)  # its prompt takes keys once it has finished starting
         if not quit(tui, how):
             print(f"{TAG} APPARATUS: opencode did not exit on {how}")
@@ -234,8 +239,7 @@ try:
     stage("kill an opencode and its cleanup together, then open another")
     tui, crashed = open_plain(wake_dirs())
     if crashed is None:
-        print(f"{TAG} APPARATUS: the plugin of the opencode to kill opened no wake directory")
-        sys.exit(2)
+        raise NoDir(f"the plugin of the opencode to kill made none in {TMP}")
     helper = helper_of(crashed)
     if helper is not None:
         os.kill(helper, signal.SIGKILL)
@@ -252,14 +256,17 @@ try:
     time.sleep(11)  # older than the plugin's guard for a socket bound and not yet listening
     tui, d = open_plain(wake_dirs())
     if d is None:
-        print(f"{TAG} APPARATUS: the opencode opened after the kill made no wake directory")
-        sys.exit(2)
+        raise NoDir(f"the plugin of the opencode opened after the kill made none in {TMP}")
     print(f"{TAG} SWEPT: {'removed' if gone(crashed) else 'left'} {crashed}")
     tui.pump(3)
     if not quit(tui, "/exit"):
         print(f"{TAG} APPARATUS: opencode did not exit on /exit")
         sys.exit(2)
     tui = None
+    code = 0
+except NoDir as e:
+    # Not the apparatus: only the plugin makes the directory. The caller judges this line.
+    print(f"{TAG} NODIR: {e}")
     code = 0
 except Hung as h:
     print(f"{TAG} HUNG at {h}")

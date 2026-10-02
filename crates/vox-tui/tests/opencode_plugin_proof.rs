@@ -467,6 +467,57 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         out.stage,
         plugin_diag("hand-opened")
     );
+    // **The product's verdicts first, whatever the driver did next.** A line the driver printed
+    // is what the person saw; judged only after the exit code, a plugin that made no wake
+    // channel (so the driver could not go on) read as the apparatus's failure.
+    let seen = |key: &str| {
+        said.lines()
+            .find_map(|l| l.strip_prefix(&format!("wake {key}: ")))
+            .map(str::to_owned)
+    };
+    println!(
+        "[proof] hand-opened `opencode`: registered {:?}; addressed to someone else: {:?}; \
+         addressed to it: {:?}; its running turn: {:?}",
+        seen("REGISTERED"),
+        seen("OTHER"),
+        seen("WAKE"),
+        seen("TURN")
+    );
+    if let Some(registered) = seen("REGISTERED") {
+        assert!(
+            registered.starts_with("opencode /") && registered.ends_with("wake.sock"),
+            "PRODUCT (1): a plain `opencode` must register as OpenCode, reachable through the \
+             plugin's wake socket; its drain registered {registered:?}"
+        );
+    }
+    if let Some(other) = seen("OTHER") {
+        assert!(
+            other == "absent",
+            "PRODUCT (2): an urgent message addressed to someone else must not interrupt this \
+             session; it was {other}: {said}"
+        );
+    }
+    if let Some(wake) = seen("WAKE") {
+        assert!(
+            wake.starts_with("shown mid-turn"),
+            "PRODUCT (3): an urgent message addressed to this session must interrupt it while its \
+             turn runs; it was {wake}: {said}"
+        );
+    }
+    if let Some(turn) = seen("TURN") {
+        assert!(
+            turn == "completed",
+            "PRODUCT (4): the interrupt must queue into the running turn, not abort its tool; the \
+             turn {turn}: {said}"
+        );
+    }
+    // Only the plugin makes a wake directory, so a session that has none is the product's.
+    if let Some(nodir) = seen("NODIR") {
+        panic!(
+            "PRODUCT (7): a plain `opencode`'s plugin made no wake directory: {nodir}{}",
+            plugin_diag("no directory")
+        );
+    }
     match out.code {
         Some(0) => {}
         Some(2) => panic!("CANNOT MEASURE: the hand-opened session's apparatus failed: {said}"),
@@ -482,43 +533,13 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     }
     // The driver ran to its end (exit 0), so a line it did not print is the driver's fault.
     let line = |key: &str| {
-        said.lines()
-            .find_map(|l| l.strip_prefix(&format!("wake {key}: ")))
-            .unwrap_or_else(|| {
-                panic!("APPARATUS: the driver exited 0 without its `wake {key}:` line: {said}")
-            })
-            .to_owned()
+        seen(key).unwrap_or_else(|| {
+            panic!("APPARATUS: the driver exited 0 without its `wake {key}:` line: {said}")
+        })
     };
-    let (registered, other, wake, turn) = (
-        line("REGISTERED"),
-        line("OTHER"),
-        line("WAKE"),
-        line("TURN"),
-    );
-    println!(
-        "[proof] hand-opened `opencode`: registered {registered:?}; addressed to someone else: \
-         {other}; addressed to it: {wake}; its running turn: {turn}"
-    );
-    assert!(
-        registered.starts_with("opencode /") && registered.ends_with("wake.sock"),
-        "PRODUCT (1): a plain `opencode` must register as OpenCode, reachable through the plugin's wake \
-         socket; its drain registered {registered:?}"
-    );
-    assert!(
-        other == "absent",
-        "PRODUCT (2): an urgent message addressed to someone else must not interrupt this \
-         session; it was {other}: {said}"
-    );
-    assert!(
-        wake.starts_with("shown mid-turn"),
-        "PRODUCT (3): an urgent message addressed to this session must interrupt it while its turn runs; \
-         it was {wake}: {said}"
-    );
-    assert!(
-        turn == "completed",
-        "PRODUCT (4): the interrupt must queue into the running turn, not abort its tool; the \
-         turn {turn}: {said}"
-    );
+    for key in ["REGISTERED", "OTHER", "WAKE", "TURN"] {
+        line(key);
+    }
 
     // ---- each session's wake directory goes with it (F17) ----
     for how in ["hup", "ctrl+c", "/exit"] {
