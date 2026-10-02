@@ -33,14 +33,18 @@
 //!    by its address (an IPv4-mapped one canonicalised first) and an IPv6 one by its /64, so
 //!    `127.0.0.1` and `::1` are two sources.
 //!
-//!
-//!    No joiner may have asked for a circuit (each one's own `vox status --json`), so no join
-//!    measured here rode a relay; otherwise CANNOT MEASURE.
+//!    Carol's join must have gone direct, by its own word: her daemon's `join got in` line says
+//!    which path the join rode (`<member>: direct` or `<member>: relayed`, V210-124), and a
+//!    relayed one is CANNOT MEASURE. (This read the anchor's count of circuits, which also counts
+//!    circuits a ladder raced and never used, and alice's own: a join that went direct read as
+//!    relayed.) A stranger's join relayed from 127.0.0.1 is keyed by that same address, so it
+//!    changes nothing measured here.
 //! 4. `a_relayed_flood_from_one_host_does_not_keep_a_relayed_joiner_from_another_out`: as 3, but
 //!    **every join relayed** by the one anchor (see `Layout::Relayed`: alice is IPv6-only and
 //!    every joiner IPv4, so neither a dial nor a hole punch reaches her on any OS). The sixteen
-//!    stranger identities are relayed from 127.0.0.1, carol from the LAN address. Each joiner's
-//!    own `vox status --json` must show it asked for a circuit, else CANNOT MEASURE.
+//!    stranger identities are relayed from 127.0.0.1, carol from the LAN address. Carol's join
+//!    must say it was relayed, and the anchor must have carried a circuit for each stranger
+//!    identity and carol at once, else CANNOT MEASURE.
 //!    Only the origin the relay says tells carol from the flood: a relayed join's circuit address
 //!    is made up per circuit and says nothing.
 //!
@@ -226,6 +230,24 @@ struct Who {
     data: PathBuf,
     cfg: PathBuf,
     pass: PathBuf,
+    /// The stranger's: every process of it runs at the lowest priority (V210-124), see [`vox`].
+    stranger: bool,
+}
+
+/// A `vox` command for `who`: **the stranger's at the lowest priority** (`nice -n 19`, V210-124).
+/// The stranger stands for a host somewhere else, whose proof of work costs it and nobody else;
+/// here it shares this machine with alice and carol, so its sixteen grinding joins took the CPU
+/// the joiner it is meant to stand in front of needed, and a red would have been this proof's own
+/// load. Lowest priority, it grinds on what alice and carol leave. `nice` execs, so the process is
+/// the same `vox`, under the same pid, killed by its handle as before.
+fn vox(stranger: bool) -> Command {
+    if stranger {
+        let mut cmd = Command::new("nice");
+        cmd.args(["-n", "19", VOX]);
+        cmd
+    } else {
+        Command::new(VOX)
+    }
 }
 
 impl Who {
@@ -234,6 +256,7 @@ impl Who {
             data: tmp.join(name).join("data"),
             cfg: tmp.join(name).join("cfg"),
             pass: tmp.join(format!("{name}.pass")),
+            stranger: name.starts_with("stranger"),
         };
         std::fs::create_dir_all(&w.cfg).unwrap();
         std::fs::write(&w.pass, IDENTITY).unwrap();
@@ -241,7 +264,7 @@ impl Who {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(VOX);
+        let mut cmd = vox(self.stranger);
         cmd.args(args)
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
@@ -304,7 +327,7 @@ impl Who {
 
     /// `vox daemon` for this profile, stderr to `err`, answering on its socket before this returns.
     fn daemon(&self, anchor: &str, listen: &str, err: &Path, env: &[(&str, String)]) -> Proc {
-        let mut cmd = Command::new(VOX);
+        let mut cmd = vox(self.stranger);
         cmd.args(["daemon", "--listen", listen, "--anchor", anchor])
             .arg("--passphrase-file")
             .arg(&self.pass)
@@ -614,13 +637,22 @@ fn circuits_asked(who: &Who) -> u64 {
         .unwrap_or(0)
 }
 
-/// What the path every join took says about the case, read from the **anchor**, the only relay
-/// here: what it carried is what was relayed. None in [`Layout::TwoAddresses`] (else the address
-/// dimension is not what was measured); in [`Layout::Relayed`], a circuit for every stranger
-/// identity and carol at once, since every one of their joins is held open while carol joins.
-/// `Err` is CANNOT MEASURE, returned rather than raised so the caller can stop the stranger first.
+/// Whether the joins took the path the case is about. **Carol's join by its own word**: her
+/// daemon's `join got in` line names the path the join rode (V210-124):
+/// direct in [`Layout::TwoAddresses`] (else the address dimension is not what was measured),
+/// relayed in [`Layout::Relayed`]. And in [`Layout::Relayed`], the anchor, the only relay here,
+/// must have carried a circuit for every stranger identity and carol at once, since every one of
+/// their joins is held open while carol joins. `Err` is CANNOT MEASURE, returned rather than raised
+/// so the caller can stop the stranger first.
 fn paths(s: &Staged, case: &str) -> Result<(), String> {
     std::thread::sleep(Duration::from_secs(2));
+    // Carol's daemon says how each join it ran went, `vox: join got in — …`, with its path.
+    let carol_err = std::fs::read_to_string(s.dir.join("carol.daemon.err")).unwrap_or_default();
+    let carol_said = carol_err
+        .lines()
+        .rev()
+        .find(|l| l.contains("join got in"))
+        .unwrap_or("(carol's daemon said no `join got in` line)");
     let (max, reports) = anchor_circuits(s);
     let carol = circuits_asked(&s.carol);
     let strangers: Vec<u64> = s.strangers.iter().map(circuits_asked).collect();
@@ -630,10 +662,16 @@ fn paths(s: &Staged, case: &str) -> Result<(), String> {
         profile()
     );
     let want = s.strangers.len() + 1;
+    let direct = carol_said.contains(": direct") && !carol_said.contains(": relayed");
+    let relayed = carol_said.contains(": relayed");
     match s.layout {
-        Layout::TwoAddresses if max > 0 || reports == 0 => Err(format!(
-            "APPARATUS, CANNOT MEASURE: {case}: the anchor carried {max} circuit(s) ({reports} reports), so \
-             some join was relayed and not from the address measured"
+        Layout::TwoAddresses if !direct => Err(format!(
+            "APPARATUS, CANNOT MEASURE: {case}: carol's join did not say it went direct, so it was \
+             not her address that was measured: {carol_said:?}"
+        )),
+        Layout::Relayed if !relayed => Err(format!(
+            "APPARATUS, CANNOT MEASURE: {case}: carol's join did not say it was relayed: \
+             {carol_said:?}"
         )),
         Layout::Relayed if max < want => Err(format!(
             "APPARATUS, CANNOT MEASURE: {case}: the anchor carried at most {max} circuit(s) at once, not one \

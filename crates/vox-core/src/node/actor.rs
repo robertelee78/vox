@@ -2629,6 +2629,17 @@ impl Joiner {
                     }
                 }
             };
+            // **Which path the join rode** (V210-124): said with its timings, so a person — and a
+            // proof that must know whether an anchor carried it — can tell a direct join from one
+            // relayed through an anchor, which a timing alone does not say.
+            steps.note(format!(
+                "{short}: {}",
+                if conn.via_circuit() {
+                    "relayed"
+                } else {
+                    "direct"
+                }
+            ));
             let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
             let dh = *signer.x25519_identity_secret();
             let mut ctx = crate::node::channel::join_context_from_genesis(&genesis, 0)
