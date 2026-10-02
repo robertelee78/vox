@@ -24,6 +24,12 @@ dropped:
    what it injects — the machine's API key returned 401 and no model ran. M19.5b closes it: a real
    model now reproduces a codeword only the room knew, with `--pure` as the mutation control.
 
+**Amended 2026-10-01** (the decider, after a read-only review of agent-tincan): §6 is to change how a wake
+reads and when an idle session is told of a reply; §9 is to gain a cycle check and a parent that a reply
+cannot opt out of; the non-goals gain the principle that **Vox never spawns instances of anything**. Planned in
+`docs/release/v0.3.0.md` (V030-15 to V030-21) and `docs/release/v0.2.10.md` (V210-121, V210-123). V210-121 is
+built (§9, #322); the rest is not built yet.
+
 **Date**: 2026-09-21
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, app-tier, node, ipc, consent, keyring, harness-integration
@@ -471,6 +477,24 @@ in a closing line** and delivered on the next turn, because the cursor moves onl
 shown. A cursor the node no longer holds restarts from the room's first message **and says so** in
 the injection; it used to do that silently, on any error.
 
+**Amended 2026-10-01 (the decider; planned for v0.3.0, not built):**
+- **A wake is to announce, never deliver** (V030-15). The push into a live session is to carry only "N urgent
+  messages addressed to you from <petnames> in room <name>" and no byte any author chose; the message itself is
+  to arrive once, through this drain, in the same turn. Measured 2026-10-01 against Claude Code 2.1.287: a
+  message written to its messaging socket runs `UserPromptSubmit` with that message as `prompt`, whether the
+  session is idle, generating, or between tool calls. The daemon is to recount what is still unread just before
+  it wakes, and to keep at most one wake outstanding per session; that is to dedupe and to drop nothing.
+- **An idle session is to be told when a reply to it waits** (V030-20). This changes the urgent-only rule above
+  for one case: a reply (`re`) to a post the session addressed to someone, unread and the session idle, is to get an
+  announce-only notice at once, then 5, 20 and 60 minutes after each previous one, then no more; a fresh reply
+  is to restart it. A reply notice is to be a wake: it is to obey the one-outstanding rule above (the plan
+  owner, 2026-10-02). Idle and busy are to come from the harness's own end-of-turn hook (`Stop`, `SessionEnd`),
+  never from the network. It is never to be a delivery cap: the reply is to be in the next turn's drain.
+- **A sender is to be told how each addressee can be reached** (V030-17): a session's `hello` is to say whether it
+  can be interrupted, and `vox room post --to` is to report it ("codex: urgent will not interrupt it").
+- **The OpenCode fence is to carry a per-turn nonce** and a relayed wake is never to be labelled the user's
+  message (V030-21).
+
 ### 7. The node MUST fan out to several local clients without any of them able to stall it
 
 Measured on `main` (`spike-1`): the actor emits every event with `event_tx.send(..).await` on a
@@ -525,14 +549,16 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
   **MUST NOT** auto-reply to `status`, `hello`, `bye` or `ack` at all.
 - `hops` **MUST** be decremented on relay and the message dropped at zero. The default **MUST** be 8
   (ruflo ADR-097's value, whose default "alone closes the recursion-loop class").
-- **A reply that names no parent still spends a hop** (V210-121). A budget counted along `re` was
-  bypassed by leaving `re` out, an ordinary omission, and two agents answering each other urgently
-  that way woke each other for ever. So a session's post right after a wake **MUST** answer the
+- **A session cannot escape the hop budget by omitting `re` when it was woken** (V210-121). A
+  budget counted along `re` was bypassed by leaving `re` out, an ordinary omission, and two agents
+  answering each other urgently that way woke each other for ever. So a session's post right after a wake **MUST** answer the
   message that woke it when exactly one such wake is unanswered (an explicit `re` still wins), and
   an urgent one with two or more unanswered **MUST** be refused until it names one; a raw
   urgent envelope with no `re` from a session with an unanswered wake **MUST** be refused; and the
   daemon **MUST NOT** wake a session that already spoke in the `re` chain the message answers. That
-  message still queues for the session's next turn.
+  message still queues for the session's next turn. An agent that keeps passing an explicit `--re`
+  naming an unrelated old entry never shortens its hop chain; that is deliberate mis-naming, which
+  this guard does not try to stop.
 - Identical repeats from the same `(author, session)` within a short window **MAY** be dropped. There is
   **no rate cap**: the decider's product principle is no rate limits (2026-09-24), and loop prevention
   rests on `hops`, on addressing, and on the rules above and below. (This said a sender "SHOULD be
@@ -683,6 +709,14 @@ hook` attach to.
 - **IP-level anonymity**, per ADR-017. Confidentiality is the goal.
 - **An MCP delivery path**, per §6.
 - **Carrying file bytes through the log.** Withdrawn in §11 — a room-bound service already does it.
+- **Spawning anything** (the decider, 2026-10-01): "vox does not spin up instances of anything ever. Vox is a
+  transport layer with apps/use cases (like chat, agent comms, etc) on top of it." No Vox feature starts a
+  model, a harness or a headless run, so Codex is not woken by starting `codex exec`; it reads at its next turn.
+- **A council feature.** "Any message in the room can be seen by any node in the room that has the key material
+  to read it. Any node can respond." A council is an `ask` in a room whose agents span model families.
+- **An operator hold on messages.** "no, never. I'll be conscious about which nodes trust which nodes, and which
+  nodes are in rooms with which nodes." The trust keyring (§3) and room membership are the controls.
+- **Hosted agent sandboxes** that allow only HTTP out are out of scope.
 
 ## Consequences
 
