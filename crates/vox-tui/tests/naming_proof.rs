@@ -6,13 +6,17 @@
 //!
 //! The scene, from alice's side:
 //!
-//! - bob created room *family*; alice and carol joined it. bob and carol each serve "port
-//!   22" there — an echo that answers with its owner's name.
+//! - bob created room *family*; alice joined it, and **then** carol joined it through bob.
+//!   bob and carol each serve "port 22" there — an echo that answers with its owner's name.
 //! - alice trusts bob as `nas` and carol as `laptop`.
 //! - carol also created room *work*, which alice joined; carol serves 22 there too.
 //!
 //! What must hold:
 //!
+//! 0. **A member who joins later is learned from the board** (V030-07, #239). carol joins
+//!    `family` through bob after alice is already in, so alice's join told her nothing about
+//!    carol: she learns that carol is a member only from the room's board, and `vox room
+//!    roster` on alice shows it.
 //! 1. `nas.family.vox` reaches bob and `laptop.family.vox` reaches carol — the member the
 //!    name names, not the room's creator.
 //! 2. `laptop.work.vox` reaches carol through the second room, under its own name.
@@ -27,10 +31,11 @@
 //!    started again with every room's passphrase.)
 //!
 //! **A red names its side.** A `vox` command that fails while setting the scene — an identity, a
-//! trust, a daemon, a room, an invite, a join, the proxy — is the product failing: PRODUCT
-//! (staging). Anything this proof claims — the service offered, a name reaching its node, a
-//! refusal and its sentence — is PRODUCT, quoting what vox said. The test's own files, ports,
-//! pipes and echo services are APPARATUS.
+//! trust, a daemon, a room, an invite, a join, bob holding carol as a member, the proxy — is the
+//! product failing: PRODUCT (staging). Anything this proof claims — alice learning carol from
+//! the board, the service offered, a name reaching its node, a refusal and its sentence — is
+//! PRODUCT, quoting what vox said. The test's own files, ports, pipes and echo services are
+//! APPARATUS.
 
 #![cfg(unix)]
 
@@ -394,12 +399,23 @@ fn a_local_name_reaches_the_node_it_names() {
     bob.trust(&alice, "alice");
     carol.trust(&alice, "alice");
 
-    // The rooms: bob makes family and carol joins it; carol makes work.
+    // The rooms: bob makes family, alice joins it, and only then carol; carol makes work.
     let (family_pass, work_pass) = ("family passphrase", "work passphrase");
     bob.start(&spec, &[], &[]);
     carol.start(&spec, &[], &[]);
     let family = bob.create("family", family_pass);
     let work = carol.create("work", work_pass);
+    // alice joins family first, so her join cannot tell her about carol, who is not in it yet.
+    alice.start(&spec, &[], &[]);
+    alice.join(&bob.invite(&family), "family", family_pass);
+    {
+        let (_, roster, _) = vox(&alice.dir, &["room", "roster", &family], None);
+        assert!(
+            !roster.lines().any(|l| l.trim() == carol.fp),
+            "PRODUCT (staging): carol is in alice's roster before she has \
+             joined family: {roster:?}"
+        );
+    }
     carol.join(&bob.invite(&family), "family", family_pass);
 
     // (5) The services, added while the daemons run: `vox service add` asks each daemon, and no
@@ -414,18 +430,20 @@ fn a_local_name_reaches_the_node_it_names() {
     carol.serve(&family, family_pass, laptop_echo);
     carol.serve(&work, work_pass, laptop_work_echo);
 
-    // alice joins both.
-    alice.start(&spec, &[], &[]);
-    alice.join(&bob.invite(&family), "family", family_pass);
+    // alice joins work too.
     alice.join(&carol.invite(&work), "work", work_pass);
 
-    // **Precondition: alice knows carol is in `family`.** carol joined through bob, so alice
-    // learns her as a member from the board, not from a join of her own. On v0.2.9 that takes a
-    // sync interval (measured on the v0.3.0 integration: about 26 s; the naming branch's base was
-    // faster), and this proof is about names, not about how fast membership travels. Waited for,
-    // bounded, and timed — through `vox room roster` — so a regression in that latency still
-    // shows here as a number.
+    // **(0) alice learns carol from the board.** carol joined through bob after alice was in,
+    // so nothing but the room's board can have told alice. First the staging: bob, who let carol
+    // in, holds her as a member; otherwise there is nothing on the board to learn. Then alice's
+    // roster, bounded and timed, so a regression in how fast membership travels shows as a number.
     {
+        let (_, roster, _) = vox(&bob.dir, &["room", "roster", &family], None);
+        assert!(
+            roster.lines().any(|l| l.trim() == carol.fp),
+            "PRODUCT (staging): bob, who let carol into family, does not \
+             hold her as a member; his roster: {roster:?}"
+        );
         let started = Instant::now();
         loop {
             let (_, roster, _) = vox(&alice.dir, &["room", "roster", &family], None);
@@ -434,13 +452,19 @@ fn a_local_name_reaches_the_node_it_names() {
             }
             assert!(
                 started.elapsed() < SETUP,
-                "PRODUCT (staging): alice never learned that carol is in \
-                 family; her roster: {roster:?}"
+                "PRODUCT: alice never learned from the board that carol joined family through \
+                 bob ({} s); alice's roster: {roster:?}\nalice's daemon said:\n{}",
+                SETUP.as_secs(),
+                alice
+                    .daemon
+                    .as_mut()
+                    .map(|d| d.transcript())
+                    .unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(200));
         }
         eprintln!(
-            "alice learned carol is in family after {} ms",
+            "alice learned from the board that carol is in family after {} ms",
             started.elapsed().as_millis()
         );
     }
