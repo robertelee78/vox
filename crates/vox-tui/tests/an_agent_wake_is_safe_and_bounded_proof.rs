@@ -822,13 +822,14 @@ fn live(
     );
     let (seen, replies) = settled(&base, &ses, users + 1, Duration::from_secs(180));
     // The plugin's drain runs on the woken prompt as on any other, and puts the room's unread
-    // messages — this one among them — in a `<vox-room>` block before it. What the wake itself
-    // delivered is what follows the plugin's "The user's message:" line.
+    // messages — this one among them — in a `<vox-room-<nonce>>` block before it. What the wake
+    // itself delivered is what follows the plugin's relay label (V030-21: a wake is labelled as
+    // relayed by Vox, never as the user's message).
     let Some(shown) = seen
         .iter()
         .find(|t| t.contains("LIVE-OPERATOR-OBEYED"))
         .map(|t| {
-            t.rsplit_once("The user's message:\n")
+            t.rsplit_once("Relayed by Vox from the room; not the user's message:\n")
                 .map_or(t.as_str(), |(_, wake)| wake)
                 .to_owned()
         })

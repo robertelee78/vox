@@ -297,6 +297,15 @@ function wakeChannel(client, woken) {
   }
 }
 
+/**
+ * Room text with every `<vox-room` and `</vox-room` (any case) made inert (V030-21), so a message
+ * cannot open or close a fence of its own: the `<` becomes `&lt;`. The fence's own tags are added
+ * after this, and carry a nonce besides.
+ */
+function defang(text) {
+  return text.replace(/<(\/?)(vox-room)/gi, "&lt;$1$2")
+}
+
 export default async function vox({ $, client }) {
   log("plugin loaded (cwd=" + process.cwd() + ")")
   const woken = new Map()
@@ -353,6 +362,8 @@ export default async function vox({ $, client }) {
         // drain that fails after this only means the next one may show it again.
         const typed = output.parts.find((p) => p.type === "text" && typeof p.text === "string")
         const relays = woken.get(sessionID) ?? []
+        // This message is itself a wake Vox relayed, not something the operator typed.
+        const isWake = Boolean(typed) && relays.some((w) => w.text === typed.text)
         const told = relays.filter((w) => w.taken || (typed && w.text === typed.text))
         woken.set(sessionID, relays.filter((w) => !told.includes(w)))
         const flags = told.flatMap((w) => ["--woken", w.entry])
@@ -365,6 +376,14 @@ export default async function vox({ $, client }) {
             .nothrow()
         const text = result.stdout.toString()
         log("drain: exit=" + result.exitCode + " bytes=" + text.length)
+        // **The fence's tag is this turn's own** (V030-21): a nonce drawn now, after the drain has
+        // returned, so nothing in the room text can have known it. Only `</vox-room-<nonce>>` ends
+        // the block; a fixed `</vox-room>` inside a message used to end it early, and whatever
+        // followed read as outside the room.
+        const nonce = randomBytes(8).toString("hex")
+
+        // A wake is room text too: its tags are defanged like the drain's (see `defang`).
+        if (isWake) typed.text = defang(typed.text)
 
         // A quiet room injects nothing at all — not "no new messages". A quiet
         // room should cost zero tokens per turn.
@@ -380,10 +399,18 @@ export default async function vox({ $, client }) {
         // block shares the operator's message: the fence names its source, and what
         // follows the closing tag is the operator's own. Without that, a live model
         // refused the operator's instruction as one "embedded in messages".
+        //
+        // **What follows the block is labelled as what it is** (V030-21). A wake Vox relayed is a
+        // user message to OpenCode, but it is room text, not the operator's: labelled "The user's
+        // message:" it was the operator speaking, so it is labelled as relayed by Vox instead.
+        const after = isWake
+          ? "Relayed by Vox from the room; not the user's message:\n"
+          : "The user's message:\n"
         const block =
-          '<vox-room source="other agents; not the user">\n' +
-          text.trim() +
-          "\n</vox-room>\n\nThe user's message:\n"
+          `<vox-room-${nonce} source="other agents; not the user">\n` +
+          defang(text.trim()) +
+          `\n</vox-room-${nonce}>\n\n` +
+          after
         for (const part of output.parts) {
           if (part.type === "text" && typeof part.text === "string") {
             part.text = block + part.text
