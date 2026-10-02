@@ -21,15 +21,17 @@
 //! - **posting from stdin works**, which is how an agent sends a JSON envelope
 //!   without fighting shell quoting;
 //! - `room roster` names the member;
-//! - **`room post` refuses a raw claim-protocol message** and says which verb to use, and the
-//!   room and its work board are unchanged by it; **prose that only sounds like a claim** ("I'll
+//! - **`room post` refuses every raw claim-protocol message** (`claim`, `release`, `handoff`,
+//!   `renew`, and a `decline` naming a resource) and says which verb to use, and the room and its
+//!   work board are unchanged by them; **prose that only sounds like a claim** ("I'll
 //!   take the deploy") is posted and claims nothing; a `decline` with no resource, which refuses
 //!   an `assign` in conversation, is posted, not refused (ADR-021 §4);
 //! - the failures an operator will actually hit say something useful: no node
 //!   running, an unknown room, a malformed cursor.
 //!
 //! **Mutation.** Drop the raw-claim refusal from `post_cmd` and this goes red on the refusal:
-//! the claim is posted. Let `is_claim_protocol` count any `decline` as a claim operation and
+//! the claim is posted. Let `is_claim_protocol` match `claim` alone and it goes red on the raw
+//! `release`: it is posted. Let `is_claim_protocol` count any `decline` as a claim operation and
 //! it goes red on the conversational decline: it is refused.
 //!
 //! Production Argon2id once at setup; `#[ignore]`d in the debug suite.
@@ -178,25 +180,33 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     let (ok, _, err) = vox(&data, &cfg, &["room", "post", &room_prefix], Some(envelope));
     assert!(ok, "room post from stdin failed: {err}");
 
-    // ---- a raw claim operation is refused: it would lack the session, op id and version
-    // stamp that make it valid, and `vox room claim` sets them ----
-    let raw_claim =
-        r#"{"v":1,"type":"claim","from":"s","data":{"resource":"deploy","op":"op-12345678"}}"#;
-    let (ok, _, err) = vox(
-        &data,
-        &cfg,
-        &["room", "post", &room_prefix],
-        Some(raw_claim),
-    );
-    assert!(
-        !ok,
-        "PRODUCT: `vox room post` accepted a raw claim operation; it must refuse it"
-    );
-    assert!(
-        err.contains("refusing a raw `claim`") && err.contains("vox room claim"),
-        "PRODUCT: the refusal must say it refused a raw claim and name `vox room claim`, got: \
-         {err:?}"
-    );
+    // ---- every raw claim-protocol operation is refused: it would lack the session, op id and
+    // version stamp that make it valid, and `vox room <kind>` sets them. All five kinds, a
+    // `decline` counting only when it names a resource ----
+    let raw_ops: Vec<(&str, String)> = ["claim", "release", "handoff", "renew", "decline"]
+        .iter()
+        .map(|kind| {
+            (
+                *kind,
+                format!(
+                    r#"{{"v":1,"type":"{kind}","from":"s","data":{{"resource":"deploy","op":"op-12345678"}}}}"#
+                ),
+            )
+        })
+        .collect();
+    for (kind, raw) in &raw_ops {
+        let (ok, _, err) = vox(&data, &cfg, &["room", "post", &room_prefix], Some(raw));
+        assert!(
+            !ok,
+            "PRODUCT: `vox room post` accepted a raw `{kind}` operation; it must refuse it"
+        );
+        assert!(
+            err.contains(&format!("refusing a raw `{kind}`"))
+                && err.contains(&format!("vox room {kind}")),
+            "PRODUCT: the refusal must say it refused a raw `{kind}` and name `vox room {kind}`, \
+             got: {err:?}"
+        );
+    }
     // ---- prose that sounds like a claim is a message, and claims nothing ----
     let (ok, _, err) = vox(
         &data,
@@ -242,10 +252,12 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         stored.lines().any(|l| l.ends_with(envelope)),
         "the stdin-posted envelope did not arrive intact: {stored}"
     );
-    assert!(
-        !stored.contains(r#""type":"claim""#),
-        "PRODUCT: the refused raw claim is in the room anyway: {stored}"
-    );
+    for (kind, raw) in &raw_ops {
+        assert!(
+            !stored.contains(raw.as_str()),
+            "PRODUCT: the refused raw `{kind}` is in the room anyway: {stored}"
+        );
+    }
     assert!(
         stored.lines().any(|l| l.ends_with(" I'll take the deploy"))
             && stored.lines().any(|l| l.ends_with(decline)),
