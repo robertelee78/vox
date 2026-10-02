@@ -99,17 +99,6 @@ Vox MUST NOT claim the following; each is absent unless a later ADR builds it:
   exchange messages; a channel of three or more needs any two online to propagate the log; a single
   online member MAY queue messages to send but cannot receive (ADR-008, ADR-012).
 
-### Engineering rules (binding on all work under every ADR)
-
-- **E1.** Work MUST be built to production quality from the start, with no shortcuts.
-- **E2.** Work MUST NOT rest on assumptions: designs, implementations and outputs MUST be verified
-  before they are relied on.
-- **E3.** Shipped code MUST NOT contain stubs or fallbacks (`todo!()`, `unimplemented!()`, "fix this
-  later"). A feature that is not complete MUST NOT ship, and a needed feature MUST NOT be falsely
-  deferred.
-- **E4.** Existing code MUST be understood, including why it exists, before it is changed or removed
-  (Chesterton's fence).
-
 ## Consequences
 
 - No server, account or phone number to trust or be deplatformed from; room-level admission failure
@@ -123,3 +112,15 @@ Vox MUST NOT claim the following; each is absent unless a later ADR builds it:
 
 Governs ADR-002 onwards. Directly cited: ADR-002, ADR-003, ADR-004, ADR-005, ADR-006, ADR-007,
 ADR-008, ADR-009, ADR-010, ADR-011, ADR-012, ADR-013, ADR-014, ADR-015.
+
+## Engineering Mantra
+
+These principles are binding on all work under this ADR:
+
+- **Do not be lazy.** Plenty of time to do it right.
+- **No shortcuts.** Every component is built to production quality from day one.
+- **Never make assumptions.** Dive deep before writing a single line of code.
+- **Measure three times, cut once.** Verify designs, implementations, and outputs.
+- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
+- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
+- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.

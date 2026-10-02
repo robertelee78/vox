@@ -122,4 +122,16 @@ initiators can consume the same one-time prekey concurrently.
 ## Related ADRs
 
 Depends on ADR-002 and ADR-003. Depended on by ADR-005, ADR-006, ADR-007, ADR-011. Cited: ADR-008,
-ADR-012, ADR-016. The engineering rules of ADR-001 bind all work under this ADR.
+ADR-012, ADR-016.
+
+## Engineering Mantra
+
+These principles are binding on all work under this ADR:
+
+- **Do not be lazy.** Plenty of time to do it right.
+- **No shortcuts.** Every component is built to production quality from day one.
+- **Never make assumptions.** Dive deep before writing a single line of code.
+- **Measure three times, cut once.** Verify designs, implementations, and outputs.
+- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
+- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
+- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.

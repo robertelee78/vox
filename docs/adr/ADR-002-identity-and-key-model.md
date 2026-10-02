@@ -147,4 +147,16 @@ encoding. Role separation limits the blast radius of a compromise.
 
 Depends on ADR-001. Depended on by ADR-003, ADR-004, ADR-005, ADR-007, ADR-008, ADR-009, ADR-010,
 ADR-011, ADR-014. ADR-002 names ML-DSA and ML-KEM directly; the policy governing them is ADR-003
-(one-directional, ADR-003 → ADR-002). The engineering rules of ADR-001 bind all work under this ADR.
+(one-directional, ADR-003 → ADR-002).
+
+## Engineering Mantra
+
+These principles are binding on all work under this ADR:
+
+- **Do not be lazy.** Plenty of time to do it right.
+- **No shortcuts.** Every component is built to production quality from day one.
+- **Never make assumptions.** Dive deep before writing a single line of code.
+- **Measure three times, cut once.** Verify designs, implementations, and outputs.
+- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
+- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
+- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.
