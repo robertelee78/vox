@@ -33,8 +33,9 @@
 //!    silent streams were opened, and the first is still open at the victim's end — accepted
 //!    and waited on, not refused.
 //!
-//! **Which side a slow post is on.** The apparatus clock is only the apparatus: a `vox --version`
-//! on the same timeline, the cost of starting `vox` at all. Before the attack, one quiet `vox room
+//! **Which side a slow post is on.** The apparatus clock is only the apparatus: `/usr/bin/true`
+//! on the same timeline, the cost of starting a process that is not vox (a vox slow even only to
+//! start reads as the product's). Before the attack, one quiet `vox room
 //! post` is timed as the product's baseline, never as part of that clock. It must answer within
 //! [`PATIENCE`]: a quiet post that fails, or misses the bound while the clock is within
 //! [`APPARATUS_BUDGET`], is `PRODUCT (staging):` (the node is slow with no attack at all). A post
@@ -80,7 +81,7 @@ const SILENT_EVERY: Duration = Duration::from_secs(2);
 /// are open by the last one.
 const GAP: Duration = Duration::from_secs(2);
 const SETUP: Duration = Duration::from_secs(120);
-/// The most starting `vox --version` may take before a slow post is the runner's, not the node's.
+/// The most starting `/usr/bin/true` may take before a slow post is the runner's, not the node's.
 const APPARATUS_BUDGET: Duration = Duration::from_millis(2500);
 const ROOM_PASS: &str = "room passphrase";
 
@@ -228,6 +229,25 @@ fn fingerprint(data: &Path) -> [u8; 32] {
     })
 }
 
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
+    let t = Instant::now();
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
+    assert!(
+        ok,
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
+    );
+    t.elapsed()
+}
+
 #[test]
 #[ignore = "real vox processes and production Argon2id; run in release"]
 fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
@@ -359,10 +379,10 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     );
     println!("[proof] quiet post: ok={ok} in {quiet:?}");
     if !(ok && quiet < PATIENCE) {
-        let (_, apparatus, _) = vox_timed(&victim_dir, &["--version"], PATIENCE * 8);
+        let apparatus = apparatus_spawn();
         assert!(
-            ok || apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+            !ok || apparatus <= APPARATUS_BUDGET,
+            "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
              {APPARATUS_BUDGET:?}) right after the quiet post took {quiet:?}, so the runner, not \
              the node, may be slow. The post said: {said}"
         );
@@ -417,10 +437,10 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
         );
         took.push(t);
         if !(ok && t < PATIENCE) {
-            let (_, apparatus, _) = vox_timed(&victim_dir, &["--version"], PATIENCE * 8);
+            let apparatus = apparatus_spawn();
             assert!(
                 apparatus <= APPARATUS_BUDGET,
-                "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+                "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
                  {APPARATUS_BUDGET:?}) right after post {i} took {t:?}, so the runner, not the \
                  node, may be slow. The post said: {said}"
             );
