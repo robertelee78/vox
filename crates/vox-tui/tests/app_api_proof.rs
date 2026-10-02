@@ -22,6 +22,12 @@
 //! 6. **Stalled app streams cannot starve the room.** 200 app streams held open waiting,
 //!    and a message still crosses in under a second.
 //!
+//! **A red names its side.** A claim's assertion is PRODUCT. A `vox` command that fails while
+//! the scene is set (an identity, a daemon, a room, a join, a trust, a listener, a status
+//! report) is the product failing: PRODUCT (staging). CANNOT MEASURE is kept for what the test
+//! itself could not arrange: the attacker's own profile, endpoint, connection and frames in
+//! case 4. The test's own processes, pipes, locks, runtime and clock are APPARATUS.
+//!
 //! **One participant is not the product, deliberately: the attacker in case 4.** mallory
 //! is a real member — her identity is made by `vox id`, and she joins with her own
 //! `vox daemon` and `vox room join` — but what probes alice is a raw QUIC endpoint holding
@@ -86,13 +92,13 @@ impl Proc {
             }
             assert!(
                 !matches!(self.child.try_wait(), Ok(Some(_))),
-                "CANNOT MEASURE: staging not achieved — `vox app listen` exited before listening: {}",
+                "PRODUCT (staging): `vox app listen` exited before listening: {}",
                 self.said()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!(
-            "CANNOT MEASURE: staging not achieved — the listener never registered: {}",
+            "PRODUCT (staging): the listener never registered: {}",
             self.said()
         );
     }
@@ -134,16 +140,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("CANNOT MEASURE: run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .expect("CANNOT MEASURE: vox's stdin")
+        .expect("APPARATUS: vox's stdin")
         .write_all(stdin.as_bytes())
-        .expect("CANNOT MEASURE: write to vox's stdin");
-    let out = child
-        .wait_with_output()
-        .expect("CANNOT MEASURE: wait for vox");
+        .expect("APPARATUS: write to vox's stdin");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -174,7 +178,7 @@ impl Member {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("CANNOT MEASURE: spawn vox");
+            .expect("APPARATUS: spawn vox");
         let said = Arc::new(Mutex::new(String::new()));
         drain_into(child.stderr.take(), &said);
         Proc { child, said }
@@ -185,7 +189,7 @@ impl Member {
         let (ok, out, err) = vox_once(&self.data, &args(argv));
         assert!(
             ok,
-            "CANNOT MEASURE: staging not achieved — {}: vox {argv:?} failed: {out}{err}",
+            "PRODUCT (staging): {}: vox {argv:?} failed: {out}{err}",
             self.name
         );
         out
@@ -259,14 +263,11 @@ impl std::fmt::Debug for App {
 /// `vox daemon` serving it that answers `vox room list`.
 fn member(tmp: &Path, name: &str) -> Member {
     let data = tmp.join(name);
-    std::fs::create_dir_all(data.join("cfg")).expect("CANNOT MEASURE: a profile directory");
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: a profile directory");
     let pass = tmp.join("identity-passphrase");
-    std::fs::write(&pass, IDENTITY).expect("CANNOT MEASURE: the passphrase file");
+    std::fs::write(&pass, IDENTITY).expect("APPARATUS: the passphrase file");
     let (ok, out, err) = vox_once(&data, &args(&["id"]));
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — {name}: vox id: {out}{err}"
-    );
+    assert!(ok, "PRODUCT (staging): {name}: vox id: {out}{err}");
     let fp = out.trim().to_owned();
     let mut daemon = VoxProc::spawn(
         name,
@@ -276,7 +277,7 @@ fn member(tmp: &Path, name: &str) -> Member {
             "--listen",
             "127.0.0.1:0",
             "--passphrase-file",
-            pass.to_str().expect("CANNOT MEASURE: a UTF-8 path"),
+            pass.to_str().expect("APPARATUS: a UTF-8 path"),
         ]),
     );
     let until = Instant::now() + SETUP;
@@ -292,7 +293,7 @@ fn member(tmp: &Path, name: &str) -> Member {
         std::thread::sleep(Duration::from_millis(250));
     }
     panic!(
-        "CANNOT MEASURE: staging not achieved — {name}'s daemon never answered `vox room list`:\n{}",
+        "PRODUCT (staging): {name}'s daemon never answered `vox room list`:\n{}",
         daemon.transcript()
     );
 }
@@ -304,11 +305,7 @@ fn join(who: &Member, link: &str) {
         &["room", "join", link, "--name", "calls"],
         ROOM_PASS,
     );
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — {} joins: {out}{err}",
-        who.name
-    );
+    assert!(ok, "PRODUCT (staging): {} joins: {out}{err}", who.name);
 }
 
 /// A room alice created and bob joined, each on its own daemon. Nobody trusts anybody
@@ -322,7 +319,7 @@ struct Scene {
 }
 
 fn scene() -> Scene {
-    let tmp = tempfile::tempdir().expect("CANNOT MEASURE: a temporary directory");
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let alice = member(tmp.path(), "alice");
     let bob = member(tmp.path(), "bob");
     let (ok, out, err) = vox_in(
@@ -330,18 +327,13 @@ fn scene() -> Scene {
         &["room", "create", "--name", "calls"],
         ROOM_PASS,
     );
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — vox room create: {out}{err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let list = alice.run(&["room", "list"]);
     let room = list
         .lines()
         .find(|l| l.contains("calls"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: staging not achieved — the room is not listed: {list}")
-        })
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the room is not listed: {list}"))
         .to_owned();
     let link = alice.run(&["room", "invite", &room]).trim().to_owned();
     join(&bob, &link);
@@ -374,7 +366,7 @@ fn mutual(s: &mut Scene) {
                 eprintln!("---- {}'s daemon ----\n{}", m.name, m.daemon.transcript());
             }
             panic!(
-                "CANNOT MEASURE: after {SETUP:?} alice and bob do not read each other.\nalice \
+                "PRODUCT (staging): after {SETUP:?} alice and bob do not read each other.\nalice \
                  reads:\n{a}\nbob reads:\n{b}"
             );
         }
@@ -600,7 +592,7 @@ fn an_opener_outside_the_responders_ring_reaches_no_listener() {
     assert_eq!(
         a.n("inbound"),
         1,
-        "CANNOT MEASURE: staging not achieved — bob's stream must have reached alice's gate: {a:?}"
+        "PRODUCT (staging): bob's stream must have reached alice's gate: {a:?}"
     );
     assert_eq!(
         a.announced(),
@@ -682,17 +674,13 @@ async fn probe(
     let (mut send, mut recv) = conn
         .open_stream()
         .await
-        .expect("CANNOT MEASURE: staging not achieved — the attacker could not open a stream");
+        .expect("CANNOT MEASURE: the attacker could not open a stream");
     vox_core::transport::framing::write_frame(&mut send, first)
         .await
-        .expect(
-            "CANNOT MEASURE: staging not achieved — the attacker could not write its first frame",
-        );
+        .expect("CANNOT MEASURE: the attacker could not write its first frame");
     vox_core::transport::framing::write_frame(&mut send, then)
         .await
-        .expect(
-            "CANNOT MEASURE: staging not achieved — the attacker could not write its second frame",
-        );
+        .expect("CANNOT MEASURE: the attacker could not write its second frame");
     let read = tokio::time::timeout(Duration::from_secs(20), recv.read_to_end(4096))
         .await
         .expect("PRODUCT: the node must answer, not leave the stream hanging");
@@ -708,7 +696,7 @@ fn stop(mut p: VoxProc) {
         .args(["-TERM", &p.child.id().to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "CANNOT MEASURE: kill -TERM {}", p.name);
+    assert!(ok, "APPARATUS: kill -TERM {}", p.name);
     let until = Instant::now() + Duration::from_secs(20);
     while Instant::now() < until {
         if matches!(p.child.try_wait(), Ok(Some(_))) {
@@ -717,7 +705,7 @@ fn stop(mut p: VoxProc) {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!(
-        "CANNOT MEASURE: staging not achieved — {}'s daemon did not stop on SIGTERM",
+        "PRODUCT (staging): {}'s daemon did not stop on SIGTERM",
         p.name
     );
 }
@@ -751,26 +739,24 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
     let report = s.alice.status();
     let alice_addr = report["listening"]
         .as_array()
-        .expect("CANNOT MEASURE: staging not achieved — alice's report lists where she listens")
+        .expect("PRODUCT (staging): alice's report lists where she listens")
         .iter()
         .filter_map(Value::as_str)
         .filter_map(|m| vox_core::nat::multiaddr::Multiaddr::parse(m).ok())
         .filter_map(|m| m.socket_addr())
         .find(|a| a.ip().is_loopback())
-        .expect("CANNOT MEASURE: staging not achieved — alice listens on loopback");
+        .expect("PRODUCT (staging): alice listens on loopback");
     let room_id = report["rooms"]
         .as_array()
         .and_then(|rs| rs.iter().find(|r| r["name"] == "calls"))
         .and_then(|r| r["id"].as_str())
         .map(|id| {
             vox_core::node::link::b32_decode(id, "room id")
-                .expect("CANNOT MEASURE: staging not achieved — the room id in alice's report")
+                .expect("PRODUCT (staging): the room id in alice's report")
         })
-        .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: staging not achieved — alice's report lists the room: {report}")
-        });
+        .unwrap_or_else(|| panic!("PRODUCT (staging): alice's report lists the room: {report}"));
     let alice_id = vox_core::node::link::b32_decode(&s.alice.fp, "fingerprint")
-        .expect("CANNOT MEASURE: staging not achieved — `vox id` prints the whole fingerprint");
+        .expect("PRODUCT (staging): `vox id` prints the whole fingerprint");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -783,20 +769,35 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
             Some(&mallory_data),
             Some(&mallory_data.join("cfg")),
         )
-        .expect("CANNOT MEASURE: staging not achieved — mallory's profile paths");
+        .expect("CANNOT MEASURE: mallory's profile paths");
         let mut profile = vox_core::node::profile::Profile::open(paths)
-            .expect("CANNOT MEASURE: staging not achieved — mallory's profile opens once her daemon is gone");
-        profile.unlock(IDENTITY.as_bytes()).expect("CANNOT MEASURE: staging not achieved — mallory's identity unlocks");
-        let signer = profile.signer_arc().expect("CANNOT MEASURE: staging not achieved — mallory's signer");
-        let ep =
-            vox_core::transport::quic::VoxEndpoint::bind(&*signer, "127.0.0.1:0".parse().expect("APPARATUS: an address"))
-                .expect("CANNOT MEASURE: staging not achieved — the attacker's endpoint binds");
+            .expect("CANNOT MEASURE: mallory's profile opens once her daemon is gone");
+        profile
+            .unlock(IDENTITY.as_bytes())
+            .expect("CANNOT MEASURE: mallory's identity unlocks");
+        let signer = profile
+            .signer_arc()
+            .expect("CANNOT MEASURE: mallory's signer");
+        let ep = vox_core::transport::quic::VoxEndpoint::bind(
+            &*signer,
+            "127.0.0.1:0".parse().expect("APPARATUS: an address"),
+        )
+        .expect("CANNOT MEASURE: the attacker's endpoint binds");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("APPARATUS: the clock")
             .as_secs();
-        let conn = ep.connect(alice_addr, alice_id, now).await.unwrap_or_else(|e| panic!("CANNOT MEASURE: staging not achieved — the attacker could not connect to alice: {e}"));
-        assert_eq!(conn.peer_id(), alice_id, "CANNOT MEASURE: staging not achieved — the attacker reached a node that is not alice");
+        let conn = ep
+            .connect(alice_addr, alice_id, now)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("CANNOT MEASURE: the attacker could not connect to alice: {e}")
+            });
+        assert_eq!(
+            conn.peer_id(),
+            alice_id,
+            "CANNOT MEASURE: the attacker reached a node that is not alice"
+        );
         let open = vox_core::node::app::AppOpen {
             channel_id: room_id,
             labels: vec![LABEL.to_owned()],
@@ -832,7 +833,7 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
     assert_eq!(
         after.n("inbound"),
         before.n("inbound") + 1,
-        "CANNOT MEASURE: staging not achieved — mallory's app stream must have reached the app \
+        "PRODUCT (staging): mallory's app stream must have reached the app \
          gate; otherwise it was refused as a stream kind and this compares nothing"
     );
     assert_eq!(
@@ -896,7 +897,7 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
     assert_eq!(
         (at_alice.trim(), at_bob.trim()),
         ("hello from bob", "hello from alice"),
-        "CANNOT MEASURE: staging not achieved — the stream must be live both ways before trust \
+        "PRODUCT (staging): the stream must be live both ways before trust \
          is withdrawn"
     );
     // Both stdins stay open: nothing but the withdrawal can end this stream. alice
@@ -946,8 +947,9 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
 /// person's Ctrl-Z) once it is listening: its node announces every stream to it and none
 /// is ever taken. The 200 are 200 `vox app open` processes, started together.
 ///
-/// **Reds.** The scene (the room, the trust, the listener, its suspension, alice's `vox room
-/// tail`) failing is CANNOT MEASURE. Everything after the 200 opens start is PRODUCT: the
+/// **Reds.** A `vox` command failing while the scene is set (the room, the trust, the listener,
+/// alice's `vox room tail`) is PRODUCT (staging); the suspension is APPARATUS. Everything after
+/// the 200 opens start is PRODUCT: the
 /// message arriving late or not at all, alice's node no longer answering `vox status`, the
 /// 200 not reaching alice's gate, and the per-peer limit's counts. The message is asserted
 /// first, so a node starved by app streams reds on the claim itself, with the counts of the
@@ -968,7 +970,7 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
         .args(["-STOP", &never.child.id().to_string()])
         .status()
         .is_ok_and(|st| st.success());
-    assert!(ok, "CANNOT MEASURE: kill -STOP the listener");
+    assert!(ok, "APPARATUS: kill -STOP the listener");
     // What alice sees arrive, as a person watching the room would.
     let mut tail = VoxProc::spawn(
         "alice-tail",
@@ -978,7 +980,7 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         matches!(tail.child.try_wait(), Ok(None)),
-        "CANNOT MEASURE: staging not achieved — alice's `vox room tail` ended before the \
+        "PRODUCT (staging): alice's `vox room tail` ended before the \
          opens: {}",
         tail.transcript()
     );
