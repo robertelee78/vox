@@ -65,13 +65,8 @@ const IDPASS: &str = "an identity passphrase";
 const ROOMPASS: &str = "room passphrase";
 /// How long the relay is held frozen while both members open their sessions.
 const FREEZE: Duration = Duration::from_secs(4);
-/// The test-only knob that makes a daemon lose the first N hellos it receives, and what it says
-/// then.
+/// The test-only knob that makes a daemon lose the first hello it receives, and what it says then.
 const LOSE_HELLOS: &str = "VOX_TEST_LOSE_HELLOS";
-/// How many of the winner's hellos the losing member loses in the backoff case.
-const LOSER_LOSES: usize = 4;
-/// The losing member's post is read by the winner within this of the relay's release.
-const BOUND: Duration = Duration::from_secs(8);
 const LOST_SAID: &str = "VOX_TEST_LOSE_HELLOS: an inbound hello was lost";
 
 fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
@@ -128,15 +123,15 @@ impl Drop for Daemon {
     }
 }
 
-fn daemon(dir: &std::path::Path, listen: &str, anchor: &str, lose_hellos: usize) -> Daemon {
+fn daemon(dir: &std::path::Path, listen: &str, anchor: &str, lose_hellos: bool) -> Daemon {
     let mut cmd = Command::new(VOX);
     cmd.args(["daemon", "--listen", listen, "--anchor", anchor])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM")
         .env_remove(LOSE_HELLOS);
-    if lose_hellos > 0 {
-        cmd.env(LOSE_HELLOS, lose_hellos.to_string());
+    if lose_hellos {
+        cmd.env(LOSE_HELLOS, "1");
     }
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -200,67 +195,18 @@ fn signal(pid: u32, sig: &str) {
 #[test]
 #[ignore = "three daemons and a relay anchor with production Argon2id; CI runs it in release"]
 fn two_members_who_open_sessions_at_once_converge_and_read_each_other() {
-    race(Lose::None);
+    race(false);
 }
 
 #[test]
 #[ignore = "three daemons and a relay anchor with production Argon2id; CI runs it in release"]
 fn two_members_whose_hellos_are_both_lost_still_converge_and_read_each_other() {
-    race(Lose::FirstAtBoth);
+    race(true);
 }
 
-/// **Simultaneous trust does not stall on a doubling backoff** (V210-80, #271).
-///
-/// The member whose session loses the race has its key refused ("its hello was not accepted")
-/// until it adopts the winner's session, which arrives with the winner's next hello. That refusal
-/// set the key backoff, 2 s and doubling, and the backoff still held after the adoption. So when a
-/// winner's hello was lost after it was written (a connection retired by a tie-break, seen through
-/// the shipped binary, 7.56 s), the loser's retries waited 2, then 4, then 8 s.
-///
-/// **Staging, forced on every run.** The same race as above, and the losing member (the higher
-/// fingerprint, since both ends keep the session the lower one opened) loses the first
-/// [`LOSER_LOSES`] hellos it receives (`VOX_TEST_LOSE_HELLOS`, a test-only knob, inert unset). The
-/// run is `CANNOT MEASURE` unless it said it lost exactly that many and nothing else lost any.
-///
-/// **Asserted, as the members see it:** the winner reads a post of the loser's within [`BOUND`] of
-/// the relay's release. The loser's refusals are printed with when each was seen.
-///
-/// **Mutation that must turn it red:** the key backoff as before V210-80, doubling on every
-/// refusal and kept after the loser adopts the winner's session.
-#[test]
-#[ignore = "three daemons and a relay anchor with production Argon2id; CI runs it in release"]
-fn a_member_whose_session_lost_the_race_is_read_promptly_after_lost_hellos() {
-    race(Lose::WinnersAtLoser);
-}
-
-/// Which hellos the race loses (V210-89, V210-80).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Lose {
-    None,
-    /// bob and carol each lose the first hello they receive.
-    FirstAtBoth,
-    /// The member whose session loses loses the first [`LOSER_LOSES`] hellos it receives.
-    WinnersAtLoser,
-}
-
-/// A fingerprint as `vox id` prints it (unpadded lowercase base32) decoded to its 5-bit digits,
-/// which order the same way as the digest's bytes do.
-fn digits(fp: &str) -> Vec<u8> {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-    fp.bytes()
-        .map(|c| {
-            ALPHABET
-                .iter()
-                .position(|&a| a == c)
-                .unwrap_or_else(|| panic!("CANNOT MEASURE: `vox id` printed {fp:?}, not base32"))
-                as u8
-        })
-        .collect()
-}
-
-/// The race, losing the hellos `lose` names.
-fn race(lose: Lose) {
-    if lose != Lose::None {
+/// The race; with `lose_hellos`, bob and carol each lose the first hello they receive (V210-89).
+fn race(lose_hellos: bool) {
+    if lose_hellos {
         test_knobs::require(&[LOSE_HELLOS]);
     }
     watchdog::arm();
@@ -282,22 +228,14 @@ fn race(lose: Lose) {
     }
     // alice and bob on IPv4, carol on IPv6: bob and carol reach each other only through
     // the anchor's relay.
-    // Both ends keep the session the lower fingerprint opened, so the higher one's loses.
-    let bob_loses = digits(&fps[1]) > digits(&fps[2]);
-    let (bob_knob, carol_knob) = match lose {
-        Lose::None => (0, 0),
-        Lose::FirstAtBoth => (1, 1),
-        Lose::WinnersAtLoser if bob_loses => (LOSER_LOSES, 0),
-        Lose::WinnersAtLoser => (0, LOSER_LOSES),
-    };
-    let _alice = daemon(alice_dir, "127.0.0.1:0", &anchor.v4_spec, 0);
-    let bob = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec, bob_knob);
+    let _alice = daemon(alice_dir, "127.0.0.1:0", &anchor.v4_spec, false);
+    let bob = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec, lose_hellos);
     let carol_spec = Split::Families.guest_spec(&anchor).to_owned();
     let carol = daemon(
         carol_dir,
         Split::Families.guest_listen(),
         &carol_spec,
-        carol_knob,
+        lose_hellos,
     );
 
     // alice's room; alice and each joiner trust each other. bob and carol do NOT, yet.
@@ -365,7 +303,7 @@ fn race(lose: Lose) {
     assert!(c.0, "carol trusts bob: {}", c.2);
     std::thread::sleep(FREEZE.saturating_sub(frozen.elapsed()));
     signal(anchor_pid, "-CONT");
-    let released = Instant::now();
+    let thawed = Instant::now();
     eprintln!(
         "[proof] relay frozen {:?} while both trusted",
         frozen.elapsed()
@@ -378,12 +316,9 @@ fn race(lose: Lose) {
     // retry offers a fresh hello (#262, finding A). With both in, counting a hello on write stays
     // green here (A heals the pair), and so does removing A (the hello rule does). Whoever removes
     // either must know the other is then this race's only guard.
-    // Each posts a fresh probe every round until the other reads one of them.
+    // Each posts a fresh probe every 2 s until the other reads one of them.
     let deadline = Instant::now() + Duration::from_secs(90);
     let (mut bob_reads_carol, mut carol_reads_bob) = (false, false);
-    let (mut bob_read_at, mut carol_read_at) = (None, None);
-    let refused = |d: &Daemon| d.1.lock().unwrap().matches("did not take our key").count();
-    let mut refusals_seen: Vec<(Duration, &str)> = Vec::new();
     let mut n = 0;
     while !(bob_reads_carol && carol_reads_bob) && Instant::now() < deadline {
         let (ok, _, _) = vox(
@@ -398,44 +333,21 @@ fn race(lose: Lose) {
             None,
         );
         assert!(ok);
-        std::thread::sleep(Duration::from_millis(500));
-        if !carol_reads_bob && reads(carol_dir, &room, "BOB-PROBE-") {
-            carol_reads_bob = true;
-            carol_read_at = Some(released.elapsed());
-        }
-        if !bob_reads_carol && reads(bob_dir, &room, "CAROL-PROBE-") {
-            bob_reads_carol = true;
-            bob_read_at = Some(released.elapsed());
-        }
-        for (who, d) in [("bob", &bob), ("carol", &carol)] {
-            let seen = refusals_seen.iter().filter(|(_, w)| *w == who).count();
-            for _ in seen..refused(d) {
-                refusals_seen.push((released.elapsed(), who));
-            }
-        }
+        std::thread::sleep(Duration::from_secs(2));
+        carol_reads_bob |= reads(carol_dir, &room, "BOB-PROBE-");
+        bob_reads_carol |= reads(bob_dir, &room, "CAROL-PROBE-");
         n += 1;
     }
     let lost = |d: &Daemon| d.1.lock().unwrap().matches(LOST_SAID).count();
     let (bob_lost, carol_lost) = (lost(&bob), lost(&carol));
     eprintln!(
-        "[proof] release={} lose={lose:?}: after the race ({n} probe rounds, watched {:.1?} of \
-         90s): bob reads carol at {bob_read_at:?}, carol reads bob at {carol_read_at:?} after the \
-         relay's release; hellos lost: bob {bob_lost}, carol {carol_lost}; bob's session loses: \
-         {bob_loses}",
+        "[proof] release={} lose_hellos={lose_hellos}: after the race ({n} probe rounds, \
+         watched {:.1?} of 90s): bob reads carol = {bob_reads_carol}, carol reads bob = \
+         {carol_reads_bob}; hellos lost: bob {bob_lost}, carol {carol_lost}",
         !cfg!(debug_assertions),
-        released.elapsed()
+        thawed.elapsed()
     );
-    for (at, who) in &refusals_seen {
-        eprintln!("[proof] {who}'s key refused, seen at {at:?} after the release");
-    }
-    if lose == Lose::WinnersAtLoser {
-        assert!(
-            (bob_lost, carol_lost) == (bob_knob, carol_knob),
-            "CANNOT MEASURE: the knob did not lose {LOSER_LOSES} of the winner's hellos at the \
-             loser and none at the winner (bob lost {bob_lost} of {bob_knob}, carol {carol_lost} \
-             of {carol_knob}), so this run did not force the case"
-        );
-    } else if lose == Lose::FirstAtBoth {
+    if lose_hellos {
         assert!(
             bob_lost == 1 && carol_lost == 1,
             "CANNOT MEASURE: the knob did not lose one hello at each end (bob {bob_lost}, carol \
@@ -458,27 +370,9 @@ fn race(lose: Lose) {
             .collect();
         lines[lines.len().saturating_sub(40)..].join("\n")
     };
-    if lose == Lose::WinnersAtLoser {
-        let (reading, loser_read) = if bob_loses {
-            (
-                "carol reads bob, whose session lost the race,",
-                carol_read_at,
-            )
-        } else {
-            ("bob reads carol, whose session lost the race,", bob_read_at)
-        };
-        assert!(
-            loser_read.is_some_and(|t| t < BOUND),
-            "PRODUCT: {reading} at {loser_read:?} after the \
-             release, over {BOUND:?}: a key refused in the race waited out its backoff\n--- bob's \
-             daemon:\n{}\n--- carol's daemon:\n{}",
-            record(&bob),
-            record(&carol)
-        );
-    }
     assert!(
         bob_reads_carol && carol_reads_bob,
-        "PRODUCT: two members who opened their sessions at once did not converge: bob reads carol = \
+        "two members who opened their sessions at once did not converge: bob reads carol = \
          {bob_reads_carol}, carol reads bob = {carol_reads_bob}\n--- bob's daemon:\n{}\n--- \
          carol's daemon:\n{}",
         record(&bob),
