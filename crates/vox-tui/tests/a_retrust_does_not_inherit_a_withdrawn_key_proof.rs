@@ -50,12 +50,15 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox: {e}"));
     if let Some(text) = stdin {
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(text.as_bytes()).expect("write");
+        let mut pipe = child.stdin.take().expect("APPARATUS: no stdin pipe");
+        pipe.write_all(text.as_bytes())
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot write vox's stdin: {e}"));
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot wait for vox: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -99,9 +102,10 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn a daemon");
-    let mut pipe = child.stdin.take().expect("stdin");
-    pipe.write_all(format!("{IDPASS}\n").as_bytes()).unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn a daemon: {e}"));
+    let mut pipe = child.stdin.take().expect("APPARATUS: no daemon stdin pipe");
+    pipe.write_all(format!("{IDPASS}\n").as_bytes())
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the daemon's stdin: {e}"));
     drop(pipe);
     let said = Arc::new(Mutex::new(String::new()));
     for stream in [
@@ -137,7 +141,7 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
     while !d.1.lock().unwrap().contains("control socket") {
         assert!(
             Instant::now() < deadline,
-            "a daemon never served its socket:\n{}",
+            "PRODUCT: a daemon never served its control socket:\n{}",
             d.1.lock().unwrap()
         );
         std::thread::sleep(Duration::from_millis(50));
@@ -150,77 +154,78 @@ fn signal(pid: u32, sig: &str) {
         .args([sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill {sig} {pid}");
+    assert!(ok, "APPARATUS: kill {sig} {pid} did not take");
 }
 
 #[test]
 #[ignore = "three daemons and a relay anchor with production Argon2id; CI runs it in release"]
 fn a_retrust_does_not_inherit_a_withdrawn_key() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dirs: Vec<std::path::PathBuf> = ["alice", "bob", "carol"]
         .iter()
         .map(|n| tmp.path().join(n))
         .collect();
     for d in &dirs {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: cannot make a profile directory");
     }
     let (alice_dir, bob_dir, carol_dir) = (&dirs[0], &dirs[1], &dirs[2]);
     let anchor = Anchor::start(&tmp.path().join("anchor"));
     let mut fps = Vec::new();
     for d in &dirs {
         let (ok, out, err) = vox(d, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         fps.push(out.trim().to_owned());
     }
     let _alice = daemon(alice_dir, "127.0.0.1:0", &anchor.v4_spec);
-    let _bob = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec);
+    let bob = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec);
     let carol_spec = Split::Families.guest_spec(&anchor).to_owned();
-    let _carol = daemon(carol_dir, Split::Families.guest_listen(), &carol_spec);
+    let carol = daemon(carol_dir, Split::Families.guest_listen(), &carol_spec);
+    let said = |d: &Daemon| d.1.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     for (i, name) in [(1usize, "bob"), (2, "carol")] {
         let (ok, _, err) = vox(alice_dir, &["trust", "add", &fps[i], "--name", name], None);
-        assert!(ok, "alice trusts {name}: {err}");
+        assert!(ok, "PRODUCT (staging): alice trusts {name} failed: {err}");
         let (ok, _, err) = vox(
             &dirs[i],
             &["trust", "add", &fps[0], "--name", "alice"],
             None,
         );
-        assert!(ok, "{name} trusts alice: {err}");
+        assert!(ok, "PRODUCT (staging): {name} trusts alice failed: {err}");
     }
     let (ok, _, err) = vox(
         alice_dir,
         &["room", "create", "--name", "late"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "room create: {err}");
+    assert!(ok, "PRODUCT (staging): room create failed: {err}");
     let listed = vox(alice_dir, &["room", "list"], None).1;
     let room = listed
         .split_whitespace()
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .expect("a room id in `room list`")
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in `vox room list`: {listed:?}"))
         .to_owned();
     let (ok, link, err) = vox(alice_dir, &["room", "invite", &room], None);
-    assert!(ok, "invite: {err}");
+    assert!(ok, "PRODUCT (staging): room invite failed: {err}");
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,
             &["room", "join", link.trim(), "--name", "late"],
             Some(&format!("{ROOMPASS}\n")),
         );
-        assert!(ok, "CANNOT MEASURE: a join failed: {err}");
+        assert!(ok, "PRODUCT (staging): a join failed: {err}");
     }
     // Bob trusts carol from the start: a node reads only whom its owner trusts (V210-118), so
     // what this measures is carol's decision alone.
     let (ok, _, err) = vox(bob_dir, &["trust", "add", &fps[2], "--name", "carol"], None);
-    assert!(ok, "bob trusts carol: {err}");
+    assert!(ok, "PRODUCT (staging): bob trusts carol failed: {err}");
     // Both hold the room and each other's admission before carol decides anything.
-    let (ok, _, _) = vox(
+    let (ok, _, err) = vox(
         carol_dir,
         &["room", "post", &room, "CAROL-BEFORE-TRUST"],
         None,
     );
-    assert!(ok);
+    assert!(ok, "PRODUCT (staging): carol's first post failed: {err}");
     assert!(
         until("bob holds carol's entry (unreadable yet)", 60, || {
             vox(bob_dir, &["room", "read", &room, "--json"], None)
@@ -228,12 +233,14 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
                 .contains(&fps[2][..20])
                 || reads(alice_dir, &room, "CAROL-BEFORE-TRUST")
         }),
-        "CANNOT MEASURE: carol's first post never reached the room"
+        "PRODUCT (staging): carol's first post never reached the room"
     );
     std::thread::sleep(Duration::from_secs(3));
     assert!(
         !reads(bob_dir, &room, "CAROL-BEFORE-TRUST"),
-        "CANNOT MEASURE: bob reads carol before carol trusts him"
+        "PRODUCT: bob reads carol's post before carol trusts him — a confidentiality breach\n\
+         ---- bob ----\n{}",
+        said(&bob)
     );
 
     // ---- with bob unreachable: trust, untrust, post, re-trust, post ----
@@ -241,23 +248,26 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
     signal(anchor_pid, "-STOP");
     let frozen = Instant::now();
     let (ok, _, err) = vox(carol_dir, &["trust", "add", &fps[1], "--name", "bob"], None);
-    assert!(ok, "carol trusts bob: {err}");
+    assert!(ok, "PRODUCT: carol trusts bob: {err}");
     let (ok, o, err) = vox(carol_dir, &["trust", "remove", &fps[1]], None);
-    assert!(ok, "carol untrusts bob: {o}{err}");
+    assert!(ok, "PRODUCT: carol untrusts bob: {o}{err}");
     let (ok, _, err) = vox(
         carol_dir,
         &["room", "post", &room, "CAROL-WHILE-UNTRUSTED"],
         None,
     );
-    assert!(ok, "carol posts: {err}");
+    assert!(
+        ok,
+        "PRODUCT: carol's post while bob is untrusted failed: {err}"
+    );
     let (ok, _, err) = vox(carol_dir, &["trust", "add", &fps[1], "--name", "bob"], None);
-    assert!(ok, "carol re-trusts bob: {err}");
+    assert!(ok, "PRODUCT: carol re-trusts bob: {err}");
     let (ok, _, err) = vox(
         carol_dir,
         &["room", "post", &room, "CAROL-AFTER-RETRUST"],
         None,
     );
-    assert!(ok, "carol posts again: {err}");
+    assert!(ok, "PRODUCT: carol's post after the re-trust failed: {err}");
     std::thread::sleep(FREEZE.saturating_sub(frozen.elapsed()));
     signal(anchor_pid, "-CONT");
     let after = until("bob reads CAROL-AFTER-RETRUST", 90, || {
@@ -267,9 +277,23 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
     let leaked = reads(bob_dir, &room, "CAROL-WHILE-UNTRUSTED");
     eprintln!("[proof] after-retrust read = {after}; while-untrusted read (a leak) = {leaked}");
     assert!(
-        after,
-        "CANNOT MEASURE: bob never read the post made after the re-trust"
+        !leaked,
+        "PRODUCT: a re-trust inherited the pending key from before the untrust: bob reads what \
+         carol posted while he was untrusted\n---- bob ----\n{}\n---- carol ----\n{}",
+        said(&bob),
+        said(&carol)
     );
-    assert!(!leaked, "a re-trust inherited the pending key from before the untrust: bob reads what carol posted while he was untrusted");
-    assert!(!reads(bob_dir, &room, "CAROL-BEFORE-TRUST"), "forward-only");
+    assert!(
+        after,
+        "PRODUCT: bob never read the post carol made after she re-trusted him\n---- bob ----\n{}\n\
+         ---- carol ----\n{}",
+        said(&bob),
+        said(&carol)
+    );
+    assert!(
+        !reads(bob_dir, &room, "CAROL-BEFORE-TRUST"),
+        "PRODUCT: bob reads the post carol made before she ever trusted him (trust is \
+         forward-only)\n---- bob ----\n{}",
+        said(&bob)
+    );
 }

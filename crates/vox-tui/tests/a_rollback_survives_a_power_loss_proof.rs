@@ -26,6 +26,13 @@
 //!
 //! Mutations: the flush of a copy removed → red on (1); the directory flush between the two
 //! renames removed → red on (2).
+//!
+//! Every red says which it is: `PRODUCT:` quotes what `vox` said or did; `CANNOT MEASURE:` is
+//! staging or the recorder not seeing what it must (each recorded run must show at least one
+//! `open` by `vox`, so a recorder that recorded nothing never passes for "vox did nothing");
+//! `APPARATUS:` is the proof's own I/O. The two 20 s bounds are read beside a no-op `vox
+//! --version` timed on the same timeline: over the bound with the apparatus over its budget is
+//! `CANNOT MEASURE: apparatus took X`.
 
 #![cfg(target_os = "macos")]
 
@@ -46,23 +53,56 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// An install as `install.sh` makes one: the real `vox`, and a marker naming its channel.
 fn install_dir(root: &Path) -> PathBuf {
     let dir = root.join("bin");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(VOX, dir.join("vox")).unwrap();
+    std::fs::create_dir_all(&dir).expect("APPARATUS: cannot make the install directory");
+    std::fs::copy(VOX, dir.join("vox")).expect("APPARATUS: cannot copy vox into the install");
     std::fs::write(
         dir.join(".vox-standalone.json"),
         "{\"kind\":\"vox.install-channel\",\"schema_version\":1,\"package\":\"vox\",\
          \"channel\":\"stable\"}\n",
     )
-    .unwrap();
+    .expect("APPARATUS: cannot write the install's channel marker");
     dir
 }
 
 /// "The vox you had before": runnable, and told apart from the real one by its `--version`.
 fn previous_stub(path: &Path, version: &str) {
-    std::fs::write(path, format!("#!/bin/sh\necho \"vox {version}\"\n")).unwrap();
-    let mut p = std::fs::metadata(path).unwrap().permissions();
+    std::fs::write(path, format!("#!/bin/sh\necho \"vox {version}\"\n"))
+        .expect("APPARATUS: cannot write the previous-vox stub");
+    make_runnable(path);
+}
+
+/// Mode 0755, as an installed binary has.
+fn make_runnable(path: &Path) {
+    let mut p = std::fs::metadata(path)
+        .expect("APPARATUS: cannot read a staged file's mode")
+        .permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o755);
-    std::fs::set_permissions(path, p).unwrap();
+    std::fs::set_permissions(path, p).expect("APPARATUS: cannot make a staged file runnable");
+}
+
+/// The recorder's positive control: a recorded run of `vox` shows at least one `open`, so an
+/// empty log is never read as "vox made no such call".
+fn recorder_saw_vox(events: &[Event]) -> bool {
+    events.iter().any(|e| matches!(&e.call, Call::Open { .. }))
+}
+
+/// The most the apparatus may take — a no-op `vox --version` here and now — before a rollback
+/// over its bound is the runner's, not the product's.
+const APPARATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a no-op `vox --version` takes on this timeline: the runner's own stall.
+fn noop_vox() -> std::time::Duration {
+    let t = std::time::Instant::now();
+    let out = Command::new(VOX)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run a no-op vox: {e}"));
+    assert!(
+        out.status.success(),
+        "APPARATUS: the no-op `vox --version` failed"
+    );
+    t.elapsed()
 }
 
 /// What `path --version` says, or `None` if it did not run.
@@ -90,9 +130,9 @@ fn find(events: &[Event], from: usize, pred: impl Fn(&Call) -> bool) -> Option<u
             release gate runs it"]
 fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&home).expect("APPARATUS: cannot make the private HOME");
     let dir = install_dir(tmp.path());
     let (active, previous) = (dir.join("vox"), dir.join(".vox-previous"));
     let scratch = dir.join(".vox-rollback.partial");
@@ -109,13 +149,16 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
         .env("DYLD_INSERT_LIBRARIES", syscalls::interposer())
         .env("VOX_INTERPOSE_LOG", &log)
         .output()
-        .expect("run vox update --rollback");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox update --rollback: {e}"));
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(out.status.success(), "vox update --rollback failed: {said}");
+    assert!(
+        out.status.success(),
+        "PRODUCT: vox update --rollback failed: {said}"
+    );
     let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
     syscalls::assert_the_recorder_saw_vox(&events, "`vox update --rollback`");
     let (now_active, now_previous) = (version_of(&active), version_of(&previous));
@@ -124,14 +167,20 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
          {now_previous:?}; {} calls recorded",
         events.len()
     );
+    assert!(
+        recorder_saw_vox(&events),
+        "CANNOT MEASURE: the recorder saw no open by vox ({} calls recorded)",
+        events.len()
+    );
     assert_eq!(
         now_active.as_deref(),
         Some("vox 0.0.1"),
-        "CANNOT MEASURE: the rollback did not put the previous binary back: {said}"
+        "PRODUCT: the rollback did not put the previous binary back: {said}"
     );
     assert!(
         now_previous.as_deref().is_some_and(|v| v.contains(VERSION)),
-        "CANNOT MEASURE: the rollback did not keep the replaced binary as .vox-previous"
+        "PRODUCT: the rollback did not keep the replaced binary as .vox-previous \
+         ({now_previous:?}): {said}"
     );
 
     // ---- the order of the calls that did it --------------------------------------------------
@@ -139,7 +188,7 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
         norm(&active),
         norm(&previous),
         norm(&scratch),
-        std::fs::canonicalize(&dir).unwrap(),
+        std::fs::canonicalize(&dir).expect("APPARATUS: no install directory"),
     );
     let is_dir_sync = |c: &Call| matches!(c, Call::Sync { path, .. } if std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()) == dir_n);
     let first_rename = find(
@@ -171,16 +220,15 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
         }
     }
     let mut failures: Vec<String> = Vec::new();
+    let mut unmeasured: Vec<String> = Vec::new();
 
     // 1. the copy is filled, then flushed, before the rename that publishes it.
     let last_fill = events[..second]
         .iter()
         .rposition(|e| e.call.fills(&scratch_n));
     match last_fill {
-        None => failures.push(
-            "CANNOT MEASURE: no write, clone or copy into the rollback's copy was recorded"
-                .to_owned(),
-        ),
+        None => unmeasured
+            .push("no write, clone or copy into the rollback's copy was recorded".to_owned()),
         Some(k) => {
             let flushed = events[k + 1..second].iter().any(|e| {
                 e.ret == 0 && matches!(&e.call, Call::Sync { path, .. } if norm(path) == scratch_n)
@@ -218,8 +266,13 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
     }
     eprintln!("[proof] {} of 3 claims failed", failures.len());
     assert!(
+        unmeasured.is_empty(),
+        "CANNOT MEASURE: {}",
+        unmeasured.join("\n")
+    );
+    assert!(
         failures.is_empty(),
-        "a rollback does not survive every power loss:\n{}",
+        "PRODUCT: a rollback does not survive every power loss:\n{}",
         failures.join("\n")
     );
 }
@@ -245,7 +298,9 @@ fn rollback_with(dir: &Path, home: &Path, shell: bool, log: Option<&Path>) -> (b
         cmd.env("DYLD_INSERT_LIBRARIES", syscalls::interposer())
             .env("VOX_INTERPOSE_LOG", log);
     }
-    let out = cmd.output().expect("run vox update --rollback");
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox update --rollback: {e}"));
     (
         out.status.success(),
         format!(
@@ -258,10 +313,9 @@ fn rollback_with(dir: &Path, home: &Path, shell: bool, log: Option<&Path>) -> (b
 
 /// A leftover that exits 0 but is not a `vox`, or that hangs.
 fn impostor(path: &Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    let mut p = std::fs::metadata(path).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o755);
-    std::fs::set_permissions(path, p).unwrap();
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n"))
+        .expect("APPARATUS: cannot write a staged leftover");
+    make_runnable(path);
 }
 
 /// **A rollback a power loss interrupted is finished by the next one, not refused** (#242, the
@@ -284,9 +338,9 @@ fn impostor(path: &Path, body: &str) {
 #[ignore = "real install directories and the shipped binary; the macOS release gate runs it"]
 fn an_interrupted_rollback_is_finished_by_the_next_one() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&home).expect("APPARATUS: cannot make the private HOME");
     let mut failures: Vec<String> = Vec::new();
 
     // 1. between the renames
@@ -321,7 +375,8 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
         let root = tmp.path().join("before");
         let dir = install_dir(&root);
         previous_stub(&dir.join(".vox-previous"), "0.0.1");
-        std::fs::copy(dir.join("vox"), dir.join(".vox-rollback.partial")).unwrap();
+        std::fs::copy(dir.join("vox"), dir.join(".vox-rollback.partial"))
+            .expect("APPARATUS: cannot stage the leftover copy");
         let (ok, said) = rollback(&dir, &home);
         let (active, previous) = (
             version_of(&dir.join("vox")),
@@ -347,7 +402,8 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
     {
         let root = tmp.path().join("broken");
         let dir = install_dir(&root);
-        std::fs::write(dir.join(".vox-rollback.partial"), b"").unwrap();
+        std::fs::write(dir.join(".vox-rollback.partial"), b"")
+            .expect("APPARATUS: cannot stage the empty leftover");
         let (ok, said) = rollback(&dir, &home);
         let active = version_of(&dir.join("vox"));
         let partial_left = dir.join(".vox-rollback.partial").exists();
@@ -372,7 +428,7 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
     eprintln!("[proof] {} of 3 states failed", failures.len());
     assert!(
         failures.is_empty(),
-        "a rollback does not recover what a power loss left:\n{}",
+        "PRODUCT: a rollback does not recover what a power loss left:\n{}",
         failures.join("\n")
     );
 }
@@ -397,15 +453,22 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
 #[ignore = "real install directories and the shipped binary; the macOS release gate runs it"]
 fn the_recovery_path_is_bounded_durable_and_complete() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&home).expect("APPARATUS: cannot make the private HOME");
     let mut failures: Vec<String> = Vec::new();
+    let mut unmeasured: Vec<String> = Vec::new();
+    // Each staged leftover records the PIDs of the children it starts, so what they leave
+    // running is found by PID, never by a name pattern.
+    let pids = tmp.path().join("leftover-children");
 
     // 4. a leftover that hangs
     {
         let dir = install_dir(&tmp.path().join("hangs"));
-        impostor(&dir.join(".vox-rollback.partial"), "sleep 613");
+        impostor(
+            &dir.join(".vox-rollback.partial"),
+            &format!("sleep 613 &\necho $! >> '{}'\nwait", pids.display()),
+        );
         let t0 = std::time::Instant::now();
         let (ok, said) = rollback(&dir, &home);
         let took = t0.elapsed();
@@ -415,10 +478,20 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
             "[proof] (4) a hanging leftover: ok={ok} in {took:?}; installed as .vox-previous: \
              {installed}; left: {left}"
         );
-        if ok || installed || left || took > std::time::Duration::from_secs(20) {
+        let apparatus = noop_vox();
+        if ok || installed || left {
             failures.push(format!(
-                "(4) a hanging leftover: ok={ok}, took {took:?}, installed {installed}, left \
-                 {left}: {said}"
+                "(4) a hanging leftover: ok={ok}, installed {installed}, left {left}: {said}"
+            ));
+        } else if took > std::time::Duration::from_secs(20) && apparatus > APPARATUS_BUDGET {
+            unmeasured.push(format!(
+                "(4) apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) beside a rollback \
+                 of {took:?}"
+            ));
+        } else if took > std::time::Duration::from_secs(20) {
+            failures.push(format!(
+                "(4) a hanging leftover kept the rollback {took:?} (apparatus {apparatus:?}): \
+                 {said}"
             ));
         }
     }
@@ -443,15 +516,25 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
         let dir = install_dir(&tmp.path().join("holds-stdout"));
         impostor(
             &dir.join(".vox-rollback.partial"),
-            "sleep 31.5 &\necho \"vox 0.0.1\"",
+            &format!(
+                "sleep 31.5 &\necho $! >> '{}'\necho \"vox 0.0.1\"",
+                pids.display()
+            ),
         );
         let t0 = std::time::Instant::now();
         let (ok, said) = rollback(&dir, &home);
         let took = t0.elapsed();
         eprintln!("[proof] (8) a leftover whose child holds stdout: ok={ok} in {took:?}");
-        if took > std::time::Duration::from_secs(20) {
+        let apparatus = noop_vox();
+        if took > std::time::Duration::from_secs(20) && apparatus > APPARATUS_BUDGET {
+            unmeasured.push(format!(
+                "(8) apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) beside a rollback \
+                 of {took:?}"
+            ));
+        } else if took > std::time::Duration::from_secs(20) {
             failures.push(format!(
-                "(8) a leftover's child holding stdout kept the rollback {took:?}: {said}"
+                "(8) a leftover's child holding stdout kept the rollback {took:?} (apparatus \
+                 {apparatus:?}): {said}"
             ));
         }
     }
@@ -481,7 +564,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
         let (scratch, previous, dir_n) = (
             norm(&dir.join(".vox-rollback.partial")),
             norm(&dir.join(".vox-previous")),
-            std::fs::canonicalize(&dir).unwrap(),
+            std::fs::canonicalize(&dir).expect("APPARATUS: no install directory"),
         );
         let renamed = find(
             &events,
@@ -501,9 +584,14 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
             events.len(),
             renamed.is_some()
         );
-        if !ok || renamed.is_none() {
+        if !ok {
             failures.push(format!(
-                "CANNOT MEASURE (6a): the recovery or its rename was not seen: ok={ok}: {said}"
+                "(6a) the rollback that finishes an interrupted swap failed: {said}"
+            ));
+        } else if !recorder_saw_vox(&events) || renamed.is_none() {
+            unmeasured.push(format!(
+                "(6a) the recorder saw {} calls and no rename of the leftover: {said}",
+                events.len()
             ));
         } else if !flushed_after {
             failures.push("(6a) the directory was not flushed after finishing the swap".to_owned());
@@ -513,14 +601,15 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
     {
         let dir = install_dir(&tmp.path().join("durable-discard"));
         previous_stub(&dir.join(".vox-previous"), "0.0.1");
-        std::fs::copy(dir.join("vox"), dir.join(".vox-rollback.partial")).unwrap();
+        std::fs::copy(dir.join("vox"), dir.join(".vox-rollback.partial"))
+            .expect("APPARATUS: cannot stage the leftover copy");
         let log = tmp.path().join("discard.tsv");
         let (ok, said) = rollback_with(&dir, &home, false, Some(&log));
         let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
         syscalls::assert_the_recorder_saw_vox(&events, "(6b) discarding a leftover copy");
         let (scratch, dir_n) = (
             norm(&dir.join(".vox-rollback.partial")),
-            std::fs::canonicalize(&dir).unwrap(),
+            std::fs::canonicalize(&dir).expect("APPARATUS: no install directory"),
         );
         let refilled = events.iter().position(|e| e.call.fills(&scratch));
         let flushed_before = refilled.is_some_and(|i| {
@@ -536,9 +625,14 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
             events.len(),
             refilled.is_some()
         );
-        if !ok || refilled.is_none() {
+        if !ok {
             failures.push(format!(
-                "CANNOT MEASURE (6b): the rollback after the discard was not seen: ok={ok}: {said}"
+                "(6b) the rollback over a leftover copy failed: {said}"
+            ));
+        } else if !recorder_saw_vox(&events) || refilled.is_none() {
+            unmeasured.push(format!(
+                "(6b) the recorder saw {} calls and no refill of the leftover's name: {said}",
+                events.len()
             ));
         } else if !flushed_before {
             failures.push(
@@ -575,24 +669,37 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
         }
     }
     // Nothing the staged leftovers started outlives the test: a check that kills only the
-    // leftover leaves its children behind (#247, verifier).
-    let stray: Vec<String> = ["sleep 613", "sleep 31.5"]
+    // leftover leaves its children behind (#247, verifier). Each child's PID was recorded as it
+    // started; one still alive is a stray, killed here by that PID.
+    let recorded: Vec<String> = std::fs::read_to_string(&pids)
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if recorded.len() < 2 {
+        unmeasured.push(format!(
+            "the leftovers recorded {} child PID(s), not the 2 they start: {recorded:?}",
+            recorded.len()
+        ));
+    }
+    let stray: Vec<String> = recorded
         .iter()
-        .flat_map(|pat| {
-            let out = Command::new("pgrep").args(["-f", pat]).output().ok();
-            out.map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+        .filter(|pid| {
+            Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .is_ok_and(|s| s.success())
         })
+        .cloned()
         .collect();
     for pid in &stray {
-        let _ = Command::new("kill").args(["-KILL", pid]).status();
+        let killed = Command::new("kill")
+            .args(["-KILL", pid])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(killed, "APPARATUS: kill -KILL {pid} did not take");
     }
-    eprintln!("[proof] processes the leftovers left running: {stray:?}");
+    eprintln!("[proof] processes the leftovers left running: {stray:?} of {recorded:?}");
     if !stray.is_empty() {
         failures.push(format!(
             "the leftovers' children outlived the rollback: {stray:?} (killed by PID now)"
@@ -601,7 +708,12 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
     eprintln!("[proof] {} of 8 claims failed", failures.len());
     assert!(
         failures.is_empty(),
-        "the recovery path is not bounded, durable and complete:\n{}",
+        "PRODUCT: the recovery path is not bounded, durable and complete:\n{}",
         failures.join("\n")
+    );
+    assert!(
+        unmeasured.is_empty(),
+        "CANNOT MEASURE: {}",
+        unmeasured.join("\n")
     );
 }

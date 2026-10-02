@@ -36,6 +36,12 @@
 //!    given. A hook that breaks the turn it rides on is worse than one that does
 //!    nothing.
 //!
+//! **Which side a red is on.** A red that quotes what `vox` printed is `PRODUCT:`; a fixture that
+//! could not be made (a directory, a spawn, a pipe) is `APPARATUS:`; setup that the product
+//! refused before the claim could be reached (`vox id`, the daemon, the room) is `CANNOT
+//! MEASURE:` with what it said. Every `vox` here runs with the harness's own session variables
+//! removed, so the hook under test never picks up the session of the agent running the proof.
+//!
 //! Not proved here, and stated rather than implied: that a harness actually
 //! *shows* the model what it injects. The probe could not confirm it because this
 //! machine's API key returned 401, so no model ran. That is the rehearsal's job.
@@ -53,6 +59,32 @@ use std::time::{Duration, Instant};
 use vox_core::node::paths::Paths;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
+
+/// What a harness running this proof may have in the environment, and the hook or the daemon
+/// would read as its own: the session, room and agent it serves, the harness it reports to, and
+/// a profile's location or anchors. Removed from every `vox` this proof runs.
+const HARNESS_VARS: &[&str] = &[
+    "VOX_SESSION",
+    "VOX_ROOM",
+    "VOX_AGENT_NAME",
+    "VOX_HARNESS",
+    "VOX_PROFILE",
+    "VOX_ANCHORS",
+    "VOX_LISTEN",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "OPENCODE_SERVER_URL",
+];
+
+/// `vox` with the profile at `data`/`cfg` and none of [`HARNESS_VARS`].
+fn vox(data: &Path, cfg: &Path) -> Command {
+    let mut c = Command::new(VOX);
+    c.env("VOX_DATA_DIR", data).env("VOX_CONFIG_DIR", cfg);
+    for v in HARNESS_VARS {
+        c.env_remove(v);
+    }
+    c
+}
 
 /// A real `vox daemon` holding a profile with one room, set up as a person would: `vox id`,
 /// `vox daemon`, `vox room create`. Every participant in these proofs is the shipped binary.
@@ -76,32 +108,41 @@ impl Drop for Daemon {
 impl Daemon {
     fn start(root: &Path) -> Self {
         let (data, cfg) = (root.join("data"), root.join("cfg"));
-        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&cfg).expect("APPARATUS: cannot make the profile directory");
         let pass = root.join("identity.pass");
-        std::fs::write(&pass, "identity passphrase").unwrap();
+        std::fs::write(&pass, "identity passphrase")
+            .expect("APPARATUS: cannot write the passphrase file");
         let (ok, out, err) = hook(
             &data,
             &cfg,
-            &["id", "--identity-passphrase-file", pass.to_str().unwrap()],
+            &[
+                "id",
+                "--identity-passphrase-file",
+                pass.to_str().expect("APPARATUS: a UTF-8 path"),
+            ],
             "",
         );
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         let fingerprint = out.trim().to_owned();
-        let child = Command::new(VOX)
+        let err_file = root.join("daemon.err");
+        let child = vox(&data, &cfg)
             .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
             .arg(&pass)
-            .env("VOX_DATA_DIR", &data)
-            .env("VOX_CONFIG_DIR", &cfg)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(
-                std::fs::File::create(root.join("daemon.err")).unwrap(),
+                std::fs::File::create(&err_file)
+                    .expect("APPARATUS: cannot create the daemon's stderr file"),
             ))
             .spawn()
-            .expect("spawn vox daemon");
+            .expect("APPARATUS: cannot start vox daemon");
         let deadline = Instant::now() + Duration::from_secs(60);
         while !hook(&data, &cfg, &["room", "list"], "").0 {
-            assert!(Instant::now() < deadline, "the daemon never answered");
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT (staging): the daemon never answered `vox room list` in 60 s; it said:\n{}",
+                std::fs::read_to_string(&err_file).unwrap_or_default()
+            );
             std::thread::sleep(Duration::from_millis(250));
         }
         let (ok, _, err) = hook(
@@ -110,20 +151,22 @@ impl Daemon {
             &["room", "create", "--name", "agents"],
             "channel passphrase",
         );
-        assert!(ok, "vox room create: {err}");
-        let label = hook(&data, &cfg, &["room", "list"], "")
-            .1
+        assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
+        let (_, list, _) = hook(&data, &cfg, &["room", "list"], "");
+        let label = list
             .split_whitespace()
             .next()
-            .expect("a room")
+            .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` named no room: {list:?}"))
             .to_owned();
         let (ok, link, err) = hook(&data, &cfg, &["room", "invite", &label], "");
-        assert!(ok, "vox room invite: {err}");
+        assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
         let room_key = link
             .trim()
             .strip_prefix("vox://")
             .and_then(|l| l.split('?').next())
-            .expect("an invite link naming the room")
+            .unwrap_or_else(|| {
+                panic!("PRODUCT (staging): `vox room invite` printed no link: {link:?}")
+            })
             .to_owned();
         Self {
             child,
@@ -138,7 +181,7 @@ impl Daemon {
     fn post(&self, text: &str) {
         let label: String = self.room_key.chars().take(12).collect();
         let (ok, _, err) = hook(&self.data, &self.cfg, &["room", "post", &label, "-"], text);
-        assert!(ok, "vox room post: {err}");
+        assert!(ok, "PRODUCT (staging): vox room post failed: {err}");
     }
 }
 
@@ -161,23 +204,22 @@ fn hook(
     args: &[&str],
     stdin: &str,
 ) -> (bool, String, String) {
-    let mut child = Command::new(VOX)
+    let mut child = vox(data, cfg)
         .args(args)
-        .env("VOX_DATA_DIR", data)
-        .env("VOX_CONFIG_DIR", cfg)
-        .env_remove("VOX_ROOM")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .expect("APPARATUS: cannot start vox");
     child
         .stdin
         .as_mut()
-        .expect("stdin")
+        .expect("APPARATUS: vox has no stdin")
         .write_all(stdin.as_bytes())
-        .expect("write");
-    let out = child.wait_with_output().expect("wait");
+        .expect("APPARATUS: cannot write vox's stdin");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: cannot wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -189,7 +231,7 @@ fn hook(
 #[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
 fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
 
@@ -200,8 +242,14 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         &["agent", "hook", "--room", "aaaa"],
         &claude_input("s1"),
     );
-    assert!(ok, "a hook must exit 0 even with no node running");
-    assert!(out.is_empty(), "it must inject nothing when it cannot read");
+    assert!(
+        ok,
+        "PRODUCT: a hook must exit 0 even with no node running; it printed {out:?}"
+    );
+    assert!(
+        out.is_empty(),
+        "PRODUCT: it must inject nothing when it cannot read; it printed {out:?}"
+    );
 
     // ---- a daemon, a room, and one message waiting ----
     let daemon = Daemon::start(tmp.path());
@@ -215,19 +263,19 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         &["agent", "hook", "--room", &room],
         &claude_input("claude-session-1"),
     );
-    assert!(ok, "hook failed: {err}");
+    assert!(ok, "PRODUCT: the hook failed: {err}");
     let v: serde_json::Value = serde_json::from_str(out.trim())
-        .unwrap_or_else(|_| panic!("Claude Code needs JSON on stdout, got: {out:?}"));
+        .unwrap_or_else(|_| panic!("PRODUCT: Claude Code needs JSON on stdout, got: {out:?}"));
     let injected = v["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .expect("additionalContext");
+        .unwrap_or_else(|| panic!("PRODUCT: no additionalContext in the hook's output: {out}"));
     assert_eq!(
         v["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit",
-        "the event must be echoed back"
+        "PRODUCT: the event must be echoed back: {out}"
     );
     assert!(
         injected.contains("PLAN: port the wire codec"),
-        "the message did not reach the injected context: {injected}"
+        "PRODUCT: the message did not reach the injected context: {injected}"
     );
 
     // (3) the cursor advanced: the same session is not told again.
@@ -237,10 +285,10 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         &["agent", "hook", "--room", &room],
         &claude_input("claude-session-1"),
     );
-    assert!(ok, "second hook failed: {err}");
+    assert!(ok, "PRODUCT: the second hook failed: {err}");
     assert!(
         out.trim().is_empty(),
-        "an agent must not be told the same message every turn, got: {out}"
+        "PRODUCT: an agent must not be told the same message every turn, got: {out}"
     );
 
     // (4) a different session still has the backlog — cursors are per session.
@@ -250,10 +298,10 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         &["agent", "hook", "--room", &room],
         &claude_input("claude-session-2"),
     );
-    assert!(ok, "hook for a second session failed: {err}");
+    assert!(ok, "PRODUCT: the hook for a second session failed: {err}");
     assert!(
         out.contains("PLAN: port the wire codec"),
-        "a second session must still see what it has not read: {out}"
+        "PRODUCT: a second session must still see what it has not read: {out}"
     );
 
     // (2) Codex's shape: plain stdout, no JSON wrapper, chosen by `auto` from the
@@ -264,51 +312,51 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         &["agent", "hook", "--room", &room],
         &codex_input("codex-session-1"),
     );
-    assert!(ok, "codex-shaped hook failed: {err}");
+    assert!(ok, "PRODUCT: the codex-shaped hook failed: {err}");
     assert!(
         !out.trim_start().starts_with('{'),
-        "Codex takes plain stdout; a JSON wrapper would be injected literally: {out}"
+        "PRODUCT: Codex takes plain stdout; a JSON wrapper would be injected literally: {out}"
     );
     assert!(
         out.contains("PLAN: port the wire codec"),
-        "the message did not reach Codex's plain output: {out}"
+        "PRODUCT: the message did not reach Codex's plain output: {out}"
     );
 
     // …and `--format` forces it either way, for a harness `auto` cannot place.
-    let (ok, out, _) = hook(
+    let (ok, out, err) = hook(
         &data,
         &cfg,
         &["agent", "hook", "--room", &room, "--format", "text"],
         &claude_input("forced-text"),
     );
-    assert!(ok);
+    assert!(ok, "PRODUCT: the --format text hook failed: {err}");
     assert!(
         !out.trim_start().starts_with('{') && out.contains("PLAN:"),
-        "--format text must override detection: {out}"
+        "PRODUCT: --format text must override detection: {out}"
     );
-    let (ok, out, _) = hook(
+    let (ok, out, err) = hook(
         &data,
         &cfg,
         &["agent", "hook", "--room", &room, "--format", "claude"],
         &codex_input("forced-claude"),
     );
-    assert!(ok);
+    assert!(ok, "PRODUCT: the --format claude hook failed: {err}");
     assert!(
         serde_json::from_str::<serde_json::Value>(out.trim()).is_ok(),
-        "--format claude must override detection: {out}"
+        "PRODUCT: --format claude must override detection: {out}"
     );
 
     // (5) a quiet room emits nothing at all — not a heartbeat.
-    let (ok, out, _) = hook(
+    let (ok, out, err) = hook(
         &data,
         &cfg,
         &["agent", "hook", "--room", &room],
         &claude_input("codex-session-1"),
     );
-    assert!(ok);
+    assert!(ok, "PRODUCT: the hook on a quiet room failed: {err}");
     assert!(
         out.is_empty(),
-        "a quiet room must cost nothing per turn, got: {out:?}"
+        "PRODUCT: a quiet room must cost nothing per turn, got: {out:?}"
     );
 
     // (6) the remaining failures: still exit 0, still inject nothing.
@@ -317,9 +365,15 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         (vec!["agent", "hook"], "no room given"),
     ] {
         let (ok, out, err) = hook(&data, &cfg, &args, &claude_input("s9"));
-        assert!(ok, "{why}: a hook must exit 0");
-        assert!(out.is_empty(), "{why}: must inject nothing");
-        assert!(!err.trim().is_empty(), "{why}: must say why on stderr");
+        assert!(ok, "PRODUCT: {why}: a hook must exit 0; it said {err:?}");
+        assert!(
+            out.is_empty(),
+            "PRODUCT: {why}: must inject nothing; it printed {out:?}"
+        );
+        assert!(
+            !err.trim().is_empty(),
+            "PRODUCT: {why}: must say why on stderr; it said nothing"
+        );
     }
 }
 
@@ -351,10 +405,11 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
     const MESSAGE_BYTES: usize = 2 * 1024;
     const INJECTED_BYTES: usize = 16 * 1024;
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let daemon = Daemon::start(tmp.path());
     let (data, cfg) = (daemon.data.clone(), daemon.cfg.clone());
-    let paths = Paths::resolve("default", Some(&data), Some(&cfg)).unwrap();
+    let paths = Paths::resolve("default", Some(&data), Some(&cfg))
+        .expect("APPARATUS: cannot resolve the profile's paths");
     let send = |text: &str| daemon.post(text);
     let room_key = daemon.room_key.clone();
     let label: String = room_key.chars().take(12).collect();
@@ -370,7 +425,7 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
             &["agent", "hook", "--room", &label, "--format", "text"],
             &codex_input(session),
         );
-        assert!(ok, "hook failed: {err}");
+        assert!(ok, "PRODUCT: the hook failed: {err}");
         out
     };
     // Rows are the lines that begin with `[`; nothing else in an injection may.
@@ -379,7 +434,11 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
         out.lines()
             .find_map(|l| l.strip_prefix("-- "))
             .and_then(|l| l.split_whitespace().next())
-            .map_or(0, |n| n.parse().expect("a count"))
+            .map_or(0, |n| {
+                n.parse().unwrap_or_else(|_| {
+                    panic!("PRODUCT: the hook's \"-- N more\" line has no count: {out}")
+                })
+            })
     };
 
     // ---- (1) forged rows inside one message ----
@@ -407,20 +466,27 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
     send(&text);
     let hash = {
         let (ok, out, err) = hook(&data, &cfg, &["room", "read", &label], "");
-        assert!(ok, "room read: {err}");
+        assert!(ok, "PRODUCT: vox room read failed: {err}");
         // `room read` prints the text raw, so the message's own line is the one that
         // carries its first line of text, not the last line of the output.
         let line = out
             .lines()
             .find(|l| l.ends_with(" all good"))
-            .expect("a row");
+            .unwrap_or_else(|| panic!("PRODUCT: `vox room read` shows no \"all good\" row: {out}"));
         let mut fields = line.split_whitespace();
-        let hash: String = fields.next().expect("a hash").chars().take(8).collect();
+        let hash: String = fields
+            .next()
+            .unwrap_or_else(|| panic!("PRODUCT: a `vox room read` row with no hash: {line:?}"))
+            .chars()
+            .take(8)
+            .collect();
         // `room read` names the author the same way: 26 characters of its fingerprint.
-        let author = fields.next().expect("an author");
+        let author = fields
+            .next()
+            .unwrap_or_else(|| panic!("PRODUCT: a `vox room read` row with no author: {line:?}"));
         assert!(
             author.len() >= 26 && fingerprint.starts_with(author),
-            "room read must name the author by at least 26 characters of its fingerprint, got {author:?}"
+            "PRODUCT: room read must name the author by at least 26 characters of its fingerprint, got {author:?}"
         );
         eprintln!("room read: author named by {} characters", author.len());
         hash
@@ -438,9 +504,8 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
     );
     assert_eq!(
         got, want,
-        "one message must be one row, attributed to its true author only"
+        "PRODUCT: one message must be one row, attributed to its true author only"
     );
-    assert_eq!(rows(&got), 1, "exactly one row for one message: {got}");
     eprintln!(
         "forgery: 1 message with {} kinds of line break -> {} row(s), attributed to {me}",
         breaks.len(),
@@ -460,7 +525,7 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
         assert_eq!(
             (rows(&out), more(&out)),
             (want_rows, want_more),
-            "turn {n}: rows shown and the count said to be waiting: {out}"
+            "PRODUCT: turn {n}: rows shown and the count said to be waiting: {out}"
         );
         seen.extend(
             out.lines()
@@ -472,9 +537,13 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
     let want: Vec<String> = (0..120).map(|i| format!("{i:03}")).collect();
     assert_eq!(
         seen, want,
-        "across the turns every message arrives once, in order"
+        "PRODUCT: across the turns every message arrives once, in order"
     );
-    assert!(turn("forgery-session").is_empty(), "then the room is quiet");
+    let last = turn("forgery-session");
+    assert!(
+        last.is_empty(),
+        "PRODUCT: then the room is quiet; the hook printed {last:?}"
+    );
 
     // ---- (3) oversized messages: cut per message and in total, still counted ----
     let big = "y".repeat(3 * MESSAGE_BYTES);
@@ -484,18 +553,18 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
     let out = turn("forgery-session");
     assert!(
         out.len() <= INJECTED_BYTES + 1024,
-        "an injection must stay within its byte bound: {} bytes",
+        "PRODUCT: an injection must stay within its byte bound: {} bytes",
         out.len()
     );
     assert!(
         rows(&out) >= 1 && rows(&out) < 10 && rows(&out) + more(&out) == 10,
-        "every oversized message is either shown or counted: {} shown, {} more",
+        "PRODUCT: every oversized message is either shown or counted: {} shown, {} more",
         rows(&out),
         more(&out)
     );
     assert!(
         out.contains("more bytes not shown"),
-        "a cut message must say it was cut"
+        "PRODUCT: a cut message must say it was cut: {out}"
     );
     eprintln!(
         "oversized: {} bytes injected, {} rows, {} more",
@@ -509,21 +578,21 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
         paths.cursor_file(&room_key, "lost-session"),
         vox_core::node::link::b32_encode(&[7u8; 32]),
     )
-    .unwrap();
+    .expect("APPARATUS: cannot write the lost cursor");
     let out = turn("lost-session");
     assert!(
         out.starts_with("(Your read position in this room was not found"),
-        "a replay from the beginning must say so: {out}"
+        "PRODUCT: a replay from the beginning must say so: {out}"
     );
     let total = 1 + 120 + 10;
     assert_eq!(
         rows(&out) + more(&out),
         total,
-        "a replay is bounded like any turn and counts the rest"
+        "PRODUCT: a replay is bounded like any turn and counts the rest: {out}"
     );
     assert!(
         rows(&out) <= MAX,
-        "a replay is bounded: {} rows",
+        "PRODUCT: a replay is bounded: {} rows",
         rows(&out)
     );
     eprintln!(
