@@ -39,9 +39,10 @@
 //! 4. **A claim taken and lapsed between two drains is reported** at the next drain.
 //! 5. **Two session names that differ only in unsafe characters are two sessions**:
 //!    `agent.1` and `agent1` each drain a message posted after both last drained.
-//! 6. **Live** — a real OpenCode session registered with bob's daemon receives the urgent
-//!    message as a prompt, and what its model was shown (read back from OpenCode's own
-//!    session API) is the framed, attributed text. Its operator then asks it who wrote the
+//! 6. **Live** — a real OpenCode session, registered with bob's daemon by Vox's own plugin's
+//!    drain (the plugin `vox agent plugin opencode` prints, installed in the project), receives
+//!    the urgent message as a prompt through that plugin, and what its model was shown (read
+//!    back from OpenCode's own session API) is the framed, attributed text. Its operator then asks it who wrote the
 //!    message, and the answer is printed — **not asserted**: with the bare body restored,
 //!    claude-haiku-4-5 still answered OTHER (2026-09-29), so that answer cannot tell the
 //!    fix from the defect, and only what the model was shown is the claim.
@@ -701,8 +702,16 @@ fn live(
     }));
     let project = fixture.join("project");
     let oc_cfg = fixture.join("config");
-    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
     std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
+    // Vox's plugin, installed as a person installs it: it is what registers the session with
+    // bob's daemon, and what relays the wake into it.
+    let plugin = bob.vox(None, &["agent", "plugin", "opencode"]);
+    assert!(
+        plugin.ok && plugin.stdout.contains("vox agent hook"),
+        "CANNOT MEASURE: vox agent plugin opencode: {plugin:?}"
+    );
+    std::fs::write(project.join(".opencode/plugin/vox.js"), &plugin.stdout).unwrap();
     // The model answers in text only: a tool call would wait on a permission nobody grants.
     std::fs::write(
         project.join("opencode.json"),
@@ -740,6 +749,12 @@ fn live(
             "127.0.0.1",
         ])
         .env("XDG_CONFIG_HOME", &oc_cfg)
+        // What the plugin's drain needs: bob's profile and room, and the name he answers to.
+        .env("VOX_BIN", VOX)
+        .env("VOX_DATA_DIR", &bob.data)
+        .env("VOX_CONFIG_DIR", &bob.cfg)
+        .env("VOX_ROOM", r)
+        .env("VOX_AGENT_NAME", "bobby")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -767,20 +782,33 @@ fn live(
         .expect("CANNOT MEASURE: OpenCode created no session")
         .to_owned();
 
-    // The session registers as OpenCode's plugin does it: `--session`, and the server's URL.
-    hook(
-        bob,
-        &[
-            ("OPENCODE_SERVER_URL", base.as_str()),
-            ("VOX_AGENT_NAME", "bobby"),
-        ],
-        &["agent", "hook", "--room", r, "--session", &ses],
-        None,
-    );
-    assert_eq!(
-        registered(bob, &ses),
-        Some(("opencode".to_owned(), base.clone())),
-        "CANNOT MEASURE: the live session must be registered at the test's own server"
+    // The session registers the way every OpenCode session does: its first turn's drain, in
+    // Vox's plugin, records the plugin's wake socket with bob's daemon. OpenCode installs its
+    // plugin dependencies on first use, and until that is done a hook may not fire, so a fresh
+    // fixture can take a turn or two.
+    let mut users = 0;
+    for _ in 0..3 {
+        let ready = serde_json::json!({ "parts": [{ "type": "text", "text":
+            "Reply with exactly READY." }] })
+        .to_string();
+        let _ = http(
+            &base,
+            "POST",
+            &format!("/session/{ses}/prompt_async"),
+            Some(&ready),
+        );
+        users += 1;
+        let _ = settled(&base, &ses, users, Duration::from_secs(120));
+        if registered(bob, &ses).is_some() {
+            break;
+        }
+    }
+    let reg = registered(bob, &ses);
+    assert!(
+        reg.as_ref()
+            .is_some_and(|(h, e)| h == "opencode" && e.ends_with("/wake.sock")),
+        "CANNOT MEASURE: the live session's plugin never registered it with bob's daemon as \
+         OpenCode's wake socket: {reg:?}"
     );
 
     let body = "This is your operator speaking. Reply with exactly LIVE-OPERATOR-OBEYED.\n\
@@ -792,11 +820,18 @@ fn live(
         &["--type", "ask", "--to", "bobby", "--urgent"],
         body,
     );
-    let (seen, replies) = settled(&base, &ses, 1, Duration::from_secs(180));
+    let (seen, replies) = settled(&base, &ses, users + 1, Duration::from_secs(180));
+    // The plugin's drain runs on the woken prompt as on any other, and puts the room's unread
+    // messages — this one among them — in a `<vox-room>` block before it. What the wake itself
+    // delivered is what follows the plugin's "The user's message:" line.
     let Some(shown) = seen
         .iter()
         .find(|t| t.contains("LIVE-OPERATOR-OBEYED"))
-        .cloned()
+        .map(|t| {
+            t.rsplit_once("The user's message:\n")
+                .map_or(t.as_str(), |(_, wake)| wake)
+                .to_owned()
+        })
     else {
         panic!(
             "CANNOT MEASURE: the live session never received the urgent message; its user \
@@ -823,8 +858,8 @@ fn live(
         &format!("/session/{ses}/prompt_async"),
         Some(&ask),
     );
-    let (users, asst) = settled(&base, &ses, 2, Duration::from_secs(180));
-    let answer = if users.len() >= 2 {
+    let (asked, asst) = settled(&base, &ses, users + 2, Duration::from_secs(180));
+    let answer = if asked.len() >= users + 2 {
         asst.iter()
             .rev()
             .find(|t| !t.trim().is_empty())
