@@ -68,14 +68,14 @@
 //! Then, once the turn the wake started has answered, what the model was **given** — the
 //! session's user messages as OpenCode stored them, after the plugin rewrote them (V210-112):
 //!
-//! 5. the message that woke it appears **once**, as the wake itself: the `<vox-room>` read that
-//!    follows does not repeat it; and the one addressed to someone else, which woke nothing,
-//!    appears exactly once, in that read;
+//! 5. the message that woke it appears **once**, in the `<vox-room>` read of the turn the wake
+//!    started: the wake is a notice carrying no message (V030-15); and the one addressed to
+//!    someone else, which woke nothing, appears exactly once, in that read;
 //! 6. and every message is shown as its words, never as its envelope JSON.
 //!
 //! Mutation-checked: `vox agent hook` not registering the plugin's socket (the session stays
 //! `unknown`) goes red at (1) and (3); the plugin taking the wake and never relaying it goes
-//! red at (3); the drain re-emitting a woken message goes red at (5); the text format printing
+//! red at (3); the message put back in the wake goes red at (5); the text format printing
 //! a message's raw envelope goes red at (6).
 //!
 //! ## The wake directory goes with the session, however the person quits (ADR-021 F17)
@@ -537,9 +537,9 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         }
         assert!(
             count("woken") == "1" && count("other") == "1",
-            "PRODUCT (5): the message that woke the session must reach the model once — as the \
-             wake, not again in the room read that follows — and the one that woke nothing \
-             exactly once; the model was given woken={} other={}: {said}",
+            "PRODUCT (5): the message that woke the session must reach the model once — in the \
+             room read, never in the wake, which carries no message — and the one that woke \
+             nothing exactly once; the model was given woken={} other={}: {said}",
             count("woken"),
             count("other")
         );

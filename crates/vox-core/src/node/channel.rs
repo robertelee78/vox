@@ -2296,7 +2296,8 @@ impl ChannelState {
 
     /// Where a service this node offers in this channel lives locally, or `None`.
     /// This is pure host configuration and carries **no** authorization: what a peer
-    /// may reach is the `dial:` capability in the log, checked separately.
+    /// may reach is whether this host approved its key in this channel (its reachers,
+    /// ADR-017 decision 3 as revised), checked separately.
     #[must_use]
     pub fn service_endpoint(&self, service_tag: &str) -> Option<SocketAddr> {
         self.services.get(service_tag).copied()
@@ -2305,8 +2306,8 @@ impl ChannelState {
     /// Offer `service_tag` at `local`, persisted under the channel's SEK so a restart
     /// still serves it — unless `persist` is false, when it lasts only until it is removed
     /// or this node stops. Replacing an existing tag's address is allowed (that is how a
-    /// service moves); the caller must hold `bind:<tag>` in this channel, which is
-    /// checked here — a host cannot offer what the log does not let it offer.
+    /// service moves). No capability is checked: offering a port of this machine is
+    /// configuration, not authorization (see the body).
     ///
     /// Returns whether this added a tag that was not offered before.
     pub fn add_service(
@@ -2503,6 +2504,13 @@ impl ChannelState {
     #[must_use]
     pub fn author_keys(&self) -> Vec<CompositePublicKey> {
         self.authors.values().cloned().collect()
+    }
+
+    /// Every admitted author's key by its fingerprint, as held: the fingerprints are not worked
+    /// out again (V030-09).
+    #[must_use]
+    pub fn author_map(&self) -> BTreeMap<Digest32, CompositePublicKey> {
+        self.authors.clone()
     }
 
     /// Every admitted author's fingerprint, in deterministic order.

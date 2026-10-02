@@ -19,11 +19,19 @@
 //! 4. B comes back, syncs with C only, and must read all **six** — across the rotation — and
 //!    **not** the message from step 1 (forward-only, R12: a grant opens what is sealed after
 //!    it, never before).
-//! 5. With every daemon stopped, the stores are read at rest: C carries the key-packages for B
-//!    and **cannot open one**; B's own ring opens every one.
+//! 5. **And not through the anchor** (ADR-023 decision 6, proof 6; PRD-001 R34, R11): A, B and C
+//!    all run with `--anchor` at a `vox node` that is a member of nothing. Its board serves the
+//!    room (it says so), and after the whole exchange its data directory has **no store file**,
+//!    the one place a node keeps anything for a room: no log, no key-package, nothing at rest.
+//!    B read A's keys with A down and only C up, so they reached it through C, the always-on
+//!    member. (The anchor may relay a circuit between members, the in-flight datagrams decision 6
+//!    leaves it; the most it carried is printed.)
 //!
-//! The second test removes C before A comes back: B reads none of A's messages, and B's log
-//! holds no key-package for B — nothing was online with both. That is "keys wait for overlap"
+//! Everything is read from what the binaries say and what is on disk; nothing is opened in this
+//! process.
+//!
+//! The second test removes C before A comes back: B reads none of A's messages — nothing was
+//! online with both. That is "keys wait for overlap"
 //! (ADR-023 decision 4's accepted consequence), read from B's timeline and log; the `vox status`
 //! line is added when status reaches this branch.
 //!
@@ -34,7 +42,8 @@
 //! and reached only through the log. B, reading through C alone, must read the same six D reads;
 //! and neither reads the message A posted before trusting them (never wider).
 //!
-//! Mutations: no key-package posted → B reads 0. The log path releasing forward-only from the key
+//! Mutations: the anchor keeping its old ciphertext copy of the room (as before ADR-023 decision
+//! 6) → the anchor's data directory holds a store file. No key-package posted → B reads 0. The log path releasing forward-only from the key
 //! held when the consent fell due (what it did before #226) → B reads 0 of the six, D all six.
 //! R14 deleting every superseded generation whatever V210-45 still owes (as the merge had it) →
 //! D and B each read 3 of the six: generation one's key was gone before either joined.
@@ -44,6 +53,7 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -52,6 +62,12 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
+
+thread_local! {
+    /// The `--anchor` every daemon this test's thread starts names, if it set one. Per thread,
+    /// since the tests of this file run side by side and only the first uses an anchor.
+    static ANCHOR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// A daemon, killed by its own PID however the test ends, with stdout and stderr collected.
 struct Daemon {
@@ -85,9 +101,13 @@ impl Daemon {
     fn start(name: &'static str, dir: &std::path::Path) -> Self {
         let pass = dir.join("pass");
         std::fs::write(&pass, format!("{IDPASS}\n{ROOMPASS}\n")).unwrap();
-        let mut child = Command::new(VOX)
-            .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
-            .arg(&pass)
+        let mut cmd = Command::new(VOX);
+        cmd.args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+            .arg(&pass);
+        if let Some(spec) = ANCHOR.with(|a| a.borrow().clone()) {
+            cmd.args(["--anchor", &spec]);
+        }
+        let mut child = cmd
             .env("VOX_DATA_DIR", dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
             .env_remove("VOX_ROOM")
@@ -95,9 +115,9 @@ impl Daemon {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-        let out = collect(child.stdout.take().expect("stdout"));
-        let err = collect(child.stderr.take().expect("stderr"));
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn {name}: {e}"));
+        let out = collect(child.stdout.take().expect("APPARATUS: a piped stdout"));
+        let err = collect(child.stderr.take().expect("APPARATUS: a piped stderr"));
         let d = Self {
             name,
             child,
@@ -121,7 +141,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!(
-            "{}: never printed {what}\nstderr:\n{}",
+            "CANNOT MEASURE (staging): {} never printed {what}\nstderr:\n{}",
             self.name,
             self.stderr()
         );
@@ -144,7 +164,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!(
-            "{}: never said {what} (a {}th time)\nstderr:\n{}",
+            "CANNOT MEASURE (staging): {} never said {what} (a {}th time)\nstderr:\n{}",
             self.name,
             already + 1,
             self.stderr()
@@ -169,11 +189,12 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: &str) -> (bool, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
-    let mut pipe = child.stdin.take().expect("stdin");
-    pipe.write_all(stdin.as_bytes()).expect("write");
+        .expect("APPARATUS: spawn vox");
+    let mut pipe = child.stdin.take().expect("APPARATUS: a piped stdin");
+    pipe.write_all(stdin.as_bytes())
+        .expect("APPARATUS: write stdin");
     drop(pipe);
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         format!(
@@ -186,7 +207,11 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: &str) -> (bool, String) {
 
 fn ok(dir: &std::path::Path, args: &[&str], stdin: &str) -> String {
     let (ok, said) = vox(dir, args, stdin);
-    assert!(ok, "`vox {}` failed: {said}", args.join(" "));
+    assert!(
+        ok,
+        "CANNOT MEASURE (staging): `vox {}` failed: {said}",
+        args.join(" ")
+    );
     said
 }
 
@@ -196,40 +221,60 @@ fn readable(dir: &std::path::Path, room: &str, texts: &[String]) -> usize {
     texts.iter().filter(|t| said.contains(t.as_str())).count()
 }
 
-/// The key-packages `dir`'s store holds in its (only) room, read at rest with the daemon
-/// stopped: `(for_recipient, opened_by_this_identity)` counting packages addressed to
-/// `recipient`.
-fn packages_at_rest(dir: &std::path::Path, recipient: &vox_core::hash::Digest32) -> (usize, usize) {
-    use vox_core::node::channel::ChannelState;
-    let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
-        .unwrap();
-    let mut profile = vox_core::node::profile::Profile::open(paths).unwrap();
-    profile.unlock(IDPASS.as_bytes()).unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let channels = profile.store().channels().unwrap();
-    assert_eq!(channels.len(), 1, "one room in {}", dir.display());
-    let channel = ChannelState::open(&profile, &channels[0], ROOMPASS.as_bytes(), now).unwrap();
-    let ctx = channel.join_context().unwrap();
-    let signer = profile.signer().unwrap();
-    let dh = *signer.x25519_identity_secret();
-    let (mut ring, _) =
-        vox_core::node::prekeys::load_or_create(profile.store(), signer, &dh, now).unwrap();
-    let mut held = 0;
-    let mut opened = 0;
-    for (_, pkg) in channel.key_packages() {
-        if pkg.recipient != *recipient {
-            continue;
-        }
-        held += 1;
-        match pkg.open_with_ring(&mut ring, &ctx, now) {
-            Ok(_) => opened += 1,
-            Err(e) => eprintln!("[at rest {}] cannot open a package: {e}", dir.display()),
+/// A `vox node` anchor, killed by its own PID however the test ends, with its stdout collected.
+struct Anchor {
+    child: Child,
+    out: Arc<Mutex<Vec<String>>>,
+    spec: String,
+}
+
+impl Anchor {
+    fn start(dir: &std::path::Path) -> Self {
+        let mut child = Command::new(VOX)
+            .args(["node", "--listen", "127.0.0.1:0"])
+            .env("VOX_DATA_DIR", dir)
+            .env("VOX_CONFIG_DIR", dir.join("cfg"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn the anchor: {e}"));
+        let out = collect(child.stdout.take().expect("APPARATUS: the anchor's stdout"));
+        // Held from here, so its `Drop` kills and reaps the anchor on every path out.
+        let mut anchor = Self {
+            child,
+            out,
+            spec: String::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let spec = anchor.out.lock().unwrap().iter().find_map(|l| {
+                let l = l.trim();
+                (l.contains('@') && l.starts_with(|c: char| c.is_alphanumeric()))
+                    .then(|| l.to_owned())
+            });
+            if let Some(spec) = spec {
+                anchor.spec = spec;
+                return anchor;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE (staging): the anchor never printed its --anchor spec"
+            );
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
-    (held, opened)
+
+    fn out(&self) -> String {
+        self.out.lock().unwrap().join("\n")
+    }
+}
+
+impl Drop for Anchor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 struct Cast {
@@ -267,10 +312,6 @@ fn cast() -> Cast {
     }
 }
 
-fn b32(fp: &str) -> vox_core::hash::Digest32 {
-    vox_core::node::link::b32_decode(fp, "fingerprint").unwrap()
-}
-
 /// C makes the room and stays up; A joins, trusts C, posts `before`, trusts B and D, and D joins
 /// and leaves; A goes down;
 /// B joins through C, trusts A, and goes down.
@@ -285,12 +326,12 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
     k.room = listed
         .split_whitespace()
         .find(|w| w.len() >= 12 && w.chars().all(|ch| ch.is_ascii_alphanumeric()))
-        .expect("a room id")
+        .expect("CANNOT MEASURE (staging): a room id")
         .to_owned();
     k.link = ok(&k.c, &["room", "invite", &k.room], "")
         .lines()
         .find(|l| l.starts_with("vox://"))
-        .expect("an address")
+        .expect("CANNOT MEASURE (staging): an address")
         .trim()
         .to_owned();
 
@@ -351,6 +392,11 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
 fn keys_reach_an_offline_member_through_an_always_on_member() {
     watchdog::arm();
     let mut k = cast();
+    // A `vox node` that is a member of nothing: every daemon names it as its anchor.
+    let anchor_dir = k._tmp.path().join("anchor");
+    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    let anchor = Anchor::start(&anchor_dir);
+    ANCHOR.with(|a| *a.borrow_mut() = Some(anchor.spec.clone()));
     let before = "r11-before-the-grant".to_owned();
     let c = set_up(&mut k, &before);
     let b_short: String = k.fps[1].chars().take(12).collect();
@@ -415,39 +461,64 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
     let b_said = b.stderr();
     b.stop();
     c.stop();
-
-    // ---- at rest: who holds the packages for B, and who can open them ----
-    let for_b = b32(&k.fps[1]);
-    let (a_held, _) = packages_at_rest(&k.a, &for_b);
-    let (c_held, c_opened) = packages_at_rest(&k.c, &for_b);
-    let (b_held, b_opened) = packages_at_rest(&k.b, &for_b);
+    // The anchor served the room: its board said so. Without that, zero pages would say nothing.
+    let room_short: String = k.room.chars().take(12).collect();
+    let anchor_out = anchor.out();
+    let served = anchor_out
+        .lines()
+        .any(|l| l.contains("vox node: board — ") && l.contains(&room_short));
+    drop(anchor);
+    assert!(
+        served,
+        "CANNOT MEASURE (staging): the anchor never said its board serves room {room_short}, so \
+         what it stores proves nothing\nanchor:\n{anchor_out}"
+    );
+    // **Nothing at rest** (R34, ADR-023 proof 6): what a person sees in the anchor's data
+    // directory. An anchor that kept a copy of the room kept it in a store file, the one place a
+    // node keeps anything for a room; this build's anchor keeps none.
+    let store = anchor_dir.join("default").join("store.redb");
+    // **Relayed, not kept** (R11): the anchor says how many circuits it carries. A circuit is the
+    // relay's in-flight datagrams, which decision 6 leaves an anchor; it is printed, not asserted.
+    // What R11 and R34 take from an anchor is the room kept at rest, which the store file is.
+    let carried: u64 = anchor_out
+        .lines()
+        .filter_map(|l| {
+            l.split(" circuit(s) carried")
+                .next()?
+                .rsplit(' ')
+                .next()?
+                .parse()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
     eprintln!(
-        "[R11] B read {got} of {} of A's messages, across a rotation; the one sealed before the \
-         grant: {early} of 1",
+        "[R11] B read {got} of {} of A's messages, across a rotation, with A down and only C up; \
+         the one sealed before the grant: {early} of 1",
         sent.len()
     );
     eprintln!(
-        "[R11] key-packages for B: A posted {a_held}; C holds {c_held}, opens {c_opened}; B holds \
-         {b_held}, opens {b_opened}"
+        "[R11/R34] the anchor, a member of nothing: a store file at {}: {}; the most circuits it \
+         said it carried (relay, in flight): {carried}",
+        store.display(),
+        store.exists()
+    );
+    assert!(
+        !store.exists(),
+        "PRODUCT: an anchor that is not a member of a room must store nothing for it (ADR-023 \
+         decision 6, PRD-001 R34): its data directory holds a store file, {}",
+        store.display()
     );
     assert_eq!(
         got,
         sent.len(),
-        "B must read every message A posted after granting it, through C alone\nB stderr:\n{b_said}"
+        "PRODUCT: B must read every message A posted after granting it, with A down and only C, \
+         the always-on member, up (PRD-001 R11)\nB stderr:\n{b_said}"
     );
     assert_eq!(
         early, 0,
-        "forward-only: a message sealed before the grant must stay unreadable to B"
+        "PRODUCT: forward-only: a message sealed before the grant must stay unreadable to B"
     );
-    assert!(
-        c_held >= 2,
-        "C must carry B's packages (consent + rotation): {c_held}"
-    );
-    assert_eq!(
-        c_opened, 0,
-        "a member carrying a package for someone else cannot open it"
-    );
-    assert_eq!(b_opened, b_held, "B's own ring opens every package for B");
 }
 
 #[test]
@@ -484,19 +555,16 @@ fn without_an_always_on_member_keys_wait_for_overlap() {
         .unwrap_or_default()
         .to_owned();
     b.stop();
-    let (b_held, _) = packages_at_rest(&k.b, &b32(&k.fps[1]));
     eprintln!("[R11, no carrier] B's timeline:\n{timeline}");
     eprintln!("[R11, no carrier] B's log: {why}");
     eprintln!(
-        "[R11, no carrier] B read {got} of {} of A's messages and holds {b_held} key-packages \
-         for itself — keys wait for overlap",
+        "[R11, no carrier] B read {got} of {} of A's messages — keys wait for overlap",
         sent.len()
     );
     assert_eq!(
         got, 0,
-        "with no member online with both, B can read nothing of A's"
+        "PRODUCT: with no member online with both, B can read nothing of A's"
     );
-    assert_eq!(b_held, 0, "and nothing carried a key to B");
 }
 
 /// Wait until `dir`'s node reads every one of `texts` in `room`; how many it read.
@@ -528,12 +596,12 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
     k.room = ok(&k.c, &["room", "list"], "")
         .split_whitespace()
         .find(|w| w.len() >= 12 && w.chars().all(|ch| ch.is_ascii_alphanumeric()))
-        .expect("a room id")
+        .expect("CANNOT MEASURE (staging): a room id")
         .to_owned();
     k.link = ok(&k.c, &["room", "invite", &k.room], "")
         .lines()
         .find(|l| l.starts_with("vox://"))
-        .expect("an address")
+        .expect("CANNOT MEASURE (staging): an address")
         .trim()
         .to_owned();
     let join = |dir: &std::path::Path| {
@@ -634,29 +702,27 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
     let b_said = b.stderr();
     b.stop();
     c.stop();
-    let (b_held, b_opened) = packages_at_rest(&k.b, &b32(&b_fp));
     eprintln!(
         "[V030-01] trusted before six posts across a rotation: D (reached directly) read {d_got} of \
          {n}, B (through the log only) read {b_got} of {n}; the post before the trust: D {d_early}, \
-         B {b_early} of 1; key-packages for B at rest: {b_held}, B opens {b_opened}",
+         B {b_early} of 1",
         n = sent.len()
     );
     assert_eq!(
         d_got,
         sent.len(),
-        "a member trusted before it joined, reached directly, must read every post made since its \
+        "PRODUCT: a member trusted before it joined, reached directly, must read every post made since its \
          trust (V210-45) — across the rotation too: no generation it is owed may be deleted first \
          (R14 deletes only what is no longer needed)"
     );
     assert_eq!(
         b_got, d_got,
-        "a member reached only through the log must read what a directly reached one reads\n\
+        "PRODUCT: a member reached only through the log must read what a directly reached one reads\n\
          B stderr:\n{b_said}"
     );
     assert_eq!(
         (d_early, b_early),
         (0, 0),
-        "never wider: a post made before the trust stays unreadable, whichever path the key took"
+        "PRODUCT: never wider: a post made before the trust stays unreadable, whichever path the key took"
     );
-    assert_eq!(b_opened, b_held, "B's own ring opens every package for B");
 }

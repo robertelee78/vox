@@ -296,6 +296,13 @@ pub struct Room {
 }
 
 impl Room {
+    /// Stop worker `i`'s daemon as a crash does: killed (SIGKILL) and reaped by its own PID. It
+    /// stays down until [`Room::restart`].
+    #[allow(dead_code)] // not every proof that includes this support module stops a daemon
+    pub fn stop(&mut self, i: usize) {
+        self.workers[i].daemon = None;
+    }
+
     /// Restart worker `i`'s daemon as an operator does after a crash: killed (SIGKILL) and
     /// reaped by its own PID, then `vox daemon` again with the identity passphrase alone, which
     /// reopens every room it held (#208). Returns once this room reads on that node again.

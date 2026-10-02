@@ -27,7 +27,6 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use crate::hash::Digest32;
-use crate::node::anchor::AnchorState;
 use crate::node::channel::{ChannelState, SyncFailure};
 use crate::node::status::BackoffKind;
 use crate::transport::quic::VoxConnection;
@@ -187,10 +186,8 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
 /// ports start over (a reopen after a poison, an unlock, a new epoch).
 #[derive(Debug, Clone)]
 pub enum RoomRef {
-    /// A room this node is a member of.
+    /// A room this node is a member of: the only kind it syncs (ADR-023 decision 6).
     Channel(Weak<tokio::sync::Mutex<ChannelState>>),
-    /// A room this node keeps as an anchor.
-    Anchored(Weak<tokio::sync::Mutex<AnchorState>>),
 }
 
 impl RoomRef {
@@ -199,8 +196,6 @@ impl RoomRef {
     pub fn is(&self, current: &RoomRef) -> bool {
         match (self, current) {
             (Self::Channel(a), Self::Channel(b)) => a.ptr_eq(b),
-            (Self::Anchored(a), Self::Anchored(b)) => a.ptr_eq(b),
-            _ => false,
         }
     }
 }

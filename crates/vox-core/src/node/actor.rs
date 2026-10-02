@@ -33,7 +33,6 @@ use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
 use crate::governance::capability::{Capability, CapabilitySet};
 use crate::hash::Digest32;
-use crate::identity::composite::CompositePublicKey;
 use crate::nat::bootstrap::{BootstrapNode, BootstrapSet};
 use crate::nat::record::{MemberBundleRecord, RendezvousRecord};
 use crate::node::api::{
@@ -550,12 +549,13 @@ pub struct NodeConfig {
     /// and stores ciphertext. The absence of secrets is structural: every path that
     /// needs a profile finds none.
     pub headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
-    /// Keep a **ciphertext copy of the log** for every channel whose genesis lands on
-    /// this node's board (ADR-016 M15.2b, `node::anchor`): the store-and-forward that
-    /// lets members who are never online together converge. A role, not a secret:
-    /// the copy holds nothing this node could read. `vox node` turns it on; a client
-    /// leaves it off, so a stranger's genesis on its board costs it nothing.
-    pub anchor_logs: bool,
+    /// Keep a **rendezvous board** for every room whose genesis a member publishes to this node,
+    /// though it is not a member: an anchor's job (ADR-012). **Nothing else**: an anchor stores
+    /// no log, ciphertext or otherwise, for a room it is not a member of (ADR-023 decision 6,
+    /// PRD-001 R34). Members who are never online together converge through an always-on
+    /// *member*, not through an anchor. `vox node` turns it on; a client leaves it off, so a
+    /// stranger's genesis on its board costs it nothing.
+    pub anchor_boards: bool,
     /// How long nothing new must have expired before a backlog of this identity's expired
     /// entries smaller than a checkpoint batch is checkpointed anyway (ADR-023 decision 3).
     /// Production is [`crate::node::channel::CHECKPOINT_IDLE_SECS`]; only the test-only
@@ -564,7 +564,7 @@ pub struct NodeConfig {
     /// For an anchor, which creators' rooms it serves: `None` serves any room published to
     /// it (`vox node --serve anyone`), `Some` only rooms whose genesis names one of these
     /// (`--serve trusted`, the anchor profile's `vox trust` list). Ignored unless
-    /// [`NodeConfig::anchor_logs`] is on.
+    /// [`NodeConfig::anchor_boards`] is on.
     pub serve_only: Option<BTreeSet<Digest32>>,
 }
 
@@ -617,7 +617,7 @@ impl NodeConfig {
             pow_params: None,
             anchors: BootstrapSet::new(),
             headless: None,
-            anchor_logs: false,
+            anchor_boards: false,
             checkpoint_idle_secs: checkpoint_idle_from_env(),
             serve_only: None,
         }
@@ -631,10 +631,11 @@ impl NodeConfig {
         self
     }
 
-    /// Keep a ciphertext copy of every anchored channel's log.
+    /// Keep a rendezvous board for rooms this node is not a member of (an anchor's job); see
+    /// [`NodeConfig::anchor_boards`].
     #[must_use]
-    pub fn anchor_logs(mut self, on: bool) -> Self {
-        self.anchor_logs = on;
+    pub fn anchor_boards(mut self, on: bool) -> Self {
+        self.anchor_boards = on;
         self
     }
 
@@ -765,10 +766,10 @@ fn anchor_close_reason(
     }
 }
 
-/// What a sync session runs against: a member's channel, or an anchor's copy.
+/// What a sync session runs against: a member's channel. An anchor holds no copy of a room it is
+/// not a member of, so there is nothing else to sync (ADR-023 decision 6).
 enum SessionTarget {
     Channel(SharedChannel),
-    Anchored(Arc<tokio::sync::Mutex<crate::node::anchor::AnchorState>>),
 }
 
 /// Run one sync session on a blocking thread and return its report (ADR-025). The worker holds
@@ -798,9 +799,6 @@ async fn run_session_worker(
         match target {
             SessionTarget::Channel(shared) => crate::node::channel::ChannelState::sync_over_room(
                 &shared, &store, &mut t, now, &fence, &on_stored,
-            ),
-            SessionTarget::Anchored(state) => crate::node::anchor::AnchorState::sync_over_room(
-                &state, &store, &mut t, &fence, &on_stored,
             ),
         }
     })
@@ -3069,16 +3067,10 @@ pub struct Node {
     bind: Option<Bind>,
     /// The headless transport identity, if this node runs without a vault.
     headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
-    /// Whether this node keeps a ciphertext copy of every anchored channel's log.
-    anchor_logs: bool,
+    /// See [`NodeConfig::anchor_boards`].
+    anchor_boards: bool,
     /// See [`NodeConfig::serve_only`].
     serve_only: Option<BTreeSet<Digest32>>,
-    /// The store a headless node keeps its anchored logs in (a profile node uses its
-    /// profile's store).
-    anchor_store: Option<Arc<crate::node::store::Store>>,
-    /// The anchored channels' logs, by channelID (ADR-016 M15.2b). A channel is never
-    /// both here and in `channels`: a member holds the real thing.
-    anchored: BTreeMap<Digest32, Arc<tokio::sync::Mutex<crate::node::anchor::AnchorState>>>,
     /// Live forwards by their bound local address (ADR-013 Dial, M16.1). Dropping one
     /// stops its listener.
     forwards: BTreeMap<std::net::SocketAddr, crate::node::tunnel::Forward>,
@@ -3585,7 +3577,7 @@ impl Node {
             pow_params,
             anchors,
             headless,
-            anchor_logs,
+            anchor_boards,
             checkpoint_idle_secs,
             serve_only,
         } = cfg;
@@ -3622,10 +3614,8 @@ impl Node {
             room_anchors: BTreeMap::new(),
             anchors,
             headless,
-            anchor_logs,
+            anchor_boards,
             serve_only,
-            anchor_store: None,
-            anchored: BTreeMap::new(),
             forwards: BTreeMap::new(),
             pow_params,
             stream_loops: std::collections::BTreeMap::new(),
@@ -3757,13 +3747,13 @@ impl Node {
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
         if node.headless.is_some() {
-            if node.anchor_logs {
-                node.anchor_store = Some(Arc::new(crate::node::store::Store::open(
-                    &node.paths.store_file(),
-                )?));
+            // **Stored anchor pages are deleted on upgrade** (ADR-023 decision 6): an anchor
+            // kept a ciphertext copy of every room it served until then, and holds none now.
+            if node.anchor_boards && node.paths.store_file().is_file() {
+                crate::node::store::Store::open(&node.paths.store_file())?
+                    .delete_retired_anchor_pages()?;
             }
             node.start_network()?;
-            node.reopen_anchored()?;
         }
         node.publish_initial();
         tokio::spawn(node.run(cmd_rx, net_rx));
@@ -3983,7 +3973,6 @@ impl Node {
                     self.maintain_prekeys();
                     self.renew_mappings_if_due();
                     self.renew_records_if_due().await;
-                    self.adopt_anchored_from_board().await;
                     if self.view_stale.load(std::sync::atomic::Ordering::Relaxed) {
                         self.refresh_network_view().await;
                     }
@@ -4042,7 +4031,6 @@ impl Node {
         // tolerated there by a retry. So the actor gives up its own handles, waits — bounded — until
         // it holds the store's last reference, and answers only then.
         self.profile = None;
-        self.anchor_store = None;
         if let Some(store) = store {
             let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN;
             while std::sync::Arc::strong_count(&store) > 1 && tokio::time::Instant::now() < deadline
@@ -4340,7 +4328,7 @@ impl Node {
         let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
         // narrows that to rooms its operator's trust list created (V210-70).
-        net.serve_rooms(match (self.anchor_logs, self.serve_only.as_ref()) {
+        net.serve_rooms(match (self.anchor_boards, self.serve_only.as_ref()) {
             (false, _) => crate::nat::service::AnchorRooms::Held,
             (true, None) => crate::nat::service::AnchorRooms::Anyone,
             (true, Some(creators)) => crate::nat::service::AnchorRooms::CreatedBy(creators.clone()),
@@ -4835,130 +4823,10 @@ impl Node {
         *entry
     }
 
-    /// The store anchored logs and channels live in: the profile's, or the headless
-    /// node's own.
+    /// The store channels live in: the profile's. A headless node (an anchor) holds no room and
+    /// keeps no store for one (ADR-023 decision 6).
     fn log_store(&self) -> Option<Arc<crate::node::store::Store>> {
-        self.profile
-            .as_ref()
-            .map(Profile::store_handle)
-            .or_else(|| self.anchor_store.as_ref().map(Arc::clone))
-    }
-
-    /// The sealing key for the anchor's copy of `channel_id`: derived from whichever
-    /// identity this node networks as.
-    fn anchor_sek(&self, channel_id: &Digest32) -> Option<crate::atrest::sek::Sek> {
-        if let Some(signer) = self.headless.as_ref() {
-            return crate::node::anchor::anchor_sek(&**signer, channel_id).ok();
-        }
-        let profile = self.profile.as_ref()?;
-        let signer = profile.signer().ok()?;
-        crate::node::anchor::anchor_sek(signer, channel_id).ok()
-    }
-
-    /// Start keeping a log for `channel_id` if this node anchors logs, its board holds
-    /// the genesis, and it is neither a member of the channel nor already keeping it.
-    /// Reopens a copy the store already has (a restart), else creates one.
-    async fn adopt_anchored(&mut self, channel_id: &Digest32) {
-        if !self.anchor_logs
-            || self.channels.contains_key(channel_id)
-            || self.anchored.contains_key(channel_id)
-        {
-            return;
-        }
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
-            return;
-        };
-        let Some(genesis) = net.board_genesis(channel_id) else {
-            return;
-        };
-        // A room nobody has published a member record for is a genesis and nothing else: no log
-        // to keep yet. Adopting it anyway wrote an anchored copy to this node's store for every
-        // genesis a stranger minted — 4100 of them, from one connection — and the copies outlive
-        // the board evicting those geneses (V210-70). Retried every tick, so a real room is
-        // adopted as soon as its first member's records land.
-        if !net.may_anchor(&genesis) || !net.board_has_members(channel_id) {
-            return;
-        }
-        let (Some(store), Some(sek)) = (self.log_store(), self.anchor_sek(channel_id)) else {
-            return;
-        };
-        let now = self.now();
-        let opened =
-            crate::node::anchor::AnchorState::open(&store, sek, channel_id).or_else(|_| {
-                let sek = self
-                    .anchor_sek(channel_id)
-                    .ok_or(Error::Profile("no anchor key"))?;
-                crate::node::anchor::AnchorState::create(&store, sek, &genesis, now)
-            });
-        if let Ok(state) = opened {
-            self.anchored
-                .insert(*channel_id, Arc::new(tokio::sync::Mutex::new(state)));
-            self.refresh_anchored_authors(channel_id).await;
-            self.refresh_network_view().await;
-        }
-    }
-
-    /// Adopt every channel the board holds a genesis for (the tick's pass).
-    async fn adopt_anchored_from_board(&mut self) {
-        if !self.anchor_logs {
-            return;
-        }
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
-            return;
-        };
-        let ids: Vec<Digest32> = net
-            .anchored_channels()
-            .into_iter()
-            .map(|a| a.channel_id)
-            .filter(|cid| !self.channels.contains_key(cid) && !self.anchored.contains_key(cid))
-            .collect();
-        for cid in ids {
-            self.adopt_anchored(&cid).await;
-        }
-    }
-
-    /// Admit into an anchored channel every author its board knows (the creator, and
-    /// everyone a member vouched for), so their entries verify.
-    async fn refresh_anchored_authors(&mut self, channel_id: &Digest32) {
-        let (Some(net), Some(state), Some(store)) = (
-            self.net.as_ref().map(Arc::clone),
-            self.anchored.get(channel_id).map(Arc::clone),
-            self.log_store(),
-        ) else {
-            return;
-        };
-        let keys = net.board_member_keys(channel_id, 0);
-        let added = state.lock().await.admit_authors(&store, keys).unwrap_or(0);
-        if added > 0 {
-            self.refresh_network_view().await;
-        }
-    }
-
-    /// After a restart, reopen every anchored channel the store holds and put its
-    /// genesis back on the board, so members find the room where they left it.
-    fn reopen_anchored(&mut self) -> crate::error::Result<()> {
-        if !self.anchor_logs {
-            return Ok(());
-        }
-        let (Some(store), Some(net)) = (self.log_store(), self.net.as_ref().map(Arc::clone)) else {
-            return Ok(());
-        };
-        for cid in store.anchored_channels()? {
-            let Some(sek) = self.anchor_sek(&cid) else {
-                continue;
-            };
-            if let Ok(state) = crate::node::anchor::AnchorState::open(&store, sek, &cid) {
-                // A room anchored under `--serve anyone` is not served after a restart under
-                // `--serve trusted` unless its creator is trusted.
-                if !net.may_anchor(state.genesis()) {
-                    continue;
-                }
-                let _ = net.publish_anchored(&state.genesis().to_wire());
-                self.anchored
-                    .insert(cid, Arc::new(tokio::sync::Mutex::new(state)));
-            }
-        }
-        Ok(())
+        self.profile.as_ref().map(Profile::store_handle)
     }
 
     /// Every anchor this node keeps a connection to, with the addresses its next dial tries:
@@ -5368,10 +5236,11 @@ impl Node {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             };
-            let members: BTreeMap<Digest32, CompositePublicKey> = ch
-                .member_keys()
+            // Who left is not a member to the network (V030-08); it is classed a joiner below.
+            let members: BTreeMap<_, _> = ch
+                .author_map()
                 .into_iter()
-                .map(|k| (k.fingerprint(), k))
+                .filter(|(a, _)| !ch.has_left(a))
                 .collect();
             policy.add_members(members.keys().copied());
             // A member that left may join again, like anyone with the passphrase (V030-08), and
@@ -5388,23 +5257,28 @@ impl Node {
             }
             net.membership().set_channel(*cid, ch.epoch(), members);
         }
-        // An anchored channel's known authors are its members as far as this node's
-        // board and streams are concerned (M15.2b): their records verify, and they may
-        // open what a member may.
-        for (cid, state) in &self.anchored {
-            let Ok(st) = state.try_lock() else {
-                // Same: an anchored room mid-sync must not stop the actor.
-                self.view_stale
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
-            };
-            let members: BTreeMap<Digest32, CompositePublicKey> = st
-                .author_keys()
-                .into_iter()
-                .map(|k| (k.fingerprint(), k))
-                .collect();
-            policy.add_members(members.keys().copied());
-            net.membership().set_channel(*cid, st.epoch(), members);
+        // A room this node anchors but is not a member of: the members its **board** knows (the
+        // creator, and everyone a member vouched for) are its members as far as the board and the
+        // streams are concerned — their records verify, and they may open what a member may (a
+        // circuit through this anchor among them). Read from the board, which an anchor keeps;
+        // it keeps nothing else for the room (ADR-023 decision 6).
+        if self.anchor_boards {
+            for room in net.anchored_channels() {
+                let cid = room.channel_id;
+                if self.channels.contains_key(&cid) || !net.board_has_members(&cid) {
+                    continue;
+                }
+                if !net.board_genesis(&cid).is_some_and(|g| net.may_anchor(&g)) {
+                    continue;
+                }
+                let members: BTreeMap<Digest32, crate::identity::CompositePublicKey> = net
+                    .board_member_keys(&cid, 0)
+                    .into_iter()
+                    .map(|k| (k.fingerprint(), k))
+                    .collect();
+                policy.add_members(members.keys().copied());
+                net.membership().set_channel(cid, 0, members);
+            }
         }
         // Anchors are not channel membership: they are carried in by hand. A member that left is
         // not one either, though a link named its board: it is a joiner now (above), and as an
@@ -8550,26 +8424,19 @@ impl Node {
             let gen = shared.lock().await.generation();
             return Some((RoomRef::Channel(Arc::downgrade(shared)), gen));
         }
-        if let Some(state) = self.anchored.get(channel_id) {
-            let gen = state.lock().await.generation();
-            return Some((RoomRef::Anchored(Arc::downgrade(state)), gen));
-        }
         None
     }
 
     /// The room instance `channel_id` names now, without its lock.
     fn current_room(&self, channel_id: &Digest32) -> Option<crate::node::ports::RoomRef> {
         use crate::node::ports::RoomRef;
-        if let Some(shared) = self.channels.get(channel_id) {
-            return Some(RoomRef::Channel(Arc::downgrade(shared)));
-        }
-        self.anchored
+        self.channels
             .get(channel_id)
-            .map(|s| RoomRef::Anchored(Arc::downgrade(s)))
+            .map(|shared| RoomRef::Channel(Arc::downgrade(shared)))
     }
 
     /// Whether `peer` shares `channel_id` with this node: a member (or an anchor) of a room this
-    /// node holds, or an author of a room it keeps as an anchor. May admit the peer from this
+    /// node holds. May admit the peer from this
     /// node's own board first (see [`Self::may_sync`]): a peer that has just joined is on the
     /// board before it is in the author table, and skipping it for that lost posts made right
     /// after a join.
@@ -8581,12 +8448,6 @@ impl Node {
         if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
             let epoch = shared.lock().await.epoch();
             return self.may_sync(channel_id, peer, epoch).await;
-        }
-        if self.anchored.contains_key(channel_id) {
-            self.refresh_anchored_authors(channel_id).await;
-            if let Some(state) = self.anchored.get(channel_id).map(Arc::clone) {
-                return state.lock().await.is_author(peer);
-            }
         }
         false
     }
@@ -8653,12 +8514,7 @@ impl Node {
         // A room held since its last discovery (a new instance included) is discovered for every
         // connected peer: this is how a room created, joined or reopened gets its ports, whichever
         // path held it.
-        let rooms: Vec<Digest32> = self
-            .channels
-            .keys()
-            .chain(self.anchored.keys())
-            .copied()
-            .collect();
+        let rooms: Vec<Digest32> = self.channels.keys().copied().collect();
         for room in &rooms {
             let current = self.current_room(room);
             let known = self.discovered.get(room);
@@ -8889,8 +8745,7 @@ impl Node {
                     port.raise();
                 }
             }
-            self.discover_rooms
-                .extend(self.channels.keys().chain(self.anchored.keys()).copied());
+            self.discover_rooms.extend(self.channels.keys().copied());
             self.sched_all = true;
         }
     }
@@ -8947,19 +8802,10 @@ impl Node {
         let Some(store) = self.log_store() else {
             return false;
         };
-        let target = match (
-            self.channels.get(&channel_id).map(Arc::clone),
-            self.anchored.get(&channel_id).map(Arc::clone),
-        ) {
-            (Some(shared), _) => SessionTarget::Channel(shared),
-            (None, Some(state)) => SessionTarget::Anchored(state),
-            (None, None) => return false,
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return false;
         };
-        // An anchor's authors come from its own board, which is local: cheap, and it has to happen
-        // before the session so the anchor can verify what arrives.
-        if matches!(target, SessionTarget::Anchored(_)) {
-            self.refresh_anchored_authors(&channel_id).await;
-        }
+        let target = SessionTarget::Channel(shared);
         let wake = self.net_tx.clone();
         let Some(slot) = crate::node::ports::Slots::take(
             &self.slots,
@@ -9067,7 +8913,6 @@ impl Node {
                     let _ = tokio::time::timeout(SETUP_PATIENCE, setup).await;
                     shared.lock().await.epoch()
                 }
-                SessionTarget::Anchored(state) => state.lock().await.epoch(),
             };
             stepper.step(crate::node::status::SyncStep::Opening);
             // 2. Open the stream. Also a round trip. **A stream that will not open still
@@ -9138,14 +8983,10 @@ impl Node {
         let Some(store) = self.log_store() else {
             return;
         };
-        let target = match (
-            self.channels.get(&channel_id).map(Arc::clone),
-            self.anchored.get(&channel_id).map(Arc::clone),
-        ) {
-            (Some(shared), _) => SessionTarget::Channel(shared),
-            (None, Some(state)) => SessionTarget::Anchored(state),
-            (None, None) => return,
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return;
         };
+        let target = SessionTarget::Channel(shared);
         let Some(port) = self.ports.get_mut(&(channel_id, peer)) else {
             return;
         };
@@ -9447,20 +9288,11 @@ impl Node {
             }
             return;
         }
-        // Only a channel we hold open at that epoch — or keep as an anchor — can be
-        // reconciled. An anchor whose board just received the genesis adopts it here
-        // rather than making the member wait for the next tick.
-        if !self.channels.contains_key(&channel_id) {
-            self.adopt_anchored(&channel_id).await;
-            self.refresh_anchored_authors(&channel_id).await;
-        }
-        let matches_epoch = match (
-            self.channels.get(&channel_id),
-            self.anchored.get(&channel_id),
-        ) {
-            (Some(shared), _) => shared.lock().await.epoch() == epoch,
-            (None, Some(state)) => state.lock().await.epoch() == epoch,
-            (None, None) => false,
+        // Only a channel we hold open at that epoch can be reconciled. An anchor holds no copy
+        // of a room it is not a member of (ADR-023 decision 6), so it refuses every one.
+        let matches_epoch = match self.channels.get(&channel_id) {
+            Some(shared) => shared.lock().await.epoch() == epoch,
+            None => false,
         };
 
         // **Refused, not dropped.** A node asked for a room it does not hold — an anchor that keeps
@@ -9571,9 +9403,6 @@ impl Node {
             )
             .await;
             return shared.lock().await.is_member(peer);
-        }
-        if let Some(state) = self.anchored.get(channel_id) {
-            return state.lock().await.is_author(peer);
         }
         false
     }
@@ -10234,7 +10063,14 @@ impl Node {
         if asked || !recent {
             self.member_dialed_at.insert(target, now);
             let tx = self.net_tx.clone();
+            let room = *channel_id;
             tokio::spawn(async move {
+                // Nothing known for it here: read a connected board before bridging (V030-22).
+                let endpoints = if endpoints.is_empty() {
+                    net.member_endpoints(&room, target).await
+                } else {
+                    endpoints
+                };
                 match net.reach(target, &endpoints).await {
                     Ok(conn) => {
                         let _ = tx
@@ -10279,9 +10115,11 @@ impl Node {
         if net.manager().existing(&peer).is_some() || !self.sync_dials.insert(peer) {
             return;
         }
-        let endpoints = net.board_endpoints(channel_id, &peer);
+        let room = *channel_id;
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
+            // This node's board record, or a connected board's when it holds none yet (V030-22).
+            let endpoints = net.member_endpoints(&room, peer).await;
             match net.reach(peer, &endpoints).await {
                 Ok(conn) => {
                     let _ = tx
@@ -11738,6 +11576,12 @@ impl Node {
         // `ForwardDialed` binds the forward. One sender, so the two arrive in that order.
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
+            // Nothing known for the host here: read a connected board before bridging (V030-22).
+            let endpoints = if endpoints.is_empty() {
+                net.member_endpoints(&channel_id, host).await
+            } else {
+                endpoints
+            };
             let result = match net.reach(host, &endpoints).await {
                 Ok(conn) => {
                     // A forward whose every connection would be refused is refused now, in
@@ -12297,27 +12141,11 @@ impl Node {
             .as_ref()
             .and_then(|p| p.store().channels().ok())
             .unwrap_or_default();
-        let mut anchoring = self
+        let anchoring = self
             .net
             .as_ref()
             .map(|n| n.anchored_channels())
             .unwrap_or_default();
-        for a in &mut anchoring {
-            if let Some(state) = self.anchored.get(&a.channel_id) {
-                let earlier = prev.anchoring.iter().find(|p| p.channel_id == a.channel_id);
-                match by(deadline, state).await {
-                    Some(st) => {
-                        a.entries = Some(st.entries() as u64);
-                        a.equivocations = st.equivocations();
-                    }
-                    None => {
-                        a.entries = earlier.and_then(|p| p.entries);
-                        a.equivocations =
-                            earlier.map(|p| p.equivocations.clone()).unwrap_or_default();
-                    }
-                }
-            }
-        }
         // Each open room's lock is taken once, for both its summary and its detail.
         let mut read = std::collections::BTreeSet::new();
         let mut summaries = BTreeMap::new();
@@ -12494,7 +12322,8 @@ impl crate::node::up::HostDialer for NodeDialer {
         // endpoint hints come from the board, which is also why this must happen per
         // request: a node that has only just joined has not read the board yet.
         let endpoints = match &self.channel_id {
-            Some(cid) => self.net.board_endpoints(cid, host),
+            // A connected board's record when this node's board holds none yet (V030-22).
+            Some(cid) => self.net.member_endpoints(cid, *host).await,
             None => self.net.board_endpoints_any(host),
         };
         self.net.reach(*host, &endpoints).await

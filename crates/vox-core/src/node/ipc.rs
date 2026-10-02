@@ -232,6 +232,8 @@ const T_LINK: u64 = 9;
 const T_TRUSTED: u64 = 26;
 /// Protocol 6: the room's whole order, as `(entry hash, clock)` pairs.
 const T_ORDER_ROWS: u64 = 27;
+/// The services a [`Request::Services`] asked for (V030-24).
+const T_SERVICES: u64 = 28;
 // Client → node.
 const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
@@ -283,6 +285,11 @@ const T_RENAME: u64 = 25;
 // request can tell a node at work from a suspended or stuck one. Not a protocol bump: a node that
 // does not know it answers with an error, and any answer is proof of life.
 const T_PING: u64 = 17;
+// The services a room offers (V030-24): `vox service list` with a daemon running. `add` and
+// `remove` reached the daemon (V030-06) while `list` still opened the profile, which the daemon
+// holds, so a service just added could not be listed. Not a protocol bump: additive, and a node
+// that does not know it answers with an error.
+const T_SERVICES_REQ: u64 = 18;
 // A room's lifecycle (V030-08): leave, forget, end, and the creator's idle end. Not gated on the
 // identity passphrase: tearing down a room the work is done in is an agent's call to make.
 const T_LEAVE: u64 = 30;
@@ -359,6 +366,11 @@ pub enum Request {
         /// Kept: offered until removed, across this node's restarts, as `vox service add` offers
         /// it without a daemon (V030-06). Not withdrawn when the connection closes.
         persist: bool,
+    },
+    /// The services this node offers in a room, answered with [`Frame::Services`] (V030-24).
+    Services {
+        /// The room.
+        channel_id: Digest32,
     },
     /// Stop offering a service.
     RemoveService {
@@ -537,6 +549,9 @@ impl Request {
             }
             Request::Order { channel_id } => {
                 e.array(2).uint(T_ORDER).bytes(channel_id);
+            }
+            Request::Services { channel_id } => {
+                e.array(2).uint(T_SERVICES_REQ).bytes(channel_id);
             }
             Request::Rooms { after } => {
                 e.array(2)
@@ -754,6 +769,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Order { channel_id })
+            }
+            (T_SERVICES_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Services { channel_id })
             }
             // The unpaged form (no `after`), as any release before #189 sends it: read as the first
             // page. Refused, a worker on an older release died at its first room lookup with
@@ -1036,6 +1057,14 @@ pub enum Frame {
         /// this identity left the room or it ended (V030-08), and is empty while it goes on.
         rooms: Vec<(Digest32, String, bool, String)>,
     },
+    /// The services a [`Request::Services`] asked for: the room's local name, and
+    /// `(service tag, local address)` per service, as the node offers them.
+    Services {
+        /// The room's local name.
+        room: String,
+        /// `(service tag, local address)`, in the node's order.
+        services: Vec<(String, String)>,
+    },
 }
 
 impl Frame {
@@ -1115,6 +1144,12 @@ impl Frame {
                 e.array(2).uint(T_TRUSTED).array(entries.len());
                 for (id, petname) in entries {
                     e.array(2).bytes(id).text(petname);
+                }
+            }
+            Frame::Services { room, services } => {
+                e.array(3).uint(T_SERVICES).text(room).array(services.len());
+                for (tag, local) in services {
+                    e.array(2).text(tag).text(local);
                 }
             }
         }
@@ -1543,6 +1578,23 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 rooms.push((id, name, open, over));
             }
             return Ok(Frame::Rooms { rooms });
+        }
+        (T_SERVICES, 3) => {
+            let room = text(d, "ipc services room")?;
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc services array"))?;
+            let mut services = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let arity = d
+                    .array()
+                    .map_err(|_| Error::MalformedIpc("ipc service row"))?;
+                if arity != 2 {
+                    return Err(Error::MalformedIpc("ipc service row arity"));
+                }
+                services.push((text(d, "ipc service tag")?, text(d, "ipc service address")?));
+            }
+            return Ok(Frame::Services { room, services });
         }
         (T_TRUSTED, 2) => {
             let count = d
@@ -2577,6 +2629,26 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         // (PRD-001's family scale); a member is a 32-byte key, so a roster is ~17 KiB of a
         // 256 KiB frame. A frame would hold ~7,700; paging this is owed only if that scale
         // ever rises past a few thousand (V210-16).
+        Request::Services { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Services {
+                    room: detail.local_name.clone(),
+                    services: detail
+                        .services
+                        .iter()
+                        .map(|(tag, local)| (tag.clone(), local.to_string()))
+                        .collect(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view

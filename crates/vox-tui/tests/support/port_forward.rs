@@ -1,6 +1,6 @@
 //! A **port forward** the proof owns: a UDP socket on `[::1]` that carries datagrams to and from a
 //! host bound to `127.0.0.1`, the way a router's port forward carries them to a machine on its LAN.
-//! It adds no delay, and it can be **closed** (every datagram both ways is dropped) and opened
+//! It adds no delay unless told to (`set_delay`, guest → host), and it can be **closed** (every datagram both ways is dropped) and opened
 //! again while the processes behind it keep running.
 //!
 //! Why it exists: on loopback, split by address family, a host on `127.0.0.1` and a guest on `[::1]`
@@ -45,6 +45,9 @@ struct State {
     dropped: AtomicU64,
     /// When the first datagram from each guest source arrived, open or not.
     first_seen: Mutex<HashMap<SocketAddr, Instant>>,
+    /// How long each datagram guest → host is held before it is sent on, in microseconds; 0 sends
+    /// at once. A path with latency, as a real one has (V210-122).
+    delay_us: AtomicU64,
 }
 
 pub struct PortForward {
@@ -70,6 +73,19 @@ impl PortForward {
         let state = Arc::new(State::default());
         state.open.store(open, Ordering::SeqCst);
         let st = Arc::clone(&state);
+        // Delayed datagrams guest → host, in arrival order: one constant delay keeps them in order.
+        let (late, due) = std::sync::mpsc::channel::<(Arc<UdpSocket>, Vec<u8>, Instant)>();
+        let late_st = Arc::clone(&state);
+        std::thread::spawn(move || {
+            while let Ok((sock, data, at)) = due.recv() {
+                std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                if sock.send(&data).is_ok() {
+                    late_st
+                        .to_host
+                        .fetch_add(data.len() as u64, Ordering::SeqCst);
+                }
+            }
+        });
         std::thread::spawn(move || {
             let public_sock = Arc::new(public_sock);
             let mut inside: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
@@ -118,7 +134,10 @@ impl PortForward {
                     });
                     s
                 });
-                if sock.send(&buf[..n]).is_ok() {
+                let delay = Duration::from_micros(st.delay_us.load(Ordering::SeqCst));
+                if !delay.is_zero() {
+                    let _ = late.send((Arc::clone(sock), buf[..n].to_vec(), at + delay));
+                } else if sock.send(&buf[..n]).is_ok() {
                     st.to_host.fetch_add(n as u64, Ordering::SeqCst);
                 }
             }
@@ -128,6 +147,14 @@ impl PortForward {
             host,
             state,
         }
+    }
+
+    /// Hold every datagram guest → host for `delay` from now on (zero: none).
+    pub fn set_delay(&self, delay: Duration) {
+        self.state.delay_us.store(
+            u64::try_from(delay.as_micros()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
     }
 
     pub fn open(&self) {
