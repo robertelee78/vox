@@ -402,11 +402,20 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         // Live, and the one message arrived. Another row beside it is the room's own traffic,
         // not counted (`wait_for` counts only the proof's messages), and is printed below.
         (1, _) => {}
-        (0, true) => panic!(
-            "CANNOT MEASURE: staging not achieved — the second consumer emitted no row within 10s \
-             of bob's first message, so it was not subscribed and live before the first was to \
-             be frozen"
-        ),
+        // No row at all is the product's answer too (the lead, on c3): a `tail` that emits
+        // nothing for a message posted to its room is a stream that failed, whatever it said.
+        (0, true) => {
+            let status = match steady.run.child.try_wait() {
+                Ok(Some(s)) => format!("it exited, {s}"),
+                Ok(None) => "it is still running".to_owned(),
+                Err(e) => format!("its status is unreadable ({e})"),
+            };
+            let said = std::fs::read_to_string(&steady_err).unwrap_or_default();
+            panic!(
+                "PRODUCT: the second consumer emitted no row within 10s of bob's first message \
+                 ({status}); its stderr:\n{said}"
+            )
+        }
         (0, false) => panic!(
             "PRODUCT: the second consumer was live — it emitted {} other row(s): {others:?} — but \
              not bob's first message within 10s of its posting",
