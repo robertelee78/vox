@@ -233,7 +233,7 @@ fn an_approval_chooses_history_and_superseded_keys_are_deleted_once_no_grant_nee
         }
     };
     let tmp = root.as_path();
-    let (alice, _) = identity(tmp, "alice");
+    let (alice, alice_fp) = identity(tmp, "alice");
     let (bob, bob_fp) = identity(tmp, "bob");
     let (carol, carol_fp) = identity(tmp, "carol");
     let _a = daemon(&alice, "alice", &format!("{IDENTITY}\n"));
@@ -251,6 +251,10 @@ fn an_approval_chooses_history_and_superseded_keys_are_deleted_once_no_grant_nee
     for who in [&bob, &carol] {
         join(&alice, who, &room);
     }
+    // **Trust is per direction** (V210-118): a node reads only members its own owner trusted, so
+    // bob and carol trust alice before her grants can make her readable to them.
+    trust(&bob, &alice_fp, "alice", "now");
+    trust(&carol, &alice_fp, "alice", "now");
 
     // ---- (a) history per grant --------------------------------------------------------
     for i in 1..=10 {

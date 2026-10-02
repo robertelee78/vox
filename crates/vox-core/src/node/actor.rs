@@ -8159,6 +8159,14 @@ impl Node {
         // this instant is judged by the set as it stands when its request lands (M17.11).
         self.refresh_reachers().await;
         self.deliver_owed_consents(Some(fingerprint)).await;
+        if newly {
+            // A key-package this node held back while the member was untrusted (V210-118) is
+            // opened now: the member reads from the moment its owner decided.
+            let open: Vec<Digest32> = self.channels.keys().copied().collect();
+            for channel_id in open {
+                self.install_key_packages(&channel_id).await;
+            }
+        }
         self.publish().await;
         Outcome::Done
     }
@@ -10038,8 +10046,18 @@ impl Node {
             };
             (packages, ctx)
         };
+        // **A node reads only the members its owner trusts** (V210-118), by a key-package too: one
+        // from an author this owner has not trusted is not opened — opening it would use up a
+        // one-time prekey for a key this node must refuse — and is held until they are trusted,
+        // when it is opened (`trust_identity`).
+        let (packages, held): (Vec<_>, Vec<_>) = packages
+            .into_iter()
+            .partition(|(author, _)| self.trust.is_trusted(author));
+        if !held.is_empty() {
+            shared.lock().await.hold_inbound_packages(held);
+        }
         let now = self.now();
-        for package in packages {
+        for (from, package) in packages {
             let Ok(init) = package.initial_message() else {
                 continue;
             };
@@ -10050,6 +10068,11 @@ impl Node {
                 continue;
             };
             let author = skdm.body.author_id;
+            // The key must be the one its carrying entry's author released: the trust above was
+            // decided about that author.
+            if author != from {
+                continue;
+            }
             let installed = {
                 let Some(profile) = self.profile.as_ref() else {
                     return;

@@ -586,7 +586,7 @@ pub struct ChannelState {
     /// Key-packages addressed to this identity that arrived in the log and are not installed
     /// yet, oldest first (ADR-023 decision 4). Installing one needs this identity's prekey
     /// ring, which the actor holds, so the actor drains them ([`Self::take_inbound_packages`]).
-    inbound_packages: Vec<crate::node::keypackage::KeyPackage>,
+    inbound_packages: Vec<(Digest32, crate::node::keypackage::KeyPackage)>,
     /// Accepted governance entries (consent grants and the rest) in acceptance
     /// order — the evaluator's input, rebuilt from the log on open (M14.5).
     gov_entries: Vec<GovEntry>,
@@ -1508,7 +1508,7 @@ impl ChannelState {
                     .and_then(|p| crate::node::keypackage::KeyPackage::from_wire(p).ok())
                 {
                     if pkg.recipient == me {
-                        inbound_packages.push(pkg);
+                        inbound_packages.push((entry.skeleton.author_id, pkg));
                     }
                 }
             }
@@ -2350,22 +2350,34 @@ impl ChannelState {
 
     /// If `payload` is a key-package, queue it when it is for this identity and say so; the
     /// caller then neither renders nor retries it as a message.
-    fn queue_if_key_package(&mut self, payload: &[u8]) -> bool {
+    fn queue_if_key_package(&mut self, author: Digest32, payload: &[u8]) -> bool {
         if !crate::node::keypackage::KeyPackage::is_key_package(payload) {
             return false;
         }
         if let Ok(pkg) = crate::node::keypackage::KeyPackage::from_wire(payload) {
             if pkg.recipient == self.me() {
-                self.inbound_packages.push(pkg);
+                self.inbound_packages.push((author, pkg));
             }
         }
         true
     }
 
     /// Take the key-packages addressed to this identity that the log delivered since the last
-    /// call (ADR-023 decision 4). The caller installs them with its prekey ring.
-    pub fn take_inbound_packages(&mut self) -> Vec<crate::node::keypackage::KeyPackage> {
+    /// call (ADR-023 decision 4), each with the author of the entry that carried it. The caller
+    /// installs them with its prekey ring.
+    pub fn take_inbound_packages(
+        &mut self,
+    ) -> Vec<(Digest32, crate::node::keypackage::KeyPackage)> {
         std::mem::take(&mut self.inbound_packages)
+    }
+
+    /// Keep key-packages the caller did not open, for a later [`Self::take_inbound_packages`]:
+    /// those from an author this node's owner has not trusted (V210-118), opened once they are.
+    pub fn hold_inbound_packages(
+        &mut self,
+        held: Vec<(Digest32, crate::node::keypackage::KeyPackage)>,
+    ) {
+        self.inbound_packages.extend(held);
     }
 
     /// Every key-package this node holds in the room's log, with its author, whoever it is
@@ -4333,7 +4345,7 @@ impl ChannelState {
                     };
                     // A key-package is queued for the actor to install, never rendered or aged as
                     // a message.
-                    if self.queue_if_key_package(&payload) {
+                    if self.queue_if_key_package(author, &payload) {
                         return Ok(Ok(rows));
                     }
                     self.track_body_into(&mut batch, entry_hash, id, now_secs)?;
@@ -5036,7 +5048,7 @@ impl ChannelState {
                 else {
                     return Ok(Accepted::ContentNotReadable);
                 };
-                if self.queue_if_key_package(&payload) {
+                if self.queue_if_key_package(author, &payload) {
                     return Ok(Accepted::ContentNotReadable);
                 }
                 self.track_body(store, entry_hash, id, now_secs)?;
