@@ -31,7 +31,6 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 
 use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
-use crate::governance::capability::{Capability, CapabilitySet};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::nat::bootstrap::{BootstrapNode, BootstrapSet};
@@ -10677,16 +10676,9 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
             return;
         };
-        // A service room's genesis grant names its port (ADR-017): it is retained on the wire
-        // (M17.13) and grants nothing, and the room's `.vox` name is the same for a UDP service
-        // (ADR-022 decision 6). The service's tag is what the host's gate is asked about.
-        let grant = match &service {
-            Some((tag, _)) => CapabilitySet::from_iter_caps([Capability::dial(
-                tag.strip_prefix("udp/").unwrap_or(tag).to_owned(),
-            )]),
-            None => crate::governance::capability::CapabilitySet::new(),
-        };
-        let (genesis, sek) = match ChannelState::create_genesis(profile, &local_name, grant, now) {
+        // A service room's genesis is like any other room's: it carries no grant (PRD-001 R44).
+        // The service is the host's to offer, and its gate decides who reaches it.
+        let (genesis, sek) = match ChannelState::create_genesis(profile, &local_name, now) {
             Ok(g) => g,
             Err(e) => {
                 let _ = reply.send(Outcome::Failed(fault_of(&e)));
@@ -10737,9 +10729,9 @@ impl Node {
     /// Finish a service room whose key was sealed off the actor, and offer its one service,
     /// atomically (ADR-017).
     ///
-    /// The two halves are one command because either alone is a lie: a room with a
-    /// service grant and no service hands out an address for nothing, and a service in a
-    /// room nobody can join is unreachable. If the service cannot be offered the room is
+    /// The two halves are one command because either alone is a lie: a service room with
+    /// no service hands out an address for nothing, and a service in a room nobody can
+    /// join is unreachable. If the service cannot be offered the room is
     /// not kept.
     async fn finish_serve_room(
         &mut self,
@@ -11010,9 +11002,8 @@ impl Node {
         }
     }
 
-    /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). The `bind:`
-    /// capability is checked by the channel, so a node cannot offer what the log does
-    /// not let it offer.
+    /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). Offering needs no
+    /// capability (ADR-017 M17.7); who may reach it is the host's dial gate.
     async fn add_service(
         &mut self,
         channel_id: &Digest32,

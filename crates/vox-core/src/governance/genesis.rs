@@ -43,22 +43,15 @@ use crate::wire::{frame, parse_frame, signing_input, StructTag};
 /// Length of the genesis nonce in bytes (128-bit, ADR-007).
 pub const GENESIS_NONCE_LEN: usize = 16;
 
-/// The most capabilities a genesis service grant may confer (ADR-017 decision 3). A
-/// room exists to offer a handful of services; a genesis carrying more than this is
-/// not a room, and the bound keeps an untrusted genesis body from becoming an
-/// unbounded allocation.
+/// The most tokens a legacy genesis service grant may carry: a bound on what decoding an
+/// untrusted genesis may allocate (PRD-001 R44; it confers nothing).
 pub const MAX_SERVICE_GRANT: usize = 16;
 
-/// Validate a service grant: only `dial:` and `bind:` capabilities, at most
-/// [`MAX_SERVICE_GRANT`] of them.
-///
-/// The restriction is the load-bearing part. The grant is conferred on every admitted
-/// member and lives in an immutable record, so `admin`, `delegate`, `policy` or
-/// `passphrase-rotate` here would make membership permanently equal to control of the
-/// channel, with no governance act able to undo it. `#role` tags are excluded too: a
-/// role is an attribute other certificates attenuate *from*, so handing one to every
-/// member silently widens what they may later be delegated.
-pub fn validate_service_grant(grant: &CapabilitySet) -> Result<()> {
+/// Bound and shape-check a decoded legacy service grant: only `dial:` and `bind:` tokens, as
+/// v0.1.0–v0.2.x wrote, at most [`MAX_SERVICE_GRANT`] of them. It confers nothing (PRD-001
+/// R44); the check only keeps an untrusted genesis from being an unbounded allocation or
+/// carrying tokens no build ever wrote.
+fn validate_service_grant(grant: &CapabilitySet) -> Result<()> {
     if grant.len() > MAX_SERVICE_GRANT {
         return Err(Error::SizeLimitExceeded("genesis service grant"));
     }
@@ -191,21 +184,16 @@ pub struct GenesisBody {
     pub created: u64,
     /// The channel policy (history / ttl / floor).
     pub policy: ChannelPolicy,
-    /// The **service grant** (ADR-017 decision 3): capabilities conferred on every
-    /// identity this node has admitted as an author of the channel, with no
-    /// certificate issued to anyone.
+    /// The **legacy service grant**: bytes only, never meaning (PRD-001 R44).
     ///
-    /// This is what lets a room *be* an access list. A room created for one service
-    /// grants `dial:<port>` by existing, so joining it — which already required the
-    /// passphrase and the ADR-005 proof of work — *is* the authorization, and the host
-    /// never waits for the guest to appear in order to grant them something.
+    /// v0.1.0–v0.2.x wrote `dial:<port>` here for every `vox serve` room, under the
+    /// capability model ADR-017 M17.7 withdrew. It is **inside the genesis signature and
+    /// the channelID hash**, so it is still decoded and re-encoded exactly, or every such
+    /// room would change its name (M17.13). Nothing reads it for any decision, and this
+    /// build writes it empty ([`Genesis::create_with_nonce`]).
     ///
-    /// It sits beside [`ChannelPolicy`] rather than inside it, deliberately: the policy
-    /// is the part a policy-update may change, and this is **genesis-immutable**. Only
-    /// `dial:`/`bind:` may appear, at most [`MAX_SERVICE_GRANT`] of them
-    /// ([`validate_service_grant`]). Empty — the default, and what every channel
-    /// created before this field had — means membership confers nothing and every
-    /// capability comes from an explicit ADR-007 certificate.
+    /// Decoding still bounds and shape-checks it (`decode_service_grant`): an untrusted
+    /// genesis must not become an unbounded allocation or a second encoding of one room.
     pub service_grant: CapabilitySet,
     /// The creator's composite root public key — the root admin (ADR-007).
     pub creator_pubkey: CompositePublicKey,
@@ -213,7 +201,7 @@ pub struct GenesisBody {
 
 impl GenesisBody {
     /// Canonical-CBOR body in the ADR-007 field order:
-    /// `[nonce, created, [history_mode, deniability_mode, ttl, min_suite],
+    /// `[nonce, created, [history_mode, retired_deniability (always 0), ttl, min_suite],
     ///   [service_grant_token…], creator_pubkey, [sign_algo]]`. `sign_algo` is the
     /// composite signature class (the only algorithm a genesis record commits to);
     /// `min_suite` is the ADR-003 ciphersuite floor the channel is created at; the
@@ -337,57 +325,23 @@ impl Genesis {
 
     /// Build and self-sign a genesis record with an explicit nonce (deterministic
     /// — used by golden vectors and tests; production uses [`Genesis::create`]).
+    ///
+    /// **Its service grant is always empty** (PRD-001 R44): the grant was the withdrawn
+    /// capability model (ADR-017 M17.7), so no build writes one any more. The field stays on
+    /// the wire only so rooms made by v0.1.0–v0.2.x keep their bytes and names (M17.13).
     pub fn create_with_nonce(
         creator_root: &dyn RootSigner,
         created: u64,
         policy: ChannelPolicy,
         nonce: [u8; GENESIS_NONCE_LEN],
     ) -> Result<Self> {
-        Self::create_with_nonce_and_grant(
-            creator_root,
-            created,
-            policy,
-            CapabilitySet::new(),
-            nonce,
-        )
-    }
-
-    /// Build and self-sign a genesis record carrying a **service grant** (ADR-017
-    /// decision 3): the capabilities every admitted member holds without a
-    /// certificate. This is what `vox serve` uses; an ordinary chat room is created
-    /// with an empty grant by [`Genesis::create`].
-    ///
-    /// The grant is validated here ([`validate_service_grant`]) rather than trusted:
-    /// it is immutable once the channelID exists, so an invalid one could never be
-    /// corrected.
-    pub fn create_with_grant(
-        creator_root: &dyn RootSigner,
-        created: u64,
-        policy: ChannelPolicy,
-        service_grant: CapabilitySet,
-    ) -> Result<Self> {
-        let mut nonce = [0u8; GENESIS_NONCE_LEN];
-        fill_random(&mut nonce)?;
-        Self::create_with_nonce_and_grant(creator_root, created, policy, service_grant, nonce)
-    }
-
-    /// [`Genesis::create_with_grant`] with an explicit nonce (deterministic — golden
-    /// vectors and tests).
-    pub fn create_with_nonce_and_grant(
-        creator_root: &dyn RootSigner,
-        created: u64,
-        policy: ChannelPolicy,
-        service_grant: CapabilitySet,
-        nonce: [u8; GENESIS_NONCE_LEN],
-    ) -> Result<Self> {
         // A genesis can only be created at a registered floor (ADR-003).
         suite_by_id(policy.min_suite)?;
-        validate_service_grant(&service_grant)?;
         let body = GenesisBody {
             nonce,
             created,
             policy,
-            service_grant,
+            service_grant: CapabilitySet::new(),
             creator_pubkey: creator_root.public_key(),
         };
         let signature = creator_root.sign(&body.signing_input())?;

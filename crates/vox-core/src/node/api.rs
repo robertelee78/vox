@@ -503,11 +503,11 @@ pub enum NodeCommand {
     /// Create a **service room** and offer one local TCP service in it, in one act
     /// (ADR-017 decisions 3 and 4) — what `vox serve <port>` does.
     ///
-    /// The room's genesis confers `dial:<port>` on every member, so joining it *is* the
-    /// authorization and the host never waits to grant anyone anything; the service is
-    /// declared in the same step, because a room created for a service that does not
-    /// exist yet is a room that lies. Nothing is exposed implicitly: the port named here
-    /// is the only thing reachable, and only by members.
+    /// The room's genesis confers nothing (PRD-001 R44): who may reach the service is the
+    /// host's own dial gate, its trust keyring and the room's current authors. The service is
+    /// declared in the same step, because a room created for a service that does not exist
+    /// yet is a room that lies. Nothing is exposed implicitly: the port named here is the
+    /// only thing reachable, and only by members the host trusts.
     ///
     /// Fails without creating anything if the room cannot be created *or* the service
     /// cannot be offered — a half-made service room would hand out an address for
