@@ -27,8 +27,8 @@ dropped:
 **Amended 2026-10-01** (the decider, after a read-only review of agent-tincan): §6 is to change how a wake
 reads and when an idle session is told of a reply; §9 is to gain a cycle check and a parent that a reply
 cannot opt out of; the non-goals gain the principle that **Vox never spawns instances of anything**. Planned in
-`docs/release/v0.3.0.md` (V030-15 to V030-21) and `docs/release/v0.2.10.md` (V210-121, V210-123); none of it is
-built yet.
+`docs/release/v0.3.0.md` (V030-15 to V030-21) and `docs/release/v0.2.10.md` (V210-121, V210-123). V210-121 is
+built (§9, #322); the rest is not built yet.
 
 **Date**: 2026-09-21
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -487,7 +487,8 @@ the injection; it used to do that silently, on any error.
 - **An idle session is to be told when a reply to it waits** (V030-20). This changes the urgent-only rule above
   for one case: a reply (`re`) to a post the session addressed to someone, unread and the session idle, gets an
   announce-only notice now, then 5, 20 and 60 minutes after each previous one, then no more; a fresh reply
-  restarts it. Idle and busy come from the harness's own end-of-turn hook (`Stop`, `SessionEnd`), never from the
+  restarts it. A reply notice is a wake: it obeys the one-outstanding rule above (the plan owner,
+  2026-10-02). Idle and busy come from the harness's own end-of-turn hook (`Stop`, `SessionEnd`), never from the
   network. It is never a delivery cap: the reply is always in the next turn's drain.
 - **A sender is to be told how each addressee can be reached** (V030-17): a session's `hello` says whether it
   can be interrupted, and `vox room post --to` reports it ("codex: urgent will not interrupt it").
@@ -555,16 +556,14 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
   an urgent one with two or more unanswered **MUST** be refused until it names one; a raw
   urgent envelope with no `re` from a session with an unanswered wake **MUST** be refused; and the
   daemon **MUST NOT** wake a session that already spoke in the `re` chain the message answers. That
-  message still queues for the session's next turn.
+  message still queues for the session's next turn. An agent that keeps passing an explicit `--re`
+  naming an unrelated old entry never shortens its hop chain; that is deliberate mis-naming, which
+  this guard does not try to stop.
 - Identical repeats from the same `(author, session)` within a short window **MAY** be dropped. There is
   **no rate cap**: the decider's product principle is no rate limits (2026-09-24), and loop prevention
   rests on `hops`, on addressing, and on the rules above and below. (This said a sender "SHOULD be
   rate-limited to one message per second"; nothing ever enforced it, and it is withdrawn.)
 - A terminal acknowledgement **MUST NOT** generate another terminal acknowledgement.
-- **Amended 2026-10-01 (V210-121, v0.2.10; not built):** the budget is to be decremented whether or not a reply
-  names its parent. A post from a session that a wake just put a message in front of is to inherit that entry as
-  its `re` when exactly one is open, and a session already in a message's `re` chain is not to be woken by it
-  (the message still queues). Until then a reply that leaves out `--re` starts a fresh budget.
 - `status` **SHOULD** supersede the previous `status` from the same `(author, session, thread)` in a
   rendered view rather than appending a new line.
 
