@@ -553,6 +553,20 @@ impl ConnectionManager {
         &self.endpoint
     }
 
+    /// The connection this node holds for each peer, as `vox status --json` reports it: the
+    /// peer, the connection's tag (the first bytes of its TLS exporter, the same at both ends, as
+    /// the connection notes name it) and its path. Only connections not yet closed.
+    #[must_use]
+    pub fn held(&self) -> Vec<(Digest32, String, PathClass)> {
+        let mut held: Vec<(Digest32, String, PathClass)> = lock(&self.conns)
+            .iter()
+            .filter(|(_, c)| is_live(c))
+            .map(|(peer, c)| (*peer, conn_tag(c), path_class(&self.endpoint, c)))
+            .collect();
+        held.sort_by(|a, b| a.0.cmp(&b.0));
+        held
+    }
+
     /// The live connection to `peer`, if any.
     ///
     /// **Live means heard from**, not merely unclosed: a connection silent past
