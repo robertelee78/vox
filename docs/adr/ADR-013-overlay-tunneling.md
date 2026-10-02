@@ -138,9 +138,14 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
     (`up::open_tunnel`). It MUST retry a path failure within `HOST_PATIENCE` (300 s), MUST NOT retry a
     refusal, and MUST back off a failed accept (`ACCEPT_BACKOFF`) rather than end or spin.
   - **Patience at start.** `vox forward` MUST wait for its host with `HOST_PATIENCE`, as `vox up`
-    does, printing each attempt's rung verdicts. Status: the first connection after a host restart can
-    still wait for QUIC's idle timeout on the dialer's stale connection (about 60 s); bounding that is
-    not done, tracked as V210-141 (#360).
+    does, printing each attempt's rung verdicts.
+  - **A restarted host.** A running `vox forward`'s and `vox up`'s first connection after their host
+    restarts MUST reach the new process within V210-57's 10 s host-restart bound. Status: planned,
+    until #360 (V210-141) and #321 merge. **Known limit until then:** the first connection after a
+    host restart can wait out QUIC's idle timeout on the dialer's stale connection, about 60 s;
+    tracked as V210-141 (#360). Note: 1.25–1.26 s was measured on V210-141's unlanded branch
+    (`75e110d8`, on #321's unlanded `7fecc49d`), not on either integrate branch, with its proof
+    `tunnel_honesty_proof::a_restarted_host_is_reached_again_promptly_by_a_forward_and_by_a_proxy`.
 
 ### Loopback
 
