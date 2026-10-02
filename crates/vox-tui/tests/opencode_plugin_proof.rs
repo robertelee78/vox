@@ -491,6 +491,36 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     };
     let prompt = "What is the codeword for this mission? Answer with just the codeword.";
 
+    // ---- the control: the same turn with the plugin disabled ----
+    // `--pure` removes external plugins, so the codeword must be out of the model's reach. It is
+    // run **first**, before any turn the plugin has fed, and with an empty vox profile and no
+    // room: a model with a shell otherwise found the codeword without the plugin (a free model
+    // listed the run's files and read it back), through `vox room read` on the run's daemon or
+    // an earlier session's transcript. Denying the shell is not an option: the free tier refuses
+    // any turn whose shell is denied (measured, opencode 1.18.34).
+    let bare = tmp.path().join("bare");
+    for d in [bare.join("data"), bare.join("cfg")] {
+        std::fs::create_dir_all(&d)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make the control's {d:?}: {e}"));
+    }
+    let (bare_data, bare_cfg) = (bare.join("data"), bare.join("cfg"));
+    let control_env: Vec<(&str, &std::ffi::OsStr)> = vec![
+        ("TMPDIR", oc_tmp.as_os_str()),
+        ("XDG_CONFIG_HOME", oc_cfg.as_os_str()),
+        ("VOX_DATA_DIR", bare_data.as_os_str()),
+        ("VOX_CONFIG_DIR", bare_cfg.as_os_str()),
+    ];
+    let without = opencode_turn(&project, &control_env, true, prompt);
+    println!(
+        "[proof] with --pure, the model's answer contains the codeword: {}",
+        without.contains(&codeword)
+    );
+    assert!(
+        !without.contains(&codeword),
+        "CANNOT MEASURE: `--pure` disables external plugins, so the codeword must be \
+         unreachable; it still appears, so this run is not measuring the plugin. Got: {without:?}"
+    );
+
     // **Warm the project directory first.** OpenCode installs a `node_modules` tree
     // into `.opencode/` the first time it is used in a directory, and during that
     // first run the plugin is loaded but its `chat.message` hook never fires — the
@@ -557,18 +587,6 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             plugin_diag("with plugin")
         );
     }
-
-    // ---- the mutation check: same everything, plugin disabled ----
-    let without = opencode_turn(&project, &env, true, prompt);
-    println!(
-        "[proof] with --pure, the model's answer contains the codeword: {}",
-        without.contains(&codeword)
-    );
-    assert!(
-        !without.contains(&codeword),
-        "CANNOT MEASURE: `--pure` disables external plugins, so the codeword must be \
-         unreachable; it still appears, so this run is not measuring the plugin. Got: {without:?}"
-    );
 
     // ---- a plain `opencode`, opened by hand, interrupted mid-turn (F17) ----
     let _ = std::fs::write(&plugin_log, "");
