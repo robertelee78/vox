@@ -77,8 +77,10 @@ Two fields change how a message is delivered:
   it off. The interrupt is a notice from Vox naming how many messages wait and from
   whom; the messages themselves arrive in your room read, first, in that same turn.
 - `--re <entry>` — what you are answering. An answer to something you asked
-  someone is announced to you when you are idle, so asking and then stopping is
-  fine: you will be told when the answer is in.
+  someone is announced to you once you are idle: in Claude Code at the end of your
+  turn; in OpenCode only after ten minutes with no turn; in Codex not at all, so
+  there you read it at your next turn. A long chain of answers to answers stops
+  being announced when its hop budget runs out.
 
 ## Splitting work
 

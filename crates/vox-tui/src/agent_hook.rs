@@ -73,24 +73,61 @@ fn parse_input(raw: &str) -> HookInput {
     }
 }
 
-/// Read this session's cursor for `room`, if it has one.
+/// Read this session's cursor for `room`, if it has one: the first line of its cursor file.
 pub(crate) fn load_cursor(paths: &Paths, room: &str, session: &str) -> Option<Digest32> {
     let text = std::fs::read_to_string(paths.cursor_file(room, session)).ok()?;
-    let t = text.trim();
-    b32_decode(t, "cursor").ok()
+    b32_decode(text.lines().next()?.trim(), "cursor").ok()
 }
 
-/// Record how far this session has now read.
+/// The entries `session`'s drain already showed it ahead of its cursor (V030-15): the urgent
+/// messages and replies a bounded drain shows first, past older rows it had no room for. They are
+/// not shown again, nor announced, while the cursor has not passed them. The cursor file's lines
+/// after the first.
+pub(crate) fn delivered_ahead(
+    paths: &Paths,
+    room: &str,
+    session: &str,
+) -> std::collections::BTreeSet<Digest32> {
+    std::fs::read_to_string(paths.cursor_file(room, session))
+        .map(|t| {
+            t.lines()
+                .skip(1)
+                .filter_map(|l| b32_decode(l.trim(), "ahead").ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Record how far this session has now read, and what it was shown ahead of that.
+///
+/// **One file, one write**: the cursor on the first line (empty while the session has none), each
+/// entry shown ahead of it on a line of its own. The daemon reads both to count what a session is
+/// owed, so a cursor that had moved while the record of what was shown past it had not would
+/// count messages already shown as unread, and announce them again.
 ///
 /// Written **after** the messages have been emitted, so a crash between the two
 /// re-delivers rather than skips. Re-reading a message is noise; missing one is a
 /// silent failure, and between the two the choice is not close.
-fn save_cursor(paths: &Paths, room: &str, session: &str, at: &Digest32) -> std::io::Result<()> {
-    let dir = paths.cursor_dir();
-    std::fs::create_dir_all(&dir)?;
-    vox_core::node::paths::write_private_file(
+fn save_read(
+    paths: &Paths,
+    room: &str,
+    session: &str,
+    cursor: Option<&Digest32>,
+    ahead: &std::collections::BTreeSet<Digest32>,
+) -> std::io::Result<()> {
+    if cursor.is_none() && ahead.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(paths.cursor_dir())?;
+    let mut body = cursor.map(b32_encode).unwrap_or_default();
+    body.push('\n');
+    for h in ahead {
+        body.push_str(&b32_encode(h));
+        body.push('\n');
+    }
+    vox_core::node::paths::write_private_file_unique(
         &paths.cursor_file(room, session),
-        b32_encode(at).as_bytes(),
+        body.as_bytes(),
     )
     .map_err(|e| std::io::Error::other(e.to_string()))
 }
@@ -118,50 +155,6 @@ fn under_cursors(paths: &Paths, room: &str, session: &str, dir: &str) -> std::pa
 /// The directory, under the cursors, holding each session's held claims.
 const HELD_DIR: &str = "held";
 
-/// The directory, under the cursors, holding the messages each session's drain showed ahead of
-/// its cursor.
-const AHEAD_DIR: &str = "ahead";
-
-/// The entries `session`'s drain already showed it ahead of its cursor (V030-15): the urgent
-/// messages and replies a bounded drain shows first, past older rows it had no room for. They are
-/// not shown again, nor announced, while the cursor has not passed them.
-pub(crate) fn delivered_ahead(
-    paths: &Paths,
-    room: &str,
-    session: &str,
-) -> std::collections::BTreeSet<Digest32> {
-    std::fs::read_to_string(under_cursors(paths, room, session, AHEAD_DIR))
-        .map(|t| {
-            t.lines()
-                .filter_map(|l| b32_decode(l.trim(), "ahead").ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Record the entries shown ahead of the cursor; none left removes the record.
-fn save_ahead(
-    paths: &Paths,
-    room: &str,
-    session: &str,
-    ahead: &std::collections::BTreeSet<Digest32>,
-) -> std::io::Result<()> {
-    let path = under_cursors(paths, room, session, AHEAD_DIR);
-    if ahead.is_empty() {
-        return match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
-    }
-    std::fs::create_dir_all(paths.cursor_dir().join(AHEAD_DIR))?;
-    let body: String = ahead
-        .iter()
-        .map(|h| format!("{}\n", b32_encode(h)))
-        .collect();
-    vox_core::node::paths::write_private_file(&path, body.as_bytes())
-        .map_err(|e| std::io::Error::other(e.to_string()))
-}
-
 fn load_held(paths: &Paths, room: &str, session: &str) -> std::collections::BTreeSet<String> {
     std::fs::read_to_string(held_file(paths, room, session))
         .map(|t| {
@@ -181,8 +174,11 @@ fn save_held(
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(paths.cursor_dir().join(HELD_DIR))?;
     let body: String = held.iter().map(|r| format!("{r}\n")).collect();
-    vox_core::node::paths::write_private_file(&held_file(paths, room, session), body.as_bytes())
-        .map_err(|e| std::io::Error::other(e.to_string()))
+    vox_core::node::paths::write_private_file_unique(
+        &held_file(paths, room, session),
+        body.as_bytes(),
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Record that `session` now holds `resource`, **when the claim is made** (V210-79).
@@ -833,15 +829,17 @@ async fn drain(
         .collect();
     let cursor = upto.map(|i| rows[i].entry_hash);
     let record = || {
-        if let Some(c) = &cursor {
-            if let Err(e) = save_cursor(paths, &room_key, &input.session_id, c) {
-                // The messages are already out; failing to record that only means the
-                // next turn re-delivers them.
-                eprintln!("vox agent hook: could not record the cursor: {e}");
-            }
-        }
-        if let Err(e) = save_ahead(paths, &room_key, &input.session_id, &still_ahead) {
-            eprintln!("vox agent hook: could not record what was shown ahead of the cursor: {e}");
+        // A drain that moved nothing keeps the cursor it had.
+        if let Err(e) = save_read(
+            paths,
+            &room_key,
+            &input.session_id,
+            cursor.as_ref().or(since.as_ref()),
+            &still_ahead,
+        ) {
+            // The messages are already out; failing to record that only means the
+            // next turn re-delivers them.
+            eprintln!("vox agent hook: could not record the cursor: {e}");
         }
         // Recorded after emitting, like the cursor: a crash in between repeats the notice
         // rather than losing it.

@@ -470,12 +470,17 @@ bounded drain shows past its cursor is remembered as delivered ahead of the curs
 or announced again. The daemon **recounts** the unread urgent addressed rows past the session's
 cursor just before it wakes and sends nothing when there are none. A session has **at most one
 notice outstanding**: none more until its cursor moves or `agent_wake_hold` (10 minutes) passes,
-which dedupes and drops nothing. Codex is unchanged: it has no wake path.
+which dedupes and drops nothing. A notice that does not arrive (the endpoint fails or times out)
+stays owed and is tried again once the hold passes or the cursor moves. When the daemon starts,
+every session is counted from its cursor, so what landed while it was down is owed too. The
+cursor and the set shown ahead of it are one file, written whole, so the daemon never reads one
+without the other. Codex is unchanged: it has no wake path.
 
 **An idle session is told when a reply to it is waiting** (v0.3.0, V030-20; the decider changed
 the urgent-only rule above for this case, 2026-10-01). A reply is a row whose `re` names a post by
 this session that addressed someone, not its own, and not `ack`, `status`, `hello`, `bye`, `ping`
-or `pong`. While one is unread and the session is idle, the session gets a notice as above, then
+or `pong`, and it must have hops left (§9): two sessions answering each other's answers stop
+being announced when the budget runs out. While one is unread and the session is idle, the session gets a notice as above, then
 one after each wait of `agent_reply_nudges` (5, 20 and 60 minutes), then no more; a fresher reply
 starts the series again. Idle comes from the harness: Claude Code's `Stop` and `SessionEnd` hooks
 run `vox agent hook`, which records idle or removes the registration and prints nothing;
@@ -483,7 +488,9 @@ run `vox agent hook`, which records idle or removes the registration and prints 
 activity counts as idle: Claude Code runs no `Stop` for a turn interrupted with Esc, and OpenCode
 and Codex report no end of turn to Vox (OpenCode documents a `session.idle` plugin event but not
 its fields, so it is not used). The series lives in the session's record (`sessions/notices/`), so
-a daemon restart resumes it. The three timings are settings in the profile's settings file.
+a daemon restart resumes it. The three timings are settings in the profile's settings file; a
+value that does not read, an empty schedule or a zero is refused, said on the daemon's stderr
+(again every ten minutes while it stands), and the default used.
 
 ### 7. The node MUST fan out to several local clients without any of them able to stall it
 

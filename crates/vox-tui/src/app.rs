@@ -935,11 +935,22 @@ fn tend(
     paths: &vox_core::node::paths::Paths,
     view: &vox_core::node::api::NodeView,
     answered: &std::collections::HashSet<vox_core::hash::Digest32>,
-    said_held: &mut std::collections::HashSet<String>,
+    t: &mut Tending,
 ) {
-    let (settings, _) = crate::wake::Settings::load(paths);
-    let me = view.identity.as_ref().map(|i| i.fingerprint);
+    let (settings, problems) = crate::wake::Settings::load(paths);
     let now = crate::wake::now_millis();
+    // **A setting that cannot be read is said, not silently replaced**: when it changes, and
+    // again every ten minutes while it stands.
+    if problems != t.problems || now.saturating_sub(t.problems_said) >= 600_000 {
+        for problem in &problems {
+            eprintln!("vox daemon: {problem}; its default is used until it is fixed");
+        }
+        t.problems_said = if problems.is_empty() { 0 } else { now };
+        t.problems = problems;
+    }
+    let said_held = &mut t.said_held;
+    let me = view.identity.as_ref().map(|i| i.fingerprint);
+    let starting = std::mem::take(&mut t.starting);
     for session in crate::wake::registered(paths) {
         if !crate::wake::wakeable(&session.harness) {
             continue;
@@ -951,13 +962,19 @@ fn tend(
             continue;
         };
         let mut n = crate::wake::notices(paths, &session.session);
-        if !(n.urgent_due || n.reply.is_some() || answered.contains(&cid)) {
+        // Looked at only when something may be owed: the whole room is read to count it.
+        if !(starting || n.active(&settings) || answered.contains(&cid)) {
             continue;
         }
         let cursor = crate::agent_hook::load_cursor(paths, &session.room, &session.session);
         let ahead = crate::agent_hook::delivered_ahead(paths, &session.room, &session.session);
         let (urgent, replies) = crate::wake::unread(&detail.timeline, me, &session, cursor, &ahead);
         let before = n.clone();
+        // **What landed while the daemon was down is owed too**: its rows are history to the
+        // wake loop, so nothing new marks them. At start every session is counted from its cursor.
+        if starting && !urgent.is_empty() {
+            n.urgent_due = true;
+        }
         let outcome = crate::wake::tend(
             &mut n,
             cursor.as_ref().map(vox_core::node::link::b32_encode),
@@ -1011,10 +1028,23 @@ fn tend(
                     &urgent.iter().map(name).collect::<Vec<_>>(),
                     &replies.iter().map(name).collect::<Vec<_>>(),
                 );
-                deliver(paths.clone(), session, text);
+                let hold = u64::try_from(settings.wake_hold.as_millis()).unwrap_or(u64::MAX);
+                deliver(paths.clone(), session, text, (before, n, hold));
             }
         }
     }
+}
+
+/// What the wake loop remembers between looks (see [`tend`]).
+#[derive(Default)]
+struct Tending {
+    /// The first look since the daemon started: every session is counted from its cursor.
+    starting: bool,
+    /// The sessions already told, on stderr, that their notice is held.
+    said_held: std::collections::HashSet<String>,
+    /// The settings problems last said, and when.
+    problems: Vec<String>,
+    problems_said: u64,
 }
 
 /// Wake `session` with `text`, on a task of its own.
@@ -1022,8 +1052,19 @@ fn tend(
 /// **One wedged session must not stall every other wake.** Each is its own task, bounded by a
 /// deadline: a session endpoint that accepts and never reads would otherwise hold the wake
 /// loop — and so every later interrupt — indefinitely.
-fn deliver(paths: vox_core::node::paths::Paths, session: crate::wake::Session, text: String) {
+///
+/// **A notice that does not arrive stays owed** (`undo`: the record before and after it was sent,
+/// and the hold): it is tried again once the hold passes or the session's cursor moves.
+fn deliver(
+    paths: vox_core::node::paths::Paths,
+    session: crate::wake::Session,
+    text: String,
+    undo: (crate::wake::Notices, crate::wake::Notices, u64),
+) {
     tokio::spawn(async move {
+        let failed = |paths: &vox_core::node::paths::Paths| {
+            crate::wake::undelivered(paths, &session.session, &undo.0, &undo.1, undo.2);
+        };
         let woke = crate::wake::wake(&session, &text);
         match tokio::time::timeout(WAKE_DEADLINE, woke).await {
             Ok(Ok(())) => eprintln!("vox daemon: woke session {}", session.session),
@@ -1043,16 +1084,23 @@ fn deliver(paths: vox_core::node::paths::Paths, session: crate::wake::Session, t
             }
             // Reported, never fatal: an agent that cannot be interrupted still reads the
             // message on its next turn, which is the whole point of queueing always.
-            Ok(Err(e)) => eprintln!(
-                "vox daemon: could not interrupt session {}: {e}",
-                session.session
-            ),
-            Err(_) => eprintln!(
-                "vox daemon: interrupting session {} took longer than {}s; gave up — it \
-                 reads the message on its next turn",
-                session.session,
-                WAKE_DEADLINE.as_secs()
-            ),
+            Ok(Err(e)) => {
+                failed(&paths);
+                eprintln!(
+                    "vox daemon: could not interrupt session {}: {e}; it stays owed, and is \
+                     tried again",
+                    session.session
+                );
+            }
+            Err(_) => {
+                failed(&paths);
+                eprintln!(
+                    "vox daemon: interrupting session {} took longer than {}s; gave up for now — \
+                     it stays owed, and is tried again",
+                    session.session,
+                    WAKE_DEADLINE.as_secs()
+                );
+            }
         }
     });
 }
@@ -1537,12 +1585,12 @@ pub fn run_daemon(
             // may now be owed a reply's notice (V030-20).
             let mut answered: std::collections::HashSet<vox_core::hash::Digest32> =
                 std::collections::HashSet::new();
-            for problem in crate::wake::Settings::load(&paths).1 {
-                eprintln!("vox daemon: {problem}; its default is used");
-            }
-            // The sessions already told, on stderr, that their notice is held.
-            let mut said_held: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut tending = Tending {
+                starting: true,
+                ..Tending::default()
+            };
+            // Counted at once, not at the first tick.
+            tend(&paths, &node.view(), &answered, &mut tending);
             loop {
                 let sweep = tokio::select! {
                     item = events.next() => match item {
@@ -1613,7 +1661,7 @@ pub fn run_daemon(
                     for (cid, row) in fresh {
                         judge(&paths, &view, &cid, &row);
                     }
-                    tend(&paths, &view, &answered, &mut said_held);
+                    tend(&paths, &view, &answered, &mut tending);
                     answered.clear();
                 }
             }

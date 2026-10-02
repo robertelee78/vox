@@ -468,8 +468,29 @@ pub fn check_socket_owner(socket: &Path) -> Result<()> {
 /// A failure at any step leaves `path` as it was: the old file is replaced only by the rename,
 /// and only once the new bytes are on the device.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_private_via(path, bytes, &path.with_extension("tmp"))
+}
+
+/// [`write_private_file`] for a file **two processes may write at once**: an agent session's
+/// record, cursor and notice record, written by its harness's hook and by the daemon. Each write
+/// stages through a temporary file of its own (`<name>.<pid>.<n>.tmp`), so two writers never
+/// share one and one cannot publish the other's half-written bytes under its own name; whichever
+/// rename is last wins whole. The identity vault keeps the fixed name: its writers hold the
+/// profile, so there is only ever one.
+///
+/// # Errors
+/// As [`write_private_file`].
+pub fn write_private_file_unique(path: &Path, bytes: &[u8]) -> Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    write_private_via(path, bytes, &path.with_file_name(name))
+}
+
+fn write_private_via(path: &Path, bytes: &[u8], tmp: &Path) -> Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp.to_path_buf();
     let fail = |op: &'static str, at: &Path, e: std::io::Error| Error::Path {
         op,
         detail: format!("{}: {e}", at.display()),

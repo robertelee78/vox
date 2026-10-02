@@ -171,7 +171,8 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
         return;
     }
     if let Ok(body) = serde_json::to_vec(&reg) {
-        let _ = vox_core::node::paths::write_private_file(&paths.session_file(session), &body);
+        let _ =
+            vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
     }
 }
 
@@ -224,7 +225,8 @@ pub fn record_idle(paths: &Paths, session: &str) {
     reg.state = IDLE.into();
     reg.state_ms = now_millis();
     if let Ok(body) = serde_json::to_vec(&reg) {
-        let _ = vox_core::node::paths::write_private_file(&paths.session_file(session), &body);
+        let _ =
+            vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
     }
 }
 
@@ -497,7 +499,10 @@ pub fn unread<'a>(
         if !session.name.is_empty() && e.may_interrupt(&session.name) && hops_left(&e, timeline) > 0
         {
             urgent.push(r);
-        } else if is_reply(&e, &asked) {
+        } else if is_reply(&e, &asked) && hops_left(&e, timeline) > 0 {
+            // **A reply with no hops left is announced to nobody** (ADR-020 §9): two sessions
+            // answering each other's answers would otherwise wake each other for ever. It is
+            // still read at the next turn.
             replies.push(r);
         }
     }
@@ -552,8 +557,12 @@ impl Settings {
             .filter_map(|l| l.split_once('='))
             .map(|(k, v)| (k.trim(), v.split('#').next().unwrap_or("").trim()))
         {
-            let one = |v: &str| {
-                duration(v).ok_or_else(|| format!("{k} = {v}: not a duration (e.g. 90s, 10m, 1h)"))
+            // Zero is refused everywhere: a hold or a wait of nothing would send a notice on
+            // every tick, and a busy session idle at once would be told mid-turn.
+            let one = |v: &str| match duration(v) {
+                Some(d) if !d.is_zero() => Ok(d),
+                Some(_) => Err(format!("{k} = {v}: must be more than zero")),
+                None => Err(format!("{k} = {v}: not a duration (e.g. 90s, 10m, 1h)")),
             };
             let read = match k {
                 "agent_wake_hold" => one(v).map(|d| s.wake_hold = d),
@@ -563,7 +572,14 @@ impl Settings {
                     .filter(|w| !w.is_empty())
                     .map(one)
                     .collect::<Result<Vec<_>, _>>()
-                    .map(|d| s.reply_nudges = d),
+                    .and_then(|d| {
+                        if d.is_empty() {
+                            Err(format!("{k} = : names no waits (e.g. 5m 20m 60m)"))
+                        } else {
+                            s.reply_nudges = d;
+                            Ok(())
+                        }
+                    }),
                 _ => Ok(()),
             };
             if let Err(e) = read {
@@ -613,6 +629,38 @@ pub struct Notices {
     /// When the last of them was, in Unix milliseconds.
     #[serde(default)]
     pub reply_at: u64,
+    /// A notice that could not be delivered is tried again at this time (Unix milliseconds), or
+    /// once the session's cursor moves: what it announced stays owed (see [`undelivered`]).
+    #[serde(default)]
+    pub retry_at: Option<u64>,
+}
+
+impl Notices {
+    /// Whether the daemon has anything to look at for this session on its tick: an urgent notice
+    /// owed, a notice to retry, or a reply series still running. A series that has sent its last
+    /// notice is not looked at again until a fresh answer lands in the room.
+    #[must_use]
+    pub fn active(&self, s: &Settings) -> bool {
+        self.urgent_due
+            || self.retry_at.is_some()
+            || (self.reply.is_some() && self.reply_sent as usize <= s.reply_nudges.len())
+    }
+}
+
+/// A notice that `tend` sent (`before` → `after`) did not arrive: put back what it announced, so
+/// it stays owed, and try again once `hold` has passed or the session's cursor moves. Nothing is
+/// dropped; the hold bounds how often an endpoint that keeps failing is tried.
+pub fn undelivered(paths: &Paths, session: &str, before: &Notices, after: &Notices, hold_ms: u64) {
+    let mut now = notices(paths, session);
+    if now == *after {
+        now = before.clone();
+        now.sent_at = after.sent_at;
+        now.sent_cursor = after.sent_cursor.clone();
+    } else {
+        now.urgent_due |= before.urgent_due;
+    }
+    now.retry_at = Some(now_millis().saturating_add(hold_ms));
+    let _ = save_notices(paths, session, &now);
 }
 
 /// The directory, under the sessions, holding what the daemon owes each one in notices.
@@ -643,7 +691,7 @@ pub fn notices(paths: &Paths, session: &str) -> Notices {
 pub fn save_notices(paths: &Paths, session: &str, n: &Notices) -> std::io::Result<()> {
     std::fs::create_dir_all(paths.session_dir().join(NOTICES_DIR))?;
     let body = serde_json::to_vec(n).map_err(std::io::Error::other)?;
-    vox_core::node::paths::write_private_file(&notices_file(paths, session), &body)
+    vox_core::node::paths::write_private_file_unique(&notices_file(paths, session), &body)
         .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
@@ -684,6 +732,15 @@ pub fn tend(
     let outstanding = n.sent_cursor == cursor
         && n.sent_at
             .is_some_and(|t| now.saturating_sub(t) < ms(s.wake_hold));
+    // A notice that did not arrive waits for its retry time, or for the cursor to move.
+    if n.retry_at.is_some_and(|t| now < t) && n.sent_cursor == cursor {
+        return if n.urgent_due {
+            Tended::Held
+        } else {
+            Tended::Quiet
+        };
+    }
+    n.retry_at = None;
     if newest_reply != n.reply {
         n.reply = newest_reply;
         n.reply_sent = 0;
