@@ -12,6 +12,9 @@
 //!    trusted once, but not as it stands (measured on codex-cli 0.157.0) — and running the
 //!    command again trusts the new hash;
 //! 5. with no Vox entry at all it fails and says why;
+//! 7. **what `vox agent plugin codex` prints is a hook Codex runs**: installed exactly as printed,
+//!    Codex lists it and `vox agent trust codex` trusts it (V210-133; the flat shape it printed
+//!    before was listed by nothing, so a user following Vox's own instructions wired nothing);
 //! 6. **hostile look-alikes are never trusted** — a command that *contains* `vox agent
 //!    hook` behind a pipe, a `;`, a `$(…)`, another binary, or an unknown flag — and a
 //!    trusted entry **tampered** into one (Codex lists it `modified`) is not re-trusted.
@@ -34,7 +37,8 @@
 //!
 //! **Which side a red is on.** What vox said or did, read back through Codex's own API, is
 //! `PRODUCT:`. Codex not answering, not listing an entry this proof wrote, or not seeing a
-//! staged change is `CANNOT MEASURE:` (Codex is the instrument here). A fault of this proof's own
+//! staged change is `CANNOT MEASURE:` (Codex is the instrument here), except at (7), where the
+//! entry is vox's own output and Codex not listing it is `PRODUCT:`. A fault of this proof's own
 //! (a file, a symlink, a leaked variable) is `APPARATUS:`.
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -401,5 +405,36 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     assert!(
         !ok && said.contains("no hook running `vox agent hook`"),
         "PRODUCT: with no Vox entry the command must fail and say why: {said}"
+    );
+
+    // ---- (7) a user installs exactly what `vox agent plugin codex` prints (V210-133) ----
+    let printed = isolated(VOX, home)
+        .args(["agent", "plugin", "codex"])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox: {e}"));
+    let snippet = String::from_utf8_lossy(&printed.stdout).into_owned();
+    assert!(
+        printed.status.success(),
+        "PRODUCT: `vox agent plugin codex` failed: {snippet}{}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    std::fs::write(home.join("hooks.json"), &snippet).expect("APPARATUS: cannot write hooks.json");
+    let listed = trust_status(home);
+    println!("[proof] (7) Codex lists, from `vox agent plugin codex`'s output: {listed:?}");
+    assert!(
+        listed.iter().any(|(c, _)| c == HOOK),
+        "PRODUCT: Codex lists no hook from what `vox agent plugin codex` prints, so a user \
+         following it wires nothing; it printed {snippet:?} and Codex lists {listed:?}"
+    );
+    let (ok, said) = vox_trust(home);
+    assert!(
+        ok,
+        "PRODUCT: `vox agent trust codex` must accept the hook `vox agent plugin codex` printed: \
+         {said}"
+    );
+    assert_eq!(
+        status_of(home, HOOK),
+        "trusted",
+        "PRODUCT: the hook `vox agent plugin codex` printed must now be trusted: {said}"
     );
 }

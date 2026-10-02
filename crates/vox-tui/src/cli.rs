@@ -1951,9 +1951,13 @@ pub fn run() -> ExitCode {
                 ExitCode::SUCCESS
             }
             "codex" => {
+                // Codex reads a hook only inside a matcher group's own `hooks` list, as Claude
+                // Code does. The bare entry this printed is listed by nothing: Codex never ran it
+                // and `vox agent trust codex` found nothing to trust (V210-133).
                 println!(
-                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{ \
-                     \"command\": \"vox agent hook\", \"async\": false }}\n    ]\n  \
+                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
+                     \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
+                     \"vox agent hook\", \"async\": false }}\n        ]\n      }}\n    ]\n  \
                      }}\n}}"
                 );
                 eprintln!(
