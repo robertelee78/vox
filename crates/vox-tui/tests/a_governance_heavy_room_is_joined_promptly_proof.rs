@@ -182,7 +182,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
 
 fn fingerprint(data: &Path) -> String {
     let (ok, out, err) = vox_once(data, &args(&["id"]));
-    assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
     out.trim().to_owned()
 }
 
@@ -241,18 +241,15 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         .collect();
 
     let (ok, out, err) = vox_in(&host_dir, &["room", "create", "--name", "team"], ROOM_PASS);
-    assert!(
-        ok,
-        "APPARATUS (precondition not met): room create: {out}\n{err}"
-    );
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, list, _) = vox_once(&host_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
         .next()
-        .expect("APPARATUS (precondition not met): the new room in `vox room list`")
+        .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
     let (ok, link, err) = vox_once(&host_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "APPARATUS (precondition not met): room invite: {err}");
+    assert!(ok, "PRODUCT (staging): room invite: {err}");
     let link = link.trim().to_owned();
     // Which attempt got in, and when it started: `None` if none did.
     let attempts = |data: &Path, who: &str| {
@@ -270,17 +267,14 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let join = |data: &Path, who: &str| attempts(data, who).is_some();
     let t_setup = Instant::now();
     for (name, d, fp) in &members {
-        assert!(
-            join(d, name),
-            "APPARATUS (precondition not met): {name} could not join"
-        );
+        assert!(join(d, name), "PRODUCT (staging): {name} could not join");
         assert!(
             trust(d, "add", &host_fp, "host"),
-            "APPARATUS (precondition not met): {name} could not trust the host"
+            "PRODUCT (staging): {name} could not trust the host"
         );
         assert!(
             trust(&host_dir, "add", fp, name),
-            "APPARATUS (precondition not met): the host could not trust {name}"
+            "PRODUCT (staging): the host could not trust {name}"
         );
     }
     println!(
@@ -288,7 +282,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         t_setup.elapsed()
     );
     let (ok, _, err) = vox_once(&host_dir, &args(&["room", "post", &prefix, "hello"]));
-    assert!(ok, "APPARATUS (precondition not met): first post: {err}");
+    assert!(ok, "PRODUCT (staging): first post: {err}");
     let (_, rows, _) = vox_once(&host_dir, &args(&["room", "read", &prefix, "--json"]));
     let room = rows
         .lines()
@@ -299,7 +293,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
                 .as_str()
                 .map(str::to_owned)
         })
-        .expect("APPARATUS (precondition not met): the host's read names its room");
+        .expect("PRODUCT (staging): the host's read names its room");
 
     // ---- the governance history: every member changes its mind, again and again --------
     let t_hist = Instant::now();
@@ -340,16 +334,16 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     // had not trusted the host would never read the host's post, however fast its sync.
     assert!(
         trust(&host_dir, "add", &newcomer_fp, "newcomer"),
-        "APPARATUS (precondition not met): the host could not trust the newcomer"
+        "PRODUCT (staging): the host could not trust the newcomer"
     );
     assert!(
         trust(&newcomer_dir, "add", &host_fp, "host"),
-        "APPARATUS (precondition not met): the newcomer could not trust the host"
+        "PRODUCT (staging): the newcomer could not trust the host"
     );
     let newcomer = daemon("newcomer", &newcomer_dir, &spec, &pass_file);
     let t_join = Instant::now();
     let Some((tries, got_in_from)) = attempts(&newcomer_dir, "newcomer") else {
-        panic!("APPARATUS (precondition not met): the newcomer could not join");
+        panic!("PRODUCT (staging): the newcomer could not join");
     };
     let joined = Instant::now();
     // The newcomer's daemon names each step of its join: `join got in — board …, solve …`.
@@ -384,7 +378,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let (ok, _, err) = vox_once(&host_dir, &args(&["room", "post", &room, marker]));
     assert!(
         ok,
-        "APPARATUS (precondition not met): the host's post after the join: {err}"
+        "PRODUCT (staging): the host's post after the join: {err}"
     );
 
     let mut posts: Vec<Duration> = Vec::new();
