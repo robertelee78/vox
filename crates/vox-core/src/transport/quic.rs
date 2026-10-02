@@ -403,22 +403,21 @@ impl VoxEndpoint {
         })
     }
 
-    /// Attach a relay circuit to `peer` (ADR-012 rung 4): datagrams the endpoint
-    /// sends to the port's own [`CircuitPort::addr`] come out of it, and datagrams
-    /// its inlet is fed arrive from that address. Dialling that address then runs
-    /// the ordinary handshake, pinned to `peer`, over whatever carries the port.
+    /// Attach a relay circuit (ADR-012 rung 4): datagrams the endpoint sends to the
+    /// port's own [`CircuitPort::addr`] come out of it, and datagrams its inlet is fed
+    /// arrive from that address. Dialling that address then runs the ordinary
+    /// handshake, pinned to the peer the dial names, over whatever carries the port.
     ///
     /// # Errors
     /// If the OS CSPRNG is unavailable, since the address is drawn from it.
     pub fn attach_circuit(
         &self,
-        peer: &Digest32,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach(peer, None, carrier)
+        self.mux.attach(None, carrier)
     }
 
-    /// Attach an **inbound** circuit from `peer`, as [`Self::attach_circuit`] does, recording
+    /// Attach an **inbound** circuit, as [`Self::attach_circuit`] does, recording
     /// where its far end comes from (V210-92). The connection the circuit makes carries it as
     /// [`VoxConnection::circuit_origin`].
     ///
@@ -426,11 +425,10 @@ impl VoxEndpoint {
     /// If the OS CSPRNG is unavailable, since the address is drawn from it.
     pub fn attach_inbound_circuit(
         &self,
-        peer: &Digest32,
         origin: crate::transport::mux::CircuitOrigin,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach(peer, Some(origin), carrier)
+        self.mux.attach(Some(origin), carrier)
     }
 
     /// Whether `addr` is a **live circuit** on this endpoint's socket — answered from the
@@ -438,13 +436,6 @@ impl VoxEndpoint {
     #[must_use]
     pub fn is_circuit(&self, addr: std::net::SocketAddr) -> bool {
         self.mux.is_circuit(addr)
-    }
-
-    /// The address `peer`'s newest live circuit stands at, if it has one. Circuit addresses are
-    /// allocated, so this is the only way to get from a peer to its circuit.
-    #[must_use]
-    pub fn circuit_addr_of(&self, peer: &Digest32) -> Option<std::net::SocketAddr> {
-        self.mux.circuit_addr_of(peer)
     }
 
     /// How many relay circuits are attached.

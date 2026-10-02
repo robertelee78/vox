@@ -126,9 +126,6 @@ fn key(addr: SocketAddr) -> SocketAddr {
 pub struct MuxSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     circuits: Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
-    /// Which address each peer's newest live circuit stands at. The addresses are random, so
-    /// this is the only way to get from a peer to its circuit.
-    by_peer: Mutex<HashMap<Digest32, SocketAddr>>,
     /// Where each inbound circuit's far end comes from, when the node said (see
     /// [`CircuitOrigin`]).
     origins: Mutex<HashMap<SocketAddr, CircuitOrigin>>,
@@ -223,15 +220,14 @@ impl MuxSocket {
             ipv6,
             inner,
             circuits: Mutex::new(HashMap::new()),
-            by_peer: Mutex::new(HashMap::new()),
             origins: Mutex::new(HashMap::new()),
             carriers: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Inbox::default()),
         })
     }
 
-    /// Attach a circuit to `peer` at a freshly allocated address. An earlier circuit to the same
-    /// peer **stays attached** until its own port is dropped; `peer` now names the newest.
+    /// Attach a circuit at a freshly allocated address. An earlier circuit to the same peer
+    /// **stays attached** until its own port is dropped.
     ///
     /// It used to be replaced here, and that was wrong whenever two circuits to one peer are
     /// live at once — which is ordinary: a node dialling a peer through a relay while that peer
@@ -248,7 +244,6 @@ impl MuxSocket {
     /// guessable circuit address would leak which peers this node relays to.
     pub fn attach(
         self: &Arc<Self>,
-        peer: &Digest32,
         origin: Option<CircuitOrigin>,
         carrier: Option<CircuitCarrier>,
     ) -> Result<CircuitPort> {
@@ -269,7 +264,6 @@ impl MuxSocket {
         if let Some(carrier) = carrier {
             self.carriers().insert(addr, carrier);
         }
-        self.by_peer().insert(*peer, addr);
         drop(circuits);
         Ok(CircuitPort {
             addr,
@@ -308,16 +302,6 @@ impl MuxSocket {
         self.origins.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The address `peer`'s newest live circuit stands at, if it has one.
-    #[must_use]
-    pub fn circuit_addr_of(&self, peer: &Digest32) -> Option<SocketAddr> {
-        self.by_peer().get(peer).copied()
-    }
-
-    fn by_peer(&self) -> std::sync::MutexGuard<'_, HashMap<Digest32, SocketAddr>> {
-        self.by_peer.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// The number of live circuits.
     #[must_use]
     pub fn circuit_count(&self) -> usize {
@@ -328,7 +312,6 @@ impl MuxSocket {
         self.circuits().remove(&addr);
         self.origins().remove(&addr);
         self.carriers().remove(&addr);
-        self.by_peer().retain(|_, a| *a != addr);
     }
 
     fn circuits(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>> {
