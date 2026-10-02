@@ -15,8 +15,9 @@
 //! [`CYCLES`] times — `vox trust remove` and `vox trust add` of the host — each of which puts a
 //! consent revocation or a consent grant on the room's log. The members do so at the same time:
 //! every trust change costs one production Argon2id check of the operator's passphrase, so one
-//! node making all of them took minutes on a busy machine. Only then does a newcomer, already
-//! trusted by the host, join with `vox room join`.
+//! node making all of them took minutes on a busy machine. Only then does a newcomer, which the
+//! host trusts and which trusts the host (a node reads only members its owner trusts, V210-118),
+//! join with `vox room join`.
 //!
 //! **Asserted.**
 //! 1. The history exists: at least [`MIN_ENTRIES`] of the members' trust changes succeeded (each
@@ -334,10 +335,16 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         MEMBERS * CYCLES * 2
     );
 
-    // ---- the newcomer, trusted by the host before it joins ------------------------------
+    // ---- the newcomer and the host trust each other before it joins ----------------------
+    // Both ways: a node reads only the members its owner trusts (V210-118), so a newcomer that
+    // had not trusted the host would never read the host's post, however fast its sync.
     assert!(
         trust(&host_dir, "add", &newcomer_fp, "newcomer"),
         "APPARATUS (precondition not met): the host could not trust the newcomer"
+    );
+    assert!(
+        trust(&newcomer_dir, "add", &host_fp, "host"),
+        "APPARATUS (precondition not met): the newcomer could not trust the host"
     );
     let newcomer = daemon("newcomer", &newcomer_dir, &spec, &pass_file);
     let t_join = Instant::now();
