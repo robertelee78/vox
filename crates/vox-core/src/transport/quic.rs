@@ -324,6 +324,137 @@ fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
 /// which is the failure mode ADR-018 §8 exists to prevent.
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How many ephemeral ports a dual-stack bind tries before it gives up (see [`bind_udp`]). Each
+/// failed try costs at most [`DUAL_STACK_SELF_TEST`]; a collision is rare outside a machine holding
+/// thousands of IPv4 ports, where one in two can collide, and 32 keeps even that from failing.
+const DUAL_STACK_TRIES: usize = 32;
+/// How long a dual-stack bind waits for its own IPv4 self-test datagram (see [`bind_udp`]).
+const DUAL_STACK_SELF_TEST: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Bind the endpoint's UDP socket to `addr`.
+///
+/// **A dual-stack socket must hear its IPv4 traffic (V210-147).** On macOS a socket bound to
+/// `[::]:0` with IPv6-only off is often given a port another program already holds on IPv4 —
+/// measured, 529 of 3000 such binds against 3000 held `127.0.0.1` ports, 564 against `0.0.0.0` —
+/// and an explicit `[::]:P` is even allowed over a `0.0.0.0:P` holder. IPv4 datagrams to that port
+/// then go to the other program and this node hears none of them, saying nothing: a host dialling
+/// such an anchor over IPv4 reached another program instead (V210-143). Probe-binding the IPv4
+/// port cannot tell this socket's own hold on it from another program's, as both refuse the probe.
+/// So the socket is tested instead: a datagram sent to `127.0.0.1:P`, and one sent to the machine's
+/// routable IPv4 address on P, must each reach it — the two IPv4 addresses a node advertises
+/// (`nat::reachability`), so a program holding the port on either, `0.0.0.0` included, is caught.
+/// An ephemeral port that fails is bound again (the old one held meanwhile, so it is not handed
+/// back); an explicit one is refused, saying why. What the test sent is drained before QUIC gets the
+/// socket. **Not covered:** a program bound to another IPv4 address of this machine that no node
+/// advertises; it takes only traffic no peer was told to send there.
+fn bind_udp(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    let bind = |at: SocketAddr| {
+        std::net::UdpSocket::bind(at).map_err(|e| Error::LocalBind {
+            addr: at,
+            in_use: e.kind() == std::io::ErrorKind::AddrInUse,
+            reason: e.to_string(),
+        })
+    };
+    let mut socket = bind(addr)?;
+    let dual_stack = match addr {
+        SocketAddr::V6(a) if a.ip().is_unspecified() => {
+            !socket2::SockRef::from(&socket).only_v6().unwrap_or(true)
+        }
+        _ => false,
+    };
+    if !dual_stack {
+        return Ok(socket);
+    }
+    for _ in 0..DUAL_STACK_TRIES {
+        let port = socket
+            .local_addr()
+            .map_err(|e| Error::LocalBind {
+                addr,
+                in_use: false,
+                reason: e.to_string(),
+            })?
+            .port();
+        if hears_ipv4(&socket, port) {
+            return Ok(socket);
+        }
+        if addr.port() != 0 {
+            return Err(Error::LocalBind {
+                addr,
+                in_use: true,
+                reason: format!(
+                    "IPv4 traffic to port {port} reaches another program, which holds that port \
+                     on IPv4; on it this node would hear IPv6 only"
+                ),
+            });
+        }
+        // Bound before the old socket closes, so the kernel cannot hand back the same port.
+        socket = bind(addr)?;
+    }
+    Err(Error::LocalBind {
+        addr,
+        in_use: true,
+        reason: format!(
+            "{DUAL_STACK_TRIES} ports in a row were each held on IPv4 by another program, so \
+             this node would hear IPv6 only on any of them"
+        ),
+    })
+}
+
+/// The machine's routable IPv4 address: the one the OS would send from toward the internet (a
+/// connected UDP socket's local address; nothing is sent), as `nat::reachability` finds it.
+fn routable_ipv4() -> Option<std::net::Ipv4Addr> {
+    let s = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    // 192.0.2.0/24 is the reserved documentation prefix (RFC 5737): never routed to a real host.
+    s.connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_unspecified() && !v4.is_loopback() => Some(v4),
+        _ => None,
+    }
+}
+
+/// Whether a datagram sent over IPv4 to each address a node advertises — `127.0.0.1` and the
+/// routable IPv4 address — on `port` reaches `socket` (see [`bind_udp`]). Everything the test sent
+/// that arrived is drained, so none of it reaches QUIC.
+fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> bool {
+    let mut targets = vec![std::net::Ipv4Addr::LOCALHOST];
+    targets.extend(routable_ipv4());
+    let Ok(probe) = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) else {
+        return true; // no test is possible; never refuse a bind for that
+    };
+    let mut owed: Vec<Vec<u8>> = Vec::new();
+    for target in targets {
+        let mut nonce = [0u8; 16];
+        if getrandom::fill(&mut nonce).is_err() {
+            return true;
+        }
+        let mut text = b"vox dual-stack self-test ".to_vec();
+        text.extend_from_slice(&nonce);
+        if probe.send_to(&text, (target, port)).is_err() {
+            return true;
+        }
+        owed.push(text);
+    }
+    let deadline = std::time::Instant::now() + DUAL_STACK_SELF_TEST;
+    let mut buf = [0u8; 64];
+    while !owed.is_empty() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || socket.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => owed.retain(|t| buf[..n] != t[..]),
+            Err(_) => break,
+        }
+    }
+    // Drain: nothing the test sent may reach QUIC.
+    if socket.set_nonblocking(true).is_ok() {
+        while socket.recv_from(&mut buf).is_ok() {}
+        let _ = socket.set_nonblocking(false);
+    }
+    let _ = socket.set_read_timeout(None);
+    owed.is_empty()
+}
+
 impl VoxEndpoint {
     /// Bind a Vox endpoint to `addr`, authenticating as `signer`'s identity.
     ///
@@ -338,11 +469,7 @@ impl VoxEndpoint {
     /// its own verifier output slot), so `bind` itself only stores the local leaf
     /// + the provider's supported-signature algorithms.
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
-        let socket = std::net::UdpSocket::bind(addr).map_err(|e| Error::LocalBind {
-            addr,
-            in_use: e.kind() == std::io::ErrorKind::AddrInUse,
-            reason: e.to_string(),
-        })?;
+        let socket = bind_udp(addr)?;
         let effective = {
             let sock = socket2::SockRef::from(&socket);
             let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
