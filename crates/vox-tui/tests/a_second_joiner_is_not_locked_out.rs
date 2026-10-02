@@ -92,7 +92,8 @@ enum Hold {
 /// serves the room's board too, so a host slow to take handshakes delayed the joiner's `board`
 /// step, which the sum left out — a mutant that held each inbound handshake 6 s waited
 /// `board 6.01s` and passed. `None` when the line is missing or lacks its `board`, `dial` or
-/// `exchange` step, which is a proof that cannot measure, not a pass.
+/// `exchange` step, which is a proof that cannot measure, not a pass. The path a join rode,
+/// `<member>: direct|relayed`, carries no duration and is skipped.
 fn waited_on_others(stderr: &str) -> Option<Duration> {
     let line = stderr.lines().find(|l| l.contains("join got in — "))?;
     let steps = line.split("join got in — ").nth(1)?;
@@ -102,6 +103,11 @@ fn waited_on_others(stderr: &str) -> Option<Duration> {
         let Some((name, secs)) = step.rsplit_once(' ') else {
             continue;
         };
+        // `<member>: direct` or `<member>: relayed`: which path the join rode (V210-124, #332), not a
+        // step with a duration (V210-144).
+        if name.ends_with(':') && matches!(secs, "direct" | "relayed") {
+            continue;
+        }
         if name.ends_with(": solve") || name == "seal" {
             continue;
         }
