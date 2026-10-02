@@ -29,8 +29,29 @@ use std::process::{Command, Stdio};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 
+/// A command for a child of this proof (Codex, or `vox`, which starts Codex itself), with **only a
+/// whitelisted environment**: the operator's API keys, tokens and harness sockets never reach a
+/// `codex app-server` (V210-122 gate review). `home` is the proof's own: Codex's `CODEX_HOME`, the
+/// child's `HOME`, and `vox`'s profile (`VOX_DATA_DIR`, `VOX_CONFIG_DIR`) all live under it, so
+/// nothing reads or writes the operator's own.
+fn sealed(program: &str, home: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    for key in ["PATH", "TMPDIR", "USER", "LANG"] {
+        if let Ok(value) = std::env::var(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.env("HOME", home)
+        .env("CODEX_HOME", home)
+        .env("VOX_DATA_DIR", home.join("vox-data"))
+        .env("VOX_CONFIG_DIR", home.join("vox-config"));
+    cmd
+}
+
 fn codex_present() -> bool {
-    Command::new("codex")
+    let home = std::env::temp_dir();
+    sealed("codex", &home)
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
@@ -62,9 +83,8 @@ const HOSTILE: &[&str] = &[
 
 /// `command -> trustStatus`, asked of Codex's own app-server, independently of vox.
 fn trust_status(home: &Path) -> Vec<(String, String)> {
-    let mut child = Command::new("codex")
+    let mut child = sealed("codex", home)
         .arg("app-server")
-        .env("CODEX_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -120,9 +140,8 @@ fn status_of(home: &Path, command: &str) -> String {
 }
 
 fn vox_trust(home: &Path) -> (bool, String) {
-    let out = Command::new(VOX)
+    let out = sealed(VOX, home)
         .args(["agent", "trust", "codex"])
-        .env("CODEX_HOME", home)
         .output()
         .expect("run vox");
     (

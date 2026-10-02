@@ -86,7 +86,15 @@ impl std::fmt::Debug for SharedPolicy {
 #[cfg(feature = "test-knobs")]
 pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 
-/// How long a reach gives its direct dial before it asks any peer to carry a circuit (V210-122):
+/// How long a reach gives its direct dial before it asks any peer to carry a circuit (V210-122).
+///
+/// **500 ms, not 250** (#321, attempt 3). A direct dial's first answer cannot come before the peer
+/// has done its post-quantum handshake crypto, and on a loaded machine that is most of the time:
+/// a CI runner's direct dial over a 30 ms path took 271 ms and lost to the circuit at 250 ms
+/// (run 36968701360). 500 ms is the top of the range the plan gave; a pair that cannot reach each
+/// other directly pays it once per reach. Waiting on the peer's first answer instead does not help:
+/// the dialling side's handshake finishes as soon as that answer arrives.
+///
 /// RFC 8305's connection-attempt delay, as for a join's board search. Measured: a direct join over
 /// a LAN address dials its board in under 5 ms, so a reachable peer answers well inside it, and a
 /// peer that cannot be reached directly costs this much and no more — its circuits start the moment
@@ -96,7 +104,7 @@ pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 /// circuit asked of the anchor on the same instant; the circuit lost the tie-break, was retired,
 /// and the anchor carried it for its 60 s grace — an anchor working for a pair that never needed
 /// it, which is everything ADR-012's anchor principle says it must not do.
-pub const DIRECT_HEAD_START: std::time::Duration = std::time::Duration::from_millis(250);
+pub const DIRECT_HEAD_START: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[cfg(feature = "test-knobs")]
 fn test_advertise() -> Option<EndpointList> {
@@ -1055,7 +1063,8 @@ impl NodeNet {
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
             set.spawn(async move {
-                let deadline = tokio::time::Instant::now() + DIRECT_HEAD_START;
+                let started = tokio::time::Instant::now();
+                let deadline = started + DIRECT_HEAD_START;
                 loop {
                     // This ladder's direct rung failed: nothing direct is coming from it.
                     if *failed.borrow() {
@@ -1081,6 +1090,21 @@ impl NodeNet {
                         () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                     }
                 }
+                // Said, so a pair that bridges shows why (V210-122): how long the reach waited, and
+                // whether its direct dial had failed or was still under way.
+                manager.note(
+                    peer,
+                    format!(
+                        "asking {} for a circuit {} ms into the reach; its direct dial {}",
+                        short_id(relay.peer_id()),
+                        started.elapsed().as_millis(),
+                        if *failed.borrow() {
+                            "failed"
+                        } else {
+                            "had not finished (or there was none)"
+                        }
+                    ),
+                );
                 (
                     label,
                     circuitstream::connect_through(&relay, peer, &endpoint, now).await,
