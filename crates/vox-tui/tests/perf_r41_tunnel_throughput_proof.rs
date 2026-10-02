@@ -891,6 +891,9 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     ));
 
     let mut failed = Vec::new();
+    // An APPARATUS fault on one link or arm makes that one CANNOT MEASURE and the run goes on: one
+    // late window must not void every other link's and arm's figures.
+    let mut cannot = Vec::new();
     // Diagnostic knob (test-side only): `VOX_PERF_ONLY` runs just the links whose name contains it.
     for l in LINKS {
         if !perf_only(l.name) {
@@ -903,17 +906,23 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
             .iter()
             .map(|w| format!("{:.1}%", w * 8.0 / l.bits_per_sec * 100.0))
             .collect();
-        assert!(
-            !l.gated || fidelity >= EMULATOR_FIDELITY,
-            "CANNOT MEASURE {} (APPARATUS): the emulator itself delivered only {:.1}% of the link's \
-             rate in a calibration window (windows {pct:?}; each must reach {:.0}%), so this run \
-             would measure the emulator, not vox (load: {})\nbusiest processes:\n{}",
-            l.name,
-            fidelity * 100.0,
-            EMULATOR_FIDELITY * 100.0,
-            uptime(),
-            busiest()
-        );
+        if l.gated && fidelity < EMULATOR_FIDELITY {
+            cant(
+                &mut cannot,
+                format!(
+                    "CANNOT MEASURE {} (APPARATUS): the emulator itself delivered only {:.1}% of the \
+                     link's rate in a calibration window (windows {pct:?}; each must reach {:.0}%), \
+                     so this link would measure the emulator, not vox (load: {})\nbusiest \
+                     processes:\n{}",
+                    l.name,
+                    fidelity * 100.0,
+                    EMULATOR_FIDELITY * 100.0,
+                    uptime(),
+                    busiest()
+                ),
+            );
+            continue;
+        }
         *link.lock().unwrap() = Some(l);
         std::thread::sleep(Duration::from_millis(500));
         let drops_before = TAIL_DROPS.load(std::sync::atomic::Ordering::Relaxed);
@@ -932,16 +941,22 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
                 )
             })
             .collect();
-        assert!(
-            !l.gated || late <= MAX_EMULATOR_LATENESS,
-            "CANNOT MEASURE {} (APPARATUS): the emulator was {} ms late during a timed tunnel \
-             transfer (at most {} ms measures the link), so this run measured the emulator, not vox; \
-             rounds (tunnel/raw): {per_round:?}; calibration windows {pct:?}; load: {}",
-            l.name,
-            late.as_millis(),
-            MAX_EMULATOR_LATENESS.as_millis(),
-            uptime()
-        );
+        if l.gated && late > MAX_EMULATOR_LATENESS {
+            cant(
+                &mut cannot,
+                format!(
+                    "CANNOT MEASURE {} (APPARATUS): the emulator was {} ms late during a timed tunnel \
+                     transfer (at most {} ms measures the link), so this link measured the emulator, \
+                     not vox; rounds (tunnel/raw): {per_round:?}; calibration windows {pct:?}; load: \
+                     {}",
+                    l.name,
+                    late.as_millis(),
+                    MAX_EMULATOR_LATENESS.as_millis(),
+                    uptime()
+                ),
+            );
+            continue;
+        }
         let verdict = if !l.gated {
             "reported".to_owned()
         } else if ratio >= min_ratio {
@@ -966,7 +981,6 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
             late.as_millis()
         ));
     }
-    let mut cannot = Vec::new();
     taper_arms(
         Rig {
             tunnel,
