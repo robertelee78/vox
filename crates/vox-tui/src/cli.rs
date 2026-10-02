@@ -2020,10 +2020,7 @@ pub fn run() -> ExitCode {
                     ServiceCmd::Remove(r) => {
                         crate::tunnel_cli::service_remove(&node, cid, &r.tag).await
                     }
-                    ServiceCmd::List(_) => {
-                        crate::tunnel_cli::service_list(&node, cid);
-                        Ok(())
-                    }
+                    ServiceCmd::List(_) => crate::tunnel_cli::service_list(&node, cid),
                 }
             }
         }),
