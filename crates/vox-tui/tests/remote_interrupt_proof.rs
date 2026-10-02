@@ -50,29 +50,40 @@
 //!
 //! `an_idle_agent_is_told_when_a_reply_to_it_is_waiting` (V030-20): bob's session `asker` asks
 //! alice something, and alice answers (`--re`), each answer carrying a canary. The schedule is
-//! the profile's real setting, shortened here (`agent_reply_nudges = 8s 8s 8s` in bob's settings
-//! file); its default is 5, 20 and 60 minutes.
+//! the profile's real setting, shortened here (`agent_reply_nudges = 4s 8s 12s` in bob's
+//! settings file); its default is 5, 20 and 60 minutes.
 //!
 //! 1. while the session is **busy** (its turn started and has not ended) — no notice;
 //! 2. at its **end of turn** (Claude Code's `Stop` hook, run as `vox agent hook`, printing
 //!    nothing) — exactly one notice, naming one reply from alice, with no canary byte;
-//! 3. then one after each wait of the schedule, and no more: four in all;
-//! 4. **a daemon restart resumes the series**: restarted after the second notice, the third and
-//!    fourth still come, and no fifth;
+//! 3. then one after each wait of the schedule, 4 s and then 8 s, and no more: four in all;
+//! 4. **a daemon restart resumes the series**: restarted after the third notice, the fourth still
+//!    comes, no sooner than 12 s after the third, and no fifth;
 //! 5. **a fresh reply starts it again**: one more notice;
 //! 6. the turn that notice starts reads each answer **once**; and an answer the session read
 //!    before going idle again is **never announced**;
 //! 7. `SessionEnd` removes the registration: a later answer wakes nothing;
 //! 8. `vox agent plugin claude` prints the `UserPromptSubmit`, `Stop` and `SessionEnd` entries.
 //!
-//! Every red says PRODUCT, with what the product sent or said, or CANNOT MEASURE, naming the
+//! (8) of the first test: sixty older messages and one urgent, more than one turn's 50: the turn
+//! the wake starts shows the urgent one first and 49 others, a second urgent wake counts only the
+//! new one (the first was shown ahead of the cursor), and over three turns every message is shown
+//! exactly once.
+//!
+//! `two_sessions_answering_each_other_stop_being_told_at_the_hop_budget` (ADR-020 §9): a session
+//! on each node answers every answer it is told of. Each answer spends a hop, and an answer with
+//! none left is announced to nobody: seven notices (hops 7 down to 1), then the exchange stops.
+//!
+//! Every red says PRODUCT, with what the product sent or said, or APPARATUS, naming the
 //! staging that was not achieved.
 //!
 //! **Mutation**, one per claim, each red at its own assertion: the message put back in the wake
 //! (V030-15 (1), V030-20 (2)); no recount — the daemon counting from the start of the room rather
 //! than the cursor (V030-15 (7), V030-20 (6)); no outstanding-notice rule (V030-15 (6)); no idle
 //! gate (V030-20 (1)); no generation, so a fresh reply is not announced (V030-20 (5)); the
-//! series held in memory (V030-20 (4)). The pre-F15 loop — the daemon judging only `NewEntry` —
+//! series held in memory (V030-20 (4)); a reply announced with no hops left (the exchange runs to
+//! its bound of twenty rounds); and the delivered-ahead record never written, ignored by the
+//! drain, ignored by the count, or a cursor moved past rows not shown ((8)). The pre-F15 loop — the daemon judging only `NewEntry` —
 //! goes red at V030-15 (1).
 
 #![cfg(unix)]
@@ -145,16 +156,23 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
         out.status.code(),
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    assert!(out.status.success(), "`vox agent hook` must exit 0");
+    assert!(
+        out.status.success(),
+        "PRODUCT: `vox agent hook` must exit 0 whatever happens, so it never breaks a turn; it \
+         exited {:?}",
+        out.status.code()
+    );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// The endpoint bob's daemon will wake `session` at, as the hook registered it.
 fn registered_endpoint(bob: &Worker, session: &str) -> (String, String) {
     let body = std::fs::read(bob.paths.session_file(session)).unwrap_or_else(|e| {
-        panic!("CANNOT MEASURE: `vox agent hook` registered no session {session}: {e}")
+        panic!("APPARATUS: `vox agent hook` registered no session {session}: {e}")
     });
-    let v: serde_json::Value = serde_json::from_slice(&body).expect("a session registration");
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
+        panic!("PRODUCT: the session record `vox agent hook` wrote does not parse: {e}")
+    });
     (
         v["harness"].as_str().unwrap_or_default().to_owned(),
         v["endpoint"].as_str().unwrap_or_default().to_owned(),
@@ -193,6 +211,21 @@ fn contents(frames: &[String]) -> Vec<String> {
         .filter(|v| v["type"] == "user")
         .filter_map(|v| v["message"]["content"].as_str().map(str::to_owned))
         .collect()
+}
+
+/// The next notice `inbox` receives within `within`, and when it arrived.
+fn next_notice(inbox: &mpsc::Receiver<String>, within: Duration) -> Option<(Instant, String)> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if let Ok(frame) = inbox.recv_timeout(Duration::from_millis(50)) {
+            let at = Instant::now();
+            eprintln!("[receipt] the session received: {frame}");
+            if let Some(c) = contents(&[frame]).into_iter().next() {
+                return Some((at, c));
+            }
+        }
+    }
+    None
 }
 
 /// A Claude Code hook input for `event`, for `session`, carrying `prompt` when the event has one.
@@ -281,7 +314,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     assert_eq!(
         reg,
         ("claude".to_owned(), sock_s.clone()),
-        "CANNOT MEASURE: bob's session must be registered at the test's own socket, never a \
+        "APPARATUS: bob's session must be registered at the test's own socket, never a \
          real session's"
     );
 
@@ -361,7 +394,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     // ---- (5) the wake's own turn reads the message once, first ----
     let Some(wake_text) = wakes.first().cloned() else {
         panic!(
-            "CANNOT MEASURE (5)-(7): bob's session was never woken; {} claim(s) failed:\n- {}",
+            "APPARATUS (5)-(7): bob's session was never woken; {} claim(s) failed:\n- {}",
             failures.len(),
             failures.join("\n- ")
         );
@@ -378,7 +411,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     );
     assert!(
         read.matches("OTHER-ADDRESSEE").count() == 1 && read.matches("NOT-URGENT").count() == 1,
-        "CANNOT MEASURE (5): the wake's turn must read the two messages that woke nothing, once \
+        "APPARATUS (5): the wake's turn must read the two messages that woke nothing, once \
          each, or the read did not reach them: {read}"
     );
     check(
@@ -406,7 +439,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     }));
     assert!(
         got.len() == 1,
-        "CANNOT MEASURE (6): a second urgent message, after the first was read, must wake bob \
+        "APPARATUS (6): a second urgent message, after the first was read, must wake bob \
          for the outstanding-notice case to mean anything; got {got:?}; bob's daemon:\n{}",
         bob_err()
     );
@@ -452,7 +485,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let read = turn(&second);
     assert!(
         read.contains("CANARY-URGENT-2") && read.contains("CANARY-URGENT-3"),
-        "CANNOT MEASURE (7): the session's read must take both held messages first: {read}"
+        "APPARATUS (7): the session's read must take both held messages first: {read}"
     );
     let after = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
     let said_read = bob_err().contains("it already read the urgent message(s)");
@@ -504,7 +537,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     assert_eq!(
         reg,
         ("opencode".to_owned(), wedge_url.clone()),
-        "CANNOT MEASURE: the wedged session must be registered at the test's own endpoint, \
+        "APPARATUS: the wedged session must be registered at the test's own endpoint, \
          never a real session's"
     );
     let registered = std::fs::read_dir(bob.paths.session_dir())
@@ -514,10 +547,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
                 .count()
         })
         .unwrap_or(0);
-    assert_eq!(
-        registered, 2,
-        "CANNOT MEASURE: exactly two sessions registered"
-    );
+    assert_eq!(registered, 2, "APPARATUS: exactly two sessions registered");
     post(
         alice,
         &room,
@@ -535,6 +565,108 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
             "PRODUCT (4): a wedged session stalled another session's wake; received {got:?}; \
              bob's daemon:\n{}",
             bob_err()
+        ),
+    );
+
+    // ---- (8) a bounded read shows the urgent message first, and loses nothing behind it ----
+    // Sixty older messages and one urgent: more than one turn's 50. The turn the wake starts
+    // shows the urgent one first and 49 of the others; the next shows the rest. Each once.
+    let _ = turn("catch up");
+    let _ = collect(&inbox, Duration::from_secs(3), |_| false);
+    for i in 0..60 {
+        post(alice, &room, &format!("BULK-{i:02}-ROW"));
+    }
+    post(
+        alice,
+        &room,
+        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-AHEAD-1"}"#,
+    );
+    until(
+        bob,
+        None,
+        "the sixty messages and the urgent one to reach bob's node",
+        &["room", "read", &room],
+        |o| o.stdout.contains("CANARY-AHEAD-1") && o.stdout.contains("BULK-59-ROW"),
+    );
+    let w1 = contents(&collect(&inbox, Duration::from_secs(30), |g| {
+        g.contains("\"user\"")
+    }));
+    assert!(
+        w1.len() == 1,
+        "APPARATUS (8): the urgent message must wake bob for the bounded read to be staged; got \
+         {w1:?}; bob's daemon:\n{}",
+        bob_err()
+    );
+    let turn1 = turn(&w1[0]);
+    let bulk = |t: &str| {
+        (0..60)
+            .filter(|i| t.contains(&format!("BULK-{i:02}-ROW")))
+            .count()
+    };
+    let first_row = turn1.lines().find(|l| l.starts_with('[')).unwrap_or("");
+    println!(
+        "[proof] (8) turn 1: the urgent message first {}, older messages {}, said the rest \
+         follow {}",
+        first_row.contains("CANARY-AHEAD-1"),
+        bulk(&turn1),
+        turn1.contains("more unread message(s) not shown")
+    );
+    assert!(
+        turn1.contains("more unread message(s) not shown"),
+        "APPARATUS (8): the first read must be bounded, or nothing is shown ahead of the cursor: \
+         {turn1}"
+    );
+    check(
+        &mut failures,
+        first_row.contains("CANARY-AHEAD-1") && bulk(&turn1) == 49,
+        format!(
+            "PRODUCT (8): a bounded read must show the urgent message first, then 49 older ones: \
+             {turn1}"
+        ),
+    );
+    // A second urgent message: the first was already shown, so the wake counts one.
+    post(
+        alice,
+        &room,
+        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-AHEAD-2"}"#,
+    );
+    let w2 = contents(&collect(&inbox, Duration::from_secs(30), |g| {
+        g.contains("\"user\"")
+    }));
+    println!("[proof] (8) the wake after turn 1: {w2:?}");
+    check(
+        &mut failures,
+        w2.len() == 1 && w2[0].contains("1 urgent message addressed to you"),
+        format!(
+            "PRODUCT (8): a message already shown ahead of the cursor must not be counted again: \
+             {w2:?}; bob's daemon:\n{}",
+            bob_err()
+        ),
+    );
+    let turn2 = turn(w2.first().map_or("go on", String::as_str));
+    let turn3 = turn("and again");
+    let all3 = format!("{turn1}\n{turn2}\n{turn3}");
+    let once: Vec<String> = (0..60)
+        .map(|i| format!("BULK-{i:02}-ROW"))
+        .chain(["CANARY-AHEAD-1".to_owned(), "CANARY-AHEAD-2".to_owned()])
+        .filter(|m| all3.matches(m.as_str()).count() != 1)
+        .collect();
+    println!(
+        "[proof] (8) over three turns: turn 2 older {}, turn 3 older {}; messages not shown \
+         exactly once: {once:?}",
+        bulk(&turn2),
+        bulk(&turn3)
+    );
+    check(
+        &mut failures,
+        once.is_empty()
+            && turn2
+                .lines()
+                .find(|l| l.starts_with('['))
+                .is_some_and(|l| l.contains("CANARY-AHEAD-2")),
+        format!(
+            "PRODUCT (8): every message must be shown exactly once over the turns, the new \
+             urgent one first; not once: {once:?}; turn 2: {turn2}; turn 3: {turn3}"
         ),
     );
 
@@ -560,8 +692,8 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let bob_err = || daemon_err(tmp.path(), "bob");
     let mut failures = Vec::new();
 
-    // The schedule is the profile's own setting, shortened: 8 s between notices, not 5, 20, 60
-    // minutes.
+    // The schedule is the profile's own setting, shortened: 4, 8 and 12 s, not 5, 20 and 60
+    // minutes. Three different waits, so a notice sent on the wrong step's wait shows.
     {
         use std::io::Write as _;
         let cfg = r.workers[1].paths.config_file();
@@ -571,7 +703,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
             .append(true)
             .open(&cfg)
             .expect("APPARATUS: open bob's settings file");
-        writeln!(f, "\nagent_reply_nudges = 8s 8s 8s").unwrap();
+        writeln!(f, "\nagent_reply_nudges = 4s 8s 12s").unwrap();
     }
 
     // ---- (8) the entries a person merges into Claude Code's settings ----
@@ -618,7 +750,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     assert_eq!(
         registered_endpoint(&r.workers[1], "asker"),
         ("claude".to_owned(), sock_s.clone()),
-        "CANNOT MEASURE: asker must be registered at the test's own socket"
+        "APPARATUS: asker must be registered at the test's own socket"
     );
     // It asks alice, as its model would with `vox room post`.
     let o = r.workers[1].vox_in(
@@ -628,10 +760,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         ],
         Some("What is the build number?"),
     );
-    assert!(
-        o.ok,
-        "CANNOT MEASURE: asker could not post its question: {o:?}"
-    );
+    assert!(o.ok, "APPARATUS: asker could not post its question: {o:?}");
     let q = o.json()["entry_hash"]
         .as_str()
         .expect("`vox room post --json` names the entry")
@@ -649,7 +778,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
             &["room", "post", &room, "--type", "answer", "--re", &q, "-"],
             Some(&format!("{canary}: build 42")),
         );
-        assert!(o.ok, "CANNOT MEASURE: alice could not answer: {o:?}");
+        assert!(o.ok, "APPARATUS: alice could not answer: {o:?}");
         until(
             bob,
             None,
@@ -676,51 +805,69 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         stop.is_empty(),
         format!("PRODUCT (2): the Stop hook must print nothing: {stop:?}"),
     );
-    let first = collect(&inbox, Duration::from_secs(15), |g| g.contains("\"user\""));
-    // Six more seconds: inside the 8 s wait, so a second notice here is one too many.
-    let mut frames = first.clone();
-    frames.extend(collect(&inbox, Duration::from_secs(6), |_| false));
-    let told = contents(&frames);
-    println!("[proof] (2) at the end of its turn, asker got {told:?}");
+    let Some((t1, first)) = next_notice(&inbox, Duration::from_secs(15)) else {
+        panic!(
+            "PRODUCT (2): an idle session with an unread reply got no notice; {} claim(s) \
+             failed:\n- {}\nbob's daemon:\n{}",
+            failures.len(),
+            failures.join("\n- "),
+            bob_err()
+        );
+    };
+    println!("[proof] (2) at the end of its turn, asker got {first:?}");
     check(
         &mut failures,
-        told.len() == 1 && told[0].contains("1 reply to your messages from alice"),
-        format!(
-            "PRODUCT (2): an idle session with an unread reply must get exactly one notice \
-             naming one reply from alice; got {told:?}; bob's daemon:\n{}",
-            bob_err()
-        ),
+        first.contains("1 reply to your messages from alice"),
+        format!("PRODUCT (2): the notice must name one reply from alice: {first:?}"),
     );
     check(
         &mut failures,
-        !frames.join("\n").contains("CANARY-REPLY") && !frames.join("\n").contains("build 42"),
-        format!("PRODUCT (2): no byte of the reply may reach the wake endpoint: {frames:?}"),
+        !first.contains("CANARY-REPLY") && !first.contains("build 42"),
+        format!("PRODUCT (2): no byte of the reply may reach the wake endpoint: {first:?}"),
     );
 
-    // ---- (3)/(4) the series goes on by the schedule, and survives a daemon restart ----
-    let second = contents(&collect(&inbox, Duration::from_secs(20), |g| {
-        g.contains("\"user\"")
-    }));
-    assert!(
-        second.len() == 1,
-        "CANNOT MEASURE (4): the second notice of the series must come before the restart; got \
-         {second:?}; bob's daemon:\n{}",
-        bob_err()
-    );
+    // ---- (3)/(4) one notice after each wait of the schedule, and a restart resumes it ----
+    let (t2, t3) = match (
+        next_notice(&inbox, Duration::from_secs(15)),
+        next_notice(&inbox, Duration::from_secs(20)),
+    ) {
+        (Some((t2, _)), Some((t3, _))) => (t2, t3),
+        other => panic!(
+            "PRODUCT (3): the second and third notices of the series must come; got {other:?}; \
+             bob's daemon:\n{}",
+            bob_err()
+        ),
+    };
     r.restart(1);
-    // The third is due 8 s after the second, which the restart has likely passed; the fourth 8 s
-    // after the third. Then no more.
-    let rest = contents(&collect(&inbox, Duration::from_secs(40), |_| false));
+    let fourth = next_notice(&inbox, Duration::from_secs(45));
+    let fifth = fourth
+        .as_ref()
+        .and_then(|_| next_notice(&inbox, Duration::from_secs(20)));
+    let gaps: Vec<f64> = [Some(t1), Some(t2), Some(t3), fourth.as_ref().map(|f| f.0)]
+        .windows(2)
+        .filter_map(|w| Some((w[1]? - w[0]?).as_secs_f64()))
+        .collect();
     println!(
-        "[proof] (3)/(4) after the restart, asker got {} more notice(s) (2 due, then none)",
-        rest.len()
+        "[proof] (3)/(4) gaps between notices {gaps:.1?} s (4, 8, 12 due; the daemon restarted \
+         after the third); a fourth {}, a fifth {}",
+        fourth.is_some(),
+        fifth.is_some()
+    );
+    // The tick is 2 s, so a notice comes up to 2 s after it is due.
+    let within = |g: f64, due: f64| (due - 0.5..due + 3.0).contains(&g);
+    check(
+        &mut failures,
+        gaps.len() >= 2 && within(gaps[0], 4.0) && within(gaps[1], 8.0),
+        format!("PRODUCT (3): the notices must follow the schedule, 4 s then 8 s: {gaps:?}"),
     );
     check(
         &mut failures,
-        rest.len() == 2,
+        gaps.len() == 3 && gaps[2] >= 11.5 && fifth.is_none(),
         format!(
-            "PRODUCT (3)/(4): a restarted daemon must resume the series — the third and fourth \
-             notices, then no more; got {rest:?}; bob's daemon:\n{}",
+            "PRODUCT (3)/(4): a restarted daemon must resume the series — the fourth notice no \
+             sooner than 12 s after the third, then no more; gaps {gaps:?}, a fifth {:?}; \
+             bob's daemon:\n{}",
+            fifth.map(|f| f.1),
             bob_err()
         ),
     );
@@ -759,7 +906,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let read = injected(&event(&r.workers[1], "UserPromptSubmit", Some("go on")));
     assert!(
         read.contains("CANARY-REPLY-3"),
-        "CANNOT MEASURE (6): the session's own read must take the third answer: {read}"
+        "APPARATUS (6): the session's own read must take the third answer: {read}"
     );
     let _ = event(&r.workers[1], "Stop", None);
     let after = contents(&collect(&inbox, Duration::from_secs(12), |_| false));
@@ -799,5 +946,132 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         "{} claim(s) failed:\n- {}",
         failures.len(),
         failures.join("\n- ")
+    );
+}
+
+#[test]
+#[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
+fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let room = r.id.clone();
+    let errs = || {
+        format!(
+            "{}\n{}",
+            daemon_err(tmp.path(), "alice"),
+            daemon_err(tmp.path(), "bob")
+        )
+    };
+
+    // One stand-in Claude Code session on each node: `pa` on alice's, `pb` on bob's.
+    let sides: Vec<(&Worker, &str, &str, std::path::PathBuf)> = vec![
+        (&r.workers[0], "pa", "pb", tmp.path().join("pa.sock")),
+        (&r.workers[1], "pb", "pa", tmp.path().join("pb.sock")),
+    ];
+    let inboxes: Vec<mpsc::Receiver<String>> = sides.iter().map(|s| listen(&s.3)).collect();
+    let socks: Vec<String> = sides
+        .iter()
+        .map(|s| s.3.to_string_lossy().into_owned())
+        .collect();
+    let event = |i: usize, name: &str, prompt: Option<&str>| {
+        let (w, me, _, _) = &sides[i];
+        let env = [
+            ("CLAUDE_CODE_MESSAGING_SOCKET", socks[i].as_str()),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "pp-token"),
+            ("VOX_AGENT_NAME", *me),
+        ];
+        hook(
+            w,
+            &env,
+            &["agent", "hook", "--room", &room],
+            Some(&hook_json(name, me, prompt)),
+        )
+    };
+    // Each side answers what it was told, addressed back, as its model would; then its turn ends.
+    let answer = |i: usize, re: Option<&str>, body: &str| -> String {
+        let (w, me, other, _) = &sides[i];
+        let mut args = vec![
+            "room", "post", &room, "--type", "answer", "--to", other, "--json",
+        ];
+        if let Some(re) = re {
+            args.extend(["--re", re]);
+        }
+        args.push("-");
+        let o = w.vox_in(Some(me), &args, Some(body));
+        assert!(o.ok, "APPARATUS: {me} could not post: {o:?}");
+        o.json()["entry_hash"]
+            .as_str()
+            .expect("`vox room post --json` names the entry")
+            .to_owned()
+    };
+    for i in 0..2 {
+        let _ = event(i, "UserPromptSubmit", Some("hi"));
+        assert_eq!(
+            registered_endpoint(sides[i].0, sides[i].1),
+            ("claude".to_owned(), socks[i].clone()),
+            "APPARATUS: {} must be registered at the test's own socket",
+            sides[i].1
+        );
+    }
+
+    // pa asks pb (8 hops); pb answers; from then on each side answers the answer it is told of.
+    let mut last = answer(0, None, "PING-0");
+    let _ = event(0, "Stop", None);
+    until(
+        sides[1].0,
+        None,
+        "pa's question to reach bob",
+        &["room", "read", &room],
+        |o| o.stdout.contains("PING-0"),
+    );
+    let _ = event(1, "UserPromptSubmit", Some("read"));
+    last = answer(1, Some(&last), "PING-1");
+    let _ = event(1, "Stop", None);
+    let mut told = 0;
+    let mut turn = 0usize; // whose notice is awaited next: pa
+                           // At most twenty rounds: an exchange that never ends is the defect, and this bounds it.
+    for round in 2..22 {
+        let Some((_, notice)) = next_notice(&inboxes[turn], Duration::from_secs(20)) else {
+            break;
+        };
+        told += 1;
+        println!(
+            "[proof] round {round}: {} was told {notice:?}",
+            sides[turn].1
+        );
+        let _ = event(turn, "UserPromptSubmit", Some(&notice));
+        last = answer(turn, Some(&last), &format!("PING-{round}"));
+        let _ = event(turn, "Stop", None);
+        turn = 1 - turn;
+    }
+    let hops: Vec<i64> = sides[0]
+        .0
+        .vox(None, &["room", "read", &room, "--json"])
+        .ndjson()
+        .into_iter()
+        .filter(|x| x["text"].as_str().is_some_and(|t| t.contains("PING-")))
+        .map(|x| x["envelope"]["hops"].as_i64().unwrap_or(-1))
+        .collect();
+    println!(
+        "[proof] the exchange: {told} notice(s); hops in the log {hops:?} (8 down to 0: each \
+         answer told while it has hops left, the one at 0 to nobody)"
+    );
+    assert_eq!(
+        hops.first(),
+        Some(&8),
+        "APPARATUS: the first question must start with the default budget of 8: {hops:?}"
+    );
+    assert_eq!(
+        told,
+        7,
+        "PRODUCT: answers to answers must be announced only while they have hops left — the \
+         answers carrying 7 down to 1 — and the one at 0 to nobody; {told} notices, hops in the \
+         log {hops:?}; the daemons:\n{}",
+        errs()
     );
 }
