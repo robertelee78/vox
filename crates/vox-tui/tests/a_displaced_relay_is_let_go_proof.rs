@@ -342,6 +342,7 @@ fn the_tunnel_cap_holds_across_a_path_upgrade() {
     const FREED_WITHIN: Duration = Duration::from_secs(20);
     const CAP: usize = vox_core::transport::quic::TUNNELS_PER_PEER as usize;
     const LIMIT_SAID: &str = "16 tunnels are already open to this member";
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let mut w = ForwardedWorld::new(false);
     eprintln!(

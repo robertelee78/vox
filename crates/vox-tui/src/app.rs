@@ -846,9 +846,14 @@ const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long `vox daemon` waits for its node to stop on SIGTERM or Ctrl-C before leaving anyway.
 /// A clean stop takes milliseconds; this is for a node stuck waiting on a peer that vanished.
-/// It must stay longer than the node's own wait for finished tunnels (`STOP_ACK_BOUND`, 3 s), so a
-/// stop that waits that out still closes its connections before the daemon leaves.
+/// It must stay longer than the node's own worst-case stop
+/// ([`vox_core::node::actor::STOP_WORST_CASE`], 4.45 s, which names each of its waits), so a stop
+/// that waits every one of them out still closes its connections before the daemon leaves.
 const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+const _: () = assert!(
+    vox_core::node::actor::STOP_WORST_CASE.as_millis() + 500 <= SHUTDOWN_PATIENCE.as_millis(),
+    "the daemon gives a stop that waits out every bound at least 0.5 s more"
+);
 
 /// How long one wake may take before it is abandoned.
 const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);

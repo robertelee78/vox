@@ -164,8 +164,9 @@ pub async fn serve(
 ///
 /// `carried` is the connection the stream arrived on: an authorized tunnel is credited a
 /// receive window of its own on it for as long as it runs ([`VoxConnection::carry_tunnel`]),
-/// and a refused one is not. One past the connection's
-/// [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER) is refused.
+/// and a refused one is not. One past the member's
+/// [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER), counted across all of its
+/// connections, is refused.
 ///
 /// [`VoxConnection::carry_tunnel`]: crate::transport::quic::VoxConnection::carry_tunnel
 pub async fn serve_reporting(
