@@ -59,19 +59,6 @@ use crate::transport::router::DatagramStats;
 /// A room with other members and no completed sync for this long is flagged.
 pub const STALE_SYNC_SECS: u64 = 10 * 60;
 
-/// One tunnel this node is serving right now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServedTunnel {
-    /// The member reaching it.
-    pub client: Digest32,
-    /// The room it is bound to.
-    pub channel_id: Digest32,
-    /// The service.
-    pub service_tag: String,
-    /// When it was authorized, seconds since the epoch.
-    pub since: u64,
-}
-
 /// The ledgers this module keeps beside the node's own state.
 #[derive(Debug, Default)]
 pub struct StatusBook {
@@ -81,61 +68,9 @@ pub struct StatusBook {
     pub member_synced: BTreeMap<Digest32, u64>,
     /// Peer → when this node last saw a live connection to it.
     pub last_seen: BTreeMap<Digest32, u64>,
-    /// Tunnels being served, by a local id; entries leave when the tunnel ends.
-    pub served: Arc<Mutex<BTreeMap<u64, ServedTunnel>>>,
     /// When the node started, seconds since the epoch: a room that has not synced *yet*
     /// is not stale until it has had [`STALE_SYNC_SECS`] to do so.
     pub started: u64,
-    next_tunnel: u64,
-}
-
-/// A place in [`StatusBook::served`], given back when the tunnel ends.
-#[derive(Debug)]
-pub struct ServedGuard {
-    id: u64,
-    served: Arc<Mutex<BTreeMap<u64, ServedTunnel>>>,
-}
-
-impl ServedGuard {
-    /// The tunnel was authorized: it is now being served.
-    pub fn serving(&self, tunnel: ServedTunnel) {
-        self.served
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(self.id, tunnel);
-    }
-}
-
-impl Drop for ServedGuard {
-    fn drop(&mut self) {
-        self.served
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.id);
-    }
-}
-
-impl StatusBook {
-    /// A guard for one inbound tunnel stream; it shows as served once
-    /// [`ServedGuard::serving`] says so, and stops when the guard drops.
-    pub fn tunnel(&mut self) -> ServedGuard {
-        self.next_tunnel += 1;
-        ServedGuard {
-            id: self.next_tunnel,
-            served: Arc::clone(&self.served),
-        }
-    }
-
-    /// The tunnels being served now.
-    #[must_use]
-    pub fn served_now(&self) -> Vec<ServedTunnel> {
-        self.served
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect()
-    }
 }
 
 /// One member of a room, as this node sees it.
@@ -199,9 +134,11 @@ pub struct PeerStatus {
     pub datagrams: DatagramStats,
 }
 
-/// A local port forwarded to a member's service (the dial side).
+/// A local port forwarded to a member's service (the dial side): a door, which carries a tunnel
+/// only while something is connected through it. The tunnels themselves are in the one list of
+/// live tunnels ([`crate::transport::quic::live_tunnels`], V210-81).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DialedTunnel {
+pub struct ForwardStatus {
     /// The room.
     pub channel_id: Digest32,
     /// The member hosting it.
@@ -231,10 +168,8 @@ pub struct StatusReport {
     pub peers: Vec<PeerStatus>,
     /// How many circuits it carries for others.
     pub relaying: usize,
-    /// Tunnels it serves now.
-    pub tunnels_served: Vec<ServedTunnel>,
     /// Ports it forwards to others' services.
-    pub tunnels_dialed: Vec<DialedTunnel>,
+    pub forwards: Vec<ForwardStatus>,
     /// Datagram counters, summed over every connection.
     pub datagrams: DatagramStats,
     /// The app layer's counters.
@@ -371,17 +306,7 @@ impl StatusReport {
         });
         let _ = write!(j, "\"peers\":[{}],", list(peers));
         let _ = write!(j, "\"relaying\":{},", self.relaying);
-        let served = self.tunnels_served.iter().map(|t| {
-            format!(
-                "{{\"client\":{},\"room\":{},\"service\":{},\"since\":{}}}",
-                q(&b32_encode(&t.client)),
-                q(&b32_encode(&t.channel_id)),
-                q(&t.service_tag),
-                t.since
-            )
-        });
-        let _ = write!(j, "\"tunnels_served\":[{}],", list(served));
-        let dialed = self.tunnels_dialed.iter().map(|t| {
+        let forwards = self.forwards.iter().map(|t| {
             format!(
                 "{{\"host\":{},\"room\":{},\"service\":{},\"local\":{}}}",
                 q(&b32_encode(&t.host)),
@@ -390,7 +315,7 @@ impl StatusReport {
                 q(&t.local.to_string())
             )
         });
-        let _ = write!(j, "\"tunnels_dialed\":[{}],", list(dialed));
+        let _ = write!(j, "\"forwards\":[{}],", list(forwards));
         let _ = write!(j, "\"datagrams\":{},", dgram_json(&self.datagrams));
         let a = &self.app;
         let _ = write!(
@@ -501,15 +426,27 @@ impl StatusReport {
             "Circuits carried for other peers.",
             vec![(String::new(), self.relaying as u64)],
         );
+        let live = crate::transport::quic::live_tunnels();
         gauge(
             "vox_tunnels_served",
             "Tunnels being served now.",
-            vec![(String::new(), self.tunnels_served.len() as u64)],
+            vec![(
+                String::new(),
+                live.iter().filter(|t| !t.outbound).count() as u64,
+            )],
         );
         gauge(
             "vox_tunnels_dialed",
+            "Tunnels this node opened to members' services, now.",
+            vec![(
+                String::new(),
+                live.iter().filter(|t| t.outbound).count() as u64,
+            )],
+        );
+        gauge(
+            "vox_forwards",
             "Local forwards to members' services.",
-            vec![(String::new(), self.tunnels_dialed.len() as u64)],
+            vec![(String::new(), self.forwards.len() as u64)],
         );
         gauge(
             "vox_unhealthy",
