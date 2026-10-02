@@ -9,8 +9,15 @@ rather than accepted — F12 in `vox-core` key distribution (fixed, on `main` si
 daemon's interrupt path (fixed, PR #16), F17, OpenCode delivery (fixed 2026-10-01 for v0.2.10), and F18–F20
 (open, v0.2.10); F14 is retired. Statements about the tree before this change describe `main` at `96c47ed`
 (v0.2.7).
+**Amended 2026-10-02 (the decider; V030-26, #348).** "github is the authority, vox is the nagging
+reminder." Vox holds **no** task state: the claim protocol (§4), its version gate (§5), the attempt
+semantics and seeded attempt ids (§2, §3) and the board's fold are removed, and §1's boundary moves
+"live ownership" to the work item's GitHub issue, which agents maintain through awa. What stays:
+`data.work` as an opaque, shape-checked reference (awa's work key, `gwa:OWNER/REPO:SOURCE:ITEM`),
+operation ids (§6) for retrying one post, and the gapless stream (§7). Each amended section says so.
+
 **Date**: 2026-09-23
-**Updated**: 2026-09-24 — implemented; see the revision history below.
+**Updated**: 2026-09-24 — implemented; see the revision history below. 2026-10-02 — amended (above).
 
 Revision history:
 
@@ -164,6 +171,11 @@ defects**, not accepted gaps, because each is a thing a user meets.
 
 ### 1. The boundary
 
+> **Amended 2026-10-02 (V030-26).** The row "Live ownership among cooperating workers (claims) |
+> Vox" below no longer holds: who holds a task is the GitHub issue's open attempt, recorded through
+> awa, and Vox computes no ownership. Every other row stands. Vox owns communication, delivery and
+> waking a worker; the issue owns the work, including who holds it.
+
 **Vox owns communication, delivery and live coordination claims. The tracker owns work and mints the
 references that Vox carries opaquely.**
 
@@ -194,6 +206,12 @@ branch, pull request or file overlap, green CI, merge or worker exit does not by
 phase. Releasing ownership means neither Done nor failure.
 
 ### 2. Stable work-item references
+
+> **Amended 2026-10-02 (V030-26).** `data.work` stays, checked for shape and never interpreted;
+> its value is awa's work key under the `gwa` scheme. **`data.attempt` and its seeding are
+> removed**, with `--attempt`: an attempt is awa's attempt-started on the issue, and a work-bound
+> post carries no attempt id. "A claim on a work item uses the reference as its resource" is moot:
+> there are no claims.
 
 A message about a work item **MUST** carry the reference in `data.work`:
 
@@ -254,6 +272,12 @@ as small as §4 intended.
 
 ### 3. Event meanings
 
+> **Amended 2026-10-02 (V030-26).** Every type is a heads-up to the room and none is a record:
+> `working` starts no attempt, `result` submits no candidate, `failed` ends nothing — the matching
+> facts are awa's records on the issue. `assign`, `accept`, `claim`, `renew`, `release`, `handoff`
+> and `decline` are no longer Vox vocabulary (an unknown type is still carried unchanged). The
+> table below is the record of what was built.
+
 These meanings are **normative for any message that carries `data.work`**. They tell every producer and
 consumer what the others mean. Three things are kept apart, as the decider asked:
 
@@ -285,6 +309,8 @@ consumer what the others mean. Three things are kept apart, as the decider asked
   its current bare list.
 
 ### 4. The claim protocol
+
+> **Removed 2026-10-02 (V030-26).** Kept as the record of what was built.
 
 **There is one claim protocol.** It keeps ADR-020 §5's type names (`claim`, `release`, `handoff`) and
 its canonical order, `(created_millis, entry_hash)` — milliseconds since v0.2.7 (ADR-020 §5, M19.9).
@@ -365,6 +391,11 @@ two agents' entries have no causal edge in the log (ADR-008 gives no cross-autho
 order in which things happened in wall-clock time.
 
 ### 5. Workers must run the same Vox version, enforced
+
+> **Removed 2026-10-02 (V030-26).** The gate existed so two versions could not fold claims
+> differently; with no claims there is nothing to fold, and a post is never refused on a version.
+> Structured posts still carry `data.vox` and a session's `hello` still announces it, so a reader
+> can say which version each member runs.
 
 **Mixed-version work coordination is not supported.** Every worker participating in a room's claim
 protocol **MUST** run the same Vox version. A worker **MUST** refuse to participate while any
@@ -492,6 +523,11 @@ Every work message and every claim-protocol operation carries `data.op`.
 
 ### 7. What Vox exposes to an adapter
 
+> **Amended 2026-10-02 (V030-26).** Item 3 below, the folded board (`vox room board --json`, its
+> `position`, `coordination: refused` and exit 3), and the refusal of raw claim-protocol posts are
+> removed with the claims. The stream (`vox room tail --since --json`) and `vox room read --json`
+> remain, gapless as stated.
+
 An adapter is a process on a node's host that reads the room and feeds the tracker. It holds its own
 (host, harness) identity per ADR-020 §2, e.g. `tracker@mbp`, runs the same Vox version as the workers,
 and is trusted like any worker. It sees exactly what its node can decrypt. It needs **four surfaces,
@@ -618,6 +654,11 @@ per-tool-call event. The adapter pulls from its cursor, so a tracker that is dow
 was posted.
 
 ### 8. Hands-free guidance: what replay can and cannot recover (a tracker obligation, not Vox's)
+
+> **Amended 2026-10-02 (V030-26).** The SHOULD below — that an integration also emit the matching
+> `assign`, `blocked`, `decline`, `result` or `failed` into the room — is withdrawn. The record is
+> the issue; mirroring it into the room is the noise the room exists to keep out. An agent tells the
+> room only what someone there asked about or is waiting for, with the issue's link.
 
 The decider's condition — no ticket maintenance and no manual status repair — is the tracker's to meet.
 Vox's part is the durable log and the gapless stream. Two kinds of gap must not be confused:

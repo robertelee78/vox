@@ -1,5 +1,5 @@
-//! **A room past one IPC frame of history reads whole** — `vox room read`, `tail` and
-//! `board`, through the shipped binary, on the node the history reached by sync.
+//! **A room past one IPC frame of history reads whole** — `vox room read` and `tail`,
+//! through the shipped binary, on the node the history reached by sync.
 //!
 //! A `Read` reply used to be every row after the cursor in one frame, and the client
 //! refuses a frame over `MAX_FRAME` (256 KiB). So once a room's rows passed 256 KiB the
@@ -11,8 +11,7 @@
 //! largest text a post may carry (64 KiB); bob, which received them by sync, must then
 //!
 //! 1. `read --json` every one of them, in full;
-//! 2. `tail --since <before the first> --json` every one of them;
-//! 3. answer `board --json`, which folds the whole room.
+//! 2. `tail --since <before the first> --json` every one of them.
 //!
 //! The maximum row is the bound a page relies on: a reply always carries at least
 //! one row, so the largest row must fit a frame by itself.
@@ -187,19 +186,6 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         String::from_utf8_lossy(&out.stderr)
     );
     same_rows("tail --since", &tailed, &sent);
-
-    // 3. `board --json` folds the whole room.
-    let board = bob.vox(None, &["room", "board", r, "--json"]);
-    assert!(
-        board.ok,
-        "PRODUCT: `vox room board --json` over a large room failed: {board:?}"
-    );
-    assert_eq!(
-        board.json()["schema"],
-        "vox.room.board/1",
-        "PRODUCT: `vox room board --json` over a large room answered another schema: {}",
-        board.stdout
-    );
 }
 
 /// Assert that `got`, the large rows `verb` showed bob, are `sent`: each once, whole and in the

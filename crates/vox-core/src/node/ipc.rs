@@ -677,9 +677,8 @@ impl Request {
                 Ok(Request::Order { channel_id })
             }
             // The unpaged form (no `after`), as any release before #189 sends it: read as the first
-            // page. Refused, a worker on an older release died at its first room lookup with
-            // "ipc request unknown tag" and never reached the version check that exists to refuse it
-            // by name (ADR-021 M21.1, work_version_proof).
+            // page. Refused, a client on an older release died at its first room lookup with
+            // "ipc request unknown tag" (ADR-021 M21.1).
             (T_ROOMS_REQ, 1) => {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;

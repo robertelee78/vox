@@ -41,9 +41,8 @@ test-knobs = ["vox-core/test-knobs"]
 
 [dependencies]
 vox-core = { path = "../vox-core" }
-# The app tier (ADR-020 §1). `vox room claim|release|handoff|board` are this crate's
-# vocabulary and claim resolver made reachable from the product; without this
-# dependency the model exists and nothing can use it.
+# The app tier (ADR-020 §1): the agent-comms envelope, operation ids and version stamps that
+# `vox room post` and the drain hook use.
 vox-agentcomms = { path = "../vox-agentcomms" }
 ratatui.workspace = true
 crossterm.workspace = true

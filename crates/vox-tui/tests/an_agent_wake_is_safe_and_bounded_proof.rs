@@ -1,5 +1,5 @@
-//! V210-79 — **an agent's wake is safe, and claims and loops are bounded**, through the
-//! shipped `vox` binary: two `vox daemon`s, `vox room post`, `vox room claim` and the real
+//! V210-79 — **an agent's wake is safe, and loops are bounded**, through the
+//! shipped `vox` binary: two `vox daemon`s, `vox room post` and the real
 //! drain hook `vox agent hook`, plus — for what a model is actually shown — a live OpenCode
 //! server and a real model turn.
 //!
@@ -37,7 +37,9 @@
 //!    does not. A forged reply that writes itself a fresh budget of 8 does not wake him either.
 //!    Bob's session reads its room after each wake, as its harness does, so no notice is held
 //!    outstanding.
-//! 4. **A claim taken and lapsed between two drains is reported** at the next drain.
+//! 4. (Retired with Vox's claims, V030-26: a claim lapsing between two drains was reported.)
+//!    Case 1's urgent ask is work-bound instead (`--work <awa key>`): asking about a task is an
+//!    ordinary message now, and it must still wake its addressee.
 //! 5. **Two session names that differ only in unsafe characters are two sessions**:
 //!    `agent.1` and `agent1` each drain a message posted after both last drained.
 //! 6. **Live — not run until a sandbox lands** (safety stop, 2026-10-02): only a build with the
@@ -51,8 +53,8 @@
 //!    claude-haiku-4-5 still answered OTHER (2026-09-29), so that answer cannot tell the
 //!    fix from the defect, and only what the model was shown is the claim.
 //!
-//! **Mutation.** Restore the defects in the product — the wake carries the body, the claim
-//! verb records nothing, `judge` ignores `hops` and a reply keeps the default, ended sessions
+//! **Mutation.** Restore the defects in the product — the wake carries the body, `judge`
+//! ignores `hops` and a reply keeps the default, ended sessions
 //! are never forgotten, and `sanitize` only drops characters — and each numbered case goes red
 //! at its own assertion: every case runs and is reported before the test fails, so one mutant
 //! shows every red.
@@ -329,7 +331,17 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         alice,
         "alice-s",
         r,
-        &["--type", "ask", "--to", "bob", "--urgent"],
+        // A work-bound ask: Vox has no claims (V030-26), so asking about a task is an
+        // ordinary message carrying awa's work key, and it must still wake its addressee.
+        &[
+            "--type",
+            "ask",
+            "--to",
+            "bob",
+            "--urgent",
+            "--work",
+            "gwa:robertelee78/vox:RELEASE-HARDENING:V030-26",
+        ],
         forged,
     );
     let got = collect(&inbox, Duration::from_secs(60), |g| {
@@ -618,23 +630,6 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         &mut failures,
         !forged_woke,
         "(3) a reply that writes itself a fresh budget must not wake anyone".to_owned(),
-    );
-
-    // ---- (4) a claim taken and lapsed between two drains is reported ----
-    let _ = drain(bob, r, "s-claim"); // the drain before the claim: it holds nothing
-    let o = bob.vox(
-        Some("s-claim"),
-        &["room", "claim", r, "brief", "--ttl", "2"],
-    );
-    assert!(o.ok, "PRODUCT (staging): s-claim must win `brief`: {o:?}");
-    std::thread::sleep(Duration::from_secs(4));
-    let told = drain(bob, r, "s-claim");
-    let reported = told.contains("Your room claim on `brief` lapsed");
-    println!("[proof] (4) a claim made and lapsed between drains reported: {reported}");
-    check(
-        &mut failures,
-        reported,
-        format!("(4) the lapse of a claim made between drains must be reported: {told:?}"),
     );
 
     // ---- (5) names that differ only in unsafe characters are two sessions ----

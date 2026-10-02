@@ -132,137 +132,6 @@ fn save_read(
     .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
-/// Where a session records the claims it held at its last drain (ADR-021 M21.9): under
-/// the cursors, in a directory of its own, one resource per line.
-///
-/// **Not beside the cursor.** It was `<cursor>.held`, and a file is written through
-/// `<path with extension "tmp">`, so the cursor and the held record shared one temp path:
-/// two writers at once could publish one's bytes under the other's name (V210-79).
-fn held_file(paths: &Paths, room: &str, session: &str) -> std::path::PathBuf {
-    under_cursors(paths, room, session, HELD_DIR)
-}
-
-/// `session`'s file for `room` in the directory `dir` under the cursors, named as its cursor is.
-fn under_cursors(paths: &Paths, room: &str, session: &str, dir: &str) -> std::path::PathBuf {
-    let cursor = paths.cursor_file(room, session);
-    let name = cursor.file_name().map(std::ffi::OsStr::to_owned);
-    paths
-        .cursor_dir()
-        .join(dir)
-        .join(name.unwrap_or_else(|| dir.into()))
-}
-
-/// The directory, under the cursors, holding each session's held claims.
-const HELD_DIR: &str = "held";
-
-fn load_held(paths: &Paths, room: &str, session: &str) -> std::collections::BTreeSet<String> {
-    std::fs::read_to_string(held_file(paths, room, session))
-        .map(|t| {
-            t.lines()
-                .filter(|l| !l.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn save_held(
-    paths: &Paths,
-    room: &str,
-    session: &str,
-    held: &std::collections::BTreeSet<String>,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(paths.cursor_dir().join(HELD_DIR))?;
-    let body: String = held.iter().map(|r| format!("{r}\n")).collect();
-    vox_core::node::paths::write_private_file_unique(
-        &held_file(paths, room, session),
-        body.as_bytes(),
-    )
-    .map_err(|e| std::io::Error::other(e.to_string()))
-}
-
-/// Record that `session` now holds `resource`, **when the claim is made** (V210-79).
-///
-/// The drain compares what the session held at its last drain with what it holds now, so a
-/// claim taken after one drain and lapsed before the next was in neither set and its loss was
-/// never said. A verb that leaves the session holding a resource adds it here; the next drain
-/// then either still finds it held or reports it lost. Best effort, like the drain's own
-/// record: failing to write only means the lapse goes unreported, which is said on stderr.
-pub(crate) fn note_held(paths: &Paths, room: &str, session: &str, resource: &str) {
-    let mut held = load_held(paths, room, session);
-    if held.insert(resource.to_owned()) {
-        if let Err(e) = save_held(paths, room, session, &held) {
-            eprintln!("vox: could not record that this session holds `{resource}`: {e}");
-        }
-    }
-}
-
-/// What every lapse notice ends with: where the truth is, and what to do with the news.
-const LAPSE_POINTER: &str = "A room claim records nothing: the work item's GitHub issue says \
-     who holds the task (its open attempt). Check the issue, and say in the room what you are doing.";
-
-/// **The room claims this session no longer holds, and why** (ADR-021 M21.9).
-///
-/// A lapse ends a session's room claim without any message addressed to it, so the drain says
-/// so. **It is information, never an order** (V210-131): a room claim records nothing — the
-/// work item's GitHub issue, maintained through awa, is the only record of who holds a task —
-/// so the notice points at the issue and never tells the agent to stop. (A handoff or release is the
-/// holder's own act, so it is not news; once lapsed, the item may already be held by, or
-/// reserved for, someone else, and the notice says which.) Each is told **once**: `prev` is what the session held at its last
-/// drain, and the caller records `now` afterwards. A loss the session caused itself —
-/// its own latest operation on the resource is a `release` or `handoff` — is not
-/// news, and is not reported.
-fn lost_claims(
-    snap: &crate::coord::Snapshot,
-    session: &str,
-    prev: &std::collections::BTreeSet<String>,
-    now: &std::collections::BTreeSet<String>,
-) -> Vec<String> {
-    use vox_agentcomms::claim::{self, State};
-    let own_last = |resource: &str| {
-        snap.posted
-            .iter()
-            .filter(|p| {
-                p.author == snap.me
-                    && p.envelope.from == session
-                    && p.envelope.data.get("resource").and_then(|v| v.as_str()) == Some(resource)
-                    && claim::is_claim_protocol(&p.envelope)
-            })
-            .max_by_key(|p| (p.created_millis, p.entry_hash))
-            .map(|p| p.envelope.kind.clone())
-    };
-    let who = |fp: &[u8; 32], session: &str| format!("{}/{session}", crate::ident::author_id(fp));
-    prev.difference(now)
-        .filter(|r| {
-            !matches!(
-                own_last(r).as_deref(),
-                Some(claim::RELEASE | claim::HANDOFF)
-            )
-        })
-        .map(|r| match snap.fold.resources.get(r.as_str()) {
-            // Only the holder can release or hand off, and those were filtered out
-            // above, so a claim that is gone and not by this session's own act LAPSED
-            // first; what state it is in now is the rest of the news.
-            Some(State::Held { owner, .. }) => format!(
-                "Your room claim on `{r}` lapsed, and {} has since claimed it in the room. \
-                 {LAPSE_POINTER}",
-                who(&owner.author, &owner.session)
-            ),
-            Some(State::Pending {
-                to_fp, to_session, ..
-            }) => format!(
-                "Your room claim on `{r}` lapsed, and it is now reserved in the room for {}. \
-                 {LAPSE_POINTER}",
-                who(to_fp, to_session.as_deref().unwrap_or("any session"))
-            ),
-            None => format!(
-                "Your room claim on `{r}` lapsed (its ttl ran out without a renew). \
-                 {LAPSE_POINTER}"
-            ),
-        })
-        .collect()
-}
-
 /// Whether `row` is this very session's own message: the same author fingerprint
 /// **and** the same session.
 fn is_own(row: &vox_core::node::api::MessageRow, me: Option<Digest32>, session: &str) -> bool {
@@ -743,14 +612,7 @@ async fn drain(
         .cloned()
         .collect();
 
-    // **Coordination refused is said plainly, every turn it holds** (ADR-021 §5): a
-    // session that cannot claim work should learn why before it tries, not from an
-    // exit status in the middle of a task.
     let snap = crate::coord::snapshot(&mut client, channel_id).await.ok();
-    let refused = snap
-        .as_ref()
-        .filter(|s| s.table.refused())
-        .map(|s| crate::coord::refusal(&room_key, &s.table));
 
     // **What is owed to this session goes first** (V030-15, V030-20): the urgent messages
     // addressed to it, and the replies to its posts — what a wake announced. A bounded drain then
@@ -775,34 +637,6 @@ async fn drain(
     };
     let (mut fresh, rest): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|r| owed(r));
     fresh.extend(rest);
-
-    // **What this session held last turn and holds no longer** (M21.9). Without a
-    // snapshot nothing is compared and nothing recorded, so a failed read never
-    // reports a loss that did not happen, nor forgets one that did.
-    let (lost, held_now) = match &snap {
-        Some(snap) => {
-            let now: std::collections::BTreeSet<String> = snap
-                .fold
-                .resources
-                .iter()
-                .filter(|(_, st)| {
-                    matches!(st, vox_agentcomms::claim::State::Held { owner, .. }
-                        if owner.author == snap.me && owner.session == input.session_id)
-                })
-                .map(|(r, _)| r.clone())
-                .collect();
-            let prev = load_held(paths, &room_key, &input.session_id);
-            (lost_claims(snap, &input.session_id, &prev, &now), Some(now))
-        }
-        None => (Vec::new(), None),
-    };
-    let record_held = || {
-        if let Some(now) = &held_now {
-            if let Err(e) = save_held(paths, &room_key, &input.session_id, now) {
-                eprintln!("vox agent hook: could not record held claims: {e}");
-            }
-        }
-    };
 
     // How far the cursor may move: past every row, in arrival order, until the first one this
     // session has not been shown (its own, and those shown ahead before, count as shown). What was
@@ -847,12 +681,9 @@ async fn drain(
             // next turn re-delivers them.
             eprintln!("vox agent hook: could not record the cursor: {e}");
         }
-        // Recorded after emitting, like the cursor: a crash in between repeats the notice
-        // rather than losing it.
-        record_held();
     };
 
-    if fresh.is_empty() && refused.is_none() && lost.is_empty() {
+    if fresh.is_empty() {
         // Nothing new: emit nothing at all rather than "no new messages". An
         // agent's context is not the place for a heartbeat, and a quiet room
         // should cost zero tokens per turn.
@@ -861,19 +692,6 @@ async fn drain(
     }
 
     let mut context = String::new();
-    for line in &lost {
-        context.push_str(line);
-        context.push('\n');
-    }
-    if !lost.is_empty() {
-        context.push('\n');
-    }
-    if let Some(r) = &refused {
-        context.push_str(&format!(
-            "{r}\nUntil then `vox room claim|renew|handoff|release|decline` and \
-             `vox room post --work` exit 3.\n\n"
-        ));
-    }
     // Bounded (PRD-001 D9): what did not fit is delivered next turn, so the cursor
     // moves only as far as everything shown before it.
     context.push_str(&text);

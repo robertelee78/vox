@@ -87,7 +87,7 @@ or blocked obligation MUST be recorded as failing or blocked, never as waived-gr
 
 | Gap | Accepted because | Where it is proved instead |
 |---|---|---|
-| `opencode`: `agent_rehearsal_proof`, `drain_self_filter_proof`, `opencode_plugin_proof`, `tracker_rehearsal_proof` | they drive a live model through a real OpenCode, and CI runners have neither OpenCode nor a model account. The decider chose (2026-09-26) "Only on this Mac": they run with the decider's account on a real Mac. | `scripts/release-gate.sh`, which runs with **no** gap accepted and refuses a tag unless they are green |
+| `opencode`: `agent_rehearsal_proof`, `drain_self_filter_proof`, `opencode_plugin_proof` (`tracker_rehearsal_proof` was deleted with Vox's claims, V030-26) | they drive a live model through a real OpenCode, and CI runners have neither OpenCode nor a model account. The decider chose (2026-09-26) "Only on this Mac": they run with the decider's account on a real Mac. | `scripts/release-gate.sh`, which runs with **no** gap accepted and refuses a tag unless they are green |
 
 **Amended 2026-10-01 (the decider's ruling):** asked whether the release gate should still block a tag on the live-model OpenCode
 proofs, the decider answered "Fully optional". They are optional proofs ("What may block a release,

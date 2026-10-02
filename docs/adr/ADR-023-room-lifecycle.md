@@ -94,8 +94,6 @@ What the code does today (`origin/main` 671527a):
 - **Late arrivals.** An entry from a member who was offline takes its causal position, which may
   be earlier than rows already shown. The UI inserts it there and marks it as arriving late. It
   does not move to the bottom.
-- **Claims.** `seen` gives claims (vox-96's R17 work) a real happens-before: a claim that saw
-  another claim follows it. Only truly concurrent claims fall back to the tie-break.
 - **Size.** A `seen` entry is 32 bytes; 16 are about 0.5 KB, against a 3.4 KB signature.
 
 ### 2. Retention (R6–R10)
@@ -328,9 +326,8 @@ covers only the approver's own messages, as consent always has.
       - Mutation, the fork check skipped for a pruned position: red, frozen `[]` above the
         checkpoint.
 
-- **M23.2** `seen` and the deterministic causal order (decision 1). Proofs 1–2. R17's
-  takeover-after-silence does not need it. Hard-lock claims (PRD-001 §7 Q5) are to be designed on it
-  if the decider answers "wait for certainty". **Built on `prd1/causal-order` (on v0.2.8). Proofs 2
+- **M23.2** `seen` and the deterministic causal order (decision 1). Proofs 1–2. (Vox has no
+  claims since V030-26, so nothing is to be designed on it for claims.) **Built on `prd1/causal-order` (on v0.2.8). Proofs 2
   and 3 DONE through the shipped binary. Proof 1 DONE on in-process nodes; through three daemons it
   is intermittently red for a connectivity defect below the log, so it is NOT marked done there.**
   - The skeleton carries `seen` (≤16 heads of other authors' feeds, strictly ascending) and
@@ -369,8 +366,8 @@ covers only the approver's own messages, as consent always has.
       late post must be shown exactly once", left 2.
   - **`vox room read --hashes` (hidden):** prints `<hash> <clock-ms>` for every held entry, in
     order.
-  - **For claims:** `Dag::happened_before(a, b)` and `ChannelState::happened_before` are the
-    relation R17 is to use; nothing consumes them yet.
+  - `Dag::happened_before(a, b)` and `ChannelState::happened_before` give the causal relation;
+    nothing consumes them yet.
   - **Proof 2 DONE:** `crates/vox-tui/tests/causal_order_proof.rs`
     `a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind`, shipped binary.
     - Bob's clock is −1 h (test-only `VOX_TEST_CLOCK_SKEW_MS`). The answer's stored claimed time is

@@ -77,11 +77,12 @@ friction for this audience can be fixed later.
 - **R15.** Addressing (`to`) **must** use fingerprints on the wire and display keyring names.
 - **R16.** An urgent message **must** wake an idle agent on another node **within seconds**, without
   anyone typing. `vox room tail` and the TUI **must** show messages that arrived by sync.
-- **R17.** Claims: whoever files a work item **must** be able to mark it as needing a hard lock.
-  - Unmarked items may race.
-  - Only the holder releases a claim.
-  - If the holder goes silent, another member may ask to take it over, and the claim transfers when no
-    answer comes within a window.
+- **R17.** Agents coordinate work through the room, and **Vox holds no task state** (the decider,
+  2026-10-02: "github is the authority, vox is the nagging reminder"). Who holds a task is the work
+  item's GitHub issue, maintained through awa; the volunteer takes work by recording its attempt there,
+  and nobody assigns or locks. A takeover after repeated unanswered status asks is a **written rule** in
+  the agent instructions, not code; its numbers are the decider's to set. When two agents both record a
+  start on one issue, the first attempt-start on the issue keeps it.
 - **R18.** Files use a **pull** model. `vox share` **must** serve a file or folder over a room-bound HTTP
   service and announce its name, size and SHA-256. The receiver pulls with any tool (curl, rsync) or with
   Vox.
