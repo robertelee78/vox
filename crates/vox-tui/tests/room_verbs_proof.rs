@@ -25,6 +25,16 @@
 //!   running, an unknown room, a malformed cursor.
 //!
 //! Production Argon2id once at setup; `#[ignore]`d in the debug suite.
+//!
+//! **A room is made and posted to in a debug build too**
+//! ([`a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running`], not ignored, so the debug
+//! suite runs it; V210-127, #341): a debug `vox daemon` aborted on `vox room create` with "thread
+//! 'tokio-rt-worker' has overflowed its stack". A debug build gives every future an async fn awaits
+//! a stack slot of its own, and the actor's dispatchers await dozens, so their poll frames came to
+//! about 815 KiB (`handle_net`) and 471 KiB (`Node::run`), and signing the new room's records on
+//! top of them passed the 2 MiB worker stack. The actor's large steps are boxed where they are made
+//! (`Boxed` in `node/actor.rs`). Mutation that must turn it red: those steps awaited unboxed
+//! again.
 
 #![cfg(unix)]
 
@@ -260,4 +270,86 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     let (ok, _, err) = vox(&data, &cfg, &["room", "post", &room_prefix, "   "], None);
     assert!(!ok, "an empty message should be refused");
     assert!(err.contains("empty"), "got: {err}");
+}
+
+/// A debug `vox daemon` makes a room, takes a post into it, and is still running afterwards. A red
+/// is PRODUCT and quotes the daemon's own stderr (an abort there says "has overflowed its stack").
+#[test]
+fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
+    // `vox id` and the daemon's unlock, and the room key's seal: three Argon2id runs.
+    watchdog::arm_for_setup(0, 3);
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let cfg = tmp.path().join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let pass = tmp.path().join("identity.pass");
+    std::fs::write(&pass, "identity passphrase").unwrap();
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &["id", "--identity-passphrase-file", pass.to_str().unwrap()],
+        None,
+    );
+    assert!(ok, "CANNOT MEASURE (staging not achieved): vox id: {err}");
+    let daemon_err = tmp.path().join("daemon.err");
+    let mut node = daemon(&data, &cfg, &pass, &daemon_err);
+    let said = |what: &str| {
+        format!(
+            "{what}. The daemon said:\n{}",
+            std::fs::read_to_string(&daemon_err).unwrap_or_default()
+        )
+    };
+
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &["room", "create", "--name", "made-in-debug"],
+        Some("channel passphrase"),
+    );
+    assert!(
+        ok,
+        "{}",
+        said(&format!("PRODUCT: vox room create failed: {err}"))
+    );
+    let (ok, out, err) = vox(&data, &cfg, &["room", "list"], None);
+    let room = out
+        .lines()
+        .find(|l| l.contains("made-in-debug"))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_owned);
+    let Some(room) = room.filter(|_| ok) else {
+        panic!(
+            "{}",
+            said(&format!(
+                "PRODUCT: the daemon does not list the room it made: {out}{err}"
+            ))
+        );
+    };
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &["room", "post", &room, "posted in debug"],
+        None,
+    );
+    assert!(
+        ok,
+        "{}",
+        said(&format!("PRODUCT: vox room post failed: {err}"))
+    );
+    let (ok, read, err) = vox(&data, &cfg, &["room", "read", &room], None);
+    assert!(
+        ok && read.lines().any(|l| l.ends_with(" posted in debug")),
+        "{}",
+        said(&format!(
+            "PRODUCT: the post is not in the room: {read}{err}"
+        ))
+    );
+    let exited = node.0.try_wait().ok().flatten();
+    assert!(
+        exited.is_none(),
+        "{}",
+        said(&format!(
+            "PRODUCT: vox daemon exited ({exited:?}) after making a room and a post"
+        ))
+    );
 }
