@@ -2,9 +2,7 @@
 //! between two online nodes whose only path is a relay circuit is delivered, and within R40's
 //! **1 s**.
 //!
-//! Until now the relayed half of R40 was proved only on the NAT simulator
-//! (`vox-core/tests/perf_r40_relayed_chat_gate.rs`), because nothing in the binary forces a relay.
-//! `support/relay.rs` forces one with the product's own `--listen`: a real `vox node` anchor on
+//! Nothing in the binary forces a relay, so `support/relay.rs` forces one with the product's own `--listen`: a real `vox node` anchor on
 //! `[::]`, alice's `vox daemon` on `127.0.0.1`, bob's on `[::1]`. Neither daemon can send a
 //! datagram to the other, so the anchor's circuit is the only path.
 //!
@@ -17,6 +15,13 @@
 //! bob's node over bob's own control socket, polled every [`POLL`]. Printed as min / median / p95
 //! / max for end to end (post launched) and network (post returned); the target is asserted on
 //! every end-to-end sample.
+//!
+//! **A red names its side.** The verdict (a sample at or over the bar) is PRODUCT, quoting the
+//! samples. A `vox` command that fails while the scene is set (an identity, a daemon, a room, an
+//! invite, a join, a trust, the warm-up), or a sample that never arrives, is the product failing:
+//! PRODUCT (staging). The anchor's circuit count (`support/relay.rs`) says CANNOT MEASURE when
+//! the split did not make the pair relayed, and PRODUCT when the control was not direct. The
+//! test's own files, processes, pipes, runtime and its reader on bob's socket are APPARATUS.
 //!
 //! ## Mutation knobs (test-side only)
 //!
@@ -72,12 +77,13 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(text.as_bytes()).expect("write");
+        let mut pipe = child.stdin.take().expect("APPARATUS: vox's stdin");
+        pipe.write_all(text.as_bytes())
+            .expect("APPARATUS: write to vox's stdin");
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -96,7 +102,7 @@ fn until(dir: &std::path::Path, what: &str, args: &[&str], ok: impl Fn(&str) -> 
         last = format!("stdout={out:?} stderr={err:?}");
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}; last saw {last}");
+    panic!("PRODUCT (staging): timed out waiting for {what}; vox last said {last}");
 }
 
 /// A daemon, killed by its own PID however the test ends, stderr drained.
@@ -119,9 +125,10 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn a daemon");
-    let mut pipe = child.stdin.take().expect("stdin");
-    pipe.write_all(format!("{IDPASS}\n").as_bytes()).unwrap();
+        .expect("APPARATUS: spawn a daemon");
+    let mut pipe = child.stdin.take().expect("APPARATUS: the daemon's stdin");
+    pipe.write_all(format!("{IDPASS}\n").as_bytes())
+        .expect("APPARATUS: write the daemon's passphrase");
     drop(pipe);
     let said = Arc::new(Mutex::new(String::new()));
     for stream in [
@@ -146,7 +153,7 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
                     Ok(0) | Err(_) => return,
                     Ok(n) => sink
                         .lock()
-                        .unwrap()
+                        .expect("APPARATUS: the daemon's output buffer")
                         .push_str(&String::from_utf8_lossy(&buf[..n])),
                 }
             }
@@ -154,11 +161,16 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
     }
     let d = Daemon(child, said);
     let deadline = Instant::now() + Duration::from_secs(90);
-    while !d.1.lock().unwrap().contains("control socket") {
+    while !d
+        .1
+        .lock()
+        .expect("APPARATUS: the daemon's output buffer")
+        .contains("control socket")
+    {
         assert!(
             Instant::now() < deadline,
-            "a daemon never served its socket:\n{}",
-            d.1.lock().unwrap()
+            "PRODUCT (staging): a daemon never served its socket:\n{}",
+            d.1.lock().map(|s| s.clone()).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -194,17 +206,17 @@ fn uptime() -> String {
 fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Duration>) {
     let inject = env_ms("VOX_PERF_INJECT_MS").unwrap_or_default();
     eprintln!("uptime at start: {}", uptime());
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let alice_dir = tmp.path().join("alice");
     let bob_dir = tmp.path().join("bob");
     for d in [&alice_dir, &bob_dir] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: a profile directory");
     }
     let mut anchor = Anchor::start(&tmp.path().join("anchor"));
     let mut fps = Vec::new();
     for dir in [&alice_dir, &bob_dir] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         fps.push(out.trim().to_owned());
     }
     let alice = daemon(&alice_dir, "127.0.0.1:0", &anchor.v4_spec);
@@ -216,17 +228,17 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
         &["room", "create", "--name", "chat"],
         Some("room passphrase\n"),
     );
-    assert!(ok, "room create: {err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let listed = until(&alice_dir, "the room", &["room", "list"], |o| {
         o.contains("chat")
     });
     let room = listed
         .split_whitespace()
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .expect("a room id in `room list`")
+        .expect("PRODUCT (staging): a room id in `vox room list`")
         .to_owned();
     let (ok, link, err) = vox(&alice_dir, &["room", "invite", &room], None);
-    assert!(ok, "invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, _, err) = vox(
         &bob_dir,
         &["room", "join", link.trim(), "--name", "chat"],
@@ -234,16 +246,16 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     );
     assert!(
         ok,
-        "CANNOT MEASURE ({split:?}): bob could not join — {err}\nalice:\n{}\nbob:\n{}",
-        alice.1.lock().unwrap(),
-        bob.1.lock().unwrap()
+        "PRODUCT (staging) ({split:?}): bob could not join — {err}\nalice:\n{}\nbob:\n{}",
+        alice.1.lock().map(|s| s.clone()).unwrap_or_default(),
+        bob.1.lock().map(|s| s.clone()).unwrap_or_default()
     );
     for (dir, fp, name) in [(&alice_dir, &fps[1], "bob"), (&bob_dir, &fps[0], "alice")] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(ok, "trust add {name}: {err}");
+        assert!(ok, "PRODUCT (staging): vox trust add {name}: {err}");
     }
     let (ok, _, err) = vox(&alice_dir, &["room", "post", &room, "warm-up"], None);
-    assert!(ok, "warm-up post: {err}");
+    assert!(ok, "PRODUCT (staging): the warm-up vox room post: {err}");
     until(
         &bob_dir,
         "the warm-up to cross",
@@ -254,23 +266,23 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .expect("APPARATUS: a tokio runtime");
     let bob_paths = vox_core::node::paths::Paths::resolve(
         "default",
         Some(&bob_dir),
         Some(&bob_dir.join("cfg")),
     )
-    .unwrap();
+    .expect("APPARATUS: bob's profile paths");
     let mut reader = rt
         .block_on(IpcClient::open(&bob_paths.socket_file()))
-        .expect("attach to bob's node");
+        .expect("APPARATUS: the reader could not attach to bob's node");
     let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms
             .iter()
             .map(|(id, _, _)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(&room))
-            .expect("the room on bob's node"),
-        other => panic!("rooms: {other:?}"),
+            .expect("PRODUCT (staging): the room is not open on bob's node"),
+        other => panic!("APPARATUS: the reader's room list on bob's node: {other:?}"),
     };
     let readable = |reader: &mut IpcClient, text: &str| -> bool {
         match rt.block_on(reader.read_rows(channel_id, None)) {
@@ -288,13 +300,13 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
         std::thread::sleep(inject);
         let (ok, _, err) = vox(&alice_dir, &["room", "post", &room, &text], None);
         let posted = Instant::now();
-        assert!(ok, "post {i}: {err}");
+        assert!(ok, "PRODUCT (staging): vox room post {i}: {err}");
         let deadline = t0 + Duration::from_secs(60);
         while !readable(&mut reader, &text) {
             assert!(
                 Instant::now() < deadline,
-                "sample {i} never arrived on bob's node within 60 s\nbob:\n{}",
-                bob.1.lock().unwrap()
+                "PRODUCT (staging): sample {i} never arrived on bob's node within 60 s\nbob:\n{}",
+                bob.1.lock().map(|s| s.clone()).unwrap_or_default()
             );
             std::thread::sleep(POLL);
         }
@@ -322,8 +334,8 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_relayed() {
     let over = end_to_end.iter().filter(|d| **d >= target).count();
     assert!(
         max < target,
-        "R40 (relayed): {over} of {SAMPLES} messages took {target:?} or longer end to end; the \
-         slowest took {max:?}"
+        "PRODUCT: R40 (relayed): {over} of {SAMPLES} messages took {target:?} or longer end to \
+         end; the slowest took {max:?}; every sample: {end_to_end:?}"
     );
 }
 
