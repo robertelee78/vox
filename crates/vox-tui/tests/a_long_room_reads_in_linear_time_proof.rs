@@ -97,9 +97,10 @@ const BURST_APPARATUS: Duration = Duration::from_secs(20);
 /// How many messages are sent from the TUI's composer in the long room, one after another
 /// (V210-120).
 const TUI_POSTS: usize = 10;
-/// All of them must be on screen within this: under a second and a half for a run of ten short
-/// messages, which a person sending them expects to see as fast as they type.
-const TUI_ALL: Duration = Duration::from_millis(1_500);
+/// All of them must be on screen within this: a run of ten short messages, which a person sending
+/// them expects to see as fast as they type. Measured (release, a shared machine under load): 0.19
+/// s and 0.24 s; with the whole timeline projected again on every frame, 1.36 s.
+const TUI_ALL: Duration = Duration::from_millis(600);
 /// How many agent turns, and how many `--json` reads, are timed in each room (V210-120).
 const TURNS: usize = 10;
 /// The cap on any one verb, so a stopped node is reported rather than waited on.
