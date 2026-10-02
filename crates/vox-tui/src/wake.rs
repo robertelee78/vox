@@ -716,9 +716,10 @@ pub enum Tended {
 ///   [`Settings::wake_hold`] has not passed. That dedupes, it drops nothing: the message stays
 ///   due, the session's next read carries it, and once the cursor moves or the hold passes it is
 ///   counted again. Counted **now**: one read first is not announced at all.
-/// - **A reply** gets a notice only while the session is idle: one, then one after each wait in
-///   [`Settings::reply_nudges`], then no more. A fresher reply starts the series again, at once,
-///   whatever is outstanding. Read, the series ends.
+/// - **A reply** gets a notice only while the session is idle and no notice is outstanding: one,
+///   then one after each wait in [`Settings::reply_nudges`], then no more. A fresher reply starts
+///   the series again; its first notice too waits for the cursor to move or the hold to pass.
+///   Read, the series ends. So a session has at most one wake outstanding, of either kind.
 pub fn tend(
     n: &mut Notices,
     cursor: Option<String>,
@@ -754,11 +755,12 @@ pub fn tend(
     } else {
         n.urgent_due && !outstanding
     };
+    // **A reply's notice is a wake too** (the plan owner's ruling, 2026-10-02): it obeys the
+    // one-outstanding rule, so a session has at most one wake outstanding of either kind.
     let reply_now = n.reply.is_some()
         && idle
+        && !outstanding
         && match n.reply_sent {
-            // A reply not yet announced is told at once, an outstanding notice or not: the
-            // notice is about this reply, which nothing sent yet has counted.
             0 => true,
             k => s
                 .reply_nudges

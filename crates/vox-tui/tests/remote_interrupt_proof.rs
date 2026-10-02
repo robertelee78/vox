@@ -58,10 +58,12 @@
 //! 1. while the session is **busy** (its turn started and has not ended) — no notice;
 //! 2. at its **end of turn** (Claude Code's `Stop` hook, run as `vox agent hook`, printing
 //!    nothing) — exactly one notice, naming one reply from alice, with no canary byte;
-//! 3. then one after each wait of the schedule, 4 s and then 8 s, and no more: four in all;
+//! 3. then one after each wait of the schedule, **each held while a notice is outstanding**
+//!    (`agent_wake_hold = 6s` here): the 4 s wait becomes 6 s, then 8 s;
 //! 4. **a daemon restart resumes the series**: restarted after the third notice, the fourth still
-//!    comes, no sooner than 12 s after the third, and no fifth;
-//! 5. **a fresh reply starts it again**: one more notice;
+//!    comes, no sooner than 12 s after the third; then no more;
+//! 5. **a fresh reply starts it again**; and a fresh reply's first notice is a wake too: posted
+//!    just after an unread notice, it is announced only once the 6 s hold has passed;
 //! 6. the turn that notice starts reads each answer **once**; and an answer the session read
 //!    before going idle again is **never announced**;
 //! 7. `SessionEnd` removes the registration: a later answer wakes nothing;
@@ -71,7 +73,9 @@
 //!    is back, both are counted in a notice. They reach bob's node by sync after it starts, so
 //!    this does not exercise the daemon's startup count (which guards only a crash between a row
 //!    landing and the next sweep, and is unproven by mutant); it goes red if what arrives after a
-//!    restart is not announced.
+//!    restart is not announced;
+//! 10. **what is not a reply**: an `ack`, `status`, `hello`, `bye`, `ping` or `pong` answering
+//!     the session's question is never announced, and a real answer after them counts one reply.
 //!
 //! (8) of the first test: sixty older messages and one urgent, more than one turn's 50: the turn
 //! the wake starts shows the urgent one first and 49 others, a second urgent wake counts only the
@@ -110,7 +114,7 @@ use support::{until, Worker};
 
 /// A stand-in Claude Code messaging socket: every connection's bytes, as they are written.
 fn listen(path: &std::path::Path) -> mpsc::Receiver<String> {
-    let listener = UnixListener::bind(path).expect("bind the stand-in session socket");
+    let listener = UnixListener::bind(path).expect("APPARATUS: bind the stand-in session socket");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -148,16 +152,18 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
         })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox agent hook");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox agent hook");
     if let Some(input) = stdin {
         child
             .stdin
             .take()
-            .unwrap()
+            .expect("APPARATUS: a piped stdin")
             .write_all(input.as_bytes())
-            .unwrap();
+            .expect("APPARATUS: write the hook input");
     }
-    let out = child.wait_with_output().expect("vox agent hook ran");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: wait for vox agent hook");
     eprintln!(
         "[receipt] vox {} -> {:?}; stderr: {}",
         args.join(" "),
@@ -196,7 +202,7 @@ fn post_text(w: &Worker, room: &str, text: &str) {
 /// Alice posts `text` exactly as given, through `vox room post <room> -` on her daemon.
 fn post(alice: &Worker, room: &str, text: &str) {
     let o = alice.vox_in(None, &["room", "post", room, "-"], Some(text));
-    assert!(o.ok, "alice could not post: {o:?}");
+    assert!(o.ok, "APPARATUS: alice could not post: {o:?}");
 }
 
 /// Everything bob's stand-in session receives within `within`, stopping early once `done`.
@@ -232,7 +238,7 @@ fn contents(frames: &[String]) -> Vec<String> {
 /// takes the rest. Each prompt's text, when it arrived, and whether it was taken.
 fn flaky(path: &std::path::Path, refuse: usize) -> mpsc::Receiver<(Instant, String, bool)> {
     use std::io::{BufRead as _, Write as _};
-    let listener = UnixListener::bind(path).expect("bind the stand-in plugin socket");
+    let listener = UnixListener::bind(path).expect("APPARATUS: bind the stand-in plugin socket");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for (n, stream) in listener.incoming().enumerate() {
@@ -275,6 +281,31 @@ fn next_notice(inbox: &mpsc::Receiver<String>, within: Duration) -> Option<(Inst
         }
     }
     None
+}
+
+/// **Every red names its kind** (decider rule 1). A product verdict says `PRODUCT:`; a staging
+/// or harness failure says `APPARATUS`. Anything else that panics (an `unwrap` or `expect` on a
+/// socket, a file, a process) is this proof's own failure, and this hook says so first.
+fn label_reds() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            if !(message.starts_with("PRODUCT") || message.starts_with("APPARATUS")) {
+                eprintln!(
+                    "APPARATUS (harness error): the panic below is this proof's own, not a \
+                     verdict on the product"
+                );
+            }
+            previous(info);
+        }));
+    });
 }
 
 /// A Claude Code hook input for `event`, for `session`, carrying `prompt` when the event has one.
@@ -329,11 +360,12 @@ fn daemon_err(tmp: &std::path::Path, name: &str) -> String {
 #[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
 fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     watchdog::arm();
+    label_reds();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: a tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
     let room = r.id.clone();
@@ -486,10 +518,16 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let got = contents(&collect(&inbox, Duration::from_secs(30), |g| {
         g.contains("\"user\"")
     }));
+    println!(
+        "[proof] (6) after the session read the first notice, a second urgent message woke it \
+         {} time(s) (the hold is 10 minutes; only the moved cursor can end it)",
+        got.len()
+    );
     assert!(
         got.len() == 1,
-        "APPARATUS (6): a second urgent message, after the first was read, must wake bob \
-         for the outstanding-notice case to mean anything; got {got:?}; bob's daemon:\n{}",
+        "PRODUCT (6): a session that has read its notice (its cursor moved) must be woken by the \
+         next urgent message at once: the hold ends when the cursor moves, not only after 10 \
+         minutes; got {got:?}; bob's daemon:\n{}",
         bob_err()
     );
     let second = got[0].clone();
@@ -557,8 +595,11 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     // An OpenCode plugin's wake socket that accepts and never answers: its wake would wait
     // for ever.
     let wedge_path = tmp.path().join("wedge.sock");
-    let wedge = UnixListener::bind(&wedge_path).expect("bind the wedged session socket");
-    let wedge_url = wedge_path.to_str().unwrap().to_owned();
+    let wedge = UnixListener::bind(&wedge_path).expect("APPARATUS: bind the wedged session socket");
+    let wedge_url = wedge_path
+        .to_str()
+        .expect("APPARATUS: a UTF-8 temporary path")
+        .to_owned();
     std::thread::spawn(move || {
         let mut held = Vec::new();
         for s in wedge.incoming().flatten() {
@@ -728,7 +769,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
             .append(true)
             .open(bob.paths.config_file())
             .expect("APPARATUS: open bob's settings file");
-        writeln!(f, "\nagent_wake_hold = 6s").unwrap();
+        writeln!(f, "\nagent_wake_hold = 6s").expect("APPARATUS: write bob's settings file");
     }
     let flaky_path = tmp.path().join("flaky.sock");
     let attempts = flaky(&flaky_path, 1);
@@ -792,7 +833,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
 
     assert!(
         failures.is_empty(),
-        "{} claim(s) failed:\n- {}",
+        "PRODUCT: {} claim(s) failed:\n- {}",
         failures.len(),
         failures.join("\n- ")
     );
@@ -802,11 +843,12 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
 #[ignore = "an anchor and two vox daemons with production Argon2id, and a daemon restart; CI runs it in release"]
 fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     watchdog::arm();
+    label_reds();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: a tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let mut r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let room = r.id.clone();
     let bob_err = || daemon_err(tmp.path(), "bob");
@@ -817,13 +859,18 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     {
         use std::io::Write as _;
         let cfg = r.workers[1].paths.config_file();
-        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(
+            cfg.parent()
+                .expect("APPARATUS: a settings file has a directory"),
+        )
+        .expect("APPARATUS: create bob's settings directory");
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&cfg)
             .expect("APPARATUS: open bob's settings file");
-        writeln!(f, "\nagent_reply_nudges = 4s 8s 12s").unwrap();
+        writeln!(f, "\nagent_reply_nudges = 4s 8s 12s\nagent_wake_hold = 6s")
+            .expect("APPARATUS: write bob's settings file");
     }
 
     // ---- (8) the entries a person merges into Claude Code's settings ----
@@ -883,7 +930,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     assert!(o.ok, "APPARATUS: asker could not post its question: {o:?}");
     let q = o.json()["entry_hash"]
         .as_str()
-        .expect("`vox room post --json` names the entry")
+        .expect("PRODUCT: `vox room post --json` must name the entry it posted")
         .to_owned();
     until(
         &r.workers[0],
@@ -960,65 +1007,105 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     };
     r.restart(1);
     let fourth = next_notice(&inbox, Duration::from_secs(45));
-    let fifth = fourth
-        .as_ref()
-        .and_then(|_| next_notice(&inbox, Duration::from_secs(20)));
     let gaps: Vec<f64> = [Some(t1), Some(t2), Some(t3), fourth.as_ref().map(|f| f.0)]
         .windows(2)
         .filter_map(|w| Some((w[1]? - w[0]?).as_secs_f64()))
         .collect();
     println!(
-        "[proof] (3)/(4) gaps between notices {gaps:.1?} s (4, 8, 12 due; the daemon restarted \
-         after the third); a fourth {}, a fifth {}",
-        fourth.is_some(),
-        fifth.is_some()
+        "[proof] (3)/(4) gaps between notices {gaps:.1?} s (6, 8, 12 due: the first wait, 4 s, is \
+         held to the 6 s hold, since the session did not read; the daemon restarted after the \
+         third); a fourth {}",
+        fourth.is_some()
     );
     // The tick is 2 s, so a notice comes up to 2 s after it is due.
     let within = |g: f64, due: f64| (due - 0.5..due + 3.0).contains(&g);
     check(
         &mut failures,
-        gaps.len() >= 2 && within(gaps[0], 4.0) && within(gaps[1], 8.0),
-        format!("PRODUCT (3): the notices must follow the schedule, 4 s then 8 s: {gaps:?}"),
+        gaps.len() >= 2 && within(gaps[0], 6.0) && within(gaps[1], 8.0),
+        format!(
+            "PRODUCT (3): the notices must follow the schedule, each held while one is outstanding: \
+             6 s (the 4 s wait, held to the 6 s hold), then 8 s: {gaps:?}"
+        ),
     );
     check(
         &mut failures,
-        gaps.len() == 3 && gaps[2] >= 11.5 && fifth.is_none(),
+        gaps.len() == 3 && gaps[2] >= 11.5,
         format!(
             "PRODUCT (3)/(4): a restarted daemon must resume the series — the fourth notice no \
-             sooner than 12 s after the third, then no more; gaps {gaps:?}, a fifth {:?}; \
-             bob's daemon:\n{}",
-            fifth.map(|f| f.1),
+             sooner than 12 s after the third; gaps {gaps:?}; bob's daemon:\n{}",
             bob_err()
         ),
     );
 
-    // ---- (5) a fresh reply starts the series again ----
-    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-2");
-    let fresh = contents(&collect(&inbox, Duration::from_secs(15), |g| {
-        g.contains("\"user\"")
-    }));
-    println!("[proof] (5) after a fresh reply, asker got {fresh:?}");
+    // ---- (3) then no more: the series has sent its last notice ----
+    let fifth = next_notice(&inbox, Duration::from_secs(14));
+    println!(
+        "[proof] (3) after the fourth: a fifth {:?}",
+        fifth.as_ref().map(|f| &f.1)
+    );
     check(
         &mut failures,
-        fresh.len() == 1 && fresh[0].contains("2 replies to your messages from alice"),
+        fourth.is_some() && fifth.is_none(),
+        format!("PRODUCT (3): after its last wait the series must stop; a fifth {fifth:?}"),
+    );
+
+    // ---- (5) a fresh reply starts the series again, its first notice held like any wake ----
+    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-2");
+    let restart_notice = next_notice(&inbox, Duration::from_secs(15));
+    // Posted at once after that notice, which the session has not read: this fresh reply's first
+    // notice must wait for the 6 s hold, then come.
+    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-2B");
+    let held = next_notice(&inbox, Duration::from_secs(20));
+    let after = match (&restart_notice, &held) {
+        (Some(a), Some(b)) => Some((b.0 - a.0).as_secs_f64()),
+        _ => None,
+    };
+    println!(
+        "[proof] (5) a fresh reply after the series ended: {:?}; another at once after it: {:?}, \
+         {after:.1?} s later (the hold is 6 s)",
+        restart_notice.as_ref().map(|f| &f.1),
+        held.as_ref().map(|f| &f.1)
+    );
+    check(
+        &mut failures,
+        restart_notice
+            .as_ref()
+            .is_some_and(|f| f.1.contains("2 replies to your messages from alice")),
         format!(
             "PRODUCT (5): a fresh reply must start the series again with a notice naming both \
-             replies; got {fresh:?}; bob's daemon:\n{}",
+             replies; got {restart_notice:?}; bob's daemon:\n{}",
             bob_err()
         ),
     );
+    check(
+        &mut failures,
+        held.as_ref()
+            .is_some_and(|f| f.1.contains("3 replies to your messages from alice"))
+            && after.is_some_and(|g| within(g, 6.0)),
+        format!(
+            "PRODUCT (5): a fresh reply's first notice is a wake, held while one is outstanding: \
+             6 s after the unread notice before it; got {held:?}, {after:?} s after it; bob's \
+             daemon:\n{}",
+            bob_err()
+        ),
+    );
+    let fresh: Vec<String> = held.into_iter().map(|f| f.1).collect();
 
     // ---- (6) the notice's turn reads each answer once; one read before idling is never told ----
     let prompt = fresh.first().cloned().unwrap_or_else(|| "a notice".into());
     let read = injected(&event(&r.workers[1], "UserPromptSubmit", Some(&prompt)));
     println!(
-        "[proof] (6) the notice's turn read reply 1 {} time(s), reply 2 {} time(s)",
+        "[proof] (6) the notice's turn read reply 1 {} time(s), reply 2 {} time(s), reply 2B {} \
+         time(s)",
         read.matches("CANARY-REPLY-1").count(),
-        read.matches("CANARY-REPLY-2").count()
+        read.matches("CANARY-REPLY-2:").count(),
+        read.matches("CANARY-REPLY-2B").count()
     );
     check(
         &mut failures,
-        read.matches("CANARY-REPLY-1").count() == 1 && read.matches("CANARY-REPLY-2").count() == 1,
+        read.matches("CANARY-REPLY-1").count() == 1
+            && read.matches("CANARY-REPLY-2:").count() == 1
+            && read.matches("CANARY-REPLY-2B").count() == 1,
         format!("PRODUCT (6): the turn a notice starts must read each answer once: {read}"),
     );
     // Busy now. Another answer lands, and the session reads it before its turn ends.
@@ -1042,6 +1129,53 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
              {after:?}"
         ),
     );
+
+    // ---- (10) acknowledgements, progress and presence are not replies ----
+    // The session is idle and has read everything; each of these answers its question with `re`.
+    for kind in ["ack", "status", "hello", "bye", "ping", "pong"] {
+        post_text(
+            &r.workers[0],
+            &room,
+            &format!(
+                r#"{{"v":1,"from":"alice-s","type":"{kind}","re":"{q}","body":"NOT-A-REPLY-{kind}"}}"#
+            ),
+        );
+    }
+    until(
+        &r.workers[1],
+        None,
+        "the six to reach bob",
+        &["room", "read", &room],
+        |o| o.stdout.contains("NOT-A-REPLY-pong"),
+    );
+    let quiet = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    // Then a real answer, so a notice is seen to come at all, and it counts one reply.
+    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-X");
+    let control = next_notice(&inbox, Duration::from_secs(20)).map(|f| f.1);
+    println!(
+        "[proof] (10) ack/status/hello/bye/ping/pong answering the question: {} notice(s); then a \
+         real answer: {control:?}",
+        quiet.len()
+    );
+    assert!(
+        control.is_some(),
+        "APPARATUS (10): a real answer must bring a notice, or the quiet before it proves \
+         nothing; bob's daemon:\n{}",
+        bob_err()
+    );
+    check(
+        &mut failures,
+        quiet.is_empty()
+            && control
+                .as_ref()
+                .is_some_and(|c| c.contains("1 reply to your messages from alice")),
+        format!(
+            "PRODUCT (10): an ack, status, hello, bye, ping or pong is never announced as a reply, \
+             nor counted in one; got {quiet:?}, then {control:?}"
+        ),
+    );
+    let _ = event(&r.workers[1], "UserPromptSubmit", Some("read"));
+    let _ = event(&r.workers[1], "Stop", None);
 
     // ---- (7) SessionEnd removes the registration ----
     let end = event(&r.workers[1], "SessionEnd", None);
@@ -1093,7 +1227,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     assert!(o.ok, "APPARATUS: late could not post its question: {o:?}");
     let q2 = o.json()["entry_hash"]
         .as_str()
-        .expect("`vox room post --json` names the entry")
+        .expect("PRODUCT: `vox room post --json` must name the entry it posted")
         .to_owned();
     until(
         &r.workers[0],
@@ -1148,7 +1282,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
 
     assert!(
         failures.is_empty(),
-        "{} claim(s) failed:\n- {}",
+        "PRODUCT: {} claim(s) failed:\n- {}",
         failures.len(),
         failures.join("\n- ")
     );
@@ -1158,11 +1292,12 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
 #[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
 fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
     watchdog::arm();
+    label_reds();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: a tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let room = r.id.clone();
     let errs = || {
@@ -1211,7 +1346,7 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
         assert!(o.ok, "APPARATUS: {me} could not post: {o:?}");
         o.json()["entry_hash"]
             .as_str()
-            .expect("`vox room post --json` names the entry")
+            .expect("PRODUCT: `vox room post --json` must name the entry it posted")
             .to_owned()
     };
     for i in 0..2 {
