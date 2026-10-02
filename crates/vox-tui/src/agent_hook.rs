@@ -325,8 +325,9 @@ fn is_line_break(c: char) -> bool {
 /// and a two-line post was indistinguishable from two posts by two people (PRD-001
 /// D9, R19).
 ///
-/// Other control characters are replaced rather than passed through, for the same
-/// reason line breaks are: whatever displays this must not be steered by the text.
+/// Other control characters, and the bidi controls (V210-123), are replaced rather than
+/// passed through, for the same reason line breaks are: whatever displays this must not be
+/// steered by the text.
 fn render_row(out: &mut String, r: &vox_core::node::api::MessageRow) {
     render_attributed(
         out,
@@ -380,7 +381,7 @@ fn render_attributed(out: &mut String, entry: &Digest32, author: &str, text: &st
             out.push_str(CONTINUATION);
             pending_break = false;
         }
-        if c.is_control() && c != '\t' {
+        if vox_agentcomms::envelope::breaks_lines(c) && c != '\t' {
             out.push('\u{fffd}');
         } else {
             out.push(c);
