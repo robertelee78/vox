@@ -221,12 +221,21 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
             && p.timeline.last().map(|r| r.entry_hash)
                 == n.checked_sub(1).map(|i| rows[i].entry_hash)
     };
-    let timeline = match prev.filter(prefix) {
-        Some(p) if p.timeline.len() == rows.len() => p.timeline.clone(),
-        Some(p) => p
-            .timeline
-            .appended(rows[p.timeline.len()..].iter().map(row_of)),
-        None => rows.iter().map(row_of).collect(),
+    // The structured-post index grows with the timeline, from the same rows (V210-120).
+    let (timeline, structured) = match prev.filter(prefix) {
+        Some(p) if p.timeline.len() == rows.len() => (p.timeline.clone(), p.structured.clone()),
+        Some(p) => {
+            let from = p.timeline.len();
+            (
+                p.timeline.appended(rows[from..].iter().map(row_of)),
+                p.structured
+                    .appended(from, rows[from..].iter().map(|r| &r.text)),
+            )
+        }
+        None => (
+            rows.iter().map(row_of).collect(),
+            crate::node::api::StructuredIndex::default().appended(0, rows.iter().map(|r| &r.text)),
+        ),
     };
     ChannelDetail {
         channel_id: ch.channel_id(),
@@ -235,6 +244,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         members: ch.members(),
         timeline,
         order: ch.order_keys(),
+        structured,
         services: ch
             .services()
             .iter()

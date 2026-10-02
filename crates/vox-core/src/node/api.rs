@@ -75,7 +75,8 @@ pub struct MessageRow {
 /// V030-10).
 pub const NOT_RECEIVED_YET: &str = "(not received yet)";
 
-/// A room's rendered timeline as the view carries it, oldest first (V210-120).
+/// Rows the view carries, oldest first, in shared chunks (V210-120): a room's timeline, and the
+/// positions of its structured posts.
 ///
 /// **A new message costs what it adds, not what came before it.** Each new row was published by
 /// rebuilding the room's whole timeline, so the work a node did per message grew with the room's
@@ -84,13 +85,25 @@ pub const NOT_RECEIVED_YET: &str = "(not received yet)";
 /// into larger ones only up to [`Timeline::CHUNK`] rows, and a full chunk is never copied again.
 /// So an append copies at most a chunk's worth of rows, and a clone of the view copies one pointer
 /// per chunk.
-#[derive(Clone, Default)]
-pub struct Timeline {
-    chunks: Vec<std::sync::Arc<[MessageRow]>>,
+#[derive(Clone)]
+pub struct Chunks<T> {
+    chunks: Vec<std::sync::Arc<[T]>>,
     len: usize,
 }
 
-impl Timeline {
+/// A room's rendered timeline: [`Chunks`] of its rows.
+pub type Timeline = Chunks<MessageRow>;
+
+impl<T> Default for Chunks<T> {
+    fn default() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<T: Clone> Chunks<T> {
     /// The most rows a chunk holds before it is frozen.
     pub const CHUNK: usize = 1024;
 
@@ -107,12 +120,12 @@ impl Timeline {
     }
 
     /// Every row, oldest first.
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &MessageRow> + '_ {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + '_ {
         self.chunks.iter().flat_map(|c| c.iter())
     }
 
     /// Every row from position `start` on, oldest first, skipping whole chunks before it.
-    pub fn iter_from(&self, start: usize) -> impl Iterator<Item = &MessageRow> + '_ {
+    pub fn iter_from(&self, start: usize) -> impl Iterator<Item = &T> + '_ {
         let mut skip = start;
         self.chunks.iter().flat_map(move |c| {
             let from = skip.min(c.len());
@@ -123,7 +136,7 @@ impl Timeline {
 
     /// The row at position `i`, oldest first.
     #[must_use]
-    pub fn get(&self, mut i: usize) -> Option<&MessageRow> {
+    pub fn get(&self, mut i: usize) -> Option<&T> {
         for c in &self.chunks {
             if i < c.len() {
                 return c.get(i);
@@ -135,21 +148,21 @@ impl Timeline {
 
     /// The oldest row.
     #[must_use]
-    pub fn first(&self) -> Option<&MessageRow> {
+    pub fn first(&self) -> Option<&T> {
         self.chunks.first().and_then(|c| c.first())
     }
 
     /// The newest row.
     #[must_use]
-    pub fn last(&self) -> Option<&MessageRow> {
+    pub fn last(&self) -> Option<&T> {
         self.chunks.last().and_then(|c| c.last())
     }
 
     /// This timeline with `rows` added after its newest row. Nothing already held is copied but
     /// the open chunks that the new rows merge into, which are at most [`Self::CHUNK`] rows.
     #[must_use]
-    pub fn appended(&self, rows: impl IntoIterator<Item = MessageRow>) -> Self {
-        let added: std::sync::Arc<[MessageRow]> = rows.into_iter().collect();
+    pub fn appended(&self, rows: impl IntoIterator<Item = T>) -> Self {
+        let added: std::sync::Arc<[T]> = rows.into_iter().collect();
         if added.is_empty() {
             return self.clone();
         }
@@ -163,8 +176,7 @@ impl Timeline {
             if older.len() > newer.len() || older.len() + newer.len() > Self::CHUNK {
                 break;
             }
-            let merged: std::sync::Arc<[MessageRow]> =
-                older.iter().chain(newer.iter()).cloned().collect();
+            let merged: std::sync::Arc<[T]> = older.iter().chain(newer.iter()).cloned().collect();
             next.chunks.pop();
             next.chunks.pop();
             next.chunks.push(merged);
@@ -184,8 +196,8 @@ impl Timeline {
     }
 }
 
-impl FromIterator<MessageRow> for Timeline {
-    fn from_iter<I: IntoIterator<Item = MessageRow>>(rows: I) -> Self {
+impl<T: Clone> FromIterator<T> for Chunks<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(rows: I) -> Self {
         let mut t = Self::default();
         let mut chunk = Vec::with_capacity(Self::CHUNK);
         for row in rows {
@@ -203,26 +215,213 @@ impl FromIterator<MessageRow> for Timeline {
     }
 }
 
-impl<'a> IntoIterator for &'a Timeline {
-    type Item = &'a MessageRow;
-    type IntoIter = Box<dyn DoubleEndedIterator<Item = &'a MessageRow> + 'a>;
+impl<'a, T: Clone> IntoIterator for &'a Chunks<T> {
+    type Item = &'a T;
+    type IntoIter = Box<dyn DoubleEndedIterator<Item = &'a T> + 'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         Box::new(self.iter())
     }
 }
 
-impl PartialEq for Timeline {
+impl<T: Clone + PartialEq> PartialEq for Chunks<T> {
     fn eq(&self, other: &Self) -> bool {
         self.shares_chunks(other) || (self.len == other.len && self.iter().eq(other.iter()))
     }
 }
 
-impl Eq for Timeline {}
+impl<T: Clone + Eq> Eq for Chunks<T> {}
 
-impl std::fmt::Debug for Timeline {
+impl<T: Clone + std::fmt::Debug> std::fmt::Debug for Chunks<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// Where a room's **structured posts** sit in its timeline (V210-120): by `type`, and by
+/// operation id.
+///
+/// A structured post is a body that parses as a JSON object with a string `type`; it may carry an
+/// operation id, a string at `data.op`. Nothing here knows what any `type` or id means: a client
+/// names the types and ids it wants ([`crate::node::ipc::Request::Structured`]) and is served those
+/// rows. A client that needed a room's claims, or the posts under one operation id, read every row
+/// of the room for them, every time, so its work grew with the room's history. Filled as rows are
+/// added, never rebuilt, and shared like the timeline.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct StructuredIndex {
+    /// Positions in the timeline, oldest first, of the posts of each `type`.
+    pub by_type: std::collections::BTreeMap<String, Chunks<u32>>,
+    /// The posts carrying an operation id, by a hash of the id.
+    pub by_op: OpRuns,
+}
+
+impl std::fmt::Debug for StructuredIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StructuredIndex")
+            .field(
+                "by_type",
+                &self
+                    .by_type
+                    .iter()
+                    .map(|(t, c)| (t, c.len()))
+                    .collect::<Vec<_>>(),
+            )
+            .field("by_op", &self.by_op.len())
+            .finish()
+    }
+}
+
+/// `(hash of an operation id, position)` pairs in sorted runs, each run sorted by hash.
+///
+/// A new post's pair becomes a run of one, and the newest two runs merge while the older is no
+/// longer than the newer, as a binary counter carries: so there are about log2(n) runs, an append
+/// does amortized O(log n) work, a lookup is a binary search in each run, and a clone copies one
+/// pointer per run. (The ids are many, one or a few per post, so a map of them would be copied
+/// whole on every append the view is shared across.)
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct OpRuns {
+    runs: Vec<std::sync::Arc<[(u64, u32)]>>,
+    len: usize,
+}
+
+impl OpRuns {
+    /// How many pairs.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether there are none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// These runs with `pairs` added.
+    #[must_use]
+    pub fn appended(&self, mut pairs: Vec<(u64, u32)>) -> Self {
+        if pairs.is_empty() {
+            return self.clone();
+        }
+        pairs.sort_unstable();
+        let mut next = self.clone();
+        next.len += pairs.len();
+        next.runs.push(pairs.into());
+        while let [.., older, newer] = next.runs.as_slice() {
+            if older.len() > newer.len() {
+                break;
+            }
+            let mut merged: Vec<(u64, u32)> = Vec::with_capacity(older.len() + newer.len());
+            let (mut i, mut j) = (0, 0);
+            while i < older.len() && j < newer.len() {
+                if older[i] <= newer[j] {
+                    merged.push(older[i]);
+                    i += 1;
+                } else {
+                    merged.push(newer[j]);
+                    j += 1;
+                }
+            }
+            merged.extend_from_slice(&older[i..]);
+            merged.extend_from_slice(&newer[j..]);
+            next.runs.pop();
+            next.runs.pop();
+            next.runs.push(merged.into());
+        }
+        next
+    }
+
+    /// The positions of the posts whose id hashes to `hash`, in no order. A hash can collide, so
+    /// a caller checks the id itself.
+    #[must_use]
+    pub fn find(&self, hash: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        for run in &self.runs {
+            let from = run.partition_point(|(h, _)| *h < hash);
+            out.extend(
+                run[from..]
+                    .iter()
+                    .take_while(|(h, _)| *h == hash)
+                    .map(|(_, p)| *p),
+            );
+        }
+        out
+    }
+}
+
+impl std::fmt::Debug for OpRuns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OpRuns({} in {} runs)", self.len, self.runs.len())
+    }
+}
+
+/// The hash an operation id is indexed by: FNV-1a, 64 bits. Not a security boundary: a collision
+/// only serves a client a row it then discards.
+#[must_use]
+pub fn op_hash(op: &str) -> u64 {
+    op.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// A structured post's `type` and operation id, or `None` for any other body.
+#[must_use]
+pub fn structured_kind(text: &str) -> Option<(String, Option<String>)> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let kind = value.get("type")?.as_str()?.to_owned();
+    let op = value
+        .get("data")
+        .and_then(|d| d.get("op"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Some((kind, op))
+}
+
+impl StructuredIndex {
+    /// This index with the bodies of the rows at `start..` of a timeline added.
+    #[must_use]
+    pub fn appended<'a>(&self, start: usize, texts: impl IntoIterator<Item = &'a String>) -> Self {
+        let mut by_type: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        let mut ops = Vec::new();
+        for (i, text) in texts.into_iter().enumerate() {
+            let Some((kind, op)) = structured_kind(text) else {
+                continue;
+            };
+            let at = u32::try_from(start + i).unwrap_or(u32::MAX);
+            by_type.entry(kind).or_default().push(at);
+            if let Some(op) = op {
+                ops.push((op_hash(&op), at));
+            }
+        }
+        let mut next = self.clone();
+        for (kind, at) in by_type {
+            let entry = next.by_type.entry(kind).or_default();
+            *entry = entry.appended(at);
+        }
+        next.by_op = next.by_op.appended(ops);
+        next
+    }
+
+    /// The positions of the posts of any type in `types`, and of those whose operation id hashes
+    /// like one in `ops`, oldest first, each once.
+    #[must_use]
+    pub fn positions(&self, types: &[String], ops: &[String]) -> Vec<u32> {
+        let mut out: Vec<u32> = types
+            .iter()
+            .filter_map(|t| self.by_type.get(t))
+            .flat_map(|c| c.iter().copied())
+            .collect();
+        for op in ops {
+            out.extend(self.by_op.find(op_hash(op)));
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 }
 
@@ -245,6 +444,8 @@ pub struct ChannelDetail {
     /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
     /// sequence restricted to rendered rows.
     pub order: Vec<(Digest32, u64)>,
+    /// Where its structured posts sit in `timeline`, by `type` (V210-120).
+    pub structured: StructuredIndex,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
