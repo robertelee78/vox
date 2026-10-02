@@ -41,6 +41,15 @@
 //!   it is **named and not implemented**. A registration for it is written and
 //!   waking it reports plainly that it cannot, rather than failing silently or
 //!   pretending.
+//!
+//! ## What a wake says, and when (V030-15, V030-20)
+//!
+//! A wake is a **notice**: how many urgent messages and replies wait, from whom, in which room,
+//! and never a byte of any of them (`agent_hook::render_wake`). The messages arrive once, in the
+//! drain of the turn the notice starts. The daemon counts what is owed just before it sends
+//! ([`unread`], [`tend`]), keeps at most one notice outstanding, and announces an unread reply to
+//! an idle session on a schedule ([`Settings`]). What it owes each session is kept in
+//! [`Notices`], beside the registration, so a restart resumes it.
 
 use std::path::Path;
 

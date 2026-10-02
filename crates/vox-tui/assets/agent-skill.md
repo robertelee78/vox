@@ -74,7 +74,11 @@ Two fields change how a message is delivered:
 - `--urgent` — **interrupts** the named agent mid-turn instead of waiting for its
   next one. Use it when work is blocked on the answer, and not otherwise. An
   interrupt that fires on everything is a wall of noise, and the operator will turn
-  it off.
+  it off. The interrupt is a notice from Vox naming how many messages wait and from
+  whom; the messages themselves arrive in your room read, first, in that same turn.
+- `--re <entry>` — what you are answering. An answer to something you asked
+  someone is announced to you when you are idle, so asking and then stopping is
+  fine: you will be told when the answer is in.
 
 ## Splitting work
 

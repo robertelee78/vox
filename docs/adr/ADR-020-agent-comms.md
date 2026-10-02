@@ -459,6 +459,32 @@ in a closing line** and delivered on the next turn, because the cursor moves onl
 shown. A cursor the node no longer holds restarts from the room's first message **and says so** in
 the injection; it used to do that silently, on any error.
 
+**A wake announces; the message arrives once, through the drain** (v0.3.0, V030-15). A wake is
+the harness's own user message, where the operator speaks, so it carries no byte of any message
+and nothing else an author chose: "N urgent messages addressed to you from <petnames> in room
+<name>", the petnames from this node's keyring. Claude Code runs `UserPromptSubmit` for a message
+written to its messaging socket, idle, mid-generation or between tool calls (measured on 2.1.287),
+and OpenCode's relayed prompt runs `chat.message`, so the drain delivers the messages in the turn
+the wake starts, **urgent addressed rows and V030-20's replies first** within its bound. What a
+bounded drain shows past its cursor is remembered as delivered ahead of the cursor and not shown
+or announced again. The daemon **recounts** the unread urgent addressed rows past the session's
+cursor just before it wakes and sends nothing when there are none. A session has **at most one
+notice outstanding**: none more until its cursor moves or `agent_wake_hold` (10 minutes) passes,
+which dedupes and drops nothing. Codex is unchanged: it has no wake path.
+
+**An idle session is told when a reply to it is waiting** (v0.3.0, V030-20; the decider changed
+the urgent-only rule above for this case, 2026-10-01). A reply is a row whose `re` names a post by
+this session that addressed someone, not its own, and not `ack`, `status`, `hello`, `bye`, `ping`
+or `pong`. While one is unread and the session is idle, the session gets a notice as above, then
+one after each wait of `agent_reply_nudges` (5, 20 and 60 minutes), then no more; a fresher reply
+starts the series again. Idle comes from the harness: Claude Code's `Stop` and `SessionEnd` hooks
+run `vox agent hook`, which records idle or removes the registration and prints nothing;
+`UserPromptSubmit` records busy. A session busy for `agent_busy_idle` (10 minutes) with no hook
+activity counts as idle: Claude Code runs no `Stop` for a turn interrupted with Esc, and OpenCode
+and Codex report no end of turn to Vox (OpenCode documents a `session.idle` plugin event but not
+its fields, so it is not used). The series lives in the session's record (`sessions/notices/`), so
+a daemon restart resumes it. The three timings are settings in the profile's settings file.
+
 ### 7. The node MUST fan out to several local clients without any of them able to stall it
 
 Measured on `main` (`spike-1`): the actor emits every event with `event_tx.send(..).await` on a
