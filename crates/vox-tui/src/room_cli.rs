@@ -332,9 +332,13 @@ pub async fn post_cmd(
             if env.urgent && env.re.is_none() {
                 if let Some(session) = coord::session(opts.coord.session.as_deref()) {
                     let (mut client, cid, room_key) = open_room(paths, room).await?;
-                    let snap = coord::snapshot(&mut client, cid).await?;
-                    let open =
-                        crate::wake::open_wakes(paths, &session, &room_key, &snap.rows, &snap.me);
+                    let me = client
+                        .me()
+                        .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?;
+                    // The wakes and what followed the oldest of them (V210-120).
+                    let rows =
+                        coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
+                    let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &me);
                     if !open.is_empty() {
                         return Err(AppError::Usage(format!(
                             "refusing a raw urgent message with no `re` from session {session}: \
@@ -436,9 +440,11 @@ pub async fn post_cmd(
     // have been renewed, re-taken or failed since, and a different id would make the retry
     // a conflict rather than the same message.
     if let (Some(w), None) = (&work, data.get("attempt")) {
-        let earlier = snap
-            .posted
-            .iter()
+        // A retry's earlier post, read by its operation id (V210-120): the snapshot holds the
+        // coordination posts, not every post an operation id may be on.
+        let earlier = coord::op_group(&mut client, cid, &op)
+            .await?
+            .into_iter()
             .find(|p| p.author == snap.me && vox_agentcomms::ops::op_of(&p.envelope) == Some(&op))
             .and_then(|p| p.envelope.data.get("attempt").cloned());
         let seeded = match snap.fold.resources.get(w) {
@@ -460,7 +466,9 @@ pub async fn post_cmd(
     let re = match &opts.re {
         Some(re) => Some(re.clone()),
         None => {
-            let open = crate::wake::open_wakes(paths, &session, &room_key, &snap.rows, &snap.me);
+            // The wakes and what followed the oldest of them, read from there (V210-120).
+            let rows = coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
+            let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &snap.me);
             match &open[..] {
                 [] => None,
                 [only] => {
@@ -488,6 +496,15 @@ pub async fn post_cmd(
             }
         }
     };
+    // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
+    // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
+    let hops_of_reply = match &re {
+        Some(re) => Some(crate::wake::reply_hops(
+            re,
+            &coord::reply_chain(&mut client, cid, re).await?,
+        )),
+        None => None,
+    };
     let draft = Draft {
         kind,
         to: opts.to.clone(),
@@ -496,9 +513,7 @@ pub async fn post_cmd(
         thread: opts.thread.clone(),
         // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's
         // budget less one, so an urgent reply chain ends at zero instead of looping.
-        hops: re
-            .as_ref()
-            .map(|re| crate::wake::reply_hops(re, &snap.rows)),
+        hops: hops_of_reply,
         body: body.trim_end().to_owned(),
         data,
     };
@@ -508,7 +523,14 @@ pub async fn post_cmd(
     // to this session can land after its last drain and before it reports; the result
     // still posts, and the caller is shown every such message so it can follow up.
     let unread = if is_result {
-        unread_addressed(paths, &room_key, &session, &posting)
+        // What follows this session's drain cursor, read from there (V210-120); the whole room
+        // only if the node no longer holds that cursor.
+        let cursor = crate::agent_hook::load_cursor(paths, &room_key, &session);
+        let after = match coord::read_all(&mut client, cid, cursor).await {
+            Ok(rows) => rows,
+            Err(_) => coord::read_all(&mut client, cid, None).await?,
+        };
+        unread_addressed(&session, &posting, &after)
     } else {
         Vec::new()
     };
@@ -550,10 +572,9 @@ pub async fn post_cmd(
 /// drain cursor, not its own, naming it in `to` — by `VOX_AGENT_NAME`, the name it is
 /// addressed by, or by its session id. The one just posted is excluded.
 fn unread_addressed(
-    paths: &Paths,
-    room_key: &str,
     session: &str,
     posting: &coord::Posting,
+    after_cursor: &[vox_core::node::api::MessageRow],
 ) -> Vec<(String, String, String, String)> {
     let snap = &posting.after;
     let names: Vec<String> = std::iter::once(session.to_owned())
@@ -563,10 +584,7 @@ fn unread_addressed(
                 .filter(|n| !n.trim().is_empty()),
         )
         .collect();
-    let start = crate::agent_hook::load_cursor(paths, room_key, session)
-        .and_then(|c| snap.rows.iter().position(|r| r.entry_hash == c))
-        .map_or(0, |i| i + 1);
-    snap.rows[start..]
+    after_cursor
         .iter()
         .filter(|r| r.entry_hash != posting.entry_hash)
         .filter_map(|r| {
@@ -739,7 +757,15 @@ pub async fn read(
         Some(s) => Some(parse_cursor(s)?),
     };
     if !json {
-        let rows = coord::read_all(&mut client, channel_id, since).await?;
+        // No further than `--limit` (V210-120): a limit was applied only after every row past
+        // the cursor had been read.
+        let take = usize::try_from(limit).unwrap_or(usize::MAX);
+        let Some(rows) = coord::read_upto(&mut client, channel_id, since, take).await? else {
+            return Err(AppError::Usage(format!(
+                "cursor {} is not in this room's timeline",
+                since.map(|c| id(&c)).unwrap_or_default()
+            )));
+        };
         let held_back = equivocations_in(paths, &channel_id).await;
         let mut out = std::io::stdout().lock();
         // **A member held back for equivocating is said first** (V210-63), by the same short id
@@ -752,31 +778,33 @@ pub async fn read(
                 crate::ident::equivocation_notice(&crate::ident::author_id(author), *seq)
             );
         }
-        let take = if limit == 0 {
-            rows.len()
-        } else {
-            usize::try_from(limit).unwrap_or(usize::MAX)
-        };
-        for r in rows.iter().take(take) {
+        for r in &rows {
             let _ = writeln!(out, "{}", plain_row(r));
         }
         return Ok(());
     }
-    // The operation index needs the whole room, not only what follows the cursor: an
-    // entry after it may repeat, or conflict with, one before it.
-    let all = coord::read_all(&mut client, channel_id, None).await?;
-    let from = after_cursor(&all, since)?;
-    let mut ops = vox_agentcomms::ops::OpIndex::new();
-    for p in coord::posted_of(&all) {
-        ops.insert(p.entry_hash, p.author, p.created_millis, &p.envelope);
-    }
-    let take = if limit == 0 {
-        usize::MAX
-    } else {
-        usize::try_from(limit).unwrap_or(usize::MAX)
+    // Only the rows asked for, and only the operations they carry (V210-120). An operation's
+    // verdict needs its whole group, and an entry after the cursor may repeat, or conflict with,
+    // one before it: so each shown row's group is read by its id, from the node's index, rather
+    // than the whole room on every call.
+    let take = usize::try_from(limit).unwrap_or(usize::MAX);
+    let Some(shown) = coord::read_upto(&mut client, channel_id, since, take).await? else {
+        return Err(AppError::Usage(format!(
+            "cursor {} is not in this room's timeline",
+            since.map(|c| id(&c)).unwrap_or_default()
+        )));
     };
+    let mut ids: Vec<String> = shown
+        .iter()
+        .filter_map(|r| Envelope::parse(&r.text).ok())
+        .filter_map(|e| vox_agentcomms::ops::op_of(&e).map(str::to_owned))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let group = coord::structured(&mut client, channel_id, &[], &ids).await?;
+    let ops = coord::index_of(&coord::posted_of(&group));
     let mut out = std::io::stdout().lock();
-    for r in all[from..].iter().take(take) {
+    for r in &shown {
         let _ = writeln!(out, "{}", row_json(&room_key, r, &ops, None));
     }
     Ok(())
@@ -1643,6 +1671,13 @@ pub async fn board(
 ) -> Result<(), AppError> {
     let (mut client, cid, room_key) = open_room(paths, room).await?;
     let snap = coord::snapshot(&mut client, cid).await?;
+    // The board's position is the whole room's: its row count and newest row. A one-off read,
+    // not part of the snapshot every turn takes (V210-120).
+    let all = if json {
+        coord::read_all(&mut client, cid, None).await?
+    } else {
+        Vec::new()
+    };
     let session = coord::session(session).unwrap_or_default();
     let me = Owner {
         author: snap.me,
@@ -1701,8 +1736,8 @@ pub async fn board(
                 "resources": resources,
                 "violations": violations,
                 "position": {
-                    "entries": snap.rows.len(),
-                    "last": snap.rows.last().map(|r| claim::b32(&r.entry_hash)),
+                    "entries": all.len(),
+                    "last": all.last().map(|r| claim::b32(&r.entry_hash)),
                 },
                 "now_millis": snap.now_millis,
             })

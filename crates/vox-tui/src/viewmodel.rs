@@ -129,8 +129,10 @@ pub struct ChannelView {
     pub local_name: String,
     /// The members, in display order.
     pub members: Vec<MemberView>,
-    /// The render-gated timeline, oldest-first.
-    pub timeline: Vec<MessageView>,
+    /// The render-gated timeline, oldest-first. Shared with the core, which adds a new
+    /// message's row to it rather than projecting the whole room again on every frame
+    /// (V210-120).
+    pub timeline: std::sync::Arc<Vec<MessageView>>,
     /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
     /// the name this operator gave them; drawn above the timeline, **each on its own line**.
     pub held_back: Vec<String>,

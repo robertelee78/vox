@@ -40,6 +40,14 @@
 //! cost must not depend on the room's history. A fresh room slower than [`BURST_APPARATUS`] is `APPARATUS`. Mutation: rebuild the whole timeline when a
 //! room's timeline has grown (`detail_of`), as before V210-120: red on the burst assertion.
 //!
+//! **And an agent's turn costs what is new, in a long room (V210-120 c2).** [`TURNS`] runs of
+//! `vox agent hook`, as a harness runs it before each prompt, for a session that has never drained
+//! the room, and [`TURNS`] runs of `vox room read --json --since <a row> --limit 1`, each timed, in
+//! the long room and in the fresh one: the long room's median may be at most one and a half times
+//! the fresh room's plus a quarter second. Mutations: the drain's coordination snapshot reads the
+//! whole room again (`coord::snapshot`); the `--json` read reads the whole room again for its
+//! operation index. Each is red on its own assertion.
+//!
 //! **Mutation that must turn it red.** Copy every room's timeline again on each clone of the view
 //! (and rebuild every room's timeline on each publish), as before V210-71: the read takes many
 //! times longer, past the bound.
@@ -51,6 +59,9 @@ mod watchdog;
 
 #[path = "support/world.rs"]
 mod world;
+
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -77,6 +88,14 @@ const APPEND_MAX: Duration = Duration::from_millis(1_000);
 const BURST: usize = 100;
 /// A fresh room slower than this to show a burst is a machine that cannot measure this.
 const BURST_APPARATUS: Duration = Duration::from_secs(20);
+/// How many messages are sent from the TUI's composer in the long room (V210-120).
+const TUI_POSTS: usize = 10;
+/// Each must be on screen within this, at the median: what a person feels as the screen keeping
+/// up. Measured (release, a shared machine under load): 17 ms; with the whole timeline projected
+/// again on every frame, 121 ms.
+const TUI_P50: Duration = Duration::from_millis(60);
+/// How many agent turns, and how many `--json` reads, are timed in each room (V210-120).
+const TURNS: usize = 10;
 /// The cap on any one verb, so a stopped node is reported rather than waited on.
 const VERB_CAP: Duration = Duration::from_secs(600);
 const SETUP: Duration = Duration::from_secs(120);
@@ -230,6 +249,50 @@ fn burst_to_visible(data: &Path, room: &str, tag: &str, after: &str) -> Duration
     }
 }
 
+/// [`TURNS`] agent turns in `room` for session `session`: each runs `vox agent hook`, as a harness
+/// does before every prompt, and is timed until it exits.
+fn hook_turns(data: &Path, room: &str, session: &str) -> Vec<Duration> {
+    let input =
+        format!("{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"{session}\"}}");
+    (0..TURNS)
+        .map(|_| {
+            let (ok, took, _, err) = vox(
+                data,
+                &["agent", "hook", "--room", room, "--format", "text"],
+                &input,
+            );
+            assert!(ok, "PRODUCT: `vox agent hook` failed in room {room}: {err}");
+            took
+        })
+        .collect()
+}
+
+/// [`TURNS`] calls of `vox room read --json --since <after> --limit 1` in `room`, as an agent
+/// reading the next message does, each timed until it exits and required to print one row.
+fn json_reads(data: &Path, room: &str, after: &str) -> Vec<Duration> {
+    (0..TURNS)
+        .map(|_| {
+            let (ok, took, out, err) = vox(
+                data,
+                &[
+                    "room", "read", room, "--json", "--since", after, "--limit", "1",
+                ],
+                "",
+            );
+            assert!(
+                ok,
+                "PRODUCT: `vox room read --json` failed in room {room}: {err}"
+            );
+            assert_eq!(
+                out.lines().filter(|l| !l.trim().is_empty()).count(),
+                1,
+                "PRODUCT: `vox room read --json --limit 1` printed other than one row: {out}"
+            );
+            took
+        })
+        .collect()
+}
+
 /// The 50th and 95th percentiles and the maximum of `took`.
 fn spread(took: &[Duration]) -> (Duration, Duration, Duration) {
     let mut t = took.to_vec();
@@ -254,17 +317,14 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
-    let _daemon = VoxProc::spawn(
-        "alice",
-        &data,
-        &args(&[
-            "daemon",
-            "--listen",
-            "127.0.0.1:0",
-            "--passphrase-file",
-            pass_file.to_str().unwrap(),
-        ]),
-    );
+    let daemon_args = args(&[
+        "daemon",
+        "--listen",
+        "127.0.0.1:0",
+        "--passphrase-file",
+        pass_file.to_str().unwrap(),
+    ]);
+    let mut daemon = Some(VoxProc::spawn("alice", &data, &daemon_args));
     let deadline = Instant::now() + SETUP;
     while !vox(&data, &["room", "list"], "").0 {
         assert!(
@@ -315,9 +375,12 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     assert!(ok, "PRODUCT: vox room read failed after {took:?}: {err}");
     let seen: Vec<usize> = out
         .lines()
+        // A row is `<entry> <author> <text>`; the number is read from the text, never from the
+        // first " m" in the line, which an author id starting with `m` (1 run in 32) matched
+        // first, so every row was dropped and the read reported 0 messages.
         .filter_map(|l| {
-            let at = l.find(" m")? + 2;
-            l.get(at..at + 6)?.parse().ok()
+            let text = l.splitn(3, ' ').nth(2)?;
+            text.strip_prefix('m')?.get(..6)?.parse().ok()
         })
         .collect();
     let mut sorted = seen.clone();
@@ -370,6 +433,76 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         .to_owned();
     let (long, long_last) = append_to_visible(&data, &room, "long", newest);
     let long_burst = burst_to_visible(&data, &room, "long", &long_last);
+    // ---- V210-120: the TUI keeps up in the long room ------------------------------------
+    // The daemon is stopped and the person opens `vox tui` on the profile instead, and sends
+    // [`TUI_POSTS`] messages from its composer, each timed until the timeline pane shows it.
+    drop(daemon.take());
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_long_room.py");
+    let out = pty_driver::run_within(
+        script,
+        &[
+            VOX,
+            "tuilong",
+            data.to_str().unwrap(),
+            data.join("cfg").to_str().unwrap(),
+            "long",
+            &TUI_POSTS.to_string(),
+            IDENTITY,
+            ROOM_PASS,
+        ],
+        Duration::from_secs(900),
+    );
+    let sent: Vec<Duration> = out
+        .stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("tuilong SENT "))
+        .filter_map(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+        .map(|ms| Duration::from_secs_f64(ms / 1000.0))
+        .collect();
+    match out.code {
+        Some(0) if out.stdout.contains("tuilong PASS") => {}
+        Some(2) => panic!(
+            "APPARATUS (precondition not met): the TUI driver: {}",
+            out.stdout
+        ),
+        _ if !out.has_verdict("tuilong") => panic!(
+            "APPARATUS (watchdog): the TUI driver was stopped before a verdict, at stage {:?} \
+             (exit {:?}): {}",
+            out.stage, out.code, out.stdout
+        ),
+        _ => panic!(
+            "PRODUCT: the TUI did not show a message sent from its composer in the room of \
+             {POSTS} messages (exit {:?}, last stage {:?}): {}",
+            out.code, out.stage, out.stdout
+        ),
+    }
+    assert_eq!(
+        sent.len(),
+        TUI_POSTS,
+        "APPARATUS (precondition not met): the TUI driver timed {} of {TUI_POSTS} messages: {}",
+        sent.len(),
+        out.stdout
+    );
+    let (t50, t95, tmax) = spread(&sent);
+    println!(
+        "[proof] the TUI, sent from its composer until shown, {TUI_POSTS} in the {POSTS}-message \
+         room: p50 {t50:?} p95 {t95:?} max {tmax:?} (bound p50 {TUI_P50:?}); each: {sent:?}"
+    );
+    assert!(
+        t50 < TUI_P50,
+        "PRODUCT: in a room of {POSTS} messages the TUI took p50 {t50:?} (p95 {t95:?}) to show a \
+         message sent from its own composer (bound {TUI_P50:?}): each frame costs the room's \
+         history"
+    );
+    let _restarted = VoxProc::spawn("alice", &data, &daemon_args);
+    let deadline = Instant::now() + SETUP;
+    while !vox(&data, &["room", "list"], "").0 {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS (precondition not met): the daemon never answered after the TUI"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let (ok, _, out, err) = vox(&data, &["room", "create", "--name", "short"], ROOM_PASS);
     assert!(
         ok,
@@ -433,5 +566,38 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         "PRODUCT: a message added to a room of {POSTS} messages took p95 {l95:?}, max {lmax:?} to \
          become readable (bound p95 {APPEND_P95:?}, max {APPEND_MAX:?}); in a fresh room on the \
          same node, p95 {s95:?}, max {smax:?}: each message costs the room's whole history"
+    );
+
+    // ---- V210-120: an agent's turn, and its read of the next message, cost what is new -----
+    // A session that has never drained the room starts behind by all of it; each turn shows a
+    // page and moves on. And an agent reads the next message with `--json`, whose verdicts on
+    // operations need each shown row's operation group.
+    let (long_turns, short_turns) = (
+        hook_turns(&data, &room, "agent-long"),
+        hook_turns(&data, &short_room, "agent-short"),
+    );
+    let (long_json, short_json) = (
+        json_reads(&data, &room, &long_last),
+        json_reads(&data, &short_room, &short_last),
+    );
+    let ((h50, h95, _), (hs50, hs95, _)) = (spread(&long_turns), spread(&short_turns));
+    let ((j50, j95, _), (js50, js95, _)) = (spread(&long_json), spread(&short_json));
+    println!(
+        "[proof] {TURNS} agent turns (`vox agent hook`): the {POSTS}-message room p50 {h50:?} p95 \
+         {h95:?}; a fresh room p50 {hs50:?} p95 {hs95:?}. {TURNS} `vox room read --json --limit 1`: \
+         the {POSTS}-message room p50 {j50:?} p95 {j95:?}; a fresh room p50 {js50:?} p95 {js95:?}"
+    );
+    let turn_allowed = hs50 * 3 / 2 + Duration::from_millis(250);
+    assert!(
+        h50 < turn_allowed,
+        "PRODUCT: an agent's turn in a room of {POSTS} messages took p50 {h50:?}, and {hs50:?} in a \
+         fresh room on the same node (allowed {turn_allowed:?}): each turn costs the room's history"
+    );
+    let json_allowed = js50 * 3 / 2 + Duration::from_millis(250);
+    assert!(
+        j50 < json_allowed,
+        "PRODUCT: `vox room read --json --limit 1` in a room of {POSTS} messages took p50 {j50:?}, \
+         and {js50:?} in a fresh room on the same node (allowed {json_allowed:?}): each read costs \
+         the room's history"
     );
 }
