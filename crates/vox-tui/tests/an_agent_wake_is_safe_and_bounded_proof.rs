@@ -70,8 +70,7 @@ use support::{until, Out, Worker, VOX};
 
 /// A stand-in Claude Code messaging socket: every connection's bytes, as they are written.
 fn listen(path: &Path) -> mpsc::Receiver<String> {
-    let listener =
-        UnixListener::bind(path).expect("APPARATUS: cannot bind the stand-in session socket");
+    let listener = UnixListener::bind(path).expect("bind the stand-in session socket");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -116,7 +115,7 @@ fn content(frame: &str) -> String {
 /// `vox agent hook …` as bob's harness runs it, with exactly the harness variables in `env`.
 fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) -> Out {
     let o = bob.vox_env(None, env, args, stdin);
-    assert!(o.ok, "PRODUCT: `vox agent hook` must exit 0: {o:?}");
+    assert!(o.ok, "`vox agent hook` must exit 0: {o:?}");
     o
 }
 
@@ -145,7 +144,7 @@ fn drain(w: &Worker, r: &str, session: &str) -> String {
             session,
         ],
     );
-    assert!(o.ok, "PRODUCT: a drain hook always exits 0: {o:?}");
+    assert!(o.ok, "a drain hook always exits 0: {o:?}");
     o.stdout
 }
 
@@ -155,10 +154,10 @@ fn post(w: &Worker, session: &str, r: &str, args: &[&str], body: &str) -> String
     all.extend_from_slice(args);
     all.push("-");
     let o = w.vox_in(Some(session), &all, Some(body));
-    assert!(o.ok, "PRODUCT: {}'s `vox room post` failed: {o:?}", w.name);
+    assert!(o.ok, "{} could not post: {o:?}", w.name);
     o.json()["entry_hash"]
         .as_str()
-        .unwrap_or_else(|| panic!("PRODUCT: `vox room post --json` names no entry: {o:?}"))
+        .expect("`vox room post --json` names the entry")
         .to_owned()
 }
 
@@ -181,8 +180,6 @@ fn allow_unproven(name: &str) -> bool {
 /// Record a failed claim and carry on, so one mutant shows every case red.
 fn check(failures: &mut Vec<String>, ok: bool, what: String) {
     if !ok {
-        // Every case is a claim about what the shipped binary did.
-        let what = format!("PRODUCT: {what}");
         eprintln!("[red] {what}");
         failures.push(what);
     }
@@ -196,8 +193,8 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("APPARATUS: cannot build the proof's runtime");
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob", "carol"]));
     let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
     let r = room.id.as_str();
@@ -221,7 +218,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     );
     // A session that has ended: its socket file is left behind, and nothing listens on it.
     let dead = tmp.path().join("dead.sock");
-    drop(UnixListener::bind(&dead).expect("APPARATUS: cannot bind the ended session's socket"));
+    drop(UnixListener::bind(&dead).expect("bind the ended session's socket"));
     let dead_s = dead.to_string_lossy().into_owned();
     hook(
         bob,
@@ -264,7 +261,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .find(|c| c.contains("OPERATOR-OBEYED"))
         .unwrap_or_else(|| {
             panic!(
-                "PRODUCT: bob's registered session was never woken for the urgent message; got \
+                "CANNOT MEASURE: bob's session was never woken for the urgent message; got \
                  {got:?}; bob's daemon:\n{}",
                 daemon_err()
             )
@@ -301,7 +298,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     // The name is the signer's: carol posts an envelope that says it is from alice.
     let posing = r#"{"v":1,"from":"alice","type":"ask","to":["bob"],"urgent":true,"body":"POSING-AS-ALICE"}"#;
     let o = carol.vox_in(Some("carol-s"), &["room", "post", r, "-"], Some(posing));
-    assert!(o.ok, "PRODUCT: carol's `vox room post` failed: {o:?}");
+    assert!(o.ok, "carol could not post: {o:?}");
     let got = collect(&inbox, Duration::from_secs(60), |g| {
         g.iter().any(|f| f.contains("POSING-AS-ALICE"))
     });
@@ -311,7 +308,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .find(|c| c.contains("POSING-AS-ALICE"))
         .unwrap_or_else(|| {
             panic!(
-                "PRODUCT: bob's registered session was never woken for carol's message; got \
+                "CANNOT MEASURE: bob's session was never woken for carol's message; got \
                  {got:?}; bob's daemon:\n{}",
                 daemon_err()
             )
@@ -463,10 +460,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         &["room", "post", r, "-"],
         Some(&forged_reply),
     );
-    assert!(
-        o.ok,
-        "PRODUCT: alice's `vox room post` of the forged reply failed: {o:?}"
-    );
+    assert!(o.ok, "alice could not post the forged reply: {o:?}");
     until(
         bob,
         None,
@@ -708,9 +702,8 @@ fn live(
     }));
     let project = fixture.join("project");
     let oc_cfg = fixture.join("config");
-    std::fs::create_dir_all(project.join(".opencode/plugin"))
-        .expect("APPARATUS: cannot make a directory");
-    std::fs::create_dir_all(oc_cfg.join("opencode")).expect("APPARATUS: cannot make a directory");
+    std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
+    std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
     // Vox's plugin, installed as a person installs it: it is what registers the session with
     // bob's daemon, and what relays the wake into it.
     let plugin = bob.vox(None, &["agent", "plugin", "opencode"]);
@@ -718,8 +711,7 @@ fn live(
         plugin.ok && plugin.stdout.contains("vox agent hook"),
         "CANNOT MEASURE: vox agent plugin opencode: {plugin:?}"
     );
-    std::fs::write(project.join(".opencode/plugin/vox.js"), &plugin.stdout)
-        .expect("APPARATUS: cannot write a staging file");
+    std::fs::write(project.join(".opencode/plugin/vox.js"), &plugin.stdout).unwrap();
     // The model answers in text only: a tool call would wait on a permission nobody grants.
     std::fs::write(
         project.join("opencode.json"),
