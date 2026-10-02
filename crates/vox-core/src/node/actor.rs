@@ -5188,7 +5188,7 @@ impl Node {
                     self.channels
                         .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
                     self.mark_decisions_on_open(&channel_id).await;
-                    self.forget_untrusted_keys(&channel_id).await;
+                    self.act_on_removals_while_closed(&channel_id).await;
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
                     self.publish_channel_locally(&channel_id).await;
@@ -7561,6 +7561,55 @@ impl Node {
     /// Drop, in a room just opened, every sender key held from a member this owner does not trust
     /// (V210-118): one stopped being trusted while the room was closed, or a key taken before this
     /// node refused untrusted keys. Rendered messages stay; nothing more of theirs opens.
+    /// Act, in a room just opened, on every removal from the ring made while it was closed
+    /// (V210-118 amendment): drop the member's keys and change the lock — revoke and rotate, as a
+    /// removal does in an open room — then clear the record. Only a member still untrusted, and
+    /// only where this identity had consented to it: a per-room consent given without trust is
+    /// never recorded here, so it is never revoked on opening.
+    async fn act_on_removals_while_closed(&mut self, channel_id: &Digest32) {
+        self.forget_untrusted_keys(channel_id).await;
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(channel_id).map(Arc::clone),
+        ) else {
+            return;
+        };
+        let Ok(signer) = profile.signer() else {
+            return;
+        };
+        let Ok(mut locks) = crate::node::pending_lock::PendingLocks::load(profile.store(), signer)
+        else {
+            return;
+        };
+        let removed = locks.for_room(channel_id);
+        if removed.is_empty() {
+            return;
+        }
+        let mut owed = Vec::new();
+        {
+            let channel = shared.lock().await;
+            for member in removed {
+                if !self.trust.is_trusted(&member) && channel.has_consented(&member) {
+                    owed.push(member);
+                }
+            }
+        }
+        // The lock changes before the record goes: a failure in between changes it again on the
+        // next open, which narrows nothing that should be read.
+        for member in owed {
+            let _ = self.revoke(channel_id, member).await;
+        }
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        let Ok(signer) = profile.signer() else {
+            return;
+        };
+        if locks.clear_room(channel_id) {
+            let _ = locks.save(profile.store(), signer);
+        }
+    }
+
     async fn forget_untrusted_keys(&mut self, channel_id: &Digest32) {
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
@@ -7596,6 +7645,16 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        // A removal still waiting on a closed room is withdrawn with this decision (V210-118
+        // amendment). Not load-bearing: left behind, it would change the lock on the reopen, and
+        // the consent owed to a trusted member would then be released again.
+        if let Ok(mut locks) =
+            crate::node::pending_lock::PendingLocks::load(profile.store(), signer)
+        {
+            if locks.forget(&fingerprint) {
+                let _ = locks.save(profile.store(), signer);
+            }
+        }
         if newly {
             // The decision's place in the consent order, and where each open room's sender
             // key stands at it (V210-45). A rename is the same decision and keeps its place.
@@ -7644,6 +7703,32 @@ impl Node {
         // a new place in the consent order, and a decision is only read for a trusted identity,
         // so a failure here leaves nothing that could widen a later release.
         let _ = crate::node::consent_order::forget_trust(profile.store(), signer, fingerprint);
+        // **A room that is closed now acts on the removal when it opens** (V210-118 amendment):
+        // its key is not held while it is closed, so neither the lock change nor the key drop
+        // below can reach it. Recorded before the ring is written, so a removal whose record
+        // cannot be kept is refused whole rather than left undone in the closed rooms.
+        let closed: Vec<Digest32> = profile
+            .store()
+            .channels()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| !self.channels.contains_key(c))
+            .collect();
+        if !closed.is_empty() {
+            let mut locks =
+                match crate::node::pending_lock::PendingLocks::load(profile.store(), signer) {
+                    Ok(l) => l,
+                    Err(e) => return Outcome::Failed(fault_of(&e)),
+                };
+            for room in closed {
+                if !locks.insert(room, *fingerprint) {
+                    return Outcome::Failed(Fault::Internal);
+                }
+            }
+            if let Err(e) = locks.save(profile.store(), signer) {
+                return Outcome::Failed(fault_of(&e));
+            }
+        }
         // The ring is written FIRST and unconditionally, exactly as a revocation's
         // log fact lands before its re-keys: if the rotations below cannot all be
         // delivered, the decision must still have been taken. A removal that were
@@ -7653,9 +7738,9 @@ impl Node {
         }
         self.trust = next;
         // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
-        // nothing it posts from now opens on this node. A closed room drops them when it opens.
-        // What was already read stays read. A re-trust is offered its key again, as any member
-        // whose key this node does not hold.
+        // nothing it posts from now opens on this node. A closed room drops them, and changes its
+        // lock, when it opens (recorded above). What was already read stays read. A re-trust is
+        // offered its key again, as any member whose key this node does not hold.
         let trusted = self.trust.trusted();
         let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
         for ch in shared {
@@ -10442,7 +10527,7 @@ impl Node {
         self.channels
             .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         self.mark_decisions_on_open(&channel_id).await;
-        self.forget_untrusted_keys(&channel_id).await;
+        self.act_on_removals_while_closed(&channel_id).await;
         self.adopt_channel_anchors(&channel_id, None).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&channel_id).await;
