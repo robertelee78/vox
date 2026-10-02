@@ -33,7 +33,6 @@ use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
 use crate::governance::capability::{Capability, CapabilitySet};
 use crate::hash::Digest32;
-use crate::identity::composite::CompositePublicKey;
 use crate::nat::bootstrap::{BootstrapNode, BootstrapSet};
 use crate::nat::record::{MemberBundleRecord, RendezvousRecord};
 use crate::node::api::{
@@ -5300,11 +5299,7 @@ impl Node {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             };
-            let members: BTreeMap<Digest32, CompositePublicKey> = ch
-                .author_keys()
-                .into_iter()
-                .map(|k| (k.fingerprint(), k))
-                .collect();
+            let members = ch.author_map();
             policy.add_members(members.keys().copied());
             net.membership().set_channel(*cid, ch.epoch(), members);
         }
@@ -5318,11 +5313,7 @@ impl Node {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             };
-            let members: BTreeMap<Digest32, CompositePublicKey> = st
-                .author_keys()
-                .into_iter()
-                .map(|k| (k.fingerprint(), k))
-                .collect();
+            let members = st.author_map();
             policy.add_members(members.keys().copied());
             net.membership().set_channel(*cid, st.epoch(), members);
         }

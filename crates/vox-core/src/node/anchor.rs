@@ -290,6 +290,13 @@ impl AnchorState {
         self.authors.values().cloned().collect()
     }
 
+    /// Every known author's key by its fingerprint, as held: the fingerprints are not worked out
+    /// again (V030-09).
+    #[must_use]
+    pub fn author_map(&self) -> BTreeMap<Digest32, CompositePublicKey> {
+        self.authors.clone()
+    }
+
     /// Whether `fingerprint` is a known author.
     #[must_use]
     pub fn is_author(&self, fingerprint: &Digest32) -> bool {
