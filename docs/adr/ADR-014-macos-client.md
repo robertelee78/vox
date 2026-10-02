@@ -70,7 +70,8 @@ the client presents it.
 
 3.1. The create screen MUST start on these policy defaults, and the creator MUST be able to change
      them (ADR-007): authorship attributable (ADR-009); history full, with forward-only as an
-     opt-in; retention never expires (ADR-010). *Planned.*
+     opt-in; retention never expires (ADR-010). *Planned.* Deniable authorship is not offered:
+     deniable mode is removed (PRD-001 R43).
 3.2. An invite MUST be one scannable QR and copyable code carrying only the channel ID (ADR-005). The
      passphrase MUST be shared out of band and MUST NOT be in the same artifact, and the UI MUST
      explain why.
@@ -137,6 +138,8 @@ the client presents it.
      reachable through it until the user turns it on. Off by default MUST NOT mean hidden. *Planned.*
 8.2. Chat membership MUST NOT grant tunnel reach (ADR-017 decision 3). A room MAY carry chat and
      tunnels at once.
+8.3. The app's tunneling surface MUST follow ADR-017. Per-member `bind:`/`dial:` grants and a
+     privileged TUN `vox up` are withdrawn (ADR-017's third revision; PRD-001 R44 removes their code).
 
 ### 9. Notifications
 

@@ -93,7 +93,7 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 
 6.1. Create MUST set policy up front (ADR-007): authorship attributable, history full, TTL never,
      each changeable as ADR-007 allows. Creating mints the genesis; `channelID = SHA-256(genesis)`.
-     *Built.*
+     *Built.* Deniable authorship is not offered: deniable mode is removed (PRD-001 R43).
 6.2. Two invite modes MUST be supported (ADR-007): an identity-bound invite (the default), which
      names the newcomer's expected identity, after which the TUI shows "expecting `<safety code>`"
      and flags a joiner who doesn't match; and an open passphrase join, whose joiner is shown
@@ -148,6 +148,9 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 10.1. Tunneling MUST be present in the client and MUST be off by default: present, not hidden, and
       nothing reachable until the user turns it on. *Built (`vox serve`, `vox up`, `vox forward`).*
 10.2. Room membership MUST NOT grant tunnel reach (ADR-017 decision 3). *Built.*
+10.3. The TUI's tunneling surface MUST follow ADR-017. Per-member `bind:`/`dial:` grants and a
+      privileged TUN `vox up` are withdrawn (ADR-017's third revision; PRD-001 R44 removes their
+      code): `vox up` is an unprivileged SOCKS5 proxy (ADR-017 decision 5). *Built.*
 
 ### 11. At rest, lock and screen
 
@@ -301,6 +304,11 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
        `APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64`, `APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD`,
        `APPLE_NOTARY_KEY_P8_BASE64`. The macOS jobs MUST draw them only from that environment, so a
        fork or pull request cannot produce a release artifact.
+
+### 18. Proof
+
+18.1. The client's claims MUST be proved as ADR-018 requires: only real use of the shipped binary
+      counts. There MUST be no unit-test, render-snapshot or input-injection gate.
 
 ## Consequences
 
