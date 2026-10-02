@@ -278,6 +278,13 @@ pub enum Inbound {
         /// The authenticated peer.
         peer: Digest32,
     },
+    /// The peer said it is stopping (V210-93): the connection is marked and closed here, so its
+    /// loss reads as a stop whether or not the peer's own close arrives. Nothing for the actor
+    /// to do; the connection's loss is noticed like any other.
+    ServedGoodbye {
+        /// The authenticated peer.
+        peer: Digest32,
+    },
     /// A coordinator has relayed a punch session to this node: the DCUtR exchange is
     /// still to be run on these streams, and then the synchronized dial fired. The
     /// actor spawns it, because it takes seconds and must not block the coordinator's
@@ -645,6 +652,16 @@ impl NodeNet {
         })
     }
 
+    /// Drop the pre-join record `peer` holds on this node's board for `channel_id`: it has just
+    /// been admitted, so it is no longer waiting to join (V210-102).
+    pub fn forget_prejoin(&self, channel_id: &Digest32, peer: &Digest32) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .forget_prejoin(channel_id, peer);
+    }
+
     /// Whether the board knows `peer` as a member of some channel it anchors: the
     /// creator named by a genesis it holds, or the author of a live member record
     /// (which the board only admitted from an authenticated member).
@@ -811,6 +828,15 @@ impl NodeNet {
                 Ok(Inbound::ServedCircuit { peer })
             }
             StreamKind::Tunnel => Ok(Inbound::Tunnel { peer, send, recv }),
+            StreamKind::Goodbye => {
+                // Marked before it is closed, so whoever sees it closed sees why. Closed here
+                // rather than left for the peer's own close, which may never arrive (see
+                // `StreamKind::Goodbye`); the peer is stopping and needs nothing more from it.
+                conn.mark_peer_stopped();
+                drop((send, recv));
+                conn.close(crate::wire::WireError::ShuttingDown);
+                Ok(Inbound::ServedGoodbye { peer })
+            }
         }
     }
 

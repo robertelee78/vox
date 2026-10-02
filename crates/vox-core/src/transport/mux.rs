@@ -110,6 +110,13 @@ fn random_circuit_addr() -> Result<SocketAddr> {
 /// makes (see [`crate::transport::quic::VoxConnection::circuit_origin`]).
 pub type CircuitOrigin = [Digest32; 3];
 
+/// **Who carries a circuit** (V210-93): the relay's identity, and the flag its connection raises
+/// when the relay says it is stopping. A connection over the circuit keeps it, so that when the
+/// connection is lost it can say its path ran through a relay that stopped, rather than give the
+/// liveness probe's verdict on a path that no longer exists. A flag, not the relay's connection:
+/// holding that would count as using it.
+pub type CircuitCarrier = (Digest32, Arc<std::sync::atomic::AtomicBool>);
+
 /// The circuit table's canonical key: IPv4, whatever quinn presented.
 fn key(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
@@ -125,6 +132,8 @@ pub struct MuxSocket {
     /// Where each inbound circuit's far end comes from, when the node said (see
     /// [`CircuitOrigin`]).
     origins: Mutex<HashMap<SocketAddr, CircuitOrigin>>,
+    /// Who carries each circuit (see [`CircuitCarrier`]).
+    carriers: Mutex<HashMap<SocketAddr, CircuitCarrier>>,
     inbox: Mutex<Inbox>,
     /// Whether the socket underneath is IPv6, and so what family a circuit's datagrams must be
     /// handed up in (see [`Self::as_seen`]).
@@ -216,6 +225,7 @@ impl MuxSocket {
             circuits: Mutex::new(HashMap::new()),
             by_peer: Mutex::new(HashMap::new()),
             origins: Mutex::new(HashMap::new()),
+            carriers: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Inbox::default()),
         })
     }
@@ -240,6 +250,7 @@ impl MuxSocket {
         self: &Arc<Self>,
         peer: &Digest32,
         origin: Option<CircuitOrigin>,
+        carrier: Option<CircuitCarrier>,
     ) -> Result<CircuitPort> {
         let (tx, rx) = mpsc::channel(CIRCUIT_QUEUE);
         let mut circuits = self.circuits();
@@ -254,6 +265,9 @@ impl MuxSocket {
         circuits.insert(addr, tx);
         if let Some(origin) = origin {
             self.origins().insert(addr, origin);
+        }
+        if let Some(carrier) = carrier {
+            self.carriers().insert(addr, carrier);
         }
         self.by_peer().insert(*peer, addr);
         drop(circuits);
@@ -280,6 +294,16 @@ impl MuxSocket {
         self.origins().get(&key(addr)).copied()
     }
 
+    /// Who carries the live circuit at `addr`, if the node said when it attached it.
+    #[must_use]
+    pub fn carrier_of(&self, addr: SocketAddr) -> Option<CircuitCarrier> {
+        self.carriers().get(&key(addr)).cloned()
+    }
+
+    fn carriers(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, CircuitCarrier>> {
+        self.carriers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn origins(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, CircuitOrigin>> {
         self.origins.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -303,6 +327,7 @@ impl MuxSocket {
     fn detach(&self, addr: SocketAddr) {
         self.circuits().remove(&addr);
         self.origins().remove(&addr);
+        self.carriers().remove(&addr);
         self.by_peer().retain(|_, a| *a != addr);
     }
 

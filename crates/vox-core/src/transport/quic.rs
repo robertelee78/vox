@@ -410,8 +410,12 @@ impl VoxEndpoint {
     ///
     /// # Errors
     /// If the OS CSPRNG is unavailable, since the address is drawn from it.
-    pub fn attach_circuit(&self, peer: &Digest32) -> Result<CircuitPort> {
-        self.mux.attach(peer, None)
+    pub fn attach_circuit(
+        &self,
+        peer: &Digest32,
+        carrier: Option<crate::transport::mux::CircuitCarrier>,
+    ) -> Result<CircuitPort> {
+        self.mux.attach(peer, None, carrier)
     }
 
     /// Attach an **inbound** circuit from `peer`, as [`Self::attach_circuit`] does, recording
@@ -424,8 +428,9 @@ impl VoxEndpoint {
         &self,
         peer: &Digest32,
         origin: crate::transport::mux::CircuitOrigin,
+        carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach(peer, Some(origin))
+        self.mux.attach(peer, Some(origin), carrier)
     }
 
     /// Whether `addr` is a **live circuit** on this endpoint's socket — answered from the
@@ -539,6 +544,7 @@ impl VoxEndpoint {
 
         // Read before the first packet leaves: see [`VoxConnection::via_circuit`].
         let via_circuit = self.mux.is_circuit(addr);
+        let carrier = self.mux.carrier_of(addr);
         // The SNI server name is unused for authentication (we authenticate by the
         // Vox identity), but rustls requires a syntactically valid name.
         let connecting = self
@@ -546,7 +552,9 @@ impl VoxEndpoint {
             .connect_with(client_cfg, addr, "vox.invalid")
             .map_err(|_| Error::MalformedBundle("quic connect"))?;
         let connection = connecting.await.map_err(handshake_failed)?;
-        finish_connection(connection, &verified, now_secs, via_circuit)
+        let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
+        conn.carrier = carrier.filter(|_| via_circuit);
+        Ok(conn)
     }
 
     /// Accept the next inbound connection, admitting **any authenticated Vox
@@ -619,6 +627,7 @@ impl VoxEndpoint {
         // Read before this end answers anything: see [`VoxConnection::via_circuit`].
         let via_circuit = self.mux.is_circuit(incoming.remote_address());
         let circuit_origin = self.mux.origin_of(incoming.remote_address());
+        let carrier = self.mux.carrier_of(incoming.remote_address());
         // A fresh slot for THIS connection's verifier output. We install a
         // per-connection server config so the verifier writes into our slot.
         let verified = VerifiedPeer::new();
@@ -648,6 +657,7 @@ impl VoxEndpoint {
             .map_err(handshake_failed)?;
         let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
+        conn.carrier = carrier.filter(|_| via_circuit);
 
         // Transport-layer admission, after authentication. A non-admitted peer is
         // closed with the coded reason and rejected — indistinguishable on the wire
@@ -661,8 +671,18 @@ impl VoxEndpoint {
 
     /// Gracefully close the endpoint (all connections).
     pub fn close(&self) {
-        self.endpoint
-            .close(quinn::VarInt::from_u32(0), b"endpoint closed");
+        // A stopping node's last word to every connection it still has (V210-93): "stopped",
+        // the same as `ConnectionManager::close_all` says, never a code that reads as a fault.
+        self.endpoint.close(
+            close_code(WireError::ShuttingDown),
+            WireError::ShuttingDown.to_string().as_bytes(),
+        );
+    }
+
+    /// Wait until every connection of this endpoint has finished closing, which includes its
+    /// CONNECTION_CLOSE having left. Callers bound it.
+    pub async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
     }
 
     /// Clone the private key (rustls `PrivateKeyDer` is clone-by-method).
@@ -737,6 +757,9 @@ fn finish_connection(
         datagram_tx: Mutex::new(DatagramSender::new()),
         datagram_rx: Mutex::new(ReplayWindow::default()),
         datagrams_dropped: AtomicU64::new(0),
+        closed_here: std::sync::OnceLock::new(),
+        peer_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        carrier: None,
         tunnels: Arc::new(Mutex::new(0)),
     })
 }
@@ -814,6 +837,13 @@ pub struct VoxConnection {
     /// for observability ([`VoxConnection::datagrams_dropped`]); a rising count
     /// on a live connection is a replay signal worth surfacing.
     datagrams_dropped: AtomicU64,
+    /// The code this end closed the connection with, if it did (see [`Self::closed_here`]).
+    closed_here: std::sync::OnceLock<WireError>,
+    /// Whether the peer said it is stopping (see [`Self::peer_stopped`]). Shared, so a
+    /// connection over a circuit this one carries can tell (see [`Self::carrier_stopped`]).
+    peer_stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Who carries this connection, if it runs over a circuit (see [`Self::carrier_stopped`]).
+    carrier: Option<crate::transport::mux::CircuitCarrier>,
     /// Tunnels running on this connection, each credited a stream window of its own
     /// ([`VoxConnection::carry_tunnel`]). Shared with each [`TunnelCredit`], so a credit needs no
     /// borrow of the connection.
@@ -938,7 +968,6 @@ fn set_tunnel_window(connection: &Connection, tunnels: u32) {
     connection.set_receive_window(quinn::VarInt::from_u64(window).unwrap_or(quinn::VarInt::MAX));
 }
 
-/// Whether a connection already carrying `open` tunnels must refuse one more.
 /// Whether `peer` already has as many live tunnels with this node as it may, on whatever
 /// connections they run.
 fn at_tunnel_cap(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> bool {
@@ -1172,8 +1201,55 @@ impl VoxConnection {
 
     /// Close the connection with an application code + reason.
     pub fn close(&self, err: WireError) {
+        // **A connection already closed keeps the reason it closed with** (V210-93): closing it
+        // again here made quinn report it as closed locally, so a peer that said "stopped" was
+        // reported as a connection this end gave up on.
+        if self.connection.close_reason().is_some() {
+            return;
+        }
+        let _ = self.closed_here.set(err);
         self.connection
             .close(close_code(err), err.to_string().as_bytes());
+    }
+
+    /// Record that the peer said it is stopping (a [`StreamKind::Goodbye`] stream).
+    ///
+    /// [`StreamKind::Goodbye`]: crate::transport::streams::StreamKind::Goodbye
+    pub fn mark_peer_stopped(&self) {
+        self.peer_stopped.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the peer said it is stopping before this connection ended (V210-93): however it
+    /// then ended — its close, or a close of this end's, or nothing at all — it ended because
+    /// the peer stopped.
+    #[must_use]
+    pub fn peer_stopped(&self) -> bool {
+        self.peer_stopped.load(Ordering::Relaxed)
+    }
+
+    /// This connection as the carrier of a circuit: the peer's identity and its stop flag, for a
+    /// circuit opened through it (see [`crate::transport::mux::CircuitCarrier`]).
+    #[must_use]
+    pub fn as_carrier(&self) -> crate::transport::mux::CircuitCarrier {
+        (self.peer_id, Arc::clone(&self.peer_stopped))
+    }
+
+    /// **The relay this connection's only path ran through, if that relay said it was stopping**
+    /// (V210-93). A connection over a circuit loses its path when its relay stops, though its own
+    /// peer is still running; its loss is then the relay's stop, and is said as that.
+    #[must_use]
+    pub fn carrier_stopped(&self) -> Option<Digest32> {
+        self.carrier
+            .as_ref()
+            .filter(|(_, stopped)| stopped.load(Ordering::Relaxed))
+            .map(|(relay, _)| *relay)
+    }
+
+    /// The code this end first closed the connection with, through [`Self::close`]: quinn reports
+    /// a local close only as "locally closed", which says nothing about why (V210-93).
+    #[must_use]
+    pub fn closed_here(&self) -> Option<WireError> {
+        self.closed_here.get().copied()
     }
 
     /// The underlying quinn connection, for advanced callers (M11 tunnels).

@@ -30,6 +30,16 @@ pub enum StreamKind {
     Coord = 6,
     /// A relay circuit (ADR-012 rung 4): QUIC packets carried through a peer.
     Circuit = 7,
+    /// **"I am stopping"** (V210-93): the last thing a stopping node says on each connection,
+    /// before it closes it. It carries nothing past its kind frame.
+    ///
+    /// A close alone is one datagram that is never sent again, and quinn (0.11.19 and earlier,
+    /// quinn-rs/quinn#2785) does not send it at all while the connection's congestion window or
+    /// pacer holds back stream data still queued: the close waits behind that data, the
+    /// connection's closing period ends first, and the peer hears nothing. It then counts the node
+    /// as up until its probing says otherwise, and reports a clean stop as silence. A stream is
+    /// delivered like any data, so this is said while the connection still runs.
+    Goodbye = 8,
 }
 
 /// The largest kind frame we will read: `[kind]` is 2 bytes; anything bigger is
@@ -48,6 +58,7 @@ impl StreamKind {
             5 => Some(Self::Tunnel),
             6 => Some(Self::Coord),
             7 => Some(Self::Circuit),
+            8 => Some(Self::Goodbye),
             _ => None,
         }
     }
