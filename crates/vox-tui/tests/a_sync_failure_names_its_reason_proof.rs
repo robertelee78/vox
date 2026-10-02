@@ -20,8 +20,18 @@
 //! over the rounds (`vox status --json`). Not one per round: posts made while a session runs are
 //! carried by it (measured on the change: 14 and 10 over 40 rounds).
 //!
+//! 4. **A dial that gave up is logged with its cause** (PRD-001 R36, #85): after the rounds Bob's
+//!    daemon is killed, Alice posts, and Alice's daemon — the node nobody is watching — logs a
+//!    line naming Bob and why he could not be reached. No command is waiting on it, so the log
+//!    line is the only place the failure is said.
+//!
+//! **A red names its side.** What (1)–(4) assert is `PRODUCT:`, quoting what the daemons logged.
+//! A `vox` step the scene needs that fails is `PRODUCT (staging):`; the test's own files, pipes and
+//! threads are `APPARATUS:`; too few sessions to judge (1)–(3) is `CANNOT MEASURE:`.
+//!
 //! Mutations: restoring the busy refusal at the inbound check breaks (1); the old governance
-//! wrapper in `sync_failure` breaks (2) wherever a failure is reported.
+//! wrapper in `sync_failure` breaks (2) wherever a failure is reported; a daemon that does not log
+//! an unreachable peer breaks (4).
 
 #![cfg(unix)]
 
@@ -42,6 +52,10 @@ use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 /// Rounds of both members posting at once.
 const ROUNDS: usize = 40;
 const TIMEOUT: Duration = Duration::from_secs(90);
+/// How long Alice may take to give up on Bob, gone, and log it. Measured on the change, with
+/// Alice posting three times: two such lines in the 45 s watched after Bob's daemon was killed;
+/// twice that.
+const UNREACHABLE_WITHIN: Duration = Duration::from_secs(90);
 /// What a collision reads as, from the coded reason `SessionBusy`.
 const COLLISION: &str = "the peer was busy syncing this room";
 /// A collision, said as the peer's refusal.
@@ -58,14 +72,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: vox's stdin")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("APPARATUS: write vox's stdin");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -84,7 +98,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file.to_str().expect("APPARATUS: a UTF-8 temp path"),
         ]),
     );
     let deadline = Instant::now() + TIMEOUT;
@@ -94,7 +108,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 /// The daemon's reports of syncs that did not complete, among the lines it printed after the
@@ -119,15 +133,15 @@ fn lines_so_far(p: &mut VoxProc) -> usize {
 #[ignore = "real vox processes with production Argon2id; CI runs it in release"]
 fn a_sync_that_did_not_complete_says_why() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: a profile directory");
         d
     };
     let (anchor_dir, alice_dir, bob_dir) = (dir("anchor"), dir("alice"), dir("bob"));
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write the passphrase file");
 
     let mut anchor = VoxProc::spawn(
         "anchor",
@@ -143,13 +157,13 @@ fn a_sync_that_did_not_complete_says_why() {
 
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     };
     let (alice_fp, bob_fp) = (fp(&alice_dir), fp(&bob_dir));
     for (d, other, name) in [(&alice_dir, &bob_fp, "bob"), (&bob_dir, &alice_fp, "alice")] {
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", other, "--name", name]));
-        assert!(ok, "vox trust add {name}: {out}{err}");
+        assert!(ok, "PRODUCT (staging): vox trust add {name}: {out}{err}");
     }
 
     let mut alice = daemon("alice", &alice_dir, &spec, &idpass);
@@ -160,23 +174,23 @@ fn a_sync_that_did_not_complete_says_why() {
         &["room", "create", "--name", "pair"],
         "room pass",
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("pair"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the room is not listed: {list}"))
         .to_owned();
     let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
         &["room", "join", link.trim(), "--name", "pair"],
         "room pass",
     );
-    assert!(ok, "bob joins: {out}{err}");
+    assert!(ok, "PRODUCT (staging): bob joins: {out}{err}");
 
     // Both members read each other before the rounds, so every failure below is between two
     // members that can sync, not a join still settling.
@@ -185,7 +199,7 @@ fn a_sync_that_did_not_complete_says_why() {
         &alice_dir,
         &args(&["room", "post", &room, "hello from alice"]),
     );
-    assert!(ok, "alice posts: {err}");
+    assert!(ok, "PRODUCT (staging): alice posts: {err}");
     loop {
         let (_, read, _) = vox_once(&bob_dir, &args(&["room", "read", &room]));
         if read.contains("hello from alice") {
@@ -193,7 +207,7 @@ fn a_sync_that_did_not_complete_says_why() {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: bob never read alice before the rounds"
+            "PRODUCT (staging): bob never read alice before the rounds"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -216,8 +230,8 @@ fn a_sync_that_did_not_complete_says_why() {
     };
     let a = poster(alice_dir.clone(), "alice");
     let b = poster(bob_dir.clone(), "bob");
-    a.join().unwrap();
-    b.join().unwrap();
+    a.join().expect("APPARATUS: alice's poster thread panicked");
+    b.join().expect("APPARATUS: bob's poster thread panicked");
     // Let the retries of the last collisions finish and be reported.
     std::thread::sleep(Duration::from_secs(5));
 
@@ -243,8 +257,10 @@ fn a_sync_that_did_not_complete_says_why() {
         .collect();
     let opened = |d: &Path, other: &str| -> u64 {
         let (ok, out, err) = vox_once(d, &args(&["status", "--json"]));
-        assert!(ok, "vox status --json: {err}");
-        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status JSON");
+        assert!(ok, "PRODUCT (staging): vox status --json: {err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
+            panic!("PRODUCT (staging): vox status --json printed {out:?}: {e}")
+        });
         v["sync"]
             .as_array()
             .map(|rows| {
@@ -274,16 +290,66 @@ fn a_sync_that_did_not_complete_says_why() {
     );
     assert_eq!(
         collisions, 0,
-        "two members posting at once refused each other as busy {collisions} time(s): {reports:?}"
+        "PRODUCT: two members posting at once refused each other as busy {collisions} time(s): \
+         {reports:?}"
     );
     assert!(
         misnamed.is_empty(),
-        "a failed sync between two members was reported as a governance, malformed-data or \
-         authenticator failure: {misnamed:?}"
+        "PRODUCT: a failed sync between two members was reported as a governance, malformed-data \
+         or authenticator failure: {misnamed:?}"
     );
     assert!(
         unattributed.is_empty(),
-        "a collision was not reported as the peer's refusal: {unattributed:?}"
+        "PRODUCT: a collision was not reported as the peer's refusal: {unattributed:?}"
+    );
+
+    // ---- (4) a dial that gave up, in the background: Bob is gone, Alice's daemon says why ------
+    let alice_mark = lines_so_far(&mut alice);
+    drop(bob); // killed by its own PID, and reaped
+    let bob12 = &bob_fp[..12];
+    let deadline = Instant::now() + UNREACHABLE_WITHIN;
+    let mut posted = 0;
+    let logged = loop {
+        let line = alice
+            .transcript()
+            .lines()
+            .skip(alice_mark)
+            .find(|l| l.contains("could not reach ") && l.contains(bob12))
+            .map(str::to_owned);
+        if line.is_some() || Instant::now() >= deadline {
+            break line;
+        }
+        // Something to carry to Bob, every few seconds: what makes Alice dial him.
+        let (ok, _, err) = vox_once(
+            &alice_dir,
+            &args(&["room", "post", &room, &format!("for bob, gone {posted}")]),
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): alice posts while bob is gone: {err}"
+        );
+        posted += 1;
+        std::thread::sleep(Duration::from_secs(3));
+    };
+    let Some(logged) = logged else {
+        panic!(
+            "PRODUCT: (4) bob's daemon was killed and alice posted {posted} time(s), yet over \
+             {UNREACHABLE_WITHIN:?} alice's daemon logged no line saying it could not reach him; it \
+             logged:\n{}",
+            alice
+                .transcript()
+                .lines()
+                .skip(alice_mark)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    };
+    println!("[proof] (4) alice's daemon logged: {logged}");
+    let cause = logged.split_once(" — ").map_or("", |(_, why)| why.trim());
+    assert!(
+        cause.contains("unreachable") || cause.contains("timed out") || cause.contains("refused"),
+        "PRODUCT: (4) alice's daemon logged that it could not reach bob without the specific \
+         cause: {logged:?}"
     );
     drop(anchor);
 }

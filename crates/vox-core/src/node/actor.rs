@@ -9315,6 +9315,13 @@ impl Node {
         recv: quinn::RecvStream,
     ) {
         use crate::node::syncstream::accept_sync;
+        // The mutant build's `refuse-sessions` (#85): every inbound session refused, with a reason.
+        #[cfg(feature = "mutant-sender")]
+        if let Some(code) = crate::log::sync::mutant::refuses() {
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream_because(&mut send, &mut recv, code);
+            return;
+        }
         // **Full duplex** (ADR-025 D4, the decider's option C): an inbound session is admitted
         // beside this side's own outbound one for the same room and peer, so two members that post
         // at once no longer refuse each other and retry at random (a hub's CSMA/CD). Up to

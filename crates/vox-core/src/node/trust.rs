@@ -96,6 +96,26 @@ pub enum HistoryGrant {
 /// corrupt or hostile blob from forcing an unbounded allocation on load.
 pub const MAX_TRUSTED: usize = 1024;
 
+/// **For proofs only.** When set to a number below [`MAX_TRUSTED`], [`Keyring::trust_with`] refuses
+/// past that many identities instead, through the same refusal: R36's proof shows a full keyring's
+/// message without 1,100 production-Argon2id `trust add`s first (#85). Nothing a person runs sets
+/// it; unset, nothing changes. Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_KEYRING_CAP_ENV: &str = "VOX_TEST_KEYRING_CAP";
+
+/// How many identities [`Keyring::trust_with`] takes: [`MAX_TRUSTED`], or the test-only
+/// [`TEST_KEYRING_CAP_ENV`] when it names fewer.
+fn trust_cap() -> usize {
+    #[cfg(feature = "test-knobs")]
+    if let Some(cap) = std::env::var(TEST_KEYRING_CAP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return cap.min(MAX_TRUSTED);
+    }
+    MAX_TRUSTED
+}
+
 /// Longest petname. Long enough for `codex@some-long-hostname`, short enough that
 /// a name cannot be used to smuggle a payload into a operator's terminal.
 pub const MAX_PETNAME: usize = 64;
@@ -151,7 +171,7 @@ impl Keyring {
         if name.chars().any(char::is_control) {
             return Err(Error::MalformedGovernance("petname control character"));
         }
-        if !self.entries.contains_key(&fingerprint) && self.entries.len() >= MAX_TRUSTED {
+        if !self.entries.contains_key(&fingerprint) && self.entries.len() >= trust_cap() {
             return Err(Error::SizeLimitExceeded("trusted identities"));
         }
         self.entries.insert(fingerprint, name.to_owned());
