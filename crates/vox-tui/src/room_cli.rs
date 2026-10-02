@@ -1434,6 +1434,51 @@ pub async fn release_resource(
     report(&done, claim::RELEASE, resource, opts, ok, &said)
 }
 
+/// `vox service add`, asked of the node already running this profile (V030-06).
+///
+/// The one-shot form opens the profile itself, which redb refuses while a daemon holds it: a
+/// person with a daemon running had to stop it, add the service, and start it again with every
+/// room's passphrase. The daemon already holds the room open, so it is asked instead, and the
+/// service is offered at once. It is kept as the one-shot form keeps it: offered until removed,
+/// across the daemon's restarts — not withdrawn when this verb's connection closes.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or the node refuses the offer.
+pub async fn service_add(
+    paths: &Paths,
+    room: &str,
+    tag: &str,
+    local: std::net::SocketAddr,
+) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client
+        .request(&Request::AddService {
+            channel_id,
+            service_tag: tag.to_owned(),
+            local: local.to_string(),
+            persist: true,
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            // What the one-shot form says (`tunnel_cli::service_add`).
+            println!(
+                "vox: offering {tag:?} at {local} in room {}",
+                crate::tunnel_cli::short_id_of(&channel_id)
+            );
+            println!("     it is dark until you `vox trust add` someone — and they join this room");
+            Ok(())
+        }
+        // The node's reason, as `vox service add` without a daemon gives it.
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("cannot offer {tag:?}: {reason}")))
+        }
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox service remove`, asked of the node already running this profile.
 ///
 /// The one-shot form opens the profile itself, which redb refuses while a daemon holds it
@@ -1892,6 +1937,7 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
             channel_id,
             service_tag: tag.clone(),
             local: local.to_string(),
+            persist: false,
         })
         .await
     {

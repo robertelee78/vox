@@ -6,13 +6,17 @@
 //!
 //! The scene, from alice's side:
 //!
-//! - bob created room *family*; alice and carol joined it. bob and carol each serve "port
-//!   22" there — an echo that answers with its owner's name.
+//! - bob created room *family*; alice joined it, and **then** carol joined it through bob.
+//!   bob and carol each serve "port 22" there — an echo that answers with its owner's name.
 //! - alice trusts bob as `nas` and carol as `laptop`.
 //! - carol also created room *work*, which alice joined; carol serves 22 there too.
 //!
 //! What must hold:
 //!
+//! 0. **A member who joins later is learned from the board** (V030-07, #239). carol joins
+//!    `family` through bob after alice is already in, so alice's join told her nothing about
+//!    carol: she learns that carol is a member only from the room's board, and `vox room
+//!    roster` on alice shows it.
 //! 1. `nas.family.vox` reaches bob and `laptop.family.vox` reaches carol — the member the
 //!    name names, not the room's creator.
 //! 2. `laptop.work.vox` reaches carol through the second room, under its own name.
@@ -20,10 +24,18 @@
 //!    a sentence saying which.
 //! 4. A node that is no longer trusted has no name.
 //!
-//! `vox service add` opens the profile itself, so it cannot run beside the daemon that holds
-//! it. bob and carol therefore offer their services the way a person would have to: stop the
-//! daemon, `vox service add`, start the daemon again with the room passphrases. Each comes
-//! back on the UDP port it had.
+//! 5. **A service added to a running daemon is offered without a restart** (V030-06, #238). bob and
+//!    carol add theirs with `vox service add` while their daemons run; `vox service add` asks the
+//!    daemon, and alice reaches each service through the name in (1) and (2) with no daemon ever
+//!    restarted. (It used to open the profile itself, so the daemon had to be stopped first, and
+//!    started again with every room's passphrase.)
+//!
+//! **A red names its side.** A `vox` command that fails while setting the scene — an identity, a
+//! trust, a daemon, a room, an invite, a join, bob holding carol as a member, the proxy — is the
+//! product failing: PRODUCT (staging). Anything this proof claims — alice learning carol from
+//! the board, the service offered, a name reaching its node, a refusal and its sentence — is
+//! PRODUCT, quoting what vox said. The test's own files, ports, pipes and echo services are
+//! APPARATUS.
 
 #![cfg(unix)]
 
@@ -61,12 +73,13 @@ fn vox(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     if let Some(text) = stdin {
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(text.as_bytes()).unwrap();
+        let mut pipe = child.stdin.take().expect("APPARATUS: vox's stdin");
+        pipe.write_all(text.as_bytes())
+            .expect("APPARATUS: write to vox's stdin");
     }
-    let out = child.wait_with_output().expect("vox finished");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -86,19 +99,22 @@ struct Member {
 
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+        .and_then(|s| s.local_addr())
+        .expect("APPARATUS: a free UDP port")
         .port()
 }
 
 fn member(tmp: &Path, name: &'static str) -> Member {
     let dir = tmp.join(name);
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: a profile directory");
     let (ok, out, err) = vox(&dir, &["id", "--listen", "127.0.0.1:0"], None);
-    assert!(ok, "vox id ({name}): {err}");
+    assert!(ok, "PRODUCT (staging): vox id ({name}): {err}");
     let fp = out.trim().to_owned();
-    assert_eq!(fp.len(), 52, "{name}'s fingerprint: {out:?}");
+    assert_eq!(
+        fp.len(),
+        52,
+        "PRODUCT (staging): {name}'s fingerprint: {out:?}"
+    );
     Member {
         name,
         dir,
@@ -125,7 +141,7 @@ impl Member {
         );
         assert!(
             ok,
-            "{} trusts {} as {as_name}: {out}{err}",
+            "PRODUCT (staging): {} trusts {} as {as_name}: {out}{err}",
             self.name, peer.name
         );
     }
@@ -139,7 +155,7 @@ impl Member {
             text.push_str(p);
             text.push('\n');
         }
-        std::fs::write(&pass_file, text).unwrap();
+        std::fs::write(&pass_file, text).expect("APPARATUS: write the passphrase file");
         let mut p = VoxProc::spawn(
             self.name,
             &self.dir,
@@ -166,7 +182,8 @@ impl Member {
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "{}'s daemon never held {rooms:?} open; room list said {out:?}. It said:\n{}",
+                    "PRODUCT (staging): {}'s daemon never held {rooms:?} \
+                     open; room list said {out:?}. It said:\n{}",
                     self.name,
                     p.transcript()
                 );
@@ -176,26 +193,10 @@ impl Member {
         self.daemon = Some(p);
     }
 
-    /// Stop the daemon by its PID with SIGTERM and wait until it has exited, so the profile
-    /// is free for a verb that opens it itself.
-    fn stop(&mut self) {
-        let Some(mut p) = self.daemon.take() else {
-            return;
-        };
-        let ok = Command::new("kill")
-            .args(["-TERM", &p.child.id().to_string()])
-            .status()
-            .is_ok_and(|s| s.success());
-        assert!(ok, "kill -TERM {}", self.name);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            if matches!(p.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("{}'s daemon did not exit on SIGTERM", self.name);
-        // Drop would kill it by PID.
+    /// The running daemon's PID, while it still runs; `None` once it has exited.
+    fn pid(&mut self) -> Option<u32> {
+        let p = self.daemon.as_mut()?;
+        matches!(p.child.try_wait(), Ok(None)).then(|| p.child.id())
     }
 
     /// `vox room create --name <local>`, passphrase on stdin; the room's id as `vox room
@@ -206,19 +207,23 @@ impl Member {
             &["room", "create", "--name", local],
             Some(&format!("{pass}\n")),
         );
-        assert!(ok, "{} creates {local}: {out}{err}", self.name);
+        assert!(
+            ok,
+            "PRODUCT (staging): {} creates {local}: {out}{err}",
+            self.name
+        );
         let (ok, list, err) = vox(&self.dir, &["room", "list"], None);
-        assert!(ok, "vox room list: {err}");
+        assert!(ok, "PRODUCT (staging): vox room list: {err}");
         list.lines()
             .find(|l| l.split_whitespace().nth(1) == Some(local))
             .and_then(|l| l.split_whitespace().next())
-            .unwrap_or_else(|| panic!("{local} is not listed: {list}"))
+            .unwrap_or_else(|| panic!("PRODUCT (staging): {local} is not listed: {list}"))
             .to_owned()
     }
 
     fn invite(&self, room: &str) -> String {
         let (ok, link, err) = vox(&self.dir, &["room", "invite", room], None);
-        assert!(ok, "vox room invite {room}: {err}");
+        assert!(ok, "PRODUCT (staging): vox room invite {room}: {err}");
         link.trim().to_owned()
     }
 
@@ -228,14 +233,20 @@ impl Member {
             &["room", "join", link, "--name", local],
             Some(&format!("{pass}\n")),
         );
-        assert!(ok, "{} joins {local}: {out}{err}", self.name);
+        assert!(
+            ok,
+            "PRODUCT (staging): {} joins {local}: {out}{err}",
+            self.name
+        );
     }
 
-    /// `vox service add <room> 22 <at>` — the profile must not be held by a daemon.
+    /// `vox service add <room> 22 <at>`, with this member's daemon running (V030-06): it asks the
+    /// daemon, which offers the service at once. The room passphrase is passed as a person who
+    /// scripted the one-shot form would have; the daemon already holds the room open.
     fn serve(&self, room: &str, pass: &str, at: SocketAddr) {
         // From a file, never argv (V210-72: a room passphrase on the command line is refused).
         let pass_file = self.dir.join("room.pass");
-        std::fs::write(&pass_file, pass).unwrap();
+        std::fs::write(&pass_file, pass).expect("APPARATUS: write the room passphrase file");
         let (ok, out, err) = vox(
             &self.dir,
             &[
@@ -251,7 +262,17 @@ impl Member {
             ],
             None,
         );
-        assert!(ok, "{} offers 22 in {room}: {out}{err}", self.name);
+        assert!(
+            ok,
+            "PRODUCT: {} could not offer 22 in {room} with its daemon running — `vox service add` \
+             did not ask the daemon: {out}{err}",
+            self.name
+        );
+        assert!(
+            out.contains("vox: offering \"22\""),
+            "PRODUCT: {}'s `vox service add` did not say it is offering 22: {out}{err}",
+            self.name
+        );
     }
 
     /// `vox forward <name> 22 0`: whether it bound, and what it said.
@@ -273,8 +294,8 @@ impl Member {
 
 /// A TCP service that answers each line with `<owner>:<line>`.
 fn echo(owner: &'static str) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let at = l.local_addr().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("APPARATUS: an echo listener");
+    let at = l.local_addr().expect("APPARATUS: the echo's address");
     std::thread::spawn(move || {
         for s in l.incoming() {
             let Ok(mut s) = s else { return };
@@ -298,20 +319,24 @@ fn echo(owner: &'static str) -> SocketAddr {
 
 /// A CONNECT through the proxy to `host:port`; the stream, or the SOCKS reply code.
 fn socks(proxy: SocketAddr, host: &str, port: u16) -> Result<TcpStream, u8> {
-    let mut s = TcpStream::connect(proxy).unwrap();
+    let mut s = TcpStream::connect(proxy).expect("PRODUCT: `vox up`'s proxy refused a connection");
     s.set_read_timeout(Some(
         vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
     ))
-    .unwrap();
-    s.write_all(&[0x05, 0x01, 0x00]).unwrap();
+    .expect("APPARATUS: set a read timeout");
+    s.write_all(&[0x05, 0x01, 0x00])
+        .expect("PRODUCT: `vox up`'s proxy closed on the SOCKS greeting");
     let mut hello = [0u8; 2];
-    s.read_exact(&mut hello).unwrap();
+    s.read_exact(&mut hello)
+        .expect("PRODUCT: `vox up`'s proxy did not answer the SOCKS greeting");
     let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
     req.extend_from_slice(host.as_bytes());
     req.extend_from_slice(&port.to_be_bytes());
-    s.write_all(&req).unwrap();
+    s.write_all(&req)
+        .expect("PRODUCT: `vox up`'s proxy closed on the CONNECT");
     let mut head = [0u8; 4];
-    s.read_exact(&mut head).unwrap();
+    s.read_exact(&mut head)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox up`'s proxy did not answer CONNECT {host}: {e}"));
     if head[1] != 0 {
         return Err(head[1]);
     }
@@ -320,23 +345,27 @@ fn socks(proxy: SocketAddr, host: &str, port: u16) -> Result<TcpStream, u8> {
         0x04 => 18,
         _ => {
             let mut l = [0u8; 1];
-            s.read_exact(&mut l).unwrap();
+            s.read_exact(&mut l)
+                .expect("PRODUCT: `vox up`'s proxy cut its CONNECT reply short");
             usize::from(l[0]) + 2
         }
     };
     let mut rest = vec![0u8; skip];
-    s.read_exact(&mut rest).unwrap();
+    s.read_exact(&mut rest)
+        .expect("PRODUCT: `vox up`'s proxy cut its CONNECT reply short");
     Ok(s)
 }
 
 /// Who answers at `name` through the proxy: the owner's name from the echo.
 fn who_answers(proxy: SocketAddr, name: &str) -> Result<String, u8> {
     let mut s = socks(proxy, name, 22)?;
-    s.write_all(b"hello\n").unwrap();
+    s.write_all(b"hello\n")
+        .unwrap_or_else(|e| panic!("PRODUCT: {name}'s tunnel closed before a line was sent: {e}"));
     // To the end of the line: one `read` may return only part of the answer, and a
     // partial `car` would read as a wrong host.
     let mut line = String::new();
-    std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line).unwrap();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line)
+        .unwrap_or_else(|e| panic!("PRODUCT: no answer came back through {name}: {e}"));
     Ok(line.split(':').next().unwrap_or("").to_owned())
 }
 
@@ -344,19 +373,19 @@ fn who_answers(proxy: SocketAddr, name: &str) -> Result<String, u8> {
 #[ignore = "an anchor, three vox daemons and real child processes; CI runs it in release"]
 fn a_local_name_reaches_the_node_it_names() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let (nas_echo, laptop_echo, laptop_work_echo) =
         (echo("bob"), echo("carol"), echo("carol-work"));
 
     let anchor_dir = tmp.path().join("anchor");
-    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: the anchor's directory");
     let mut anchor = VoxProc::spawn(
         "anchor",
         &anchor_dir,
         &args(&["node", "--listen", "127.0.0.1:0"]),
     );
     let spec = anchor
-        .expect_line("an --anchor spec", |l| {
+        .expect_line("PRODUCT (staging): an --anchor spec", |l| {
             l.trim_start().contains("@/ip4/127.0.0.1/udp/")
         })
         .trim()
@@ -370,35 +399,51 @@ fn a_local_name_reaches_the_node_it_names() {
     bob.trust(&alice, "alice");
     carol.trust(&alice, "alice");
 
-    // The rooms: bob makes family and carol joins it; carol makes work.
+    // The rooms: bob makes family, alice joins it, and only then carol; carol makes work.
     let (family_pass, work_pass) = ("family passphrase", "work passphrase");
     bob.start(&spec, &[], &[]);
     carol.start(&spec, &[], &[]);
     let family = bob.create("family", family_pass);
     let work = carol.create("work", work_pass);
+    // alice joins family first, so her join cannot tell her about carol, who is not in it yet.
+    alice.start(&spec, &[], &[]);
+    alice.join(&bob.invite(&family), "family", family_pass);
+    {
+        let (_, roster, _) = vox(&alice.dir, &["room", "roster", &family], None);
+        assert!(
+            !roster.lines().any(|l| l.trim() == carol.fp),
+            "PRODUCT (staging): carol is in alice's roster before she has \
+             joined family: {roster:?}"
+        );
+    }
     carol.join(&bob.invite(&family), "family", family_pass);
 
-    // The services, offered with the daemons down, then the daemons back on their ports.
-    bob.stop();
-    carol.stop();
+    // (5) The services, added while the daemons run: `vox service add` asks each daemon, and no
+    // daemon is restarted from here to the end. Each daemon's PID is checked at the end.
+    let pids = (bob.pid(), carol.pid());
+    assert!(
+        pids.0.is_some() && pids.1.is_some(),
+        "PRODUCT (staging): bob's and carol's daemons must be running before \
+         their services are added: {pids:?}"
+    );
     bob.serve(&family, family_pass, nas_echo);
     carol.serve(&family, family_pass, laptop_echo);
     carol.serve(&work, work_pass, laptop_work_echo);
-    bob.start(&spec, &[family_pass], &[&family]);
-    carol.start(&spec, &[family_pass, work_pass], &[&family, &work]);
 
-    // alice joins both.
-    alice.start(&spec, &[], &[]);
-    alice.join(&bob.invite(&family), "family", family_pass);
+    // alice joins work too.
     alice.join(&carol.invite(&work), "work", work_pass);
 
-    // **Precondition: alice knows carol is in `family`.** carol joined through bob, so alice
-    // learns her as a member from the board, not from a join of her own. On v0.2.9 that takes a
-    // sync interval (measured on the v0.3.0 integration: about 26 s; the naming branch's base was
-    // faster), and this proof is about names, not about how fast membership travels. Waited for,
-    // bounded, and timed — through `vox room roster` — so a regression in that latency still
-    // shows here as a number.
+    // **(0) alice learns carol from the board.** carol joined through bob after alice was in,
+    // so nothing but the room's board can have told alice. First the staging: bob, who let carol
+    // in, holds her as a member; otherwise there is nothing on the board to learn. Then alice's
+    // roster, bounded and timed, so a regression in how fast membership travels shows as a number.
     {
+        let (_, roster, _) = vox(&bob.dir, &["room", "roster", &family], None);
+        assert!(
+            roster.lines().any(|l| l.trim() == carol.fp),
+            "PRODUCT (staging): bob, who let carol into family, does not \
+             hold her as a member; his roster: {roster:?}"
+        );
         let started = Instant::now();
         loop {
             let (_, roster, _) = vox(&alice.dir, &["room", "roster", &family], None);
@@ -407,12 +452,19 @@ fn a_local_name_reaches_the_node_it_names() {
             }
             assert!(
                 started.elapsed() < SETUP,
-                "alice never learned that carol is in family; her roster: {roster:?}"
+                "PRODUCT: alice never learned from the board that carol joined family through \
+                 bob ({} s); alice's roster: {roster:?}\nalice's daemon said:\n{}",
+                SETUP.as_secs(),
+                alice
+                    .daemon
+                    .as_mut()
+                    .map(|d| d.transcript())
+                    .unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(200));
         }
         eprintln!(
-            "alice learned carol is in family after {} ms",
+            "alice learned from the board that carol is in family after {} ms",
             started.elapsed().as_millis()
         );
     }
@@ -423,13 +475,14 @@ fn a_local_name_reaches_the_node_it_names() {
         &alice.dir,
         &args(&["up", "--bind", "127.0.0.1:0"]),
     );
-    let first = up.expect_line("vox up's address", |l| l.starts_with("vox up on "));
+    let first = up.expect_line("PRODUCT (staging): vox up's address", |l| {
+        l.starts_with("vox up on ")
+    });
     let proxy: SocketAddr = first
         .split_whitespace()
         .nth(3)
-        .unwrap_or_else(|| panic!("vox up said {first:?}"))
-        .parse()
-        .unwrap();
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| panic!("PRODUCT (staging): vox up said {first:?}"));
 
     // (1) and (2): each name reaches the node it names.
     let reached: Vec<(&str, Result<String, u8>)> = [
@@ -469,63 +522,85 @@ fn a_local_name_reaches_the_node_it_names() {
             .iter()
             .find(|(name, _)| *name == n)
             .map(|(_, r)| r.clone())
-            .unwrap()
+            .expect("APPARATUS: a name this proof did not try")
     };
-    assert_eq!(answered("nas.family.vox"), Ok("bob".into()), "nas is bob");
+    assert_eq!(
+        answered("nas.family.vox"),
+        Ok("bob".into()),
+        "PRODUCT: nas.family.vox did not reach bob's service, added to his running daemon"
+    );
     assert_eq!(
         answered("laptop.family.vox"),
         Ok("carol".into()),
-        "laptop is carol — not the room's creator"
+        "PRODUCT: laptop.family.vox did not reach carol's service, added to her running daemon — laptop is carol, not the room's creator"
     );
     assert_eq!(
         answered("laptop.work.vox"),
         Ok("carol-work".into()),
-        "the same node through a second room, under that room's name"
+        "PRODUCT: laptop.work.vox did not reach carol's work service, added to her running daemon — the same node through a second room, under that room's name"
     );
     assert_eq!(
         answered("NAS.Family.vox"),
         Ok("bob".into()),
-        "names are case-insensitive"
+        "PRODUCT: names are case-insensitive"
     );
-    assert!(named.0, "vox forward takes a name too: {}", named.1);
+    assert!(
+        named.0,
+        "PRODUCT: vox forward takes a name too: {}",
+        named.1
+    );
     assert!(
         !unknown_room.0
             && unknown_room
                 .1
                 .contains("no room on this machine is called `nowhere`"),
-        "{unknown_room:?}"
+        "PRODUCT: an unknown room is refused, saying so: {unknown_room:?}"
     );
     assert!(
         !unknown_node.0
             && unknown_node
                 .1
                 .contains("no node you trust is called `ghost`"),
-        "{unknown_node:?}"
+        "PRODUCT: an unknown node is refused, saying so: {unknown_node:?}"
     );
     assert!(
         !not_there.0 && not_there.1.contains("not a member of `work`"),
-        "{not_there:?}"
+        "PRODUCT: a node not in the room is refused, saying so: {not_there:?}"
     );
-    assert!(rename.0, "the rename must succeed: {rename:?}");
+    assert!(rename.0, "PRODUCT: the rename must succeed: {rename:?}");
     assert!(
         !ambiguous.0 && ambiguous.1.contains("names 2 nodes you trust in `family`"),
-        "{ambiguous:?}"
+        "PRODUCT: an ambiguous name is refused, saying so: {ambiguous:?}"
     );
     assert_eq!(
         ambiguous_socks,
         Err(2),
-        "the proxy refuses an ambiguous name"
+        "PRODUCT: the proxy refuses an ambiguous name"
     );
-    assert!(untrust.0, "the untrust must succeed: {untrust:?}");
+    assert!(untrust.0, "PRODUCT: the untrust must succeed: {untrust:?}");
     assert!(
         untrusted.0,
-        "with carol untrusted, `nas` is bob's again: {untrusted:?}"
+        "PRODUCT: with carol untrusted, `nas` is bob's again: {untrusted:?}"
     );
-    assert_eq!(now_bob, Ok("bob".into()));
+    assert_eq!(
+        now_bob,
+        Ok("bob".into()),
+        "PRODUCT: with carol untrusted, nas.family.vox is bob's again"
+    );
     assert_eq!(
         untrusted_laptop,
         Err(2),
-        "carol is no longer trusted, so no name reaches her"
+        "PRODUCT: carol is no longer trusted, so no name reaches her"
+    );
+    // (5) No daemon was restarted: bob's and carol's are the processes that ran when their
+    // services were added, and still run.
+    assert_eq!(
+        (bob.pid(), carol.pid()),
+        pids,
+        "PRODUCT: a daemon was restarted or exited after its service was added"
+    );
+    eprintln!(
+        "[proof] 3 services added to 2 running daemons, each reached by name, none restarted"
     );
     drop((up, alice, bob, carol, anchor));
 }

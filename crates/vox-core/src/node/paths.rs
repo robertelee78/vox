@@ -46,6 +46,11 @@ pub const RETENTION_FILE: &str = "retention";
 /// given. A leading `~/` means the home directory. Absent, it is `~/Downloads`.
 pub const DOWNLOADS_FILE: &str = "downloads";
 
+/// The config file saying how long a tunnel's bytes may wait to be taken before it is closed as
+/// stuck (V030-11): one line, `600`, `600s`, `10m` or `1h`. Absent or unreadable, it is 10
+/// minutes ([`STUCK_AFTER`](crate::tunnel::session::STUCK_AFTER)).
+pub const TUNNEL_STUCK_FILE: &str = "tunnel-stuck-after";
+
 /// The config file saying which rooms `vox node` serves: `anyone` or `trusted` (its
 /// `--serve` flag overrides it).
 pub const SERVE_FILE: &str = "serve";
@@ -183,6 +188,34 @@ impl Paths {
     #[must_use]
     pub fn serve_file(&self) -> PathBuf {
         self.config_dir.join(SERVE_FILE)
+    }
+
+    /// How long a stuck tunnel is given, for this profile ([`TUNNEL_STUCK_FILE`]).
+    #[must_use]
+    pub fn tunnel_stuck_file(&self) -> PathBuf {
+        self.config_dir.join(TUNNEL_STUCK_FILE)
+    }
+
+    /// The time the profile's [`TUNNEL_STUCK_FILE`] names, if it names one.
+    #[must_use]
+    pub fn tunnel_stuck_after(&self) -> Option<std::time::Duration> {
+        let text = std::fs::read_to_string(self.tunnel_stuck_file()).ok()?;
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+        let (digits, unit) = line.split_at(
+            line.find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(line.len()),
+        );
+        let n: u64 = digits.parse().ok()?;
+        let secs = match unit.trim() {
+            "" | "s" => n,
+            "m" => n.checked_mul(60)?,
+            "h" => n.checked_mul(3600)?,
+            _ => return None,
+        };
+        (secs > 0).then(|| std::time::Duration::from_secs(secs))
     }
 
     /// The download-directory file for this profile ([`DOWNLOADS_FILE`]).
