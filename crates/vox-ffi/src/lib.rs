@@ -405,7 +405,7 @@ impl VoxNode {
                 }
                 let current = view.borrow_and_update().clone();
                 for room in current.open_channels {
-                    for row in &room.timeline {
+                    for row in room.timeline.iter() {
                         if delivered.insert(row.entry_hash) {
                             listener.on_message(b32_encode(&room.channel_id), message(row));
                         }

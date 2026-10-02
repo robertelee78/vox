@@ -846,7 +846,7 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
     let sent = Instant::now();
     s.bob.run(&["room", "post", &s.room, "still here"]);
     let arrived = tail
-        .wait_for(Duration::from_secs(10), |l| l.contains("still here"))
+        .line_within(Duration::from_secs(10), |l| l.contains("still here"))
         .map(|_| sent.elapsed());
     let still_waiting = s.alice.app();
     // Every opener ends: refused busy, or refused once nobody accepted in time.

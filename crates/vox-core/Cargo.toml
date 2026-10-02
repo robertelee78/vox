@@ -55,6 +55,13 @@ sha1.workspace = true
 # `VOX_MUTANT_SENDER`; the mode is chosen per daemon by `VOX_MUTANT_SENDER_MODE`
 # (see `log::sync::mutant`).
 mutant-sender = []
+# **Test-only knobs, for proofs only** (V210-105, #300). Each `VOX_TEST_*` variable stages a race
+# or a failure (a delay, a lost hello, a shorter lifetime) that no `vox` command can, and with this
+# feature off neither the variable's read nor the path it drives is compiled: the binary a person
+# installs has none of them. Proofs build with it through vox-tui's `test-knobs`
+# (`cargo test --features vox-tui/test-knobs`); release.yml builds `--bin vox` without it, and
+# scripts/package-release.sh refuses an artifact that carries a `VOX_TEST_` string.
+test-knobs = []
 
 [lints.rust]
 unsafe_code = "forbid"

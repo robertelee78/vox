@@ -58,7 +58,8 @@ pub fn system_millis_clock() -> MillisClock {
 }
 
 /// [`system_clock`], shifted by [`TEST_CLOCK_STEP_ENV`] in whole seconds (rounded down).
-/// **Test-only: for proofs; nothing in a real deployment sets it.**
+/// **Test-only: for proofs; nothing in a real deployment sets it**, and without the `test-knobs`
+/// feature (V210-105) it is the system clock.
 ///
 /// **A clock step moves both clocks** (V210-64): the seconds a record is stamped with as well as
 /// the milliseconds that floor its `seq`, and a board refuses a record that is behind on either.
@@ -78,11 +79,18 @@ pub fn clock_with_test_skew() -> Clock {
 }
 
 /// The signed milliseconds `var` names; zero when unset or unparsable.
+#[cfg(feature = "test-knobs")]
 fn env_ms(var: &str) -> i64 {
     std::env::var(var)
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// No skew and no step: the knobs are not compiled in (V210-105).
+#[cfg(not(feature = "test-knobs"))]
+const fn env_ms(_var: &str) -> i64 {
+    0
 }
 
 /// The environment variable that moves only the millisecond clock ([`millis_clock_with_test_skew`]).
@@ -95,7 +103,8 @@ pub const TEST_CLOCK_STEP_ENV: &str = "VOX_TEST_CLOCK_STEP_MS";
 
 /// [`system_millis_clock`], shifted by a signed number of milliseconds read once from
 /// [`TEST_CLOCK_SKEW_ENV`] and [`TEST_CLOCK_STEP_ENV`] together. **Test-only: for proofs; nothing
-/// in a real deployment sets them.**
+/// in a real deployment sets them**, and without the `test-knobs` feature (V210-105) it is the
+/// system clock.
 ///
 /// It lets a proof drive the shipped binary with a node whose millisecond clock is wrong, which
 /// a proof that pinned the clock inside the process could not: that would not be the binary a

@@ -78,6 +78,8 @@ pub struct Attempt {
     pub abort: Option<tokio::task::AbortHandle>,
     /// Its fence (ADR-025 D1a).
     pub fence: Arc<Fence>,
+    /// Its place among the port's running sessions in `vox status`, removed when it drops.
+    pub running: crate::node::status::Running,
 }
 
 impl Attempt {
@@ -141,7 +143,8 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
     Some(match fail {
         SyncFailure::Poisoned(_) => return None,
         SyncFailure::Unreachable(_) => BackoffKind::Unreachable,
-        SyncFailure::Panicked | SyncFailure::Session(SessionError::ProtocolViolation) => {
+        SyncFailure::Panicked
+        | SyncFailure::Session(SessionError::ProtocolViolation | SessionError::DrainBudget(_)) => {
             BackoffKind::NoProgress
         }
         // Every code is named, in both arms, with no catch-all: a code added to `WireError` does not
@@ -220,6 +223,9 @@ pub struct Port {
     pub done_gen: u64,
     /// When a completion last made progress, for concurrent completions (progress wins).
     pub last_progress: Option<Instant>,
+    /// When this node's own outbound session last completed cleanly, so the periodic request
+    /// passes over a port that was just served (ADR-025 D7, V210-97).
+    pub last_clean_out: Option<Instant>,
 }
 
 impl Port {
@@ -238,6 +244,7 @@ impl Port {
             req_done: 0,
             done_gen: 0,
             last_progress: None,
+            last_clean_out: None,
         }
     }
 
@@ -251,6 +258,20 @@ impl Port {
     /// Raise a request (ADR-025 D2).
     pub fn raise(&mut self) {
         self.req_gen = self.req_gen.saturating_add(1);
+    }
+
+    /// Whether the periodic request (ADR-025 D7) has anything to add at `now`: not while this
+    /// node's own session on the port is running, nor within `fresh` of its last clean completion.
+    /// The request is a safety net for a port nothing has served lately. Raised on a port that had
+    /// just carried a post, or was carrying one, it made that port open a second session for the
+    /// same post, and when it fell due inside a burst every port of the burst was queued and opened
+    /// twice (V210-97: `queued 72, opened 80` for 40 posts).
+    #[must_use]
+    pub fn periodic_due(&self, now: Instant, fresh: Duration) -> bool {
+        self.out.is_none()
+            && self
+                .last_clean_out
+                .is_none_or(|t| now.saturating_duration_since(t) >= fresh)
     }
 
     /// Whether a backoff holds new outbound sessions back at `now`.

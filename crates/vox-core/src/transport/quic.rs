@@ -399,7 +399,22 @@ impl VoxEndpoint {
     /// # Errors
     /// If the OS CSPRNG is unavailable, since the address is drawn from it.
     pub fn attach_circuit(&self, peer: &Digest32) -> Result<CircuitPort> {
-        self.mux.attach(peer)
+        self.mux.attach(peer, None)
+    }
+
+    /// Attach an **inbound** circuit from `peer`, carried by `relay`, as
+    /// [`Self::attach_circuit_via`] does, recording where its far end comes from (V210-92). The
+    /// connection the circuit makes carries it as [`VoxConnection::circuit_origin`].
+    ///
+    /// # Errors
+    /// If the OS CSPRNG is unavailable, since the address is drawn from it.
+    pub fn attach_inbound_circuit(
+        &self,
+        peer: &Digest32,
+        relay: &Digest32,
+        origin: crate::transport::mux::CircuitOrigin,
+    ) -> Result<CircuitPort> {
+        self.mux.attach_via(peer, relay, Some(origin))
     }
 
     /// [`VoxEndpoint::attach_circuit`], recording `relay` as the peer carrying it.
@@ -407,7 +422,7 @@ impl VoxEndpoint {
     /// # Errors
     /// As [`VoxEndpoint::attach_circuit`].
     pub fn attach_circuit_via(&self, peer: &Digest32, relay: &Digest32) -> Result<CircuitPort> {
-        self.mux.attach_via(peer, relay)
+        self.mux.attach_via(peer, relay, None)
     }
 
     /// The relay carrying `peer`'s live circuit, if one is recorded.
@@ -533,7 +548,7 @@ impl VoxEndpoint {
             .endpoint
             .connect_with(client_cfg, addr, "vox.invalid")
             .map_err(|_| Error::MalformedBundle("quic connect"))?;
-        let connection = connecting.await.map_err(|_| Error::SignatureInvalid)?; // handshake/auth failure
+        let connection = connecting.await.map_err(handshake_failed)?;
         finish_connection(connection, &verified, now_secs, via_circuit)
     }
 
@@ -606,6 +621,7 @@ impl VoxEndpoint {
     ) -> Result<VoxConnection> {
         // Read before this end answers anything: see [`VoxConnection::via_circuit`].
         let via_circuit = self.mux.is_circuit(incoming.remote_address());
+        let circuit_origin = self.mux.origin_of(incoming.remote_address());
         // A fresh slot for THIS connection's verifier output. We install a
         // per-connection server config so the verifier writes into our slot.
         let verified = VerifiedPeer::new();
@@ -628,7 +644,8 @@ impl VoxEndpoint {
             .await
             .map_err(|_| Error::SignatureInvalid)?
             .map_err(|_| Error::SignatureInvalid)?;
-        let conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
+        let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
+        conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
 
         // Transport-layer admission, after authentication. A non-admitted peer is
         // closed with the coded reason and rejected — indistinguishable on the wire
@@ -649,6 +666,33 @@ impl VoxEndpoint {
     /// Clone the private key (rustls `PrivateKeyDer` is clone-by-method).
     fn clone_key(&self) -> rustls_pki_types::PrivateKeyDer<'static> {
         self.leaf_key.clone_key()
+    }
+}
+
+/// What a failed QUIC handshake is reported as: a failure of authentication as
+/// [`Error::SignatureInvalid`], anything else by its own cause ([`Error::Handshake`]).
+///
+/// Authentication happens inside TLS, so it fails as a TLS alert: a QUIC crypto error
+/// (`0x100`–`0x1ff`), raised here when the peer's certificate does not verify or names another
+/// identity, or received from a peer that refused ours. Everything else — a refusal, a close, a
+/// peer that never answered, this endpoint closing — is not about keys, and saying "signature
+/// verification failed" for it sent the operator after the wrong thing.
+///
+/// A refusal is a peer that is busy (V210-86, #278): a node past its cap on handshakes refuses
+/// what it cannot take in time, and its dialler is to say so and try again shortly, not report
+/// a fault.
+fn handshake_failed(e: quinn::ConnectionError) -> Error {
+    use quinn::ConnectionError as C;
+    let tls = |code: quinn::TransportErrorCode| (0x100..0x200).contains(&u64::from(code));
+    match e {
+        C::TransportError(t) if tls(t.code) => Error::SignatureInvalid,
+        C::ConnectionClosed(c) if tls(c.error_code) => Error::SignatureInvalid,
+        C::ConnectionClosed(c) if c.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED => {
+            Error::Handshake("the peer is busy: it refused the connection for now".to_owned())
+        }
+        C::TimedOut => Error::Handshake("the peer did not answer".to_owned()),
+        C::LocallyClosed => Error::Handshake("this node's endpoint is closing".to_owned()),
+        other => Error::Handshake(other.to_string()),
     }
 }
 
@@ -686,6 +730,7 @@ fn finish_connection(
         peer_process,
         session,
         via_circuit,
+        circuit_origin: None,
         router: DatagramRouter::start(connection.clone()),
         connection,
     })
@@ -742,6 +787,8 @@ pub struct VoxConnection {
     session: SessionEstablishment,
     /// Whether this connection was set up over a relay circuit (see [`Self::via_circuit`]).
     via_circuit: bool,
+    /// Where an inbound circuit's far end comes from (see [`Self::circuit_origin`]).
+    circuit_origin: Option<crate::transport::mux::CircuitOrigin>,
     router: Arc<DatagramRouter>,
 }
 
@@ -802,6 +849,18 @@ impl VoxConnection {
     #[must_use]
     pub fn via_circuit(&self) -> bool {
         self.via_circuit
+    }
+
+    /// **Where the far end of an inbound circuit comes from** (V210-92): the source the node
+    /// recorded when it attached the circuit, from what the relay said of the asker and who the
+    /// relay is. `None` on a direct connection and on one this node dialled.
+    ///
+    /// A circuit's address is made up per circuit and says nothing about the peer behind it, so
+    /// without this every relayed join came from one place, and one stranger with many identities
+    /// behind one relay tied every newcomer that relay carried.
+    #[must_use]
+    pub fn circuit_origin(&self) -> Option<crate::transport::mux::CircuitOrigin> {
+        self.circuit_origin
     }
 
     /// The recorded session-establishment entry (tag `0x0011`) for this session,

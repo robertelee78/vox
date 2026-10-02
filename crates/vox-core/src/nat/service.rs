@@ -47,7 +47,7 @@ use crate::log::sync::wire_error_for;
 use crate::nat::record::{
     MemberBundleRecord, PreJoinRecord, RendezvousRecord, MAX_PREKEY_BUNDLE_BYTES,
 };
-use crate::nat::store::{RendezvousStore, MAX_AUTHORS_PER_BUCKET, MAX_PREJOIN_PER_CHANNEL};
+use crate::nat::store::{RendezvousStore, Source, MAX_AUTHORS_PER_BUCKET, MAX_PREJOIN_PER_CHANNEL};
 use crate::time::Clock;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::{close_code, VoxConnection};
@@ -336,6 +336,37 @@ pub struct RecordSet {
     pub genesis: Option<Genesis>,
 }
 
+/// Which rooms a board keeps for a peer that brings their genesis — the rooms it will
+/// **anchor** (see [`RendezvousService::serve_rooms`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AnchorRooms {
+    /// None: this node is not an anchor. It keeps the boards of the rooms it holds, which it
+    /// files itself, and takes no room from a peer.
+    #[default]
+    Held,
+    /// Any room brought to it (`vox node --serve anyone`, the default for an anchor).
+    Anyone,
+    /// Only rooms whose genesis names one of these creators (`vox node --serve trusted`: the
+    /// anchor profile's `vox trust` list).
+    CreatedBy(std::collections::BTreeSet<Digest32>),
+}
+
+impl AnchorRooms {
+    /// **May this node anchor the room `genesis` founds?** The one predicate both the board's
+    /// genesis acceptance and the node's adoption of a room go through, so the two cannot
+    /// disagree about which rooms this node serves.
+    #[must_use]
+    pub fn may_anchor(&self, genesis: &Genesis) -> bool {
+        match self {
+            Self::Held => false,
+            Self::Anyone => true,
+            Self::CreatedBy(creators) => {
+                creators.contains(&genesis.body.creator_pubkey.fingerprint())
+            }
+        }
+    }
+}
+
 /// Told a channelID when a member-kind record **from a peer** is admitted to this board.
 ///
 /// A plain closure rather than a typed sender because `nat` must not depend on `node`: the
@@ -351,6 +382,21 @@ pub struct RendezvousService {
     clock: Clock,
     /// See [`RendezvousService::on_admitted`].
     admitted: Option<AdmittedHook>,
+    /// See [`RendezvousService::serve_rooms`].
+    rooms: AnchorRooms,
+}
+
+/// Whether a record by `author` that the board took credits its room to the source it came from
+/// ([`Source`]): only when the peer that put it **wrote** it — a genesis put by its creator, an
+/// address or bundle record put by its member — and then whether or not the board already held it.
+/// A room's records are served to anyone who asks, so putting one proves nothing about who put it:
+/// credited to whoever put it, a stranger re-sent a real room's records from its own network and
+/// the room was evicted with the stranger's own rooms (V210-70, c4). And the member's own put must
+/// credit even when it changes nothing: credited only when it stored something new, a stranger that
+/// put the records on a board first left the member's republish a no-op, the room credited to no
+/// one (c5).
+fn wrote(publisher: Option<&Digest32>, author: &Digest32) -> bool {
+    publisher == Some(author)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -370,7 +416,28 @@ impl RendezvousService {
             oracle,
             clock,
             admitted: None,
+            rooms: AnchorRooms::Held,
         }
+    }
+
+    /// Which rooms this board keeps when a peer brings their genesis — what an **anchor** is
+    /// for (`vox node`: a member points `--anchor` at it and it keeps that room's board).
+    /// [`AnchorRooms::Held`] by default, and for every node that is not an anchor.
+    ///
+    /// A board that took any peer's genesis made that genesis's creator a member here
+    /// (`node::network::classify`), and a genesis is something anybody can mint: an
+    /// unknown peer published one for a room it had just invented and could then open
+    /// every stream a member can, relay through this node, and list its room in this
+    /// node's status. A node that holds rooms files their geneses itself (see
+    /// [`RendezvousService::handle_local`]); a peer never needs to give it one.
+    pub fn serve_rooms(&mut self, rooms: AnchorRooms) {
+        self.rooms = rooms;
+    }
+
+    /// Whether this node may anchor the room `genesis` founds (see [`AnchorRooms::may_anchor`]).
+    #[must_use]
+    pub fn may_anchor(&self, genesis: &Genesis) -> bool {
+        self.rooms.may_anchor(genesis)
     }
 
     /// Be told when a record by an author **other than this node** is admitted.
@@ -399,14 +466,39 @@ impl RendezvousService {
     pub fn handle(
         &self,
         publisher: Option<&Digest32>,
+        source: Option<Source>,
         request: &RendezvousRequest,
+    ) -> Vec<RendezvousResponse> {
+        self.handle_as(publisher, source, request, false)
+    }
+
+    /// [`RendezvousService::handle`] for a request **this node** makes of its own board
+    /// (`publisher` is this node). A genesis filed this way is one of the node's own rooms,
+    /// or one it anchors, and is pinned: never refused for want of room, never displaced.
+    #[must_use]
+    pub fn handle_local(
+        &self,
+        publisher: &Digest32,
+        request: &RendezvousRequest,
+    ) -> Vec<RendezvousResponse> {
+        self.handle_as(Some(publisher), None, request, true)
+    }
+
+    fn handle_as(
+        &self,
+        publisher: Option<&Digest32>,
+        source: Option<Source>,
+        request: &RendezvousRequest,
+        local: bool,
     ) -> Vec<RendezvousResponse> {
         let now = (self.clock)();
         match request {
-            RendezvousRequest::Put { record } => vec![match self.put(publisher, record, now) {
-                Ok(()) => RendezvousResponse::Accepted,
-                Err(e) => RendezvousResponse::Rejected(e),
-            }],
+            RendezvousRequest::Put { record } => {
+                vec![match self.put(publisher, source, record, now, local) {
+                    Ok(()) => RendezvousResponse::Accepted,
+                    Err(e) => RendezvousResponse::Rejected(e),
+                }]
+            }
             RendezvousRequest::Get {
                 channel_id,
                 epoch,
@@ -453,9 +545,9 @@ impl RendezvousService {
     /// The authenticated key for `author` in `(channel, epoch)`, from what this node
     /// knows: its own membership view (the oracle), the **creator** named by the
     /// genesis it holds, or a **bundle record** it already holds for that author —
-    /// which carries the author's key, and was admitted only because a known member
-    /// published it (see `put`). This is how a node that *anchors* a channel it is not
-    /// a member of comes to know that channel's members (ADR-016 M15.2a).
+    /// which carries the author's key, and was admitted only on the evidence it carries
+    /// (see `put`). This is how a node that *anchors* a channel it is not a member of
+    /// comes to know that channel's members (ADR-016 M15.2a).
     fn known_key(
         &self,
         store: &RendezvousStore,
@@ -477,20 +569,47 @@ impl RendezvousService {
             .and_then(|b| CompositePublicKey::from_bytes(&b.prekey_bundle.root_pub).ok())
     }
 
+    /// The key a bundle record for an author this board does not know yet may be admitted
+    /// under: the one it carries, **if its join witness holds up** — signed by a key this
+    /// board already knows for that room, over this room, this epoch and this author
+    /// (ADR-016 M17.6). The chain starts at the creator, whom the genesis names.
+    ///
+    /// It used to be enough that the record came *from* a peer this board knew as a member:
+    /// the publisher was taken to vouch. So any member could put any key on another node's
+    /// board, and that key was then a member there — it could open every stream a member can
+    /// and relay through the node — with no evidence anyone ever admitted it. Members forward
+    /// one another's bundles all the time (the mirror loop), so this happened without anyone
+    /// meaning it to. A member's own node already refused such a key as an author
+    /// (`ChannelState::admit_from_board`); the board now asks for the same evidence.
+    fn witnessed_key(
+        &self,
+        store: &RendezvousStore,
+        rec: &MemberBundleRecord,
+        now: u64,
+    ) -> Option<CompositePublicKey> {
+        let witness = rec.admission.witness()?;
+        let witness_key =
+            self.known_key(store, &rec.channel_id, rec.epoch, &witness.witness_id, now)?;
+        witness
+            .verify(&witness_key, &rec.channel_id, rec.epoch, &rec.author_id)
+            .ok()?;
+        CompositePublicKey::from_bytes(&rec.prekey_bundle.root_pub).ok()
+    }
+
     /// Admit one framed record by its struct tag.
-    /// `publisher` is the authenticated peer the record came in from (`None` for a
-    /// local publish). It matters for one case: a **bundle record from an author this
-    /// node does not know**, published by a peer it knows as a member of that channel,
-    /// is admitted with the key the record carries — the member is **vouching**, which
-    /// is exactly the trust members already extend to one another's boards (a member
-    /// learns new members from the boards of members who witnessed the join). The
-    /// record's own verification binds the carried key to the author; the vouch only
-    /// says "this author is one of us".
+    /// `publisher` is the authenticated peer the record came in from (this node itself
+    /// for a local publish, `None` when nobody is named). It matters for a pre-join: a
+    /// joiner announces **itself**, so a pre-join is taken only from the identity it
+    /// names. `source` is where it came from, which a full board shares itself out by
+    /// ([`Source`]); `local` says the request is this node's own (see
+    /// [`RendezvousService::handle_local`]).
     fn put(
         &self,
         publisher: Option<&Digest32>,
+        source: Option<Source>,
         record: &[u8],
         now: u64,
+        local: bool,
     ) -> std::result::Result<(), RejectReason> {
         let tag = parse_frame(record)
             .map(|f| f.tag)
@@ -513,13 +632,15 @@ impl RendezvousService {
                 let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
                 let mut store = lock(&self.store);
                 let key = self.known_key(&store, &cid, epoch, &author, now);
-                store
-                    .accept_member(rec, |_| key.clone(), now)
-                    .map(|learned| {
-                        if learned && publisher.is_some() {
-                            grew = Some(cid);
-                        }
-                    })
+                let res = store.accept_member(rec, |_| key.clone(), now);
+                if res.is_ok() && wrote(publisher, &author) {
+                    store.note_source(&cid, source);
+                }
+                res.map(|learned| {
+                    if learned && publisher.is_some() {
+                        grew = Some(cid);
+                    }
+                })
             }
             StructTag::MemberBundleRecord => {
                 let rec = MemberBundleRecord::from_wire(record)
@@ -528,35 +649,47 @@ impl RendezvousService {
                 let mut store = lock(&self.store);
                 let key = self
                     .known_key(&store, &cid, epoch, &author, now)
-                    .or_else(|| {
-                        let vouched = publisher.is_some_and(|p| {
-                            *p != author && self.known_key(&store, &cid, epoch, p, now).is_some()
-                        });
-                        if vouched {
-                            CompositePublicKey::from_bytes(&rec.prekey_bundle.root_pub).ok()
-                        } else {
-                            None
-                        }
-                    });
-                store
-                    .accept_bundle(rec, |_| key.clone(), now)
-                    .map(|learned| {
-                        if learned && publisher.is_some() {
-                            grew = Some(cid);
-                        }
-                    })
+                    .or_else(|| self.witnessed_key(&store, &rec, now));
+                let res = store.accept_bundle(rec, |_| key.clone(), now);
+                if res.is_ok() && wrote(publisher, &author) {
+                    store.note_source(&cid, source);
+                }
+                res.map(|learned| {
+                    if learned && publisher.is_some() {
+                        grew = Some(cid);
+                    }
+                })
             }
             StructTag::PreJoinRecord => {
                 let rec =
                     PreJoinRecord::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
+                // A joiner announces itself. Taken from anyone, one connection could fill a
+                // room's pre-join slots with keys it minted by the hundred (V210-70); taken
+                // only from the identity it names, each slot costs an authenticated
+                // connection of its own.
+                if publisher.is_some_and(|p| *p != rec.asserted_id()) {
+                    return Err(RejectReason::Policy);
+                }
                 lock(&self.store).accept_prejoin(rec, now)
             }
             // Self-validating: its hash is the channelID, so no author check is
-            // needed or possible (ADR-007; see `accept_genesis`).
+            // needed or possible (ADR-007; see `accept_genesis`). Whether this board takes
+            // it is another matter: only its own rooms, or a room it may anchor (see
+            // `serve_rooms`), and a genesis it already holds is always a no-op.
             StructTag::GenesisRecord => {
                 let genesis =
                     Genesis::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
-                lock(&self.store).accept_genesis(genesis)
+                let mut store = lock(&self.store);
+                if !local
+                    && store.genesis(&genesis.channel_id()).is_none()
+                    && !self.rooms.may_anchor(&genesis)
+                {
+                    return Err(RejectReason::Policy);
+                }
+                // Credited only to its creator: anyone can bring a room's genesis (see `wrote`).
+                let creator = genesis.body.creator_pubkey.fingerprint();
+                let source = source.filter(|_| wrote(publisher, &creator));
+                store.accept_genesis(genesis, local, now, source)
             }
             // A signed withdraw (V030-14): a member's own records, or a whole room, off this
             // board at once — and kept off.
@@ -616,6 +749,7 @@ impl RendezvousService {
     pub async fn serve_stream(
         &self,
         publisher: Digest32,
+        source: Source,
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<()> {
@@ -639,7 +773,7 @@ impl RendezvousService {
                     return Err(e);
                 }
             };
-            for response in self.handle(Some(&publisher), &request) {
+            for response in self.handle(Some(&publisher), Some(source), &request) {
                 if let Err(e) = write_frame(&mut send, &response.to_frame()).await {
                     reset(&mut send, &mut recv, &e);
                     return Err(e);

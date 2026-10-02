@@ -155,6 +155,40 @@ pub fn join_initiate<'a>(
     // 1. PoW — memory-hard work bound to (channelID, epoch, responder_nonce).
     let token = pow::solve_token(ctx.pow_params, challenge)?;
     // 2. CPace — keyed by the passphrase.
+    let (initiator, own_share) = join_start(ctx, passphrase, sid, root, ik)?;
+    Ok((initiator, token, own_share))
+}
+
+/// The checks [`join_initiate`] makes **before** any work, alone: the suite floor, the
+/// responder's signature over the challenge, its binding to this channel and epoch, and the
+/// accessibility cap. For a caller that grinds the PoW itself, off whatever holds its secrets
+/// (V210-94), and then calls [`join_start`].
+pub fn join_check_challenge(
+    ctx: &JoinContext,
+    challenge: &ResponderNonce,
+    responder_pub: &CompositePublicKey,
+    challenge_sig: &CompositeSignature,
+) -> Result<()> {
+    ctx.floor.check(ctx.suite_id)?;
+    challenge.verify(responder_pub, challenge_sig)?;
+    if challenge.channel_id != ctx.channel_id || challenge.epoch != ctx.epoch {
+        return Err(Error::JoinPowInvalid);
+    }
+    if challenge.difficulty.exceeds_cap() {
+        return Err(Error::JoinPowInvalid);
+    }
+    Ok(())
+}
+
+/// Start CPace for the joiner, after the PoW: the part of [`join_initiate`] that needs the
+/// passphrase and the identity. Call it only once [`join_check_challenge`] has passed.
+pub fn join_start<'a>(
+    ctx: JoinContext,
+    passphrase: &[u8],
+    sid: &[u8],
+    root: &'a (dyn RootSigner + Send + Sync),
+    ik: &'a X25519IdentityKey,
+) -> Result<(JoinInitiator<'a>, [u8; CPACE_SHARE_LEN])> {
     let (cpace, own_share) =
         CpaceState::start(passphrase, &ctx.channel_id, ctx.epoch, ctx.suite_id, sid)?;
     Ok((
@@ -166,7 +200,6 @@ pub fn join_initiate<'a>(
             root,
             ik,
         },
-        token,
         own_share,
     ))
 }

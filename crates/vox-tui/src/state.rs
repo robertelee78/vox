@@ -92,6 +92,12 @@ impl PromptKind {
     }
 }
 
+/// The most a prompt field holds, in bytes. Each field is given all of it when the prompt opens and
+/// never grows past it (V210-94): a `String` that outgrows its buffer moves to a bigger one and frees
+/// the old one as it was, so a passphrase typed a key at a time would leave its earlier prefixes in
+/// freed memory, which [`Zeroizing`] never reaches.
+pub const PROMPT_FIELD_CAPACITY: usize = 1024;
+
 /// A masked multi-field prompt. Every field buffer is [`Zeroizing`], so a
 /// cancelled or submitted prompt leaves no passphrase in memory; the values never
 /// appear in a status string or the palette line.
@@ -117,7 +123,7 @@ impl Prompt {
             fields: kind
                 .fields()
                 .iter()
-                .map(|_| Zeroizing::new(String::new()))
+                .map(|_| Zeroizing::new(String::with_capacity(PROMPT_FIELD_CAPACITY)))
                 .collect(),
             target,
         }
@@ -377,6 +383,13 @@ impl UiState {
         }
     }
 
+    /// Whether the key being typed now goes into a secret field: the loop then reads it past the
+    /// terminal library, which keeps whatever it reads in a buffer of its own (V210-94).
+    #[must_use]
+    pub fn typing_a_secret(&self) -> bool {
+        matches!(&self.mode, Mode::Prompt(p) if p.kind.is_secret(p.step))
+    }
+
     /// Open a masked prompt (also used by the loop for onboarding: no identity ⇒
     /// create; locked ⇒ unlock).
     pub fn start_prompt(&mut self, kind: PromptKind, target: Option<Digest32>) {
@@ -394,8 +407,11 @@ impl UiState {
                 Action::Redraw
             }
             KeyCode::Char(c) => {
+                // Never past the field's own buffer: see `PROMPT_FIELD_CAPACITY`.
                 if let Some(f) = p.fields.get_mut(p.step) {
-                    f.push(c);
+                    if f.len() + c.len_utf8() <= f.capacity() {
+                        f.push(c);
+                    }
                 }
                 Action::Redraw
             }

@@ -4,6 +4,11 @@
 //!
 //! Included with `#[path]` by each proof that needs it, which is why not every item is
 //! used by every includer.
+//!
+//! **Every red here names its side** (V210-106): `PRODUCT:` when `vox` said or did the wrong
+//! thing — quoting what it said, stderr included — and `APPARATUS:` or `CANNOT MEASURE:` when the
+//! fault is this harness's or the machine's (a spawn, a temp dir, a socket of the proof's own, a
+//! runner that stalled), naming the fault.
 
 #![allow(dead_code)]
 
@@ -30,7 +35,15 @@ pub struct VoxProc {
     /// Every stderr line with **when it was read**, so a proof's red can say when each thing
     /// the product noticed happened, not only that it did.
     pub timed: Arc<Mutex<Vec<(Instant, String)>>>,
+    /// When it was started, so a red can say how long it had.
+    pub started: Instant,
 }
+
+/// The longest a wait that asked for at most [`POLL`] may overrun it before this process counts
+/// as **stalled** — not scheduled, so not watching — rather than the product as silent.
+pub const STALL: Duration = Duration::from_secs(5);
+/// The longest one wait for a line lasts before the harness looks at the clock again.
+const POLL: Duration = Duration::from_secs(1);
 
 impl VoxProc {
     pub fn spawn(name: &str, data: &Path, args: &[String]) -> Self {
@@ -61,10 +74,13 @@ impl VoxProc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("APPARATUS: could not spawn {name} ({}): {e}", exe.display())
+            });
+        let started = Instant::now();
         let (tx, rx) = mpsc::channel();
-        let out = child.stdout.take().expect("stdout");
-        let err = child.stderr.take().expect("stderr");
+        let out = child.stdout.take().expect("APPARATUS: a piped stdout");
+        let err = child.stderr.take().expect("APPARATUS: a piped stderr");
         let tx_err = tx.clone();
         let timed = Arc::new(Mutex::new(Vec::new()));
         let timed_err = Arc::clone(&timed);
@@ -94,44 +110,124 @@ impl VoxProc {
             lines: rx,
             seen: Vec::new(),
             timed,
+            started,
         }
     }
 
-    /// Wait up to `within` for the first line matching `pred`. Every line seen is kept so a
-    /// failure shows what the command actually said.
+    /// Wait up to `within` for the first line matching `pred`, **a claim**: `vox` not saying it
+    /// is a `PRODUCT:` red. Every line seen is kept so a failure shows what the command actually
+    /// said. A wait this process overslept by more than [`STALL`] is `CANNOT MEASURE:` instead —
+    /// a runner that did not schedule the harness cannot say the product was silent.
     pub fn expect_within(
         &mut self,
         within: Duration,
         what: &str,
         pred: impl Fn(&str) -> bool,
     ) -> String {
+        self.wait_for("PRODUCT:", within, what, pred)
+            .unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// [`Self::expect_within`], handing back why it did not come instead of panicking, so a proof
+    /// can say which side a missing line is on: a precondition the scene never reached
+    /// (apparatus), or something the product failed to say. The reason carries the same labels
+    /// [`Self::expect_within`] would have panicked with, the stall check included.
+    pub fn try_expect_within(
+        &mut self,
+        within: Duration,
+        what: &str,
+        pred: impl Fn(&str) -> bool,
+    ) -> Result<String, String> {
+        self.wait_for("PRODUCT:", within, what, pred)
+    }
+
+    /// [`VoxProc::expect_within`] for **staging** — a state the proof needs before it can measure
+    /// anything, which the product may legitimately not reach (a path that did not end up
+    /// relayed). Not reaching it is `CANNOT MEASURE: staging not achieved`, never a verdict.
+    pub fn expect_staging_within(
+        &mut self,
+        within: Duration,
+        what: &str,
+        pred: impl Fn(&str) -> bool,
+    ) -> String {
+        self.wait_for("CANNOT MEASURE: staging not achieved:", within, what, pred)
+            .unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// The one wait loop: the first line matching `pred` within `within`, or why not, labelled
+    /// `side` — or `CANNOT MEASURE: the runner stalled:` if this process overslept a wait by
+    /// more than [`STALL`], and `PRODUCT:` with its exit status if it exited first.
+    fn wait_for(
+        &mut self,
+        side: &str,
+        within: Duration,
+        what: &str,
+        pred: impl Fn(&str) -> bool,
+    ) -> Result<String, String> {
         if let Some(line) = self.seen.iter().find(|l| pred(l)) {
-            return line.clone();
+            return Ok(line.clone());
         }
-        let deadline = Instant::now() + within;
+        let t0 = Instant::now();
+        let deadline = t0 + within;
+        // The harness's own clock: how far past what it asked for one wait came back.
+        let mut overslept = Duration::ZERO;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !left.is_zero(),
-                "{}: timed out after {within:?} waiting for {what}. It said:\n{}",
-                self.name,
-                self.seen.join("\n")
-            );
-            match self.lines.recv_timeout(left.min(Duration::from_secs(5))) {
+            if left.is_zero() {
+                let side = if overslept > STALL {
+                    "CANNOT MEASURE: the runner stalled:"
+                } else {
+                    side
+                };
+                return Err(format!(
+                    "{side} {} did not say {what} within {within:?} (it has run {:?}; this \
+                     harness overslept one wait by at most {overslept:?}, so it was watching). It \
+                     said:\n{}",
+                    self.name.clone(),
+                    self.started.elapsed(),
+                    self.transcript()
+                ));
+            }
+            let ask = left.min(POLL);
+            let asked = Instant::now();
+            let got = self.lines.recv_timeout(ask);
+            overslept = overslept.max(asked.elapsed().saturating_sub(ask));
+            match got {
                 Ok(line) => {
                     eprintln!("[{}] {line}", self.name);
                     let hit = pred(&line);
                     self.seen.push(line.clone());
                     if hit {
-                        return line;
+                        return Ok(line);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
-                    "{}: exited before saying {what}. It said:\n{}",
-                    self.name,
-                    self.seen.join("\n")
-                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "PRODUCT: {} exited ({}) after {:?}, before saying {what}. It said:\n{}",
+                        self.name.clone(),
+                        self.exit_status(),
+                        self.started.elapsed(),
+                        self.seen.join("\n")
+                    ))
+                }
+            }
+        }
+    }
+
+    /// How the process ended, for a red: its exit status, or that it still runs (its output
+    /// closed without it exiting), or why that could not be read.
+    pub fn exit_status(&mut self) -> String {
+        // Its output has closed; give the exit a moment to be reaped before asking.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.to_string(),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => return "still running, with its output closed".to_owned(),
+                Err(e) => return format!("exit status unreadable: {e}"),
             }
         }
     }
@@ -163,7 +259,7 @@ impl VoxProc {
 
     /// The first line matching `pred` within `within`, or `None` if the process exits or
     /// the time runs out first — for a caller that has something better to do than fail.
-    pub fn wait_for(&mut self, within: Duration, pred: impl Fn(&str) -> bool) -> Option<String> {
+    pub fn line_within(&mut self, within: Duration, pred: impl Fn(&str) -> bool) -> Option<String> {
         if let Some(line) = self.seen.iter().find(|l| pred(l)) {
             return Some(line.clone());
         }
@@ -191,6 +287,11 @@ impl VoxProc {
     pub fn expect_line(&mut self, what: &str, pred: impl Fn(&str) -> bool) -> String {
         self.expect_within(LINE_TIMEOUT, what, pred)
     }
+
+    /// [`VoxProc::expect_staging_within`], with [`LINE_TIMEOUT`].
+    pub fn expect_staging(&mut self, what: &str, pred: impl Fn(&str) -> bool) -> String {
+        self.expect_staging_within(LINE_TIMEOUT, what, pred)
+    }
 }
 
 impl Drop for VoxProc {
@@ -212,7 +313,17 @@ pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(Stdio::null())
         .output()
-        .expect("run vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run {VOX} {args:?}: {e}"));
+    // **How it ended, not only whether it succeeded** (V210-85). A `vox connect` killed by the
+    // watchdog's SIGKILL read as `false` with empty output — the same as a verb that failed and
+    // said nothing — and was reported as a product failure with no reason.
+    if !out.status.success() {
+        eprintln!(
+            "[vox_once] vox {}: {}",
+            args.first().map_or("", String::as_str),
+            out.status
+        );
+    }
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -222,7 +333,9 @@ pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
 
 pub fn after_label(line: &str, label: &str) -> String {
     line.strip_prefix(label)
-        .unwrap_or_else(|| panic!("line {line:?} does not start with {label:?}"))
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: vox printed {line:?}, which does not start with {label:?}")
+        })
         .trim()
         .to_owned()
 }
@@ -231,10 +344,29 @@ pub fn after_label(line: &str, label: &str) -> String {
 /// room passphrase is never taken from argv or the environment (V210-72).
 #[allow(dead_code)]
 pub fn room_pass_file(dir: &Path, pass: &str) -> String {
-    std::fs::create_dir_all(dir).unwrap();
     let at = dir.join("room-passphrase");
-    std::fs::write(&at, pass).unwrap();
-    at.to_str().unwrap().to_owned()
+    std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(&at, pass))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", at.display()));
+    utf8(&at)
+}
+
+/// `p` as UTF-8, for an argument; a temp path that is not is the apparatus's fault.
+pub fn utf8(p: &Path) -> String {
+    p.to_str()
+        .unwrap_or_else(|| panic!("APPARATUS: the path {} is not UTF-8", p.display()))
+        .to_owned()
+}
+
+/// A fresh temp dir, or an `APPARATUS:` red naming why there is none.
+pub fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"))
+}
+
+/// `create_dir_all`, or an `APPARATUS:` red naming the directory.
+pub fn mkdir(d: &Path) {
+    std::fs::create_dir_all(d)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
 }
 
 pub fn args(list: &[&str]) -> Vec<String> {
@@ -243,8 +375,12 @@ pub fn args(list: &[&str]) -> Vec<String> {
 
 /// A real TCP echo service on loopback. Returns its port.
 pub fn echo_service() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind echo");
-    let port = listener.local_addr().unwrap().port();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not bind the echo service: {e}"));
+    let port = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("APPARATUS: the echo service has no address: {e}"))
+        .port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
@@ -268,17 +404,24 @@ pub const PARTIAL: &[u8] = b"the first half of a reply";
 /// enough for it to cross the overlay, then resets its socket (zero linger, so the kernel
 /// sends RST rather than FIN). Returns its port.
 pub fn resetting_service() -> u16 {
-    let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind resetting backend");
-    let port = std_listener.local_addr().unwrap().port();
-    std_listener.set_nonblocking(true).unwrap();
+    let std_listener = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not bind the resetting backend: {e}"));
+    let port = std_listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("APPARATUS: the resetting backend has no address: {e}"))
+        .port();
+    std_listener
+        .set_nonblocking(true)
+        .unwrap_or_else(|e| panic!("APPARATUS: the resetting backend: {e}"));
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap();
+            .unwrap_or_else(|e| panic!("APPARATUS: the resetting backend's runtime: {e}"));
         rt.block_on(async move {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            let listener = tokio::net::TcpListener::from_std(std_listener)
+                .unwrap_or_else(|e| panic!("APPARATUS: the resetting backend's listener: {e}"));
             loop {
                 let Ok((mut s, _)) = listener.accept().await else {
                     continue;
@@ -290,7 +433,9 @@ pub fn resetting_service() -> u16 {
                     }
                     let _ = s.write_all(PARTIAL).await;
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    s.set_zero_linger().unwrap();
+                    s.set_zero_linger().unwrap_or_else(|e| {
+                        panic!("APPARATUS: the resetting backend's linger: {e}")
+                    });
                     drop(s);
                 });
             }
@@ -496,11 +641,11 @@ impl World {
     /// A world serving `setup.specs` (`<port>`, `<port>/udp`) on the path `setup.path`.
     pub fn build(setup: &Setup) -> Self {
         let trusted = setup.trusted;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
         let anchor_dir = tmp.path().join("anchor");
         for d in [&anchor_dir, &host_dir, &guest_dir] {
-            std::fs::create_dir_all(d.join("cfg")).unwrap();
+            mkdir(&d.join("cfg"));
         }
         let (anchor, host_anchor, guest_anchor) = match setup.path {
             PathKind::Direct => {
@@ -540,7 +685,7 @@ impl World {
                             &args(&["node", "--listen", &format!("[::]:{port}")]),
                         );
                         let id = anchor
-                            .wait_for(LINE_TIMEOUT, |l| l.starts_with("vox node: identity "))?;
+                            .line_within(LINE_TIMEOUT, |l| l.starts_with("vox node: identity "))?;
                         Some((port, anchor, id))
                     })
                     .expect("an anchor on a free dual-stack port");
@@ -559,23 +704,17 @@ impl World {
             }
         };
         let anchor_spec = host_anchor.clone();
-        let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-        assert!(ok, "vox id (guest): {err}");
-        let guest_fp = guest_fp.trim().to_owned();
-        let (ok, host_fp, err) = vox_once(&host_dir, &args(&["id"]));
-        assert!(ok, "vox id (host): {err}");
-        let host_fp = host_fp.trim().to_owned();
-        assert_eq!(
-            (guest_fp.len(), host_fp.len()),
-            (52, 52),
-            "two fingerprints"
-        );
+        let guest_fp = fingerprint(&guest_dir, "guest");
+        let host_fp = fingerprint(&host_dir, "host");
         if trusted {
             let (ok, out, err) = vox_once(
                 &host_dir,
                 &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
             );
-            assert!(ok, "trust add: {out}\n{err}");
+            assert!(
+                ok,
+                "PRODUCT (staging): the host's `vox trust add` of the guest failed.\nstdout:\n{out}\nstderr:\n{err}"
+            );
         }
 
         let mut host = VoxProc::spawn(
@@ -605,7 +744,7 @@ impl World {
             &host.expect_line("passphrase", |l| l.starts_with("passphrase ")),
             "passphrase",
         );
-        let w = Self {
+        let mut w = Self {
             tmp,
             anchor,
             host_anchor,
@@ -634,7 +773,13 @@ impl World {
             if ok { "joined" } else { "FAILED" },
             setup.path
         );
-        assert!(ok, "vox connect failed.\nstdout:\n{out}\nstderr:\n{err}");
+        if !ok {
+            let host = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
+            panic!(
+                "PRODUCT (staging): the guest's `vox connect` failed after {took:?}.\nstdout:\n{out}\n\
+                 stderr:\n{err}\nthe host's `vox serve` said:\n{host}"
+            );
+        }
         w
     }
 
@@ -662,9 +807,7 @@ impl World {
     /// The room passphrase in a file, for `--passphrase-file`: a room passphrase is never
     /// taken from argv or the environment (V210-72).
     pub fn passphrase_file(&self) -> String {
-        let at = self.tmp.path().join("room-passphrase");
-        std::fs::write(&at, &self.passphrase).unwrap();
-        at.to_str().unwrap().to_owned()
+        room_pass_file(self.tmp.path(), &self.passphrase)
     }
 
     /// Kill the host's `vox serve` and bring the same identity and room back as
@@ -677,14 +820,15 @@ impl World {
             eprintln!("[test] host `vox serve` pid {pid} killed and reaped");
         }
         let pass_file = self.tmp.path().join("daemon-passphrases");
-        std::fs::write(&pass_file, format!("{IDENTITY}\n{}\n", self.passphrase)).unwrap();
+        std::fs::write(&pass_file, format!("{IDENTITY}\n{}\n", self.passphrase))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
         let mut daemon = VoxProc::spawn(
             "host-daemon",
             &self.host_dir,
             &args(&[
                 "daemon",
                 "--passphrase-file",
-                pass_file.to_str().unwrap(),
+                &utf8(&pass_file),
                 "--anchor",
                 &self.host_anchor,
                 "--listen",
@@ -701,6 +845,10 @@ impl World {
     /// `vox forward <room>.vox <spec> 0` from `dir` — the `.vox` form ADR-022 names, where
     /// the name gives the room and its host — returning it and the address it bound.
     pub fn forward_vox(&self, name: &str, dir: &Path, spec: &str) -> (VoxProc, SocketAddr) {
+        // From a file, never argv (V210-72: a room passphrase on the command line is refused).
+        let pass_file = dir.join(format!("{name}.room.pass"));
+        std::fs::write(&pass_file, &self.passphrase)
+            .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
         let mut fwd = VoxProc::spawn(
             name,
             dir,
@@ -709,8 +857,8 @@ impl World {
                 &format!("{}.vox", self.room),
                 spec,
                 "0",
-                "--passphrase",
-                &self.passphrase,
+                "--passphrase-file",
+                &utf8(&pass_file),
                 "--anchor",
                 &self.guest_anchor,
                 "--listen",
@@ -748,12 +896,7 @@ impl World {
             ]),
         );
         let line = up.expect_line("the proxy's bound address", |l| l.starts_with("vox up on "));
-        let bound: SocketAddr = line
-            .split_whitespace()
-            .nth(3)
-            .expect("an address in the up line")
-            .parse()
-            .expect("a socket address");
+        let bound = address_in(&mut up, &line, 3);
         (up, bound)
     }
 
@@ -779,44 +922,127 @@ impl World {
         let line = fwd.expect_line("the forward's bound address", |l| {
             l.starts_with("vox: 127.0.0.1:") && l.contains('→')
         });
-        let bound: SocketAddr = line
-            .split_whitespace()
-            .nth(1)
-            .expect("an address")
-            .parse()
-            .expect("a socket address");
+        let bound = address_in(&mut fwd, &line, 1);
         (fwd, bound)
+    }
+}
+
+/// `vox id` in `dir`: the identity's fingerprint, made on first use. `PRODUCT:` if it fails or
+/// prints something that is not a fingerprint.
+pub fn fingerprint(dir: &Path, who: &str) -> String {
+    let (ok, out, err) = vox_once(dir, &args(&["id"]));
+    let fp = out.trim().to_owned();
+    assert!(
+        ok && fp.len() == 52,
+        "PRODUCT (staging): `vox id` ({who}) did not print a fingerprint (exit ok: {ok}).\n\
+         stdout:\n{out}\nstderr:\n{err}"
+    );
+    fp
+}
+
+/// The socket address that is word `nth` of `line`, which `p` printed. `PRODUCT:` quoting the line
+/// and everything `p` said if there is none.
+pub fn address_in(p: &mut VoxProc, line: &str, nth: usize) -> SocketAddr {
+    match line.split_whitespace().nth(nth).map(str::parse::<SocketAddr>) {
+        Some(Ok(at)) => at,
+        other => panic!(
+            "PRODUCT: {} printed {line:?}, whose word {nth} is not a socket address ({other:?}). It \
+             said:\n{}",
+            p.name.clone(),
+            p.transcript()
+        ),
     }
 }
 
 /// Speak RFC 1928 to `proxy` and CONNECT to `host:port` **by name** (`socks5h`), returning
 /// the reply code — `0` is success — and the stream positioned at the payload.
+///
+/// The proxy is `vox up`, so a proxy that refuses the connection, closes or stalls mid-handshake,
+/// or answers something that is not SOCKS5 is a `PRODUCT:` red quoting every byte it sent.
 pub fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> (u8, TcpStream) {
-    let mut s = TcpStream::connect(proxy).expect("connect to the proxy");
+    let mut s = TcpStream::connect(proxy).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT: the proxy at {proxy}, which said it was listening, refused a connection: {e}"
+        )
+    });
     // Longer than the proxy's own patience, so its verdict is what this reports.
-    s.set_read_timeout(Some(
-        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
-    ))
-    .unwrap();
-    s.write_all(&[0x05, 0x01, 0x00]).unwrap();
-    let mut hello = [0u8; 2];
-    s.read_exact(&mut hello).unwrap();
-    assert_eq!(hello, [0x05, 0x00], "proxy refused the no-auth method");
-    let mut req = vec![0x05, 0x01, 0x00, 0x03, u8::try_from(host.len()).unwrap()];
+    let patience = vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30);
+    s.set_read_timeout(Some(patience)).unwrap_or_else(|e| {
+        panic!("APPARATUS: could not set a read timeout on the proxy socket: {e}")
+    });
+    let mut got = Vec::new();
+    socks_write(&mut s, &[0x05, 0x01, 0x00], "its greeting", &got);
+    let hello = socks_read(&mut s, 2, "its method choice", &mut got);
+    assert!(
+        hello == [0x05, 0x00],
+        "PRODUCT: the proxy refused the no-auth method: it sent {got:02x?}"
+    );
+    let len = u8::try_from(host.len()).unwrap_or_else(|_| {
+        panic!("APPARATUS: the proof's host name {host:?} is too long for SOCKS5")
+    });
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, len];
     req.extend_from_slice(host.as_bytes());
     req.extend_from_slice(&port.to_be_bytes());
-    s.write_all(&req).unwrap();
-    let mut head = [0u8; 4];
-    s.read_exact(&mut head).unwrap();
-    assert_eq!(head[0], 0x05, "not a SOCKS5 reply");
+    socks_write(&mut s, &req, "the CONNECT request", &got);
+    let head = socks_read(&mut s, 4, "its CONNECT reply", &mut got);
+    assert!(
+        head[0] == 0x05,
+        "PRODUCT: the proxy's CONNECT reply is not SOCKS5: it sent {got:02x?}"
+    );
     let skip = match head[3] {
         0x01 => 4 + 2,
         0x04 => 16 + 2,
-        other => panic!("unexpected address type {other} in reply"),
+        other => panic!(
+            "PRODUCT: the proxy's CONNECT reply has address type {other}, which is neither IPv4 nor \
+             IPv6: it sent {got:02x?}"
+        ),
     };
-    let mut sink = vec![0u8; skip];
-    s.read_exact(&mut sink).unwrap();
+    socks_read(
+        &mut s,
+        skip,
+        "the bound address in its CONNECT reply",
+        &mut got,
+    );
     (head[1], s)
+}
+
+/// Send `bytes` to the proxy, or a `PRODUCT:` red: it closed on us mid-handshake.
+fn socks_write(s: &mut TcpStream, bytes: &[u8], what: &str, got: &[u8]) {
+    if let Err(e) = s.write_all(bytes) {
+        panic!(
+            "PRODUCT: the proxy closed or failed during the SOCKS handshake, before taking {what}: \
+             {e} (kind {:?}). Before that it sent {got:02x?}",
+            e.kind()
+        );
+    }
+}
+
+/// Read exactly `n` bytes of the proxy's reply, appending them to `got`, or a `PRODUCT:` red quoting
+/// everything it did send: it closed, reset or went silent mid-handshake.
+fn socks_read(s: &mut TcpStream, n: usize, what: &str, got: &mut Vec<u8>) -> Vec<u8> {
+    let t0 = Instant::now();
+    let mut part = vec![0u8; n];
+    let mut have = 0;
+    while have < n {
+        match s.read(&mut part[have..]) {
+            Ok(0) => panic!(
+                "PRODUCT: the proxy closed the connection during the SOCKS handshake, {have} of {n} \
+                 bytes into {what}. Everything it sent: {:02x?}",
+                [&got[..], &part[..have]].concat()
+            ),
+            Ok(k) => have += k,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => panic!(
+                "PRODUCT: the proxy failed during the SOCKS handshake, {have} of {n} bytes into \
+                 {what}, after {:?}: {e} (kind {:?}). Everything it sent: {:02x?}",
+                t0.elapsed(),
+                e.kind(),
+                [&got[..], &part[..have]].concat()
+            ),
+        }
+    }
+    got.extend_from_slice(&part);
+    part
 }
 
 /// Connect through `at`, send `payload`, and read the echo, waiting up to `patience` for the

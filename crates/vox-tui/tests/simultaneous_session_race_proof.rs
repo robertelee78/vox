@@ -44,6 +44,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/world.rs"]
 mod world;
 
@@ -203,6 +206,9 @@ fn two_members_whose_hellos_are_both_lost_still_converge_and_read_each_other() {
 
 /// The race; with `lose_hellos`, bob and carol each lose the first hello they receive (V210-89).
 fn race(lose_hellos: bool) {
+    if lose_hellos {
+        test_knobs::require(&[LOSE_HELLOS]);
+    }
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let dirs: Vec<std::path::PathBuf> = ["alice", "bob", "carol"]
@@ -297,12 +303,19 @@ fn race(lose_hellos: bool) {
     assert!(c.0, "carol trusts bob: {}", c.2);
     std::thread::sleep(FREEZE.saturating_sub(frozen.elapsed()));
     signal(anchor_pid, "-CONT");
+    let thawed = Instant::now();
     eprintln!(
         "[proof] relay frozen {:?} while both trusted",
         frozen.elapsed()
     );
 
     // ---- they converge and read each other ----
+    // **Two cures hold this, so this proof cannot see either regress alone** (V210-89, V210-71).
+    // A hello counts as delivered only once a key sealed under its session is taken (#281); and a
+    // key refused as not opening under the session the peer holds marks that session dead, so the
+    // retry offers a fresh hello (#262, finding A). With both in, counting a hello on write stays
+    // green here (A heals the pair), and so does removing A (the hello rule does). Whoever removes
+    // either must know the other is then this race's only guard.
     // Each posts a fresh probe every 2 s until the other reads one of them.
     let deadline = Instant::now() + Duration::from_secs(90);
     let (mut bob_reads_carol, mut carol_reads_bob) = (false, false);
@@ -328,10 +341,11 @@ fn race(lose_hellos: bool) {
     let lost = |d: &Daemon| d.1.lock().unwrap().matches(LOST_SAID).count();
     let (bob_lost, carol_lost) = (lost(&bob), lost(&carol));
     eprintln!(
-        "[proof] release={} lose_hellos={lose_hellos}: after the race ({n} probe rounds): bob \
-         reads carol = {bob_reads_carol}, carol reads bob = {carol_reads_bob}; hellos lost: bob \
-         {bob_lost}, carol {carol_lost}",
-        !cfg!(debug_assertions)
+        "[proof] release={} lose_hellos={lose_hellos}: after the race ({n} probe rounds, \
+         watched {:.1?} of 90s): bob reads carol = {bob_reads_carol}, carol reads bob = \
+         {carol_reads_bob}; hellos lost: bob {bob_lost}, carol {carol_lost}",
+        !cfg!(debug_assertions),
+        thawed.elapsed()
     );
     if lose_hellos {
         assert!(
