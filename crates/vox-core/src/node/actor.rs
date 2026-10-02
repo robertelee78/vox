@@ -1029,9 +1029,11 @@ enum NetEvent {
         channel_id: Digest32,
         /// The joiner's proven identity.
         identity: Box<crate::identity::composite::CompositePublicKey>,
-        /// Answered once the admission is applied, which releases the acceptance frame. A dropped
-        /// sender answers too — the slot must never wait on an actor that has moved on.
-        ack: tokio::sync::oneshot::Sender<()>,
+        /// Answered with whether the admission was applied: `Ok` releases the acceptance frame, an
+        /// error refuses the joiner instead (a full room says so). A dropped sender answers too —
+        /// the slot must never wait on an actor that has moved on — and is a refusal: nothing
+        /// admitted the joiner.
+        ack: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
     },
     /// A joiner's task dialled a peer: adopt the connection now, so its streams are served while
     /// the join is still running over it.
@@ -2916,6 +2918,8 @@ const fn worth_another_responder(fault: Fault) -> bool {
             // This device's speed, against a wait every member derives the same way: another
             // member would cost another grind as long and end the same (V210-87).
             | Fault::SolveTooSlow
+            // Every member holds the same room: another would refuse it as full too.
+            | Fault::RoomFull
     )
 }
 
@@ -5305,28 +5309,33 @@ impl Node {
                 // The join proved this identity; admit it as an author so its entries — and its
                 // records on this node's board — are accepted. Reading still needs consent.
                 let now = self.now();
-                if let (Some(profile), Some(shared)) = (
+                let admitted = match (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
                 ) {
-                    let _ = shared
+                    (Some(profile), Some(shared)) => shared
                         .lock()
                         .await
-                        .admit_author(profile.store(), &identity, now);
+                        .admit_author(profile.store(), &identity, now)
+                        .map(|_| ()),
+                    (None, _) => Err(Error::Profile("locked")),
+                    (_, None) => Err(Error::Profile("no such channel in this profile")),
+                };
+                // **Not admitted, not accepted.** This was dropped, and the joiner was told it was
+                // in whatever happened: a room already full took nobody, and its joiner exited 0.
+                if admitted.is_ok() {
+                    // And into the view the board and the stream gate read, before the joiner is
+                    // answered: an author only the room knows is still a stranger to the board,
+                    // which refused the newcomer's records until something else refreshed it
+                    // (V210-80).
+                    self.refresh_network_view().await;
+                    // No longer waiting to join, so its pre-join record goes, and this node's
+                    // board stops counting it as pending (V210-102).
+                    if let Some(net) = self.net.as_ref() {
+                        net.forget_prejoin(&channel_id, &identity.fingerprint());
+                    }
                 }
-                // And into the view the board and the stream gate read, before the joiner is
-                // answered: an author only the room knows is still a stranger to the board, which
-                // refused the newcomer's records until something else refreshed it (V210-80).
-                self.refresh_network_view().await;
-                // No longer waiting to join, so its pre-join record goes, and this node's board
-                // stops counting it as pending (V210-102).
-                if let Some(net) = self.net.as_ref() {
-                    net.forget_prejoin(&channel_id, &identity.fingerprint());
-                }
-                // Answered whatever happened: a joiner waiting on this must not be left holding a
-                // stream because the room closed or this node has no profile. It will find out from
-                // the join's own outcome, which is the right place for it to learn.
-                let _ = ack.send(());
+                let _ = ack.send(admitted);
             }
             NetEvent::Dialed {
                 conn,
@@ -6388,8 +6397,14 @@ impl Node {
                             .is_ok()
                         {
                             // A dropped sender resolves this too, so a shutting-down actor cannot
-                            // strand a joiner mid-exchange.
-                            let _ = wait.await;
+                            // strand a joiner mid-exchange; nothing admitted it, so it is refused.
+                            wait.await.unwrap_or(Err(Error::JoinRefused(
+                                "the member stopped before it admitted the joiner",
+                            )))
+                        } else {
+                            Err(Error::JoinRefused(
+                                "the member stopped before it admitted the joiner",
+                            ))
                         }
                     },
                 )
@@ -11518,6 +11533,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
         Error::JoinSolveTooSlow { .. } => Fault::SolveTooSlow,
         Error::JoinResponderBusy | Error::JoinEndedForNewcomer => Fault::MembersBusy,
+        Error::RoomFull { .. } => Fault::RoomFull,
         Error::Path {
             op: crate::node::profile::VAULT_WRITE,
             ..

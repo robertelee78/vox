@@ -390,6 +390,15 @@ pub enum Error {
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
 
+    /// The room already holds as many members as a room can (`MAX_AUTHORS`), so the member that
+    /// answered the join could not admit the joiner, and refused it. Before this the refusal was
+    /// dropped and the joiner was told it was in: it exited 0, a member of nothing.
+    #[error("the room is full: {members} members")]
+    RoomFull {
+        /// How many members the room holds.
+        members: u64,
+    },
+
     /// Every one of the responder's join slots was held, so it refused before the exchange began
     /// (V210-92). The passphrase was never checked.
     #[error("a member is busy answering other joins")]
