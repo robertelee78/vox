@@ -155,19 +155,22 @@ jobs:
   # **The release suite, split across runners** (V210-116). Run as one `cargo test` of every binary
   # in turn it took 90–104 minutes, which put build-test at 89–117 of its 120 and
   # `scripts/release-gate.sh` (two-thirds of the limit, V210-14) could never pass. Each shard builds
-  # the same release suite, runs every third binary with `--ignored`, and records what it ran;
+  # the same release suite, runs every fourth binary with `--ignored`, and records what it ran;
   # `release-proofs-union` then requires the shards to have run the whole list, each binary once.
   # The proofs that drive the shipped `vox` with production parameters (Argon2id, real sockets) are
   # too slow unoptimized, so they are `#[ignore]`d in the debug suite and run here in release.
   # No proof is excluded by name (V210-19, #192). One red does not hide the rest: every binary in a
   # shard runs whatever the others did (v0.2.9 left ~120 binaries unrun behind one).
+  # Four, measured (draft #318, run 36938525058, three shards): each shard spends 22-28 minutes
+  # building (the mutant sender, then the suite) and the macOS suite runs 83 minutes in all, so three
+  # shards took 40-63 of 90 minutes, over two-thirds; four bring the slowest to about 55.
   release-proofs:
     name: release proofs
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        shard: [0, 1, 2]
+        shard: [0, 1, 2, 3]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -204,11 +207,11 @@ jobs:
           echo "VOX_MUTANT_SENDER=$path" >> "$GITHUB_ENV"
       - name: Build and list the release suite
         run: scripts/ci_shard.py list "list-${{ matrix.shard }}.tsv"
-      - name: Real-parameter gates (release), shard ${{ matrix.shard }} of 3
+      - name: Real-parameter gates (release), shard ${{ matrix.shard }} of 4
         env:
           # `update_proof` asks GitHub which releases exist, to find one to update *from*.
           GH_TOKEN: ${{ github.token }}
-        run: scripts/ci_shard.py run "list-${{ matrix.shard }}.tsv" ${{ matrix.shard }} 3 "ran-${{ matrix.shard }}.tsv"
+        run: scripts/ci_shard.py run "list-${{ matrix.shard }}.tsv" ${{ matrix.shard }} 4 "ran-${{ matrix.shard }}.tsv"
       # Uploaded whatever happened, so a shard cut short shows as binaries that never ran.
       - name: Record what this shard ran
         if: ${{ !cancelled() }}
