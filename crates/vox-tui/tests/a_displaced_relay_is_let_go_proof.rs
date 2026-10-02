@@ -76,8 +76,9 @@ const LET_GO_WITHIN: Duration = Duration::from_secs(75);
 const UPGRADE_WITHIN: Duration = Duration::from_secs(100);
 const PAYLOAD: usize = 16 * 1024;
 
-/// How long both ends may take, once a request rode the direct path or one end decided, to have
-/// decided between the same two connections: both file one handshake, so this is scheduling.
+/// How long both ends may take, once a request rode the direct path or one end decided, to name
+/// the same connection for each other in `vox status --json`: one upgrade's dials all land within
+/// about a second (measured), so the rest is scheduling.
 const BOTH_DECIDED_WITHIN: Duration = Duration::from_secs(20);
 
 /// Every connection note `p` printed about `peer` (named by the first 26 characters of its
@@ -198,12 +199,37 @@ fn ends_disagree(w: &ForwardedWorld, up: &world::VoxProc) -> bool {
     shared(w, up).iter().any(|(h, g)| h.kept != g.kept)
 }
 
-/// **V29-15: both ends keep the same one of two live connections.** Every pair of connections
-/// both ends decided between must have been decided alike (`PRODUCT`), whatever each one's path.
-/// Waits up to [`BOTH_DECIDED_WITHIN`] for at least one such pair once either end has decided or
-/// a request rode the direct path (`direct_seen`), then a moment for a later filing. No pair
-/// decided at both ends is `CANNOT MEASURE`, unless neither end decided anything and no request
-/// rode the direct path (there was no duplicate; the caller then names that).
+/// The connection `dir`'s running node says it holds for `peer` in `vox status --json` (its `reach`
+/// row's `connection`, with the row's `path`), or why it could not say: the status failed, did not
+/// parse, or names no connection for the peer.
+fn status_holds(dir: &std::path::Path, peer: &str) -> Result<(String, String), String> {
+    let (ok, out, err) = world::vox_once(dir, &world::args(&["status", "--json"]));
+    if !ok {
+        return Err(format!("`vox status --json` failed: {err}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|e| format!("`vox status --json` is not JSON ({e}): {out}"))?;
+    let row = v["reach"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["peer"] == peer))
+        .ok_or_else(|| format!("no `reach` row for the peer: {out}"))?;
+    match (row["connection"].as_str(), row["path"].as_str()) {
+        (Some(tag), Some(path)) => Ok((tag.to_owned(), path.to_owned())),
+        _ => Err(format!("its row names no connection: {row}")),
+    }
+}
+
+/// **V29-15: both ends keep the same one of two live connections.**
+///
+/// **Judged on the end state.** Each end's `vox status --json` names the connection it holds for
+/// the other. Within [`BOTH_DECIDED_WITHIN`] of the upgrade, both must name **the same one**, and
+/// still do a second later (`PRODUCT` otherwise, quoting both ends' rows and every connection note
+/// each gave about the other). An end that decided differently, silently, holds a different one
+/// here whatever it wrote.
+///
+/// **The notes as further evidence.** Every pair of connections both ends wrote a decision about
+/// must have been decided alike (`PRODUCT` otherwise). A pair only one end wrote about is not
+/// compared: an end can file a connection the other has not yet.
 fn both_ends_keep_the_same_connection(
     w: &mut ForwardedWorld,
     up: &mut world::VoxProc,
@@ -216,13 +242,6 @@ fn both_ends_keep_the_same_connection(
     if !direct_seen && !any_decided(w, up) {
         return;
     }
-    let since = Instant::now();
-    while shared(w, up).is_empty() && since.elapsed() < BOTH_DECIDED_WITHIN {
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    // A later filing (the other end's own dial landing) would be said by now as well.
-    std::thread::sleep(Duration::from_secs(3));
-    let both = shared(w, up);
     // Timed from the forward opening, on every run: the order and spacing of the dials is
     // part of what a reader needs.
     let notes = |w: &ForwardedWorld, up: &world::VoxProc| {
@@ -233,19 +252,58 @@ fn both_ends_keep_the_same_connection(
             timed_notes_about(up, &w.host_fp, opened).join("\n")
         )
     };
+    // ---- the end state: both name the same connection, steadily ----
+    let read = |w: &ForwardedWorld| {
+        (
+            status_holds(&w.host_dir, &w.guest_fp),
+            status_holds(&w.guest_dir, &w.host_fp),
+        )
+    };
+    let agree = |r: &(
+        Result<(String, String), String>,
+        Result<(String, String), String>,
+    )| { matches!(r, (Ok(h), Ok(g)) if h.0 == g.0) };
+    let since = Instant::now();
+    let mut last = read(w);
+    loop {
+        if agree(&last) {
+            std::thread::sleep(Duration::from_secs(1));
+            let again = read(w);
+            if agree(&again) && again.0.as_ref().map(|h| &h.0) == last.0.as_ref().map(|h| &h.0) {
+                last = again;
+                break;
+            }
+            last = again;
+        }
+        if since.elapsed() >= BOTH_DECIDED_WITHIN {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        last = read(w);
+    }
     eprintln!("[proof] {}", notes(w, up));
+    eprintln!(
+        "[proof] which connection each end says it holds for the other (`vox status --json`): \
+         host {:?}, guest {:?}",
+        last.0, last.1
+    );
+    assert!(
+        agree(&last),
+        "PRODUCT: {BOTH_DECIDED_WITHIN:?} after the upgrade, the two ends do not hold the same \
+         connection to each other: the host's `vox status --json` says {:?} and the guest's says \
+         {:?}; each end will open streams on one the other has retired.\n{}",
+        last.0,
+        last.1,
+        notes(w, up)
+    );
+    // ---- and every duplicate both ends wrote about was decided alike ----
+    let both = shared(w, up);
     eprintln!(
         "[proof] {} pair(s) of connections decided at both ends: {:?}",
         both.len(),
         both.iter()
             .map(|(h, g)| format!("{:?}: host kept {}, guest kept {}", h.pair, h.kept, g.kept))
             .collect::<Vec<_>>()
-    );
-    assert!(
-        !both.is_empty(),
-        "CANNOT MEASURE: no pair of connections was decided between at both ends within \
-         {BOTH_DECIDED_WITHIN:?}, so whether they decide alike cannot be read.\n{}",
-        notes(w, up)
     );
     for (h, g) in &both {
         assert_eq!(
@@ -285,11 +343,13 @@ fn both_ends_keep_the_same_connection(
 ///   direct, and decides alone which to keep. Each says which on stderr (`vox: connection to
 ///   <peer> — a new connection <tag> … displaced / lost the tie-break to the one held <tag>`),
 ///   naming connections by a tag from the connection's own TLS exporter, so one connection has one
-///   tag at both ends. For **every pair** of connections that both the host's `vox serve` and
-///   the guest's `vox up` decided between, the two must have kept **the same one** (`PRODUCT`);
-///   at least one such pair is required (`CANNOT MEASURE` otherwise). A pair only one end has
-///   filed yet is not compared: the pair keeps dialling, and a third connection can reach one end
-///   before the other. Ends that disagree open streams on a connection the other has retired.
+///   tag at both ends, and `vox status --json` names the connection each holds for the other by
+///   the same tag. **The end state is judged:** within 20 s of the upgrade, the host's `vox serve`
+///   and the guest's `vox up` must name the same connection for each other, and still do a second
+///   later (`PRODUCT` otherwise). An end that decided differently and said nothing is caught here.
+///   As further evidence, every pair of connections both ends wrote a decision about must have
+///   been decided alike (`PRODUCT`); a pair only one end has filed yet is not compared. Ends that
+///   disagree open streams on a connection the other has retired.
 /// - The session opened before the upgrade answers an echo, whole, every few seconds until the
 ///   grace and 15 s for the tick have passed since the direct path took over.
 ///
