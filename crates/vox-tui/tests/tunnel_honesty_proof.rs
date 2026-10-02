@@ -23,6 +23,13 @@
 //!   reply — a lie a client cannot detect.
 //! - **Removing a service cuts the sessions it is carrying** (R22). Only untrusting a
 //!   member used to; removing the service changed the stored offer and nothing else.
+//! - **Only the client that opened a forward stops it, and only the operator withdraws a
+//!   service** (V210-151). The node's control socket stopped any client's forward and withdrew
+//!   any service, the operator's persisted ones too, for whichever local process asked. Here a
+//!   second socket client — a local process speaking the control protocol, the attacker's
+//!   vantage, so this one arm does reach into `vox_core` for its client — asks to stop the first
+//!   client's forward and to withdraw the host's service, and `vox service remove` is run with a
+//!   wrong identity passphrase. The node refuses all three, and the forward still carries.
 //! - **A quiet session is not dropped** (RP-09). quinn's defaults are a 30 s idle timeout and
 //!   no keep-alive, so on defaults an `ssh` session through a forward dies while its person
 //!   reads. Three things keep the guest's connection to the host up, and any one of them is
@@ -76,6 +83,7 @@ mod world;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use world::{
@@ -602,4 +610,176 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     );
     eprintln!("[test] both refused at the proxy; the services counted 1 (the control) and 0");
     drop(other);
+}
+
+/// A raw control-socket client of the profile at `dir`: what any local process can open.
+async fn socket_client(dir: &std::path::Path) -> vox_core::node::ipc::IpcClient {
+    let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
+        .unwrap_or_else(|e| panic!("APPARATUS: resolve {}'s paths: {e}", dir.display()));
+    vox_core::node::ipc::IpcClient::open(&paths.socket_file())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT (staging): the daemon at {} serves no control socket: {e}",
+                dir.display()
+            )
+        })
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+fn a_forward_or_a_service_is_withdrawn_only_by_whoever_opened_it() {
+    use vox_core::node::ipc::{Frame, Request};
+    watchdog::arm();
+    let mut w = World::new(echo_service(), true);
+    w.restart_host_as_daemon();
+    // The guest as a daemon too, so its forwards are opened over its control socket.
+    let pass_file = w.tmp.path().join("guest-daemon-passphrases");
+    std::fs::write(
+        &pass_file,
+        format!("{}\n{}\n", world::IDENTITY, w.passphrase),
+    )
+    .unwrap_or_else(|e| panic!("APPARATUS: write {}: {e}", pass_file.display()));
+    let mut guest = VoxProc::spawn(
+        "guest-daemon",
+        &w.guest_dir,
+        &args(&[
+            "daemon",
+            "--passphrase-file",
+            &world::utf8(&pass_file),
+            "--anchor",
+            &w.anchor_spec,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+    );
+    let room = w.room.clone();
+    guest.expect_line("the guest daemon to hold the room open", |l| {
+        l.starts_with("vox daemon: holding room") && l.contains(&room)
+    });
+    let channel_id = w
+        .address
+        .strip_prefix("vox://")
+        .and_then(|a| a.split('?').next())
+        .and_then(|id| vox_core::node::link::b32_decode(id, "room").ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): the address names no room: {}",
+                w.address
+            )
+        });
+    let host_id = vox_core::node::link::b32_decode(&w.host_fp, "host").unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT (staging): the host's fingerprint {}: {e}",
+            w.host_fp
+        )
+    });
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: build the test's runtime");
+
+    // ---- client A opens a forward to the host's service, and it carries ----
+    let mut a = rt.block_on(socket_client(&w.guest_dir));
+    let local = match rt.block_on(a.request(&Request::Forward {
+        channel_id,
+        host: host_id,
+        service_tag: w.service_port.to_string(),
+        local: "127.0.0.1:0".to_owned(),
+    })) {
+        Ok(Frame::Bound { local }) => local,
+        other => panic!("PRODUCT (staging): client A's forward was not bound: {other:?}"),
+    };
+    let at: std::net::SocketAddr = local
+        .parse()
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): the bound address {local:?}: {e}"));
+    let carries = |what: &str| {
+        round_trip(at, what.as_bytes(), Duration::from_secs(60))
+            .map(|got| got == what.as_bytes())
+            .unwrap_or(false)
+    };
+    assert!(
+        carries("before"),
+        "PRODUCT (staging): client A's forward at {local} does not carry to the host's service"
+    );
+
+    // ---- client B asks to stop A's forward: refused, and it still carries ----
+    let mut b = rt.block_on(socket_client(&w.guest_dir));
+    let stop = rt.block_on(b.request(&Request::StopForward {
+        local: local.clone(),
+    }));
+    eprintln!("[proof] client B's StopForward of A's forward: {stop:?}");
+    assert!(
+        carries("after B's stop"),
+        "PRODUCT: client B stopped client A's forward at {local}: only the client that opened a \
+         forward may stop it (V210-151). The node answered B: {stop:?}"
+    );
+    assert!(
+        matches!(&stop, Ok(Frame::Error { reason }) if reason.contains("not this client's")),
+        "PRODUCT: the node did not refuse client B's StopForward of A's forward with a reason: \
+         {stop:?}"
+    );
+
+    // ---- a raw client, and `vox service remove` with a wrong passphrase, cannot withdraw the
+    // host's service ----
+    let mut c = rt.block_on(socket_client(&w.host_dir));
+    let raw = rt.block_on(c.request(&Request::RemoveService {
+        channel_id,
+        service_tag: w.service_port.to_string(),
+        identity_passphrase: None,
+    }));
+    eprintln!("[proof] a raw RemoveService of the host's service: {raw:?}");
+    let wrong = Command::new(world::VOX)
+        .args(["service", "remove", &w.room, &w.service_port.to_string()])
+        .env("VOX_DATA_DIR", &w.host_dir)
+        .env("VOX_CONFIG_DIR", w.host_dir.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", "not the identity passphrase")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: run vox service remove: {e}"));
+    let wrong_said = String::from_utf8_lossy(&wrong.stderr).into_owned();
+    eprintln!(
+        "[proof] `vox service remove` with a wrong identity passphrase: {} {}",
+        wrong.status,
+        wrong_said.trim()
+    );
+    assert!(
+        carries("after the removals"),
+        "PRODUCT: the host's service was withdrawn by a client that is not its operator \
+         (V210-151). A raw RemoveService: {raw:?}; `vox service remove` with a wrong passphrase: \
+         {} {wrong_said}",
+        wrong.status
+    );
+    assert!(
+        matches!(&raw, Ok(Frame::Error { reason }) if reason.contains("not this client's")),
+        "PRODUCT: the node did not refuse a raw RemoveService of the host's service with a \
+         reason: {raw:?}"
+    );
+    assert!(
+        !wrong.status.success() && wrong_said.contains("does not match"),
+        "PRODUCT: `vox service remove` with a wrong identity passphrase did not fail saying so: \
+         {} {wrong_said}",
+        wrong.status
+    );
+
+    // ---- the owners can: A stops its own forward, and the operator withdraws the service ----
+    let own = rt.block_on(a.request(&Request::StopForward {
+        local: local.clone(),
+    }));
+    assert!(
+        matches!(own, Ok(Frame::Ok)),
+        "PRODUCT: client A could not stop its own forward: {own:?}"
+    );
+    let (ok, out, err) = vox_once(
+        &w.host_dir,
+        &args(&["service", "remove", &w.room, &w.service_port.to_string()]),
+    );
+    assert!(
+        ok,
+        "PRODUCT: the operator's `vox service remove`, with the identity passphrase, failed.\n\
+         stdout:\n{out}\nstderr:\n{err}"
+    );
+    eprintln!("[proof] client A stopped its own forward; the operator withdrew the service");
+    drop(guest);
+    drop(w);
 }

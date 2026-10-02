@@ -1988,6 +1988,19 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // The operator's proof, as `vox trust` takes it: a service is withdrawn only by
+            // whoever holds the identity (V210-151).
+            let identity = match crate::tunnel_cli::identity_passphrase_for(
+                &paths,
+                r.room.identity_passphrase.clone(),
+                r.room.identity_passphrase_file.clone(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -2002,6 +2015,7 @@ pub fn run() -> ExitCode {
                 &paths,
                 &r.room.room,
                 &r.tag,
+                &identity,
             )) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

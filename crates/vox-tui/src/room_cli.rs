@@ -1498,15 +1498,25 @@ pub async fn release_resource(
 /// it is carrying sessions the removal must cut (PRD-001 R22). The request is the one
 /// `vox room send` already makes when its offer ends; it only ever narrows what is exposed.
 ///
+/// A service is the operator's to withdraw (V210-151), so this carries the identity passphrase:
+/// the node refuses a withdrawal without it, as it refuses a trust edit.
+///
 /// # Errors
-/// If the node cannot be reached, the room is unknown, or the service was not offered.
-pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), AppError> {
+/// If the node cannot be reached, the room is unknown, the passphrase is not the identity's, or
+/// the service was not offered.
+pub async fn service_remove(
+    paths: &Paths,
+    room: &str,
+    tag: &str,
+    identity_passphrase: &str,
+) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client
         .request(&Request::RemoveService {
             channel_id,
             service_tag: tag.to_owned(),
+            identity_passphrase: Some(identity_passphrase.to_owned()),
         })
         .await
     {
@@ -2031,9 +2041,11 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
     // a stop that only SIGKILL could end. Its sessions are reset below either way.
     let removed = tokio::time::timeout(
         REMOVE_SERVICE_PATIENCE,
+        // This connection's own offer: the node withdraws it with no proof (V210-151).
         client.request(&Request::RemoveService {
             channel_id,
             service_tag: tag,
+            identity_passphrase: None,
         }),
     )
     .await;

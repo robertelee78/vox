@@ -321,11 +321,19 @@ pub enum Request {
         local: String,
     },
     /// Stop offering a service.
+    ///
+    /// **Only the client that offered it, or the operator** (V210-151). A client withdraws its
+    /// own offer — one this connection made — with no proof. Any other service, and every
+    /// persisted one, is the operator's: withdrawing it takes the identity passphrase, the same
+    /// proof that adds one. Without it the node refuses, and says whose the service is.
     RemoveService {
         /// The room.
         channel_id: Digest32,
         /// The service's tag.
         service_tag: String,
+        /// The identity passphrase, for a service this connection did not offer. `None` for its
+        /// own.
+        identity_passphrase: Option<String>,
     },
     /// Forward a local port to a member's service over the overlay.
     ///
@@ -341,7 +349,8 @@ pub enum Request {
         /// The local address to bind; port 0 lets the OS choose.
         local: String,
     },
-    /// Stop a forward previously bound at this address.
+    /// Stop a forward previously bound at this address. **Only the client that opened it**
+    /// (V210-151): a forward is a client's own, and any other client is refused.
     StopForward {
         /// The address [`Frame::Bound`] reported.
         local: String,
@@ -522,11 +531,14 @@ impl Request {
             Request::RemoveService {
                 channel_id,
                 service_tag,
+                identity_passphrase,
             } => {
-                e.array(3)
+                // An empty text is "none": an empty passphrase proves nothing either way.
+                e.array(4)
                     .uint(T_REMOVE_SERVICE)
                     .bytes(channel_id)
-                    .text(service_tag);
+                    .text(service_tag)
+                    .text(identity_passphrase.as_deref().unwrap_or(""));
             }
             Request::Forward {
                 channel_id,
@@ -772,14 +784,20 @@ impl Request {
                     local,
                 })
             }
-            (T_REMOVE_SERVICE, 3) => {
+            (T_REMOVE_SERVICE, n @ (3 | 4)) => {
                 let channel_id = digest(&mut d)?;
                 let service_tag = text(&mut d, "ipc service tag")?;
+                let identity_passphrase = if n == 4 {
+                    Some(text(&mut d, "ipc identity passphrase")?).filter(|p| !p.is_empty())
+                } else {
+                    None
+                };
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::RemoveService {
                     channel_id,
                     service_tag,
+                    identity_passphrase,
                 })
             }
             (T_FORWARD, 5) => {
@@ -1884,6 +1902,7 @@ impl Held {
             Request::RemoveService {
                 channel_id,
                 service_tag,
+                ..
             } => Intent::Withdraw(*channel_id, service_tag.clone()),
             Request::Forward { .. } => Intent::Forward,
             Request::StopForward { local } => Intent::StopForward(local.clone()),
@@ -1899,6 +1918,63 @@ impl Held {
             (Intent::Forward, Frame::Bound { local }) => self.forwards.push(local.clone()),
             (Intent::StopForward(local), _) => self.forwards.retain(|l| *l != local),
             _ => {}
+        }
+    }
+
+    /// Why this client may not make `request`, if it may not (V210-151): a forward or a service
+    /// is withdrawn only by the client that opened it, or — a service — by the operator, with
+    /// the identity passphrase that adding one takes. The node checks this itself, so no client
+    /// can withdraw another's forward or the operator's service, whatever it sends.
+    async fn refusal(&self, handle: &NodeHandle, request: &Request) -> Option<Frame> {
+        match request {
+            Request::StopForward { local } if !self.forwards.contains(local) => {
+                Some(Frame::Error {
+                    reason: format!(
+                        "the forward at {local} is not this client's to stop: only the client \
+                         that opened it can, and it ends when that client does"
+                    ),
+                })
+            }
+            Request::RemoveService {
+                channel_id,
+                service_tag,
+                identity_passphrase,
+            } if !self
+                .services
+                .iter()
+                .any(|(c, t)| c == channel_id && t == service_tag) =>
+            {
+                let Some(passphrase) = identity_passphrase.clone() else {
+                    return Some(Frame::Error {
+                        reason: format!(
+                            "the service {service_tag:?} is not this client's to withdraw: it \
+                             was offered by the operator or by another client, and only the \
+                             operator withdraws it — `vox service remove` with the identity \
+                             passphrase"
+                        ),
+                    });
+                };
+                match handle
+                    .apply(crate::node::api::NodeCommand::VerifyPassphrase {
+                        passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+                    })
+                    .await
+                {
+                    crate::node::api::Outcome::Done => None,
+                    crate::node::api::Outcome::Failed(crate::node::api::Fault::WrongPassphrase) => {
+                        Some(Frame::Error {
+                            reason: format!(
+                                "the identity passphrase does not match; the service \
+                                 {service_tag:?} is only withdrawn by whoever holds it"
+                            ),
+                        })
+                    }
+                    other => Some(Frame::Error {
+                        reason: other.to_string(),
+                    }),
+                }
+            }
+            _ => None,
         }
     }
 
@@ -2008,7 +2084,10 @@ async fn serve_requests(
             return pump(stream, events).await;
         }
         let intent = Held::intent(&request);
-        let reply = serve_request(handle, request).await;
+        let reply = match held.refusal(handle, &request).await {
+            Some(refused) => refused,
+            None => serve_request(handle, request).await,
+        };
         held.note(intent, &reply);
         write_frame(&mut stream, &reply.to_bytes()).await?;
     }
@@ -2384,6 +2463,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::RemoveService {
             channel_id,
             service_tag,
+            ..
         } => match handle
             .apply(crate::node::api::NodeCommand::RemoveService {
                 channel_id,
