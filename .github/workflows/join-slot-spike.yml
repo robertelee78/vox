@@ -1,0 +1,24 @@
+# SPIKE ONLY (V210-124, #332): never merged. Runs a_stranger_cannot_hold_every_join_slot_proof,
+# as CI's release suite runs it (every case, libtest's default threads), on both CI runners.
+name: join-slot-spike-v210-124
+on: pull_request
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+jobs:
+  proof:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain and runner
+        run: rustc --version && cargo --version && uname -a && (nproc || sysctl -n hw.ncpu)
+      - name: The join-slot proof (release, every case)
+        run: >
+          cargo test --release -p vox-tui --features vox-tui/test-knobs
+          --test a_stranger_cannot_hold_every_join_slot_proof
+          --no-fail-fast -- --ignored --nocapture
