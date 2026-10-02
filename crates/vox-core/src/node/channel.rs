@@ -222,6 +222,30 @@ pub const MAX_RECEIVER_CHAINS: usize = 4096;
 /// Hard cap on admitted authors per channel, so a hostile or corrupt segment cannot
 /// force an unbounded allocation on open.
 pub const MAX_AUTHORS: usize = 1024;
+
+/// **Test-only**: a smaller room, so a proof fills one with a few members rather than 1,024. Its
+/// value is the most authors a room admits, from 1 to [`MAX_AUTHORS`]. Unset, empty, unparsable or
+/// out of range is [`MAX_AUTHORS`]: nothing in a real deployment sets it, and without the
+/// `test-knobs` feature (V210-105) it is not compiled in.
+#[cfg(feature = "test-knobs")]
+pub const TEST_MAX_AUTHORS_ENV: &str = "VOX_TEST_MAX_AUTHORS";
+
+/// The most authors a room admits: [`MAX_AUTHORS`], or [`TEST_MAX_AUTHORS_ENV`]'s.
+fn max_authors() -> usize {
+    #[cfg(feature = "test-knobs")]
+    {
+        static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *MAX.get_or_init(|| {
+            std::env::var(TEST_MAX_AUTHORS_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| (1..=MAX_AUTHORS).contains(n))
+                .unwrap_or(MAX_AUTHORS)
+        })
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    MAX_AUTHORS
+}
 /// Cap on a local channel name.
 pub const MAX_LOCAL_NAME_LEN: usize = 128;
 
@@ -1914,8 +1938,10 @@ impl ChannelState {
                 "another key is already admitted for this fingerprint",
             ));
         }
-        if self.authors.len() >= MAX_AUTHORS {
-            return Err(Error::SizeLimitExceeded("channel authors"));
+        if self.authors.len() >= max_authors() {
+            return Err(Error::RoomFull {
+                members: self.authors.len() as u64,
+            });
         }
         self.authors.insert(fingerprint, key.clone());
         self.admission

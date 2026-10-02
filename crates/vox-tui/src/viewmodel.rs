@@ -216,6 +216,8 @@ pub enum UiError {
     JoinPowTooSlow,
     /// Every member that answered a join was busy answering others (V210-92).
     JoinMembersBusy,
+    /// The room already holds as many members as a room can, so the join was refused.
+    JoinRoomFull,
     /// Join proof-of-possession / identity mismatch.
     JoinProofMismatch,
     /// No reachable peer / your node — "both must be online" for a 2-member channel.
@@ -295,6 +297,9 @@ impl UiError {
             }
             UiError::JoinMembersBusy => {
                 "a member is busy answering other joins — try again shortly"
+            }
+            UiError::JoinRoomFull => {
+                "the room is full: it holds as many members as a room can — nobody else can join"
             }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — the host or a member must be online",
