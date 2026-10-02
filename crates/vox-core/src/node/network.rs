@@ -1112,7 +1112,28 @@ impl NodeNet {
                     // sent `true` first, so read the value again rather than take the drop for a
                     // win (`has_changed` errs on a dropped sender whatever it last sent).
                     let rung_won = failed.has_changed().is_err() && !*failed.borrow();
-                    if rung_won || manager.existing(&peer).is_some() {
+                    let held = manager.existing(&peer);
+                    if rung_won || held.is_some() {
+                        // Said, so a pair that never bridges shows what it waited for (V210-122):
+                        // how long, and whether the connection that answered is direct.
+                        let what = match held
+                            .as_deref()
+                            .map(|c| crate::node::net::path_class(manager.endpoint(), c))
+                        {
+                            Some(crate::node::net::PathClass::Direct) | None => {
+                                "a direct connection"
+                            }
+                            Some(_) => "a relayed connection",
+                        };
+                        manager.note(
+                            peer,
+                            format!(
+                                "not asking {} for a circuit: {what} answered first, {} ms into \
+                                 the reach",
+                                short_id(relay.peer_id()),
+                                started.elapsed().as_millis()
+                            ),
+                        );
                         return (
                             label,
                             Err(Error::Unreachable(
