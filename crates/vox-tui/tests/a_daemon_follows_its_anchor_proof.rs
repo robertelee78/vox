@@ -456,6 +456,26 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
+    // **Bob joins once alice says the anchor has the room.** When the invite was issued before the
+    // anchor took the room, alice said "anchor … has not taken room … yet … this node will say when
+    // it has", and a guest who joins before then is turned away by design. So the proof waits for
+    // her own "anchor … has taken room …", then joins once: no retry past a refusal. Alice never
+    // saying so is the product's (she did not register the room at the anchor's new address).
+    let alice_err = tmp.path().join("daemon.err");
+    let owed = std::time::Instant::now() + FOLLOW_PATIENCE;
+    loop {
+        let said = std::fs::read_to_string(&alice_err).unwrap_or_default();
+        if said.contains("has taken room") || !said.contains("has not taken room") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < owed,
+            "PRODUCT: alice said the anchor at {real_spec} had not taken the room, and never said \
+             it had within {FOLLOW_PATIENCE:?}: she did not register it at the anchor's new \
+             address\nalice's stderr: {said:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
     // One attempt: a join that fails is the product failing, and retrying past it would hide it.
     let join_started = std::time::Instant::now();
     let (joined, _, join_error) = vox_stdin(
