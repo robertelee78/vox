@@ -2428,6 +2428,34 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        // Ask the running node when there is one, as `add` and `remove` do (V030-24): the
+        // profile is not ours to open while a daemon holds it.
+        Cmd::Service(ServiceCmd::List(r)) if node_answers(&r.profile) => {
+            let paths = match r.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(crate::room_cli::service_list(&paths, &r.room)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
             let sub = sub.clone();
             async move {
