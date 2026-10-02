@@ -317,6 +317,12 @@ pub async fn post_cmd(
         if body.trim().is_empty() {
             return Err(AppError::Usage("refusing to post an empty message".into()));
         }
+        // An envelope every reader would refuse is refused here, before it is posted
+        // (V210-123): a type or name not on one line would otherwise sit in the log unread.
+        if let Err(e @ vox_agentcomms::envelope::ParseError::Malformed(_)) = Envelope::parse(&body)
+        {
+            return Err(AppError::Usage(format!("refusing to post it: {e}")));
+        }
         if let Ok(env) = Envelope::parse(&body) {
             if claim::is_claim_protocol(&env) {
                 return Err(AppError::Usage(format!(
@@ -355,6 +361,14 @@ pub async fn post_cmd(
     }
 
     let kind = opts.kind.clone().unwrap_or_else(|| "say".into());
+    if !vox_agentcomms::envelope::is_valid_name(&kind, vox_agentcomms::envelope::MAX_NAME) {
+        return Err(AppError::Usage(format!(
+            "--type {} is refused: a type must be at most {} bytes on one line, with no control \
+             characters, line separators or bidi controls, because other agents' rooms print it",
+            vox_agentcomms::envelope::shown(&kind, vox_agentcomms::envelope::SHOWN_NAME),
+            vox_agentcomms::envelope::MAX_NAME
+        )));
+    }
     let mut data = match &opts.data {
         None => serde_json::Map::new(),
         Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
@@ -591,19 +605,17 @@ fn unread_addressed(
             let env = Envelope::parse(&r.text).ok()?;
             let own = r.author == snap.me && env.from == session;
             (!own && names.iter().any(|n| env.is_addressed_to(n))).then(|| {
-                let body: String = env
-                    .body
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(160)
-                    .collect();
+                // Every field is the author's, and this lands on the reporting agent's stderr: each
+                // is shown on one line and cut (V210-123). The body's first line ends at any
+                // character a reader breaks a line at, not only `\n`.
+                use vox_agentcomms::envelope::{breaks_lines, shown, SHOWN_NAME};
+                let first = env.body.trim_start();
+                let first = first.split(breaks_lines).next().unwrap_or("");
                 (
                     claim::b32(&r.entry_hash),
-                    env.from.clone(),
-                    env.kind.clone(),
-                    body,
+                    shown(&env.from, SHOWN_NAME),
+                    shown(&env.kind, SHOWN_NAME),
+                    shown(first, 160),
                 )
             })
         })
@@ -733,8 +745,8 @@ fn after_cursor(
 /// so a message carrying a newline followed by `<hash> <author> …` would otherwise print a
 /// second row attributed to someone else — and agents read this output. Every continuation
 /// line is therefore indented with `  | `, which no row begins with, and every other
-/// control character (a carriage return, an escape sequence) is shown escaped rather than
-/// passed to the terminal. `--json` needs none of this: each row is one JSON-escaped line.
+/// control character (a carriage return, an escape sequence) and the Unicode line and
+/// paragraph separators are shown escaped rather than passed on. `--json` needs none of this: each row is one JSON-escaped line.
 fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
     // A message whose envelope is held and whose body is still asked for (V030-10).
     if r.owed {
@@ -750,7 +762,11 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
         match c {
             '\n' => text.push_str("\n  | "),
             '\t' => text.push('\t'),
-            c if c.is_control() => text.push_str(&c.escape_unicode().to_string()),
+            // U+2028 and U+2029 break a line for a model or a JSON viewer, not a
+            // terminal, so they are escaped too (V210-123).
+            c if vox_agentcomms::envelope::breaks_lines(c) => {
+                text.push_str(&c.escape_unicode().to_string());
+            }
             c => text.push(c),
         }
     }
@@ -1237,6 +1253,22 @@ async fn run_op(
     body: String,
 ) -> Result<Done, AppError> {
     let session = coord::require_session(opts.session.as_deref())?;
+    // Every node folds these names and prints them into its agents' contexts, so a name
+    // that would not stay on one line is refused here, before anything is posted, as the
+    // fold refuses it there (V210-123).
+    use vox_agentcomms::envelope::{is_valid_name, shown, MAX_NAME, MAX_RESOURCE, SHOWN_NAME};
+    for (key, max) in [("resource", MAX_RESOURCE), ("to_session", MAX_NAME)] {
+        if let Some(v) = data.get(key).and_then(serde_json::Value::as_str) {
+            if !is_valid_name(v, max) {
+                return Err(AppError::Usage(format!(
+                    "the {key} {} is refused: it must be at most {max} bytes on one line, with \
+                     no control characters or line separators, because other agents' rooms \
+                     print it",
+                    shown(v, SHOWN_NAME)
+                )));
+            }
+        }
+    }
     let op = match &opts.op {
         Some(op) if vox_agentcomms::ops::is_valid_op(op) => op.clone(),
         Some(op) => {
@@ -1394,8 +1426,24 @@ fn report(
     }
 }
 
+/// `<author>/<session>`, the session on one line and cut (V210-123): it is the author's
+/// text, and this lands in other agents' contexts.
 fn who(o: &Owner) -> String {
-    format!("{}/{}", crate::ident::author_id(&o.author), o.session)
+    format!(
+        "{}/{}",
+        crate::ident::author_id(&o.author),
+        session_name(&o.session)
+    )
+}
+
+/// An author-chosen session as this module prints it: one line, about 64 bytes (V210-123).
+fn session_name(s: &str) -> String {
+    vox_agentcomms::envelope::shown(s, vox_agentcomms::envelope::SHOWN_NAME)
+}
+
+/// An author-chosen resource as this module prints it: one line, cut (V210-123).
+fn name(s: &str) -> String {
+    vox_agentcomms::envelope::shown(s, vox_agentcomms::envelope::MAX_RESOURCE)
 }
 
 fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, AppError> {
@@ -1477,7 +1525,7 @@ pub async fn claim_resource(
                 &crate::ident::author_id(to_fp),
                 to_session
                     .as_ref()
-                    .map(|s| format!("/{s}"))
+                    .map(|s| format!("/{}", session_name(s)))
                     .unwrap_or_default()
             ),
         ),
@@ -1668,7 +1716,7 @@ pub async fn handoff_resource(
             format!(
                 "{resource} is reserved for {}{} until {}; it completes when that session claims it",
                 &crate::ident::author_id(&to_fp),
-                to_session.map(|s| format!("/{s}")).unwrap_or_default(),
+                to_session.map(|s| format!("/{}", session_name(s))).unwrap_or_default(),
                 millis_as_time(*deadline_millis)
             ),
         ),
@@ -1907,7 +1955,7 @@ pub async fn board(
                     Some(_) => " expired".to_owned(),
                     None => String::new(),
                 };
-                format!("{resource}\t{}{mine}{expiry}", who(owner))
+                format!("{}\t{}{mine}{expiry}", name(resource), who(owner))
             }
             State::Pending {
                 from,
@@ -1916,12 +1964,13 @@ pub async fn board(
                 deadline_millis,
                 ..
             } => format!(
-                "{resource}\tpending handoff from {} to {}{}{} (lapses in {}s)",
+                "{}\tpending handoff from {} to {}{}{} (lapses in {}s)",
+                name(resource),
                 who(from),
                 &crate::ident::author_id(to_fp),
                 to_session
                     .as_ref()
-                    .map(|s| format!("/{s}"))
+                    .map(|s| format!("/{}", session_name(s)))
                     .unwrap_or_default(),
                 if s.is_eligible(&me) {
                     " — you may claim or decline it"

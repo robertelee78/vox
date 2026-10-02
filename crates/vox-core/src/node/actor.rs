@@ -2856,6 +2856,17 @@ impl Joiner {
                     }
                 }
             };
+            // **Which path the join rode** (V210-124): said with its timings, so a person — and a
+            // proof that must know whether an anchor carried it — can tell a direct join from one
+            // relayed through an anchor, which a timing alone does not say.
+            steps.note(format!(
+                "{short}: {}",
+                if conn.via_circuit() {
+                    "relayed"
+                } else {
+                    "direct"
+                }
+            ));
             let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
             let dh = *signer.x25519_identity_secret();
             let mut ctx = crate::node::channel::join_context_from_genesis(&genesis, 0)
@@ -11597,7 +11608,7 @@ impl Node {
         // sent them to check a host that was never contacted (PRD-001 R36).
         let listener = match tokio::net::TcpListener::bind(bind).await {
             Ok(l) => l,
-            Err(_) => return Outcome::Failed(Fault::AddressInUse),
+            Err(e) => return Outcome::Failed(Fault::of_bind(crate::error::BindCause::of(&e))),
         };
         let bound = match listener.local_addr() {
             Ok(a) => a,
@@ -11757,8 +11768,10 @@ impl Node {
         // was not up yet, and `vox forward` sat "waiting for a path" for five minutes about a
         // problem on this machine (PRD-001 R36). Probed and released; `Forward::bind` still
         // binds for real, and still reports if the port was taken in between.
-        if local.port() != 0 && std::net::TcpListener::bind(local).is_err() {
-            return refuse(reply, Fault::AddressInUse);
+        if local.port() != 0 {
+            if let Err(e) = std::net::TcpListener::bind(local) {
+                return refuse(reply, Fault::of_bind(crate::error::BindCause::of(&e)));
+            }
         }
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return refuse(reply, Fault::NotNetworked);
@@ -12668,7 +12681,7 @@ fn fault_of(e: &Error) -> Fault {
         // A ladder that tried every rung and got nowhere is unreachable, not an internal
         // fault: falling through to `Internal` made the join walk stop after one responder.
         Error::LadderExhausted(_) => Fault::Unreachable,
-        Error::LocalBind { .. } => Fault::AddressInUse,
+        Error::LocalBind { cause, .. } => Fault::of_bind(*cause),
         Error::TunnelLimit(_) => Fault::TunnelLimit,
         Error::Profile("no identity in this profile") => Fault::NoIdentity,
         Error::Profile("identity already exists in this profile") => Fault::IdentityExists,

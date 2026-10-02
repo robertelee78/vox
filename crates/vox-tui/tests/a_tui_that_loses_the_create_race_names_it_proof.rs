@@ -16,6 +16,10 @@
 //! profile's identity at the same time") and that nothing was created here; afterwards, with both
 //! stopped, `vox id` opens the identity the first made.
 //!
+//! Which side a red is on: the answer, or a profile with no identity after the first TUI made
+//! one, is `PRODUCT:`; a driver that stopped or gave no answer is `CANNOT MEASURE:`; a temp dir
+//! this proof could not make is `APPARATUS:`.
+//!
 //! Mutation that must turn it red: the TUI's create path mapping the race to the generic
 //! `IdentityExists` again — it says "an identity already exists in this profile".
 
@@ -39,9 +43,10 @@ const NOTHING_HERE: &str = "nothing was created here";
 #[ignore = "`vox tui` in a pty with production Argon2id; needs pyte (VOX_PYTE_PATH); CI runs it in release"]
 fn a_tui_that_loses_the_create_race_names_it() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("p");
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", data.display()));
 
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_create_race.py");
     let out = pty_driver::run(
@@ -88,10 +93,10 @@ fn a_tui_that_loses_the_create_race_names_it() {
     );
     assert!(
         ok && !now.trim().is_empty(),
-        "CANNOT MEASURE: the profile holds no usable identity afterwards: {now}{err}"
+        "PRODUCT: after the first TUI made the identity, `vox id` opens none: {now}{err}"
     );
     assert!(
         answer.contains(NAMED) && answer.contains(NOTHING_HERE),
-        "the TUI that lost the create race did not name it: it said {answer:?}"
+        "PRODUCT: the TUI that lost the create race did not name it: it said {answer:?}"
     );
 }

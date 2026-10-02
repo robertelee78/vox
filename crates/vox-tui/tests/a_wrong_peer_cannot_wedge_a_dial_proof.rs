@@ -62,18 +62,27 @@ struct CountingRelay {
 
 impl CountingRelay {
     fn new(decoy: SocketAddr) -> Self {
-        let front = UdpSocket::bind("127.0.0.1:0").expect("bind the relay's front");
-        let back = UdpSocket::bind("127.0.0.1:0").expect("bind the relay's back");
+        let front =
+            UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: cannot bind the relay's front");
+        let back = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: cannot bind the relay's back");
         for s in [&front, &back] {
             s.set_read_timeout(Some(Duration::from_millis(200)))
-                .unwrap();
+                .expect("APPARATUS: cannot set the relay's read timeout");
         }
-        let front_addr = front.local_addr().unwrap();
+        let front_addr = front
+            .local_addr()
+            .expect("APPARATUS: the relay's front has no address");
         let (to_decoy, from_decoy) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let stop = Arc::new(AtomicBool::new(false));
         let client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
         {
-            let (front, back) = (front.try_clone().unwrap(), back.try_clone().unwrap());
+            let (front, back) = (
+                front
+                    .try_clone()
+                    .expect("APPARATUS: cannot clone the relay's front"),
+                back.try_clone()
+                    .expect("APPARATUS: cannot clone the relay's back"),
+            );
             let (count, stop, client) = (
                 Arc::clone(&to_decoy),
                 Arc::clone(&stop),
@@ -83,7 +92,7 @@ impl CountingRelay {
                 let mut buf = vec![0u8; 65_536];
                 while !stop.load(Ordering::Relaxed) {
                     if let Ok((n, from)) = front.recv_from(&mut buf) {
-                        *client.lock().unwrap() = Some(from);
+                        *client.lock().expect("APPARATUS: the relay's lock") = Some(from);
                         if back.send_to(&buf[..n], decoy).is_ok() {
                             count.fetch_add(1, Ordering::Relaxed);
                         }
@@ -97,7 +106,7 @@ impl CountingRelay {
                 let mut buf = vec![0u8; 65_536];
                 while !stop.load(Ordering::Relaxed) {
                     if let Ok(n) = back.recv(&mut buf) {
-                        let to = *client.lock().unwrap();
+                        let to = *client.lock().expect("APPARATUS: the relay's lock");
                         if let Some(to) = to {
                             if front.send_to(&buf[..n], to).is_ok() {
                                 count.fetch_add(1, Ordering::Relaxed);
@@ -131,11 +140,16 @@ impl Drop for CountingRelay {
 
 /// The socket address in an `--anchor` spec, `<fingerprint>@/ip4/<ip>/udp/<port>`.
 fn spec_addr(spec: &str) -> SocketAddr {
-    let addr = spec.split('@').nth(1).expect("a spec has an @");
+    let unreadable = || -> ! {
+        panic!("APPARATUS: the proof cannot read the --anchor spec vox printed: {spec}")
+    };
+    let addr = spec.split('@').nth(1).unwrap_or_else(|| unreadable());
     let parts: Vec<&str> = addr.split('/').collect();
     match parts.as_slice() {
-        ["", "ip4", ip, "udp", port] => format!("{ip}:{port}").parse().expect("an ip4 address"),
-        _ => panic!("an --anchor spec this proof cannot read: {spec}"),
+        ["", "ip4", ip, "udp", port] => format!("{ip}:{port}")
+            .parse()
+            .unwrap_or_else(|_| unreadable()),
+        _ => unreadable(),
     }
 }
 
@@ -171,10 +185,10 @@ fn cpu_secs(pid: u32) -> f64 {
 fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: cannot make a directory");
         d
     };
     let (anchor_dir, decoy_dir, host_dir, guest_dir) =
@@ -185,17 +199,23 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
     let relay = CountingRelay::new(spec_addr(&decoy_spec));
 
     let (ok, guest_fp, err) = world::vox_once(&guest_dir, &args(&["id"]));
-    assert!(ok, "vox id (guest): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (guest) failed: {err}");
     let (ok, out, err) = world::vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
     );
-    assert!(ok, "trust add: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): trust add failed: {out}\n{err}");
 
-    // The host's own address second, the decoy's (through the relay) first.
+    // The host's own address second, the decoy's (through the relay) first. The port is probed
+    // and released, then handed to `vox serve`: another process can take it in between. If one
+    // does, the host cannot listen and never prints its address; the harness's wait for that line
+    // then fails as staging not achieved, not as a dial that spun.
     let host_listen = {
-        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap()
+        let probe =
+            UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: cannot probe for a free port");
+        probe
+            .local_addr()
+            .expect("APPARATUS: the probe socket has no address")
     };
     let advertise = format!("{},{host_listen}", relay.front);
     let service = echo_service().to_string();
@@ -254,10 +274,13 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox connect");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox connect: {e}"));
     let pid = guest.id();
     let status = loop {
-        if let Some(status) = guest.try_wait().expect("poll vox connect") {
+        if let Some(status) = guest
+            .try_wait()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot poll vox connect: {e}"))
+        {
             break Some(status);
         }
         if started.elapsed() > CONNECT_PATIENCE {
@@ -270,16 +293,20 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
     let Some(status) = status else {
         let cpu = cpu_secs(pid);
         let _ = guest.kill();
-        let out = guest.wait_with_output().expect("reap vox connect");
+        let out = guest
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot reap vox connect: {e}"));
         panic!(
-            "vox connect did not finish in {CONNECT_PATIENCE:?}: {cpu:.1} CPU-seconds used in that \
+            "PRODUCT: vox connect did not finish in {CONNECT_PATIENCE:?}: {cpu:.1} CPU-seconds used in that \
              time (a spinning dial burns a core; a waiting one burns next to none). The decoy was \
              sent {to_decoy} datagram(s) and answered {from_decoy}.\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
     };
-    let out = guest.wait_with_output().expect("collect vox connect");
+    let out = guest
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot collect vox connect: {e}"));
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
@@ -295,7 +322,7 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
     );
     assert!(
         status.success(),
-        "vox connect failed after dialling the decoy ({to_decoy} datagram(s) to it, {from_decoy} \
+        "PRODUCT: vox connect failed after dialling the decoy ({to_decoy} datagram(s) to it, {from_decoy} \
          back) in {took:?}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     println!(

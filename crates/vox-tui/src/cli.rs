@@ -667,7 +667,9 @@ enum RoomCmd {
     /// Print a room's messages. The first column is the entry hash, which is the
     /// cursor: pass the last one back as `--since` to read only what is new.
     Read(RoomReadArgs),
-    /// Print new messages as they arrive, until interrupted.
+    /// Print new messages as they arrive, until stopped.
+    ///
+    /// SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     ///
     /// With `--since`, first every message after that cursor, then every new one —
     /// **with no gap across a lag or a restart** (ADR-021 §7). Persist the last entry
@@ -707,7 +709,8 @@ enum RoomCmd {
     ///
     /// The bytes never enter the log: they ride a room-bound service, and what
     /// goes on the log is a signed announcement carrying the name, the size and
-    /// the **SHA-256**. Runs until interrupted, because the bytes are served
+    /// the **SHA-256**. Runs until stopped (SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops
+    /// it cleanly), because the bytes are served
     /// live — the announcement outlives the offer, so an agent that wakes late
     /// sees what was sent and is told plainly if it can no longer be collected.
     ///
@@ -1625,6 +1628,8 @@ enum Cmd {
     /// both behind NAT and cannot reach each other directly. It holds no room and can
     /// read nothing; its identity is a key file in the profile directory, created on
     /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
+    ///
+    /// Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Node(NodeArgs),
     /// Run this profile's node without a terminal, so agent sessions can attach
     /// (ADR-020 §12).
@@ -1642,14 +1647,15 @@ enum Cmd {
     /// echo 'my passphrase' | vox daemon
     /// ```
     ///
-    /// Unlike the TUI it does not lock on SIGHUP, which is the point. SIGINT and
-    /// SIGTERM stop it.
+    /// Unlike the TUI it does not lock on SIGHUP: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each
+    /// stops it cleanly.
     Daemon(DaemonArgs),
     /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
     ///
     /// Creates a room, offers the port in it, and prints the address, the
     /// machine-generated passphrase and the `.vox` hostname it answers on. Runs until
-    /// interrupted, reporting who reaches the service (the service itself cannot tell
+    /// stopped (SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly), reporting who
+    /// reaches the service (the service itself cannot tell
     /// you: every Vox client arrives at it from loopback).
     ///
     /// **Joining the room does not grant access to the port.** Whoever you have run
@@ -1711,10 +1717,12 @@ enum Cmd {
     /// This is how a tool reaches a room-bound service by name — the same shape a Tor user
     /// reaches a `.onion` through, and for the same reason: it needs no privilege of any
     /// kind. `ssh` is pointed at it with one `ProxyCommand` line, which `vox up` prints;
-    /// most other tools take `ALL_PROXY=socks5h://…`. Runs until interrupted.
+    /// most other tools take `ALL_PROXY=socks5h://…`. Runs until stopped: SIGINT (Ctrl-C),
+    /// SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Up(UpArgs),
     /// Forward a local port to a member's service over the overlay — `ssh` over Vox
-    /// (ADR-013). Runs until interrupted.
+    /// (ADR-013). Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it
+    /// cleanly.
     Forward(ForwardArgs),
     /// Put this machine on a room's **family LAN** (PRD-001 R28): a network interface on
     /// which the room's trusted members are one subnet, so that discovery — Plex and

@@ -73,6 +73,13 @@
 //!   `say`, so that filter drops nothing.)
 //! - Key the hook's cursor by room alone, ignoring the session: red at (3), `s2` is shown
 //!   nothing because `s1` already read it.
+//!
+//! **Known limit:** the plugin, the recorder and the model's shell run in one sandbox, so the
+//! shell could write the plugin's log and the recorder's log, which the verdicts read. A tighter
+//! sandbox for the shell alone is not possible: macOS refuses a sandbox inside a sandbox
+//! (`sandbox_apply: Operation not permitted`, measured). The recorder itself is outside the
+//! sandbox's writable root, so it cannot be replaced. Forging a log takes a model set on deceiving
+//! the proof, not one exploring.
 
 // Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
 // `--features optional-proofs` a stand-in takes its place and says it was not run
@@ -132,8 +139,10 @@ struct Turn {
     hook_out: String,
 }
 
-/// An agent's plugin log, and the recording `VOX_BIN` its plugin runs (`hook_recorder`): both
-/// inside the sandbox root, one pair per agent.
+/// An agent's plugin log, and the recording `VOX_BIN` its plugin runs (`hook_recorder`), one set
+/// per agent. The recorder is outside the sandbox's writable root, readable only, so a model's
+/// shell cannot replace it; the two logs are inside it, as their writers run in the sandbox (see
+/// the module docs' known limit).
 struct Wiring {
     plugin_log: std::path::PathBuf,
     vox_bin: std::path::PathBuf,
@@ -144,10 +153,12 @@ struct Wiring {
 /// room's text was put in front of the model: `VOX_BIN`, the binary the plugin runs as
 /// `vox agent hook`, is a wrapper that runs the real `vox` and appends what it printed to
 /// `hook_log`. The model's own `vox`, if it runs one, is the real binary.
-fn hook_recorder(root: &Path, name: &str) -> Wiring {
-    let vox_bin = root.join(format!("vox-hook-{name}"));
-    let hook_log = root.join(format!("hook-{name}.log"));
-    let plugin_log = root.join(format!("plugin-{name}.log"));
+fn hook_recorder(bin_dir: &Path, log_dir: &Path, name: &str) -> Wiring {
+    std::fs::create_dir_all(bin_dir)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make the recorders' directory: {e}"));
+    let vox_bin = bin_dir.join(format!("vox-hook-{name}"));
+    let hook_log = log_dir.join(format!("hook-{name}.log"));
+    let plugin_log = log_dir.join(format!("plugin-{name}.log"));
     std::fs::write(
         &vox_bin,
         format!(
@@ -305,10 +316,17 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     // see. The plugins' hooks need the two agents' vox profiles; nothing else outside the
     // sandbox is readable. A missing credential is CANNOT MEASURE there.
     let sb = oc_sandbox::OcSandbox::new(tmp.path());
+    // The recorders are outside the writable root and only readable in the sandbox; their logs
+    // are inside it.
+    let recorders = tmp.path().join("recorders");
+    let (a_wire, b_wire) = (
+        hook_recorder(&recorders, &sb.root, "alice"),
+        hook_recorder(&recorders, &sb.root, "bob"),
+    );
     let profile = sb.profile(
         "rehearsal",
         &[&alice.data, &alice.cfg, &bob.data, &bob.cfg],
-        &[Path::new(VOX)],
+        &[Path::new(VOX), &recorders],
     );
     // **This run's own fixture, inside its sandbox**: OpenCode installs a `node_modules` tree
     // into the project and the config directory on first use (the warm-up turns below).
@@ -318,10 +336,6 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make the fixture: {e}"));
     let a_proj = install_plugin(alice, &fixture);
     let b_proj = install_plugin(bob, &fixture);
-    let (a_wire, b_wire) = (
-        hook_recorder(&sb.root, "alice"),
-        hook_recorder(&sb.root, "bob"),
-    );
 
     // Warm both projects: the first turn in a fresh directory installs and does not
     // fire the hook. This also consumes the harness's readiness posts from each cursor.

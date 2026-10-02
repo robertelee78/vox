@@ -24,7 +24,7 @@ now **per-sender consent**, and consent is **per pair, per direction, and always
 the `bind:` capability class are all withdrawn with it.
 
 **Independent review round, 2026-09-21.** The first draft of this revision was reviewed by three models
-before any code was written (`docs/adr/ADR-017-reviews/`). All three returned **REVISE**; all three agreed
+before any code was written. All three returned **REVISE**; all three agreed
 the core direction is sound and verified it against the tree; all three found defects that would have
 shipped. The material ones, and what changed:
 
@@ -1487,8 +1487,6 @@ ADR-012 (reachability, anchors), ADR-013 (the tunnel data path), ADR-016 (the no
 - Leaves ADR-014 as it was: its privileged helper / `NetworkExtension` stays **conditional on a TUN
   interface that is not on this path**.
 - Depended on by: ADR-014, ADR-015 (the clients surface these verbs).
-- **Reviews on file**: `docs/adr/ADR-017-reviews/` — three independent REVISE verdicts on the first draft of
-  this revision, and the evidence for every correction recorded above.
 
 ## Engineering Mantra
 

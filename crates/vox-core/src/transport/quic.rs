@@ -353,7 +353,7 @@ impl VoxEndpoint {
     pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
         let socket = std::net::UdpSocket::bind(addr).map_err(|e| Error::LocalBind {
             addr,
-            in_use: e.kind() == std::io::ErrorKind::AddrInUse,
+            cause: crate::error::BindCause::of(&e),
             reason: e.to_string(),
         })?;
         let effective = {

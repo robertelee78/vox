@@ -79,14 +79,17 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
-    child
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox: {e}"));
+    // A vox that exits before reading closes the pipe; its status and what it said are then the
+    // verdict, so a failed write is not one.
+    let _ = child
         .stdin
         .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("APPARATUS: vox was spawned without a stdin pipe")
+        .write_all(stdin.as_bytes());
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot collect vox's output: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -100,7 +103,7 @@ fn signal(p: &VoxProc, sig: &str) {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    assert!(ok, "kill {sig} {}", p.name);
+    assert!(ok, "CANNOT MEASURE: `kill {sig}` of {} failed", p.name);
 }
 
 /// Stop a process by its PID with SIGTERM, so it closes its connections, and reap it.
@@ -118,14 +121,13 @@ fn stop(mut p: VoxProc) {
 
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+        .and_then(|s| s.local_addr())
+        .expect("APPARATUS: cannot probe for a free port")
         .port()
 }
 
 fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
-    let p = VoxProc::spawn(
+    let mut p = VoxProc::spawn(
         name,
         data,
         &args(&[
@@ -135,7 +137,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a temp path is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -145,20 +149,26 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!(
+        "PRODUCT (staging): {name}'s daemon never answered `vox room list` within {SETUP:?}, so the \
+         scene was not staged:\n{}",
+        p.transcript()
+    );
 }
 
 /// A stopped member's whole profile, copied: a second process of the same identity.
 fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap() {
-        let e = e.unwrap();
+    std::fs::create_dir_all(to).expect("APPARATUS: cannot make a directory");
+    for e in std::fs::read_dir(from).expect("APPARATUS: cannot list a stopped profile") {
+        let e = e.expect("APPARATUS: cannot read a stopped profile's entry");
         let target = to.join(e.file_name());
-        let kind = e.file_type().unwrap();
+        let kind = e
+            .file_type()
+            .expect("APPARATUS: cannot read a stopped profile entry's type");
         if kind.is_dir() {
             copy_dir(&e.path(), &target);
         } else if kind.is_file() {
-            std::fs::copy(e.path(), &target).unwrap();
+            std::fs::copy(e.path(), &target).expect("APPARATUS: cannot copy a staging file");
         }
         // A socket or a lock of the stopped process is not part of the profile.
     }
@@ -166,7 +176,10 @@ fn copy_dir(from: &Path, to: &Path) {
 
 fn post(data: &Path, room: &str, who: &str, text: &str) {
     let (ok, out, err) = vox_in(data, &["room", "post", room, "-"], text);
-    assert!(ok, "{who} posts {text:?}: {out}{err}");
+    assert!(
+        ok,
+        "PRODUCT: {who}'s `vox room post` of {text:?} failed: {out}{err}"
+    );
 }
 
 fn reads(data: &Path, room: &str, text: &str) -> bool {
@@ -187,15 +200,13 @@ fn wait_reads(data: &Path, room: &str, text: &str, within: Duration) -> bool {
     false
 }
 
-/// The equivocations `vox status --json` lists for `room`: `(author, position)`.
+/// The equivocations `vox status --json` lists for `room`: `(author, position)`. A status that
+/// fails, or is not JSON, is the product's red, never an empty list.
 fn listed(data: &Path, room_id: &str) -> Vec<(String, u64)> {
-    let (ok, out, _) = vox_once(data, &args(&["status", "--json"]));
-    if !ok {
-        return Vec::new();
-    }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) else {
-        return Vec::new();
-    };
+    let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
+    assert!(ok, "PRODUCT: `vox status --json` failed: {out}{err}");
+    let v = serde_json::from_str::<serde_json::Value>(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` printed no JSON ({e}): {out}"));
     v["equivocations"]
         .as_array()
         .into_iter()
@@ -215,10 +226,10 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     // Four joins; 36 unlocks: five `vox id`s, twenty `trust add`s, nine daemon starts, the room
     // created, and carol's TUI.
     watchdog::arm_for_setup(4, 36);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: cannot make a directory");
         d
     };
     let (anchor_dir, alice_dir, bob_dir, carol_dir, eve_dir, frank_dir) = (
@@ -231,7 +242,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     );
     let (eve2_dir, frank2_dir) = (tmp.path().join("eve2"), tmp.path().join("frank2"));
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: cannot write a staging file");
 
     let port = free_udp_port();
     let listen = format!("127.0.0.1:{port}");
@@ -245,7 +256,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
 
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         out.trim().to_owned()
     };
     let members = [
@@ -261,7 +272,10 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         for (j, (name, _)) in members.iter().enumerate() {
             if i != j {
                 let (ok, out, err) = vox_once(d, &args(&["trust", "add", &fps[j], "--name", name]));
-                assert!(ok, "vox trust add {name}: {out}{err}");
+                assert!(
+                    ok,
+                    "PRODUCT (staging): vox trust add {name} failed: {out}{err}"
+                );
             }
         }
     }
@@ -272,35 +286,37 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     let frank = daemon("frank", &frank_dir, &spec, &idpass);
 
     let (ok, out, err) = vox_in(&alice_dir, &["room", "create", "--name", "eq"], "room pass");
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create failed: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list failed: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("eq"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the new room is not listed: {list}"))
         .to_owned();
     let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
     for (name, d) in &members[1..] {
         let (ok, out, err) = vox_in(
             d,
             &["room", "join", link.trim(), "--name", "eq"],
             "room pass",
         );
-        assert!(ok, "{name} joins: {out}{err}");
+        assert!(ok, "PRODUCT (staging): {name}'s join failed: {out}{err}");
     }
     // The room's full id, as `vox status --json` names it: the invite link carries it.
     let room_id = link
         .trim()
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
-        .unwrap_or_else(|| panic!("no room id in the invite link {link}"))
+        .unwrap_or_else(|| {
+            panic!("APPARATUS: the proof cannot read the room id in the invite link {link}")
+        })
         .to_owned();
     assert!(
         room_id.starts_with(&room),
-        "the invite link names another room: {room_id} for {room}"
+        "PRODUCT: the invite link names another room: {room_id} for {room}"
     );
 
     // ---- 1. everyone reads everyone's hello ----------------------------------------------------
@@ -331,7 +347,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: after {SETUP:?} ({round} rounds) the members still do not all read \
+            "PRODUCT (staging): after {SETUP:?} ({round} rounds) the members still do not all read \
              each other: {missing:?}"
         );
     }
@@ -353,7 +369,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     for text in ["EQ-EVE-A-3", "EQ-FRANK-A-1"] {
         assert!(
             wait_reads(&bob_dir, &room, text, REACH),
-            "CANNOT MEASURE: bob never read {text}, so the first side of the fork is not in place"
+            "PRODUCT (staging): bob never read {text}, so the first side of the fork is not in place"
         );
     }
     stop(eve);
@@ -423,12 +439,12 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     for (i, who) in ["bob", "carol"].into_iter().enumerate() {
         assert!(
             names(&last[i], &eve_fp),
-            "{who} does not list eve's equivocation below the head within {DETECT:?}: {:?}",
+            "PRODUCT: {who} does not list eve's equivocation below the head within {DETECT:?}: {:?}",
             last[i]
         );
         assert!(
             names(&last[i], &frank_fp),
-            "{who} does not list frank's equivocation at the head within {DETECT:?}: {:?}",
+            "PRODUCT: {who} does not list frank's equivocation at the head within {DETECT:?}: {:?}",
             last[i]
         );
     }
@@ -445,7 +461,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
             });
             assert!(
                 said,
-                "{who}'s `vox room read` does not say {name} equivocated:\n{r}"
+                "PRODUCT: {who}'s `vox room read` does not say {name} equivocated:\n{r}"
             );
         }
     }
@@ -458,13 +474,13 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     post(&bob_dir, &room, "bob", "EQ-CONTROL");
     assert!(
         wait_reads(&carol_dir, &room, "EQ-CONTROL", REACH),
-        "CANNOT MEASURE: carol never read bob's control message, so nothing shows the room moves"
+        "PRODUCT (staging): carol never read bob's control message, so nothing shows the room moves"
     );
     std::thread::sleep(HELD);
     for (who, d) in [("bob", &bob_dir), ("carol", &carol_dir)] {
         assert!(
             !reads(d, &room, "EQ-EVE-AFTER"),
-            "{who} read a message eve posted after her equivocation was caught"
+            "PRODUCT: {who} read a message eve posted after her equivocation was caught"
         );
     }
     stop(eve);
@@ -480,7 +496,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     for (name, f) in [("eve", &eve_fp), ("frank", &frank_fp)] {
         assert!(
             anchor_holds(&before, f),
-            "CANNOT MEASURE: the anchor never said it holds {name} back, so its restart proves \
+            "PRODUCT (staging): the anchor never said it holds {name} back, so its restart proves \
              nothing:\n{before}"
         );
     }
@@ -493,13 +509,13 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     // yet reopened.
     assert!(
         wait_reads(&carol_dir, &room, "EQ-CONTROL", REACH),
-        "CANNOT MEASURE: carol's restarted daemon never reopened the room"
+        "PRODUCT (staging): carol's restarted daemon never reopened the room"
     );
     let after = listed(&carol_dir, &room_id);
     eprintln!("[proof] carol, restarted alone, lists {after:?}");
     assert!(
         names(&after, &eve_fp) && names(&after, &frank_fp),
-        "carol forgot an equivocation across a restart: she lists {after:?}"
+        "PRODUCT: carol forgot an equivocation across a restart: she lists {after:?}"
     );
     stop(carol);
 
@@ -517,7 +533,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     for (name, f) in [("eve", &eve_fp), ("frank", &frank_fp)] {
         assert!(
             anchor_holds(&said, f),
-            "the anchor forgot it holds {name} back across a restart:\n{said}"
+            "PRODUCT: the anchor forgot it holds {name} back across a restart:\n{said}"
         );
     }
     stop(anchor);
@@ -525,7 +541,12 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     // ---- the TUI says both, each on its own line, by carol's names for them (V210-66) ----------
     // Carol's real `vox tui`, on her stopped profile, in a pty (`tests/pty/tui_equivocation.py`).
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_equivocation.py");
-    let (data, cfg) = (carol_dir.to_str().unwrap(), carol_dir.join("cfg"));
+    let (data, cfg) = (
+        carol_dir
+            .to_str()
+            .expect("APPARATUS: a temp path is not UTF-8"),
+        carol_dir.join("cfg"),
+    );
     // The driver waits on the TUI's unlock.
     let out = pty_driver::run_for(
         script,
@@ -533,7 +554,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
             env!("CARGO_BIN_EXE_vox"),
             "eq",
             data,
-            cfg.to_str().unwrap(),
+            cfg.to_str().expect("APPARATUS: a temp path is not UTF-8"),
             "eq",
         ],
         watchdog::debug_cost(0, 1),
@@ -542,21 +563,40 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         "{}\n[proof] the TUI driver took {:?}; its last stage: {:?}",
         out.stdout, out.took, out.stage
     );
+    let stage = out.stage.as_deref().unwrap_or("(before its first stage)");
+    if let Some(traceback) = out.crash() {
+        panic!("APPARATUS: the TUI driver crashed at stage {stage:?}:\n{traceback}");
+    }
     match out.code {
         Some(0) => assert!(
             out.stdout.contains("eq PASS"),
-            "exit 0 without PASS: {}",
+            "APPARATUS: the TUI driver exited 0 without a PASS line: {}",
             out.stdout
         ),
-        Some(2) => panic!("CANNOT MEASURE: the TUI apparatus failed: {}", out.stdout),
-        _ if !out.has_verdict("eq") => panic!(
-            "the TUI driver was stopped before it gave a verdict, at stage {:?} (exit {:?}): {}",
-            out.stage.as_deref().unwrap_or("(before its first stage)"),
-            out.code,
+        Some(2) => panic!(
+            "CANNOT MEASURE: the TUI apparatus failed at stage {stage:?}: {}",
             out.stdout
+        ),
+        _ if !out.has_verdict("eq") => panic!(
+            "CANNOT MEASURE: the TUI driver was stopped from outside before it gave a verdict, at \
+             stage {stage:?} after {:?} (exit {:?}; its stack is above, on stderr): {}",
+            out.took, out.code, out.stdout
+        ),
+        _ if out.stdout.contains("outlived SIGKILL") => panic!(
+            "APPARATUS: the TUI driver could not stop the `vox tui` it started: {}",
+            out.stdout
+        ),
+        _ if out.stdout.contains("eq HUNG at") && stage == "stopping every process" => panic!(
+            "APPARATUS: the TUI driver hung stopping its processes, after its verdict: {}",
+            out.stdout
+        ),
+        _ if out.stdout.contains("eq HUNG at") => panic!(
+            "PRODUCT: carol's `vox tui` did not get past {stage:?} within the driver's budget \
+             ({:?}; its stack is above, on stderr): {}",
+            out.took, out.stdout
         ),
         _ => panic!(
-            "carol's TUI must say eve and frank are held back, each on its own line: {}",
+            "PRODUCT: carol's TUI must say eve and frank are held back, each on its own line: {}",
             out.stdout
         ),
     }

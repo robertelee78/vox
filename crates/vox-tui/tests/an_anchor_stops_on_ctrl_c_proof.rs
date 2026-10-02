@@ -19,9 +19,15 @@
 //! SIGINT, SIGTERM, SIGHUP and SIGQUIT in turn. Each must exit within [`STOP_WITHIN`] with status 0,
 //! not by the signal, and say which signal stopped it and that it is shutting down.
 //!
-//! **A red names its side.** An anchor that never wrote its anchors file, or a `kill` that failed,
-//! is CANNOT MEASURE (the scene was not staged). Anything after the signal is the product's: it
-//! did not exit, died by the signal, or exited without saying why.
+//! **A red names its side.** An anchor that never wrote its anchors file is PRODUCT (staging),
+//! unless the runner stalled through that wait (CANNOT MEASURE); a `kill` that failed is CANNOT
+//! MEASURE (the scene was not staged). Anything after the signal is the product's: it
+//! did not exit, died by the signal, or exited without saying why. The wait for each exit is
+//! polled every 50 ms, and the proof measures its own clock on the same timeline: how far the
+//! deschedule's sleep overshot, and the longest gap between two polls. An anchor still running
+//! while that apparatus stalled past [`APPARATUS_BUDGET`] cannot be told from a runner that
+//! stalled, and reads `CANNOT MEASURE: apparatus took X`; otherwise it reads `PRODUCT: … (apparatus
+//! Y)`.
 //!
 //! Mutations: the listener made inside the `select!` again → red (13 of 20 anchors never exited);
 //! SIGHUP or SIGQUIT not taken → those trials die by the signal → red.
@@ -47,8 +53,9 @@
 //! - stopped at its prompt, a client also hands its terminal back with echo on: the prompt's raw
 //!   mode left behind is a shell where nothing typed shows.
 //!
-//! **A red names its side.** A verb that never reached serving, or a `kill` that failed, is
-//! APPARATUS (staging not achieved). Anything after the signal is the product's, quoting what it
+//! **A red names its side.** A verb that never reached serving, or never waited at its prompt, is
+//! PRODUCT (staging); a `kill` that failed, or a pty this proof could not set up, is APPARATUS.
+//! Anything after the signal is the product's, quoting what it
 //! said: it did not stop, died by the signal, exited with the wrong code, or did not say why.
 //!
 //! Mutations, one per claim: `vox serve`'s runner listening for Ctrl-C alone; `with_room`
@@ -87,6 +94,9 @@ const DESCHEDULED: Duration = Duration::from_millis(1200);
 const STOP_WITHIN: Duration = Duration::from_secs(10);
 /// How long an anchor may take to start and write its anchors file.
 const LINE_PATIENCE: Duration = Duration::from_secs(60);
+/// The most the proof's own clock may stall (the deschedule's sleep overshooting, or the longest
+/// gap between two 50 ms polls) before an anchor still running is the runner's, not the anchor's.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
 fn signal(pid: u32, sig: &str) {
     let sent = std::process::Command::new("kill")
@@ -100,31 +110,43 @@ fn signal(pid: u32, sig: &str) {
 #[ignore = "real binaries; CI runs it in release"]
 fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let mut stuck = Vec::new();
+    let mut stalled = Vec::new();
     for trial in 0..TRIALS {
         let (sig, name) = SIGNALS[trial % SIGNALS.len()];
         let dir = tmp.path().join(format!("anchor{trial}"));
-        std::fs::create_dir_all(dir.join("cfg")).unwrap();
+        std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: cannot make a directory");
         let mut anchor =
             VoxProc::spawn("anchor", &dir, &args(&["node", "--listen", "127.0.0.1:0"]));
-        // Staging: an anchor that never writes its file in time is CANNOT MEASURE, but one that
-        // exits first is the product's red, and says so first.
-        anchor.expect_staging_within(
+        // Staging the product performs: an anchor that never writes its file in time, or exits
+        // first, is PRODUCT (staging); a runner that stalled through the wait is CANNOT MEASURE.
+        if let Err(why) = anchor.try_expect_within(
             LINE_PATIENCE,
             &format!("the anchors file written (anchor {trial})"),
             |l| l.starts_with("vox node: wrote "),
-        );
+        ) {
+            match why.strip_prefix("PRODUCT:") {
+                Some(rest) => panic!("PRODUCT (staging):{rest}"),
+                None => panic!("{why}"),
+            }
+        }
         let pid = anchor.child.id();
         signal(pid, "-STOP");
+        let slept = Instant::now();
         std::thread::sleep(DESCHEDULED);
+        let overshoot = slept.elapsed().saturating_sub(DESCHEDULED);
         signal(pid, sig);
         signal(pid, "-CONT");
         let signalled = Instant::now();
+        let (mut last_poll, mut longest_gap) = (signalled, Duration::ZERO);
         while anchor.child.try_wait().ok().flatten().is_none() && signalled.elapsed() < STOP_WITHIN
         {
             std::thread::sleep(Duration::from_millis(50));
+            longest_gap = longest_gap.max(last_poll.elapsed());
+            last_poll = Instant::now();
         }
+        let apparatus = overshoot.max(longest_gap);
         let status = anchor.child.try_wait().ok().flatten();
         let said = anchor.transcript();
         let shut = said.lines().any(|l| l == "vox node: shutting down");
@@ -133,28 +155,33 @@ fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
             .any(|l| l == format!("vox node: stopped by {name}"));
         eprintln!(
             "[proof] anchor {trial}, {name}: exited {status:?} after {:?}, said it was stopped by \
-             {name}: {named}, shutting down: {shut}",
+             {name}: {named}, shutting down: {shut} (apparatus {apparatus:?})",
             signalled.elapsed()
         );
         let Some(status) = status else {
             let _ = anchor.child.kill();
             let _ = anchor.child.wait();
-            stuck.push(format!("anchor {trial} ({name}):\n{said}"));
+            let what = format!("anchor {trial} ({name}, apparatus {apparatus:?}):\n{said}");
+            if apparatus > APPARATUS_BUDGET {
+                stalled.push(what);
+            } else {
+                stuck.push(what);
+            }
             continue;
         };
         assert_eq!(
             status.signal(),
             None,
-            "anchor {trial}: `vox node` died by {name} instead of stopping:\n{said}"
+            "PRODUCT: anchor {trial}: `vox node` died by {name} instead of stopping:\n{said}"
         );
         assert_eq!(
             status.code(),
             Some(0),
-            "anchor {trial}: `vox node` stopped by {name} ended with {status}:\n{said}"
+            "PRODUCT: anchor {trial}: `vox node` stopped by {name} ended with {status}:\n{said}"
         );
         assert!(
             named && shut,
-            "anchor {trial} exited on {name} without saying it was stopped by {name} and is \
+            "PRODUCT: anchor {trial} exited on {name} without saying it was stopped by {name} and is \
              shutting down:\n{said}"
         );
     }
@@ -164,10 +191,18 @@ fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
     );
     assert!(
         stuck.is_empty(),
-        "{} of {TRIALS} anchors did not stop within {STOP_WITHIN:?} of a stop signal that landed \
+        "PRODUCT: {} of {TRIALS} anchors did not stop within {STOP_WITHIN:?} of a stop signal that landed \
          with a tick:\n{}",
         stuck.len(),
         stuck.join("\n")
+    );
+    assert!(
+        stalled.is_empty(),
+        "CANNOT MEASURE: {} of {TRIALS} anchors were still running {STOP_WITHIN:?} after the \
+         signal, but the apparatus stalled past {APPARATUS_BUDGET:?} meanwhile, so a slow anchor \
+         cannot be told from a stalled runner:\n{}",
+        stalled.len(),
+        stalled.join("\n")
     );
 }
 
@@ -186,7 +221,10 @@ const STOP_BOUND: Duration = Duration::from_secs(20);
 const DAEMON: Kind = Kind::Server("vox daemon");
 const SERVE: Kind = Kind::Server("vox");
 
-/// Run a staging step. A panic in it is the staging's, not the product's verdict, and says so.
+/// Run a staging step, and say which side a panic in it is on. The harness labels its own reds:
+/// a `vox` that did not do its part (`PRODUCT:`) is `PRODUCT (staging):`, and a red already naming
+/// the apparatus or an unmet precondition keeps its label. A panic with no label (a pty call of
+/// this proof's own) is `APPARATUS:`.
 fn staged<T>(what: &str, step: impl FnOnce() -> T) -> T {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)).unwrap_or_else(|e| {
         let why = e
@@ -194,7 +232,16 @@ fn staged<T>(what: &str, step: impl FnOnce() -> T) -> T {
             .cloned()
             .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
             .unwrap_or_default();
-        panic!("APPARATUS: staging not achieved — {what}: {why}")
+        if let Some(rest) = why.strip_prefix("PRODUCT:") {
+            panic!("PRODUCT (staging): {what}:{rest}")
+        } else if why.starts_with("PRODUCT (staging)")
+            || why.starts_with("APPARATUS")
+            || why.starts_with("CANNOT MEASURE")
+        {
+            panic!("{why} ({what})")
+        } else {
+            panic!("APPARATUS: staging not achieved — {what}: {why}")
+        }
     })
 }
 
@@ -343,7 +390,9 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
                 if n == 0 {
                     break;
                 }
-                into.lock().unwrap().extend_from_slice(&buf[..n]);
+                into.lock()
+                    .expect("APPARATUS: the screen buffer's lock")
+                    .extend_from_slice(&buf[..n]);
             }
         });
     }
@@ -356,7 +405,10 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
             }
         }
     });
-    let screen = || String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
+    let screen = || {
+        String::from_utf8_lossy(&shown.lock().expect("APPARATUS: the screen buffer's lock"))
+            .into_owned()
+    };
     let echo = |t: &std::fs::File| {
         rustix::termios::tcgetattr(t)
             .map(|m| m.local_modes.contains(LocalModes::ECHO))
@@ -367,14 +419,17 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
     while !screen().contains("identity passphrase") || echo(&terminal) {
         if let Ok(Some(st)) = child.try_wait() {
             panic!(
-                "APPARATUS: staging not achieved — {who} ended ({st}) before its prompt:\n{}",
+                "PRODUCT (staging): {who} ended ({st}) before its prompt:\n{}",
                 screen()
             );
         }
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("APPARATUS: staging not achieved — {who} never waited at a prompt with echo off:\n{}", screen());
+            panic!(
+                "PRODUCT (staging): {who} never waited at a prompt with echo off within 30 s:\n{}",
+                screen()
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -447,7 +502,9 @@ fn daemon(w: &World, dir: &Path, pass_file: &Path) -> VoxProc {
         &args(&[
             "daemon",
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a temp path is not UTF-8"),
             "--anchor",
             &w.host_anchor,
             "--listen",
@@ -538,7 +595,14 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
         let mut send = VoxProc::spawn(
             "send",
             &guest,
-            &args(&["room", "send", &w.room, offered.to_str().unwrap()]),
+            &args(&[
+                "room",
+                "send",
+                &w.room,
+                offered
+                    .to_str()
+                    .expect("APPARATUS: a temp path is not UTF-8"),
+            ]),
         );
         staged("`vox room send` offering", || {
             send.expect_line("the offer", |l| l.starts_with("vox: offering "))

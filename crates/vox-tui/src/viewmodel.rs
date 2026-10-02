@@ -270,8 +270,12 @@ pub enum UiError {
     NotAdmitted,
     /// This client is not networked, or is locked, so it cannot reach anyone.
     NotNetworked,
-    /// A local address the node needs (its listen port) is already in use.
+    /// A local address the node needs (its listen port) is held by another program.
     AddressInUse,
+    /// A local address the node was asked to listen on is not an address of this machine.
+    AddressNotHere,
+    /// A local address the node was asked to listen on could not be bound for another reason.
+    BindFailed,
     /// A join named a room this profile already holds.
     AlreadyMember,
     /// An unexpected internal error (never carries detail).
@@ -331,7 +335,13 @@ impl UiError {
             UiError::NoSuchTunnel => "that tunnel is no longer open",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",
-            UiError::AddressInUse => "a local port it needs is in use — pick another --listen",
+            UiError::AddressInUse => {
+                "a local port it needs is held by another program — pick another --listen"
+            }
+            UiError::AddressNotHere => {
+                "the --listen address is not an address of this machine — use one it has"
+            }
+            UiError::BindFailed => "the --listen address could not be listened on",
             UiError::AlreadyMember => "you already hold that room — it is in your list",
             UiError::Internal => "internal error",
         }

@@ -906,9 +906,16 @@ pub enum Fault {
     /// network can reach would hand that membership to whoever reaches the port
     /// (ADR-013; the same rule `vox up` enforces).
     NotLoopback,
-    /// A local address this node was asked to listen on is taken, or is not an address of
-    /// this machine: the node's `--listen` port, a `vox up --bind`, a forward's local port.
+    /// A local address this node was asked to listen on is held by another program: the
+    /// node's `--listen` port, a `vox up --bind`, a forward's local port.
     AddressInUse,
+    /// A local address this node was asked to listen on is not an address of this machine
+    /// (V210-134). Not [`Fault::AddressInUse`], which sent people looking for a program that
+    /// did not exist.
+    AddressNotHere,
+    /// A local address this node was asked to listen on could not be bound for a reason that is
+    /// neither of the two above (V210-134); the front end quotes the operating system.
+    BindFailed,
     /// A join named a room this profile already holds.
     AlreadyMember,
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
@@ -1018,8 +1025,12 @@ impl Fault {
                 "a local port for Vox must be on loopback (127.0.0.1 or ::1)\n       anything else would hand this room's membership to whoever reaches the port"
             }
             Fault::AddressInUse => {
-                "a local address it needs is already in use, or is not an address of this machine\n       pick another port, or stop whatever holds it (`lsof -i :<port>` names it)"
+                "a local port it needs is already in use: another program holds it\n       pick another port, or stop whatever holds it (`lsof -i :<port>` names it)"
             }
+            Fault::AddressNotHere => {
+                "a local address it was asked to use is not an address of this machine\n       use one this machine has (`ifconfig` lists them), or 127.0.0.1"
+            }
+            Fault::BindFailed => "a local address it was asked to use could not be listened on",
             Fault::AlreadyMember => {
                 "this profile already holds that room — there is nothing to join\n       `vox room list` shows it; open it with its passphrase if it is closed"
             }
@@ -1110,6 +1121,8 @@ fault_names!(
     StillTrusted,
     NotLoopback,
     AddressInUse,
+    AddressNotHere,
+    BindFailed,
     AlreadyMember,
     NotAServiceRoom,
     NotOffered,
@@ -1134,6 +1147,27 @@ pub enum Outcome {
     Bound(std::net::SocketAddr),
     /// The command failed for the given reason.
     Failed(Fault),
+}
+
+impl Fault {
+    /// The fault a failed local bind is, by its cause (V210-134).
+    #[must_use]
+    pub fn of_bind(cause: crate::error::BindCause) -> Self {
+        match cause {
+            crate::error::BindCause::InUse => Fault::AddressInUse,
+            crate::error::BindCause::NotHere => Fault::AddressNotHere,
+            crate::error::BindCause::Other => Fault::BindFailed,
+        }
+    }
+
+    /// Whether this is a failed local bind.
+    #[must_use]
+    pub fn is_bind(self) -> bool {
+        matches!(
+            self,
+            Fault::AddressInUse | Fault::AddressNotHere | Fault::BindFailed
+        )
+    }
 }
 
 impl Outcome {

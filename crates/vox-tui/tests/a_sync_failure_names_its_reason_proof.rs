@@ -13,12 +13,20 @@
 //! 1. **no** failed sync is reported as a collision ("the peer was busy syncing this room");
 //! 2. no failed sync between the two members is reported as a governance or malformed-data
 //!    error, or as an invalid authenticator;
-//! 3. any collision that is reported is said as the peer's refusal (#216) — vacuous while (1)
-//!    holds, kept so the mutant below shows both.
+//! 3. every post of every round is taken (`vox room post` exits 0): a post refused while the other
+//!    member posts is a collision a person sees.
 //!
-//! Precondition (else CANNOT MEASURE): both daemons opened at least three sessions to each other
+//! Preconditions (else PRODUCT (staging)): both daemons opened at least three sessions to each other
 //! over the rounds (`vox status --json`). Not one per round: posts made while a session runs are
-//! carried by it (measured on the change: 14 and 10 over 40 rounds).
+//! carried by it (measured on the change: 14 and 10 over 40 rounds). And **the reports can be
+//! seen at all**: the absence of a report proves nothing unless a sync that does fail is reported
+//! in the words this reads. So after the rounds Bob is frozen (SIGSTOP by his PID, confirmed with
+//! `ps`) and Alice posts: her sync with him cannot complete, and her daemon must say a sync "did
+//! not complete" — the positive control.
+//!
+//! Which side a red is on: `PRODUCT:` quotes what vox said; a `vox` step of the setup that failed,
+//! the preconditions above included, is `PRODUCT (staging):`; `APPARATUS:` names a fault of this
+//! proof's own.
 //!
 //! Mutations: restoring the busy refusal at the inbound check breaks (1); the old governance
 //! wrapper in `sync_failure` breaks (2) wherever a failure is reported.
@@ -44,8 +52,8 @@ const ROUNDS: usize = 40;
 const TIMEOUT: Duration = Duration::from_secs(90);
 /// What a collision reads as, from the coded reason `SessionBusy`.
 const COLLISION: &str = "the peer was busy syncing this room";
-/// A collision, said as the peer's refusal.
-const REFUSED_COLLISION: &str = "the peer refused: the peer was busy syncing this room";
+/// What a daemon says when a sync did not complete, whatever the reason.
+const DID_NOT_COMPLETE: &str = "did not complete";
 
 fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     let mut child = Command::new(VOX)
@@ -58,14 +66,16 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start vox {argv:?}: {e}"));
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: vox was started without a stdin pipe")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write vox {argv:?}'s stdin: {e}"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot wait for vox {argv:?}: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -74,7 +84,7 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
 }
 
 fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
-    let p = VoxProc::spawn(
+    let mut p = VoxProc::spawn(
         name,
         data,
         &args(&[
@@ -84,7 +94,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: the passphrase file's path is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + TIMEOUT;
@@ -94,7 +106,10 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!(
+        "PRODUCT: {name}'s `vox daemon` never answered `vox room list` within {TIMEOUT:?}\n{}",
+        p.transcript()
+    );
 }
 
 /// The daemon's reports of syncs that did not complete, among the lines it printed after the
@@ -103,7 +118,7 @@ fn sync_failures(p: &mut VoxProc, since: usize) -> Vec<String> {
     p.transcript()
         .lines()
         .skip(since)
-        .filter(|l| l.contains("did not complete"))
+        .filter(|l| l.contains(DID_NOT_COMPLETE))
         .map(str::to_owned)
         .collect()
 }
@@ -119,15 +134,16 @@ fn lines_so_far(p: &mut VoxProc) -> usize {
 #[ignore = "real vox processes with production Argon2id; CI runs it in release"]
 fn a_sync_that_did_not_complete_says_why() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", d.display()));
         d
     };
     let (anchor_dir, alice_dir, bob_dir) = (dir("anchor"), dir("alice"), dir("bob"));
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: cannot write the passphrase file");
 
     let mut anchor = VoxProc::spawn(
         "anchor",
@@ -143,13 +159,13 @@ fn a_sync_that_did_not_complete_says_why() {
 
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     };
     let (alice_fp, bob_fp) = (fp(&alice_dir), fp(&bob_dir));
     for (d, other, name) in [(&alice_dir, &bob_fp, "bob"), (&bob_dir, &alice_fp, "alice")] {
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", other, "--name", name]));
-        assert!(ok, "vox trust add {name}: {out}{err}");
+        assert!(ok, "PRODUCT (staging): vox trust add {name}: {out}{err}");
     }
 
     let mut alice = daemon("alice", &alice_dir, &spec, &idpass);
@@ -160,23 +176,25 @@ fn a_sync_that_did_not_complete_says_why() {
         &["room", "create", "--name", "pair"],
         "room pass",
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("pair"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: the room alice created is not in `vox room list`: {list}")
+        })
         .to_owned();
     let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
         &["room", "join", link.trim(), "--name", "pair"],
         "room pass",
     );
-    assert!(ok, "bob joins: {out}{err}");
+    assert!(ok, "PRODUCT (staging): bob's `vox room join`: {out}{err}");
 
     // Both members read each other before the rounds, so every failure below is between two
     // members that can sync, not a join still settling.
@@ -185,7 +203,7 @@ fn a_sync_that_did_not_complete_says_why() {
         &alice_dir,
         &args(&["room", "post", &room, "hello from alice"]),
     );
-    assert!(ok, "alice posts: {err}");
+    assert!(ok, "PRODUCT (staging): alice's first post: {err}");
     loop {
         let (_, read, _) = vox_once(&bob_dir, &args(&["room", "read", &room]));
         if read.contains("hello from alice") {
@@ -193,7 +211,7 @@ fn a_sync_that_did_not_complete_says_why() {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: bob never read alice before the rounds"
+            "PRODUCT (staging): bob never read alice before the rounds"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -205,19 +223,24 @@ fn a_sync_that_did_not_complete_says_why() {
     let poster = |data: std::path::PathBuf, who: &'static str| {
         let (barrier, room) = (Arc::clone(&barrier), room.clone());
         std::thread::spawn(move || {
+            let mut refused = Vec::new();
             for i in 0..ROUNDS {
                 barrier.wait();
-                let _ = vox_once(
+                let (ok, out, err) = vox_once(
                     &data,
                     &args(&["room", "post", &room, &format!("{who} {i}")]),
                 );
+                if !ok {
+                    refused.push(format!("{who}'s post {i}: {}{}", out.trim(), err.trim()));
+                }
             }
+            refused
         })
     };
     let a = poster(alice_dir.clone(), "alice");
     let b = poster(bob_dir.clone(), "bob");
-    a.join().unwrap();
-    b.join().unwrap();
+    let mut refused_posts = a.join().expect("APPARATUS: alice's poster thread panicked");
+    refused_posts.extend(b.join().expect("APPARATUS: bob's poster thread panicked"));
     // Let the retries of the last collisions finish and be reported.
     std::thread::sleep(Duration::from_secs(5));
 
@@ -231,10 +254,6 @@ fn a_sync_that_did_not_complete_says_why() {
         )
         .collect();
     let collisions = reports.iter().filter(|l| l.contains(COLLISION)).count();
-    let unattributed: Vec<&String> = reports
-        .iter()
-        .filter(|l| l.contains(COLLISION) && !l.contains(REFUSED_COLLISION))
-        .collect();
     let misnamed: Vec<&String> = reports
         .iter()
         .filter(|l| {
@@ -243,8 +262,10 @@ fn a_sync_that_did_not_complete_says_why() {
         .collect();
     let opened = |d: &Path, other: &str| -> u64 {
         let (ok, out, err) = vox_once(d, &args(&["status", "--json"]));
-        assert!(ok, "vox status --json: {err}");
-        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status JSON");
+        assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
+            panic!("PRODUCT: `vox status --json` printed no JSON ({e}): {out}")
+        });
         v["sync"]
             .as_array()
             .map(|rows| {
@@ -258,32 +279,101 @@ fn a_sync_that_did_not_complete_says_why() {
     let (a_opened, b_opened) = (opened(&alice_dir, &bob_fp), opened(&bob_dir, &alice_fp));
     println!(
         "[proof] {} failed-sync report(s) over {ROUNDS} simultaneous rounds: {collisions} named as a \
-         collision ({} not said as the peer's refusal), {} misnamed; sessions opened alice->bob \
-         {a_opened}, bob->alice {b_opened}",
+         collision, {} misnamed; {} post(s) refused; sessions opened alice->bob {a_opened}, \
+         bob->alice {b_opened}",
         reports.len(),
-        unattributed.len(),
-        misnamed.len()
+        misnamed.len(),
+        refused_posts.len()
     );
     for l in reports.iter().take(12) {
         println!("[report] {l}");
     }
     assert!(
         a_opened >= 3 && b_opened >= 3,
-        "CANNOT MEASURE: the members opened {a_opened} and {b_opened} sessions to each other over \
+        "PRODUCT (staging): the members opened {a_opened} and {b_opened} sessions to each other over \
          {ROUNDS} rounds"
     );
+
     assert_eq!(
         collisions, 0,
-        "two members posting at once refused each other as busy {collisions} time(s): {reports:?}"
+        "PRODUCT: two members posting at once refused each other as busy {collisions} time(s): \
+         {reports:?}"
     );
     assert!(
         misnamed.is_empty(),
-        "a failed sync between two members was reported as a governance, malformed-data or \
-         authenticator failure: {misnamed:?}"
+        "PRODUCT: a failed sync between two members was reported as a governance, malformed-data \
+         or authenticator failure: {misnamed:?}"
     );
     assert!(
-        unattributed.is_empty(),
-        "a collision was not reported as the peer's refusal: {unattributed:?}"
+        refused_posts.is_empty(),
+        "PRODUCT: {} post(s) were refused while both members posted at once: {refused_posts:?}",
+        refused_posts.len()
     );
+
+    // A report seen above is its own positive control; a green needs one staged.
+    // ---- the positive control: a sync that cannot complete is reported in these words ----------
+    let alice_before = lines_so_far(&mut alice);
+    let bob_pid = bob.child.id().to_string();
+    signal_and_confirm(&bob_pid, "-STOP");
+    let (ok, _, err) = vox_once(
+        &alice_dir,
+        &args(&["room", "post", &room, "while bob is frozen"]),
+    );
+    let frozen_at = Instant::now();
+    let seen = loop {
+        if let Some(l) = sync_failures(&mut alice, alice_before).into_iter().next() {
+            break Some(l);
+        }
+        if frozen_at.elapsed() > CONTROL_WITHIN {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    signal_and_confirm(&bob_pid, "-CONT");
+    println!(
+        "[proof] positive control: with bob frozen, alice's post ok={ok}; her report {:?} after \
+         {:?}",
+        seen,
+        frozen_at.elapsed()
+    );
+    assert!(
+        seen.is_some(),
+        "PRODUCT (staging): with bob frozen, alice never reported a sync that {DID_NOT_COMPLETE:?} \
+         within {CONTROL_WITHIN:?} (her post ok={ok}: {err}), so the silence during the rounds \
+         proves nothing\n{}",
+        alice.transcript()
+    );
+
     drop(anchor);
+}
+
+/// How long the positive control waits for a sync with a frozen member to be reported: a sync
+/// step's own patience (30 s), and a margin.
+const CONTROL_WITHIN: Duration = Duration::from_secs(60);
+
+/// Send `sig` (`-STOP` or `-CONT`) to the process `pid` and confirm it took: `ps` must show the
+/// process stopped (state `T`) after `-STOP`, and not stopped after `-CONT`.
+fn signal_and_confirm(pid: &str, sig: &str) {
+    let sent = Command::new("kill")
+        .args([sig, pid])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(sent, "APPARATUS: `kill {sig} {pid}` failed");
+    let want_stopped = sig == "-STOP";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = Command::new("ps")
+            .args(["-o", "state=", "-p", pid])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+        if !state.is_empty() && state.starts_with('T') == want_stopped {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: {sig} did not take on PID {pid}: `ps` says its state is {state:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

@@ -275,13 +275,17 @@ pub enum Error {
     /// Carried whole rather than as a `&'static str`: "quic endpoint bind" was the only thing
     /// the daemon could say when its `--listen` port was taken, and it reached the person as
     /// `Failed(Internal)` — a bug report for what is an occupied port (PRD-001 R36).
-    #[error("cannot listen on {addr}: {reason}")]
+    ///
+    /// **It names its real cause** (V210-134): a port another program holds, an address this
+    /// machine does not have, or whatever else the operating system said, quoted. "Something
+    /// else already holds that port" for an address the machine does not have sent people
+    /// looking for a process that did not exist.
+    #[error("cannot listen on {addr}: {}{reason}", cause.said())]
     LocalBind {
         /// The address that could not be bound.
         addr: std::net::SocketAddr,
-        /// Whether something else already holds it (the common case, and the one with an
-        /// obvious fix).
-        in_use: bool,
+        /// Why, as far as the operating system's error says.
+        cause: BindCause,
         /// What the operating system said.
         reason: String,
     },
@@ -569,4 +573,37 @@ pub enum IpcHandshake {
         /// How long the ping was given.
         secs: u64,
     },
+}
+
+/// Why a local address could not be bound, read from the operating system's error (V210-134).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindCause {
+    /// Another program already holds it (`EADDRINUSE`).
+    InUse,
+    /// No interface of this machine has that address (`EADDRNOTAVAIL`).
+    NotHere,
+    /// Anything else: the operating system's own words say what.
+    Other,
+}
+
+impl BindCause {
+    /// The cause of `e`, a failed bind.
+    #[must_use]
+    pub fn of(e: &std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::AddrInUse => Self::InUse,
+            std::io::ErrorKind::AddrNotAvailable => Self::NotHere,
+            _ => Self::Other,
+        }
+    }
+
+    /// What a person is told before the operating system's own words.
+    #[must_use]
+    pub const fn said(self) -> &'static str {
+        match self {
+            Self::InUse => "another program already holds it — ",
+            Self::NotHere => "it is not an address of this machine — ",
+            Self::Other => "",
+        }
+    }
 }
