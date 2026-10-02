@@ -126,7 +126,7 @@ fn key(addr: SocketAddr) -> SocketAddr {
 pub struct MuxSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     circuits: Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
-    /// Which address each peer's live circuit stands at. The addresses are random, so
+    /// Which address each peer's newest live circuit stands at. The addresses are random, so
     /// this is the only way to get from a peer to its circuit.
     by_peer: Mutex<HashMap<Digest32, SocketAddr>>,
     /// Which relay carries each circuit, by its address, when the caller said
@@ -234,9 +234,18 @@ impl MuxSocket {
         })
     }
 
-    /// Attach a circuit to `peer` at a freshly allocated address, replacing any earlier
-    /// one to the same peer: the old driver's outbound queue closes, which ends its
-    /// stream, which is how a stale circuit is torn down when a fresh one is wanted.
+    /// Attach a circuit to `peer` at a freshly allocated address. An earlier circuit to the same
+    /// peer **stays attached** until its own port is dropped; `peer` now names the newest.
+    ///
+    /// It used to be replaced here, and that was wrong whenever two circuits to one peer are
+    /// live at once — which is ordinary: a node dialling a peer through a relay while that peer
+    /// dials it back through the same relay (both reaching for each other after a restart), each
+    /// end attaching one circuit for its own dial and one for the other's. The second attach
+    /// unmapped the first circuit's address, so the handshake packets for it went to the real
+    /// socket and were lost, and that attempt waited out its whole 10 s dial timeout: a cold
+    /// relayed connection took 10558 ms on CI (R42, V210-80). No circuit needs replacing to be
+    /// torn down: the dialling end aborts its driver once the connection it carried closes, and
+    /// that ends the relay's streams and the far end's driver in turn (`circuitstream`).
     ///
     /// # Errors
     /// If the OS CSPRNG is unavailable. Vox never falls back to a weaker source, and a
@@ -258,21 +267,13 @@ impl MuxSocket {
             }
         };
         circuits.insert(addr, tx);
-        let mut origins = self.origins();
         if let Some(origin) = origin {
-            origins.insert(addr, origin);
+            self.origins().insert(addr, origin);
         }
-        let mut carriers = self.carriers();
         if let Some(carrier) = carrier {
-            carriers.insert(addr, carrier);
+            self.carriers().insert(addr, carrier);
         }
-        if let Some(stale) = self.by_peer().insert(*peer, addr) {
-            circuits.remove(&stale);
-            origins.remove(&stale);
-            carriers.remove(&stale);
-        }
-        drop(carriers);
-        drop(origins);
+        self.by_peer().insert(*peer, addr);
         drop(circuits);
         Ok(CircuitPort {
             addr,
@@ -311,7 +312,7 @@ impl MuxSocket {
         self.origins.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The address `peer`'s live circuit stands at, if it has one.
+    /// The address `peer`'s newest live circuit stands at, if it has one.
     #[must_use]
     pub fn circuit_addr_of(&self, peer: &Digest32) -> Option<SocketAddr> {
         self.by_peer().get(peer).copied()

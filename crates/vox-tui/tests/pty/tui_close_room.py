@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tui_close_room.py <vox> <data_dir> <config_dir> <identity_pass> <room_pass> <tag>
+"""tui_close_room.py <vox> <data_dir> <config_dir> <identity_pass> <room_pass> <tag> [<member>]
 
 Closes a profile's only room through the shipped `vox tui`, as a person would: unlock, open the
 room, `:close`. It is the one way to close a room on purpose (a daemon reopens every room it held
@@ -35,6 +35,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import STAGE, Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, TAG = sys.argv[1:7]
+# Optional: a member, by the first characters of its fingerprint, to consent to in this room with
+# `:consent grant` before the close: a per-room consent, which needs no trust (V210-118 c3).
+GRANT = sys.argv[7] if len(sys.argv) > 7 else None
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "180"))
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
@@ -105,6 +108,31 @@ try:
     if "passphrase" in tui.text().lower():
         # Closed on this node: the TUI asks for the room's passphrase to open it.
         key(ROOMPASS + "\r", 6)
+    if GRANT:
+        stage(":consent grant")
+        key("\t", 0.5)  # timeline -> composer
+        key("\t", 0.5)  # composer -> members
+        members = lambda: [r[100:] if len(r) > 100 else "" for r in tui.display()]
+        def label_of(prefix):
+            rows = members()
+            for i, r in enumerate(rows):
+                if prefix in r:
+                    return (rows[i + 1] if i + 1 < len(rows) else ""), "\u25b6" in r
+            return None, False
+        if not tui.until(lambda: label_of(GRANT)[0] is not None, 60, 1):
+            give(1, f"RED: PRODUCT (staging): {GRANT} is not in the members pane:\n{tui.text()}")
+        for _ in range(8):
+            if label_of(GRANT)[1]:
+                break
+            key("\x1b[B", 0.5)  # Down
+        if not label_of(GRANT)[1]:
+            give(1, f"RED: PRODUCT (staging): Down never put the marker on {GRANT}:\n{tui.text()}")
+        key(":consent grant\r", 2)
+        granted = tui.until(lambda: "consented" in (label_of(GRANT)[0] or ""), 60, 1)
+        gone_check()
+        if not granted:
+            give(1, f"RED: PRODUCT (staging): :consent grant never showed {GRANT} consented:\n{tui.text()}")
+        print(f"{TAG} the TUI consented to {GRANT}")
     before = tui.text()
     stage(":close")
     key(":zzz\r", 1.5)

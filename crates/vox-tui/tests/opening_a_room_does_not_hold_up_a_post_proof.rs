@@ -1,5 +1,5 @@
 //! V210-71 (#262), finding 3 — **a post answers while the same node opens another room with its
-//! passphrase**, through the shipped binary. An opt-in proof (`--features heavy-proofs`): it
+//! passphrase**, through the shipped binary. An opt-in proof (`--features optional-proofs`): it
 //! drives the terminal UI and seeds a room with hundreds of posts, so it is not part of every CI
 //! run or release gate.
 //!
@@ -43,7 +43,15 @@
 //! - mutant (the open on the actor), 2 of 2 red: opens of 1.22 s and 1.89 s, with a post made at
 //!   the start taking 1091 ms and 1675 ms.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(target_os = "macos")]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_post_answers_while_the_node_opens_another_room);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -184,8 +192,9 @@ fn drive(script: &str, args: &[&str], tag: &str) -> String {
     said
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "opt-in (heavy-proofs): drives the TUI and seeds a room; run in release"]
+#[ignore = "optional: drives the TUI and seeds a room; run in release"]
 fn a_post_answers_while_the_node_opens_another_room() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();

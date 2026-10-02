@@ -23,9 +23,13 @@
 //! vox room read --json --limit --since   # bob walks the room a page at a time
 //! ```
 //!
-//! **Asserted:** bob's paged read shows all 1,500 distinct `post <i>` texts, each once, within
-//! 300 s of his join. Precondition, or `CANNOT MEASURE`: alice's own paged read shows all 1,500,
-//! and bob renders alice's post made *after* his join (so his log and his key did arrive).
+//! **Asserted:** bob's paged read shows every `post <i>` text, **each once and in order**, within
+//! 300 s of his join. Two arms: [`a_newcomer_reads_a_short_history_once_each_in_order`] (60 posts
+//! read 25 to a page) **blocks**; [`a_newcomer_trusted_before_every_post_reads_all_of_them`] (1,500
+//! posts read 500 to a page, across the rotation at 1,000) is **optional** for its staging time.
+//! Alice's own paged read must show every post she made once each in order, or it is a `PRODUCT`
+//! red: each was accepted. The one precondition, or `CANNOT MEASURE`: bob renders alice's post made
+//! *after* his join (so his log and his key did arrive).
 //!
 //! **Every participant is the shipped binary.** Nothing in this process runs a node, opens a
 //! store or speaks a wire protocol; each step is a `vox` process with its own
@@ -41,9 +45,18 @@
 //! the decision is read from the decision on — is `a_member_reads_only_what_follows_trust_proof`.
 //!
 //! **Mutation:** make the consent release cover no history (`history_plan` returns nothing) and
-//! this goes red with bob short of 1,500.
+//! the 1,500-post arm goes red with bob short of 1,500. The short arm, inside one generation, is
+//! the blocking check that a newcomer's paged read loses, repeats and reorders nothing.
 
+// Two arms (decider, 2026-10-01: "Valid proofs block; rest optional"). The short history BLOCKS:
+// a newcomer reads every post exactly once and in order, over several pages. The 1,500-post
+// history, which crosses a sender-key rotation, is optional: CI only compiles it, and without
+// `--features optional-proofs` a stand-in says it was not run (`support/optional_proof.rs`).
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_newcomer_trusted_before_every_post_reads_all_of_them);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -57,12 +70,8 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
-/// Half again past one sender-key generation (1,000 messages), from one author.
-const POSTS: usize = 1_500;
 /// How long bob has, from his join, to read the whole history.
 const BOUND: Duration = Duration::from_secs(300);
-/// Rows per page when walking a room, as an agent reading a long room pages it.
-const PAGE: usize = 500;
 
 /// A `vox daemon`, killed by its own PID when dropped.
 struct Daemon(Child);
@@ -90,17 +99,25 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run {VOX} {args:?}: {e}"));
     if let Some(text) = stdin {
-        child
+        // A `vox` that exits without reading its stdin closes the pipe: its exit status and what
+        // it said are the verdict, so a refused write is reported, not fatal.
+        if let Err(e) = child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: a piped stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+        {
+            eprintln!("[harness] vox {args:?}: stdin not taken: {e}");
+        }
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not wait for {VOX} {args:?}: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -110,23 +127,34 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 
 /// Start `vox daemon` with the identity passphrase piped in, its output to files by the profile.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let file = |kind: &str| {
+        let at = dir.join(format!("daemon-{tag}.{kind}"));
+        std::fs::File::create(&at)
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", at.display()))
+    };
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM")
         .stdin(Stdio::piped())
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
+        .stdout(Stdio::from(file("out")))
+        .stderr(Stdio::from(file("err")))
         .spawn()
-        .expect("spawn vox daemon");
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run {VOX} daemon: {e}"));
     // Write, then close: the daemon reads stdin to EOF before it binds its socket.
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+    let mut pipe = child.stdin.take().expect("APPARATUS: a piped stdin");
+    if let Err(e) = pipe.write_all(format!("{IDENTITY}\n").as_bytes()) {
+        eprintln!("[harness] {tag}'s daemon did not take its passphrase: {e}");
+    }
     drop(pipe);
     Daemon(child)
+}
+
+/// What a profile's daemon said on stderr, for a red.
+fn said(dir: &Path, tag: &str) -> String {
+    std::fs::read_to_string(dir.join(format!("daemon-{tag}.err")))
+        .unwrap_or_else(|e| format!("(its stderr could not be read: {e})"))
 }
 
 /// `vox room list` once the daemon's socket answers.
@@ -142,60 +170,64 @@ fn attached(dir: &Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "CANNOT MEASURE: {tag}'s daemon never answered: {last}\nits stderr: {}",
-        std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
+        "PRODUCT: {tag}'s daemon never answered `vox room list` in 90 s: {last}\nits stderr: {}",
+        said(dir, tag)
     );
 }
 
-/// Every `post <i>` this profile's `vox room read --json` shows for `room`, walked a page at a
-/// time with `--limit` and `--since`. Returns the distinct post numbers, how many rows carried
-/// one (a duplicate would make this larger than the set), and the pages read.
-fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize, usize) {
-    let mut seen = BTreeSet::new();
-    let (mut rows_with_post, mut pages) = (0usize, 0usize);
+/// Every `post <i>` this profile's `vox room read --json` shows for `room`, in the order its rows
+/// come, walked `page` rows at a time with `--limit` and `--since`; and the pages read. A
+/// duplicate shows as a number twice, a reordering as a number out of turn.
+fn read_posts(dir: &Path, room: &str, page: usize) -> (Vec<usize>, usize) {
+    let mut order = Vec::new();
+    let mut pages = 0usize;
     let mut since: Option<String> = None;
     loop {
-        let limit = PAGE.to_string();
+        let limit = page.to_string();
         let mut args = vec!["room", "read", room, "--json", "--limit", &limit];
         if let Some(c) = since.as_deref() {
             args.extend(["--since", c]);
         }
         let (ok, out, err) = vox(dir, &args, None);
-        assert!(ok, "vox room read --json refused: {err}");
+        assert!(ok, "PRODUCT: `vox room read --json` refused: {err}");
         pages += 1;
-        let page: Vec<serde_json::Value> = out
+        let rows: Vec<serde_json::Value> = out
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad row ({e}): {l}")))
+            .map(|l| {
+                serde_json::from_str(l).unwrap_or_else(|e| {
+                    panic!(
+                        "PRODUCT: `vox room read --json` printed a row that is not JSON ({e}): {l}"
+                    )
+                })
+            })
             .collect();
-        for row in &page {
-            if let Some(n) = row["text"]
+        order.extend(rows.iter().filter_map(|row| {
+            row["text"]
                 .as_str()
                 .and_then(|t| t.strip_prefix("post "))
                 .and_then(|n| n.parse::<usize>().ok())
-            {
-                rows_with_post += 1;
-                seen.insert(n);
-            }
-        }
-        match page.last() {
-            Some(last) if page.len() == PAGE => {
+        }));
+        match rows.last() {
+            Some(last) if rows.len() == page => {
                 since = Some(
                     last["entry_hash"]
                         .as_str()
-                        .expect("every row carries its entry hash")
+                        .unwrap_or_else(|| {
+                            panic!("PRODUCT: a `vox room read --json` row carries no entry_hash: {last}")
+                        })
                         .to_owned(),
                 );
             }
-            _ => return (seen, rows_with_post, pages),
+            _ => return (order, pages),
         }
     }
 }
 
-/// The post numbers in `1..=POSTS` that `seen` lacks, as a few ranges for a failure message.
-fn missing_ranges(seen: &BTreeSet<usize>) -> Vec<(usize, usize)> {
+/// The post numbers in `1..=posts` that `seen` lacks, as a few ranges for a failure message.
+fn missing_ranges(seen: &BTreeSet<usize>, posts: usize) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
-    for n in (1..=POSTS).filter(|n| !seen.contains(n)) {
+    for n in (1..=posts).filter(|n| !seen.contains(n)) {
         match out.last_mut() {
             Some((_, hi)) if *hi + 1 == n => *hi = n,
             _ => out.push((n, n)),
@@ -204,31 +236,56 @@ fn missing_ranges(seen: &BTreeSet<usize>) -> Vec<(usize, usize)> {
     out
 }
 
+/// The first place `order` is not `1, 2, 3, …`: its index, and what was there.
+fn first_out_of_turn(order: &[usize]) -> Option<(usize, usize)> {
+    order
+        .iter()
+        .enumerate()
+        .find(|(i, n)| **n != i + 1)
+        .map(|(i, n)| (i, *n))
+}
+
+/// The blocking arm: a history short enough to stage in seconds, read over several pages.
 #[test]
-#[ignore = "real vox daemons, 1,500 CLI posts and production Argon2id; CI runs it in release"]
+#[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
+fn a_newcomer_reads_a_short_history_once_each_in_order() {
+    newcomer_reads_the_whole_history(60, 25);
+}
+
+/// The optional arm: half again past one sender-key generation (1,000 messages), from one author.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real vox daemons, 1,500 CLI posts and production Argon2id; optional, run it in release"]
 fn a_newcomer_trusted_before_every_post_reads_all_of_them() {
+    newcomer_reads_the_whole_history(1_500, 500);
+}
+
+/// Alice posts `posts` times; bob, trusted before any of them and joining cold, must read every
+/// one exactly once and in order, `page` rows at a time.
+fn newcomer_reads_the_whole_history(posts: usize, page: usize) {
     // One join; 7 unlocks: two `vox id`s, two `trust add`s, two daemons and the room.
     watchdog::arm_for_setup(1, 7);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     for d in [&alice, &bob] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
     }
 
     // ---- two identities that consent to each other, decided before any daemon runs ----
     let mut fps = Vec::new();
     for dir in [&alice, &bob] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
         fps.push(out.trim().to_owned());
     }
     for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(ok, "vox trust add {name}: {err}");
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
 
-    // ---- alice: a room, and 1,500 posts from one author ----------------------------------
+    // ---- alice: a room, and `posts` posts from one author ------------------------------------
     let alice_daemon = daemon(&alice, "alice");
     attached(&alice, "alice");
     let (ok, _, err) = vox(
@@ -236,38 +293,41 @@ fn a_newcomer_trusted_before_every_post_reads_all_of_them() {
         &["room", "create", "--name", "long"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "PRODUCT: `vox room create` failed: {err}");
     let listed = attached(&alice, "alice");
     let room = listed
         .split_whitespace()
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .expect("a room id in `room list`")
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
         .to_owned();
 
     let started = Instant::now();
-    for i in 1..=POSTS {
+    for i in 1..=posts {
         let (ok, _, err) = vox(&alice, &["room", "post", &room, &format!("post {i}")], None);
         assert!(
             ok,
-            "CANNOT MEASURE: alice's post {i} of {POSTS} was refused: {err}"
+            "PRODUCT: alice's post {i} of {posts} was refused: {err}"
         );
     }
-    let (mine, mine_rows, pages) = read_posts(&alice, &room);
+    let (mine, pages) = read_posts(&alice, &room, page);
     println!(
-        "[proof] alice posted {POSTS} in {:?}; her own paged read shows {} distinct posts in \
-         {mine_rows} rows over {pages} pages",
+        "[proof] alice posted {posts} in {:?}; her own paged read shows {} rows over {pages} pages",
         started.elapsed(),
         mine.len()
     );
+    // Every post was accepted above, so an author who cannot read them back once each, in
+    // order, is the product's paged read failing, not a staging fault.
     assert!(
-        mine.len() == 1_500 && mine_rows == 1_500,
-        "CANNOT MEASURE: the author herself reads {} distinct posts in {mine_rows} rows, not 1,500",
-        mine.len()
+        first_out_of_turn(&mine).is_none() && mine.len() == posts,
+        "PRODUCT: the author's own paged read of her {posts} accepted posts is not each once in \
+         order: {} rows; first out of turn (index, post): {:?}",
+        mine.len(),
+        first_out_of_turn(&mine)
     );
 
     // ---- bob joins cold -------------------------------------------------------------------
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT: `vox room invite` failed: {err}");
     let link = link.trim().to_owned();
     let bob_daemon = daemon(&bob, "bob");
     attached(&bob, "bob");
@@ -276,63 +336,77 @@ fn a_newcomer_trusted_before_every_post_reads_all_of_them() {
         &["room", "join", &link, "--name", "long"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: vox room join: {err}");
+    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
     let joined = Instant::now();
     // A post made after the join: the forward-only minimum bob must read in any case, and the
     // sign that his log and his key have arrived at all.
-    let after_join = POSTS + 1;
+    let after_join = posts + 1;
     let (ok, _, err) = vox(
         &alice,
         &["room", "post", &room, &format!("post {after_join}")],
         None,
     );
-    assert!(ok, "alice's post after bob joined: {err}");
+    assert!(
+        ok,
+        "PRODUCT: alice's post after bob joined was refused: {err}"
+    );
 
     // ---- bob walks the room until he reads everything, or the bound passes ---------------
-    let (mut seen, mut rows, mut pages);
+    let (mut order, mut pages);
     let mut last_count = usize::MAX;
     loop {
-        (seen, rows, pages) = read_posts(&bob, &room);
-        let history = seen.iter().filter(|n| **n <= POSTS).count();
+        (order, pages) = read_posts(&bob, &room, page);
+        let history = order.iter().filter(|n| **n <= posts).count();
         if history != last_count {
             println!(
-                "[proof] +{:?}: bob reads {history} of the {POSTS} pre-join posts \
+                "[proof] +{:?}: bob reads {history} rows of the {posts} pre-join posts \
                  (post {after_join}: {})",
                 joined.elapsed(),
-                seen.contains(&after_join)
+                order.contains(&after_join)
             );
             last_count = history;
         }
-        if (history == POSTS && seen.contains(&after_join)) || joined.elapsed() > BOUND {
+        if (history >= posts && order.contains(&after_join)) || joined.elapsed() > BOUND {
             break;
         }
         std::thread::sleep(Duration::from_secs(2));
     }
     let took = joined.elapsed();
-    let history: BTreeSet<usize> = seen.iter().copied().filter(|n| *n <= POSTS).collect();
-    let history_rows = rows - usize::from(seen.contains(&after_join));
+    let history: Vec<usize> = order.iter().copied().filter(|n| *n <= posts).collect();
+    let distinct: BTreeSet<usize> = history.iter().copied().collect();
     println!(
-        "[proof] bob, {took:?} after his join: {} distinct pre-join posts in {history_rows} rows \
-         over {pages} pages (first {:?}, last {:?}); post {after_join} read: {}",
+        "[proof] bob, {took:?} after his join: {} rows of pre-join posts, {} distinct, over \
+         {pages} pages; post {after_join} read: {}",
         history.len(),
-        history.first(),
-        history.last(),
-        seen.contains(&after_join)
+        distinct.len(),
+        order.contains(&after_join)
     );
     assert!(
-        seen.contains(&after_join),
+        order.contains(&after_join),
         "CANNOT MEASURE: bob never read alice's post {after_join}, made after his join, within \
-         {took:?} — his log or his key never arrived, so what he reads of the history says \
+         {took:?}: his log or his key never arrived, so what he reads of the history says \
          nothing\nbob's daemon said: {}\nalice's daemon said: {}",
-        std::fs::read_to_string(bob.join("daemon-bob.err")).unwrap_or_default(),
-        std::fs::read_to_string(alice.join("daemon-alice.err")).unwrap_or_default()
+        said(&bob, "bob"),
+        said(&alice, "alice")
     );
-    assert_eq!(
-        (history.len(), history_rows),
-        (1_500, 1_500),
-        "a member trusted before every post must read all 1,500 of them, each once, within \
-         {BOUND:?} of his join (V210-45); missing posts {:?}",
-        missing_ranges(&history)
+    assert!(
+        distinct.len() == posts,
+        "PRODUCT: a member trusted before every post must read all {posts} of them within \
+         {BOUND:?} of his join (V210-45), but read {}; missing posts {:?}",
+        distinct.len(),
+        missing_ranges(&distinct, posts)
+    );
+    assert!(
+        history.len() == posts,
+        "PRODUCT: bob's paged read shows {} rows for {posts} posts: a post read more than once \
+         (a duplicate row)",
+        history.len()
+    );
+    assert!(
+        first_out_of_turn(&history).is_none(),
+        "PRODUCT: bob's paged read is out of order: at row {:?} (index, post), where post \
+         index+1 belongs",
+        first_out_of_turn(&history)
     );
     drop(bob_daemon);
     drop(alice_daemon);

@@ -473,7 +473,7 @@ impl VoxEndpoint {
         self.mux.is_circuit(addr)
     }
 
-    /// The address `peer`'s live circuit stands at, if it has one. Circuit addresses are
+    /// The address `peer`'s newest live circuit stands at, if it has one. Circuit addresses are
     /// allocated, so this is the only way to get from a peer to its circuit.
     #[must_use]
     pub fn circuit_addr_of(&self, peer: &Digest32) -> Option<std::net::SocketAddr> {
