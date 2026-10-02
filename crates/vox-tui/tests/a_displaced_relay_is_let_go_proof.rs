@@ -334,8 +334,8 @@ fn both_ends_keep_the_same_connection(
 /// **Observed, never assumed** (CANNOT MEASURE otherwise): the session's first echo rode the
 /// circuit (the forward was closed and carried none of it); after the forward opened a *new*
 /// request rode it (the pair went direct); the host or the guest reported its relayed connection
-/// displaced; and the session rode the displaced path after the upgrade at least once (an echo
-/// that did not cross the forward) — otherwise displacement was never exercised under it.
+/// displaced; and the session rode the displaced path after the grace had ended at least once (an
+/// echo that did not cross the forward) — otherwise the grace was never exercised under it.
 ///
 /// **Asserted:**
 /// - **V29-15 (#50): both ends keep the same one of the two live connections.** When the direct
@@ -356,7 +356,10 @@ fn both_ends_keep_the_same_connection(
 ///   echo took: what a person needs is that the session never breaks, and its bytes may stay on
 ///   the retired relayed connection or move onto the direct path partway through the grace (seen
 ///   once in three runs on 2026-10-02, the session still answering every echo). Each echo's path
-///   is recorded and printed: how many crossed the forward, how many the circuit.
+///   is recorded and printed: how many crossed the forward, how many the circuit. The grace must
+///   have been exercised: at least one echo rode the displaced path **after**
+///   `RETIRE_GRACE_SECS`, when a grace that cut what it carried would already have cut it
+///   (`CANNOT MEASURE` otherwise).
 ///
 /// **The mutations that must turn it red:**
 /// - `ConnectionManager::retire_expired` treating no retired connection as still carried
@@ -474,7 +477,8 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
 
     // The hold: the session answers every echo until well past the grace, on whichever path.
     // Each echo's path is recorded: the circuit (displaced) or the forward (direct).
-    let (mut displaced, mut moved) = (0usize, Vec::new());
+    let grace = Duration::from_secs(vox_core::node::net::RETIRE_GRACE_SECS);
+    let (mut displaced, mut displaced_after_grace, mut moved) = (0usize, 0usize, Vec::new());
     while direct_at.elapsed() < hold {
         std::thread::sleep(Duration::from_secs(3));
         let (ok, direct) = echo(&mut session, &w);
@@ -493,11 +497,15 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
             moved.push(direct_at.elapsed());
         } else {
             displaced += 1;
+            if direct_at.elapsed() > grace {
+                displaced_after_grace += 1;
+            }
         }
     }
     eprintln!(
         "[proof] the session answered {0}/{0} echoes, the last {1:?} after the direct path took \
-         over (grace {2}s): {displaced} on the displaced path, {3} on the direct path (from {4:?})",
+         over (grace {2}s): {displaced} on the displaced path ({displaced_after_grace} after the \
+         grace), {3} on the direct path (from {4:?})",
         displaced + moved.len(),
         direct_at.elapsed(),
         vox_core::node::net::RETIRE_GRACE_SECS,
@@ -505,9 +513,12 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
         moved.first()
     );
     assert!(
-        displaced > 0,
-        "CANNOT MEASURE: every echo on the session after the upgrade crossed the forward, so the \
-         session never rode the displaced path and its displacement was not exercised"
+        displaced_after_grace > 0,
+        "CANNOT MEASURE: no echo on the session rode the displaced path after the {grace:?} grace \
+         ({displaced} did before it, {} crossed the forward from {:?}), so the grace never acted \
+         on a connection carrying the session",
+        moved.len(),
+        moved.first()
     );
     drop(session);
     interrupt(&mut up, Duration::from_secs(15));
