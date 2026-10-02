@@ -360,6 +360,44 @@ const PROBE_SPACING: Duration = Duration::from_millis(900);
 /// How often a probe checks whether anything came back.
 const PROBE_POLL: Duration = Duration::from_millis(10);
 
+/// A connection's **authenticated** receive count: the number of QUIC frames it has received,
+/// which quinn tallies only after a packet decrypts on the connection. A spoofer that knows a
+/// connection ID can make quinn route garbage to the connection — raising `udp_rx.datagrams`,
+/// counted before authentication — but cannot make a forged packet decrypt, so this never moves
+/// for it (V210-140). Liveness is measured from this, not from datagrams observed, so an on-path
+/// attacker cannot keep a dead connection looking alive to the idle timeout.
+///
+/// It is the sum of every received-frame counter quinn exposes: any decrypted packet carries at
+/// least one frame (an idle keep-alive is a PING the peer ACKs), so a live connection always
+/// advances it, at the same ~20s cadence a live idle connection is heard at.
+fn rx_authenticated(quic: &quinn::Connection) -> u64 {
+    let f = quic.stats().frame_rx;
+    f.acks
+        .wrapping_add(f.ack_frequency)
+        .wrapping_add(f.crypto)
+        .wrapping_add(u64::from(f.connection_close))
+        .wrapping_add(f.data_blocked)
+        .wrapping_add(f.datagram)
+        .wrapping_add(u64::from(f.handshake_done))
+        .wrapping_add(f.immediate_ack)
+        .wrapping_add(f.max_data)
+        .wrapping_add(f.max_stream_data)
+        .wrapping_add(f.max_streams_bidi)
+        .wrapping_add(f.max_streams_uni)
+        .wrapping_add(f.new_connection_id)
+        .wrapping_add(f.new_token)
+        .wrapping_add(f.path_challenge)
+        .wrapping_add(f.path_response)
+        .wrapping_add(f.ping)
+        .wrapping_add(f.reset_stream)
+        .wrapping_add(f.retire_connection_id)
+        .wrapping_add(f.stream_data_blocked)
+        .wrapping_add(f.streams_blocked_bidi)
+        .wrapping_add(f.streams_blocked_uni)
+        .wrapping_add(f.stop_sending)
+        .wrapping_add(f.stream)
+}
+
 /// How long a probe waits for an answer: three round trips of the held connection's own RTT
 /// estimate — one for the probe and its ACK, the rest for an ACK delay and a loss — but never
 /// less than 250ms, where a loopback RTT of microseconds would make scheduling noise look like
@@ -377,7 +415,7 @@ fn probe_patience(rtt: Duration) -> Duration {
 /// verdict can be re-checked at the moment it is acted on (see [`ConnectionManager::file_inner`]).
 async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     let quic = conn.quinn();
-    let before = quic.stats().udp_rx.datagrams;
+    let before = rx_authenticated(quic);
     if quic
         .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
         .is_err()
@@ -386,7 +424,7 @@ async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     }
     let deadline = tokio::time::Instant::now() + probe_patience(quic.rtt());
     loop {
-        if quic.stats().udp_rx.datagrams != before || !is_live(conn) {
+        if rx_authenticated(quic) != before || !is_live(conn) {
             return None;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -396,8 +434,8 @@ async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     }
 }
 
-/// Connections a probe found unanswered, each with the received-datagram count its probe started
-/// from. Closed only inside [`ConnectionManager::file_inner`], under the connection lock.
+/// Connections a probe found unanswered, each with the authenticated-frame count ([`rx_authenticated`])
+/// its probe started from. Closed only inside [`ConnectionManager::file_inner`], under the connection lock.
 type Unanswered = Vec<(Arc<VoxConnection>, u64)>;
 
 /// One QUIC connection per peer fingerprint (see the module docs).
@@ -580,10 +618,11 @@ impl ConnectionManager {
         Some(conn)
     }
 
-    /// How long `conn` has received nothing, sampling its datagram count now. A connection
-    /// never sampled before counts as heard this instant: the first sample is the baseline.
+    /// How long `conn` has received no **authenticated** traffic, sampling [`rx_authenticated`]
+    /// now (not datagrams observed, which a spoofer can raise; V210-140). A connection never
+    /// sampled before counts as heard this instant: the first sample is the baseline.
     fn silent_for(&self, conn: &VoxConnection) -> Duration {
-        let received = conn.quinn().stats().udp_rx.datagrams;
+        let received = rx_authenticated(conn.quinn());
         let now = Instant::now();
         let mut heard = lock(&self.heard);
         let entry = heard.entry(conn.serial()).or_insert((received, now));
@@ -963,7 +1002,7 @@ impl ConnectionManager {
         // connection leaves the newcomer's way exactly as a close did, and what it carries
         // finishes; [`Self::retire_expired`] closes it once nothing does.
         for (dead, before) in unanswered {
-            if is_live(&dead) && dead.quinn().stats().udp_rx.datagrams == before {
+            if is_live(&dead) && rx_authenticated(dead.quinn()) == before {
                 let held = map.get(&peer).is_some_and(|c| Arc::ptr_eq(c, &dead));
                 if held {
                     map.remove(&peer);
