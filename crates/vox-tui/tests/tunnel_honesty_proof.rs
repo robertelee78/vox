@@ -29,6 +29,7 @@
 //!   carries. Each closed session reaches its application as a reset, the other end says the
 //!   tunnel was closed, both ends' `vox status` lists it with why, and a new session through
 //!   the same forward works at once: the member is still trusted and the service still served.
+//!   Each end's `vox status` names the tunnel's room.
 //! - **A stuck tunnel is closed on its own, and an idle one never is** (V030-11). With the host's
 //!   `tunnel-stuck-after` set to [`STUCK_AFTER`] (the guest's far longer), a session whose
 //!   application writes and never reads the echo is closed as stuck by the host, not before that
@@ -322,6 +323,15 @@ fn rows<'a>(
         .unwrap_or_default()
 }
 
+/// Whether a `tunnels` row names `room`, the world's room as `vox serve` printed it: the row's
+/// `room` is the room's full key, so it begins with that (V030-11).
+fn names_room(row: &serde_json::Value, room: &str) -> bool {
+    !room.is_empty()
+        && row["room"]
+            .as_str()
+            .is_some_and(|r| r.len() >= 52 && r.starts_with(room))
+}
+
 /// How long a closed tunnel may take to appear on a node's closed list: its splice resets the
 /// local socket once its queue drains (`DRAIN_BOUND`, 2 s) before the tunnel ends, and the far
 /// end's after the reset reaches it.
@@ -377,6 +387,11 @@ fn a_tunnel_is_closed_from_either_end_and_nothing_else_changes() {
     });
     let host_status = status_of(&w.host_dir, "the host");
     let live = rows(&host_status, "tunnels", &port, "in");
+    assert!(
+        live.iter().all(|t| names_room(t, &w.room)),
+        "PRODUCT: the host's `vox status` must name each tunnel's room, {}: {host_status}",
+        w.room
+    );
     let member: String = match live.as_slice() {
         [one] => one["peer"]
             .as_str()
@@ -447,6 +462,10 @@ fn a_tunnel_is_closed_from_either_end_and_nothing_else_changes() {
     // Step 5: the guest closes its own session, by the number its `vox status` gives it.
     let guest_status = status_of(&guest_dir, "the guest");
     let id = match rows(&guest_status, "tunnels", &port, "out").as_slice() {
+        [one] if !names_room(one, &w.room) => panic!(
+            "PRODUCT: the guest's `vox status` must name the tunnel's room, {}: {one}",
+            w.room
+        ),
         [one] => one["id"]
             .as_u64()
             .unwrap_or_else(|| panic!("PRODUCT: a tunnel row with no number: {one}")),

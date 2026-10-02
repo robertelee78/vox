@@ -304,7 +304,7 @@ pub async fn open_tunnel<D: HostDialer>(
     loop {
         let attempt = async {
             let conn = reach_host_with_patience(dialer, host).await?;
-            let credit = conn.carry_tunnel(service_tag, true)?;
+            let credit = conn.carry_tunnel(channel_id, service_tag, true)?;
             let (mut send, mut recv) = crate::transport::streams::open_typed(
                 &conn,
                 crate::transport::streams::StreamKind::Tunnel,

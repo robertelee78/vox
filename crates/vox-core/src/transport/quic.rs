@@ -1082,6 +1082,8 @@ pub struct LiveTunnel {
     pub id: u64,
     /// The member at the other end.
     pub peer: Digest32,
+    /// The room the service is bound to.
+    pub room: Digest32,
     /// The service it reaches: a port, or a `vox room send` offer's tag.
     pub service: String,
     /// Whether this node opened it (to reach the member's service), rather than serving it.
@@ -1095,6 +1097,7 @@ pub struct LiveTunnel {
 /// A live tunnel's entry in [`LIVE`].
 struct Live {
     peer: Digest32,
+    room: Digest32,
     service: String,
     outbound: bool,
     opened: u64,
@@ -1106,6 +1109,7 @@ impl Live {
         LiveTunnel {
             id,
             peer: self.peer,
+            room: self.room,
             service: self.service.clone(),
             outbound: self.outbound,
             opened: self.opened,
@@ -1188,9 +1192,14 @@ impl VoxConnection {
     /// past the member's bound.
     ///
     /// Take it only for a tunnel this node authorized or opened for its own application: the
-    /// credit is memory this node agrees to hold for that peer. `service` and `outbound` are what
-    /// [`live_tunnels`] lists it as.
-    pub fn carry_tunnel(&self, service: &str, outbound: bool) -> Result<TunnelCredit> {
+    /// credit is memory this node agrees to hold for that peer. `room`, `service` and `outbound`
+    /// are what [`live_tunnels`] lists it as.
+    pub fn carry_tunnel(
+        &self,
+        room: &Digest32,
+        service: &str,
+        outbound: bool,
+    ) -> Result<TunnelCredit> {
         let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
         let opened = unix_now();
         let watch = TunnelWatch::new(opened);
@@ -1205,6 +1214,7 @@ impl VoxConnection {
                 id,
                 Live {
                     peer: self.peer_id,
+                    room: *room,
                     service: service.to_owned(),
                     outbound,
                     opened,

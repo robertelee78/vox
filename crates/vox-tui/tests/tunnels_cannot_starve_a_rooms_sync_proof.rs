@@ -34,7 +34,8 @@
 //! [`GREW_PAST_CAP`] (from `ps`) between the cap and past it. The refusal names the service the
 //! 16 go to and how to free one ([`FREE_ONE_SAID`]), and at the cap `vox status` (both `--json`
 //! and the lines a person reads) lists the 16 on each side: out on Bob's, in on Alice's; and
-//! Alice's names the offer once per tunnel, in one listing, never twice.
+//! Alice's names the offer once per tunnel, in one listing, never twice; Bob's once per tunnel
+//! and once for his forward.
 //!
 //! ## Preconditions (else CANNOT MEASURE)
 //! The control posts all arrived within [`BOUND`]. In the download arm, both collectors received
@@ -543,7 +544,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         assert!(ok, "PRODUCT: {}: vox status failed: {err}", m.name);
         (rows, human, out)
     };
-    let (bob_rows, bob_human, _) = listed(&bob, "out");
+    let (bob_rows, bob_human, bob_json) = listed(&bob, "out");
     let (alice_rows, alice_human, alice_json) = listed(&alice, "in");
     // **Each tunnel is listed once** (V210-81, #314): Alice serves the offer and forwards nothing,
     // so every mention of its tag in her status is one of the tunnels, in one listing.
@@ -552,6 +553,13 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         .filter(|l| l.contains(tag.as_str()))
         .count();
     let alice_named = alice_json.matches(&format!("\"{tag}\"")).count();
+    // And on Bob's side (ac-ver272): his one forward to the offer is its own line and its own
+    // `forwards` entry, and every other mention of the tag is one of his tunnels.
+    let bob_said = bob_human
+        .lines()
+        .filter(|l| l.contains(tag.as_str()))
+        .count();
+    let bob_named = bob_json.matches(&format!("\"{tag}\"")).count();
     let human_lines = |text: &str, way: &str| {
         text.lines()
             .filter(|l| {
@@ -618,7 +626,15 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
 
     eprintln!(
         "[proof] cap arm: Alice's status names {tag} on {alice_said} line(s) and {alice_named} \
-         time(s) in --json"
+         time(s) in --json; Bob's on {bob_said} line(s) and {bob_named} time(s)"
+    );
+    assert!(
+        bob_said == cap + 1 && bob_named == cap + 1,
+        "PRODUCT: with {cap} tunnels open through Bob's one forward to the offer, his `vox status` \
+         names {tag} on {bob_said} line(s) and {bob_named} time(s) in --json, not {} (each tunnel \
+         once, and the forward once): a tunnel is listed more than once\nBob's vox status:\n\
+         {bob_human}",
+        cap + 1
     );
     assert!(
         alice_said == cap && alice_named == cap,

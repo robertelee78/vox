@@ -290,9 +290,10 @@ fn tunnels(v: &serde_json::Value, out: &mut String) {
         };
         let _ = writeln!(
             out,
-            "tunnel {} {way} for {}: open {}, last moved {} ago",
+            "tunnel {} {way} for {} (room {}): open {}, last moved {} ago",
             n("id"),
             s("service"),
+            short(&s("room")),
             ago(n("opened")),
             ago(n("last_moved"))
         );

@@ -197,7 +197,7 @@ pub async fn serve_reporting(
         |channel_id, tag| {
             let mut watch = None;
             if let Some(conn) = carried {
-                let taken = conn.carry_tunnel(tag, false)?;
+                let taken = conn.carry_tunnel(channel_id, tag, false)?;
                 watch = Some(taken.watch());
                 *credit
                     .lock()

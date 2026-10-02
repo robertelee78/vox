@@ -35,8 +35,8 @@
 //! circuits (V210-53). They are what a person cannot see directly: that nothing was refused,
 //! skipped or left stale. They live in a [`SyncBook`] the actor writes and every handle reads.
 //!
-//! `"tunnels"` lists every live tunnel (V210-81): the member, the service, which way it was
-//! opened, and when it was opened and last moved a byte.
+//! `"tunnels"` lists every live tunnel (V210-81): the member, its room (V030-11), the service,
+//! which way it was opened, and when it was opened and last moved a byte.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -1068,8 +1068,9 @@ impl SyncBook {
                 list.join(",")
             );
         }
-        // **Every live tunnel** (V210-81): the member, the service, which way it was opened, and
-        // when it was opened and last moved a byte (Unix seconds), so a stale one is visible.
+        // **Every live tunnel** (V210-81): the member, its room (V030-11), the service, which way it
+        // was opened, and when it was opened and last moved a byte (Unix seconds), so a stale one
+        // is visible.
         s.push_str("],\"tunnels\":[");
         for (i, t) in crate::transport::quic::live_tunnels().iter().enumerate() {
             if i > 0 {
@@ -1077,10 +1078,11 @@ impl SyncBook {
             }
             let _ = write!(
                 s,
-                "{{\"id\":{},\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\
-                 \"opened\":{},\"last_moved\":{}}}",
+                "{{\"id\":{},\"peer\":\"{}\",\"room\":\"{}\",\"service\":{},\
+                 \"direction\":\"{}\",\"opened\":{},\"last_moved\":{}}}",
                 t.id,
                 b32_encode(&t.peer),
+                b32_encode(&t.room),
                 q(&t.service),
                 if t.outbound { "out" } else { "in" },
                 t.opened,
