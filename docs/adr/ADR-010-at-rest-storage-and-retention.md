@@ -21,7 +21,10 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 
 ### Where the identity key lives
 
-- **AR-5.** A generated identity MUST be held in an identity vault (`vault.cbor`), wrapped under an identity factor: Argon2id over the identity passphrase. An imported identity (gpg-agent, smartcard) MAY delegate signing to its agent; the private key then never leaves it. **Planned:** the gpg-agent/smartcard signers and the hardware-stored-secret identity factor exist as trait seams only.
+- **AR-5.** A generated identity MUST be held in an identity vault (`vault.cbor`), wrapped under an identity factor: Argon2id over the identity passphrase. An imported identity (gpg-agent, smartcard) MAY delegate signing to its agent; the private key then never leaves it.
+- **AR-5a.** For a key that cannot sign deterministically (some ML-DSA or smartcard configurations), the identity factor MUST instead unwrap a hardware-stored random secret released only to that identity, never touching raw private-key bytes. That variant is also the fully post-quantum identity factor (AR-9).
+- **AR-5b.** Where a platform gates unlock with biometrics, the biometric MAY replace only the identity factor's unlock. It MUST NOT replace the room-passphrase factor.
+- **AR-5c. Planned.** The gpg-agent and smartcard signers (AR-5), the hardware-stored secret (AR-5a) and biometric unlock (AR-5b) exist as trait seams only.
 
 ### Double-lock key derivation
 
@@ -41,8 +44,8 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 
 ### Post-quantum strength
 
-- **AR-9.** The post-quantum strength of a room store rests on `factor_pass`, because `id_proof` is a classical signature. Documentation MUST NOT describe the identity factor as post-quantum.
-- **AR-10.** The Argon2id profile MUST be at least 256 MiB, at least 3 passes, with a per-room random 128-bit salt. The floor MUST be enforced at compile time against the production profile (`ADR_MIN_M_COST_KIB`, `ADR_MIN_T_COST`, a `const` assertion). A production build MUST NOT be able to construct or resolve a profile below it. A reduced profile MAY exist under `cfg(test)` only.
+- **AR-9.** The post-quantum strength of a room store rests on `factor_pass` (Argon2id over the room passphrase). The Ed25519 `id_proof` is classical: a quantum adversary holding the device could forge it. Device seizure needs the passphrase regardless, so this is acceptable; it is stated so the at-rest boundary is not mistaken for post-quantum strength from the identity key.
+- **AR-10.** The Argon2id profile MUST be at least 256 MiB, at least 3 passes, with a per-room random 128-bit salt. The floor MUST be enforced at compile time against the production profile (`ADR_MIN_M_COST_KIB`, `ADR_MIN_T_COST`, a `const` assertion). A production build MUST NOT be able to construct or resolve a profile below it. A reduced profile MAY exist under `cfg(test)` only. A cheaper profile for any non-test consumer MUST be a recorded, feature-gated decision, and MUST NOT be a change to `from_id`.
 - **AR-11.** A wrap and a vault MUST record their KDF profile id, so the parameters can be raised later by re-wrapping. An unknown stored profile id MUST fail as `AtRestUnlockFailed`, the same as a wrong factor or tampering, on every unlock path. Only a structurally malformed encoding is `MalformedAtRest`.
 
 ### Passphrase rotation interaction
@@ -53,7 +56,7 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 
 ### App-lock and memory hygiene
 
-- **AR-15.** A SEK MUST be held only in memory, and only while the identity is unlocked. A lock (manual, idle timeout or signal; see ADR-015) MUST zeroize every SEK and the derived material.
+- **AR-15.** A SEK MUST be held only in memory, and only while the identity is unlocked. A lock (manual, idle timeout, or on sleep; ADR-015 maps sleep to its triggers) MUST zeroize every SEK and the derived material.
 - **AR-16.** Secret memory MUST be zeroized when it is freed. The SEK MUST be `mlock`ed where the platform allows (best effort). **Not built:** derived factors, the KEK, the vault key and opened plaintext are zeroizing but not `mlock`ed.
 - **AR-17.** An opened segment's plaintext MUST be returned zeroizing (`store::open_segment` returns `Zeroizing<Vec<u8>>`). `Sek` MUST NOT implement `Clone`.
 - **AR-18.** Plaintext caches MUST live inside the SEK-sealed store and MUST NOT be written unencrypted.
@@ -100,18 +103,23 @@ R-numbers are PRD-001's.
   - The signed hash skeleton MUST remain verifiable (ADR-008).
 - **AR-32.** An entry's age MUST run from its author's claimed time, clamped to no later than first sight. An entry this node cannot read MUST age from first sight. The first-seen time MUST be kept per entry in a sealed `Index` segment.
 - **AR-33.** On reload, a body-less entry MUST be kept: it verifies and links the feed. A body that arrives already expired MUST be pruned and MUST NOT be rendered.
-- **AR-34.** Retention is honoured by clients, not enforced. User-facing text MUST NOT promise that other members' devices delete anything.
+- **AR-34.** Retention is honoured by clients, not enforced: a malicious client can keep data. This is stated plainly, not implied to be a guarantee.
 - **AR-35. Planned.** An anchor's log store keeps bodies regardless of retention, until ADR-023 decision 6 removes that store.
 
 ### Gates
 
-- **AR-36.** Retention MUST be proven through the shipped binary (`crates/vox-tui/tests/retention_proof.rs`) in each of these cases:
-  - retroactive pruning;
-  - shortest wins;
-  - a late arrival is never shown;
-  - the node's retention applied at open.
+- **AR-36.** Retention is proven through the shipped binary by `crates/vox-tui/tests/retention_proof.rs`, which covers retroactive pruning, shortest wins, a late arrival never shown, and the node's retention applied at open. Each case has a mutation that turns it red (ADR-018).
 
-  Each case MUST have a mutation that turns it red.
+### Open defects and limits
+
+These are known and not fixed. Each stays until it is fixed, with the fixing commit or proof cited.
+
+| # | Defect or limit | Where | Tracked |
+|---|---|---|---|
+| D1 | Segment seals use random 96-bit GCM nonces with no nonce-count accounting, so the 2^32 random-nonce bound is not enforced. | `atrest/store.rs:145` | to be filed |
+| D2 | A room's SEK never rotates: it is generated only at create and at join. | `node/channel.rs:1195`, `:1865` | to be filed |
+| D3 | A peer is served the skeleton of a pruned entry, because the DAG holds only the skeleton. No proof isolates it. | `log/sync.rs` | to be filed |
+| L1 | Only the SEK is `mlock`ed. Derived factors, the KEK, the vault key and opened plaintext are zeroizing but not pinned (AR-16). | `atrest/sek.rs` | limit |
 
 ## Consequences
 
