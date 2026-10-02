@@ -147,6 +147,32 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// The cases in this file, each a flood of its own.
+const CASES: u32 = 7;
+/// What one case may take, staging to verdict, before the watchdog calls the process hung. All
+/// seven ran one after another in 456s in release at load 38 (65s each on average, carol's joins
+/// 6–33s); this is more than five times that average, for a slower runner. The watchdog bounds
+/// the whole run, `CASES` of these, and is only the backstop: a case that runs out one of its own
+/// patiences fails on it, with its own red.
+const CASE_BUDGET: Duration = Duration::from_secs(360);
+
+/// **One case at a time** (V210-124, #332). Each case stages a flood of its own: an anchor,
+/// alice, carol and up to sixteen strangers' daemons grinding their proof of work, which alice
+/// makes four times harder while the flood lasts. libtest runs a file's tests on as many threads
+/// as there are cores, so CI's runners ran three or four floods at once, the proof loaded its
+/// own machine past anything it measures, and its joins starved: carol got in after 98–370s
+/// against a 90s bound on ubuntu, three cases could not even stage, and on macOS the four running
+/// ran past the process's 600s watchdog. Run one at a time, all seven passed with carol in
+/// 6–33s. So every case holds this lock for its whole run, whatever libtest's thread count, and
+/// the watchdog, which bounds the whole process, is given the cases' budgets in turn.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    watchdog::arm_for(CASE_BUDGET * CASES);
+    // A case that failed panicked holding the lock; the next case still runs.
+    ONE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "identity passphrase";
 const ROOM_PASS: &str = "channel passphrase";
@@ -821,7 +847,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
 #[test]
 #[ignore = "sixteen joins that never finish, production Argon2id and a real anchor; CI runs it in release"]
 fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
-    watchdog::arm();
+    let _one = one_at_a_time();
     label_reds();
     let tmp = tempfile::tempdir().unwrap();
     // Rooms 0–15 are held; 16 and 17 are two more the stranger keeps arriving for.
@@ -833,7 +859,7 @@ fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
 #[test]
 #[ignore = "sixteen joins that never finish, production Argon2id and a real anchor; CI runs it in release"]
 fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
-    watchdog::arm();
+    let _one = one_at_a_time();
     label_reds();
     let tmp = tempfile::tempdir().unwrap();
     // Four identities hold four rooms each; rooms 4 and 5 are two more the first keeps arriving
@@ -848,7 +874,7 @@ fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
 #[test]
 #[ignore = "sixteen joins that never finish, production Argon2id and a real anchor; CI runs it in release"]
 fn one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out() {
-    watchdog::arm();
+    let _one = one_at_a_time();
     label_reds();
     let tmp = tempfile::tempdir().unwrap();
     // Sixteen identities on 127.0.0.1 hold one slot each, of room 0, so by identity every hold
@@ -862,7 +888,7 @@ fn one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out() {
 #[test]
 #[ignore = "sixteen joins that never finish, production Argon2id and a real anchor; CI runs it in release"]
 fn a_relayed_flood_from_one_host_does_not_keep_a_relayed_joiner_from_another_out() {
-    watchdog::arm();
+    let _one = one_at_a_time();
     label_reds();
     let tmp = tempfile::tempdir().unwrap();
     // Sixteen stranger identities, every one of their joins relayed by the anchor from one host,
@@ -886,7 +912,7 @@ const ENDED_TELL_PATIENCE: Duration = Duration::from_secs(180);
 #[test]
 #[ignore = "sixteen slow joins, production Argon2id and a real anchor; CI runs it in release"]
 fn a_join_ended_for_another_is_told_the_member_is_busy() {
-    watchdog::arm();
+    let _one = one_at_a_time();
     label_reds();
     let tmp = tempfile::tempdir().unwrap();
     let s = stage(
@@ -1017,7 +1043,7 @@ const RETRY_PAUSE: Duration = Duration::from_secs(1);
 /// none of those holds is ended for her, and that the first is given back within [`ADMIT_BOUND`]
 /// of doing its work.
 fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
-    watchdog::arm();
+    let _one = one_at_a_time();
     label_reds();
     let tmp = tempfile::tempdir().unwrap();
     let s = stage(
