@@ -306,6 +306,14 @@ pub enum Error {
     #[error("tunnel reach withdrawn: {0}")]
     TunnelRevoked(&'static str),
 
+    /// A tunnel was refused because the connection to that member already carries
+    /// [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER) tunnels, each holding a
+    /// receive window this node agreed to buffer (V210-81). Said where the tunnel was asked
+    /// for; the host refuses one past it too, uniformly, as it refuses anything. Carries what
+    /// the person is told: how many are open, to which services, and how to free one.
+    #[error("{0}")]
+    TunnelLimit(String),
+
     /// A tunnel control message (service request, stream-setup handshake) or an
     /// SSH-CA certificate was structurally malformed on parse, exceeded a size
     /// bound, or carried an out-of-domain value (ADR-013). Carries a static reason.

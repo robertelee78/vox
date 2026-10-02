@@ -53,6 +53,9 @@ mod relay;
 #[path = "support/nat.rs"]
 mod nat;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
@@ -200,6 +203,7 @@ fn sym_request(proxy: SocketAddr, host: &str, port: u16, payload: &[u8]) -> Outc
 #[test]
 #[ignore = "production Argon2id + a real PoW, two userspace NATs and four real `vox` processes; run in release"]
 fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("CANNOT MEASURE (harness error): no temp dir: {e}"));

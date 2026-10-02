@@ -178,6 +178,11 @@ impl PeerPolicy {
     ///   (ADR-012: reads open, member-only writes refused there).
     #[must_use]
     pub fn allows(class: PeerClass, kind: StreamKind) -> bool {
+        // **Any peer may say it is stopping** (V210-93): it speaks only of the connection it
+        // arrives on, which the peer is about to close anyway.
+        if kind == StreamKind::Goodbye {
+            return true;
+        }
         match class {
             PeerClass::Member => true,
             PeerClass::Anchor => matches!(
@@ -349,6 +354,9 @@ pub const SILENCE_IS_DEATH: Duration = Duration::from_secs(KEEP_ALIVE.as_secs() 
 /// ack-eliciting.
 const PROBE_BYTE: u8 = 0;
 
+/// The least time between two probes [`ConnectionManager::close_if_unanswering`] counts.
+const PROBE_SPACING: Duration = Duration::from_millis(900);
+
 /// How often a probe checks whether anything came back.
 const PROBE_POLL: Duration = Duration::from_millis(10);
 
@@ -404,6 +412,9 @@ pub struct ConnectionManager {
     /// Not keyed by quinn's stable id, which a new connection can reuse from a freed one and
     /// so inherit its silence.
     heard: Mutex<HashMap<u64, (u64, Instant)>>,
+    /// Per connection (by serial) that [`Self::close_if_unanswering`] is probing: how many probes
+    /// have gone unanswered, and when the last was counted.
+    probing: Mutex<HashMap<u64, (u32, Instant)>>,
     retire_grace_secs: u64,
     clock: Clock,
     /// Where [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote)s go,
@@ -435,6 +446,7 @@ impl ConnectionManager {
             conns: Mutex::new(HashMap::new()),
             retiring: Mutex::new(Vec::new()),
             heard: Mutex::new(HashMap::new()),
+            probing: Mutex::new(HashMap::new()),
             retire_grace_secs: grace_secs,
             clock,
             notes: Mutex::new(None),
@@ -453,6 +465,71 @@ impl ConnectionManager {
     #[must_use]
     pub fn holds(&self, peer: &Digest32) -> bool {
         lock(&self.conns).get(peer).is_some_and(|c| is_live(c))
+    }
+
+    /// The live connection held for `peer`, **looking only**, like [`Self::holds`].
+    #[must_use]
+    pub fn held(&self, peer: &Digest32) -> Option<Arc<VoxConnection>> {
+        lock(&self.conns)
+            .get(peer)
+            .filter(|c| is_live(c))
+            .map(Arc::clone)
+    }
+
+    /// Keep asking whether the process behind `conn` is still there, and close `conn` once it has
+    /// not answered for `loss_after`; how long it was silent, if it was closed.
+    ///
+    /// **A process that stops without a close — SIGKILL, a crash, a pulled cable — must still be
+    /// noticed** (V210-93). Nothing arrives to say so, and the idle timeout (60 s) and even
+    /// [`SILENCE_IS_DEATH`] (30 s) are measured against a keep-alive every 20 s. So once `conn`
+    /// has heard nothing for `probe_after`, every call sends a probe, which a live peer ACKs
+    /// within a round trip; a peer that answers none of the probes sent across `loss_after` is
+    /// gone. A connection that cannot carry a probe is never judged by its silence, since a live
+    /// peer on it could be quiet for a whole keep-alive.
+    pub fn close_if_unanswering(
+        &self,
+        conn: &VoxConnection,
+        probe_after: Duration,
+        loss_after: Duration,
+        probes_needed: u32,
+    ) -> Option<Duration> {
+        if !is_live(conn) {
+            return None;
+        }
+        let silent = self.silent_for(conn);
+        if silent < probe_after {
+            lock(&self.probing).remove(&conn.serial());
+            return None;
+        }
+        if conn
+            .quinn()
+            .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
+            .is_err()
+        {
+            return None;
+        }
+        // **Silence counts only across probes sent while this node was running** (V210-93). A node
+        // that was itself stalled — a debug build's proof of work holds its runtime for a minute —
+        // read nothing in that time, and its first look afterwards saw a long silence that was its
+        // own. So a verdict also needs `probes_needed` probes, at most one a `PROBE_SPACING`, all
+        // unanswered: a live peer answers the first one sent after the stall within a round trip,
+        // and that resets the count.
+        let now = Instant::now();
+        let mut probing = lock(&self.probing);
+        let (sent, last) = probing
+            .entry(conn.serial())
+            .or_insert((0, now.checked_sub(PROBE_SPACING).unwrap_or(now)));
+        if now.saturating_duration_since(*last) >= PROBE_SPACING {
+            *sent += 1;
+            *last = now;
+        }
+        if *sent >= probes_needed && silent >= loss_after {
+            probing.remove(&conn.serial());
+            drop(probing);
+            conn.close(WireError::Unresponsive);
+            return Some(silent);
+        }
+        None
     }
 
     /// One [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote), if
@@ -641,6 +718,7 @@ impl ConnectionManager {
             .chain(retired.iter().map(|c| c.serial()))
             .collect();
         lock(&self.heard).retain(|id, _| present.contains(id));
+        lock(&self.probing).retain(|id, _| present.contains(id));
         changed
     }
 
@@ -878,6 +956,15 @@ impl ConnectionManager {
         for (dead, before) in unanswered {
             if is_live(&dead) && dead.quinn().stats().udp_rx.datagrams == before {
                 dead.close(WireError::Unresponsive);
+                self.note(
+                    dead.peer_id(),
+                    format!(
+                        "the connection {} did not answer a probe while a new one {} was filed, \
+                         and is closed",
+                        conn_tag(&dead),
+                        conn_tag(&conn)
+                    ),
+                );
             }
         }
         // **A newcomer from another process of the identity supersedes every connection to the
@@ -950,7 +1037,7 @@ impl ConnectionManager {
                 if newcomer_loses {
                     drop(map);
                     if !serve_loser {
-                        conn.close(WireError::AuthenticatorInvalid);
+                        conn.close(WireError::Superseded);
                         self.note(
                             peer,
                             format!(
@@ -1038,7 +1125,7 @@ impl ConnectionManager {
                 } else {
                     "the peer had closed it"
                 };
-                conn.close(WireError::AuthenticatorInvalid);
+                conn.close(WireError::Superseded);
                 self.note(
                     conn.peer_id(),
                     format!("a retired connection {} was closed: {why}", conn_tag(conn)),
@@ -1100,28 +1187,90 @@ impl ConnectionManager {
         let mut n = 0;
         for (conn, _) in lock(&self.retiring).iter() {
             if relayed(conn) {
-                conn.close(WireError::AuthenticatorInvalid);
+                conn.close(WireError::ShuttingDown);
                 n += 1;
             }
         }
         for conn in lock(&self.conns).values() {
             if relayed(conn) {
-                conn.close(WireError::AuthenticatorInvalid);
+                conn.close(WireError::ShuttingDown);
                 n += 1;
             }
         }
         n
     }
 
+    /// **Tell every peer this node is stopping, and wait — at most `patience` for each of two
+    /// rounds — until each has received it** (V210-93); how many confirmed it.
+    ///
+    /// Said before any connection is closed, while each still runs, because the close itself
+    /// cannot be relied on to arrive: it is one datagram, never sent again, and quinn does not
+    /// send it at all while congestion control or pacing holds back stream data still queued on
+    /// the connection (see [`StreamKind::Goodbye`]). An anchor stopped while it was still sending
+    /// to a node that had just reached it closed in silence that way, and the node reported its
+    /// clean stop as an anchor that answered nothing for 8 s. A [`StreamKind::Goodbye`] stream is
+    /// delivered like any data, and "received" is the peer's acknowledgement of it.
+    ///
+    /// **Relayed connections first, as with the closes** ([`Self::close_relayed`]): a peer that
+    /// hears the goodbye closes that connection, and a direct connection to a relay carries this
+    /// node's circuits. Told all at once, the relay closed the carrier as soon as it heard, and the
+    /// goodbye on every relayed connection behind it was never delivered: measured on `vox
+    /// connect`, the relayed connection to the host went unconfirmed for the whole `patience` on
+    /// every stop, while the anchor's confirmed in a quarter of a millisecond.
+    ///
+    /// Bounded, and spent only on a peer that does not answer: a stop is never held up for long
+    /// by a peer that is gone.
+    pub async fn say_goodbye(&self, patience: Duration) -> usize {
+        let live: Vec<Arc<VoxConnection>> = lock(&self.retiring)
+            .iter()
+            .map(|(c, _)| Arc::clone(c))
+            .chain(lock(&self.conns).values().cloned())
+            .filter(|c| is_live(c))
+            .collect();
+        let (relayed, direct): (Vec<_>, Vec<_>) = live
+            .into_iter()
+            .partition(|c| path_class(&self.endpoint, c) == PathClass::Relayed);
+        goodbye_to(relayed, patience).await + goodbye_to(direct, patience).await
+    }
+
     /// Close every connection (node shutdown).
     pub fn close_all(&self) {
         for (conn, _) in lock(&self.retiring).drain(..) {
-            conn.close(WireError::AuthenticatorInvalid);
+            conn.close(WireError::ShuttingDown);
         }
         for (_, conn) in lock(&self.conns).drain() {
-            conn.close(WireError::AuthenticatorInvalid);
+            conn.close(WireError::ShuttingDown);
         }
     }
+}
+
+/// Say goodbye on each of `conns` at once (see [`ConnectionManager::say_goodbye`]), and wait at
+/// most `patience` for the peers to confirm it; how many did.
+async fn goodbye_to(conns: Vec<Arc<VoxConnection>>, patience: Duration) -> usize {
+    if conns.is_empty() {
+        return 0;
+    }
+    let mut saying = tokio::task::JoinSet::new();
+    for conn in conns {
+        saying.spawn(async move {
+            let (mut send, _recv) =
+                crate::transport::streams::open_typed(&conn, StreamKind::Goodbye).await?;
+            let _ = send.finish();
+            // `None`: every byte of it acknowledged. A stream the peer stopped, or one on a
+            // connection that closed meanwhile, ends the wait too, uncounted.
+            Ok::<bool, Error>(matches!(send.stopped().await, Ok(None)))
+        });
+    }
+    let mut heard = 0;
+    let _ = tokio::time::timeout(patience, async {
+        while let Some(done) = saying.join_next().await {
+            if matches!(done, Ok(Ok(true))) {
+                heard += 1;
+            }
+        }
+    })
+    .await;
+    heard
 }
 
 /// Whether a connection is still usable.

@@ -666,6 +666,10 @@ pub enum Fault {
     /// A forward was to be stopped at a local address where no forward is listening. Not
     /// [`Fault::UnknownChannel`] either: no room was named at all (V210-83).
     NoSuchForward,
+    /// A tunnel was refused because the connection to that member already carries
+    /// [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER) tunnels (V210-81). Not
+    /// [`Fault::Unreachable`]: the member was reached, and closing a tunnel is the remedy.
+    TunnelLimit,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }
@@ -676,6 +680,8 @@ impl Fault {
     ///
     // `Fault::KeyringFull`'s explanation names the cap in words; this holds them together.
     const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
+    // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
+    const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
 
     /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
     /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,
@@ -764,6 +770,9 @@ impl Fault {
                 "that service is not offered in this room\n       check its name: it is the tag that was given to `vox service add`"
             }
             Fault::NoSuchForward => "no forward is listening at that local address",
+            Fault::TunnelLimit => {
+                "16 tunnels are already open to this member\n       to free one: close the program using it, or restart the `vox up` or `vox forward` carrying it; on the host, `vox service remove` the service, or `vox trust remove` the member\n       `vox status` lists every tunnel, and when each last moved"
+            }
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
             }
@@ -839,6 +848,7 @@ fault_names!(
     NotAServiceRoom,
     NotOffered,
     NoSuchForward,
+    TunnelLimit,
     Internal,
 );
 
@@ -1117,6 +1127,25 @@ pub enum NodeEvent {
         service_tag: String,
         /// The local address actually bound (a requested port 0 is resolved here).
         local: std::net::SocketAddr,
+    },
+    /// An address for a room was asked for and is **not** handed out (V210-96): it would name no
+    /// route of this node's own (none discovered within the wait) and no anchor it names held the
+    /// room, so it would lead nowhere. `reason` names each board and what kept the room off it; the
+    /// verb itself fails with [`Fault::BoardUnreachable`].
+    AddressWithheld {
+        /// The room.
+        channel_id: Digest32,
+        /// Board by board, why none holds the room.
+        reason: String,
+    },
+    /// What an address handed out for a room carries, in plain words (V210-96): the kinds of route
+    /// to this node it names, and any anchor it names that has not taken the room yet; then, for
+    /// each such anchor, whether it took it within the wait.
+    AddressNote {
+        /// The room.
+        channel_id: Digest32,
+        /// The note.
+        note: String,
     },
     /// An invite link for a channel (public: it carries no secret).
     InviteLink {
