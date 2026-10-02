@@ -329,9 +329,10 @@ async fn accept_udp(
 /// to a queue. It is informational for a live client, *not* an audit log — a durable,
 /// signed record of session establishment is ADR-013's own open item.
 ///
-/// `served` may still refuse the tunnel with an error, which the dialer sees as the same
-/// uniform denial: the host's one such refusal is a connection already carrying all the tunnels
-/// it may ([`Error::TunnelLimit`]). It may hand back where the splice is to mark the time it
+/// `served` may still refuse the tunnel with an error. The dialer sees the uniform denial for
+/// any refusal but one: the member already has all the tunnels it may with this host
+/// ([`Error::TunnelLimit`]), which it is told as `TunnelStatus::Full`, since it reveals nothing
+/// to a member the host already lets in. It may hand back where the splice is to mark the time it
 /// last moved a byte (`vox status`).
 ///
 /// `udp` lets it serve `udp/<port>` services (ADR-022 decision 6); `None` refuses them.
