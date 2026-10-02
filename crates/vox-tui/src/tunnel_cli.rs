@@ -656,11 +656,19 @@ pub async fn connect(
         passphrase: Secret::new(room_passphrase.as_bytes().to_vec()),
     });
     tokio::pin!(join);
+    // A join that waits — for a host to publish its room at its boards (V210-143) — says what it
+    // waits for, once, rather than sitting silent for up to half a minute.
+    let mut said_waiting = std::collections::HashSet::new();
     let out = loop {
         tokio::select! {
             out = &mut join => break out,
             item = steps.next() => match item {
-                Some(EventStreamItem::Event(NodeEvent::JoinStep { step })) => waiting.on(step),
+                Some(EventStreamItem::Event(NodeEvent::JoinStep { step })) => {
+                    if step.starts_with("waiting:") && said_waiting.insert(step.clone()) {
+                        eprintln!("vox: {step}");
+                    }
+                    waiting.on(step);
+                }
                 Some(_) => {}
                 None => break (&mut join).await,
             },

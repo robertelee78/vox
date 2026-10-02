@@ -261,6 +261,11 @@ const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
 /// the address names has to take the room before this node says it has not.
 const ADDRESS_PATIENCE: Duration = Node::BOARD_PATIENCE;
 
+/// How long a join waits before asking its boards again for a room none of them holds yet
+/// (V210-143): a host publishes its room within a second of starting, and retries a failed dial to
+/// its anchor after one.
+const ROOM_RETRY: Duration = Duration::from_secs(1);
+
 /// How long a join's board search keeps preferring the room's own anchors once some other route
 /// has answered: the connection-attempt delay RFC 8305 recommends, long enough for a route that
 /// is merely a moment slower to win, short enough that one that will never answer costs nothing a
@@ -1900,6 +1905,37 @@ fn test_hold_address(channel_id: &Digest32) -> bool {
     since.elapsed() < Duration::from_millis(ms)
 }
 
+/// **For proofs only.** When set, every publish round to an anchor fails, as a round whose stream
+/// will not open does, for this many milliseconds after this node first publishes a room — a host
+/// slow to reach its anchor (its first dial failed, the anchor is starting). Each held round is
+/// tried again on its own backoff, so the room reaches the anchor once the hold has passed.
+/// V210-143's proof uses it to have a guest arrive before the anchor holds the room. Nothing a
+/// person runs sets it; unset, nothing changes. Not compiled in without the `test-knobs` feature
+/// (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_ROOM_FROM_ANCHORS_ENV: &str = "VOX_TEST_HOLD_ROOM_FROM_ANCHORS_MS";
+
+/// Whether [`TEST_HOLD_ROOM_FROM_ANCHORS_ENV`] still keeps `channel_id` off this node's anchors:
+/// its time counts from the first call for that room.
+#[cfg(feature = "test-knobs")]
+fn test_hold_room_from_anchors(channel_id: &Digest32) -> bool {
+    static FIRST: std::sync::Mutex<BTreeMap<Digest32, std::time::Instant>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let Some(ms) = std::env::var(TEST_HOLD_ROOM_FROM_ANCHORS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let mut first = FIRST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let since = *first
+        .entry(*channel_id)
+        .or_insert_with(std::time::Instant::now);
+    since.elapsed() < Duration::from_millis(ms)
+}
+
 /// **For proofs only.** When set, each blocking task that holds a secret (`secret_blocking`)
 /// waits this many milliseconds, holding what it was given, before it starts its work: a stand-in
 /// for a slow Argon2id or a large room, so a proof can lock while one runs (V210-94). Nothing a
@@ -2525,7 +2561,21 @@ impl Joiner {
         }
     }
 
-    async fn run_steps(&self, steps: &mut JoinSteps) -> std::result::Result<JoinerWon, JoinerLost> {
+    /// One search for a board that holds the room: reach a board, read the room from it, and ask
+    /// the address's other boards if it has nothing (V210-96). The board found, what it holds, and
+    /// every board tried. See [`Self::run_steps`] for why a search that finds the room on no board
+    /// is repeated.
+    async fn a_board_with_the_room(
+        &self,
+        steps: &mut JoinSteps,
+    ) -> std::result::Result<
+        (
+            Arc<VoxConnection>,
+            crate::nat::service::RecordSet,
+            std::collections::BTreeSet<Digest32>,
+        ),
+        JoinerLost,
+    > {
         let parsed = &self.parsed;
         let net = Arc::clone(&self.net);
         let t = std::time::Instant::now();
@@ -2561,8 +2611,8 @@ impl Joiner {
         // holds its room. So they are asked too before the join gives up; see
         // `another_board_with_the_room`.
         let short = crate::node::network::short_id;
-        let mut tried: std::collections::BTreeSet<Digest32> = [board.peer_id()].into();
-        let (mut board, mut set) = match fetched {
+        let tried: std::collections::BTreeSet<Digest32> = [board.peer_id()].into();
+        let found = match fetched {
             Ok(set) if set.genesis.is_some() => (board, set),
             Ok(_) => {
                 let why = vec![format!(
@@ -2595,6 +2645,42 @@ impl Joiner {
                     .await?
             }
         };
+        Ok((found.0, found.1, tried))
+    }
+
+    async fn run_steps(&self, steps: &mut JoinSteps) -> std::result::Result<JoinerWon, JoinerLost> {
+        let parsed = &self.parsed;
+        let net = Arc::clone(&self.net);
+        // **A board with nothing for the room is not the last word while the join has patience
+        // left (V210-143).** A host publishes its room to its anchor moments after it starts, and
+        // a guest that asks first — or a host whose first dial to its anchor failed and is tried
+        // again a second later — found every board empty and was told "cannot join" in half a
+        // second. Through a relay that is the only path, the circuit to the host is refused too:
+        // an anchor carries circuits for a room's pending joiners, which it can only know once it
+        // holds the room, and it refuses anyone else uninformatively (`0x05`), as it must. So while
+        // every board the join reached says it has nothing for the room, the join asks again, for
+        // as long as a join waits for a board ([`Node::BOARD_PATIENCE`]), and says what it is
+        // waiting for. Any other answer ends the search as before.
+        let started = std::time::Instant::now();
+        let (mut board, mut set, mut tried) = loop {
+            match self.a_board_with_the_room(steps).await {
+                Ok(found) => break found,
+                Err(lost)
+                    if lost.fault == Fault::RoomNotOnBoard
+                        && started.elapsed() + ROOM_RETRY < Node::BOARD_PATIENCE =>
+                {
+                    self.begin(format!(
+                        "waiting: no board this address names holds room {} yet — its host has \
+                         not published it there; asking again (up to {}s)",
+                        crate::node::network::short_id(parsed.channel_id),
+                        Node::BOARD_PATIENCE.as_secs()
+                    ));
+                    tokio::time::sleep(ROOM_RETRY).await;
+                }
+                Err(lost) => return Err(lost),
+            }
+        };
+        let short = crate::node::network::short_id;
         let prejoin_wire = {
             let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
             let ring = self.ring.lock().await;
@@ -4343,6 +4429,8 @@ impl Node {
             return;
         }
         crate::node::status::SyncBook::note_publish_round(&self.sync_book, cause);
+        #[cfg(feature = "test-knobs")]
+        let held = test_hold_room_from_anchors(channel_id);
         let conn = Arc::clone(conn);
         let tx = self.net_tx.clone();
         let cid = *channel_id;
@@ -4350,6 +4438,16 @@ impl Node {
             let conn = &conn;
             let round = async {
                 let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
+                #[cfg(feature = "test-knobs")]
+                if held {
+                    outcomes.push((
+                        "this publish round",
+                        Some(format!(
+                            "held for a proof ({TEST_HOLD_ROOM_FROM_ANCHORS_ENV})"
+                        )),
+                    ));
+                    return (outcomes, true, false);
+                }
                 // **A stream that will not open is a failed round, and says so.** It used to return
                 // no outcomes at all — "the next round's business" — which reported nothing and, for
                 // a room nothing else triggers a publish for, left it off that board indefinitely.
