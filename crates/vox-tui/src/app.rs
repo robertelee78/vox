@@ -847,7 +847,7 @@ const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `vox daemon` waits for its node to stop on SIGTERM or Ctrl-C before leaving anyway.
 /// A clean stop takes milliseconds; this is for a node stuck waiting on a peer that vanished.
 /// It must stay longer than the node's own worst-case stop
-/// ([`vox_core::node::actor::STOP_WORST_CASE`], 4.45 s, which names each of its waits), so a stop
+/// ([`vox_core::node::actor::STOP_WORST_CASE`], 4.45 s, the sum of the stop's budget), so a stop
 /// that waits every one of them out still closes its connections before the daemon leaves.
 const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 const _: () = assert!(
