@@ -168,7 +168,7 @@ pub(crate) fn parse_forks(bytes: &[u8]) -> Result<Vec<(Entry, Entry)>> {
     }
     let n = d.array()?;
     // At most one proof per author: a frozen author's later entries are refused.
-    if n > MAX_AUTHORS {
+    if n > AUTHORS_CEILING {
         return Err(Error::SizeLimitExceeded("fork proofs"));
     }
     let mut out = Vec::with_capacity(n);
@@ -222,6 +222,18 @@ pub const MAX_RECEIVER_CHAINS: usize = 4096;
 /// Hard cap on admitted authors per channel, so a hostile or corrupt segment cannot
 /// force an unbounded allocation on open.
 pub const MAX_AUTHORS: usize = 1024;
+
+/// **How far past its cap a room can go** (V210-128): the join slots a member answers at once.
+/// Each member that answers a join checks the cap against its own view, so joins answered at the
+/// same moment by different members can each take the last place. Every member then admits what
+/// the others admitted, up to [`AUTHORS_CEILING`], so the room converges on one membership — a
+/// member told it joined is a member everywhere — rather than splitting into rooms that each
+/// refuse the others' newcomers. The cap is soft by at most this much.
+pub const JOIN_OVERSHOOT: usize = 16;
+
+/// The most authors a room ever holds: [`MAX_AUTHORS`] and the [`JOIN_OVERSHOOT`] concurrent joins
+/// can take it past. A member learned from a board past this is refused.
+pub const AUTHORS_CEILING: usize = MAX_AUTHORS + JOIN_OVERSHOOT;
 
 /// **Test-only**: a smaller room, so a proof fills one with a few members rather than 1,024. Its
 /// value is the most authors a room admits, from 1 to [`MAX_AUTHORS`]. Unset, empty, unparsable or
@@ -678,7 +690,7 @@ fn parse_positions(bytes: &[u8]) -> Result<BTreeMap<Digest32, (u64, u64)>> {
         return Err(Error::MalformedAtRest("positions version"));
     }
     let n = d.array()?;
-    if n > MAX_AUTHORS {
+    if n > AUTHORS_CEILING {
         return Err(Error::SizeLimitExceeded("positions rows"));
     }
     let mut out = BTreeMap::new();
@@ -728,7 +740,7 @@ fn parse_marks(bytes: &[u8]) -> Result<BTreeMap<Digest32, TrustMark>> {
         return Err(Error::MalformedAtRest("trust marks version"));
     }
     let n = d.array()?;
-    if n > MAX_AUTHORS {
+    if n > AUTHORS_CEILING {
         return Err(Error::SizeLimitExceeded("trust marks rows"));
     }
     let mut out = BTreeMap::new();
@@ -774,7 +786,7 @@ fn parse_delivered(bytes: &[u8]) -> Result<BTreeMap<Digest32, u64>> {
     }
     let n = d.array()?;
     // One row per author this identity could ever consent to.
-    if n > MAX_AUTHORS {
+    if n > AUTHORS_CEILING {
         return Err(Error::SizeLimitExceeded("delivery ledger rows"));
     }
     let mut out = BTreeMap::new();
@@ -841,7 +853,7 @@ pub(crate) fn parse_authors(bytes: &[u8]) -> Result<BTreeMap<Digest32, Composite
         return Err(Error::MalformedAtRest("channel authors version"));
     }
     let n = d.array()?;
-    if n > MAX_AUTHORS {
+    if n > AUTHORS_CEILING {
         return Err(Error::SizeLimitExceeded("channel authors"));
     }
     let mut out = BTreeMap::new();
@@ -1898,7 +1910,9 @@ impl ChannelState {
                 w.verify(&witness_key, &self.channel_id, self.epoch, &fingerprint)?;
             }
         }
-        self.admit_author(store, key, now_secs)
+        // Past the cap, up to the ceiling: another member admitted it, and was told by its own
+        // view that there was room. Refusing it here would split the room (V210-128).
+        self.admit_within(store, key, now_secs, max_authors() + JOIN_OVERSHOOT)
     }
 
     /// Admit `key` as a log author for this channel: its entries are accepted into
@@ -1921,11 +1935,26 @@ impl ChannelState {
     /// ADR-016 M17.6 evidence. This one is for keys whose right to be here this node
     /// established itself: the genesis creator, and a joiner whose proof it just
     /// verified.
+    ///
+    /// Refused past the room's cap ([`MAX_AUTHORS`]): this node is the one deciding whether there
+    /// is room. [`ChannelState::admit_from_board`] admits what another member decided, up to
+    /// [`AUTHORS_CEILING`].
     pub fn admit_author(
         &mut self,
         store: &Store,
         key: &CompositePublicKey,
         now_secs: u64,
+    ) -> Result<bool> {
+        self.admit_within(store, key, now_secs, max_authors())
+    }
+
+    /// [`ChannelState::admit_author`], refused at `limit` authors.
+    fn admit_within(
+        &mut self,
+        store: &Store,
+        key: &CompositePublicKey,
+        now_secs: u64,
+        limit: usize,
     ) -> Result<bool> {
         let fingerprint = key.fingerprint();
         if let Some(existing) = self.authors.get(&fingerprint) {
@@ -1938,9 +1967,10 @@ impl ChannelState {
                 "another key is already admitted for this fingerprint",
             ));
         }
-        if self.authors.len() >= max_authors() {
+        if self.authors.len() >= limit {
             return Err(Error::RoomFull {
                 members: self.authors.len() as u64,
+                cap: max_authors() as u64,
             });
         }
         self.authors.insert(fingerprint, key.clone());
@@ -2587,7 +2617,7 @@ impl ChannelState {
     /// write here always has.
     ///
     /// # Errors
-    /// The room holds [`MAX_AUTHORS`] marks already, or the marks cannot be sealed.
+    /// The room holds [`AUTHORS_CEILING`] marks already, or the marks cannot be sealed.
     pub fn mark_trust_sealed(
         &mut self,
         target: Digest32,
@@ -2600,7 +2630,7 @@ impl ChannelState {
         {
             return Ok(None);
         }
-        if !self.trust_marks.contains_key(&target) && self.trust_marks.len() >= MAX_AUTHORS {
+        if !self.trust_marks.contains_key(&target) && self.trust_marks.len() >= AUTHORS_CEILING {
             return Err(Error::SizeLimitExceeded("trust marks"));
         }
         let position = (
