@@ -21,7 +21,9 @@
 //! invite, a join, a trust, the warm-up), or a sample that never arrives, is the product failing:
 //! PRODUCT (staging). The anchor's circuit count (`support/relay.rs`) says CANNOT MEASURE when
 //! the split did not make the pair relayed, and PRODUCT when the control was not direct. The
-//! test's own files, processes, pipes, runtime and its reader on bob's socket are APPARATUS.
+//! reader on bob's control socket being refused, or its room list answered with anything but the
+//! list, is PRODUCT (staging) too. The test's own files, processes, pipes and runtime are
+//! APPARATUS.
 //!
 //! ## Mutation knobs (test-side only)
 //!
@@ -275,14 +277,21 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     .expect("APPARATUS: bob's profile paths");
     let mut reader = rt
         .block_on(IpcClient::open(&bob_paths.socket_file()))
-        .expect("APPARATUS: the reader could not attach to bob's node");
+        .unwrap_or_else(|e| {
+            panic!("PRODUCT (staging): bob's node refused the reader on its control socket: {e}")
+        });
     let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms
             .iter()
             .map(|(id, _, _)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(&room))
             .expect("PRODUCT (staging): the room is not open on bob's node"),
-        other => panic!("APPARATUS: the reader's room list on bob's node: {other:?}"),
+        // The node's own answer when it is not a room list (an error reply, say), and a list
+        // whose paging the client could not follow: both are what bob's node said.
+        Ok(frame) => panic!("PRODUCT (staging): bob's node answered the room list with {frame:?}"),
+        Err(e) => {
+            panic!("PRODUCT (staging): bob's node sent a room list the client could not read: {e}")
+        }
     };
     let readable = |reader: &mut IpcClient, text: &str| -> bool {
         match rt.block_on(reader.read_rows(channel_id, None)) {
