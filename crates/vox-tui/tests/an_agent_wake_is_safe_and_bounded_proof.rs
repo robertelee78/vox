@@ -788,7 +788,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     assert!(o.ok, "CANNOT MEASURE: s-claim must win `brief`: {o:?}");
     std::thread::sleep(Duration::from_secs(4));
     let told = drain(bob, r, "s-claim");
-    let reported = told.contains("You no longer hold `brief`") && told.contains("lapsed");
+    let reported = told.contains("Your room claim on `brief` lapsed");
     println!("[proof] (4) a claim made and lapsed between drains reported: {reported}");
     check(
         &mut failures,

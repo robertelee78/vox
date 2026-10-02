@@ -555,9 +555,11 @@ enum RoomCmd {
     Roster(RoomRefArgs),
     /// List the rooms this node holds.
     List(ProfileArgs),
-    /// Take a unit of work, so no other agent starts it (ADR-020 §5).
+    /// Say in the room that you are taking a unit of work: room courtesy that records nothing.
     ///
-    /// A claim is a **message, not a lock**: nothing is reserved in the node.
+    /// **The work item's GitHub issue decides who holds a task** (its open attempt, recorded
+    /// through awa); a room claim lets the room see who said they are on what, and nothing
+    /// more (V210-131). A claim is a **message, not a lock**: nothing is reserved in the node.
     /// Ownership is whatever the room's log resolves to, so every member computes
     /// the same answer with nobody coordinating. `--ttl` is what makes an agent
     /// that dies holding work release it without anyone noticing it died.
@@ -567,18 +569,20 @@ enum RoomCmd {
     /// Every participant must run this exact vox version, or the claim is refused
     /// with exit status 3. A claim also completes a handoff pending for this session.
     Claim(ClaimArgs),
-    /// Give a unit of work up. Only the exact holding session's release counts, and
-    /// releasing means neither done nor failed.
+    /// Say in the room that you stopped working on something: releases your room claim,
+    /// which records nothing (the issue does). Only the exact holding session's release
+    /// counts, and releasing means neither done nor failed.
     Release(ResourceArgs),
-    /// Relinquish a unit of work and reserve it for another harness, named by
-    /// fingerprint; it completes when an eligible session of it claims it.
+    /// Offer your room claim to another harness, named by fingerprint; it completes when an
+    /// eligible session of it claims it. The task itself moves only on its issue.
     Handoff(HandoffArgs),
-    /// Refuse a handoff pending for this session. The work is freed, not returned.
+    /// Refuse a room handoff pending for this session. The room claim is freed, not returned.
     Decline(ResourceArgs),
-    /// Extend this session's current holding by its original `--ttl`.
+    /// Extend this session's current room claim by its original `--ttl`.
     Renew(ResourceArgs),
-    /// Show what is held or pending, by whom, until when — and whether coordination
-    /// is refused because a participant runs another vox version.
+    /// Show the room's claims — who said they are on what, until when — and whether
+    /// coordination is refused because a participant runs another vox version. A hint:
+    /// the work item's GitHub issue decides who holds a task.
     Board(RoomBoardArgs),
     /// Offer a file to the room and announce it (ADR-020 §11).
     ///
@@ -732,8 +736,8 @@ pub struct ClaimArgs {
     /// What is being claimed — a file, a milestone, a crate, whatever the room
     /// has agreed to name. Optional with `--work`, which is then the resource.
     pub resource: Option<String>,
-    /// The tracker's reference for the work item, `<scheme>:<id>` (the id may
-    /// contain `:`), carried in `data.work` and used as the resource (ADR-021 §2).
+    /// The work item's awa key as `gwa:OWNER/REPO:SOURCE:ITEM` (any `<scheme>:<id>`; the id
+    /// may contain `:`), carried in `data.work` and used as the resource (ADR-021 §2).
     #[arg(long)]
     pub work: Option<String>,
     /// Seconds after which the claim lapses on its own unless renewed.
@@ -945,18 +949,19 @@ pub struct RoomPostArgs {
     pub room: String,
     /// The message. Omit it, or pass `-`, to read from stdin.
     pub text: Option<String>,
-    /// The envelope type (`assign`, `working`, `blocked`, `result`, `failed`,
-    /// `status`, …). Any structured flag makes vox build the envelope itself.
+    /// The envelope type (`ask`, `answer`, `working`, `blocked`, `result`, `status`, …): a
+    /// heads-up to the room, never a work record — that is the GitHub issue. Any
+    /// structured flag makes vox build the envelope itself.
     #[arg(long = "type")]
     pub kind: Option<String>,
-    /// The tracker's work-item reference, `<scheme>:<id>` (the id may contain `:`),
-    /// carried in `data.work`. A post with `--work` takes part in work coordination
+    /// The work item's awa key as `gwa:OWNER/REPO:SOURCE:ITEM` (any `<scheme>:<id>`; the id
+    /// may contain `:`), carried in `data.work`. A post with `--work` takes part in work coordination
     /// and passes the version gate.
     #[arg(long)]
     pub work: Option<String>,
-    /// The attempt id, carried in `data.attempt`. Defaults, with `--work`, to an id
-    /// seeded from this session's claim (or its latest `failed`) on that item. An id
-    /// starts nothing: an attempt becomes active on `--type working`.
+    /// A label carried in `data.attempt`. Defaults, with `--work`, to an id seeded from
+    /// this session's room claim (or its latest `failed`) on that item. It is the room's
+    /// label and starts nothing: the attempt is awa's attempt-started on the issue.
     #[arg(long)]
     pub attempt: Option<String>,
     /// Address a session by petname; repeat for several.
