@@ -1360,6 +1360,23 @@ async fn read_request_head(sock: &mut tokio::net::TcpStream, within: std::time::
     }
 }
 
+/// How long [`drain_after_answer`] goes on discarding what a client still sends.
+const DRAIN_AFTER_ANSWER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// After the answer and its FIN: read and discard what the client still sends, until it closes
+/// its end or `within` passes (V030-23). Closing with unread input makes the OS reset the
+/// connection, and on macOS that reset can overtake the answer, so a client whose head was cut
+/// off at [`REQUEST_HEAD_MAX`] or never ended lost a response it had already been sent.
+async fn drain_after_answer(sock: &mut tokio::net::TcpStream, within: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut chunk = [0u8; 2048];
+    while let Ok(Ok(n)) = tokio::time::timeout_at(deadline, sock.read(&mut chunk)).await {
+        if n == 0 {
+            return;
+        }
+    }
+}
+
 /// Serve Prometheus text on every connection to `listener`, until it is dropped.
 pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle) {
     while let Ok((mut sock, _)) = listener.accept().await {
@@ -1381,7 +1398,10 @@ pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle
             );
             let _ = sock.write_all(head.as_bytes()).await;
             let _ = sock.write_all(body.as_bytes()).await;
+            // Half-closed, so the answer is followed by a FIN, then drained, so whatever of the
+            // request was never read cannot turn the close into a reset (V030-23).
             let _ = sock.shutdown().await;
+            drain_after_answer(&mut sock, DRAIN_AFTER_ANSWER).await;
         });
     }
 }
