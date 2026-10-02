@@ -429,7 +429,14 @@ fn a_refusal_tells_the_refused_side_nothing_new() {
         let mut s = TcpStream::connect(at)
             .unwrap_or_else(|e| panic!("PRODUCT: the forward at {at} refused a connection: {e}"));
         let (got, ending) = read_to_end_within(&mut s, first_reach());
-        let said = refusal_line(&mut fwd, &format!("the {label} forward"))
+        // Whatever it says on its terminal about this connection, compared below; not only the
+        // words this candidate says, or a different answer would stop the run before the
+        // comparison could name it.
+        let said = fwd
+            .line_within(Duration::from_secs(10), |l| {
+                l.starts_with("! ") && l.contains("tunnel refused or cut")
+            })
+            .unwrap_or_else(|| "(nothing within 10 s)".to_owned())
             .replace(&port.to_string(), "<port>");
         eprintln!(
             "[test] {label} port {port}: the application saw {ending:?}, {} bytes; the forward \
