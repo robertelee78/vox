@@ -24,6 +24,52 @@ pub const DEFAULT_HOPS: u32 = 8;
 /// Longest petname accepted in [`Envelope::to`], matching the keyring's bound.
 pub const MAX_NAME: usize = 64;
 
+/// Longest resource name a claim may carry: a work reference's scheme, `:` and
+/// [`MAX_WORK_ID`], with room to spare.
+pub const MAX_RESOURCE: usize = 160;
+
+/// How many bytes of an author-chosen name [`shown`] prints.
+pub const SHOWN_NAME: usize = 64;
+
+/// Whether `c` breaks a line for somebody reading: every control character (which
+/// includes `\n`, `\r`, VT, FF and NEL) and the Unicode line and paragraph separators.
+#[must_use]
+pub fn breaks_lines(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// Whether `s` may name a session, an addressee or a resource: non-empty, at most `max`
+/// bytes, and **on one line** — no control character, no line or paragraph separator
+/// (V210-123).
+///
+/// These names are chosen by whoever posts, and they are printed into other agents'
+/// contexts: in the drain's notices, `vox room board` and a claim's answer. A newline in
+/// one would start a line of its own there, outside Vox's framing, where a model reads it
+/// as anyone's words — the operator's included.
+#[must_use]
+pub fn is_valid_name(s: &str, max: usize) -> bool {
+    !s.is_empty() && s.len() <= max && !s.chars().any(breaks_lines)
+}
+
+/// An author-chosen name as it may be printed where a person or a model reads it: on one
+/// line, every character that could break it replaced with U+FFFD, and cut to `max` bytes
+/// with `…` (V210-123). [`is_valid_name`] refuses such a name on the way in; this is the
+/// second guard, for every printer, so a name that got in some other way still cannot
+/// start a line.
+#[must_use]
+pub fn shown(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max) + 3);
+    for c in s.chars() {
+        let c = if breaks_lines(c) { '\u{fffd}' } else { c };
+        if out.len() + c.len_utf8() > max {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The data key naming the work item a message is about (ADR-021 §2). Its **shape** is
 /// checked ([`is_valid_work`]); its meaning never is — carried, compared byte for byte
 /// and filtered by, never interpreted, never looked up in any tracker.
@@ -273,8 +319,17 @@ impl Envelope {
         if self.kind.len() > MAX_NAME {
             return Err(ParseError::Malformed("type too long"));
         }
-        if self.to.iter().any(|n| n.is_empty() || n.len() > MAX_NAME) {
-            return Err(ParseError::Malformed("addressee name length"));
+        if self.to.iter().any(|n| !is_valid_name(n, MAX_NAME)) {
+            return Err(ParseError::Malformed(
+                "an addressee name is empty, too long, or not on one line",
+            ));
+        }
+        // `from` names the posting session, and is printed into other agents' contexts
+        // (V210-123). Empty is a message from no session (a person typing), not an error.
+        if !self.from.is_empty() && !is_valid_name(&self.from, MAX_NAME) {
+            return Err(ParseError::Malformed(
+                "`from` is too long or not on one line",
+            ));
         }
         Ok(())
     }
