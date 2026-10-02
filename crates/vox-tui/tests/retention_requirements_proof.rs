@@ -216,27 +216,25 @@ fn status(dir: &Path) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` did not parse ({e}): {out}"))
 }
 
-/// The effective retention `vox status` reports for the room, seconds (`0` forever).
-fn retention(dir: &Path) -> Option<u64> {
-    status(dir)["rooms"][0]["retention"].as_u64()
+/// The room's effective retention as `vox status --json` reports it, seconds (`0` forever), or
+/// `None` while the node lists no room yet (one still opening). A room that is listed must name
+/// its retention, also while a sync session holds it (#58): a `null` there is PRODUCT, at once.
+fn retention(dir: &Path, who: &str) -> Option<u64> {
+    let st = status(dir);
+    let room = st["rooms"].get(0)?;
+    Some(room["retention"].as_u64().unwrap_or_else(|| {
+        panic!("PRODUCT: {who}'s `vox status --json` lists the room with no retention: {room}")
+    }))
 }
 
-/// The room's effective retention on `dir` once `vox status` can say: it reports `null` while a
-/// sync session holds the room (`RoomStatus::retention`), which is not an answer, so a single
-/// read can land on it. A room that is never readable in 30 s is PRODUCT (staging).
-fn settled_retention(dir: &Path, who: &str) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(r) = retention(dir) {
-            return r;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "PRODUCT (staging): {who}'s `vox status --json` never reported the room's retention \
-             within 30 s (null while a session holds the room)"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+/// The room's effective retention on `dir` now. The room must be listed: it was joined or made.
+fn retention_now(dir: &Path, who: &str) -> u64 {
+    retention(dir, who).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT (staging): {who}'s `vox status --json` lists no room: {}",
+            status(dir)
+        )
+    })
 }
 
 /// Poll until the room's effective retention on `dir` is `want`, and return how long it took.
@@ -246,7 +244,7 @@ fn until_retention(dir: &Path, side: &str, who: &str, want: u64, secs: u64) -> D
     let started = Instant::now();
     let mut last = None;
     while started.elapsed() < Duration::from_secs(secs) {
-        last = retention(dir);
+        last = retention(dir, who);
         if last == Some(want) {
             return started.elapsed();
         }
@@ -256,17 +254,24 @@ fn until_retention(dir: &Path, side: &str, who: &str, want: u64, secs: u64) -> D
 }
 
 /// What `dir`'s node reports it caught in the room: the authors it froze for a fork, and how
-/// many entries it refused as at or below their author's checkpoint. Polled past the moments a
-/// session holds the room (reported as `null` then) until `done` holds, or `secs` pass.
+/// many entries it refused as at or below their author's checkpoint. Polled until `done` holds,
+/// or `secs` pass. A listed room must name both, also while a session holds it (#58): a `null`
+/// is PRODUCT, at once.
 fn fork_watch(dir: &Path, secs: u64, done: impl Fn(&[String], u64) -> bool) -> (Vec<String>, u64) {
     let started = Instant::now();
     let mut last = None;
     while started.elapsed() < Duration::from_secs(secs) {
-        let room = &status(dir)["rooms"][0];
-        if let (Some(frozen), Some(refused)) = (
-            room["frozen"].as_array(),
-            room["refused_below_checkpoint"].as_u64(),
-        ) {
+        let st = status(dir);
+        if let Some(room) = st["rooms"].get(0) {
+            let (Some(frozen), Some(refused)) = (
+                room["frozen"].as_array(),
+                room["refused_below_checkpoint"].as_u64(),
+            ) else {
+                panic!(
+                    "PRODUCT: `vox status --json` lists the room without its frozen members or \
+                     its refusals below a checkpoint: {room}"
+                );
+            };
             let frozen: Vec<String> = frozen
                 .iter()
                 .filter_map(|f| f.as_str().map(str::to_owned))
@@ -278,7 +283,7 @@ fn fork_watch(dir: &Path, secs: u64, done: impl Fn(&[String], u64) -> bool) -> (
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    last.expect("PRODUCT (staging): the room was never readable in `vox status`")
+    last.expect("PRODUCT (staging): the room was never listed in `vox status`")
 }
 
 /// `creator` makes a room; returns its short id as `vox room list` prints it.
@@ -351,10 +356,7 @@ fn r6_a_room_with_no_retention_keeps_every_message_however_old() {
     trust(&alice, &bob_fp, "bob");
     trust(&bob, &alice_fp, "alice");
     // Nobody set a retention: the room's must be forever on both members.
-    let (ra, rb) = (
-        settled_retention(&alice, "alice"),
-        settled_retention(&bob, "bob"),
-    );
+    let (ra, rb) = (retention_now(&alice, "alice"), retention_now(&bob, "bob"));
     println!("R6: retention nobody set — alice {ra:?}, bob {rb:?} (0 = forever)");
     assert_eq!(
         (ra, rb),
@@ -471,7 +473,7 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
     std::thread::sleep(Duration::from_secs(3));
     for (dir, who) in members {
         assert_eq!(
-            settled_retention(dir, who),
+            retention_now(dir, who),
             604_800,
             "PRODUCT: {who}: a refused change must change nothing"
         );

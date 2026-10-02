@@ -257,6 +257,17 @@ pub struct ChannelDetail {
     /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
     /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
     pub consented: Vec<Digest32>,
+    /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
+    /// and the node's own (ADR-023 decision 2). What `vox status` reports. Carried in the view
+    /// so a reader never has to take the room's lock, which a sync session holds while it runs.
+    pub retention: u64,
+    /// How many generations of this node's own sender key it still holds here (PRD-001 R14).
+    pub key_generations: usize,
+    /// Authors this node froze here for signing two entries at one position (ADR-008).
+    pub frozen: Vec<Digest32>,
+    /// Entries this node refused here as at or below their author's checkpoint since it opened
+    /// the room (ADR-023 decision 3).
+    pub refused_below_checkpoint: u64,
 }
 
 /// The node's latest-wins view (published over a `watch`).
