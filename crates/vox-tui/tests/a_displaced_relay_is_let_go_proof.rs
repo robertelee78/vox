@@ -31,10 +31,11 @@
 //! a live tunnel stays up past the grace — is RP-26's, held below by
 //! `a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace` on the same staging.
 
-// Two tests. The let-go test is optional (decider, 2026-10-01: a 60 s grace watched): it blocks
+// Three tests. The let-go test is optional (decider, 2026-10-01: a 60 s grace watched): it blocks
 // nothing and CI only compiles it; without `--features optional-proofs` a stand-in takes its place
 // and says it was not run (`support/optional_proof.rs`; docs/release/optional-proofs.md). RP-26's
-// `a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace` blocks.
+// `a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace` and #272's
+// `the_tunnel_cap_holds_across_a_path_upgrade` block.
 #![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
 
