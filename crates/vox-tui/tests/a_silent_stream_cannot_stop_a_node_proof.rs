@@ -168,6 +168,34 @@ impl std::ops::Deref for Rt {
     }
 }
 
+impl Rt {
+    /// The runtime, with a panic hook that says once, as the apparatus's, what a worker of it
+    /// panics when it is shut down under a task still holding a timer ("A Tokio 1.x context was
+    /// found, but it is being shutdown"): the attacker's own runtime going away after the
+    /// verdict, never a second red. Installed here, not on drop: a hook cannot be set from a
+    /// thread that is unwinding a red.
+    fn new(rt: tokio::runtime::Runtime) -> Self {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            if msg.contains("it is being shutdown") {
+                eprintln!(
+                    "[apparatus] the attacker's runtime shut down under one of its tasks, after \
+                     the verdict: {msg}"
+                );
+            } else {
+                previous(info);
+            }
+        }));
+        Self(Some(rt))
+    }
+}
+
 impl Drop for Rt {
     fn drop(&mut self) {
         if let Some(rt) = self.0.take() {
@@ -333,13 +361,13 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
     // Mallory's node goes; her identity stays, in the profile the binary wrote.
     stop(mallory);
 
-    let rt = Rt(Some(
+    let rt = Rt::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
             .build()
             .expect("APPARATUS: the attacker's runtime"),
-    ));
+    );
     let _enter = rt.enter();
     let mallory_paths = Paths::resolve(
         "default",

@@ -454,8 +454,14 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     if !alive {
         let said = std::fs::read_to_string(anchor_dir.join("anchor-again.err")).unwrap_or_default();
         // Its port is handed back to it; another process taking it meanwhile is this machine's.
+        // `vox node` says that as `cannot listen on <addr>: Address already in use (os error N)`
+        // (vox-core's `Error::Listen`), or as `cannot listen on <addr>: something else already
+        // holds that UDP port`.
+        let port_taken = said.contains("cannot listen on")
+            && (said.contains("Address already in use")
+                || said.contains("something else already holds that UDP port"));
         assert!(
-            !said.contains("in use"),
+            !port_taken,
             "CANNOT MEASURE: the restarted anchor's port was taken meanwhile, so bob had nothing to \
              reach: {said:?}"
         );
