@@ -317,6 +317,12 @@ pub async fn post_cmd(
         if body.trim().is_empty() {
             return Err(AppError::Usage("refusing to post an empty message".into()));
         }
+        // An envelope every reader would refuse is refused here, before it is posted
+        // (V210-123): a type or name not on one line would otherwise sit in the log unread.
+        if let Err(e @ vox_agentcomms::envelope::ParseError::Malformed(_)) = Envelope::parse(&body)
+        {
+            return Err(AppError::Usage(format!("refusing to post it: {e}")));
+        }
         if let Ok(env) = Envelope::parse(&body) {
             if claim::is_claim_protocol(&env) {
                 return Err(AppError::Usage(format!(
@@ -330,6 +336,14 @@ pub async fn post_cmd(
     }
 
     let kind = opts.kind.clone().unwrap_or_else(|| "say".into());
+    if !vox_agentcomms::envelope::is_valid_name(&kind, vox_agentcomms::envelope::MAX_NAME) {
+        return Err(AppError::Usage(format!(
+            "--type {} is refused: a type must be at most {} bytes on one line, with no control \
+             characters, line separators or bidi controls, because other agents' rooms print it",
+            vox_agentcomms::envelope::shown(&kind, vox_agentcomms::envelope::SHOWN_NAME),
+            vox_agentcomms::envelope::MAX_NAME
+        )));
+    }
     let mut data = match &opts.data {
         None => serde_json::Map::new(),
         Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
@@ -518,19 +532,17 @@ fn unread_addressed(
             let env = Envelope::parse(&r.text).ok()?;
             let own = r.author == snap.me && env.from == session;
             (!own && names.iter().any(|n| env.is_addressed_to(n))).then(|| {
-                let body: String = env
-                    .body
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(160)
-                    .collect();
+                // Every field is the author's, and this lands on the reporting agent's stderr: each
+                // is shown on one line and cut (V210-123). The body's first line ends at any
+                // character a reader breaks a line at, not only `\n`.
+                use vox_agentcomms::envelope::{breaks_lines, shown, SHOWN_NAME};
+                let first = env.body.trim_start();
+                let first = first.split(breaks_lines).next().unwrap_or("");
                 (
                     claim::b32(&r.entry_hash),
-                    env.from.clone(),
-                    env.kind.clone(),
-                    body,
+                    shown(&env.from, SHOWN_NAME),
+                    shown(&env.kind, SHOWN_NAME),
+                    shown(first, 160),
                 )
             })
         })

@@ -31,12 +31,34 @@ pub const MAX_RESOURCE: usize = 160;
 /// How many bytes of an author-chosen name [`shown`] prints.
 pub const SHOWN_NAME: usize = 64;
 
-/// Whether `c` breaks a line for somebody reading: every control character (which
-/// includes `\n`, `\r`, VT, FF and NEL) and the Unicode line and paragraph separators.
+/// Whether `c` may not appear in a name printed for somebody reading (V210-123): every control
+/// character (which includes `\n`, `\r`, VT, FF, NEL, ESC and NUL), the Unicode line and
+/// paragraph separators, and the bidirectional controls — embeddings and overrides
+/// (U+202A–U+202E), isolates (U+2066–U+2069) and the directional marks (U+200E, U+200F).
+///
+/// The bidi controls start no line, but in a terminal or an editor they reorder how the rest of
+/// one displays, so a name could make a board row read as something it does not say.
 #[must_use]
 pub fn breaks_lines(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200E}'
+                | '\u{200F}'
+        )
 }
+
+/// One character of each kind [`breaks_lines`] refuses, for a proof to forge a name through
+/// each (as `agent_hook::LINE_BREAKS` is for message rows): a sanitiser that stops refusing any
+/// one of them turns that proof red.
+pub const NAME_BREAKERS: &[char] = &[
+    '\n', '\r', '\u{0b}', '\u{0c}', '\u{85}', '\u{1b}', '\0', '\u{2028}', '\u{2029}', '\u{202E}',
+    '\u{202A}', '\u{2066}', '\u{2069}', '\u{200F}',
+];
 
 /// Whether `s` may name a session, an addressee or a resource: non-empty, at most `max`
 /// bytes, and **on one line** — no control character, no line or paragraph separator
@@ -313,11 +335,11 @@ impl Envelope {
 
     /// Check the fields this crate is entitled to police.
     fn validate(&self) -> Result<(), ParseError> {
-        if self.kind.is_empty() {
-            return Err(ParseError::Malformed("empty type"));
-        }
-        if self.kind.len() > MAX_NAME {
-            return Err(ParseError::Malformed("type too long"));
+        // The type is printed into other agents' contexts too (V210-123): a name, like `from`.
+        if !is_valid_name(&self.kind, MAX_NAME) {
+            return Err(ParseError::Malformed(
+                "the type is empty, too long, or not on one line",
+            ));
         }
         if self.to.iter().any(|n| !is_valid_name(n, MAX_NAME)) {
             return Err(ParseError::Malformed(
