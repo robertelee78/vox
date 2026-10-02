@@ -26,6 +26,10 @@
 //! retired connection as still carried (the old defect's effect). The circuit stays at the anchor
 //! and the count never reaches 0.
 //!
+//! **Both ends keep the same one of the two** (V29-15, #50: "a duplicate is resolved identically
+//! at both ends regardless of path classification") is held by the blocking RP-26 test below,
+//! on the same upgrade: see [`both_ends_keep_the_same_connection`].
+//!
 //! Replaces `crates/vox-core/tests/displaced_relay_is_let_go.rs` (property 1), which ran every node
 //! in process on a NAT simulator with an injected clock. Its property 2 — a displaced path carrying
 //! a live tunnel stays up past the grace — is RP-26's, held below by
@@ -61,6 +65,7 @@ mod port_forward;
 use std::time::{Duration, Instant};
 
 use port_forward::{echo_over, interrupt, ForwardedWorld};
+
 use world::socks5_connect;
 
 /// From the direct path taking over to the anchor carrying no circuit: the 60 s grace and 15 s of
@@ -71,96 +76,192 @@ const LET_GO_WITHIN: Duration = Duration::from_secs(75);
 const UPGRADE_WITHIN: Duration = Duration::from_secs(100);
 const PAYLOAD: usize = 16 * 1024;
 
-#[cfg(feature = "optional-proofs")]
-#[test]
-#[ignore = "production Argon2id + a real PoW, a relayed pair upgraded and a 60 s grace watched; run in release"]
-fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {
-    watchdog::arm();
-    let mut w = ForwardedWorld::new(false);
-    eprintln!(
-        "[proof] guest joined through the relay in {:?}; forward {} (closed) for the host at {}",
-        w.joined_in, w.forward.public, w.forward.host
-    );
-    let hostname = w.hostname();
-    let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
-    let (mut up, proxy, _) = w.up("up");
+/// How long both ends may take, once a request rode the direct path or one end decided, to have
+/// decided between the same two connections: both file one handshake, so this is scheduling.
+const BOTH_DECIDED_WITHIN: Duration = Duration::from_secs(20);
 
-    let request = |w: &ForwardedWorld| -> Option<bool> {
-        let (code, mut s) = socks5_connect(proxy, &hostname, w.service_port);
-        if code != 0 {
-            return None;
-        }
-        let sent = w.forward.to_host();
-        echo_over(&mut s, &payload, Duration::from_secs(10))
-            .then(|| w.forward.to_host() - sent >= PAYLOAD as u64)
+/// Every connection note `p` printed about `peer` (named by the first 26 characters of its
+/// fingerprint, as `vox` names a peer), in order: what a red quotes, so it can be read alone.
+fn notes_about(p: &world::VoxProc, peer: &str) -> Vec<String> {
+    let about = format!("connection to {} — ", &peer[..26]);
+    p.timed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, l)| l.contains(&about))
+        .map(|(_, l)| l.clone())
+        .collect()
+}
+
+/// Every connection note `p` printed about `peer`, each with its time since `t0` in seconds: so a
+/// reader can tell dials that raced from a connection replaced again and again.
+fn timed_notes_about(p: &world::VoxProc, peer: &str, t0: Instant) -> Vec<String> {
+    let about = format!("connection to {} — ", &peer[..26]);
+    p.timed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, l)| l.contains(&about))
+        .map(|(at, l)| {
+            let secs = match at.checked_duration_since(t0) {
+                Some(d) => d.as_secs_f64(),
+                None => -t0.duration_since(*at).as_secs_f64(),
+            };
+            format!("[{secs:+.3}s] {l}")
+        })
+        .collect()
+}
+
+/// One decision an end said it made between two live connections to the same peer.
+#[derive(Clone, Debug)]
+struct Decision {
+    /// The two connections' tags, in sorted order: the same pair at both ends.
+    pair: (String, String),
+    /// The one kept.
+    kept: String,
+    /// The line that said so.
+    line: String,
+}
+
+/// Every decision `p` said it made between two connections to `peer`, in order.
+///
+/// Read from the lines the product prints when a second connection to one peer is filed: the
+/// newcomer `displaced` the held one or `replaced` a dead one (the newcomer is kept); it `lost the
+/// tie-break to the one held` (the held one is kept); or the held one `did not answer a probe in
+/// time when a new one … arrived; retired` (V210-104: the newcomer is then filed against no rival,
+/// and kept).
+fn decisions(p: &world::VoxProc, peer: &str) -> Vec<Decision> {
+    let token = |rest: &str, marker: &str| {
+        rest.split_once(marker)
+            .and_then(|(_, r)| r.split_whitespace().next())
+            .map(|t| t.trim_end_matches([',', ';']).to_owned())
     };
-
-    // Relayed first, observed.
-    let first = request(&w);
-    assert_eq!(
-        first,
-        Some(false),
-        "CANNOT MEASURE: the first request, with the forward closed, should have been answered over \
-         the anchor's circuit (Some(false)); it was {first:?}.\nup:\n{}",
-        up.transcript()
-    );
-    w.anchor.assert_relayed("after the first request");
-
-    // A direct path becomes possible; the pair's retry finds it.
-    w.forward.open();
-    let opened = Instant::now();
-    let mut direct_at = None;
-    while opened.elapsed() < UPGRADE_WITHIN {
-        std::thread::sleep(Duration::from_millis(500));
-        if request(&w) == Some(true) {
-            direct_at = Some(Instant::now());
-            break;
+    let mut out = Vec::new();
+    for line in notes_about(p, peer) {
+        let Some((_, rest)) = line.split_once(" — ") else {
+            continue;
+        };
+        // (the newcomer, the held one, whether the newcomer was kept)
+        let decided = if rest.starts_with("a new connection ") {
+            let (n, h) = (
+                token(rest, "a new connection "),
+                token(rest, "the one held "),
+            );
+            if rest.contains(" lost the tie-break to the one held ") {
+                n.zip(h).map(|(n, h)| (n, h, false))
+            } else if rest.contains(" displaced the one held ")
+                || rest.contains(" replaced the one held ")
+            {
+                n.zip(h).map(|(n, h)| (n, h, true))
+            } else {
+                None
+            }
+        } else if rest.starts_with("the connection held ")
+            && rest.contains(" did not answer a probe in time when a new one ")
+        {
+            token(rest, "when a new one ")
+                .zip(token(rest, "the connection held "))
+                .map(|(n, h)| (n, h, true))
+        } else {
+            None
+        };
+        if let Some((n, h, newcomer_kept)) = decided {
+            let kept = if newcomer_kept { n.clone() } else { h.clone() };
+            let pair = if n <= h { (n, h) } else { (h, n) };
+            out.push(Decision {
+                pair,
+                kept,
+                line: line.clone(),
+            });
         }
     }
-    let Some(direct_at) = direct_at else {
-        panic!(
-            "CANNOT MEASURE: {UPGRADE_WITHIN:?} after the forward opened, no request rode it — there \
-             is no displaced relayed path to watch.\nup:\n{}",
-            up.transcript()
+    out
+}
+
+/// Every pair of connections **both** ends decided between, with each end's decision: (the
+/// host's, the guest's). A pair only one end has filed yet is not a disagreement.
+fn shared(w: &ForwardedWorld, up: &world::VoxProc) -> Vec<(Decision, Decision)> {
+    let (host, guest) = (decisions(&w.host, &w.guest_fp), decisions(up, &w.host_fp));
+    host.iter()
+        .filter_map(|h| {
+            guest
+                .iter()
+                .find(|g| g.pair == h.pair)
+                .map(|g| (h.clone(), g.clone()))
+        })
+        .collect()
+}
+
+/// Whether the two ends decided one pair differently: two such ends may never send a request over
+/// the direct path, so a wait for one would only hide what they said.
+fn ends_disagree(w: &ForwardedWorld, up: &world::VoxProc) -> bool {
+    shared(w, up).iter().any(|(h, g)| h.kept != g.kept)
+}
+
+/// **V29-15: both ends keep the same one of two live connections.** Every pair of connections
+/// both ends decided between must have been decided alike (`PRODUCT`), whatever each one's path.
+/// Waits up to [`BOTH_DECIDED_WITHIN`] for at least one such pair once either end has decided or
+/// a request rode the direct path (`direct_seen`), then a moment for a later filing. No pair
+/// decided at both ends is `CANNOT MEASURE`, unless neither end decided anything and no request
+/// rode the direct path (there was no duplicate; the caller then names that).
+fn both_ends_keep_the_same_connection(
+    w: &mut ForwardedWorld,
+    up: &mut world::VoxProc,
+    direct_seen: bool,
+    opened: Instant,
+) {
+    let any_decided = |w: &ForwardedWorld, up: &world::VoxProc| {
+        !decisions(&w.host, &w.guest_fp).is_empty() || !decisions(up, &w.host_fp).is_empty()
+    };
+    if !direct_seen && !any_decided(w, up) {
+        return;
+    }
+    let since = Instant::now();
+    while shared(w, up).is_empty() && since.elapsed() < BOTH_DECIDED_WITHIN {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // A later filing (the other end's own dial landing) would be said by now as well.
+    std::thread::sleep(Duration::from_secs(3));
+    let both = shared(w, up);
+    // Timed from the forward opening, on every run: the order and spacing of the dials is
+    // part of what a reader needs.
+    let notes = |w: &ForwardedWorld, up: &world::VoxProc| {
+        format!(
+            "Every connection note the host gave about the guest, timed from the forward \
+             opening:\n{}\nEvery connection note the guest gave about the host:\n{}",
+            timed_notes_about(&w.host, &w.guest_fp, opened).join("\n"),
+            timed_notes_about(up, &w.host_fp, opened).join("\n")
+        )
+    };
+    eprintln!("[proof] {}", notes(w, up));
+    eprintln!(
+        "[proof] {} pair(s) of connections decided at both ends: {:?}",
+        both.len(),
+        both.iter()
+            .map(|(h, g)| format!("{:?}: host kept {}, guest kept {}", h.pair, h.kept, g.kept))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !both.is_empty(),
+        "CANNOT MEASURE: no pair of connections was decided between at both ends within \
+         {BOTH_DECIDED_WITHIN:?}, so whether they decide alike cannot be read.\n{}",
+        notes(w, up)
+    );
+    for (h, g) in &both {
+        assert_eq!(
+            h.kept,
+            g.kept,
+            "PRODUCT: the two ends decided one duplicate differently: of {:?}, the host kept {} \
+             (it said: {:?}) and the guest kept {} (it said: {:?}); each end will open streams on \
+             one the other has retired.\n{}",
+            h.pair,
+            h.kept,
+            h.line,
+            g.kept,
+            g.line,
+            notes(w, up)
         );
-    };
-    eprintln!(
-        "[proof] a request rode the direct path {:?} after the forward opened",
-        direct_at - opened
-    );
-
-    // The displaced circuit must be let go: the anchor's count falls to 0. Requests keep going
-    // meanwhile, each checked to ride the forward, so nothing is carried on the circuit.
-    let mut n = w.anchor.circuits(Duration::from_secs(1));
-    let mut requests = 0usize;
-    let mut over_circuit = 0usize;
-    while n > 0 && direct_at.elapsed() < LET_GO_WITHIN {
-        match request(&w) {
-            Some(true) => requests += 1,
-            Some(false) => over_circuit += 1,
-            None => {}
-        }
-        n = w.anchor.circuits(Duration::from_secs(1));
     }
-    let took = direct_at.elapsed();
-    eprintln!(
-        "[proof] anchor circuits {n} at {took:?} after the direct path took over; {requests} requests \
-         rode the forward meanwhile, {over_circuit} the circuit"
-    );
-    assert_eq!(
-        over_circuit, 0,
-        "a request rode the circuit after the direct path took over — the displaced path was still \
-         in use, so letting it go is not what is being measured"
-    );
-    assert_eq!(
-        n,
-        0,
-        "NOT LET GO: the anchor still carries {n} circuit(s) {took:?} after the direct path took over, \
-         past the 60 s grace — a pair that went direct keeps its relay for good.\nanchor:\n{}",
-        w.anchor.proc.transcript()
-    );
-    interrupt(&mut up, Duration::from_secs(15));
-    drop(up);
 }
 
 /// RP-26 (#133) — **a better path displacing a worse one cuts nothing it carries**, through the
@@ -178,12 +279,28 @@ fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {
 /// displaced; and every later echo on the session still crossed the anchor, not the forward — it
 /// stayed on the displaced path.
 ///
-/// **Asserted:** the session opened before the upgrade answers an echo, whole, every few seconds
-/// until the grace and 15 s for the tick have passed since the direct path took over.
+/// **Asserted:**
+/// - **V29-15 (#50): both ends keep the same one of the two live connections.** When the direct
+///   connection is filed, each end holds two live connections to the other, one relayed and one
+///   direct, and decides alone which to keep. Each says which on stderr (`vox: connection to
+///   <peer> — a new connection <tag> … displaced / lost the tie-break to the one held <tag>`),
+///   naming connections by a tag from the connection's own TLS exporter, so one connection has one
+///   tag at both ends. For **every pair** of connections that both the host's `vox serve` and
+///   the guest's `vox up` decided between, the two must have kept **the same one** (`PRODUCT`);
+///   at least one such pair is required (`CANNOT MEASURE` otherwise). A pair only one end has
+///   filed yet is not compared: the pair keeps dialling, and a third connection can reach one end
+///   before the other. Ends that disagree open streams on a connection the other has retired.
+/// - The session opened before the upgrade answers an echo, whole, every few seconds until the
+///   grace and 15 s for the tick have passed since the direct path took over.
 ///
-/// **The mutation that must turn it red:** `ConnectionManager::retire_expired` treating no
-/// retired connection as still carried (`let still_carried = false;`): the displaced path closes
-/// when its grace ends and the session's next echo fails.
+/// **The mutations that must turn it red:**
+/// - `ConnectionManager::retire_expired` treating no retired connection as still carried
+///   (`let still_carried = false;`): the displaced path closes when its grace ends and the
+///   session's next echo fails.
+/// - The tie-break reading the path class the other way round at one end only (in `file_inner`,
+///   the end whose fingerprint sorts higher swaps the newcomer's and the held connection's
+///   classes, as an end that classified the path differently would): that end keeps the relayed
+///   connection and the other the direct one, and the two tags differ.
 #[test]
 #[ignore = "production Argon2id + a real PoW, a relayed pair upgraded and a 60 s grace held; run in release"]
 fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
@@ -255,7 +372,11 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
             direct_at = Some(Instant::now());
             break;
         }
+        if ends_disagree(&w, &up) {
+            break;
+        }
     }
+    both_ends_keep_the_same_connection(&mut w, &mut up, direct_at.is_some(), opened);
     let Some(direct_at) = direct_at else {
         panic!(
             "CANNOT MEASURE: {UPGRADE_WITHIN:?} after the forward opened, no request rode it — there \
