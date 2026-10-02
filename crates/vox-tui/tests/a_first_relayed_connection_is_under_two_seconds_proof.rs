@@ -119,7 +119,7 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
 
     let guest_fp = world::fingerprint(&w.guest_dir, "guest")
