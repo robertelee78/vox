@@ -78,10 +78,10 @@ pub struct Session {
     /// What the harness last said about this session's turn (V030-20): [`BUSY`] when one began
     /// (its drain ran), [`IDLE`] when one ended (Claude Code's `Stop`).
     #[serde(default)]
-    pub activity: String,
+    pub state: String,
     /// When the harness last said so, in Unix milliseconds.
     #[serde(default)]
-    pub activity_at: u64,
+    pub state_ms: u64,
 }
 
 /// A session whose turn is running: its drain ran and no end of turn has been heard since.
@@ -96,8 +96,8 @@ impl Session {
     /// of turn to Vox at all.
     #[must_use]
     pub fn idle(&self, now: u64, busy_idle: std::time::Duration) -> bool {
-        self.activity == IDLE
-            || now.saturating_sub(self.activity_at)
+        self.state == IDLE
+            || now.saturating_sub(self.state_ms)
                 >= u64::try_from(busy_idle.as_millis()).unwrap_or(u64::MAX)
     }
 
@@ -137,8 +137,8 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
             name,
             endpoint,
             token,
-            activity: BUSY.into(),
-            activity_at: now_millis(),
+            state: BUSY.into(),
+            state_ms: now_millis(),
         }
     } else if let (Ok(endpoint), Ok(token)) = (
         std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -151,8 +151,8 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
             name,
             endpoint,
             token,
-            activity: BUSY.into(),
-            activity_at: now_millis(),
+            state: BUSY.into(),
+            state_ms: now_millis(),
         }
     } else {
         Session {
@@ -162,8 +162,8 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
             name,
             endpoint: String::new(),
             token: String::new(),
-            activity: BUSY.into(),
-            activity_at: now_millis(),
+            state: BUSY.into(),
+            state_ms: now_millis(),
         }
     };
     let dir = paths.session_dir();
@@ -221,8 +221,8 @@ pub fn record_idle(paths: &Paths, session: &str) {
     let Some(mut reg) = load(paths, session) else {
         return;
     };
-    reg.activity = IDLE.into();
-    reg.activity_at = now_millis();
+    reg.state = IDLE.into();
+    reg.state_ms = now_millis();
     if let Ok(body) = serde_json::to_vec(&reg) {
         let _ = vox_core::node::paths::write_private_file(&paths.session_file(session), &body);
     }
