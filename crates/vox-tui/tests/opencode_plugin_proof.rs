@@ -143,6 +143,12 @@ impl Drop for Daemon {
 }
 
 /// `vox` against this profile, with `input` piped to stdin when given.
+/// A path as the pty driver's argument.
+fn path_arg(p: &Path) -> &str {
+    p.to_str()
+        .unwrap_or_else(|| panic!("APPARATUS: this run's path {p:?} is not UTF-8"))
+}
+
 fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, String, String) {
     let mut child = Command::new(VOX)
         .args(args)
@@ -160,13 +166,23 @@ fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, St
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start `vox {}`: {e}", args.join(" ")));
     if let Some(text) = input {
-        let mut pipe = child.stdin.take().expect("vox stdin");
-        pipe.write_all(text.as_bytes()).expect("write stdin");
+        let mut pipe = child
+            .stdin
+            .take()
+            .unwrap_or_else(|| panic!("APPARATUS: `vox {}` has no stdin pipe", args.join(" ")));
+        // A write that fails (EPIPE) means `vox` exited without reading its input: that is
+        // the product's outcome, which the caller judges by its exit and what it printed.
+        let _ = pipe.write_all(text.as_bytes());
         drop(pipe);
     }
-    let out = child.wait_with_output().expect("vox ran");
+    let out = child.wait_with_output().unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: cannot collect `vox {}`'s output: {e}",
+            args.join(" ")
+        )
+    });
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -237,7 +253,9 @@ fn opencode_turn(
 }
 
 /// The line in an `opencode run`'s output where the model provider refused the turn, if any,
-/// without the terminal's colour codes.
+/// without the terminal's colour codes. Only opencode's own error lines count (`Error: …`, or
+/// the `"name": "…Error"` of an error it prints as JSON): `vox agent hook`'s stderr shares the
+/// stream, and a refusal by `vox` must stay the product's.
 fn provider_failure(said: &str) -> Option<String> {
     const SIGNS: &[&str] = &[
         "upstream request failed",
@@ -250,29 +268,44 @@ fn provider_failure(said: &str) -> Option<String> {
         "unauthorized",
         "invalid api key",
         "providermodelnotfound",
-        "unexpected server error",
+        "unknownerror",
     ];
-    said.lines()
-        .find(|l| {
-            let l = l.to_ascii_lowercase();
-            SIGNS.iter().any(|s| l.contains(s))
-        })
-        .map(|l| {
-            let mut plain = String::new();
-            let mut chars = l.chars();
-            while let Some(c) = chars.next() {
-                if c == '\u{1b}' {
-                    // An escape sequence runs to its final letter.
-                    for c in chars.by_ref() {
-                        if c.is_ascii_alphabetic() {
-                            break;
-                        }
+    let plain = |l: &str| {
+        let mut plain = String::new();
+        let mut chars = l.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                // An escape sequence runs to its final letter.
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
                     }
-                } else {
-                    plain.push(c);
                 }
+            } else {
+                plain.push(c);
             }
-            plain.trim().to_owned()
+        }
+        plain.trim().to_owned()
+    };
+    let lines: Vec<String> = said.lines().map(plain).collect();
+    let opencodes = |l: &str| l.starts_with("Error:") || l.starts_with("\"name\": \"");
+    lines
+        .iter()
+        .position(|l| {
+            let low = l.to_ascii_lowercase();
+            opencodes(l) && SIGNS.iter().any(|s| low.contains(s))
+        })
+        .map(|i| {
+            if lines[i].starts_with("Error:") {
+                return lines[i].clone();
+            }
+            // A JSON error names its kind on one line and its message on a later one.
+            lines[i..]
+                .iter()
+                .take(4)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
         })
 }
 
@@ -509,12 +542,21 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         "[proof] with the plugin, the model's answer contains the codeword: {}",
         answer.contains(&codeword)
     );
-    assert!(
-        answer.contains(&codeword),
-        "PRODUCT: the room never reached the model. Expected {codeword:?} in the model's answer, got: \
-         {answer:?}{}",
-        plugin_diag("with plugin")
-    );
+    if !answer.contains(&codeword) {
+        // The plugin's own log says whether it put the room in front of the model. If it did,
+        // the model chose not to repeat it, which says nothing about the product.
+        let injected = std::fs::read_to_string(&plugin_log)
+            .is_ok_and(|l| l.contains("chat.message: injected"));
+        panic!(
+            "{} Expected {codeword:?} in the model's answer, got: {answer:?}{}",
+            if injected {
+                "CANNOT MEASURE: the plugin injected the room, and the model did not repeat it."
+            } else {
+                "PRODUCT: the room never reached the model: the plugin injected nothing."
+            },
+            plugin_diag("with plugin")
+        );
+    }
 
     // ---- the mutation check: same everything, plugin disabled ----
     let without = opencode_turn(&project, &env, true, prompt);
@@ -535,13 +577,13 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         script,
         &[
             VOX,
-            data.to_str().unwrap(),
-            cfg.to_str().unwrap(),
+            path_arg(&data),
+            path_arg(&cfg),
             &room,
-            project.to_str().unwrap(),
-            oc_cfg.to_str().unwrap(),
-            plugin_log.to_str().unwrap(),
-            oc_tmp.to_str().unwrap(),
+            path_arg(&project),
+            path_arg(&oc_cfg),
+            path_arg(&plugin_log),
+            path_arg(&oc_tmp),
             "wake",
         ],
     );
