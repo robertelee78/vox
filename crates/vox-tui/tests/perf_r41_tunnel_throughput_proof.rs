@@ -1729,152 +1729,12 @@ fn taper_arms(
         );
     }
 
-    // The lossy shared links: the Cubic flow alone, then with Vox, on the same link.
-    for shared in LOSSY_SHARED {
-        if !wanted(shared.name) {
-            continue;
-        }
-        *link.lock().unwrap() = Some(shared);
-        let stop = Arc::new(AtomicBool::new(false));
-        competitor_sender(&rt, competitor, Arc::clone(&stop));
-        let alone = windows(SETTLE + SHARED_MEASURE, |_| {});
-        let alone = alone[SETTLE.as_secs() as usize..].to_vec();
-        let pump = stream_to(tunnel, Arc::clone(&stop));
-        let both = windows(SETTLE + SHARED_MEASURE, |_| {});
-        let both = both[SETTLE.as_secs() as usize..].to_vec();
-        stop.store(true, Relaxed);
-        let _ = pump.join();
-        std::thread::sleep(Duration::from_secs(1));
-        if let Some(e) = late_fault(shared.name, &alone)
-            .or_else(|| late_fault(shared.name, &both))
-            .or_else(|| crossed_fault(shared.name, &both))
-            .or_else(|| competed_fault(shared.name, &alone))
-        {
-            cant(cannot, e);
-            continue;
-        }
-        let (solo, kept, vm) = (
-            mean_of(&alone, |x| x.other),
-            mean_of(&both, |x| x.other),
-            mean_of(&both, |x| x.vox),
-        );
-        let share = kept / solo;
-        // A tunnel that carries nothing beside the flow makes the share say nothing about fairness;
-        // a person sees a stalled tunnel.
-        let verdict = if vm < solo * SHARED_VOX_FLOOR {
-            failed.push(format!(
-                "{}: the emulator was on time; beside the Cubic flow vox carried {:.1} Mbit/s, under \
-                 {:.0}% of that flow's solo {:.1}: the tunnel stalls on a lossy shared link",
-                shared.name,
-                vm / 1e6,
-                SHARED_VOX_FLOOR * 100.0,
-                solo / 1e6
-            ));
-            "BELOW (vox stalled)".to_owned()
-        } else if share >= SHARED_KEEP {
-            format!("ok (kept >= {:.0}%)", SHARED_KEEP * 100.0)
-        } else {
-            failed.push(format!(
-                "{}: the emulator was on time; the Cubic flow carried {:.1} Mbit/s alone and {:.1} with \
-                 vox beside it, {:.1}% of its solo rate, under {:.0}%; vox carried {:.1}: vox pushes a \
-                 competing flow below its own rate on a lossy shared link",
-                shared.name,
-                solo / 1e6,
-                kept / 1e6,
-                share * 100.0,
-                SHARED_KEEP * 100.0,
-                vm / 1e6
-            ));
-            format!("BELOW {:.0}%", SHARED_KEEP * 100.0)
-        };
-        note(report, format!(
-            "{}: the Cubic flow alone {:.1} Mbit/s, beside vox {:.1} ({:.1}%), vox {:.1} — {verdict}; \
-             alone: {}; both: {}; per-second Cubic alone {:?}, Cubic beside vox {:?}, vox {:?}",
-            shared.name,
-            solo / 1e6,
-            kept / 1e6,
-            share * 100.0,
-            vm / 1e6,
-            lateness(&alone),
-            lateness(&both),
-            mbit(&alone, |x| x.other),
-            mbit(&both, |x| x.other),
-            mbit(&both, |x| x.vox)
-        ));
-    }
-
-    // The congested links: Vox and the comparison flow at once, through one queue, deep and shallow.
-    for congested in [CONGESTED, CONGESTED_SHALLOW, CONGESTED_LAN] {
-        if !wanted(congested.name) {
-            continue;
-        }
-        *link.lock().unwrap() = Some(congested);
-        let stop = Arc::new(AtomicBool::new(false));
-        competitor_sender(&rt, competitor, Arc::clone(&stop));
-        let pump = stream_to(tunnel, Arc::clone(&stop));
-        let all = windows(SETTLE + CONGESTED_MEASURE, |_| {});
-        let w = all[SETTLE.as_secs() as usize..].to_vec();
-        stop.store(true, Relaxed);
-        let _ = pump.join();
-        std::thread::sleep(Duration::from_secs(1));
-        if let Some(e) = late_fault(congested.name, &w)
-            .or_else(|| crossed_fault(congested.name, &w))
-            .or_else(|| competed_fault(congested.name, &w))
-        {
-            cant(cannot, e);
-            continue;
-        }
-        let (vm, cm) = (mean_of(&w, |x| x.vox), mean_of(&w, |x| x.other));
-        let ratio = vm / cm;
-        let verdict = if ratio < FAIR_LOW {
-            failed.push(format!(
-                "{}: the emulator was on time; vox carried {:.1} Mbit/s against the Cubic flow's \
-                 {:.1}, {ratio:.3}x, under {FAIR_LOW:.1}x: vox gives way on a shared link",
-                congested.name,
-                vm / 1e6,
-                cm / 1e6
-            ));
-            format!("BELOW {FAIR_LOW:.1}x")
-        } else if ratio > FAIR_HIGH {
-            failed.push(format!(
-                "{}: the emulator was on time; vox carried {:.1} Mbit/s against the Cubic flow's \
-                 {:.1}, {ratio:.3}x, over {FAIR_HIGH:.1}x: vox takes more than its share",
-                congested.name,
-                vm / 1e6,
-                cm / 1e6
-            ));
-            format!("ABOVE {FAIR_HIGH:.1}x")
-        } else {
-            format!("fair ({FAIR_LOW:.1}x-{FAIR_HIGH:.1}x)")
-        };
-        // DIAGNOSTIC, not a verdict: the 2 s windows furthest from fair, where a failed tier-3 trial
-        // would show. ADR-024 makes no claim about any window shorter than the whole run.
-        let pairs: Vec<f64> = w
-            .windows(2)
-            .map(|p| (p[0].vox + p[1].vox) / (p[0].other + p[1].other).max(1.0))
-            .collect();
-        shown(&format!(
-            "R41 DIAGNOSTIC (not a verdict) {}: 2 s windows from {:.2}x to {:.2}x",
-            congested.name,
-            pairs.iter().copied().fold(f64::INFINITY, f64::min),
-            pairs.iter().copied().fold(0.0, f64::max)
-        ));
-        note(
-            report,
-            format!(
-                "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.3}x over {} s — {verdict}; {}; \
-             per-second vox {:?}, Cubic {:?}",
-                congested.name,
-                vm / 1e6,
-                cm / 1e6,
-                CONGESTED_MEASURE.as_secs(),
-                lateness(&w),
-                mbit(&w, |x| x.vox),
-                mbit(&w, |x| x.other)
-            ),
-        );
-    }
-
+    // The changing and paused arms run before the lossy shared and congested arms: those fail
+    // tier-3 trials on purpose, and a failed trial bars tier 3 for 30 s or more, which survives
+    // from arm to arm on the one tunnel (ADR-024: the back-off is fairness memory). Run after
+    // them, a changing arm's 20 s lossy phase can fall inside that bar (fix-adr024-bbr's trace:
+    // tier 3 "locked" for about 90 s after the 6% lossy shared arm), and it would measure the
+    // previous arm, not the change.
     // The changing links: clean, lossy, clean, under one running transfer, at 1% loss (tier 2's
     // case) and at 6% (tier 3's).
     for lossy_link in [WIFI, WIFI_HEAVY] {
@@ -2045,5 +1905,151 @@ fn taper_arms(
             mbit(&after, |x| x.vox)
         ));
     }
+    // The lossy shared links: the Cubic flow alone, then with Vox, on the same link.
+    for shared in LOSSY_SHARED {
+        if !wanted(shared.name) {
+            continue;
+        }
+        *link.lock().unwrap() = Some(shared);
+        let stop = Arc::new(AtomicBool::new(false));
+        competitor_sender(&rt, competitor, Arc::clone(&stop));
+        let alone = windows(SETTLE + SHARED_MEASURE, |_| {});
+        let alone = alone[SETTLE.as_secs() as usize..].to_vec();
+        let pump = stream_to(tunnel, Arc::clone(&stop));
+        let both = windows(SETTLE + SHARED_MEASURE, |_| {});
+        let both = both[SETTLE.as_secs() as usize..].to_vec();
+        stop.store(true, Relaxed);
+        let _ = pump.join();
+        std::thread::sleep(Duration::from_secs(1));
+        if let Some(e) = late_fault(shared.name, &alone)
+            .or_else(|| late_fault(shared.name, &both))
+            .or_else(|| crossed_fault(shared.name, &both))
+            .or_else(|| competed_fault(shared.name, &alone))
+        {
+            cant(cannot, e);
+            continue;
+        }
+        let (solo, kept, vm) = (
+            mean_of(&alone, |x| x.other),
+            mean_of(&both, |x| x.other),
+            mean_of(&both, |x| x.vox),
+        );
+        let share = kept / solo;
+        // A tunnel that carries nothing beside the flow makes the share say nothing about fairness;
+        // a person sees a stalled tunnel.
+        let verdict = if vm < solo * SHARED_VOX_FLOOR {
+            failed.push(format!(
+                "{}: the emulator was on time; beside the Cubic flow vox carried {:.1} Mbit/s, under \
+                 {:.0}% of that flow's solo {:.1}: the tunnel stalls on a lossy shared link",
+                shared.name,
+                vm / 1e6,
+                SHARED_VOX_FLOOR * 100.0,
+                solo / 1e6
+            ));
+            "BELOW (vox stalled)".to_owned()
+        } else if share >= SHARED_KEEP {
+            format!("ok (kept >= {:.0}%)", SHARED_KEEP * 100.0)
+        } else {
+            failed.push(format!(
+                "{}: the emulator was on time; the Cubic flow carried {:.1} Mbit/s alone and {:.1} with \
+                 vox beside it, {:.1}% of its solo rate, under {:.0}%; vox carried {:.1}: vox pushes a \
+                 competing flow below its own rate on a lossy shared link",
+                shared.name,
+                solo / 1e6,
+                kept / 1e6,
+                share * 100.0,
+                SHARED_KEEP * 100.0,
+                vm / 1e6
+            ));
+            format!("BELOW {:.0}%", SHARED_KEEP * 100.0)
+        };
+        note(report, format!(
+            "{}: the Cubic flow alone {:.1} Mbit/s, beside vox {:.1} ({:.1}%), vox {:.1} — {verdict}; \
+             alone: {}; both: {}; per-second Cubic alone {:?}, Cubic beside vox {:?}, vox {:?}",
+            shared.name,
+            solo / 1e6,
+            kept / 1e6,
+            share * 100.0,
+            vm / 1e6,
+            lateness(&alone),
+            lateness(&both),
+            mbit(&alone, |x| x.other),
+            mbit(&both, |x| x.other),
+            mbit(&both, |x| x.vox)
+        ));
+    }
+
+    // The congested links: Vox and the comparison flow at once, through one queue, deep and shallow.
+    for congested in [CONGESTED, CONGESTED_SHALLOW, CONGESTED_LAN] {
+        if !wanted(congested.name) {
+            continue;
+        }
+        *link.lock().unwrap() = Some(congested);
+        let stop = Arc::new(AtomicBool::new(false));
+        competitor_sender(&rt, competitor, Arc::clone(&stop));
+        let pump = stream_to(tunnel, Arc::clone(&stop));
+        let all = windows(SETTLE + CONGESTED_MEASURE, |_| {});
+        let w = all[SETTLE.as_secs() as usize..].to_vec();
+        stop.store(true, Relaxed);
+        let _ = pump.join();
+        std::thread::sleep(Duration::from_secs(1));
+        if let Some(e) = late_fault(congested.name, &w)
+            .or_else(|| crossed_fault(congested.name, &w))
+            .or_else(|| competed_fault(congested.name, &w))
+        {
+            cant(cannot, e);
+            continue;
+        }
+        let (vm, cm) = (mean_of(&w, |x| x.vox), mean_of(&w, |x| x.other));
+        let ratio = vm / cm;
+        let verdict = if ratio < FAIR_LOW {
+            failed.push(format!(
+                "{}: the emulator was on time; vox carried {:.1} Mbit/s against the Cubic flow's \
+                 {:.1}, {ratio:.3}x, under {FAIR_LOW:.1}x: vox gives way on a shared link",
+                congested.name,
+                vm / 1e6,
+                cm / 1e6
+            ));
+            format!("BELOW {FAIR_LOW:.1}x")
+        } else if ratio > FAIR_HIGH {
+            failed.push(format!(
+                "{}: the emulator was on time; vox carried {:.1} Mbit/s against the Cubic flow's \
+                 {:.1}, {ratio:.3}x, over {FAIR_HIGH:.1}x: vox takes more than its share",
+                congested.name,
+                vm / 1e6,
+                cm / 1e6
+            ));
+            format!("ABOVE {FAIR_HIGH:.1}x")
+        } else {
+            format!("fair ({FAIR_LOW:.1}x-{FAIR_HIGH:.1}x)")
+        };
+        // DIAGNOSTIC, not a verdict: the 2 s windows furthest from fair, where a failed tier-3 trial
+        // would show. ADR-024 makes no claim about any window shorter than the whole run.
+        let pairs: Vec<f64> = w
+            .windows(2)
+            .map(|p| (p[0].vox + p[1].vox) / (p[0].other + p[1].other).max(1.0))
+            .collect();
+        shown(&format!(
+            "R41 DIAGNOSTIC (not a verdict) {}: 2 s windows from {:.2}x to {:.2}x",
+            congested.name,
+            pairs.iter().copied().fold(f64::INFINITY, f64::min),
+            pairs.iter().copied().fold(0.0, f64::max)
+        ));
+        note(
+            report,
+            format!(
+                "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.3}x over {} s — {verdict}; {}; \
+             per-second vox {:?}, Cubic {:?}",
+                congested.name,
+                vm / 1e6,
+                cm / 1e6,
+                CONGESTED_MEASURE.as_secs(),
+                lateness(&w),
+                mbit(&w, |x| x.vox),
+                mbit(&w, |x| x.other)
+            ),
+        );
+    }
+
     drop(rt);
 }
