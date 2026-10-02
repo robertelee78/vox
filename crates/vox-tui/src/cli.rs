@@ -1014,7 +1014,10 @@ enum AgentCmd {
     ///
     /// Register it on a turn-start event — `UserPromptSubmit` in both Claude Code
     /// and Codex — and for Codex register it with `async: false`, or the output is
-    /// observed and discarded.
+    /// observed and discarded. In Claude Code, register it on `Stop` and `SessionEnd`
+    /// too: on `Stop` it records that the session is idle, so a reply waiting for it
+    /// can be announced, and prints nothing; on `SessionEnd` it removes the session's
+    /// registration.
     Hook(AgentHookArgs),
     /// Print the integration a harness needs to run `vox agent hook` every turn.
     ///
@@ -1105,14 +1108,6 @@ pub struct AgentHookArgs {
     /// stdin. So the id arrives as a flag instead.
     #[arg(long)]
     pub session: Option<String>,
-    /// An entry this session was already shown by a wake, so the drain does not show it again.
-    /// Repeatable.
-    ///
-    /// A wake arrives as the harness's own prompt, and the drain then runs on that prompt. The
-    /// OpenCode plugin relays wakes itself, so it knows which entries it delivered and passes
-    /// them here.
-    #[arg(long, value_name = "ENTRY")]
-    pub woken: Vec<String>,
 }
 
 /// Naming a room on a running node. No passphrase: the node is already unlocked.
@@ -2239,7 +2234,6 @@ pub fn run() -> ExitCode {
                 args.room.as_deref(),
                 format,
                 args.session.as_deref(),
-                &args.woken,
             ));
             // Always success: a hook that fails must not break the turn.
             ExitCode::SUCCESS
@@ -2329,11 +2323,10 @@ pub fn run() -> ExitCode {
             // redirected or piped to `jq`; where to put it goes to stderr so it does not
             // land in the file.
             "claude" | "claude-code" => {
-                println!(
-                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
-                     \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
-                     \"vox agent hook\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
-                );
+                // `UserPromptSubmit` drains the room; `Stop` records that a turn ended, so an
+                // unread reply can be announced to an idle session; `SessionEnd` removes the
+                // session's registration (V030-20).
+                print!("{}", crate::agent_hook::CLAUDE_HOOKS);
                 eprintln!(
                     "vox: merge that into ~/.claude/settings.json, or .claude/settings.json \
                      in a project.\n     Set VOX_ROOM in the session's environment, or pass \
