@@ -57,11 +57,18 @@
 //!
 //! ## Mutations that must turn it red
 //!
+//! Each verdict at (1), (2) and (4) is read from what the plugin logged on that turn and what
+//! `vox agent hook` handed it (recorded by the `VOX_BIN` the plugin runs), not from the answer
+//! alone: the drain's text missing the row, or the plugin injecting nothing, is PRODUCT; the
+//! model not repeating what it was given, or OpenCode never calling the hook, is CANNOT
+//! MEASURE.
+//!
 //! - Make `vox agent hook` inject nothing (the drain returns before printing what is
-//!   unread): red at (1), alice's model cannot name the assignment it was never told.
+//!   unread): red at (1) as PRODUCT, the plugin said "nothing to inject".
 //! - Make `vox agent hook` drop plain prose from what it emits (every row that parses as a
 //!   `say` is filtered out of the drain, so only typed envelopes are injected): (1) and (2)
-//!   stay green, and it goes red at (4), alice's answer does not carry the question's nonce.
+//!   stay green, and it goes red at (4) as PRODUCT: the plugin injected the room, but what the
+//!   drain gave it does not hold the question's nonce.
 //!   (Filtering on `Envelope::parse(..).is_ok()` is not this mutant: prose parses as a
 //!   `say`, so that filter drops nothing.)
 //! - Key the hook's cursor by room alone, ignoring the session: red at (3), `s2` is shown
@@ -77,19 +84,19 @@
 mod optional_proof;
 optional_proof::not_run!(two_agent_sessions_and_an_operator_share_one_room);
 
+#[path = "support/oc_sandbox.rs"]
+mod oc_sandbox;
 #[path = "support/room.rs"]
 mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
 use std::path::Path;
-use std::process::Command;
 
 use support::{until, Worker, VOX};
 
 fn model() -> String {
-    std::env::var("VOX_PROOF_OPENCODE_MODEL")
-        .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
+    oc_sandbox::model()
 }
 
 fn which(bin: &str) -> Option<std::path::PathBuf> {
@@ -99,75 +106,172 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn auth_present() -> bool {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share")))
-        .is_some_and(|b| b.join("opencode/auth.json").is_file())
-}
-
 /// Install this agent's OpenCode plugin the way a person does — `vox agent plugin opencode >
 /// .opencode/plugin/vox.js` — in its own project directory, which is also what gives it its
 /// own OpenCode session and therefore its own cursor. Returns the project directory.
 fn install_plugin(w: &Worker, fixture: &Path) -> std::path::PathBuf {
     let project = fixture.join(&w.name);
-    std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
+    std::fs::create_dir_all(project.join(".opencode/plugin"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}'s project: {e}", w.name));
     let o = w.vox(None, &["agent", "plugin", "opencode"]);
     assert!(
         o.ok && o.stdout.contains("vox agent hook"),
-        "vox agent plugin opencode: {o:?}"
+        "PRODUCT: `vox agent plugin opencode` did not print the plugin: {o:?}"
     );
-    std::fs::write(project.join(".opencode/plugin/vox.js"), &o.stdout).unwrap();
+    std::fs::write(project.join(".opencode/plugin/vox.js"), &o.stdout)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot install {}'s plugin: {e}", w.name));
     project
 }
 
-/// One real model turn for this agent, with its room wired in.
-fn turn(w: &Worker, project: &Path, oc_cfg: &Path, room: &str, prompt: &str) -> String {
-    turn_split(w, project, oc_cfg, room, prompt).1
+/// What one turn shows: the model's answer (its stdout alone), everything OpenCode printed,
+/// what the plugin logged, and what `vox agent hook` handed the plugin.
+struct Turn {
+    answer: String,
+    said: String,
+    plugin_log: String,
+    hook_out: String,
 }
 
-/// As [`turn`], also returning the model's stdout alone (the answer, without OpenCode's
-/// stderr), for a check that must not be satisfied by a log line.
-fn turn_split(
+/// An agent's plugin log, and the recording `VOX_BIN` its plugin runs (`hook_recorder`): both
+/// inside the sandbox root, one pair per agent.
+struct Wiring {
+    plugin_log: std::path::PathBuf,
+    vox_bin: std::path::PathBuf,
+    hook_log: std::path::PathBuf,
+}
+
+/// **What the drain handed the plugin is recorded**, so a turn's verdict knows whether the
+/// room's text was put in front of the model: `VOX_BIN`, the binary the plugin runs as
+/// `vox agent hook`, is a wrapper that runs the real `vox` and appends what it printed to
+/// `hook_log`. The model's own `vox`, if it runs one, is the real binary.
+fn hook_recorder(root: &Path, name: &str) -> Wiring {
+    let vox_bin = root.join(format!("vox-hook-{name}"));
+    let hook_log = root.join(format!("hook-{name}.log"));
+    let plugin_log = root.join(format!("plugin-{name}.log"));
+    std::fs::write(
+        &vox_bin,
+        format!(
+            "#!/bin/sh\nout=$('{vox}' \"$@\")\nrc=$?\nprintf '%s\\n' \"$out\" >> '{log}'\n\
+             printf '%s\\n' \"$out\"\nexit $rc\n",
+            vox = VOX,
+            log = hook_log.display()
+        ),
+    )
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot write the hook recorder: {e}"));
+    std::fs::set_permissions(
+        &vox_bin,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot make the hook recorder runnable: {e}"));
+    Wiring {
+        plugin_log,
+        vox_bin,
+        hook_log,
+    }
+}
+
+/// One real model turn for this agent, with its room wired in, confined.
+#[allow(clippy::too_many_arguments)]
+fn turn(
+    sb: &oc_sandbox::OcSandbox,
+    profile: &Path,
     w: &Worker,
+    wiring: &Wiring,
     project: &Path,
     oc_cfg: &Path,
     room: &str,
     prompt: &str,
-) -> (String, String) {
-    let mut cmd = Command::new("opencode");
-    // A spawned OpenCode that inherits cargo's environment loads the plugin and never
-    // fires its message hook. Measured; see `opencode_plugin_proof`.
-    cmd.env_clear();
-    for key in ["PATH", "HOME", "SHELL", "LANG", "TMPDIR", "USER"] {
-        if let Some(v) = std::env::var_os(key) {
-            cmd.env(key, v);
-        }
+) -> Turn {
+    for f in [&wiring.plugin_log, &wiring.hook_log] {
+        let _ = std::fs::write(f, "");
     }
+    // Confined, with a fixed environment (`OcSandbox::opencode`, support/oc_sandbox.rs): a
+    // spawned OpenCode that inherits cargo's environment never fires its message hook, and the
+    // operator's would name their files to the model.
+    let mut cmd = sb.opencode(profile, &[], project);
     let out = cmd
-        .current_dir(project)
         .args(["run", "-m", &model(), prompt])
         .env("XDG_CONFIG_HOME", oc_cfg)
         .env("VOX_DATA_DIR", &w.data)
         .env("VOX_CONFIG_DIR", &w.cfg)
         .env("VOX_ROOM", room)
-        .env("VOX_BIN", VOX)
+        .env("VOX_BIN", &wiring.vox_bin)
+        .env("VOX_PLUGIN_LOG", &wiring.plugin_log)
         .output()
-        .expect("run opencode");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run opencode in its sandbox: {e}"));
     let said = format!(
         "{}\n--- stderr ---\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    sb.check(&said, "an `opencode run` turn");
     eprintln!("[turn {}] {prompt:?} -> {said}", w.name);
-    (String::from_utf8_lossy(&out.stdout).into_owned(), said)
+    Turn {
+        answer: String::from_utf8_lossy(&out.stdout).into_owned(),
+        said,
+        plugin_log: std::fs::read_to_string(&wiring.plugin_log).unwrap_or_default(),
+        hook_out: std::fs::read_to_string(&wiring.hook_log).unwrap_or_default(),
+    }
+}
+
+/// **The verdict on a turn is what the plugin says it did, and what the drain gave it**, not
+/// the answer alone: a model may decline to repeat what it was given, and a drain may hand the
+/// plugin text without the row that matters.
+///
+/// - injected, the drain's text holding `target`, and the answer holding it: green;
+/// - injected and the drain's text holding `target`, but not the answer: CANNOT MEASURE (the
+///   model chose not to repeat it);
+/// - injected without `target` in the drain's text, or "nothing to inject", "threw" or "no
+///   text part": PRODUCT, whatever the answer;
+/// - VOX_ROOM unset: APPARATUS; no `chat.message` at all: CANNOT MEASURE.
+fn judge(t: &Turn, target: &str, step: &str, answer_has: bool) {
+    let hooked: Vec<&str> = t
+        .plugin_log
+        .lines()
+        .filter(|l| l.contains("chat.message:"))
+        .collect();
+    let said_of = |what: &str| hooked.iter().find(|l| l.contains(what)).copied();
+    if said_of("chat.message: injected").is_some() {
+        assert!(
+            t.hook_out.contains(target),
+            "PRODUCT: {step}: the plugin injected the room, but what `vox agent hook` gave it \
+             does not hold {target:?}: {:?}",
+            t.hook_out
+        );
+        assert!(
+            answer_has,
+            "CANNOT MEASURE: {step}: the plugin injected the room with {target:?}, and the model \
+             did not repeat it. The answer: {:?}",
+            t.answer
+        );
+    } else if let Some(line) = said_of("nothing to inject")
+        .or_else(|| said_of("threw"))
+        .or_else(|| said_of("no text part"))
+    {
+        panic!("PRODUCT: {step}: the room never reached the model: the plugin said {line:?}");
+    } else if let Some(line) = said_of("VOX_ROOM is unset") {
+        panic!(
+            "APPARATUS: {step}: the proof did not give OpenCode the room: the plugin said {line:?}"
+        );
+    } else {
+        panic!(
+            "CANNOT MEASURE: {step}: OpenCode never called the plugin's chat.message on this \
+             turn ({}). OpenCode printed: {:?}",
+            if hooked.is_empty() {
+                "no chat.message line".to_owned()
+            } else {
+                format!("it said {hooked:?}")
+            },
+            t.said
+        );
+    }
 }
 
 /// A per-run token, unguessable by a model and absent from every prompt.
 fn nonce(tag: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_else(|e| panic!("APPARATUS: the clock is before 1970: {e}"))
         .as_nanos();
     format!("{tag}-{}{:06}", std::process::id(), nanos % 1_000_000)
 }
@@ -177,40 +281,70 @@ fn nonce(tag: &str) -> String {
 #[ignore = "an anchor, two vox daemons, live model turns; optional, run it in release"]
 fn two_agent_sessions_and_an_operator_share_one_room() {
     watchdog::arm();
+    if !oc_sandbox::live_model_allowed(
+        "agent_rehearsal_proof::two_agent_sessions_and_an_operator_share_one_room",
+    ) {
+        return;
+    }
     assert!(
-        which("opencode").is_some() && auth_present(),
-        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH and a usable credential \
-         (~/.local/share/opencode/auth.json)"
+        which("opencode").is_some(),
+        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH"
     );
-
-    // A persistent fixture: OpenCode installs a `node_modules` tree into both the
-    // project and the config directory on first use, and until it has, the plugin
-    // loads while its hook never fires.
-    let fixture = std::env::temp_dir().join("vox-agent-rehearsal");
-    let oc_cfg = fixture.join("config");
-    std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot build the runtime: {e}"));
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
     let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
     let room = r.id.clone();
+    // **Every model turn runs confined** (support/oc_sandbox.rs): a throwaway HOME, a fixed
+    // environment, a whitelist of readable paths, a canary in the real HOME it must never
+    // see. The plugins' hooks need the two agents' vox profiles; nothing else outside the
+    // sandbox is readable. A missing credential is CANNOT MEASURE there.
+    let sb = oc_sandbox::OcSandbox::new(tmp.path());
+    let profile = sb.profile(
+        "rehearsal",
+        &[&alice.data, &alice.cfg, &bob.data, &bob.cfg],
+        &[Path::new(VOX)],
+    );
+    // **This run's own fixture, inside its sandbox**: OpenCode installs a `node_modules` tree
+    // into the project and the config directory on first use (the warm-up turns below).
+    let fixture = sb.root.join("fixture");
+    let oc_cfg = fixture.join("config");
+    std::fs::create_dir_all(oc_cfg.join("opencode"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make the fixture: {e}"));
     let a_proj = install_plugin(alice, &fixture);
     let b_proj = install_plugin(bob, &fixture);
+    let (a_wire, b_wire) = (
+        hook_recorder(&sb.root, "alice"),
+        hook_recorder(&sb.root, "bob"),
+    );
 
     // Warm both projects: the first turn in a fresh directory installs and does not
     // fire the hook. This also consumes the harness's readiness posts from each cursor.
-    for (who, proj) in [(alice, &a_proj), (bob, &b_proj)] {
-        let _ = turn(who, proj, &oc_cfg, &room, "Reply with exactly: READY");
+    for (who, wire, proj) in [(alice, &a_wire, &a_proj), (bob, &b_wire, &b_proj)] {
+        let _ = turn(
+            &sb,
+            &profile,
+            who,
+            wire,
+            proj,
+            &oc_cfg,
+            &room,
+            "Reply with exactly: READY",
+        );
     }
 
     // ---- the operator speaks, as a person, in plain prose ----
     let assignment = r#"{"v":1,"type":"assign","to":["alice"],"body":"port the wire codec to the new envelope format","data":{"resource":"port-the-codec"}}"#;
     let o = alice.vox(None, &["room", "post", &room, assignment]);
-    assert!(o.ok, "the operator could not post the assignment: {o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT: the operator could not post the assignment: {o:?}"
+    );
     until(
         bob,
         None,
@@ -220,24 +354,29 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     );
 
     // ---- (1) alice's model reads work it was never prompted with ----
-    let answer = turn(
+    let t1 = turn(
+        &sb,
+        &profile,
         alice,
+        &a_wire,
         &a_proj,
         &oc_cfg,
         &room,
         "What task have you been assigned? Answer with just the task.",
     );
-    let read_assignment = answer.contains("codec") || answer.contains("wire");
+    let read_assignment = t1.answer.contains("codec") || t1.answer.contains("wire");
     println!("[proof] (1) alice's model named its assignment: {read_assignment}");
-    assert!(
+    judge(
+        &t1,
+        "port the wire codec",
+        "(1) alice's model reads the assignment it was never prompted with",
         read_assignment,
-        "alice's model did not read its assignment: {answer:?}"
     );
 
     // ---- alice reports a result, as an agent would ----
     let result = r#"{"v":1,"type":"result","re":"port-the-codec","body":"done: the codec now speaks the envelope format. verification token QUORUM-8812"}"#;
     let o = alice.vox(None, &["room", "post", &room, result]);
-    assert!(o.ok, "alice could not post her result: {o:?}");
+    assert!(o.ok, "PRODUCT: alice could not post her result: {o:?}");
     until(
         bob,
         None,
@@ -247,8 +386,11 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     );
 
     // ---- (2) bob's model reads what alice wrote, from its own session ----
-    let seen = turn(
+    let t2 = turn(
+        &sb,
+        &profile,
         bob,
+        &b_wire,
         &b_proj,
         &oc_cfg,
         &room,
@@ -256,11 +398,13 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     );
     println!(
         "[proof] (2) bob's model repeated alice's token: {}",
-        seen.contains("QUORUM-8812")
+        t2.answer.contains("QUORUM-8812")
     );
-    assert!(
-        seen.contains("QUORUM-8812"),
-        "a message written by one agent session did not reach the other: {seen:?}"
+    judge(
+        &t2,
+        "QUORUM-8812",
+        "(2) a message one agent session wrote reaches the other",
+        t2.answer.contains("QUORUM-8812"),
     );
 
     // ---- (4) the operator asks a question in prose, and it lands ----
@@ -268,7 +412,10 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     let question =
         format!("hey, is the codec work finished? the release is waiting on it (ref {ask})");
     let o = bob.vox(None, &["room", "post", &room, &question]);
-    assert!(o.ok, "the operator could not ask a question: {o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT: the operator could not ask a question: {o:?}"
+    );
     until(
         alice,
         None,
@@ -276,20 +423,24 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
         &["room", "read", &room],
         |o| o.stdout.contains(&ask),
     );
-    let (answer4, heard) = turn_split(
+    let t4 = turn(
+        &sb,
+        &profile,
         alice,
+        &a_wire,
         &a_proj,
         &oc_cfg,
         &room,
         "Did anyone ask you a question just now? Answer yes or no and quote it exactly, \
          including any reference code in it.",
     );
-    let heard_it = answer4.contains(&ask);
+    let heard_it = t4.answer.contains(&ask);
     println!("[proof] (4) alice's model quoted the operator's prose nonce {ask}: {heard_it}");
-    assert!(
+    judge(
+        &t4,
+        &ask,
+        "(4) the operator's plain prose reaches an agent's context",
         heard_it,
-        "plain prose from the operator did not reach an agent's context: the answer does \
-         not carry the question's nonce {ask}. The answer: {heard:?}"
     );
 
     // ---- (3) cursors are per session: two sessions of one identity, one daemon ----
@@ -300,7 +451,10 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
         None,
         &["room", "post", &room, &format!("cursor check {mark}")],
     );
-    assert!(o.ok, "the operator could not post the cursor check: {o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT: the operator could not post the cursor check: {o:?}"
+    );
     until(
         alice,
         None,
@@ -323,7 +477,10 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
                 session,
             ],
         );
-        assert!(o.ok, "vox agent hook --session {session}: {o:?}");
+        assert!(
+            o.ok,
+            "PRODUCT: `vox agent hook --session {session}` failed: {o:?}"
+        );
         o.stdout
     };
     let s1_first = drain(&s1);
@@ -348,12 +505,12 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     );
     assert!(
         !b,
-        "session s1 was shown the same post twice, so the drain keeps no cursor for it: \
-         {s1_again:?}"
+        "PRODUCT: session s1 was shown the same post twice, so the drain keeps no cursor for \
+         it: {s1_again:?}"
     );
     assert!(
         c,
-        "session s2, on the same identity and daemon, was not shown a post it never read \
+        "PRODUCT: session s2, on the same identity and daemon, was not shown a post it never read \
          ({mark}) because session s1 had consumed it: the cursor is not per session. s2's \
          drain: {s2_first:?}"
     );
