@@ -3,6 +3,8 @@
 
     scripts/ci_shard.py list  <list.tsv>                  build the release test binaries; list them
     scripts/ci_shard.py run   <list.tsv> <k> <n> <ran>    run shard k of n (`--ignored`); record each
+                                                          (the split weighs each binary by its
+                                                          measured time, ci_shard_weights.tsv)
     scripts/ci_shard.py union <dir>                       every listed binary ran, in exactly one shard
 
 `list` builds with `cargo test --release --workspace --no-run`, plus the cargo arguments in
@@ -80,12 +82,39 @@ def cmd_list(out):
     print(f"ci_shard: {len(rows)} test binaries listed in {out}")
 
 
+WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci_shard_weights.tsv")
+# A binary with no measured weight (a new proof) is taken to be this slow, in seconds.
+DEFAULT_WEIGHT = 60
+
+
+def assign(rows, n):
+    """Every binary to one of `n` shards, slowest first, each to the shard with least work so far.
+
+    The weights are seconds measured on a macOS runner (`ci_shard_weights.tsv`): dealt round
+    the shards in name order, the three slowest binaries fell in one shard, which took 69 of its 90
+    minutes. Deterministic for a given list and weights, so every shard computes the same split.
+    """
+    weights = {}
+    if os.path.exists(WEIGHTS):
+        with open(WEIGHTS) as f:
+            for line in f:
+                name, secs = line.rstrip("\n").split("\t")
+                weights[name] = int(secs)
+    shards = [[] for _ in range(n)]
+    load = [0] * n
+    for row in sorted(rows, key=lambda r: (-weights.get(r[0], DEFAULT_WEIGHT), r[0])):
+        i = load.index(min(load))
+        shards[i].append(row)
+        load[i] += weights.get(row[0], DEFAULT_WEIGHT)
+    return shards
+
+
 def cmd_run(listing, k, n, ran):
     k, n = int(k), int(n)
     if not 0 <= k < n:
         die(f"shard {k} of {n} does not exist")
     rows = read_list(listing)
-    mine = [r for i, r in enumerate(rows) if i % n == k]
+    mine = assign(rows, n)[k]
     print(f"ci_shard: shard {k} of {n} runs {len(mine)} of {len(rows)} binaries")
     failed = []
     with open(ran, "w") as rec:
