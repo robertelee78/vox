@@ -151,9 +151,11 @@ fine, sans anchor".
     `SILENCE_IS_DEATH` (30 s) MUST be replaced by a newcomer, or closed by a once-a-second task
     (`tend_liveness`).
 - **N-23.** Before a newcomer is filed, every connection held for that peer MUST be probed with one
-  ack-eliciting datagram, with a patience of 3 × RTT clamped to 250 ms–2 s. On integrate/v0.3.0 an
-  unanswered connection is closed (`file_inner`). On integrate/v0.2.10 it is retired instead, so that
-  what it carries finishes (V210-104, #299); that behaviour reaches v0.3.0 by the release sync.
+  ack-eliciting datagram, with a patience of 3 × RTT clamped to 250 ms–2 s. A held connection that does
+  not answer MUST be retired, not closed, so that what it carries finishes; one already retiring MUST
+  be left to finish. Every unanswered probe MUST be noted (V210-104, #299; V210-93). Status: built on
+  integrate/v0.2.10; arrives in v0.3.0 by the #226 sync. integrate/v0.3.0 still closes an unanswered
+  connection (`file_inner`).
 - **N-24.** Holding a connection MUST NOT keep it alive past its grace:
   - the stream loop MUST hold it weakly;
   - a tunnel MUST hold its connection only while it splices;
@@ -244,7 +246,7 @@ fine, sans anchor".
   confidentiality or authenticity.
 - **N-35. Publisher sequence (V29-23).** A publisher's `seq` MUST keep rising across its restarts:
   `max(previous + 1, now in ms)`.
-- **N-36. A peer book (PRD-001 R10).** A node MUST keep each member's last direct addresses (at most
+- **N-36. A peer book (2026-09-25, found by ADR-023's R10 gate).** A node MUST keep each member's last direct addresses (at most
   4, with the time each was last seen) in its own sealed store. It MUST fall back to them when no board
   has an address for the member, and MUST dial every other member of a room when it opens the room.
   Relayed paths MUST NOT be recorded.
@@ -278,3 +280,15 @@ fine, sans anchor".
 ADR-001 (principles), ADR-002 (identity), ADR-004 and ADR-005 (join), ADR-007 (membership),
 ADR-008 (log and wire tags), ADR-011 (transport), ADR-013 (tunnels), ADR-016 (node runtime),
 ADR-017 (room-bound services), ADR-022 (datagram flows).
+
+## Engineering Mantra
+
+These principles are binding on all work under this ADR:
+
+- **Do not be lazy.** Plenty of time to do it right.
+- **No shortcuts.** Every component is built to production quality from day one.
+- **Never make assumptions.** Dive deep before writing a single line of code.
+- **Measure three times, cut once.** Verify designs, implementations, and outputs.
+- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
+- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
+- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.

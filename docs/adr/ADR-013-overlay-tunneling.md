@@ -68,10 +68,11 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   port of its own machine in a room without any capability check. Offered services MUST persist in
   the room's sealed store (`SEG_SERVICES`), at most `MAX_SERVICES` (64) per room.
 - **T-8. Advertisements.** A service advertisement MUST NOT be posted as cleartext on the replicated
-  log (ADR-008). If advertised, it MUST be sealed to its audience (`ServiceAdvertisement`, ADR-008
-  tag `0x000F`, sealed per recipient like an SKDM, ADR-006). Status: the struct and the sealing
-  exist in `tunnel::service` with no caller. A member learns another's service tags out of band, and
-  closing that is ADR-017 M17.4.
+  log (ADR-008). If advertised, it MUST be sealed to exactly the host's explicitly approved readers in
+  that room (ADR-017, third revision: consent-bound services), per recipient like an SKDM (ADR-006),
+  as a `ServiceAdvertisement` (ADR-008 tag `0x000F`). A member the host has not approved MUST NOT be
+  able to read one. Status: the struct and the sealing exist in `tunnel::service` with no caller. A
+  member learns another's service tags out of band, and closing that is ADR-017 M17.4.
 - **T-9. Accountability.** Tunnel session establishment SHOULD be recorded as a signed event in
   attributable rooms (ADR-009). Status: not built; no entry type exists.
 - **T-10. SSH certificate authority, optional.** A Vox-issued OpenSSH certificate authority MAY be
@@ -211,3 +212,15 @@ proven when the decider runs `sudo scripts/family-lan-proof.sh`. Linux is not bu
 ADR-001 (scope), ADR-002 (identity), ADR-006 (sender keys), ADR-007 (consent), ADR-008 (log and
 tags), ADR-009 (attribution), ADR-011 (transport), ADR-012 (reachability), ADR-014 (macOS client),
 ADR-017 (room-bound services), ADR-022 (datagram flows and the app API).
+
+## Engineering Mantra
+
+These principles are binding on all work under this ADR:
+
+- **Do not be lazy.** Plenty of time to do it right.
+- **No shortcuts.** Every component is built to production quality from day one.
+- **Never make assumptions.** Dive deep before writing a single line of code.
+- **Measure three times, cut once.** Verify designs, implementations, and outputs.
+- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
+- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
+- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.
