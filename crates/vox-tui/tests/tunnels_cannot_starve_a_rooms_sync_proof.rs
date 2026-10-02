@@ -104,7 +104,8 @@ const REFUSED_WITHIN: Duration = Duration::from_secs(30);
 /// What the person is told past the cap.
 const LIMIT_SAID: &str = "16 tunnels are already open to this member";
 /// How the refusal tells them to free one (decider, 2026-10-01).
-const FREE_ONE_SAID: [&str; 4] = [
+const FREE_ONE_SAID: [&str; 5] = [
+    "`vox tunnel close`",
     "close the program using it",
     "`vox forward`",
     "`vox service remove`",
@@ -545,7 +546,12 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     let (alice_rows, alice_human) = listed(&alice, "in");
     let human_lines = |text: &str, way: &str| {
         text.lines()
-            .filter(|l| l.starts_with(&format!("tunnel {way} ")) && l.contains(tag.as_str()))
+            .filter(|l| {
+                l.starts_with("tunnel ")
+                    && l.contains(&format!(" {way} "))
+                    && l.contains(": open ")
+                    && l.contains(tag.as_str())
+            })
             .count()
     };
     let (bob_lines, alice_lines) = (

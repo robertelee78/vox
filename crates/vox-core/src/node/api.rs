@@ -836,7 +836,7 @@ impl Fault {
             }
             Fault::NoSuchForward => "no forward is listening at that local address",
             Fault::TunnelLimit => {
-                "16 tunnels are already open to this member\n       to free one: close the program using it, or restart the `vox up` or `vox forward` carrying it; on the host, `vox service remove` the service, or `vox trust remove` the member\n       `vox status` lists every tunnel, and when each last moved"
+                "16 tunnels are already open to this member\n       to free one: `vox tunnel close` it (`vox status` lists every tunnel, its number, and when it last moved), close the program using it, or restart the `vox up` or `vox forward` carrying it; on the host, `vox service remove` the service, or `vox trust remove` the member"
             }
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
@@ -1168,6 +1168,13 @@ pub enum NodeEvent {
     /// `reach_host_with_patience` had deliberately kept — died in a dropped `Result`.
     ProxyRefused {
         /// What went wrong, as this node saw it.
+        reason: String,
+    },
+    /// A tunnel this node carried was **closed on purpose** (V030-11): by a person here or at
+    /// the other end (`vox tunnel close`, the TUI), or as stuck. Not [`NodeEvent::ProxyRefused`]:
+    /// "refused or cut" read a deliberate close as a fault.
+    TunnelClosed {
+        /// Which session, by which end, and why.
         reason: String,
     },
     /// A dial this node started in the background failed, with what it reported.

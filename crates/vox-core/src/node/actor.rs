@@ -3551,6 +3551,12 @@ impl Node {
         } else {
             None
         };
+        // How long a stuck tunnel is given (V030-11), from the profile's config.
+        crate::tunnel::session::set_stuck_after(
+            paths
+                .tunnel_stuck_after()
+                .unwrap_or(crate::tunnel::session::STUCK_AFTER),
+        );
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
         let (event_tx, event_rx) = broadcast::channel(EVENT_QUEUE);
         // The handle keeps the sender so any number of clients may subscribe
@@ -6343,22 +6349,32 @@ impl Node {
                                 Some(&*carried),
                             );
                             tokio::pin!(serving);
+                            let who: String = crate::node::link::b32_encode(&peer)
+                                .chars()
+                                .take(12)
+                                .collect();
                             loop {
                                 tokio::select! {
                                     // The result used to be dropped here, so a host refusing a
                                     // member — untrusted, no such service, its own service down
                                     // — said nothing anywhere (PRD-001 R36).
                                     served = &mut serving => {
-                                        // Refusals only: a session that ends in an error
-                                        // after it was accepted is a disconnect, not a no.
-                                        if let Err(e @ crate::error::Error::TunnelDenied(_)) = served {
-                                            let who: String = crate::node::link::b32_encode(&peer)
-                                                .chars()
-                                                .take(12)
-                                                .collect();
-                                            let _ = events.send(NodeEvent::ProxyRefused {
-                                                reason: format!("refused {who} a tunnel: {e}"),
-                                            });
+                                        match served {
+                                            // Refusals only: a session that ends in an error
+                                            // after it was accepted is a disconnect, not a no.
+                                            Err(e @ crate::error::Error::TunnelDenied(_)) => {
+                                                let _ = events.send(NodeEvent::ProxyRefused {
+                                                    reason: format!("refused {who} a tunnel: {e}"),
+                                                });
+                                            }
+                                            // Closed on purpose (V030-11): the host is told
+                                            // too, as a close.
+                                            Err(e @ crate::error::Error::TunnelClosed(_)) => {
+                                                let _ = events.send(NodeEvent::TunnelClosed {
+                                                    reason: format!("a session from {who}: {e}"),
+                                                });
+                                            }
+                                            _ => {}
                                         }
                                         break;
                                     }
@@ -11143,10 +11159,8 @@ impl Node {
                     });
                 }
             },
-            move |reason: &str| {
-                let _ = events.send(NodeEvent::ProxyRefused {
-                    reason: reason.to_owned(),
-                });
+            move |note: crate::node::tunnel::TunnelNote| {
+                let _ = events.send(note_event(note));
             },
         ));
         let _ = self.event_tx.send(NodeEvent::ProxyUp {
@@ -11223,8 +11237,14 @@ impl Node {
                     crate::node::link::b32_encode(room)
                 ));
             },
-            move |reason: &str| {
-                let _ = report.send(reason.to_owned());
+            // A deliberate close is said as one, never as a refusal (V030-11).
+            move |note: crate::node::tunnel::TunnelNote| {
+                let _ = report.send(match note {
+                    crate::node::tunnel::TunnelNote::Refused(reason) => reason,
+                    crate::node::tunnel::TunnelNote::Closed(reason) => {
+                        format!("tunnel closed — {reason}")
+                    }
+                });
             },
         ));
         Ok((bound, task.abort_handle()))
@@ -11352,8 +11372,8 @@ impl Node {
             channel_id: Some(*channel_id),
         });
         let events = self.event_tx.clone();
-        let report = move |reason: String| {
-            let _ = events.send(NodeEvent::ProxyRefused { reason });
+        let report = move |note: crate::node::tunnel::TunnelNote| {
+            let _ = events.send(note_event(note));
         };
         let bound = if crate::tunnel::udp::is_udp(service_tag) {
             crate::node::tunnel::Forward::bind_udp(
@@ -12155,6 +12175,14 @@ async fn admit_board_records(
         }
     }
     admitted
+}
+
+/// The event a [`crate::node::tunnel::TunnelNote`] is said as.
+fn note_event(note: crate::node::tunnel::TunnelNote) -> NodeEvent {
+    match note {
+        crate::node::tunnel::TunnelNote::Refused(reason) => NodeEvent::ProxyRefused { reason },
+        crate::node::tunnel::TunnelNote::Closed(reason) => NodeEvent::TunnelClosed { reason },
+    }
 }
 
 fn fault_of(e: &Error) -> Fault {

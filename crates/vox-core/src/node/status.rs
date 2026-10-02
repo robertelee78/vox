@@ -1140,8 +1140,9 @@ impl SyncBook {
             }
             let _ = write!(
                 s,
-                "{{\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\"opened\":{},\
-                 \"last_moved\":{}}}",
+                "{{\"id\":{},\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\
+                 \"opened\":{},\"last_moved\":{}}}",
+                t.id,
                 b32_encode(&t.peer),
                 q(&t.service),
                 if t.outbound { "out" } else { "in" },
@@ -1149,7 +1150,31 @@ impl SyncBook {
                 t.last_moved
             );
         }
-        s.push(']');
+        // **Tunnels that ended for a reason a person should see** (V030-11): closed here, closed
+        // at the other end, or closed as stuck, with why; and how long a stuck tunnel is given.
+        s.push_str("],\"closed_tunnels\":[");
+        for (i, t) in crate::transport::quic::closed_tunnels().iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(
+                s,
+                "{{\"id\":{},\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\
+                 \"opened\":{},\"closed\":{},\"why\":{}}}",
+                t.id,
+                b32_encode(&t.peer),
+                q(&t.service),
+                if t.outbound { "out" } else { "in" },
+                t.opened,
+                t.closed,
+                q(&t.why)
+            );
+        }
+        let _ = write!(
+            s,
+            "],\"tunnel_stuck_after\":{}",
+            crate::tunnel::session::stuck_after().as_secs()
+        );
         s
     }
 }
@@ -1159,6 +1184,93 @@ impl SyncBook {
 
 const T_STATUS: u64 = 2301;
 const T_STATUS_REPORT: u64 = 2302;
+const T_TUNNEL_CLOSE: u64 = 2303;
+const T_TUNNEL_CLOSED: u64 = 2304;
+
+/// What `vox tunnel close` says it closed (V030-11): each tunnel as `vox status` lists it.
+#[must_use]
+pub fn closed_said(closed: &[crate::transport::quic::LiveTunnel]) -> String {
+    closed
+        .iter()
+        .map(|t| {
+            format!(
+                "tunnel {} {} {} for {}",
+                t.id,
+                if t.outbound { "to" } else { "from" },
+                b32_encode(&t.peer).chars().take(12).collect::<String>(),
+                t.service
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `body` is a tunnel-close request (V030-11), and if so what it names.
+#[must_use]
+pub fn close_request(body: &[u8]) -> Option<crate::transport::quic::TunnelSelector> {
+    let mut d = Decoder::new(body);
+    if !matches!((d.array(), d.uint()), (Ok(4), Ok(T_TUNNEL_CLOSE))) {
+        return None;
+    }
+    let mut field = || d.text().ok().filter(|t| !t.is_empty()).map(str::to_owned);
+    let (id, member, service) = (field(), field(), field());
+    Some(crate::transport::quic::TunnelSelector {
+        id: id.and_then(|i| i.parse().ok()),
+        member,
+        service,
+    })
+}
+
+/// Close what `which` names, here in the node, and answer with what was closed.
+///
+/// # Errors
+/// If the reply cannot be written.
+pub async fn serve_close(
+    stream: &mut UnixStream,
+    which: &crate::transport::quic::TunnelSelector,
+) -> Result<()> {
+    // Nothing closed and a reason: the selector named more than one member.
+    let (n, said) =
+        match crate::transport::quic::close_tunnels(which, "closed by a person on this side") {
+            Ok(closed) => (closed.len() as u64, closed_said(&closed)),
+            Err(refused) => (0, refused),
+        };
+    let mut e = Encoder::new();
+    e.array(3).uint(T_TUNNEL_CLOSED).uint(n).text(&said);
+    write_frame(stream, &e.finish()).await
+}
+
+/// Ask the node listening on `path` to close the tunnels `which` names: how many it closed,
+/// and each as `vox status` lists it — or none, and why not, when `which` named more than one
+/// member.
+///
+/// # Errors
+/// If the node cannot be reached, does not answer in time, or answers something else.
+pub async fn request_close(
+    path: &Path,
+    which: &crate::transport::quic::TunnelSelector,
+) -> Result<(u64, String)> {
+    let mut e = Encoder::new();
+    e.array(4)
+        .uint(T_TUNNEL_CLOSE)
+        .text(&which.id.map(|i| i.to_string()).unwrap_or_default())
+        .text(which.member.as_deref().unwrap_or_default())
+        .text(which.service.as_deref().unwrap_or_default());
+    let body = tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, exchange(path, e.finish()))
+        .await
+        .map_err(|_| crate::node::ipc::silent())??;
+    let mut d = Decoder::new(&body);
+    if let (Ok(3), Ok(T_TUNNEL_CLOSED)) = (d.array(), d.uint()) {
+        let n = d
+            .uint()
+            .map_err(|_| Error::MalformedIpc("ipc tunnel-close reply"))?;
+        let said = d
+            .text()
+            .map_err(|_| Error::MalformedIpc("ipc tunnel-close reply"))?;
+        return Ok((n, said.to_owned()));
+    }
+    Err(Error::MalformedIpc("ipc tunnel-close reply"))
+}
 
 /// Whether `body` is a status request.
 #[must_use]
@@ -1217,6 +1329,27 @@ pub async fn request(path: &Path) -> Result<String> {
 }
 
 async fn ask(path: &Path) -> Result<String> {
+    let mut e = Encoder::new();
+    e.array(1).uint(T_STATUS);
+    let body = exchange(path, e.finish()).await?;
+    let mut d = Decoder::new(&body);
+    if let (Ok(2), Ok(T_STATUS_REPORT)) = (d.array(), d.uint()) {
+        return d
+            .text()
+            .map(str::to_owned)
+            .map_err(|_| Error::MalformedIpc("ipc status reply"));
+    }
+    match Frame::from_bytes(&body)? {
+        Frame::Error { reason } => Err(Error::Path {
+            op: "vox status",
+            detail: reason,
+        }),
+        _ => Err(Error::MalformedIpc("ipc status reply")),
+    }
+}
+
+/// Greet the node listening on `path`, send it `request`, and return its one reply.
+async fn exchange(path: &Path, request: Vec<u8>) -> Result<Vec<u8>> {
     let mut stream = crate::node::ipc::connect_own(path).await?;
     // A connection that ends is named as such, never as a malformed message (V210-101); and none
     // of this is an identity bundle, which `MalformedBundle` said.
@@ -1233,28 +1366,13 @@ async fn ask(path: &Path) -> Result<String> {
         }
         _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
     }
-    let mut e = Encoder::new();
-    e.array(1).uint(T_STATUS);
-    if let Err(e) = write_frame(&mut stream, &e.finish()).await {
+    if let Err(e) = write_frame(&mut stream, &request).await {
         return Err(crate::node::ipc::named(path, e).await);
     }
     let Some(body) = read_frame(&mut stream).await? else {
         return Err(crate::node::ipc::hung_up(path).await);
     };
-    let mut d = Decoder::new(&body);
-    if let (Ok(2), Ok(T_STATUS_REPORT)) = (d.array(), d.uint()) {
-        return d
-            .text()
-            .map(str::to_owned)
-            .map_err(|_| Error::MalformedIpc("ipc status reply"));
-    }
-    match Frame::from_bytes(&body)? {
-        Frame::Error { reason } => Err(Error::Path {
-            op: "vox status",
-            detail: reason,
-        }),
-        _ => Err(Error::MalformedIpc("ipc status reply")),
-    }
+    Ok(body)
 }
 
 // ---- metrics endpoint ------------------------------------------------------
