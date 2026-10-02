@@ -82,7 +82,7 @@ const KILLED_WITHIN: Duration = Duration::from_secs(11);
 /// How soon after a SIGTERM the forward must say it: the close arrives at once and the next 1 s
 /// tick reads it. Short of the 8 s any inference from silence needs.
 const CLOSED_WITHIN: Duration = Duration::from_secs(3);
-/// The most this machine's own clock may stall (a `vox --version` start, or the redial poll's
+/// The most this machine's own clock may stall (a `/usr/bin/true` start, or the redial poll's
 /// slowest turn past its 200 ms sleep and 2 s echo) before a missed [`BACK_WITHIN`] is the
 /// runner's, not the forward's.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
@@ -142,7 +142,7 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
         // A turn is at most a 2 s echo and a 200 ms sleep; anything past that is this machine.
         slowest_turn = slowest_turn.max(turn.elapsed().saturating_sub(Duration::from_millis(2200)));
     }
-    let apparatus = slowest_turn.max(apparatus_spawn(&w.guest_dir));
+    let apparatus = slowest_turn.max(apparatus_spawn());
     let said = forward(&mut w.fwd).transcript();
     let saw_it_go = said.lines().any(|l| l.contains(GONE));
     eprintln!(
@@ -217,14 +217,21 @@ fn assert_says_stopped(who: &str, said: &str, anchor: &str) {
     );
 }
 
-/// How long this machine takes to start the shipped binary (`vox --version`, against the profile
-/// at `dir`). A stalled runner stalls this too.
-fn apparatus_spawn(dir: &std::path::Path) -> Duration {
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
     let t = Instant::now();
-    let (ok, out, err) = world::vox_once(dir, &world::args(&["--version"]));
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
         ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {out}{err}"
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }

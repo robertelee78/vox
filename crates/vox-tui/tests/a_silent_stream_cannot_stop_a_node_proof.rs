@@ -34,7 +34,8 @@
 //! `PRODUCT (staging):`; the escalation or the attack not holding is `CANNOT MEASURE:`; a fault of this proof's own (a file, a runtime, a signal) is `APPARATUS:`.
 //! Mallory joins **once**: a join turned away is the product's red, not something to retry past.
 //! The bound is read against an **apparatus clock** that is only the apparatus: the time to start
-//! a `vox --version` right after any slow post. A quiet post on the victim before the attack is
+//! `/usr/bin/true`, a process that is not vox, right after any slow post (a vox slow even only to
+//! start reads as the product's). A quiet post on the victim before the attack is
 //! the product's baseline, never part of that clock: one that fails, or misses [`PATIENCE`] while
 //! the clock is within [`APPARATUS_BUDGET`], is `PRODUCT (staging):` (the node is slow with no
 //! attack at all). A post during the attack over [`PATIENCE`] while the clock was over
@@ -211,14 +212,21 @@ fn free_udp_port() -> u16 {
         .port()
 }
 
-/// The apparatus clock: how long this machine takes, now, to start a `vox` that does nothing
-/// (`vox --version` on the profile at `data`). A stalled runner stalls this too.
-fn apparatus_spawn(data: &Path) -> Duration {
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
     let t = Instant::now();
-    let (ok, out, err) = vox_once(data, &args(&["--version"]));
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
         ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {out}{err}"
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }
@@ -426,10 +434,10 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
     );
     println!("[proof] baseline: a quiet post took {quiet:?} (ok={ok}) before the attack");
     if !(ok && quiet < PATIENCE) {
-        let apparatus = apparatus_spawn(&victim_dir);
+        let apparatus = apparatus_spawn();
         assert!(
-            ok || apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+            !ok || apparatus <= APPARATUS_BUDGET,
+            "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
              {APPARATUS_BUDGET:?}) right after the quiet post took {quiet:?}, so the runner, not \
              the node, may be slow. The post said: {said}"
         );
@@ -491,10 +499,10 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
              silent Sync streams open. It said: {said}"
         );
         if t >= PATIENCE || !ok {
-            let apparatus = apparatus_spawn(&victim_dir);
+            let apparatus = apparatus_spawn();
             assert!(
                 apparatus <= APPARATUS_BUDGET,
-                "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+                "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
                  {APPARATUS_BUDGET:?}) while post {i} took {t:?}"
             );
             panic!(

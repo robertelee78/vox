@@ -29,8 +29,8 @@
 //! `APPARATUS:` names a fault of this proof's own (a process it could not start, a file
 //! it could not write, a signal it could not send). Each join is tried **once**: a join turned
 //! away is the product's red, not something to retry past. The bound is read against an
-//! **apparatus clock** on the same timeline — how long this machine takes to start a `vox
-//! --version`, and the poll's slowest turn — and a bound missed while that was over
+//! **apparatus clock** on the same timeline — how long this machine takes to start
+//! `/usr/bin/true` (not vox, so a slow vox reads as the product's), and the poll's slowest turn — and a bound missed while that was over
 //! [`APPARATUS_BUDGET`] is CANNOT MEASURE.
 //!
 //! **Mutation that must turn it red:** the union filled room by room and cut at eight
@@ -241,14 +241,21 @@ fn join(dir: &Path, link: &str, name: &str) -> (bool, String) {
     (ok, format!("{}{}", out.trim(), err.trim()))
 }
 
-/// The apparatus clock: how long this machine takes, now, to start a `vox` that does nothing
-/// (`vox --version` on the profile at `dir`). A stalled runner stalls this too.
-fn apparatus_spawn(dir: &Path) -> Duration {
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
     let t = Instant::now();
-    let (ok, out, err) = vox(dir, &["--version"], None);
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
         ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {out}{err}"
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }
@@ -443,7 +450,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
         std::thread::sleep(Duration::from_millis(200));
     };
     let alive = the_anchor.0.try_wait().ok().flatten().is_none();
-    let apparatus = slowest_turn.max(apparatus_spawn(&bob_dir));
+    let apparatus = slowest_turn.max(apparatus_spawn());
     let said_it_went = std::fs::read_to_string(&bob_err)
         .unwrap_or_default()
         .contains("the connection to this anchor is gone");

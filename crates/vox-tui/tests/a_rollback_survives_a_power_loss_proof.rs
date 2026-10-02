@@ -30,8 +30,8 @@
 //! Every red says which it is: `PRODUCT:` quotes what `vox` said or did; `CANNOT MEASURE:` is
 //! staging or the recorder not seeing what it must (each recorded run must show at least one
 //! `open` by `vox`, so a recorder that recorded nothing never passes for "vox did nothing");
-//! `APPARATUS:` is the proof's own I/O. The two 20 s bounds are read beside a no-op `vox
-//! --version` timed on the same timeline: over the bound with the apparatus over its budget is
+//! `APPARATUS:` is the proof's own I/O. The two 20 s bounds are read beside `/usr/bin/true`, a
+//! process that is not vox, timed on the same timeline: over the bound with the apparatus over its budget is
 //! `CANNOT MEASURE: apparatus took X`.
 
 #![cfg(target_os = "macos")]
@@ -86,21 +86,25 @@ fn recorder_saw_vox(events: &[Event]) -> bool {
     events.iter().any(|e| matches!(&e.call, Call::Open { .. }))
 }
 
-/// The most the apparatus may take — a no-op `vox --version` here and now — before a rollback
+/// The most the apparatus may take — `/usr/bin/true` here and now — before a rollback
 /// over its bound is the runner's, not the product's.
 const APPARATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long a no-op `vox --version` takes on this timeline: the runner's own stall.
-fn noop_vox() -> std::time::Duration {
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> std::time::Duration {
     let t = std::time::Instant::now();
-    let out = Command::new(VOX)
-        .arg("--version")
-        .env_clear()
-        .output()
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot run a no-op vox: {e}"));
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
-        out.status.success(),
-        "APPARATUS: the no-op `vox --version` failed"
+        ok,
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }
@@ -478,7 +482,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
             "[proof] (4) a hanging leftover: ok={ok} in {took:?}; installed as .vox-previous: \
              {installed}; left: {left}"
         );
-        let apparatus = noop_vox();
+        let apparatus = apparatus_spawn();
         if ok || installed || left {
             failures.push(format!(
                 "(4) a hanging leftover: ok={ok}, installed {installed}, left {left}: {said}"
@@ -525,7 +529,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
         let (ok, said) = rollback(&dir, &home);
         let took = t0.elapsed();
         eprintln!("[proof] (8) a leftover whose child holds stdout: ok={ok} in {took:?}");
-        let apparatus = noop_vox();
+        let apparatus = apparatus_spawn();
         if took > std::time::Duration::from_secs(20) && apparatus > APPARATUS_BUDGET {
             unmeasured.push(format!(
                 "(8) apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) beside a rollback \
