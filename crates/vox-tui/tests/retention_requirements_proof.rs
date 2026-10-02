@@ -9,10 +9,14 @@
 //!   (`VOX_TEST_CLOCK_SKEW_MS`, the test-only knob the causal-order proofs use), so every one of
 //!   them is ten years old by its author's claim — and age runs from that claim. They must all
 //!   still read, on both members, across sweeps and a restart.
-//! - **R7, the admin changes it later.** Only a holder of the `policy` capability — the room's
-//!   admin — may set it; a member's attempt is refused and changes nothing, on any node. The
-//!   admin's change applies to what is already stored, on every member, in both directions:
-//!   shortened, older messages go everywhere; lengthened to forever, what is left stays.
+//! - **R7, the admin changes it later.** Only the room's creator or an admin — a holder of the
+//!   `policy` capability — sets the room's retention (V030-32). A member who is neither may set
+//!   **their own node's**, lower than the room's and governing only that member's copy: their
+//!   messages go at that bound on their node alone, while every other member keeps the room's. A
+//!   member asking for longer than the room is refused and changes nothing anywhere; a node
+//!   retention file asking for longer is ignored and the node says so. The admin's change applies
+//!   to what is already stored, on every member, in both directions: shortened, older messages go
+//!   everywhere; lengthened to forever, what is left stays.
 //! - **R10, a skeleton still does its job.** An expired entry keeps its signed skeleton, and that
 //!   skeleton still takes part in fork detection: a second, conflicting entry signed by the same
 //!   author for an **expired** position is caught as an equivocation, and the author is frozen
@@ -428,6 +432,11 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
         &[],
     );
     let _b = daemon(&bob, "bob", &format!("{IDENTITY}\n"), "127.0.0.1:0", &[]);
+    // carol's node retention file asks for 60 days, longer than every value the admin sets
+    // below: a node may keep less than its room, never more, so it is ignored, and her node says
+    // so (V030-32).
+    std::fs::write(carol.join("cfg").join("retention"), "default 5184000\n")
+        .expect("APPARATUS: carol's node retention file");
     let _c = daemon(
         &carol,
         "carol",
@@ -456,19 +465,30 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
         println!("R7: the admin set {preset}; all three members report {want}");
     }
 
-    // ---- a member who is not the admin cannot change it ---------------------------------
-    let (ok, said) = set_retention(&bob, &room, "5");
+    // ---- carol's file asked for longer than the room: ignored, and her node says so -----
+    // The presets above already showed carol reporting the room's value each time. What a person
+    // running her node reads is the warning on its output.
+    let carol_said = std::fs::read_to_string(carol.join("daemon-carol.err")).unwrap_or_default();
     println!(
-        "R7: bob (not the admin) tried 5 s: ok={ok} — {}",
+        "R7: carol's node, whose file asks for 60 days: warned = {}",
+        carol_said.contains("longer than the room keeps it")
+    );
+    assert!(
+        carol_said.contains("longer than the room keeps it"),
+        "PRODUCT: carol's node file asks for longer than the room keeps messages; it is ignored, \
+         and her node must say so. Her daemon said:\n{carol_said}"
+    );
+
+    // ---- a member who is not the admin never keeps longer than the room -------------------
+    let (ok, said) = set_retention(&bob, &room, "2w");
+    println!(
+        "R7: bob (not the admin) asked for 2 weeks in a 1-week room: ok={ok} — {}",
         said.trim()
     );
     assert!(
-        !ok,
-        "PRODUCT: a member without the policy capability must be refused: {said}"
-    );
-    assert!(
-        said.contains("admin"),
-        "PRODUCT: the refusal must say why: {said}"
+        !ok && said.contains("never longer"),
+        "PRODUCT: a member who is not the admin must be refused a retention longer than the \
+         room's, saying why: ok={ok}, {said}"
     );
     std::thread::sleep(Duration::from_secs(3));
     for (dir, who) in members {
@@ -478,6 +498,62 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
             "PRODUCT: {who}: a refused change must change nothing"
         );
     }
+
+    // ---- ...but may keep less, on their own node only -------------------------------------
+    let (ok, said) = set_retention(&bob, &room, "30");
+    println!(
+        "R7: bob (not the admin) set 30 s for himself: ok={ok} — {}",
+        said.trim()
+    );
+    assert!(
+        ok && said.contains("set your own retention"),
+        "PRODUCT: a member who is not the admin may set a retention below the room's for their \
+         own node, and must be told it is their own: ok={ok}, {said}"
+    );
+    until_retention(&bob, "PRODUCT", "bob", 30, 30);
+    for (dir, who) in [(&alice, "alice"), (&carol, "carol")] {
+        assert_eq!(
+            retention_now(dir, who),
+            604_800,
+            "PRODUCT: {who}: bob's own retention must change nothing on {who}'s node"
+        );
+    }
+    for i in 1..=3 {
+        post(&alice, &room, &format!("mine {i}"));
+    }
+    until(
+        &bob,
+        &room,
+        "PRODUCT (staging): bob to read alice's 3",
+        60,
+        |t| count(t, "mine ") == 3,
+    );
+    until(
+        &bob,
+        &room,
+        "PRODUCT: bob's own 30 s must take the 3 from bob's node",
+        90,
+        |t| count(t, "mine ") == 0,
+    );
+    for (dir, who) in [(&alice, "alice"), (&carol, "carol")] {
+        let t = read(dir, &room);
+        println!(
+            "R7: after bob's own 30 s took them on his node, {who} still reads {} of 3",
+            count(&t, "mine ")
+        );
+        assert_eq!(
+            count(&t, "mine "),
+            3,
+            "PRODUCT: bob's own retention governs only bob's copy: {who} must still read all 3"
+        );
+    }
+    // bob goes back to the room's week: equal to the room's, so his own again, and allowed.
+    let (ok, said) = set_retention(&bob, &room, "1w");
+    assert!(
+        ok,
+        "PRODUCT: a member may set their own retention back to the room's: {said}"
+    );
+    until_retention(&bob, "PRODUCT", "bob", 604_800, 30);
 
     // ---- messages, then the admin shortens it: it reaches what is already held -----------
     for i in 1..=10 {
