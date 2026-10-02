@@ -634,27 +634,6 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             "CANNOT MEASURE: staging not achieved — `kill {sig} {bob_pid}` failed"
         );
     };
-    for i in 0..20 {
-        to_bob("-STOP");
-        let o = alice.vox(None, &["room", "post", &r, &format!("F19 alice {i:02}")]);
-        let posted = std::thread::scope(|s| {
-            let bobs = s.spawn(|| bob.vox(None, &["room", "post", &r, &format!("F19 bob {i:02}")]));
-            // Long enough for bob's request to be written to his control socket.
-            std::thread::sleep(Duration::from_millis(200));
-            to_bob("-CONT");
-            bobs.join()
-        });
-        assert!(o.ok, "PRODUCT: alice's post {i} was refused: {o:?}");
-        let o = posted.unwrap_or_else(|_| panic!("CANNOT MEASURE: bob's post {i} thread panicked"));
-        assert!(o.ok, "PRODUCT: bob's post {i} was refused: {o:?}");
-    }
-    until(
-        bob,
-        None,
-        "alice's last interleaved post to reach bob",
-        &["room", "read", &r],
-        |o: &Out| o.ok && o.stdout.contains("F19 alice 19"),
-    );
     let order = |w: &Worker| -> Vec<serde_json::Value> {
         let o = w.vox(None, &["room", "read", &r, "--json"]);
         assert!(o.ok, "PRODUCT: `room read --json` failed: {o:?}");
@@ -672,6 +651,37 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             })
             .collect()
     };
+    // **The order rows reach bob, watched live** by a `vox room tail` attached before the
+    // interleave: it emits each row as bob's node renders it (the node's events), so the late
+    // rows are measured without `--since`, and a `--since` that read "after the cursor" by
+    // position cannot hide the rows it is to be checked against. It starts from the last row bob
+    // holds, so it has no backlog to read.
+    let watch_from = hashes(&order(bob))
+        .last()
+        .cloned()
+        .unwrap_or_else(|| panic!("PRODUCT (staging): bob's `room read --json` is empty"));
+    let watcher = Steady::start(bob, &r, &watch_from, &tmp.path().join("watcher.stderr"));
+    for i in 0..20 {
+        to_bob("-STOP");
+        let o = alice.vox(None, &["room", "post", &r, &format!("F19 alice {i:02}")]);
+        let posted = std::thread::scope(|s| {
+            let bobs = s.spawn(|| bob.vox(None, &["room", "post", &r, &format!("F19 bob {i:02}")]));
+            // Long enough for bob's request to be written to his control socket.
+            std::thread::sleep(Duration::from_millis(200));
+            to_bob("-CONT");
+            bobs.join()
+        });
+        assert!(o.ok, "PRODUCT: alice's post {i} was refused: {o:?}");
+        let o = posted.unwrap_or_else(|_| panic!("APPARATUS: bob's post {i} thread panicked"));
+        assert!(o.ok, "PRODUCT: bob's post {i} was refused: {o:?}");
+    }
+    until(
+        bob,
+        None,
+        "alice's last interleaved post to reach bob",
+        &["room", "read", &r],
+        |o: &Out| o.ok && o.stdout.contains("F19 alice 19"),
+    );
     let rows_with = |rows: &[serde_json::Value], text: &str| -> String {
         rows.iter()
             .find(|x| x["text"].as_str() == Some(text))
@@ -683,42 +693,101 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     };
     let held = order(bob);
     let before = hashes(&held);
-    // The cursor a consumer of bob's node holds partway through the interleave: bob's own post,
-    // processed when it arrived. What follows it is what arrived after it, in arrival order:
-    // `room read --since` reads it so.
-    let mid = rows_with(&held, "F19 bob 10");
+    let place = |h: &str| before.iter().position(|x| x == h);
+    // The watcher has emitted every interleaved row once it holds all forty.
+    let interleaved: Vec<String> = (0..20)
+        .flat_map(|i| [format!("F19 alice {i:02}"), format!("F19 bob {i:02}")])
+        .map(|text| rows_with(&held, &text))
+        .collect();
+    let watched_until = Instant::now() + Duration::from_secs(30);
+    let arrival: Vec<String> = loop {
+        let seen = watcher
+            .rows
+            .lock()
+            .expect("APPARATUS: the watcher's row lock")
+            .clone();
+        if interleaved.iter().all(|h| seen.contains(h)) {
+            break seen;
+        }
+        assert!(
+            Instant::now() < watched_until,
+            "PRODUCT (staging): a `vox room tail` attached to bob's node before the interleave \
+             emitted only {} of its 40 rows within 30 s of bob holding them all",
+            interleaved.iter().filter(|h| seen.contains(h)).count()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut watcher = watcher;
+    let _ = watcher.run.child.kill();
+    let _ = watcher.run.child.wait();
+    // The cursor a consumer of bob's node holds partway through the interleave: one of bob's own
+    // posts, processed when it arrived. Its late rows reached bob after it (in the watcher's
+    // order) and sit above it in the room's order. The first of bob's posts 0..=10 with one is the
+    // cursor, so at least ten of his later posts follow it.
+    let cursor_at = |i: usize| -> (String, Vec<String>, Vec<String>) {
+        let cursor = rows_with(&held, &format!("F19 bob {i:02}"));
+        let at = place(&cursor).expect("APPARATUS: the cursor was taken from bob's own rows");
+        let after: Vec<String> = arrival
+            .iter()
+            .skip_while(|h| **h != cursor)
+            .skip(1)
+            .cloned()
+            .collect();
+        let late = after
+            .iter()
+            .filter(|h| place(h).is_some_and(|p| p < at))
+            .cloned()
+            .collect();
+        (cursor, after, late)
+    };
+    let Some((pick, (mid, arrived_after, late_expected))) = (0..=10)
+        .map(|i| (i, cursor_at(i)))
+        .find(|(_, (_, _, late))| !late.is_empty())
+    else {
+        panic!(
+            "CANNOT MEASURE (staging not achieved): no row reached bob after any of his posts \
+             0..=10 and sits above it in the room's order (as a live `vox room tail` watched \
+             them arrive), so the interleave delivered nothing late"
+        );
+    };
     let since = |w: &Worker| -> Vec<String> {
         let o = w.vox(None, &["room", "read", &r, "--since", &mid, "--json"]);
         assert!(o.ok, "PRODUCT: `room read --since` failed: {o:?}");
         hashes(&o.ndjson())
     };
     let followed = since(bob);
-    // The late rows: arrived after the cursor, but above it in the room's order. A node that
-    // rebuilt "after the cursor" from the room's order on reopen would skip them for good.
-    let place = |h: &str| before.iter().position(|x| x == h);
-    let at_mid = place(&mid).expect("APPARATUS: the cursor was taken from bob's own rows");
-    let late: Vec<&String> = followed
-        .iter()
-        .filter(|h| place(h).is_some_and(|i| i < at_mid))
-        .collect();
     eprintln!(
-        "[proof] before bob's node restarts: {} rows; {} arrived after the cursor (bob's post \
-         10), {} of them above it in the room's order",
+        "[proof] before bob's node restarts: {} rows; the cursor is bob's post {pick}; {} rows \
+         reached bob after it as a live tail watched, {} of them above it in the room's order; \
+         `read --since` the cursor returns {}",
         before.len(),
-        followed.len(),
-        late.len()
+        arrived_after.len(),
+        late_expected.len(),
+        followed.len()
     );
+    let missed: Vec<&String> = arrived_after
+        .iter()
+        .filter(|h| !followed.contains(h))
+        .collect();
+    let missed_late = late_expected
+        .iter()
+        .filter(|h| !followed.contains(h))
+        .count();
     assert!(
-        !late.is_empty(),
-        "CANNOT MEASURE (staging not achieved): no row that arrived after the cursor sits above it \
-         in the room's order, so a node that read \"after the cursor\" by position could not be \
-         told apart"
+        missed.is_empty(),
+        "PRODUCT: `vox room read --since` the cursor (bob's post {pick}) left out {} of the {} rows \
+         that reached bob after it ({missed_late} of the {} that sit above it in the room's order): \
+         a consumer holding that cursor would never see them: {missed:?}",
+        missed.len(),
+        arrived_after.len(),
+        late_expected.len()
     );
     assert!(
         followed.len() >= 10,
         "CANNOT MEASURE (staging not achieved): only {} rows arrived after the cursor {mid}",
         followed.len()
     );
+    let late = &late_expected;
 
     room.restart(1); // SIGKILL by PID, then `vox daemon` with the identity passphrase alone
     let bob = &room.workers[1];
