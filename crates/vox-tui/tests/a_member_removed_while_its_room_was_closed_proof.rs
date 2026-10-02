@@ -7,28 +7,41 @@
 //! stays closed across restarts and its key is not held, so neither could reach it: after the
 //! reopen each side went on reading the other, and re-trusting the member never restored this
 //! node's reading of it there. The removal is now recorded for the closed room and acted on when it
-//! opens: the member's keys are dropped and the lock changes; a per-room consent given without
-//! trust is left alone.
+//! opens: the member's keys are dropped and the lock changes.
+//!
+//! **And a key goes only to a member the owner trusts** (V210-148). There are rooms, nodes and
+//! trust, and no per-room grant beside them: the TUI's `:consent grant` is gone, and the node
+//! itself refuses to release a key to a member its keyring does not name, whatever a client asks.
+//! So carol, admitted to C but never trusted by bob, reads nothing bob writes, until bob trusts her.
 //!
 //! **Staging.** Alice, bob and carol, three daemons on loopback, no anchor. Alice creates room C;
 //! bob and carol join. Alice and bob trust each other; carol trusts bob; bob does not trust carol.
-//! Alice posts until bob reads her. Bob's daemon stops and his real `vox tui` opens C, consents to
-//! carol in it (`:consent grant`, a per-room consent without trust) and `:close`s it
-//! (`tests/pty/tui_close_room.py`). Bob's daemon starts with C closed (`[closed]`, or
-//! `CANNOT MEASURE`), bob removes alice from his ring, and his daemon restarts with C's
-//! passphrase, which opens C.
+//! Alice posts until bob reads her. Bob's daemon stops and his real `vox tui` opens C, selects
+//! carol, types `:consent grant`, posts `BOB-AFTER-GRANT` from the composer and keeps the TUI's node
+//! up 20 s to deliver it, and `:close`s C (`tests/pty/tui_close_room.py`). Bob's daemon
+//! starts with C closed (`[closed]`), bob removes alice from his ring, and his daemon restarts with
+//! C's passphrase, which opens C.
 //!
 //! **Asserted:**
 //! - (a) alice posts after the removal, and 20 s later bob renders **0** of those posts;
-//! - (b) bob posts after the reopen: carol renders them (the per-room consent survives the reopen,
-//!   and bob's posts went out), and alice renders **0** of them 20 s after carol has;
+//! - (b) bob posts after the reopen, and 20 s later alice renders **0** of them, and carol, whom bob
+//!   never trusted, renders **0** of them;
 //! - (c) bob trusts alice again, and within 120 s renders alice's posts made after that, and those
-//!   from (a) too (they reached him; only her key was missing); and alice renders bob's post made
-//!   after the re-trust.
+//!   from (a) too (they reached him; only her key was missing); alice renders bob's post made
+//!   after the re-trust; and bob trusts carol, and within 120 s she renders his post made after
+//!   it — the positive control for (b): bob's posts go out, and carol reads him once he trusts her;
+//! - (d) `:consent grant` is not a command: the TUI answers "unknown command", and carol's row never
+//!   shows her trusted;
+//! - (e) bob's post right after it: alice, whom bob trusts, renders it (so it went out), and carol,
+//!   whom he never trusted, renders **0** of it 10 s after alice has.
 //!
 //! **Mutations that must turn it red:** the key drop on opening disabled (`forget_untrusted_keys`
-//! in `act_on_removals_while_closed`): (a) red. The lock change on opening disabled (the `revoke`
-//! there): (b) red, and (c) red.
+//! in `act_on_removals_while_closed`): (a) red. The lock change on opening disabled
+//! (`revoke_untrusted_consents` there, and the `revoke` after it): (b) red for alice, and (c) red.
+//! The TUI's `:consent grant` restored **with** the node's keyring check in `release_key_to` kept:
+//! (e) holds — the node refuses the key — and only (d) is red. Restored with that check removed:
+//! (e) red, as PRODUCT: carol reads bob's post. ((b) stays 0 for carol even then: the reopen
+//! withdraws any consent to a member the keyring does not name.)
 
 #![cfg(unix)]
 
@@ -241,7 +254,7 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         "PRODUCT (staging): bob, who trusts alice and is trusted by her, never read her posts in 120 s"
     );
 
-    // ---- bob's TUI consents to carol in C (no trust) and closes C ------------------------
+    // ---- bob's TUI: `:consent grant` on carol (never trusted), then `:close` C -------------
     drop(bob_d);
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_close_room.py");
     let out = pty_driver::run(
@@ -271,14 +284,30 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         out.code
     );
     assert!(
-        out.code == Some(0)
-            && said.contains("closed the TUI consented to")
-            && said.contains("closed the TUI said done to :close"),
-        "PRODUCT (staging): bob's `vox tui` did not consent to carol in room C and close it as a person \
-         does; exit {:?} at stage {:?}:\n{said}",
+        out.code == Some(0) && said.contains("closed the TUI said done to :close"),
+        "PRODUCT (staging): bob's `vox tui` did not close room C as a person does; exit {:?} at \
+         stage {:?}:\n{said}",
         out.code,
         out.stage
     );
+
+    // ---- (e) bob's post right after `:consent grant`: alice reads it, carol does not -------------
+    assert!(
+        said.contains("closed posted BOB-AFTER-GRANT"),
+        "PRODUCT (staging): bob's `vox tui` did not post from its composer after `:consent grant`: \
+         {said}"
+    );
+    let e_alice = until(Duration::from_secs(60), || {
+        reads(&alice, &room, "BOB-AFTER-GRANT")
+    });
+    assert!(
+        e_alice,
+        "PRODUCT (staging): alice, who trusts bob and is trusted by him, never read the post bob made \
+         in his TUI, so carol not reading it would show nothing"
+    );
+    std::thread::sleep(Duration::from_secs(10));
+    let e_carol = count(&carol, &room, "BOB-AFTER-GRANT");
+    println!("[proof] (e) carol renders {e_carol} of bob's post made after `:consent grant`");
 
     // ---- with C closed, bob removes alice from his ring ---------------------------------------
     let bob_d = daemon(&bob, "bob-2", &format!("{IDENTITY}\n"));
@@ -310,21 +339,14 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     let a = count(&bob, &room, "ALICE-AFTER-REMOVAL");
     println!("[proof] (a) bob renders {a} of alice's 3 posts made after he removed her");
 
-    // ---- (b) bob's posts after the reopen: carol reads them, alice does not -------------------
+    // ---- (b) bob's posts after the reopen: neither alice nor carol reads them --------------------
     for k in 1..=3 {
         post(&bob, &room, &format!("BOB-AFTER-REOPEN {k}"));
     }
-    let carol_read = until(Duration::from_secs(120), || {
-        reads(&carol, &room, "BOB-AFTER-REOPEN 3")
-    });
-    assert!(
-        carol_read,
-        "PRODUCT: carol, consented to in room C without trust, never read bob's posts after the \
-         reopen: a per-room consent must survive the room opening again"
-    );
     std::thread::sleep(Duration::from_secs(20));
     let b = count(&alice, &room, "BOB-AFTER-REOPEN");
-    println!("[proof] (b) carol reads bob's posts after the reopen; alice renders {b} of 3");
+    let b_carol = count(&carol, &room, "BOB-AFTER-REOPEN");
+    println!("[proof] (b) after the reopen alice renders {b} of bob's 3 posts, carol {b_carol}");
 
     // ---- (c) bob trusts alice again and reads her again --------------------------------------
     let (ok, _, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
@@ -347,6 +369,17 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
          {c_alice} ({:?})",
         t0.elapsed()
     );
+    // And carol, once bob trusts her: the positive control for (b).
+    let (ok, _, err) = vox(&bob, &["trust", "add", &fps[2], "--name", "carol"], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): bob's `vox trust add` of carol failed: {err}"
+    );
+    post(&bob, &room, "BOB-AFTER-TRUSTING-CAROL");
+    let c_carol = until(Duration::from_secs(120), || {
+        reads(&carol, &room, "BOB-AFTER-TRUSTING-CAROL")
+    });
+    println!("[proof] (c) carol reads bob once he trusts her: {c_carol}");
 
     assert_eq!(
         a, 0,
@@ -358,6 +391,11 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         "PRODUCT: (b) alice renders {b} of bob's posts made after he removed her while room C was \
          closed: the lock did not change when C opened"
     );
+    assert_eq!(
+        b_carol, 0,
+        "PRODUCT: (b) carol, whom bob never trusted, renders {b_carol} of his posts in room C: his \
+         node released her his key (V210-148). The TUI said: {said}"
+    );
     assert!(
         c,
         "PRODUCT: (c) bob trusted alice again, yet within 120 s he does not read her posts in \
@@ -367,5 +405,30 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         c_alice,
         "PRODUCT: (c) bob trusted alice again, yet within 120 s she does not read his post made \
          after it in room C: his key never came back to her"
+    );
+    assert!(
+        c_carol,
+        "PRODUCT: (c) bob trusted carol, yet within 120 s she does not read his post made after it \
+         in room C: so (b)'s zero for her may only mean his posts never went out"
+    );
+    assert_eq!(
+        e_carol, 0,
+        "PRODUCT: (e) carol, whom bob never trusted, renders bob's post made after `:consent \
+         grant`: his node released her his key (V210-148). The TUI said: {said}"
+    );
+    assert!(
+        said.contains("closed :consent grant is not a command"),
+        "PRODUCT: (d) bob's `vox tui` still takes `:consent grant`, a per-room grant outside the \
+         keyring (V210-148): {said}"
+    );
+    assert!(
+        !said
+            .lines()
+            .filter(|l| l.contains(":consent grant answered"))
+            .any(|l| l
+                .rsplit("row then:")
+                .next()
+                .is_some_and(|row| row.contains("trusted"))),
+        "PRODUCT: (d) after `:consent grant`, bob's TUI shows carol trusted: {said}"
     );
 }

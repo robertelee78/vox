@@ -366,8 +366,6 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::OpenChannel { .. } => "opening a room",
         NodeCommand::SendText { .. } => "sending a message",
         NodeCommand::Sync { .. } => "syncing",
-        NodeCommand::Consent { .. } => "consenting to a member",
-        NodeCommand::Revoke { .. } => "revoking a member",
         NodeCommand::Serve { .. } => "publishing a service",
         NodeCommand::Up { .. } => "bringing the proxy up",
         NodeCommand::Forward { .. } => "opening a forward",
@@ -3301,12 +3299,6 @@ pub struct Node {
     anchor_owed: BTreeMap<(Digest32, Digest32), u64>,
     /// When a background dial to each member was last started: see `reach_member`.
     member_dialed_at: BTreeMap<Digest32, u64>,
-    /// Explicit consents waiting on the network: for a member's dial (answered on `Dialed` by
-    /// delivering, or on `ReachFailed` as `Unreachable`), or for that member's bundle record to
-    /// reach this node's board (retried on the room's `SyncDone`). Each carries its attempts so
-    /// far, so one that cannot succeed is answered rather than kept. The person gets the real
-    /// outcome and the node keeps answering meanwhile.
-    pending_consents: Vec<(Digest32, Digest32, oneshot::Sender<Outcome>, u8)>,
     /// Each room's view summary and detail as this node's own latest write left them, taken under the room's lock
     /// by the write itself. `view_of` uses it when a session holds the room, so a person always sees
     /// their own post in what they read straight after, however long that session holds on. A room's
@@ -3561,7 +3553,6 @@ impl Node {
             address_serial: 0,
             anchor_owed: BTreeMap::new(),
             member_dialed_at: BTreeMap::new(),
-            pending_consents: Vec::new(),
             fresh_details: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
             redeliver_now: false,
@@ -3735,17 +3726,6 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
-                    // A consent to a member with no connection is answered when the dial it
-                    // started lands: see `pending_consents`.
-                    if let NodeCommand::Consent { channel_id, target } = command {
-                        let outcome = self.consent(&channel_id, target, true).await;
-                        self.settle_consent(channel_id, target, reply, outcome, 0)
-                            .await;
-                        self.note_if_stalled(name, started);
-                        self.publish().await;
-                        self.schedule().await;
-                        continue;
-                    }
                     // **Unlock is answered once the rooms it held are held again** (#208). They
                     // reopen off the actor so the node answers everyone meanwhile, but a caller
                     // told `Done` — `vox daemon`, which then opens its control socket — must not
@@ -3831,7 +3811,6 @@ impl Node {
                     // connection died (D1a) and raises the periodic request (D7).
                     self.sync_tick().await;
                     let ran = self.schedule().await;
-                    self.retry_orphaned_consents().await;
                     if ran || self.paths_moved() {
                         self.publish().await;
                     }
@@ -3937,26 +3916,6 @@ impl Node {
             NodeCommand::JoinChannel { .. } => {
                 debug_assert!(false, "JoinChannel is answered by begin_join_channel");
                 Outcome::Failed(Fault::Internal)
-            }
-            // Answered by the run loop, which can keep the reply until a dial lands.
-            NodeCommand::Consent { channel_id, target } => {
-                self.consent(&channel_id, target, true).await
-            }
-            NodeCommand::Revoke { channel_id, target } => {
-                // A per-room revocation of a **trusted** identity does not hold: the ring
-                // still names it, so `deliver_owed_consents` re-issues consent on the next
-                // tick and the revocation heals itself, silently, within seconds. Found by
-                // review 2026-09-21; it was a fail-open at the centre of the gate.
-                //
-                // Refusing rather than special-casing, because the alternative is
-                // incoherent: trust is room-independent (ADR-020 decision 3), so "revoked
-                // here but still trusted" is not a state the model has. `Untrust` is the
-                // act that means it, and it changes the lock everywhere (M17.14).
-                if self.trust.is_trusted(&target) {
-                    Outcome::Failed(Fault::StillTrusted)
-                } else {
-                    self.revoke(&channel_id, target).await
-                }
             }
             NodeCommand::Trust {
                 fingerprint,
@@ -5361,8 +5320,6 @@ impl Node {
                 }
                 // Whatever this member is owed goes out now that it can be reached, rather than on
                 // the next tick: a dial `reach_member` started was started for exactly this.
-                self.answer_pending_consents(|_, target| *target == peer, None)
-                    .await;
                 self.deliver_owed_rekeys().await;
                 self.deliver_owed_consents(None).await;
             }
@@ -5601,11 +5558,6 @@ impl Node {
                         );
                     }
                 }
-                self.answer_pending_consents(
-                    |_, target| *target == peer,
-                    Some(Outcome::Failed(Fault::Unreachable)),
-                )
-                .await;
                 let _ = self.event_tx.send(NodeEvent::PeerUnreachable { peer, why });
             }
             NetEvent::UpgradeFailed { peer, reason } => {
@@ -6061,14 +6013,6 @@ impl Node {
                             reason: fail.to_string(),
                         });
                     }
-                    // Only a consent to this session's peer: a session with another member fetched
-                    // nothing that consent waits for, and retrying it there used its attempts up
-                    // (V210-78).
-                    self.answer_pending_consents(
-                        |room, target| *room == channel_id && *target == peer,
-                        None,
-                    )
-                    .await;
                 }
                 self.refresh_network_view().await;
                 let o = report.out;
@@ -7211,6 +7155,13 @@ impl Node {
         target: Digest32,
         asked: bool,
     ) -> Outcome {
+        // **A key goes only to a member the owner's keyring trusts** (V210-148), checked here,
+        // where the key leaves, whatever asked for it. No client — the TUI, the CLI, the control
+        // socket — can hand this identity's key to someone its owner never trusted: a client
+        // that could would be a hole in the core, not a choice in the client.
+        if !self.trust.is_trusted(&target) {
+            return Outcome::Failed(Fault::NotTrusted);
+        }
         if self.net.is_none() {
             return Outcome::Failed(Fault::NotNetworked);
         }
@@ -7367,134 +7318,8 @@ impl Node {
         Outcome::Done
     }
 
-    /// Decide what an explicit consent's `outcome` means for the person waiting on it.
-    ///
-    /// `Unreachable` has two causes. With no connection to the member, `reach_member` has started
-    /// a dial, so the consent waits for `Dialed` or `ReachFailed`. With a connection but no pairwise
-    /// session, the member's bundle record is not on this node's board yet: a node that has just
-    /// started holds only what its first sessions bring in. V29-19 measured this through the real
-    /// `vox tui`: a consent to a member who was online failed at once, in 0.75s, with
-    /// `no reachable peer`, at 0, 3, 6 and 10s after the room opened, and succeeded from 15s. So a
-    /// sync with that member is started, since that is what fetches its records, and the consent
-    /// is retried when the session with that member is done. `NotAdmitted` waits the same way:
-    /// the same sync is what admits it.
-    async fn settle_consent(
-        &mut self,
-        channel_id: Digest32,
-        target: Digest32,
-        reply: oneshot::Sender<Outcome>,
-        outcome: Outcome,
-        attempts: u8,
-    ) {
-        const MAX_CONSENT_ATTEMPTS: u8 = 3;
-        if !matches!(
-            outcome,
-            Outcome::Failed(Fault::Unreachable | Fault::NotAdmitted)
-        ) || attempts >= MAX_CONSENT_ATTEMPTS
-        {
-            let _ = reply.send(outcome);
-            return;
-        }
-        let connected = self
-            .net
-            .as_ref()
-            .is_some_and(|n| n.manager().existing(&target).is_some());
-        if connected {
-            // Started or not (a session with this same member may already be running), the retry
-            // rides the next `SyncDone` of a session **with the target**. Checking for any session
-            // on the room kept a consent waiting on sessions with other members, which, now that
-            // sessions are guarded per (room, peer), need never all end.
-            if self.ensure_port(&channel_id, &target).await {
-                if let Some(port) = self.ports.get_mut(&(channel_id, target)) {
-                    port.raise();
-                }
-                self.sched_rooms.insert(channel_id);
-                self.schedule().await;
-            }
-            if !self
-                .ports
-                .get(&(channel_id, target))
-                .is_some_and(|p| p.busy())
-            {
-                let _ = reply.send(outcome);
-                return;
-            }
-        } else if attempts > 0 || matches!(outcome, Outcome::Failed(Fault::NotAdmitted)) {
-            // A dial already landed once for this consent and the connection is gone again; or
-            // the member is not admitted here, for which no dial was started, so none would answer.
-            let _ = reply.send(outcome);
-            return;
-        }
-        self.pending_consents
-            .push((channel_id, target, reply, attempts.saturating_add(1)));
-    }
-
-    /// Retry the explicit consents `matches` selects (`Dialed` passes its peer, `SyncDone` its
-    /// room), or answer them all with `failed` (`ReachFailed`).
-    async fn answer_pending_consents(
-        &mut self,
-        matches: impl Fn(&Digest32, &Digest32) -> bool,
-        failed: Option<Outcome>,
-    ) {
-        let (waiting, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_consents)
-            .into_iter()
-            .partition(|(room, target, _, _)| matches(room, target));
-        self.pending_consents = rest;
-        if waiting.is_empty() {
-            return;
-        }
-        for (channel_id, target, reply, attempts) in waiting {
-            match failed {
-                Some(o) => {
-                    let _ = reply.send(o);
-                }
-                None => {
-                    // Still waiting on its dial: that is `Dialed`'s or `ReachFailed`'s to answer, not
-                    // a session with somebody else that happened to finish first.
-                    let connected = self
-                        .net
-                        .as_ref()
-                        .is_some_and(|n| n.manager().existing(&target).is_some());
-                    if !connected {
-                        self.pending_consents
-                            .push((channel_id, target, reply, attempts));
-                        continue;
-                    }
-                    let outcome = self.consent(&channel_id, target, false).await;
-                    self.settle_consent(channel_id, target, reply, outcome, attempts)
-                        .await;
-                }
-            }
-        }
-        // The view reflects whatever was granted before anyone reads it.
-        self.publish().await;
-    }
-
-    /// Retry the explicit consents waiting on a session with their member that no longer runs
-    /// (V210-78). A retired attempt — its connection died, its room was held again — is aborted
-    /// and reports nothing, so the `SyncDone` such a consent waits for never comes. One waiting on
-    /// a dial is left to `Dialed` or `ReachFailed`.
-    async fn retry_orphaned_consents(&mut self) {
-        let net = self.net.as_ref().map(Arc::clone);
-        let orphaned: Vec<(Digest32, Digest32)> = self
-            .pending_consents
-            .iter()
-            .map(|(room, target, _, _)| (*room, *target))
-            .filter(|key| {
-                net.as_ref()
-                    .is_some_and(|n| n.manager().existing(&key.1).is_some())
-                    && !self.ports.get(key).is_some_and(|p| p.busy())
-            })
-            .collect();
-        if orphaned.is_empty() {
-            return;
-        }
-        self.answer_pending_consents(|room, target| orphaned.contains(&(*room, *target)), None)
-            .await;
-    }
-
-    /// Consent to `target` reading this identity's messages — ADR-007 step 3, the
-    /// human decision, taken per sender.
+    /// Release this identity's key to `target`, a member its owner's keyring trusts (ADR-020 §3).
+    /// The trust decision is the human one; nothing consents per room (V210-148).
     fn consent<'a>(
         &'a mut self,
         channel_id: &'a Digest32,
@@ -7620,11 +7445,11 @@ impl Node {
     /// node refused untrusted keys. Rendered messages stay; nothing more of theirs opens.
     /// Act, in a room just opened, on every removal from the ring made while it was closed
     /// (V210-118 amendment): drop the member's keys and change the lock — revoke and rotate, as a
-    /// removal does in an open room — then clear the record. Only a member still untrusted, and
-    /// only where this identity had consented to it: a per-room consent given without trust is
-    /// never recorded here, so it is never revoked on opening.
+    /// removal does in an open room — then clear the record. Every consent to a member the ring
+    /// does not name is withdrawn too (V210-148): a key goes only to a member the owner trusts.
     async fn act_on_removals_while_closed(&mut self, channel_id: &Digest32) {
         self.forget_untrusted_keys(channel_id).await;
+        self.revoke_untrusted_consents(channel_id).await;
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(channel_id).map(Arc::clone),
@@ -7664,6 +7489,27 @@ impl Node {
         };
         if locks.clear_room(channel_id) {
             let _ = locks.save(profile.store(), signer);
+        }
+    }
+
+    /// Withdraw every consent this identity holds in `channel_id` for a member its keyring does
+    /// not trust (V210-148). A key goes only to a member the owner trusts, so a consent outside
+    /// the keyring — one a room-only grant made before that grant was removed, or one the ring
+    /// lost while the room was closed — changes the lock against that member. What it already
+    /// holds cannot be taken back; it reads nothing written from now on.
+    async fn revoke_untrusted_consents(&mut self, channel_id: &Digest32) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let untrusted: Vec<Digest32> = shared
+            .lock()
+            .await
+            .consented()
+            .into_iter()
+            .filter(|m| !self.trust.is_trusted(m))
+            .collect();
+        for member in untrusted {
+            let _ = self.revoke(channel_id, member).await;
         }
     }
 
@@ -7852,12 +7698,14 @@ impl Node {
             let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
                 continue;
             };
-            if !shared.lock().await.has_consented(removed) {
-                continue;
+            if shared.lock().await.has_consented(removed) {
+                // `revoke` is the whole act: rotate, record the log fact, re-key the
+                // members who keep consent, and emit `Revoked`.
+                let _ = self.revoke(&channel_id, *removed).await;
             }
-            // `revoke` is the whole act: rotate, record the log fact, re-key the
-            // members who keep consent, and emit `Revoked`.
-            let _ = self.revoke(&channel_id, *removed).await;
+            // And any other consent outside the keyring (V210-148): a key goes only to a member
+            // the owner trusts, so nothing the ring does not name keeps one past this.
+            self.revoke_untrusted_consents(&channel_id).await;
         }
     }
 
@@ -9722,8 +9570,7 @@ impl Node {
         // So the dial always runs in the background and reports `Dialed`/`ReachFailed`; `Dialed`
         // adopts the connection and delivers whatever that member is owed at once. Automatic work
         // (the tick, a post) dials at most once per `MEMBER_REDIAL_SECS`; a command the person
-        // gave (`asked`) dials now whatever the spacing, and an explicit consent keeps its reply
-        // until the dial's outcome is known (`pending_consents`).
+        // gave (`asked`, a member just trusted) dials now whatever the spacing.
         let now = self.now();
         let recent = self
             .member_dialed_at

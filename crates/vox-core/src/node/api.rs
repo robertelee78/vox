@@ -610,29 +610,6 @@ pub enum NodeCommand {
         /// The channel passphrase.
         passphrase: Secret,
     },
-    /// Consent to `target` reading this identity's messages in a channel (ADR-007:
-    /// per-sender, human-initiated). Delivers this identity's sender key to the
-    /// target and records the grant on the log.
-    Consent {
-        /// The channel.
-        channel_id: Digest32,
-        /// The member being consented to.
-        target: Digest32,
-    },
-    /// Revoke `target`'s consent to read this identity's messages in a channel
-    /// (ADR-007 §Revocation). Rotates this identity's sender key to a generation
-    /// `target` holds no key for, records the revocation on the log, and re-keys the
-    /// members who keep consent.
-    ///
-    /// The forward guarantee is immediate and cryptographic: it does not wait on
-    /// anyone being reachable. What `target` already received is not recalled and
-    /// cannot be (ADR-007 §"Enforcement honesty").
-    Revoke {
-        /// The channel.
-        channel_id: Digest32,
-        /// The member whose consent is withdrawn.
-        target: Digest32,
-    },
     /// Trust an identity node-wide, under a local petname (ADR-020 §3).
     ///
     /// The decision is per **identity**, not per room: from here on, every room
@@ -838,16 +815,11 @@ pub enum Fault {
     /// consent has already been revoked (ADR-007 — consent is single-writer, so this
     /// is a settled fact, not a race).
     NotConsented,
-    /// The target is in this node's trust keyring, so a **per-room** revocation of it
-    /// would not hold: `deliver_owed_consents` re-issues consent to every trusted
-    /// admitted author on the next tick, so the revocation would heal itself within
-    /// seconds and silently (found by review, 2026-09-21).
-    ///
-    /// It is also incoherent with the model: trust is an identity-level, room-independent
-    /// decision (ADR-020 decision 3), so there is no such thing as trusting someone
-    /// except in one room. Withdraw the trust instead — `Untrust` removes the entry and
-    /// changes the lock in **every** shared room (ADR-017 M17.14).
-    StillTrusted,
+    /// The target is not in this node's trust keyring, so this node releases it no key
+    /// (V210-148). A key goes only to a member the owner trusts: there are rooms, nodes and
+    /// trust, and no per-room grant beside them. The node refuses whatever a client asks, so
+    /// no client can hand a key to someone its owner never trusted.
+    NotTrusted,
     /// The requested local bind address is not a loopback address. A forward carries
     /// traffic into a room *this* machine is a member of, so binding it anywhere the
     /// network can reach would hand that membership to whoever reaches the port
@@ -959,8 +931,8 @@ impl Fault {
             Fault::NotConsented => {
                 "there is nothing to withdraw: that identity was never trusted or consented to, or already is not"
             }
-            Fault::StillTrusted => {
-                "that identity is in your trust keyring, so a per-room revoke would heal itself\n       run `vox trust remove <fingerprint>` instead"
+            Fault::NotTrusted => {
+                "that identity is not in your trust keyring, so it is given no key to read you\n       run `vox trust add <fingerprint>` if you mean it to read you"
             }
             Fault::NotLoopback => {
                 "a local port for Vox must be on loopback (127.0.0.1 or ::1)\n       anything else would hand this room's membership to whoever reaches the port"
@@ -1053,7 +1025,7 @@ fault_names!(
     Refused,
     NotAdmitted,
     NotConsented,
-    StillTrusted,
+    NotTrusted,
     NotLoopback,
     AddressInUse,
     AddressNotHere,

@@ -2,7 +2,7 @@
 """tui_room_truth.py <vox> <tag> — V210-82 (#273), through the shipped `vox tui`.
 
 Alice creates a room; Bob and Carol join it, all through real daemons. Alice and Bob trust each
-other, so each consents to the other; nobody trusts Carol, and Carol trusts Bob. Alice posts 70 lines, more than Bob's
+other, so each holds the other's key; nobody trusts Carol, and Carol trusts Bob. Alice posts 70 lines, more than Bob's
 timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in a pty (pyte at
 160x50). Each claim prints one `CLAIM <name> ok|RED` line:
 
@@ -11,20 +11,13 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
             lines): m-011 is the first line shown, not m-001 still;
-  consent   Carol, whom Bob never consented to, is not shown "consented"; Alice, whom he did, is;
+  consent   Carol, whom Bob never trusted, is not shown "trusted"; Alice, whom he did, is;
   verify    `:verify` on Carol does not show her "verified" (the node has nothing to compare);
   sync      the status bar says how many peers the node is connected to: the anchor and at least
             one member, so 2 or more (it said "idle" always);
-  target    with Carol selected, Dave joins and sorts in above her; `:consent grant` then
-            consents to Carol (her row becomes "consented") and not to whoever took her place;
-  delivers  the grant is the node's: a line Bob then posts from the composer reaches Carol's
-            `vox room read` (a pane that only drew "consented" would pass `target`, not this);
-  revoke    `:consent revoke`, with Carol still selected and not first in the pane, takes her
-            back to "← in-only" and leaves Alice "↔ consented"; a line Bob then posts reaches
-            Alice's `vox room read` and not Carol's;
   reach     back on the channel list, the room reads "● online" while Bob's node is connected to
             its other members;
-  unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline";
+  unreach   once Alice's and Carol's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   idle      once the anchor is stopped too, it says "idle", with no count.
 
@@ -34,7 +27,7 @@ its slack; every other verb 120 s. A verb past its time is a named RED, not a ha
 Exit 0 = pass, 1 = red, 2 = apparatus (CANNOT MEASURE). Every process is recorded and killed by
 PID. Bounded throughout (`vox_pty.py`, V210-54).
 """
-import base64, os, re, subprocess, sys, time
+import os, re, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -51,7 +44,7 @@ SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix=
 S = f"{SP}/tuit-{TAG}"
 POSTS = 70  # the timeline pane holds 43 lines at 160x50
 subprocess.run(["rm", "-rf", S])
-WHO = ["anchor", "alice", "bob", "carol", "dave"]
+WHO = ["anchor", "alice", "bob", "carol"]
 for w in WHO:
     for d in ("data", "cfg"):
         os.makedirs(f"{S}/{w}/{d}")
@@ -97,10 +90,6 @@ def apparatus(why):
 class Apparatus(Exception):
     pass
 
-def digest(fp):
-    """The 32 bytes a 52-character base32 fingerprint spells: the order the members pane sorts by."""
-    return base64.b32decode(fp.upper() + "====")[:32]
-
 tui = None
 code = 2
 results = {}
@@ -124,14 +113,8 @@ try:
         r = run(w, "id", "--identity-passphrase-file", f"{S}/idpass")
         if r.returncode != 0: apparatus(f"{w} id: {r.stderr}")
         fp[w] = re.search(r"[a-z2-7]{52}", r.stdout).group(0)
-    # Dave must sort in above Carol, so that his join moves her down the pane: of two fresh
-    # identities, Carol is the one that sorts later.
-    if digest(fp["dave"]) > digest(fp["carol"]):
-        os.rename(f"{S}/carol", f"{S}/swap"); os.rename(f"{S}/dave", f"{S}/carol"); os.rename(f"{S}/swap", f"{S}/dave")
-        fp["carol"], fp["dave"] = fp["dave"], fp["carol"]
-    dave = "dave"
     daemons = {w: spawn(w, "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
-                        "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol", dave)}
+                        "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol")}
     for w in daemons:
         if not until(lambda: run(w, "room", "list").returncode == 0, 60): apparatus(f"{w} daemon")
     stage("room create, invite, join, trust")
@@ -236,14 +219,15 @@ try:
         return None, False, None
 
     stage("consent")
-    # Bob consents to Alice on his own (he trusts her): wait for that before judging Carol.
-    alice_ok = tui.until(lambda: "consented" in (label_of("alice")[0] or ""), 60, 1)
+    # Bob's node releases its key to Alice on its own (he trusts her): wait for that before
+    # judging Carol.
+    alice_ok = tui.until(lambda: "trusted" in (label_of("alice")[0] or ""), 60, 1)
     if label_of("carol")[0] is None: apparatus("carol is not in bob's members pane:\n" + "\n".join(pane()))
     if not alice_ok:
-        apparatus("bob's pane never showed alice consented, so a 'not consented' for carol shows "
+        apparatus("bob's pane never showed alice trusted, so a 'not trusted' for carol shows "
                   "nothing: " + repr(label_of("alice")[0]))
     carol_label = label_of("carol")[0]
-    claim("consent", "consented" not in carol_label,
+    claim("consent", "trusted" not in carol_label,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
 
     stage("select carol")
@@ -267,57 +251,6 @@ try:
     # The anchor and at least one member (the room reads online): two peers or more.
     claim("sync", (peers() or 0) >= 2, f"status bar: {bar.strip()!r}")
 
-    stage("dave joins while carol is selected")
-    before = label_of("carol")[2]
-    j = run(dave, "room", "join", link, "--name", "m", stdin="room pass")
-    if j.returncode != 0: apparatus(f"{dave} join: {j.stderr.strip()}")
-    if not tui.until(lambda: fp[dave][:26] in "\n".join(pane()), 90, 1):
-        apparatus(f"{dave} never appeared in bob's pane")
-    after = label_of("carol")[2]
-    if not (before is not None and after is not None and after > before):
-        apparatus(f"dave's join did not move carol down the pane (row {before} -> {after}), so it "
-                  "tests nothing:\n" + "\n".join(pane()))
-    print(f"{TAG} carol moved from pane row {before} to {after}; marker on carol: {label_of('carol')[1]}")
-
-    stage("target")
-    tui.key(":consent grant\r", 3)
-    granted = tui.until(lambda: "consented" in (label_of("carol")[0] or ""), 30, 1)
-    dave_label = label_of(dave)[0] or ""
-    claim("target", granted and "consented" not in dave_label,
-          f"carol: {label_of('carol')[0].strip()!r}; {dave}: {dave_label.strip()!r}")
-
-    stage("delivers")
-    # The grant is the node's, not the pane's: Carol reads what Bob posts after it.
-    tui.key("\t", 0.5)  # members -> timeline
-    tui.key("\t", 0.5)  # timeline -> composer
-    tui.key("b-after-grant\r", 1)
-    got = until(lambda: "b-after-grant" in run("carol", "room", "read", room, "--limit", "500").stdout, 60, 1)
-    claim("delivers", got, f"carol read bob's post after :consent grant within 60 s: {got}")
-
-    stage("revoke")
-    # Carol is still selected, and is not the pane's first member (Dave sorts in above her).
-    tui.key("\t", 0.5)  # composer -> members
-    if not label_of("carol")[1]: apparatus("the marker left carol before :consent revoke:\n" + "\n".join(pane()))
-    first = next((r.strip("│ ▶") for r in pane() if r.strip("│ ") and "Members" not in r), "")
-    tui.key(":consent revoke\r", 3)
-    back = tui.until(lambda: "in-only" in (label_of("carol")[0] or ""), 30, 1)
-    carol_label, alice_label = label_of("carol")[0] or "", label_of("alice")[0] or ""
-    panes_ok = back and "consented" in alice_label
-    leaked = None
-    if panes_ok:
-        # Then Bob posts again. Alice, still consented to, reads it, so it went out; Carol, who
-        # syncs from the same peers, must not, 10 s after Alice has.
-        tui.key("\t", 0.5)  # members -> timeline
-        tui.key("\t", 0.5)  # timeline -> composer
-        tui.key("b-after-revoke\r", 1)
-        if not until(lambda: "b-after-revoke" in run("alice", "room", "read", room, "--limit", "500").stdout, 60, 1):
-            apparatus("alice never read bob's post after the revoke, so carol not reading it shows nothing")
-        time.sleep(10)
-        leaked = "b-after-revoke" in run("carol", "room", "read", room, "--limit", "500").stdout
-    claim("revoke", panes_ok and leaked is False,
-          f"first in the pane: {first[:30]!r}; carol: {carol_label.strip()!r}; alice: "
-          f"{alice_label.strip()!r}; carol read bob's post after the revoke: {leaked}")
-
     stage("reach")
     tui.key("\x1b", 2)  # Esc back to the channel list
     rows = lambda: [r.strip() for r in tui.display() if "online" in r or "offline" in r]
@@ -325,9 +258,9 @@ try:
     claim("reach", any("● online" in r for r in rows()), f"list rows: {rows()!r}")
 
     stage("unreach")
-    for w in ("alice", "carol", dave):
+    for w in ("alice", "carol"):
         daemons[w].terminate()
-    for w in ("alice", "carol", dave):
+    for w in ("alice", "carol"):
         stop(daemons[w])
     gone = tui.until(lambda: any("○ offline" in r for r in rows()), 30, 1)
     claim("unreach", gone, f"with every other member's daemon stopped, list rows: {rows()!r}")

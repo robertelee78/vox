@@ -334,7 +334,8 @@ impl LiveCore {
                                 } else {
                                     Verification::UnverifiedTofu
                                 },
-                                // Off the room's log: granted only if this identity consented.
+                                // Off the room's log: granted only where this node released its key,
+                                // which it does only to a member its keyring trusts (V210-148).
                                 outbound: if is_me || d.consented.binary_search(m).is_ok() {
                                     OutboundConsent::Granted
                                 } else {
@@ -512,19 +513,6 @@ impl CoreHandle for LiveCore {
                 passphrase: Self::secret(&passphrase),
             }),
             Command::Invite { channel_id } => self.send(NodeCommand::Invite { channel_id }),
-            // ADR-007: consent is per-sender and human-initiated. This is the human
-            // act; the node delivers the sender key and records the grant.
-            Command::GrantConsent { channel_id, member } => self.send(NodeCommand::Consent {
-                channel_id,
-                target: member,
-            }),
-            // ADR-007 revocation: rotating this identity's sender key to a generation
-            // the member holds no key for. Forward-only, and honest about it — what
-            // they already received is not recalled.
-            Command::RevokeConsent { channel_id, member } => self.send(NodeCommand::Revoke {
-                channel_id,
-                target: member,
-            }),
             Command::SetVisibility { .. } | Command::Block { .. } | Command::Unblock { .. } => {
                 CommandStatus::Failed(UiError::NotAvailableYet)
             }
