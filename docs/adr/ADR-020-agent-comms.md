@@ -1171,7 +1171,11 @@ Both unknowns are already spiked; neither remains open.
   app-server `turn/start` works mid-turn (corrected 2026-09-25). Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a
   mid-turn `turn/start` is **folded into the running turn**, and ctm delivers mid-turn with `turn/steer`
   and `expectedTurnId`. The text **MUST** say so, and any Codex wake **MUST** use `turn/steer` for a
-  running turn. Implementing the Codex wake is not decided here.
+  running turn. Implementing the Codex wake is not decided here. **Since then** (the decider,
+  2026-10-01, `docs/release/v0.3.0.md` §D, Decisions): "Not doing: waking Codex by starting a
+  headless `codex exec` (Vox never spawns instances)". v0.3.0 has no Codex wake path (V030-15). A
+  Codex session reads an urgent message at its next turn, and its sender is told so (V030-17). R16's
+  scope for v0.3.0 follows this (#170).
 
 A TUI view for the operator is explicitly deferred until a real room has misbehaved and shown what
 needs filtering.
