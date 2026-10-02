@@ -23,7 +23,10 @@
 //! dual-stack on `[::]`. The victim `vox daemon` and the joiner are on `127.0.0.1`. The stranger is
 //! a test-side client — no `vox` command publishes a genesis for a room it holds no state for, or
 //! puts another peer's records — with two networks on this one machine, without sudo: `[::1]` and
-//! `[fe80::1%lo0]`.
+//! a second loopback address ([`SECOND`]). On macOS that is `[fe80::1%lo0]`, the link-local address
+//! lo0 always has; Linux gives lo no link-local address, but routes all of `127.0.0.0/8` to it, so
+//! there it is `127.0.0.2`, an IPv4 address and so a source of its own (V210-125). The anchor
+//! listens dual-stack, and the victim and the joiner are on `127.0.0.1`, a third source.
 //!
 //! **Asserted.**
 //! 1. *Live flood:* the stranger publishes 4100 geneses and a live member record for each, from
@@ -33,7 +36,7 @@
 //!    victim's genesis and no live record; after the same live flood it still serves the room.
 //! 3. *Re-send:* the stranger fetches the room in use's member and bundle records and puts them back
 //!    unchanged from `[::1]`, then floods 4100 rooms credited to both its networks (each genesis put
-//!    from `[::1]` by its creator, and a witnessed second identity's own bundle from `[fe80::1]`).
+//!    from `[::1]` by its creator, and a witnessed second identity's own bundle from [`SECOND`]).
 //!    The anchor still serves the room, and a real join of it succeeds.
 //! 4. *Re-seed after a restart:* the victim's daemon is stopped (SIGSTOP), the anchor is restarted,
 //!    and the stranger puts the room's genesis and records back from `[::1]`; the victim resumes and
@@ -59,7 +62,7 @@ mod watchdog;
 #[path = "support/world.rs"]
 mod world;
 
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -131,26 +134,39 @@ fn dual_anchor(
     (p, format!("{fp}@/ip4/127.0.0.1/udp/{port}"), id)
 }
 
-/// The scope id of `fe80::1` on `lo0`, the stranger's second network.
+/// The stranger's second network, as the reds name it.
+#[cfg(target_os = "macos")]
+const SECOND: &str = "[fe80::1%lo0]";
+#[cfg(not(target_os = "macos"))]
+const SECOND: &str = "127.0.0.2";
+
+/// The scope id of `fe80::1` on `lo0`, the stranger's second network on macOS.
+#[cfg(target_os = "macos")]
 fn lo0_scope() -> u32 {
     let out = std::process::Command::new("ifconfig")
         .arg("lo0")
         .output()
-        .expect("CANNOT MEASURE: ifconfig lo0");
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run ifconfig lo0: {e}"));
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text
         .lines()
         .find(|l| l.contains("fe80::1%lo0"))
-        .expect("CANNOT MEASURE: no fe80::1 on lo0, so the stranger has no second network");
+        .unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE (precondition unmet): no fe80::1 on lo0, so the stranger has no \
+                 second network:\n{text}"
+            )
+        });
     let hex = line
         .split("scopeid 0x")
         .nth(1)
-        .expect("CANNOT MEASURE: fe80::1 has no scope id")
+        .unwrap_or_else(|| panic!("APPARATUS: ifconfig shows fe80::1 with no scope id: {line}"))
         .trim();
-    u32::from_str_radix(hex, 16).expect("CANNOT MEASURE: a hex scope id")
+    u32::from_str_radix(hex, 16)
+        .unwrap_or_else(|e| panic!("APPARATUS: fe80::1's scope id {hex:?} is not hex: {e}"))
 }
 
-/// The stranger's two networks, as seen by an anchor on `port`.
+/// The stranger's two networks, as seen by an anchor on `port`: `[::1]`, and [`SECOND`].
 struct Networks {
     anchor6: SocketAddr,
     anchor_ll: SocketAddr,
@@ -159,7 +175,9 @@ struct Networks {
 }
 
 impl Networks {
+    #[cfg(target_os = "macos")]
     fn to(port: u16) -> Self {
+        use std::net::{Ipv6Addr, SocketAddrV6};
         let scope = lo0_scope();
         let ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         Self {
@@ -167,6 +185,18 @@ impl Networks {
             anchor_ll: SocketAddr::V6(SocketAddrV6::new(ll, port, 0, scope)),
             local6: "[::1]:0".parse().unwrap(),
             local_ll: SocketAddr::V6(SocketAddrV6::new(ll, 0, 0, scope)),
+        }
+    }
+
+    /// Linux routes all of `127.0.0.0/8` to lo, so `127.0.0.2` needs no setup; the anchor is
+    /// reached at `127.0.0.1` from it.
+    #[cfg(not(target_os = "macos"))]
+    fn to(port: u16) -> Self {
+        Self {
+            anchor6: format!("[::1]:{port}").parse().unwrap(),
+            anchor_ll: format!("127.0.0.1:{port}").parse().unwrap(),
+            local6: "[::1]:0".parse().unwrap(),
+            local_ll: "127.0.0.2:0".parse().unwrap(),
         }
     }
 }
@@ -281,7 +311,7 @@ fn live_flood(rt: &Rt, anchor: SocketAddr, id: Digest32, skew_secs: u64) -> (usi
 #[derive(Clone, Copy, Debug)]
 enum Credit {
     /// To both of the stranger's networks: each genesis put from `[::1]` by the identity that
-    /// minted it, each bundle from `[fe80::1]` by the identity that wrote it.
+    /// minted it, each bundle from [`SECOND`] by the identity that wrote it.
     Honest,
     /// To no one: each genesis put by the identity that did not mint it, each bundle by the one
     /// that did not write it. Both are stored; neither credits.
@@ -355,7 +385,7 @@ fn flood(
         rooms.len(),
         t0.elapsed()
     );
-    // Who puts each genesis (from [::1]) and each bundle (from [fe80::1]).
+    // Who puts each genesis (from [::1]) and each bundle (from SECOND).
     let (on6_signer, onll_signer) = match credit {
         Credit::Honest => (&inventor, &carrier),
         Credit::Nobody => (&carrier, &inventor),
@@ -366,9 +396,9 @@ fn flood(
         let mut on6 = RendezvousClient::open(&c6)
             .await
             .expect("CANNOT MEASURE: a rendezvous stream from [::1]");
-        let mut onll = RendezvousClient::open(&cll)
-            .await
-            .expect("CANNOT MEASURE: a rendezvous stream from [fe80::1]");
+        let mut onll = RendezvousClient::open(&cll).await.unwrap_or_else(|e| {
+            panic!("CANNOT MEASURE: no rendezvous stream from {SECOND}: {e:?}")
+        });
         let mut answers = Vec::new();
         for wire in first {
             answers.push(format!("{:?}", on6.put(wire).await));
@@ -565,7 +595,7 @@ fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
     let (answers, geneses, taken) = flood(&rt, &nets, anchor_id, &resend, Credit::Honest);
     println!(
         "[proof] the stranger re-sent the room's {} record(s) from [::1]: {answers:?}; flood: \
-         {geneses}/{ROOMS} geneses from [::1], {taken}/{ROOMS} bundles from [fe80::1], in {:?}",
+         {geneses}/{ROOMS} geneses from [::1], {taken}/{ROOMS} bundles from {SECOND}, in {:?}",
         resend.len(),
         t0.elapsed()
     );

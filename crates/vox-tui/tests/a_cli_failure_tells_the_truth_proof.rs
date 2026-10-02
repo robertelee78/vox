@@ -18,12 +18,15 @@
 //!    exited 0, so a supervisor that restarts a failed tail never restarted it. The daemon is
 //!    killed with SIGKILL by its PID; the tail must exit non-zero within 30 s, saying the node
 //!    stopped, and never call it a "malformed control-socket message" (V210-101, #305). The kill
-//!    lands mid-frame by construction: the proof stops reading the tail's output, then posts six
-//!    messages of 60,000 characters. The tail blocks writing them to its full stdout pipe, so it
-//!    stops reading its socket, and the daemon blocks part-way through writing the next one —
-//!    each frame is larger than the socket's buffers (8 KiB each way on macOS). After the kill
-//!    the output is read again, and the tail meets a length, part of a body, then EOF. If the
-//!    tail printed all six, no frame was cut: CANNOT MEASURE.
+//!    lands mid-frame by construction: the proof stops reading the tail's output, then posts
+//!    [`BIG`] messages of 60,000 characters, about 1.9 MB. The tail blocks writing them to its full
+//!    stdout pipe, so it stops reading its socket, and the daemon blocks part-way through writing
+//!    the next one. What lies between the daemon and the tail's printed output must hold less than
+//!    that on every system CI runs: on macOS the socket buffers 8 KiB each way; on Linux a unix
+//!    stream socket holds at most its sender's 208 KiB `wmem_default`, a pipe 64 KiB, and the
+//!    tail one frame. Six posts (360 KB) fitted on Linux, and the tail printed all six
+//!    (V210-125). After the kill the output is read again, and the tail meets a length, part of
+//!    a body, then EOF. If the tail printed every one, no frame was cut: CANNOT MEASURE.
 //! 4. **A service removal that fails names its cause**, not a hard-coded "was not offered". The
 //!    one cause a person can stage is a tag that is not offered, and its wording is asserted
 //!    here; the others (a store that failed, a node with no identity) cannot be staged through
@@ -651,11 +654,10 @@ fn a_cli_failure_tells_the_truth() {
     claims += 1;
 
     // ---- (3) the node dies under the tail, part-way through a frame ----
-    // The tail's output is no longer read, and six posts each larger than everything between the
-    // daemon and the tail's stdout can buffer are made: the tail blocks printing, and the daemon
-    // blocks inside its write of the next frame.
+    // The tail's output is no longer read, and more posts are made than everything between the
+    // daemon and the tail's stdout can buffer, on macOS or Linux: the tail blocks printing, and
+    // the daemon blocks inside its write of a frame.
     tail.hold_out.store(true, Ordering::SeqCst);
-    const BIG: usize = 6;
     let filler = "x".repeat(60_000);
     for i in 0..BIG {
         let text = format!("big-{i}-{filler}");
@@ -715,6 +717,11 @@ fn a_cli_failure_tells_the_truth() {
          a claim was skipped or added without its count"
     );
 }
+
+/// How many 60,000-character posts case (3) makes while the tail's output is not read: about
+/// 1.9 MB, several times what a unix socket, a pipe and the tail hold together on macOS or Linux,
+/// so the daemon is always part-way through a frame when it is killed.
+const BIG: usize = 32;
 
 /// (6) A holder whose control socket cannot be bound runs on, and says why.
 #[test]
