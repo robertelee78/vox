@@ -17,6 +17,14 @@
 //!   must reach the new process within V210-57's host-restart bound, [`HOST_BACK_WITHIN`], one
 //!   attempt and no retry. A dialer that kept its stale connection to the dead process would wait
 //!   out the silence rule (30 s) or QUIC's idle timeout (about 60 s) instead.
+//! - **A forward survives its path changing while the host stays up** (R24's "or the path
+//!   changing"). The host and guest are split by address family, so the anchor's circuit is
+//!   their only path, and the host advertises a port forward this proof owns
+//!   (`support/port_forward.rs`), closed at first. A running `vox forward` carries a connection
+//!   over the relay; then the port forward opens, a direct path exists, and with the host and the
+//!   forward still running, a later connection through the **same** forward must ride the direct
+//!   path (its bytes cross the port forward). A forward pinned to the connection it started with
+//!   keeps riding the relay and goes red.
 //! - **A refused SOCKS CONNECT is refused in the reply, and says why** (R23, D6). `vox up`
 //!   replied "succeeded" before it had asked the host, so a refusal looked like a
 //!   connection that died.
@@ -108,6 +116,15 @@ mod world;
 
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
+#[path = "support/relay.rs"]
+mod relay;
+
+#[path = "support/port_forward.rs"]
+mod port_forward;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -239,6 +256,117 @@ fn a_forward_carries_a_new_connection_after_its_host_restarts() {
     );
     drop(fwd);
     drop(w);
+}
+
+/// R24's "or the path changing": the product retries a relayed pair's direct path every 60 s
+/// (`UPGRADE_RETRY`), so a direct path that opens is found within that and some margin. A
+/// number, not the product constant.
+const PATH_CHANGED_WITHIN: Duration = Duration::from_secs(75);
+
+#[test]
+#[ignore = "production Argon2id + a real PoW, a relayed pair held until its direct path is found; run on demand"]
+fn a_forward_keeps_carrying_when_its_path_changes_from_relayed_to_direct() {
+    watchdog::arm();
+    let mut w = port_forward::ForwardedWorld::new(false);
+    let pass = world::room_pass_file(&w.guest_dir, &w.passphrase);
+    let mut fwd = world::VoxProc::spawn(
+        "forward",
+        &w.guest_dir,
+        &args(&[
+            "forward",
+            &w.room,
+            &w.host_fp,
+            &w.service_port.to_string(),
+            "127.0.0.1:0",
+            "--passphrase-file",
+            &pass,
+            "--anchor",
+            &w.anchor.v6_spec,
+            "--listen",
+            "[::1]:0",
+        ]),
+    );
+    let line = fwd.expect_line("the forward's bound address", |l| {
+        l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+    });
+    let at = world::address_in(&mut fwd, &line, 1);
+    let payload: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+
+    // Staging: relayed, observed. The connection rides the anchor's circuit, and none of its
+    // bytes cross the port forward, which is closed.
+    let sent = w.forward.to_host();
+    let mut s = TcpStream::connect(at)
+        .unwrap_or_else(|e| panic!("PRODUCT: the bound forward at {at} refused a connection: {e}"));
+    assert!(
+        port_forward::echo_over(&mut s, &payload, Duration::from_secs(120)),
+        "CANNOT MEASURE: no echo through the forward over the relayed path, so there is no \
+         relayed forward to watch change path.\nThe forward said:\n{}",
+        fwd.transcript()
+    );
+    drop(s);
+    let crossed = w.forward.to_host() - sent;
+    assert!(
+        crossed == 0,
+        "CANNOT MEASURE: the first connection crossed the port forward ({crossed} B) while it was \
+         closed, so the path was never relayed"
+    );
+    w.anchor.assert_relayed("before the path changes");
+
+    // The path changes, live: a direct path becomes possible while the host and the forward
+    // keep running.
+    w.forward.open();
+    let opened = Instant::now();
+    let (mut tried, mut carried, mut direct) = (0usize, 0usize, None);
+    let mut last_failure = String::new();
+    while opened.elapsed() < PATH_CHANGED_WITHIN {
+        std::thread::sleep(Duration::from_millis(500));
+        tried += 1;
+        let sent = w.forward.to_host();
+        let echoed = TcpStream::connect(at)
+            .map_err(|e| e.to_string())
+            .and_then(|mut s| {
+                port_forward::echo_over(&mut s, &payload, Duration::from_secs(10))
+                    .then_some(())
+                    .ok_or_else(|| "no echo within 10 s".to_owned())
+            });
+        match echoed {
+            Ok(()) => {
+                carried += 1;
+                if w.forward.to_host() - sent >= payload.len() as u64 {
+                    direct = Some(opened.elapsed());
+                    break;
+                }
+            }
+            Err(e) => last_failure = e,
+        }
+    }
+    eprintln!(
+        "[test] path change: {tried} connections through the same forward after a direct path \
+         opened, {carried} echoed; the port forward carried {} B to the host",
+        w.forward.to_host()
+    );
+    let Some(took) = direct else {
+        panic!(
+            "PRODUCT: {PATH_CHANGED_WITHIN:?} after a direct path to its running host became \
+             possible, the same forward still carried no connection over it ({carried} of {tried} \
+             echoed, every one over the relay; last failure: {last_failure:?}) — the forward is \
+             pinned to the path it started with (PRD-001 R24).\nThe forward said:\n{}",
+            fwd.transcript()
+        );
+    };
+    match fwd.child.try_wait() {
+        Ok(None) => {}
+        Ok(Some(status)) => panic!(
+            "PRODUCT: the forward exited ({status}) while its path changed.\nIt said:\n{}",
+            fwd.transcript()
+        ),
+        Err(e) => panic!("APPARATUS: could not ask whether the forward still runs: {e}"),
+    }
+    eprintln!(
+        "[test] the same forward carried a connection over the direct path {took:?} after it \
+         became possible"
+    );
+    drop(fwd);
 }
 
 #[test]
