@@ -950,8 +950,6 @@ impl Fault {
     /// What this fault means to a person, and what to do about it, in the house style: one
     /// short line saying what happened, then indented lines saying what to do.
     ///
-    // `Fault::KeyringFull`'s explanation names the cap in words; this holds them together.
-    const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
     // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
     const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
     // `Fault::PassphraseNeeded`'s explanation names the window in words.
@@ -982,8 +980,16 @@ impl Fault {
                 "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
             }
             Fault::TooLong => "that is longer than this field allows",
+            // The cap in force, read once (#85): a test build's lowered cap is never called 1,024.
             Fault::KeyringFull => {
-                "your trust keyring is full (1,024 identities)\n       remove one with `vox trust remove <fingerprint>`, then add again"
+                static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                TEXT.get_or_init(|| {
+                    format!(
+                        "your trust keyring is full ({} identities)\n       remove one with \
+                         `vox trust remove <fingerprint>`, then add again",
+                        crate::node::trust::trust_cap_words()
+                    )
+                })
             }
             Fault::Storage => {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"

@@ -105,7 +105,8 @@ pub const TEST_KEYRING_CAP_ENV: &str = "VOX_TEST_KEYRING_CAP";
 
 /// How many identities [`Keyring::trust_with`] takes: [`MAX_TRUSTED`], or the test-only
 /// [`TEST_KEYRING_CAP_ENV`] when it names fewer.
-fn trust_cap() -> usize {
+#[must_use]
+pub fn trust_cap() -> usize {
     #[cfg(feature = "test-knobs")]
     if let Some(cap) = std::env::var(TEST_KEYRING_CAP_ENV)
         .ok()
@@ -114,6 +115,21 @@ fn trust_cap() -> usize {
         return cap.min(MAX_TRUSTED);
     }
     MAX_TRUSTED
+}
+
+/// [`trust_cap`] as a person reads it, with thousands grouped: `1,024`. A refusal that names the
+/// cap names the one in force, so a test build's lowered cap is never reported as 1,024 (#85).
+#[must_use]
+pub fn trust_cap_words() -> String {
+    let digits = trust_cap().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Longest petname. Long enough for `codex@some-long-hostname`, short enough that
