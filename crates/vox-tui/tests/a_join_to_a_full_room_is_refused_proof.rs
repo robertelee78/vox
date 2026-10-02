@@ -20,11 +20,25 @@
 //! - leaves the room out of that person's `vox room list`;
 //! - and the host's `vox room roster` still lists exactly [`CAP`], the newcomer not among them.
 //!
+//! The joins that filled it are claims too: each exited 0 and the host answered it, admitting
+//! before accepting into the store its roster reads, so a member it does not list is `PRODUCT:`.
+//!
+//! **A member that accepts the passphrase and then cannot admit the joiner says so**
+//! ([`a_join_a_member_cannot_admit_says_why`]): a host that was locked or closing mid-join, or
+//! could not write its store, refused its joiner with the refusal a wrong passphrase gets, so the
+//! joiner was told "usually the room passphrase is wrong" about a passphrase that had been
+//! accepted. Staged with `VOX_TEST_ADMISSION_FAILS` on the host (test-knobs only), which fails
+//! each joiner's admission as a host locked mid-join does, admitting nothing. Asserted: the join
+//! exits non-zero, says the passphrase was accepted and the member could not admit it, never
+//! that the passphrase is likely wrong, and the host's roster lists the host alone.
+//!
 //! **Every red says which it is:** `PRODUCT:` quotes what `vox` said or did; `CANNOT MEASURE:`
 //! names staging that was not achieved (a `vox` without the knob, a room not full when asked).
 //!
-//! **Mutation that must turn it red:** the admission's result dropped again (in `NetEvent::JoinAdmit`,
-//! the ack answered `Ok(())` whatever `admit_author` returned): the newcomer is told it joined.
+//! **Mutations that must turn it red:** the admission's result dropped again (in
+//! `NetEvent::JoinAdmit`, the ack answered `Ok(())` whatever `admit_author` returned): the
+//! newcomer is told it joined. A failed admission answered with `JoinReject::Refused` again (in
+//! `run_responder`): the second arm's joiner is told its passphrase is likely wrong.
 
 #![cfg(unix)]
 
@@ -43,6 +57,8 @@ use sync_pair::{anchor, Member, ROOM_PASS};
 const CAP: usize = 3;
 /// The knob that lowers the room's cap.
 const KNOB: &str = "VOX_TEST_MAX_AUTHORS";
+/// The knob that fails every joiner's admission on the member answering it.
+const FAILS: &str = "VOX_TEST_ADMISSION_FAILS";
 
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
@@ -84,8 +100,9 @@ fn a_join_to_a_full_room_is_refused() {
     assert_eq!(
         before.len(),
         CAP,
-        "CANNOT MEASURE: the room is not full: the host's roster lists {} of {CAP} before the \
-         last join\n{before:?}",
+        // The host answered those joins and admits before it accepts, into the store the roster
+        // reads: a join that exited 0 and is not listed is this defect, not the staging's.
+        "PRODUCT: m1 and m2's joins exited 0, but the host's roster lists {} of {CAP}\n{before:?}",
         before.len()
     );
 
@@ -123,5 +140,59 @@ fn a_join_to_a_full_room_is_refused() {
         "PRODUCT: after the refused join the host's roster lists {} (want {CAP}, the newcomer not \
          among them)\n{after:?}",
         after.len()
+    );
+}
+
+#[test]
+#[ignore = "real binaries and production Argon2id: the release gate runs it"]
+fn a_join_a_member_cannot_admit_says_why() {
+    // A debug build's budget: one join; an unlock for each `vox id` and daemon.
+    watchdog::arm_for_setup(1, 4);
+    test_knobs::require(&[FAILS]);
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let root = tmp.path();
+    let (_anchor, spec) = anchor(root);
+    let host = Member::new(root, "host");
+    let _host_d = host.daemon_with_anchor(Some(&spec), &[(FAILS, "1")]);
+    let room = host.create("locked");
+    let link = host.invite(&room);
+
+    let joiner = Member::new(root, "joiner");
+    let _joiner_d = joiner.daemon(Some(&spec));
+    let (ok, out, err) = joiner.vox(
+        &["room", "join", &link, "--name", "locked"],
+        Some(ROOM_PASS),
+    );
+    let said = format!("{out}{err}");
+    println!("[proof] the join the host could not admit exited ok={ok} and said:\n{said}");
+    assert!(
+        !ok,
+        "PRODUCT: a join the host could not admit exited 0:\n{said}"
+    );
+    let accepted = "a member accepted your passphrase, then could not admit you";
+    assert!(
+        said.contains(accepted),
+        "PRODUCT: the refused join did not say {accepted:?}:\n{said}"
+    );
+    assert!(
+        !said.contains("passphrase is wrong"),
+        "PRODUCT: a join whose passphrase was accepted was told it is likely wrong:\n{said}"
+    );
+    let (ok, list, err) = joiner.vox(&["room", "list"], None);
+    assert!(ok, "PRODUCT: the joiner's `vox room list` failed: {err}");
+    assert!(
+        !list.contains(&room[..room.len().min(12)]),
+        "PRODUCT: the refused joiner's `vox room list` lists the room:\n{list}"
+    );
+    let (ok, roster, err) = host.vox(&["room", "roster", &room], None);
+    assert!(ok, "PRODUCT: the host's `vox room roster` failed: {err}");
+    let listed: Vec<&str> = roster
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert!(
+        listed == [host.fp.as_str()],
+        "PRODUCT: the host admitted nobody, yet its roster lists {listed:?}"
     );
 }

@@ -5298,8 +5298,15 @@ impl Node {
                 // The join proved this identity; admit it as an author so its entries — and its
                 // records on this node's board — are accepted. Reading still needs consent.
                 let now = self.now();
+                // **Test-only** (`test-knobs`): this node fails every joiner's admission as a node
+                // locked mid-join does — admitting nothing — so a proof can see what the joiner is
+                // told.
+                #[cfg(feature = "test-knobs")]
+                let fails = std::env::var_os(TEST_ADMISSION_FAILS_ENV).is_some();
+                #[cfg(not(feature = "test-knobs"))]
+                let fails = false;
                 let admitted = match (
-                    self.profile.as_ref(),
+                    self.profile.as_ref().filter(|_| !fails),
                     self.channels.get(&channel_id).map(Arc::clone),
                 ) {
                     (Some(profile), Some(shared)) => shared
@@ -11498,6 +11505,12 @@ async fn admit_board_records(
     admitted
 }
 
+/// **Test-only**: set, this node fails every joiner's admission after the exchange, as a node
+/// locked or closing mid-join does (V210-128), so a proof can see what the joiner is told. Not
+/// compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_ADMISSION_FAILS_ENV: &str = "VOX_TEST_ADMISSION_FAILS";
+
 fn fault_of(e: &Error) -> Fault {
     match e {
         // A ladder that tried every rung and got nowhere is unreachable, not an internal
@@ -11521,6 +11534,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::JoinSolveTooSlow { .. } => Fault::SolveTooSlow,
         Error::JoinResponderBusy | Error::JoinEndedForNewcomer => Fault::MembersBusy,
         Error::RoomFull { .. } => Fault::RoomFull,
+        Error::JoinNotAdmitted => Fault::NotAdmittedAfterJoin,
         Error::Path {
             op: crate::node::profile::VAULT_WRITE,
             ..
