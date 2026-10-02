@@ -495,6 +495,20 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         None,
     );
     assert!(ok, "alice removes carol: {o}{e}");
+    // The rotation happened: a post made now is not readable to carol, who held the old key.
+    for (name, room, _) in &alice_posted {
+        let line = format!("A118-WHILE-CAROL-REMOVED-IN-{name}");
+        let (ok, _, e) = alice.vox(&["room", "post", room, &line], None);
+        assert!(ok, "alice posts: {e}");
+    }
+    std::thread::sleep(Duration::from_secs(10));
+    for (name, room, _) in &alice_posted {
+        assert!(
+            !carol.reads(room, &format!("A118-WHILE-CAROL-REMOVED-IN-{name}")),
+            "CANNOT MEASURE: carol still reads alice after alice removed her, so alice's key did \
+             not change in room {name} and no generation is retired"
+        );
+    }
     alice.trust(&carol);
     for (name, room, _) in &alice_posted {
         let line = format!("A118-AFTER-ROTATION-IN-{name}");
@@ -543,6 +557,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
             .collect();
         want.push(format!("A118-FINAL-IN-{name}"));
         // Under the generation live when bob trusts her: the ones above are under a retired one.
+        want.push(format!("A118-WHILE-CAROL-REMOVED-IN-{name}"));
         want.push(format!("A118-AFTER-ROTATION-IN-{name}"));
         let all = until(
             &format!("bob renders all of alice's posts in room {name}"),
