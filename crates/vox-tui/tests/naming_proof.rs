@@ -26,10 +26,11 @@
 //!    restarted. (It used to open the profile itself, so the daemon had to be stopped first, and
 //!    started again with every room's passphrase.)
 //!
-//! **A red names its side.** A step that sets the scene — an identity, a trust, a daemon, a room,
-//! an invite, a join, the proxy — failing is CANNOT MEASURE: staging not achieved. Anything this
-//! proof claims — the service offered, a name reaching its node, a refusal and its sentence — is
-//! PRODUCT, quoting what vox said.
+//! **A red names its side.** A `vox` command that fails while setting the scene — an identity, a
+//! trust, a daemon, a room, an invite, a join, the proxy — is the product failing: PRODUCT
+//! (staging). Anything this proof claims — the service offered, a name reaching its node, a
+//! refusal and its sentence — is PRODUCT, quoting what vox said. The test's own files, ports,
+//! pipes and echo services are APPARATUS.
 
 #![cfg(unix)]
 
@@ -67,15 +68,13 @@ fn vox(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("CANNOT MEASURE: run vox");
+        .expect("APPARATUS: run vox");
     if let Some(text) = stdin {
-        let mut pipe = child.stdin.take().expect("CANNOT MEASURE: vox's stdin");
+        let mut pipe = child.stdin.take().expect("APPARATUS: vox's stdin");
         pipe.write_all(text.as_bytes())
-            .expect("CANNOT MEASURE: write to vox's stdin");
+            .expect("APPARATUS: write to vox's stdin");
     }
-    let out = child
-        .wait_with_output()
-        .expect("CANNOT MEASURE: wait for vox");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -96,23 +95,20 @@ struct Member {
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
         .and_then(|s| s.local_addr())
-        .expect("CANNOT MEASURE: a free UDP port")
+        .expect("APPARATUS: a free UDP port")
         .port()
 }
 
 fn member(tmp: &Path, name: &'static str) -> Member {
     let dir = tmp.join(name);
-    std::fs::create_dir_all(dir.join("cfg")).expect("CANNOT MEASURE: a profile directory");
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: a profile directory");
     let (ok, out, err) = vox(&dir, &["id", "--listen", "127.0.0.1:0"], None);
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — vox id ({name}): {err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox id ({name}): {err}");
     let fp = out.trim().to_owned();
     assert_eq!(
         fp.len(),
         52,
-        "CANNOT MEASURE: staging not achieved — {name}'s fingerprint: {out:?}"
+        "PRODUCT (staging): {name}'s fingerprint: {out:?}"
     );
     Member {
         name,
@@ -140,7 +136,7 @@ impl Member {
         );
         assert!(
             ok,
-            "CANNOT MEASURE: staging not achieved — {} trusts {} as {as_name}: {out}{err}",
+            "PRODUCT (staging): {} trusts {} as {as_name}: {out}{err}",
             self.name, peer.name
         );
     }
@@ -154,7 +150,7 @@ impl Member {
             text.push_str(p);
             text.push('\n');
         }
-        std::fs::write(&pass_file, text).expect("CANNOT MEASURE: write the passphrase file");
+        std::fs::write(&pass_file, text).expect("APPARATUS: write the passphrase file");
         let mut p = VoxProc::spawn(
             self.name,
             &self.dir,
@@ -181,7 +177,7 @@ impl Member {
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "CANNOT MEASURE: staging not achieved — {}'s daemon never held {rooms:?} \
+                    "PRODUCT (staging): {}'s daemon never held {rooms:?} \
                      open; room list said {out:?}. It said:\n{}",
                     self.name,
                     p.transcript()
@@ -208,29 +204,21 @@ impl Member {
         );
         assert!(
             ok,
-            "CANNOT MEASURE: staging not achieved — {} creates {local}: {out}{err}",
+            "PRODUCT (staging): {} creates {local}: {out}{err}",
             self.name
         );
         let (ok, list, err) = vox(&self.dir, &["room", "list"], None);
-        assert!(
-            ok,
-            "CANNOT MEASURE: staging not achieved — vox room list: {err}"
-        );
+        assert!(ok, "PRODUCT (staging): vox room list: {err}");
         list.lines()
             .find(|l| l.split_whitespace().nth(1) == Some(local))
             .and_then(|l| l.split_whitespace().next())
-            .unwrap_or_else(|| {
-                panic!("CANNOT MEASURE: staging not achieved — {local} is not listed: {list}")
-            })
+            .unwrap_or_else(|| panic!("PRODUCT (staging): {local} is not listed: {list}"))
             .to_owned()
     }
 
     fn invite(&self, room: &str) -> String {
         let (ok, link, err) = vox(&self.dir, &["room", "invite", room], None);
-        assert!(
-            ok,
-            "CANNOT MEASURE: staging not achieved — vox room invite {room}: {err}"
-        );
+        assert!(ok, "PRODUCT (staging): vox room invite {room}: {err}");
         link.trim().to_owned()
     }
 
@@ -242,7 +230,7 @@ impl Member {
         );
         assert!(
             ok,
-            "CANNOT MEASURE: staging not achieved — {} joins {local}: {out}{err}",
+            "PRODUCT (staging): {} joins {local}: {out}{err}",
             self.name
         );
     }
@@ -253,7 +241,7 @@ impl Member {
     fn serve(&self, room: &str, pass: &str, at: SocketAddr) {
         // From a file, never argv (V210-72: a room passphrase on the command line is refused).
         let pass_file = self.dir.join("room.pass");
-        std::fs::write(&pass_file, pass).expect("CANNOT MEASURE: write the room passphrase file");
+        std::fs::write(&pass_file, pass).expect("APPARATUS: write the room passphrase file");
         let (ok, out, err) = vox(
             &self.dir,
             &[
@@ -301,8 +289,8 @@ impl Member {
 
 /// A TCP service that answers each line with `<owner>:<line>`.
 fn echo(owner: &'static str) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("CANNOT MEASURE: an echo listener");
-    let at = l.local_addr().expect("CANNOT MEASURE: the echo's address");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("APPARATUS: an echo listener");
+    let at = l.local_addr().expect("APPARATUS: the echo's address");
     std::thread::spawn(move || {
         for s in l.incoming() {
             let Ok(mut s) = s else { return };
@@ -330,7 +318,7 @@ fn socks(proxy: SocketAddr, host: &str, port: u16) -> Result<TcpStream, u8> {
     s.set_read_timeout(Some(
         vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
     ))
-    .expect("CANNOT MEASURE: set a read timeout");
+    .expect("APPARATUS: set a read timeout");
     s.write_all(&[0x05, 0x01, 0x00])
         .expect("PRODUCT: `vox up`'s proxy closed on the SOCKS greeting");
     let mut hello = [0u8; 2];
@@ -380,23 +368,21 @@ fn who_answers(proxy: SocketAddr, name: &str) -> Result<String, u8> {
 #[ignore = "an anchor, three vox daemons and real child processes; CI runs it in release"]
 fn a_local_name_reaches_the_node_it_names() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("CANNOT MEASURE: a temporary directory");
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let (nas_echo, laptop_echo, laptop_work_echo) =
         (echo("bob"), echo("carol"), echo("carol-work"));
 
     let anchor_dir = tmp.path().join("anchor");
-    std::fs::create_dir_all(anchor_dir.join("cfg"))
-        .expect("CANNOT MEASURE: the anchor's directory");
+    std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: the anchor's directory");
     let mut anchor = VoxProc::spawn(
         "anchor",
         &anchor_dir,
         &args(&["node", "--listen", "127.0.0.1:0"]),
     );
     let spec = anchor
-        .expect_line(
-            "CANNOT MEASURE: staging not achieved — an --anchor spec",
-            |l| l.trim_start().contains("@/ip4/127.0.0.1/udp/"),
-        )
+        .expect_line("PRODUCT (staging): an --anchor spec", |l| {
+            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
+        })
         .trim()
         .to_owned();
 
@@ -421,7 +407,7 @@ fn a_local_name_reaches_the_node_it_names() {
     let pids = (bob.pid(), carol.pid());
     assert!(
         pids.0.is_some() && pids.1.is_some(),
-        "CANNOT MEASURE: staging not achieved — bob's and carol's daemons must be running before \
+        "PRODUCT (staging): bob's and carol's daemons must be running before \
          their services are added: {pids:?}"
     );
     bob.serve(&family, family_pass, nas_echo);
@@ -448,7 +434,7 @@ fn a_local_name_reaches_the_node_it_names() {
             }
             assert!(
                 started.elapsed() < SETUP,
-                "CANNOT MEASURE: staging not achieved — alice never learned that carol is in \
+                "PRODUCT (staging): alice never learned that carol is in \
                  family; her roster: {roster:?}"
             );
             std::thread::sleep(Duration::from_millis(200));
@@ -465,15 +451,14 @@ fn a_local_name_reaches_the_node_it_names() {
         &alice.dir,
         &args(&["up", "--bind", "127.0.0.1:0"]),
     );
-    let first = up.expect_line(
-        "CANNOT MEASURE: staging not achieved — vox up's address",
-        |l| l.starts_with("vox up on "),
-    );
+    let first = up.expect_line("PRODUCT (staging): vox up's address", |l| {
+        l.starts_with("vox up on ")
+    });
     let proxy: SocketAddr = first
         .split_whitespace()
         .nth(3)
         .and_then(|a| a.parse().ok())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: staging not achieved — vox up said {first:?}"));
+        .unwrap_or_else(|| panic!("PRODUCT (staging): vox up said {first:?}"));
 
     // (1) and (2): each name reaches the node it names.
     let reached: Vec<(&str, Result<String, u8>)> = [
@@ -513,7 +498,7 @@ fn a_local_name_reaches_the_node_it_names() {
             .iter()
             .find(|(name, _)| *name == n)
             .map(|(_, r)| r.clone())
-            .expect("CANNOT MEASURE: a name this proof did not try")
+            .expect("APPARATUS: a name this proof did not try")
     };
     assert_eq!(
         answered("nas.family.vox"),
