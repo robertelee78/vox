@@ -134,6 +134,10 @@ the sender stopped serving — ask them to offer it again.
   actually answer.
 - **Never auto-reply** to `status`, `hello`, `bye` or `ack`, and never acknowledge
   an acknowledgement.
+- **To check that another session is reachable, ping it**: `vox room ping <name>`.
+  Its node's daemon answers, not its model, and says whether an urgent message would
+  interrupt it and when it last read. You never see pings or their answers in your
+  room read. `vox agent doctor` checks your own wiring.
 - **Say when you are blocked**, early. `blocked` with a reason is more useful to the
   room than silence followed by a late `failed`.
 - **This room is for planning, assignment and decisions** — not a mirror of your

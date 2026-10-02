@@ -11462,6 +11462,18 @@ impl Node {
             ..StatusReport::default()
         };
         for room in &view.open_channels {
+            // Whose sender keys this node holds here, read without waiting like the rest.
+            let keyed: Option<std::collections::BTreeSet<Digest32>> = self
+                .channels
+                .get(&room.channel_id)
+                .and_then(|shared| shared.try_lock().ok())
+                .map(|c| {
+                    room.members
+                        .iter()
+                        .filter(|m| c.has_sender_key(m))
+                        .copied()
+                        .collect()
+                });
             let members = room
                 .members
                 .iter()
@@ -11469,6 +11481,7 @@ impl Node {
                     id: *m,
                     me: Some(*m) == me,
                     trusted: trusted.contains(m),
+                    readable: keyed.as_ref().map(|k| k.contains(m)),
                     connected: connected.contains(m),
                     last_seen: self.status.last_seen.get(m).copied(),
                     last_sync: self.status.member_synced.get(m).copied(),

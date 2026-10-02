@@ -194,6 +194,23 @@ fn ours(listed: &Value, this_exe: Option<&std::path::Path>) -> Vec<(String, Stri
     out
 }
 
+/// Vox's hook entries as Codex lists them, changing nothing: `(command, trusted)`, once
+/// each (`vox agent doctor`, V030-16).
+///
+/// # Errors
+/// If the app-server cannot be started or answers with an error.
+pub fn status(codex: &str) -> Result<Vec<(String, bool)>, String> {
+    let this_exe = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+    let mut app = AppServer::start(codex)?;
+    app.call(
+        "initialize",
+        json!({"clientInfo": {"name": "vox", "version": env!("CARGO_PKG_VERSION")}}),
+    )?;
+    app.send(&json!({"jsonrpc": "2.0", "method": "initialized"}))?;
+    let listed = ours(&app.call("hooks/list", json!({}))?, this_exe.as_deref());
+    Ok(listed.into_iter().map(|(_, _, t, c)| (c, t)).collect())
+}
+
 /// Trust every untrusted Vox hook entry Codex knows about, through Codex's own RPCs, and
 /// read the result back.
 ///

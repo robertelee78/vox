@@ -147,6 +147,12 @@ pub struct MemberStatus {
     pub me: bool,
     /// Whether this node's keyring trusts it.
     pub trusted: bool,
+    /// Whether this node holds a sender key of its, which it releases only to a member it
+    /// trusts: so whether it has trusted this node, as far as this node can see (V030-16). A
+    /// key it released before it stopped trusting this node still counts, since this node is
+    /// not told of the withdrawal. `None` when the room was mid-session and could not be read
+    /// without waiting.
+    pub readable: Option<bool>,
     /// Whether this node has a live connection to it now.
     pub connected: bool,
     /// When this node last saw it connected (now, if it is).
@@ -333,10 +339,11 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen\":{},\"last_sync\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"readable\":{},\"connected\":{},\"last_seen\":{},\"last_sync\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
+                    m.readable.map_or("null".into(), |r| r.to_string()),
                     m.connected,
                     opt(m.last_seen),
                     opt(m.last_sync)

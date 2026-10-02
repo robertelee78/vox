@@ -288,6 +288,12 @@ envelope MUST carry only what the log does not know:**
 
 - **Reserved types**, which Vox itself understands: `hello`, `bye`, `say`. Plain text typed by the
   operator with no envelope at all **MUST** be treated as a `say`.
+- **`ping` and `pong` are plumbing, not conversation** (V030-16). `vox room ping <name>` posts a
+  `ping` addressed to a name; the **daemon** of each node holding a session under that name answers
+  with a `pong` (`re` the ping) naming each session, whether an urgent message interrupts it, and when
+  it last read. A daemon answers only a member its keyring trusts. No drain shows either to a model,
+  and neither wakes anyone, whatever its `urgent` says. A missing answer is reported as what it is:
+  it cannot tell an offline node, missing trust in either direction and no such session apart.
 - **Every other `type` is an opaque string** that implementations **MUST** pass through unchanged, in
   the manner of ctm's own `#[serde(other)] Unknown` and Matrix's reserved `m.*` prefix. A `type`
   **SHOULD** match `[A-Za-z0-9_-]{1,64}` (ruflo's agentbbs constraint, adopted).

@@ -1454,12 +1454,18 @@ pub fn run_daemon(
                             crate::tunnel_cli::say_if_it_explains_a_failure(&ev);
                             match ev {
                                 vox_core::node::api::NodeEvent::NewEntry { channel_id, row } => {
-                                    // The view — every open room's timeline — is copied only
-                                    // for a message that could interrupt someone.
-                                    if seen.insert(row.entry_hash) && may_wake(&row.text) {
-                                        judge(&paths, &node.view(), &channel_id, &row).await;
+                                    // A ping is the daemon's to answer, never a model's
+                                    // (V030-16): the sweep below answers it.
+                                    if crate::ping::is_ping(&row.text) {
+                                        true
+                                    } else {
+                                        // The view — every open room's timeline — is copied
+                                        // only for a message that could interrupt someone.
+                                        if seen.insert(row.entry_hash) && may_wake(&row.text) {
+                                            judge(&paths, &node.view(), &channel_id, &row).await;
+                                        }
+                                        false
                                     }
-                                    false
                                 }
                                 vox_core::node::api::NodeEvent::Synced { .. }
                                 | vox_core::node::api::NodeEvent::SenderKeyReceived { .. } => true,
@@ -1485,7 +1491,9 @@ pub fn run_daemon(
                             _ => 0,
                         };
                         for r in d.timeline.iter_from(from) {
-                            if seen.insert(r.entry_hash) && may_wake(&r.text) {
+                            if seen.insert(r.entry_hash)
+                                && (may_wake(&r.text) || crate::ping::is_ping(&r.text))
+                            {
                                 fresh.push((d.channel_id, r.clone()));
                             }
                         }
@@ -1495,7 +1503,11 @@ pub fn run_daemon(
                         );
                     }
                     for (cid, row) in fresh {
-                        judge(&paths, &view, &cid, &row).await;
+                        if crate::ping::is_ping(&row.text) {
+                            crate::ping::answer(&node, &paths, &view, cid, &row);
+                        } else {
+                            judge(&paths, &view, &cid, &row).await;
+                        }
                     }
                 }
             }

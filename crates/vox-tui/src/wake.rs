@@ -49,7 +49,7 @@ use vox_core::node::api::MessageRow;
 use vox_core::node::paths::Paths;
 
 /// How one agent session can be woken.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     /// The harness's own session id — the cursor key, and the wake key.
     pub session: String,
@@ -66,6 +66,74 @@ pub struct Session {
     /// The token that socket wants.
     #[serde(default)]
     pub token: String,
+    /// When this session first registered, milliseconds since the epoch (V030-16). Kept as
+    /// every later turn rewrites the record; `0` in a record written before it existed.
+    #[serde(default)]
+    pub first_seen_ms: u64,
+    /// When its drain last ran, milliseconds since the epoch: the last time it read its room.
+    #[serde(default)]
+    pub last_drained_ms: u64,
+    /// `idle` or `busy`, as the harness's own hooks last said (V030-20); empty until one has.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+    /// When `state` was recorded, milliseconds since the epoch.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub state_ms: u64,
+}
+
+// `serde`'s `skip_serializing_if` takes `fn(&T) -> bool`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Milliseconds since the epoch, or `0` on a clock set before it.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// How a registered session can be reached now (V030-16), as `vox agent doctor` and a pong
+/// report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// Its wake endpoint accepts a connection: an urgent addressed message interrupts it.
+    Interrupt,
+    /// It has no wake path (Codex, or a harness Vox does not know): it reads at its next turn.
+    Turn,
+    /// Its wake endpoint is gone: its harness exited or restarted, and nothing reaches it
+    /// until it registers again on its next turn.
+    Gone(String),
+}
+
+impl Reach {
+    /// A short machine token: `interrupt`, `turn` or `gone`.
+    #[must_use]
+    pub fn token(&self) -> &'static str {
+        match self {
+            Reach::Interrupt => "interrupt",
+            Reach::Turn => "turn",
+            Reach::Gone(_) => "gone",
+        }
+    }
+}
+
+/// Whether `session` can be woken now: a connection to its endpoint, closed at once, so
+/// nothing is delivered and nothing is woken.
+pub async fn reach(session: &Session) -> Reach {
+    if !matches!(session.harness.as_str(), "claude" | "opencode") {
+        return Reach::Turn;
+    }
+    if session.endpoint.is_empty() {
+        return Reach::Gone("it registered no wake endpoint".into());
+    }
+    let probe = tokio::net::UnixStream::connect(&session.endpoint);
+    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+        Ok(Ok(_)) => Reach::Interrupt,
+        Ok(Err(e)) => Reach::Gone(format!("{}: {e}", session.endpoint)),
+        Err(_) => Reach::Gone(format!("{}: no answer within 2 s", session.endpoint)),
+    }
 }
 
 /// Record how this session can be woken, from what the harness put in the
@@ -75,7 +143,7 @@ pub struct Session {
 /// read its room, so every failure here is silent and leaves the drain working.
 pub fn register(paths: &Paths, session: &str, room: &str) {
     let name = std::env::var("VOX_AGENT_NAME").unwrap_or_default();
-    let reg = if let (Ok(endpoint), Ok(token)) = (
+    let mut reg = if let (Ok(endpoint), Ok(token)) = (
         std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
         std::env::var("CLAUDE_CODE_MESSAGING_TOKEN"),
     ) {
@@ -86,6 +154,7 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
             name,
             endpoint,
             token,
+            ..Session::default()
         }
     } else if let (Ok(endpoint), Ok(token)) = (
         std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -98,6 +167,7 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
             name,
             endpoint,
             token,
+            ..Session::default()
         }
     } else {
         Session {
@@ -107,8 +177,25 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
             name,
             endpoint: String::new(),
             token: String::new(),
+            ..Session::default()
         }
     };
+    // What the record already says outlives this turn's rewrite: when the session was first
+    // seen, and the idle or busy its harness's hooks last recorded.
+    let now = now_ms();
+    let before = std::fs::read(paths.session_file(session))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Session>(&b).ok());
+    reg.first_seen_ms = before
+        .as_ref()
+        .map(|b| b.first_seen_ms)
+        .filter(|&t| t != 0)
+        .unwrap_or(now);
+    reg.last_drained_ms = now;
+    if let Some(b) = before {
+        reg.state = b.state;
+        reg.state_ms = b.state_ms;
+    }
     let dir = paths.session_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;

@@ -11,6 +11,18 @@ pub const HELLO: &str = "hello";
 pub const BYE: &str = "bye";
 /// Reserved: plain text from a human. Text with no envelope at all **is** a `say`.
 pub const SAY: &str = "say";
+/// Reserved: `vox room ping` asking which sessions answer to a name (V030-16). Answered by the
+/// addressee's daemon, never by a model: no drain shows it and it wakes nobody.
+pub const PING: &str = "ping";
+/// Reserved: a daemon's answer to a [`PING`], naming the sessions it holds under that name.
+/// Like the ping, never shown to a model and never a wake.
+pub const PONG: &str = "pong";
+
+/// Whether `kind` is plumbing between nodes ([`PING`], [`PONG`]), never meant for a model.
+#[must_use]
+pub fn is_plumbing(kind: &str) -> bool {
+    kind == PING || kind == PONG
+}
 
 /// Default hop budget, decremented on every relay and dropped at zero.
 ///
@@ -320,17 +332,18 @@ impl Envelope {
     ///
     /// Addressed **and** urgent — both, deliberately. An urgent broadcast does not
     /// interrupt anybody: if it were allowed to, one agent could stop the whole
-    /// room, which is the wall-of-noise failure this design exists to avoid.
+    /// room, which is the wall-of-noise failure this design exists to avoid. A ping or a
+    /// pong never interrupts, whatever it claims: they are the daemons' business (V030-16).
     #[must_use]
     pub fn may_interrupt(&self, me: &str) -> bool {
-        self.urgent && self.is_addressed_to(me)
+        self.urgent && !is_plumbing(&self.kind) && self.is_addressed_to(me)
     }
 
     /// Whether `me` may answer this without being asked (ADR-020 §9).
     ///
     /// Only when addressed. A broadcast is read, not answered — otherwise every
     /// agent answers every message and the room is unusable with more than two.
-    /// `hello`, `bye`, `ack` and `not-understood` are never auto-answered even
+    /// `hello`, `bye`, `ping`, `pong`, `ack` and `not-understood` are never auto-answered even
     /// when addressed: a terminal acknowledgement must not beget another, which is
     /// the acknowledgement loop other systems hit.
     #[must_use]
@@ -340,7 +353,7 @@ impl Envelope {
         }
         !matches!(
             self.kind.as_str(),
-            HELLO | BYE | work::ACK | work::NOT_UNDERSTOOD
+            HELLO | BYE | PING | PONG | work::ACK | work::NOT_UNDERSTOOD
         )
     }
 

@@ -300,6 +300,12 @@ pub const LINE_BREAKS: &[char] = &[
     '\n', '\r', '\u{0b}', '\u{0c}', '\u{85}', '\u{2028}', '\u{2029}',
 ];
 
+/// Whether `row` is a [`vox_agentcomms::envelope::PING`] or `PONG`, which no model is shown.
+fn is_plumbing(row: &vox_core::node::api::MessageRow) -> bool {
+    vox_agentcomms::envelope::Envelope::parse(&row.text)
+        .is_ok_and(|e| vox_agentcomms::envelope::is_plumbing(&e.kind))
+}
+
 fn is_line_break(c: char) -> bool {
     LINE_BREAKS.contains(&c)
 }
@@ -761,6 +767,9 @@ async fn drain(
         .iter()
         // A message not received yet has nothing to say to the agent until it is (V030-10).
         .filter(|r| !r.owed && !is_own(r, me, &input.session_id) && !woken.contains(&r.entry_hash))
+        // **A ping or a pong is the daemons' business, never the model's** (V030-16): passed
+        // over like an own message, so the cursor still moves past it.
+        .filter(|r| !is_plumbing(r))
         .cloned()
         .collect();
     // Once the cursor has moved to `upto`, the woken entries still ahead of it.
