@@ -551,7 +551,9 @@ impl VoxEndpoint {
             .endpoint
             .connect_with(client_cfg, addr, "vox.invalid")
             .map_err(|_| Error::MalformedBundle("quic connect"))?;
-        let connection = connecting.await.map_err(handshake_failed)?;
+        let connection = connecting
+            .await
+            .map_err(|e| handshake_failed(e, &verified))?;
         let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
@@ -645,7 +647,7 @@ impl VoxEndpoint {
         // beginning a handshake and never finishing it.
         let connecting = incoming
             .accept_with(Arc::new(server_cfg))
-            .map_err(handshake_failed)?;
+            .map_err(|e| handshake_failed(e, &verified))?;
         let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
             .await
             .map_err(|_| {
@@ -654,7 +656,7 @@ impl VoxEndpoint {
                     HANDSHAKE_TIMEOUT.as_secs()
                 ))
             })?
-            .map_err(handshake_failed)?;
+            .map_err(|e| handshake_failed(e, &verified))?;
         let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
         conn.carrier = carrier.filter(|_| via_circuit);
@@ -703,12 +705,30 @@ impl VoxEndpoint {
 /// A refusal is a peer that is busy (V210-86, #278): a node past its cap on handshakes refuses
 /// what it cannot take in time, and its dialler is to say so and try again shortly, not report
 /// a fault.
-fn handshake_failed(e: quinn::ConnectionError) -> Error {
+fn handshake_failed(e: quinn::ConnectionError, verified: &VerifiedPeer) -> Error {
     use quinn::ConnectionError as C;
     let tls = |code: quinn::TransportErrorCode| (0x100..0x200).contains(&u64::from(code));
+    // A QUIC crypto error is 0x100 plus the TLS alert.
+    let alert = |code: quinn::TransportErrorCode| {
+        let n = u8::try_from(u64::from(code) - 0x100).unwrap_or(u8::MAX);
+        format!("TLS alert {n} ({:?})", rustls::AlertDescription::from(n))
+    };
     match e {
-        C::TransportError(t) if tls(t.code) => Error::SignatureInvalid,
-        C::ConnectionClosed(c) if tls(c.error_code) => Error::SignatureInvalid,
+        // This end refused: its verifier says why, or quinn's reason does.
+        C::TransportError(t) if tls(t.code) => Error::HandshakeAuth(format!(
+            "this node refused the peer ({}): {}",
+            alert(t.code),
+            verified.rejection().unwrap_or(t.reason)
+        )),
+        // The peer refused this node, and sent only its alert.
+        C::ConnectionClosed(c) if tls(c.error_code) => Error::HandshakeAuth(format!(
+            "the peer refused this node ({}){}",
+            alert(c.error_code),
+            match String::from_utf8_lossy(&c.reason).trim() {
+                "" => String::new(),
+                r => format!(": {r}"),
+            }
+        )),
         C::ConnectionClosed(c) if c.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED => {
             Error::Handshake("the peer is busy: it refused the connection for now".to_owned())
         }
