@@ -4509,6 +4509,87 @@ impl ChannelState {
         Ok(())
     }
 
+    /// How many generations of other members' sender keys this node holds here: what `vox
+    /// status` reports beside [`Self::key_generations`], and what R14 keeps down to the ones
+    /// still needed ([`Self::prune_superseded_receivers`]).
+    #[must_use]
+    pub fn received_key_generations(&self) -> usize {
+        self.receivers.len()
+    }
+
+    /// Delete every received sender-key generation this node no longer needs (PRD-001 R14 on
+    /// the receiving side): the sender prunes its own origins ([`Self::prune_superseded_origins`]),
+    /// and a receiver that kept every generation it was ever given still opened all of them.
+    ///
+    /// A generation `c` of `author` is no longer needed once this node holds `author`'s feed
+    /// without a gap up to an entry under a later generation, and every entry under `c` in that
+    /// stretch is rendered. A sender only moves forward, so no entry under `c` can follow one
+    /// under a later generation: none can still arrive. An entry whose body is gone (pruned by
+    /// retention) needs no key. Kept: the newest generation held, and every generation with an
+    /// entry not yet rendered — no consent on the log yet, say — or that may still be followed
+    /// by one (a gap, or no later generation yet). Returns how many generations went.
+    pub fn prune_superseded_receivers(&mut self, store: &Store) -> Result<usize> {
+        if self.poisoned {
+            return Ok(0);
+        }
+        let rendered: BTreeSet<Digest32> = self.timeline.iter().map(|r| r.entry_hash).collect();
+        let authors: BTreeSet<Digest32> = self.receivers.keys().map(|(a, _)| *a).collect();
+        let mut gone: Vec<(Digest32, u64)> = Vec::new();
+        for author in authors {
+            let held: Vec<u64> = self
+                .receivers
+                .range((author, 0)..=(author, u64::MAX))
+                .map(|((_, c), _)| *c)
+                .collect();
+            if held.len() <= 1 {
+                continue;
+            }
+            let Some(feed) = self.dag.feed(&author) else {
+                continue;
+            };
+            let mut newest: Option<u64> = None;
+            let mut unrendered: BTreeSet<u64> = BTreeSet::new();
+            for seq in 1..=self.dag.verified_head(&author) {
+                // A gap: what follows it is not known, so neither is what it still needs.
+                let Some(entry) = feed.get(seq) else {
+                    break;
+                };
+                let Some(payload) = entry.payload.as_deref() else {
+                    continue;
+                };
+                if !matches!(classify_payload(payload), Ok(EntryKind::Content)) {
+                    continue;
+                }
+                let Ok(msg) = GroupMessage::from_wire(payload) else {
+                    continue;
+                };
+                let c = msg.header.chain_id;
+                newest = Some(newest.map_or(c, |n| n.max(c)));
+                if !rendered.contains(&entry.entry_hash()) {
+                    unrendered.insert(c);
+                }
+            }
+            let Some(newest) = newest else {
+                continue;
+            };
+            let last_held = held.last().copied().unwrap_or(0);
+            gone.extend(
+                held.iter()
+                    .filter(|c| **c < newest && **c < last_held && !unrendered.contains(c))
+                    .map(|c| (author, *c)),
+            );
+        }
+        if gone.is_empty() {
+            return Ok(0);
+        }
+        for slot in &gone {
+            // `ReceiverChain` holds its chain and skipped keys zeroized on drop.
+            self.receivers.remove(slot);
+        }
+        self.persist_receivers(store)?;
+        Ok(gone.len())
+    }
+
     /// Retry every stored content entry from `author` against the sender keys now
     /// held, rendering those that open. Called when a key arrives.
     /// The authors whose messages this node may read now (see [`Self::may_read`]).

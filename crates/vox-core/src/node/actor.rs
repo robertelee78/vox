@@ -7951,6 +7951,9 @@ impl Node {
             let Ok(mut channel) = shared.try_lock() else {
                 continue;
             };
+            // Other members' generations this node has read to the end go too (R14 on the
+            // receiving side), whatever this node still owes with its own.
+            let _ = channel.prune_superseded_receivers(&store);
             if channel.key_generations() <= 1 || !channel.owed_consents(&full).is_empty() {
                 continue;
             }
@@ -11491,6 +11494,9 @@ impl Node {
                     .channels
                     .get(&room.channel_id)
                     .and_then(|shared| shared.try_lock().ok().map(|c| c.key_generations())),
+                received_key_generations: self.channels.get(&room.channel_id).and_then(|shared| {
+                    shared.try_lock().ok().map(|c| c.received_key_generations())
+                }),
                 frozen: watch.as_ref().map(|(f, _)| f.clone()),
                 refused_below_checkpoint: watch.map(|(_, n)| n),
                 members,
