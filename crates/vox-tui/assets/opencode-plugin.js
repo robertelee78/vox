@@ -78,6 +78,11 @@ import { connect, createServer } from "node:net"
 import { randomBytes, timingSafeEqual } from "node:crypto"
 import { StringDecoder } from "node:string_decoder"
 import { tmpdir } from "node:os"
+
+// The node this plugin drains for (V210-160): `vox agent plugin opencode` writes its
+// `--profile` (and data and config directories, when not the default) here, so the drain never
+// acts for another node on this account.
+const VOX_NODE = []
 import { join } from "node:path"
 
 /**
@@ -359,7 +364,7 @@ export default async function vox({ $, client }) {
         if (told.length) log("drain: woken " + told.map((w) => w.entry).join(" "))
 
         const result =
-          await $`${bin} agent hook --format text --room ${room} --session ${sessionID} ${flags}`
+          await $`${bin} agent hook ${VOX_NODE} --format text --room ${room} --session ${sessionID} ${flags}`
             .env(env)
             .quiet()
             .nothrow()

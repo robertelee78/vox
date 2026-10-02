@@ -601,3 +601,375 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
         more(&out)
     );
 }
+
+// ---- several nodes on one account (V210-160) ------------------------------------------------
+
+/// `vox` acting for profile `profile` (`None`: no profile named) in the shared data root `root`,
+/// with the config directory left to its per-profile default under `xdg` (a temp
+/// `XDG_CONFIG_HOME`, so nothing reaches the real one), and none of [`HARNESS_VARS`].
+fn vox_as(root: &Path, xdg: &Path, profile: Option<&str>) -> Command {
+    let mut c = Command::new(VOX);
+    c.env("VOX_DATA_DIR", root)
+        .env("XDG_CONFIG_HOME", xdg)
+        .env_remove("VOX_CONFIG_DIR");
+    for v in HARNESS_VARS {
+        c.env_remove(v);
+    }
+    if let Some(p) = profile {
+        c.env("VOX_PROFILE", p);
+    }
+    c
+}
+
+/// Run [`vox_as`] with `args` and `stdin`: `(success, stdout, stderr)`.
+fn run_as(
+    root: &Path,
+    xdg: &Path,
+    profile: Option<&str>,
+    args: &[&str],
+    stdin: &str,
+) -> (bool, String, String) {
+    let mut child = vox_as(root, xdg, profile)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: cannot start vox");
+    child
+        .stdin
+        .as_mut()
+        .expect("APPARATUS: vox has no stdin")
+        .write_all(stdin.as_bytes())
+        .expect("APPARATUS: cannot write vox's stdin");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: cannot wait for vox");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// One node of several on the account: a profile in the shared data root, its daemon, one room.
+struct Node {
+    name: &'static str,
+    child: Child,
+    err_file: PathBuf,
+    fingerprint: String,
+    /// The room's label as `vox room list` prints it.
+    room: String,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Node {
+    fn start(root: &Path, xdg: &Path, name: &'static str) -> Self {
+        let pass = root.join(format!("{name}.pass"));
+        std::fs::create_dir_all(root).expect("APPARATUS: cannot make the data root");
+        std::fs::write(&pass, format!("{name} identity passphrase"))
+            .expect("APPARATUS: cannot write the passphrase file");
+        let pass_s = pass.to_str().expect("APPARATUS: a UTF-8 path");
+        let (ok, out, err) = run_as(
+            root,
+            xdg,
+            Some(name),
+            &["id", "--identity-passphrase-file", pass_s],
+            "",
+        );
+        assert!(ok, "CANNOT MEASURE: vox id for {name} failed: {err}");
+        let fingerprint = out.trim().to_owned();
+        let err_file = root.join(format!("{name}-daemon.err"));
+        let child = vox_as(root, xdg, Some(name))
+            .args([
+                "daemon",
+                "--listen",
+                "127.0.0.1:0",
+                "--passphrase-file",
+                pass_s,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(&err_file)
+                    .expect("APPARATUS: cannot create the daemon's stderr file"),
+            ))
+            .spawn()
+            .expect("APPARATUS: cannot start vox daemon");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !run_as(root, xdg, Some(name), &["room", "list"], "").0 {
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE: {name}'s daemon never answered `vox room list` in 60 s; it \
+                 said:\n{}",
+                std::fs::read_to_string(&err_file).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let (ok, _, err) = run_as(
+            root,
+            xdg,
+            Some(name),
+            &["room", "create", "--name", &format!("{name}-room")],
+            "channel passphrase",
+        );
+        assert!(ok, "CANNOT MEASURE: {name}'s room create failed: {err}");
+        let (_, list, _) = run_as(root, xdg, Some(name), &["room", "list"], "");
+        let room = list
+            .lines()
+            .find(|l| l.contains(&format!("{name}-room")))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: {name}'s `vox room list` does not name its new room: {list:?}")
+            })
+            .to_owned();
+        Self {
+            name,
+            child,
+            err_file,
+            fingerprint,
+            room,
+        }
+    }
+}
+
+/// **Each node on one account acts only as itself** (V210-160).
+///
+/// The decider's model is gpg-agent's: a node's key material lives in its own profile, and a
+/// client acts as the node whose profile it uses. Two nodes — the person's (`default`) and an
+/// agent's (`agent`) — share one OS account and one data root, each with its own daemon.
+///
+/// 1. **Each profile's `vox` reaches its own daemon.** Each lists only its own room, its
+///    a post lands in its own room, and the other node's room is unknown to it.
+/// 2. **A hook acts for the node it is told.** With two profiles, a bare `vox agent hook` (no
+///    `--profile`, no `VOX_PROFILE`) refuses, names both, and reads nothing: the person's
+///    unread message is still unread for that session afterwards. The hook `vox agent plugin`
+///    prints for the agent names the agent's profile, and run as printed it drains the
+///    agent's room. (One profile: a bare hook still works — the first test above.)
+/// 3. **Configuration is per profile.** `vox node` writes the anchors file of the profile it
+///    runs in; the agent's daemon, started after, must never dial that anchor.
+///
+/// Mutations that must turn it red, each as `PRODUCT:`: one socket for every profile (red at 1);
+/// a bare hook falling back to the default profile (red at 2); one config directory for every
+/// profile (red at 3).
+#[test]
+#[ignore = "production Argon2id at setup, three real processes; CI runs it in release"]
+fn each_node_on_one_account_acts_only_as_itself() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let (root, xdg) = (tmp.path().join("data"), tmp.path().join("xdg"));
+    std::fs::create_dir_all(&xdg).expect("APPARATUS: cannot make the config home");
+
+    // ---- 3. config: the person's `vox node` writes its anchors file; the agent never uses it ----
+    let pass = root.join("default.pass");
+    std::fs::create_dir_all(&root).expect("APPARATUS: cannot make the data root");
+    std::fs::write(&pass, "default identity passphrase")
+        .expect("APPARATUS: cannot write the passphrase file");
+    let pass_s = pass.to_str().expect("APPARATUS: a UTF-8 path");
+    let (ok, out, err) = run_as(
+        &root,
+        &xdg,
+        Some("default"),
+        &["id", "--identity-passphrase-file", pass_s],
+        "",
+    );
+    assert!(ok, "CANNOT MEASURE: vox id for default failed: {err}");
+    let person_fp = out.trim().to_owned();
+    let anchor_err = root.join("anchor.err");
+    let mut anchor = vox_as(&root, &xdg, Some("default"))
+        .args([
+            "node",
+            "--listen",
+            "127.0.0.1:0",
+            "--identity-passphrase-file",
+            pass_s,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            std::fs::File::create(&anchor_err).expect("APPARATUS: cannot create a log file"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&anchor_err)
+                .expect("APPARATUS: cannot open the log file"),
+        ))
+        .spawn()
+        .expect("APPARATUS: cannot start vox node");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !std::fs::read_to_string(&anchor_err)
+        .unwrap_or_default()
+        .contains("wrote ")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE: the person's `vox node` never wrote its anchors file in 60 s; it \
+             said:\n{}",
+            std::fs::read_to_string(&anchor_err).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = anchor.kill();
+    let _ = anchor.wait();
+    let short_person: String = person_fp.chars().take(26).collect();
+    let agent = Node::start(&root, &xdg, "agent");
+    std::thread::sleep(Duration::from_secs(3));
+    let agent_said = std::fs::read_to_string(&agent.err_file).unwrap_or_default();
+    println!(
+        "[proof] config: the agent's daemon said {} lines; it names the person's anchor: {}",
+        agent_said.lines().count(),
+        agent_said.contains(&short_person)
+    );
+    assert!(
+        !agent_said.contains(&short_person),
+        "PRODUCT: the agent's daemon used the anchor the person's `vox node` wrote into its own \
+         profile's configuration: the two nodes share one config directory.\nthe agent's \
+         daemon said:\n{agent_said}"
+    );
+
+    // ---- 1. each profile's vox reaches its own daemon ----
+    let person = Node::start(&root, &xdg, "default");
+    assert_eq!(
+        person.fingerprint, person_fp,
+        "CANNOT MEASURE: the person's profile changed identity between `vox id` runs"
+    );
+    for (me, other) in [(&person, &agent), (&agent, &person)] {
+        let (ok, list, err) = run_as(&root, &xdg, Some(me.name), &["room", "list"], "");
+        assert!(ok, "PRODUCT: {}'s `vox room list` failed: {err}", me.name);
+        assert!(
+            list.contains(&me.room) && !list.contains(&other.room),
+            "PRODUCT: {}'s `vox room list` is not its own node's: it lists {list:?} (its room \
+             {}, {}'s room {})",
+            me.name,
+            me.room,
+            other.name,
+            other.room
+        );
+        let text = format!("from {}", me.name);
+        let (ok, _, err) = run_as(
+            &root,
+            &xdg,
+            Some(me.name),
+            &["room", "post", &me.room, "-"],
+            &text,
+        );
+        assert!(
+            ok,
+            "PRODUCT: {}'s post to its own room failed: {err}",
+            me.name
+        );
+        let (ok, read, _) = run_as(
+            &root,
+            &xdg,
+            Some(me.name),
+            &["room", "read", &other.room],
+            "",
+        );
+        assert!(
+            !ok && !read.contains(&format!("from {}", other.name)),
+            "PRODUCT: {}'s `vox room read` reached {}'s room {}: {read:?}",
+            me.name,
+            other.name,
+            other.room
+        );
+    }
+    println!("[proof] sockets: each of default and agent lists, reads and posts only its own room");
+
+    // ---- 2. a hook acts for the node it is told ----
+    person.post_hook_message(&root, &xdg);
+    let (ok, out, err) = run_as(
+        &root,
+        &xdg,
+        None,
+        &["agent", "hook", "--room", &person.room],
+        &claude_input("bare-session"),
+    );
+    println!("[proof] bare hook with two profiles: exit ok {ok}; stdout {out:?}; stderr {err:?}");
+    assert!(
+        ok,
+        "PRODUCT: a hook must exit 0 even when it refuses: {err}"
+    );
+    assert!(
+        out.trim().is_empty(),
+        "PRODUCT: a bare `vox agent hook` with two nodes on the account read a node's room \
+         instead of refusing: it injected {out:?}"
+    );
+    assert!(
+        err.contains("several nodes") && err.contains("agent") && err.contains("default"),
+        "PRODUCT: a bare hook with two nodes must refuse and name them; it said {err:?}"
+    );
+    // Nothing was read: the person's message is still unread for that session.
+    let (_, out, err) = run_as(
+        &root,
+        &xdg,
+        Some("default"),
+        &["agent", "hook", "--room", &person.room],
+        &claude_input("bare-session"),
+    );
+    assert!(
+        out.contains(HOOK_MESSAGE),
+        "PRODUCT: the refused bare hook advanced the person's cursor for its session: the \
+         message is no longer unread ({out:?}, {err:?})"
+    );
+    // The hook the plugin prints for the agent names the agent, and run as printed drains the
+    // agent's room.
+    let (ok, printed, err) = run_as(
+        &root,
+        &xdg,
+        Some("agent"),
+        &["agent", "plugin", "claude"],
+        "",
+    );
+    assert!(ok, "PRODUCT: `vox agent plugin claude` failed: {err}");
+    let v: serde_json::Value = serde_json::from_str(printed.trim()).unwrap_or_else(|_| {
+        panic!("PRODUCT: `vox agent plugin claude` printed no JSON: {printed}")
+    });
+    let command = v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: no hook command in {printed}"))
+        .to_owned();
+    println!("[proof] the agent's printed hook: {command:?}");
+    assert!(
+        command.contains("--profile agent"),
+        "PRODUCT: the hook printed for the agent does not name its node: {command:?}"
+    );
+    let args: Vec<&str> = command.split(' ').skip(1).collect();
+    let (_, out, err) = run_as(
+        &root,
+        &xdg,
+        None,
+        &[args.as_slice(), &["--room", &agent.room]].concat(),
+        &claude_input("agent-session"),
+    );
+    assert!(
+        out.contains("from agent") && !out.contains(HOOK_MESSAGE),
+        "PRODUCT: the agent's printed hook, run as printed, did not drain the agent's own room \
+         alone: {out:?} ({err:?})"
+    );
+    println!(
+        "[proof] hook: a bare hook with two nodes refused and read nothing; the agent's printed \
+         hook drains only the agent's room"
+    );
+}
+
+/// What the person posts for the hook arm.
+const HOOK_MESSAGE: &str = "for the person's own sessions";
+
+impl Node {
+    fn post_hook_message(&self, root: &Path, xdg: &Path) {
+        let (ok, _, err) = run_as(
+            root,
+            xdg,
+            Some(self.name),
+            &["room", "post", &self.room, "-"],
+            HOOK_MESSAGE,
+        );
+        assert!(ok, "PRODUCT: {}'s post failed: {err}", self.name);
+    }
+}

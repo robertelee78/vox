@@ -1,8 +1,13 @@
 //! Profile paths (ADR-016 §"Persistence: redb, sealed segments, XDG layout";
 //! ADR-015 §"XDG-conformant layout").
 //!
-//! - config: `$XDG_CONFIG_HOME/vox/` (macOS: `~/Library/Application Support/vox/`)
+//! - config: `$XDG_CONFIG_HOME/vox/<profile>/` (macOS: `~/Library/Application Support/vox/<profile>/`)
 //! - data:   `$XDG_DATA_HOME/vox/<profile>/` holding `vault.cbor` and `store.redb`
+//!
+//! **Each profile is its own node, configuration included** (V210-160). The default config
+//! directory is per profile: shared, every node on the account read one `anchors`, `serve` and
+//! `downloads`, so one node served the rooms another's serve file named. An explicit
+//! `VOX_CONFIG_DIR` or `--config-dir` is used as given.
 //!
 //! Precedence (ADR-015), highest first: explicit override, then the
 //! `VOX_CONFIG_DIR` / `VOX_DATA_DIR` env vars, then the XDG env vars, then the
@@ -52,7 +57,7 @@ pub const DEFAULT_PROFILE: &str = "default";
 /// Resolved, created profile paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
-    /// `…/vox/` config directory (created).
+    /// `…/vox/<profile>/` config directory, or the one given explicitly (created).
     pub config_dir: PathBuf,
     /// `…/vox/<profile>/` data directory (created).
     pub profile_dir: PathBuf,
@@ -84,7 +89,7 @@ impl Paths {
             Some(p) => p.to_path_buf(),
             None => match std::env::var_os("VOX_CONFIG_DIR") {
                 Some(v) => PathBuf::from(v),
-                None => default_config_root()?,
+                None => default_config_root()?.join(profile),
             },
         };
         let profile_dir = data_root.join(profile);
@@ -95,6 +100,24 @@ impl Paths {
             config_dir,
             profile_dir,
         })
+    }
+
+    /// The profiles in this data root: each directory beside this one that holds a vault,
+    /// by name, sorted. A directory with no vault is not a node.
+    #[must_use]
+    pub fn profiles(&self) -> Vec<String> {
+        let Some(root) = self.profile_dir.parent() else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().join(VAULT_FILE).is_file())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        names
     }
 
     /// `<profile_dir>/vault.cbor`.

@@ -233,6 +233,38 @@ where
     code
 }
 
+/// The flags that name `profile`'s node to `vox agent hook` (V210-160): `--profile` always, and
+/// `--data-dir` / `--config-dir` when given and `with_dirs`.
+fn hook_node_args(profile: &ProfileArgs, with_dirs: bool) -> Vec<String> {
+    let mut out = vec!["--profile".to_owned(), profile.profile.clone()];
+    if with_dirs {
+        for (flag, dir) in [
+            ("--data-dir", &profile.data_dir),
+            ("--config-dir", &profile.config_dir),
+        ] {
+            if let Some(d) = dir {
+                let d = std::path::absolute(d).unwrap_or_else(|_| d.clone());
+                out.push(flag.to_owned());
+                out.push(d.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out
+}
+
+/// `word` as one shell word: as it is when nothing in it is special, else single-quoted.
+fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '='))
+    {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
 /// The profile's control socket path, or `None` having said why there is none.
 fn socket_of(profile: &ProfileArgs) -> Option<std::path::PathBuf> {
     match profile.paths() {
@@ -885,6 +917,10 @@ pub struct AgentPluginArgs {
     /// The harness to print an integration for. Only `opencode` needs one today;
     /// Claude Code and Codex are configured with a hook command instead.
     pub harness: String,
+    /// The node the integration drains for: its profile is written into the hook, so the hook
+    /// never acts for another node on this account (V210-160).
+    #[command(flatten)]
+    pub profile: ProfileArgs,
 }
 
 /// `vox agent hook`
@@ -1502,9 +1538,25 @@ enum Cmd {
 /// Parse arguments and dispatch. Returns the process exit code.
 #[must_use]
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = match <Cli as clap::FromArgMatches>::from_arg_matches(&matches) {
+        Ok(c) => c,
+        Err(e) => e.exit(),
+    };
+    // Whether `vox agent hook` was told its node, by `--profile` or `VOX_PROFILE`, rather than
+    // left on the default (V210-160).
+    let hook_profile_named = matches
+        .subcommand_matches("agent")
+        .and_then(|m| m.subcommand_matches("hook"))
+        .and_then(|m| m.value_source("profile"))
+        .is_some_and(|src| src != clap::parser::ValueSource::DefaultValue);
     let default_tui = Cmd::Tui(ProfileArgs {
-        profile: DEFAULT_PROFILE.to_owned(),
+        // The bare `vox` is the TUI of the profile it is given, `VOX_PROFILE` included: it opened
+        // the default profile whatever that said (V210-160).
+        profile: std::env::var("VOX_PROFILE")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| DEFAULT_PROFILE.to_owned()),
         data_dir: std::env::var_os("VOX_DATA_DIR").map(PathBuf::from),
         config_dir: std::env::var_os("VOX_CONFIG_DIR").map(PathBuf::from),
         listen: DEFAULT_LISTEN
@@ -1793,6 +1845,39 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // **A hook acts for the node it is told, never one it guesses** (V210-160). A bare
+            // `vox agent hook`, installed at user scope, resolved the default profile, which is
+            // normally the person's own node: an agent node's sessions drained the person's
+            // room through the person's daemon. With one profile on the account there is no
+            // other node to act as, so it is that one; with several it is refused, naming them.
+            // Exit 0 either way: a hook must never break the turn it rides on.
+            let paths = if hook_profile_named {
+                paths
+            } else {
+                match paths.profiles().as_slice() {
+                    [] => paths,
+                    [only] => match Paths::resolve(
+                        only,
+                        args.profile.data_dir.as_deref(),
+                        args.profile.config_dir.as_deref(),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("vox agent hook: {e}");
+                            return ExitCode::SUCCESS;
+                        }
+                    },
+                    several => {
+                        eprintln!(
+                            "vox agent hook: several nodes on this account ({}); pass --profile \
+                             or set VOX_PROFILE to the one this session is, so it never reads \
+                             another node's rooms. Nothing was read.",
+                            several.join(", ")
+                        );
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            };
             let format = match args.format.parse() {
                 Ok(f) => f,
                 Err(e) => {
@@ -1933,7 +2018,17 @@ pub fn run() -> ExitCode {
         },
         Cmd::Agent(AgentCmd::Plugin(args)) => match args.harness.to_ascii_lowercase().as_str() {
             "opencode" => {
-                print!("{}", crate::agent_hook::OPENCODE_PLUGIN);
+                print!(
+                    "{}",
+                    crate::agent_hook::OPENCODE_PLUGIN.replacen(
+                        "const VOX_NODE = []",
+                        &format!(
+                            "const VOX_NODE = {}",
+                            serde_json::Value::from(hook_node_args(&args.profile, true))
+                        ),
+                        1
+                    )
+                );
                 ExitCode::SUCCESS
             }
             // **Print the thing, do not describe it.** These take a hook entry rather than
@@ -1944,10 +2039,19 @@ pub fn run() -> ExitCode {
             // redirected or piped to `jq`; where to put it goes to stderr so it does not
             // land in the file.
             "claude" | "claude-code" => {
+                let command = std::iter::once("vox agent hook".to_owned())
+                    .chain(
+                        hook_node_args(&args.profile, true)
+                            .iter()
+                            .map(|a| shell_word(a)),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 println!(
                     "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
                      \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
-                     \"vox agent hook\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
+                     {} }}\n        ]\n      }}\n    ]\n  }}\n}}",
+                    serde_json::Value::from(command)
                 );
                 eprintln!(
                     "vox: merge that into ~/.claude/settings.json (user scope, so a session \
@@ -1959,11 +2063,23 @@ pub fn run() -> ExitCode {
                 ExitCode::SUCCESS
             }
             "codex" => {
+                // `--profile` only: Codex's trust gate refuses `--data-dir`, which could aim a
+                // tampered entry at another profile's rooms (`codex_trust::is_vox_hook`).
+                let command = std::iter::once("vox agent hook".to_owned())
+                    .chain(hook_node_args(&args.profile, false))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 println!(
                     "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{ \
-                     \"command\": \"vox agent hook\", \"async\": false }}\n    ]\n  \
-                     }}\n}}"
+                     \"command\": {}, \"async\": false }}\n    ]\n  }}\n}}",
+                    serde_json::Value::from(command)
                 );
+                if args.profile.data_dir.is_some() {
+                    eprintln!(
+                        "vox: this node's data directory is not the default, and Codex trusts \
+                         no hook that names one: set VOX_DATA_DIR in the session's environment."
+                    );
+                }
                 eprintln!(
                     "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
                      — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
