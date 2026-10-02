@@ -516,7 +516,8 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
 - **A reply that names no parent still spends a hop** (V210-121). A budget counted along `re` was
   bypassed by leaving `re` out, an ordinary omission, and two agents answering each other urgently
   that way woke each other for ever. So a session's post right after a wake **MUST** answer the
-  message that woke it when exactly one such wake is unanswered (an explicit `re` still wins); a raw
+  message that woke it when exactly one such wake is unanswered (an explicit `re` still wins), and
+  an urgent one with two or more unanswered **MUST** be refused until it names one; a raw
   urgent envelope with no `re` from a session with an unanswered wake **MUST** be refused; and the
   daemon **MUST NOT** wake a session that already spoke in the `re` chain the message answers. That
   message still queues for the session's next turn.

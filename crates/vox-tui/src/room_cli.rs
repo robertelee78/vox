@@ -340,11 +340,8 @@ pub async fn post_cmd(
                             "refusing a raw urgent message with no `re` from session {session}: \
                              it was woken by {} and has not answered. Reply with `--re <entry>`, \
                              or post with the structured flags (`--type`, `--to`, `--urgent`), \
-                             which reply to the message that woke it.",
-                            open.iter()
-                                .map(|e| &e[..12.min(e.len())])
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                             which answer the message that woke it when only one is open.",
+                            open.join(", ")
                         )));
                     }
                 }
@@ -464,15 +461,30 @@ pub async fn post_cmd(
         Some(re) => Some(re.clone()),
         None => {
             let open = crate::wake::open_wakes(paths, &session, &room_key, &snap.rows, &snap.me);
-            if let [only] = &open[..] {
-                eprintln!(
-                    "vox: replying to {} (the message that woke this session); pass --re to \
-                     answer another",
-                    &only[..12.min(only.len())]
-                );
-                Some(only.clone())
-            } else {
-                None
+            match &open[..] {
+                [] => None,
+                [only] => {
+                    eprintln!(
+                        "vox: replying to {} (the message that woke this session); pass --re to \
+                         answer another",
+                        &only[..12.min(only.len())]
+                    );
+                    Some(only.clone())
+                }
+                // **Several unanswered, and an urgent post must say which it answers** (V210-121).
+                // Sent with no `re` it started a chain of its own at a fresh budget, and a session
+                // that left two wakes unanswered stayed that way: every later wake added to the
+                // set rather than being inherited, and two such sessions woke each other for ever.
+                several if opts.urgent => {
+                    return Err(AppError::Usage(format!(
+                        "refusing an urgent message with no --re from session {session}: it was \
+                         woken by {} messages it has not answered ({}). Pass --re <entry> to say \
+                         which one this answers.",
+                        several.len(),
+                        several.join(", ")
+                    )));
+                }
+                _ => None,
             }
         }
     };

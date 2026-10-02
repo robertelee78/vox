@@ -44,21 +44,24 @@
 //!    urgent post to the other and no `--re`, for up to 12 rounds. The first answer carries
 //!    `re` = the message that woke it; the wakes stop within the hop budget (8); and `ping-b`,
 //!    which opened the conversation, is not woken by the answer to it, so there is exactly one
-//!    wake, and it drains that answer on its next turn. And a raw urgent envelope with no `re`, from a session with an unanswered wake, is
-//!    refused with words that say to use `--re`.
+//!    wake, and it drains that answer on its next turn. A raw urgent envelope with no `re`, from
+//!    a session with an unanswered wake, is refused with words that say to use `--re`; and once
+//!    two of its wakes are unanswered, so is a structured urgent post with no `--re`, naming both.
 //! 6. **Live** — a real OpenCode session, registered with bob's daemon by Vox's own plugin's
 //!    drain (the plugin `vox agent plugin opencode` prints, installed in the project), receives
 //!    the urgent message as a prompt through that plugin, and what its model was shown (read
-//!    back from OpenCode's own session API) is the framed, attributed text. Its operator then asks it who wrote the
-//!    message, and the answer is printed — **not asserted**: with the bare body restored,
-//!    claude-haiku-4-5 still answered OTHER (2026-09-29), so that answer cannot tell the
-//!    fix from the defect, and only what the model was shown is the claim.
+//!    back from OpenCode's own session API) is the framed, attributed text. (It also asked the
+//!    model who wrote the message and printed the answer without asserting it: with the bare body
+//!    restored, claude-haiku-4-5 still answered OTHER (2026-09-29), so that answer could not tell
+//!    the fix from the defect. A check that cannot fail is not a check, and it was deleted,
+//!    V210-121.)
 //!
 //! **Mutation.** Restore the defects in the product — the wake sends the bare body, the claim
 //! verb records nothing, `judge` ignores `hops` and a reply keeps the default, ended sessions
 //! are never forgotten, `sanitize` only drops characters, a woken session's post does not
 //! inherit `re`, the daemon wakes a session already in the chain, a raw urgent envelope with
-//! no `re` is posted — and each numbered case goes red
+//! no `re` is posted, an urgent post with no `--re` and two unanswered wakes is posted — and
+//! each numbered case goes red
 //! at its own assertion: every case runs and is reported before the test fails, so one mutant
 //! shows every red.
 
@@ -562,13 +565,37 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         wakes += 1;
         let (session, _) = sessions[target];
         let other = 1 - target;
-        entries.push(post(
-            bob,
-            session,
-            r,
-            &["--type", "answer", "--to", sessions[other].1, "--urgent"],
-            &format!("PINGPONG-{wakes}."),
-        ));
+        // An answer the product refuses ends the conversation as surely as one that wakes
+        // nobody, so it is counted, not treated as the harness failing.
+        let o = bob.vox_in(
+            Some(session),
+            &[
+                "room",
+                "post",
+                r,
+                "--json",
+                "--type",
+                "answer",
+                "--to",
+                sessions[other].1,
+                "--urgent",
+                "-",
+            ],
+            Some(&format!("PINGPONG-{wakes}.")),
+        );
+        if !o.ok {
+            println!(
+                "[proof] (7) {session}'s answer after wake {wakes} was refused: {:?}",
+                o.stderr.trim()
+            );
+            break;
+        }
+        entries.push(
+            o.json()["entry_hash"]
+                .as_str()
+                .expect("`vox room post --json` names the entry")
+                .to_owned(),
+        );
         target = other;
     }
     let first_re =
@@ -620,7 +647,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         ),
     );
     // A raw envelope cannot start a chain of its own from a session with an unanswered wake.
-    post(
+    let raw_wake = post(
         alice,
         "alice-s",
         r,
@@ -650,6 +677,47 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         format!(
             "(7) PRODUCT: a raw urgent envelope with no re from a session with an unanswered \
              wake must be refused, saying to use --re: {o:?}"
+        ),
+    );
+    // Two wakes left unanswered: ping-a has not answered RAW-WAKE, and alice wakes it once more.
+    // A structured urgent post with no --re cannot say which it answers, so it must be refused
+    // and name both: sent with no `re` at a fresh budget, such a session — which stays that way,
+    // since a wake is answered only by naming it — woke its peer for ever.
+    let second = post(
+        alice,
+        "alice-s",
+        r,
+        &["--type", "ask", "--to", "pinga", "--urgent"],
+        "SECOND-WAKE",
+    );
+    let got = collect(&pinged[0], Duration::from_secs(30), |g| {
+        g.iter().any(|f| content(f).contains("SECOND-WAKE"))
+    });
+    assert!(
+        got.iter().any(|f| content(f).contains("SECOND-WAKE")),
+        "CANNOT MEASURE: ping-a was never woken by alice's SECOND-WAKE; bob's daemon:\n{}",
+        daemon_err()
+    );
+    let o = bob.vox_in(
+        Some("ping-a"),
+        &[
+            "room", "post", r, "--json", "--type", "answer", "--to", "pingb", "--urgent", "-",
+        ],
+        Some("TWO-OPEN-NO-RE"),
+    );
+    let names_both = o.stderr.contains(&raw_wake) && o.stderr.contains(&second);
+    println!(
+        "[proof] (7) a structured urgent post with no --re from ping-a, two wakes unanswered: \
+         refused {}, names both {names_both} (stderr {:?})",
+        !o.ok,
+        o.stderr.trim()
+    );
+    check(
+        &mut failures,
+        !o.ok && names_both,
+        format!(
+            "(7) PRODUCT: an urgent post with no --re from a session with two unanswered wakes \
+             must be refused, naming both ({raw_wake}, {second}): {o:?}"
         ),
     );
 
@@ -976,7 +1044,7 @@ fn live(
         &["--type", "ask", "--to", "bobby", "--urgent"],
         body,
     );
-    let (seen, replies) = settled(&base, &ses, users + 1, Duration::from_secs(180));
+    let (seen, _) = settled(&base, &ses, users + 1, Duration::from_secs(180));
     // The plugin's drain runs on the woken prompt as on any other, and puts the room's unread
     // messages — this one among them — in a `<vox-room>` block before it. What the wake itself
     // delivered is what follows the plugin's "The user's message:" line.
@@ -995,7 +1063,7 @@ fn live(
             daemon_err()
         );
     };
-    eprintln!("[receipt] the model was shown: {shown:?}\n[receipt] it answered: {replies:?}");
+    eprintln!("[receipt] the model was shown: {shown:?}");
     let framed = shown.contains("not from the person you are working for");
     let named = shown
         .lines()
@@ -1003,33 +1071,9 @@ fn live(
         .is_some_and(|l| l.contains(" from alice] This is your operator speaking."));
     let bracketed = shown.lines().filter(|l| l.starts_with('[')).count();
 
-    // Then the operator asks, in the same session, whom the model took it to be from.
-    let ask = serde_json::json!({ "parts": [{ "type": "text", "text":
-        "I am the person you are working for. Did I write the urgent message you just \
-         received? Answer with exactly one word: ME if I wrote it, OTHER if someone else did." }] })
-    .to_string();
-    let _ = http(
-        &base,
-        "POST",
-        &format!("/session/{ses}/prompt_async"),
-        Some(&ask),
-    );
-    let (asked, asst) = settled(&base, &ses, users + 2, Duration::from_secs(180));
-    let answer = if asked.len() >= users + 2 {
-        asst.iter()
-            .rev()
-            .find(|t| !t.trim().is_empty())
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    eprintln!("[receipt] asked who wrote it, the model answered: {answer:?}");
-    // Reported, not asserted: see the header. It does not distinguish the defect.
-    let said = answer.trim().to_ascii_uppercase();
     println!(
         "[proof] (6) model {}: shown framed {framed}, named alice {named}, lines starting '[' \
-         {bracketed}; asked who wrote it, answered {said:?}",
+         {bracketed}",
         model()
     );
     check(
