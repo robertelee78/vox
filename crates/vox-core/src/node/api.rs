@@ -1128,6 +1128,25 @@ pub enum NodeEvent {
         /// The local address actually bound (a requested port 0 is resolved here).
         local: std::net::SocketAddr,
     },
+    /// An address for a room was asked for and is **not** handed out (V210-96): it would name no
+    /// route of this node's own (none discovered within the wait) and no anchor it names held the
+    /// room, so it would lead nowhere. `reason` names each board and what kept the room off it; the
+    /// verb itself fails with [`Fault::BoardUnreachable`].
+    AddressWithheld {
+        /// The room.
+        channel_id: Digest32,
+        /// Board by board, why none holds the room.
+        reason: String,
+    },
+    /// What an address handed out for a room carries, in plain words (V210-96): the kinds of route
+    /// to this node it names, and any anchor it names that has not taken the room yet; then, for
+    /// each such anchor, whether it took it within the wait.
+    AddressNote {
+        /// The room.
+        channel_id: Digest32,
+        /// The note.
+        note: String,
+    },
     /// An invite link for a channel (public: it carries no secret).
     InviteLink {
         /// The channel.

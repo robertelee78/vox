@@ -279,8 +279,9 @@ impl ForwardedWorld {
         let joined_in = t0.elapsed();
         assert!(
             ok,
-            "PRODUCT (staging): the guest on [::1] could not join the host's room: `vox connect` \
-             failed after {joined_in:?}.\nstdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
+            "PRODUCT (staging): the guest on [::1] could not join the host's room the moment \
+             `vox serve` printed its address (after {joined_in:?}), which leads to the room when it \
+             is printed (V210-96). `vox connect` said:\nstdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
             host.transcript()
         );
         Self {
