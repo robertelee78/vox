@@ -845,6 +845,10 @@ impl World {
     /// `vox forward <room>.vox <spec> 0` from `dir` — the `.vox` form ADR-022 names, where
     /// the name gives the room and its host — returning it and the address it bound.
     pub fn forward_vox(&self, name: &str, dir: &Path, spec: &str) -> (VoxProc, SocketAddr) {
+        // From a file, never argv (V210-72: a room passphrase on the command line is refused).
+        let pass_file = dir.join(format!("{name}.room.pass"));
+        std::fs::write(&pass_file, &self.passphrase)
+            .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
         let mut fwd = VoxProc::spawn(
             name,
             dir,
@@ -853,8 +857,8 @@ impl World {
                 &format!("{}.vox", self.room),
                 spec,
                 "0",
-                "--passphrase",
-                &self.passphrase,
+                "--passphrase-file",
+                &utf8(&pass_file),
                 "--anchor",
                 &self.guest_anchor,
                 "--listen",

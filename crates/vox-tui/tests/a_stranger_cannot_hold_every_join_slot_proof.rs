@@ -722,6 +722,18 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
             Some(ROOM_PASS),
         );
         let took = t.elapsed();
+        // **What carol and the anchor said, when her join fails** (#315, V030-12): twice a carry
+        // onto v0.3.0 saw carol's board stay unreached for 30 s, and the cause is not named yet.
+        // Printed so the next such run carries the transcripts that name it.
+        if !ok {
+            eprintln!(
+                "[#315] carol's `vox status`:\n{}\n[#315] carol's daemon said:\n{}\n[#315] the \
+                 anchor said:\n{}",
+                s.carol.vox(&["status"], None).1,
+                std::fs::read_to_string(s.dir.join("carol.daemon.err")).unwrap_or_default(),
+                std::fs::read_to_string(&s.anchor_out).unwrap_or_default()
+            );
+        }
         eprintln!(
             "[proof] {} {case}: carol's join ok={ok} in {:.1}s: {}",
             profile(),

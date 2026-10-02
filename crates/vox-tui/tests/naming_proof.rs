@@ -233,6 +233,9 @@ impl Member {
 
     /// `vox service add <room> 22 <at>` — the profile must not be held by a daemon.
     fn serve(&self, room: &str, pass: &str, at: SocketAddr) {
+        // From a file, never argv (V210-72: a room passphrase on the command line is refused).
+        let pass_file = self.dir.join("room.pass");
+        std::fs::write(&pass_file, pass).unwrap();
         let (ok, out, err) = vox(
             &self.dir,
             &[
@@ -241,8 +244,8 @@ impl Member {
                 room,
                 "22",
                 &at.to_string(),
-                "--passphrase",
-                pass,
+                "--passphrase-file",
+                pass_file.to_str().unwrap(),
                 "--listen",
                 "127.0.0.1:0",
             ],
