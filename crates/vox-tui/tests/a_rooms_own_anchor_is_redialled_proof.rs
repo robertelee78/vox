@@ -16,9 +16,9 @@
 //! stopped with SIGINT and brought back [`DOWN`] later on the same port, and the forward must
 //! carry an echo again within [`BACK_WITHIN`] of its return, and say it saw its anchor go.
 //!
-//! **And the node republishes to it.** The anchor comes back having **lost its board** (its
-//! `store.redb` is removed while it is down, as a disk replaced or a store reset would leave it;
-//! its identity file is kept, so it is the same anchor), and the host is **paused** (SIGSTOP by
+//! **And the node republishes to it.** The anchor comes back having **lost its board** (a board is
+//! held in memory, and an anchor keeps no store, ADR-023 decision 6; its identity file is kept, so
+//! it is the same anchor), and the host is **paused** (SIGSTOP by
 //! its PID) meanwhile, so the host cannot restore anything itself. A member republishes the
 //! room's genesis, its own records, and every other member's record its board holds (it vouches
 //! for them, M15.2a). So the only node that can put the **host's** record back on the wiped
@@ -167,11 +167,13 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Its board goes with its store; its identity file stays, so it is the same anchor.
+    // Its board is held in memory, so the restart alone loses it; its identity file stays, so it
+    // is the same anchor. An anchor keeps no store at all (ADR-023 decision 6, PRD-001 R34), so
+    // there is nothing on disk that could put the board back.
     let store = anchor_dir.join("default").join("store.redb");
     assert!(
-        std::fs::remove_file(&store).is_ok(),
-        "CANNOT MEASURE: the anchor's store is not at {}",
+        !store.exists(),
+        "PRODUCT: an anchor that is no member of any room must keep no store, yet {} exists",
         store.display()
     );
     std::thread::sleep(DOWN);

@@ -1548,7 +1548,6 @@ impl NodeNet {
                     channel_id,
                     members: members.len(),
                     pending: guard.current_prejoins(&channel_id, now).len(),
-                    entries: None,
                     holding: guard
                         .current_members(&channel_id, 0, now)
                         .iter()
@@ -1557,7 +1556,6 @@ impl NodeNet {
                             (r.author_id, addrs.collect())
                         })
                         .collect(),
-                    equivocations: Vec::new(),
                 }
             })
             .collect()
@@ -1822,32 +1820,6 @@ impl NodeNet {
             }
             _ => Err(crate::error::Error::MalformedRendezvous(
                 "local publish: unexpected response",
-            )),
-        }
-    }
-
-    /// Put back on this node's board the genesis of a room it **anchors** but does not hold.
-    /// Unlike [`Self::publish_local`] it is not pinned: an anchor keeps a board for any room a
-    /// peer brings it, so the rooms it anchors are rooms strangers can bring, and they stay
-    /// inside the bound on geneses taken from peers (`nat::store::MAX_GENESIS_CHANNELS`) across
-    /// a restart as they were before it.
-    pub fn publish_anchored(&self, genesis: &[u8]) -> Result<()> {
-        use crate::nat::service::{RendezvousRequest, RendezvousResponse};
-        let me = self.local_id();
-        let responses = self.service.handle(
-            Some(&me),
-            None,
-            &RendezvousRequest::Put {
-                record: genesis.to_vec(),
-            },
-        );
-        match responses.first() {
-            Some(RendezvousResponse::Accepted) => Ok(()),
-            Some(RendezvousResponse::Rejected(r)) => {
-                Err(crate::error::Error::RendezvousRejected(r.as_str()))
-            }
-            _ => Err(crate::error::Error::MalformedRendezvous(
-                "anchored publish: unexpected response",
             )),
         }
     }
