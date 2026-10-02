@@ -371,6 +371,26 @@ fn serves_udp(path: PathKind) {
         intact += usize::from(ok);
     }
     assert_eq!(intact, 2, "both oversize payloads must cross intact");
+    // On the relayed path a circuit carries no datagram over 1100 bytes
+    // (`CIRCUIT_DATAGRAM_MAX`), so both payloads crossed as fragments, and the guest's own
+    // report must count them (#227: `datagram_flows_gate`'s claim, through the binary).
+    if path == PathKind::Relayed {
+        let (ok, out, err) = vox_once(&guest, &args(&["status", "--json"]));
+        assert!(ok, "PRODUCT: the guest's `vox status --json` failed: {out}{err}");
+        let report: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` did not parse ({e}): {out}"));
+        let fragmented = report["peers"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["id"] == w.host_fp.as_str()))
+            .and_then(|p| p["datagrams"]["fragmented"].as_u64());
+        eprintln!("[test] proof 4 ({path:?}): the guest counted {fragmented:?} packet(s) fragmented");
+        assert!(
+            fragmented.is_some_and(|n| n > 0),
+            "PRODUCT: the oversize payloads crossed a circuit in fragments, and the guest's \
+             report must count them: {}",
+            report["peers"]
+        );
+    }
 
     // M22.4: FRAG ≠ 0 is dropped, and never reaches the service.
     let before = dual_udp_seen.load(Ordering::Relaxed);
