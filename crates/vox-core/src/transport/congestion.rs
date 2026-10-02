@@ -539,10 +539,11 @@ pub(crate) const QUEUE_DELAY_MIN: Duration = Duration::from_millis(4);
 pub(crate) const QUEUE_DELAY_SHARE: f64 = 0.4;
 /// Tier 2 stops growing its window while a round's minimum round trip exceeds the base by this
 /// much… (see [`PathSignals::holding`]; at a 10 ms base this keeps a Cubic flow's round trip within
-/// about 5% of what it is alone)
-pub(crate) const HOLD_DELAY_MIN: Duration = Duration::from_micros(500);
+/// about 2.5% of what it is alone: at 0.5 ms, 5% the Cubic flow kept 89.7% of its solo rate, under
+/// the decider's 90%)
+pub(crate) const HOLD_DELAY_MIN: Duration = Duration::from_micros(250);
 /// …or by this share of the base, whichever is larger.
-pub(crate) const HOLD_DELAY_SHARE: f64 = 0.05;
+pub(crate) const HOLD_DELAY_SHARE: f64 = 0.025;
 /// Past this share of the bytes sent over the last [`LOSS_ROUNDS`], a loss is congestion whatever
 /// the delay says: a queue too shallow to show as delay, or a policer.
 ///
