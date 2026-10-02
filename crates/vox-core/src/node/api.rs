@@ -1045,7 +1045,8 @@ pub enum Outcome {
     Bound(std::net::SocketAddr),
     /// A member who is not the room's creator or an admin set their **own** node's retention
     /// for a room, at or below the room's (V030-32): `own` seconds here, while the room keeps
-    /// `room` (`0` = forever). It changes nothing on any other node.
+    /// `room` (`0` = forever). It changes nothing on any other node. `own == room` means the
+    /// member's own line was cleared: their node follows the room's retention again.
     OwnRetention {
         /// This node's retention for the room now, seconds.
         own: u64,

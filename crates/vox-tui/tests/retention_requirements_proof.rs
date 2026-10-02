@@ -547,11 +547,13 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
             "PRODUCT: bob's own retention governs only bob's copy: {who} must still read all 3"
         );
     }
-    // bob goes back to the room's week: equal to the room's, so his own again, and allowed.
+    // bob asks for the room's own week: that is "follow the room", which clears his own value,
+    // so the admin's later changes reach his node too (checked at "forever" below).
     let (ok, said) = set_retention(&bob, &room, "1w");
     assert!(
-        ok,
-        "PRODUCT: a member may set their own retention back to the room's: {said}"
+        ok && said.contains("follow the room's retention"),
+        "PRODUCT: a member asking for the room's own value follows the room again, and is told \
+         so: ok={ok}, {said}"
     );
     until_retention(&bob, "PRODUCT", "bob", 604_800, 30);
 

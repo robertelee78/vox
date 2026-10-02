@@ -12076,10 +12076,13 @@ impl Node {
             if room != 0 && (ttl == 0 || ttl > room) {
                 return Outcome::Failed(Fault::AboveRoomRetention);
             }
+            // The room's own value is "follow the room": the member's line is cleared, so a later
+            // change to the room's retention reaches this node too.
+            let own = (ttl != room).then_some(ttl);
             if crate::node::retention::RetentionConfig::write_room(
                 &self.paths.retention_file(),
                 channel_id,
-                ttl,
+                own,
             )
             .is_err()
             {

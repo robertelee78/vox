@@ -138,14 +138,19 @@ impl RetentionConfig {
     }
 
     /// Set this node's own retention for `channel_id` in the file at `path` (V030-32): a member's
-    /// `vox room retention` at or below the room's value lands here. Every room line whose prefix
-    /// matches the room is replaced by one naming the room's whole id; every other line, and every
-    /// comment, is kept as it was. Written to a temporary file and renamed, so a reader never sees
-    /// half a file.
+    /// `vox room retention` below the room's value lands here as `Some(secs)`, and one equal to the
+    /// room's as `None`, which clears the line so the node follows the room again. Every room line
+    /// whose prefix matches the room is removed, and `Some` adds one naming the room's whole id;
+    /// every other line, and every comment, is kept as it was. Written to a temporary file and
+    /// renamed, so a reader never sees half a file.
     ///
     /// # Errors
     /// The file cannot be read (other than missing) or written.
-    pub fn write_room(path: &Path, channel_id: &Digest32, secs: u64) -> crate::error::Result<()> {
+    pub fn write_room(
+        path: &Path,
+        channel_id: &Digest32,
+        secs: Option<u64>,
+    ) -> crate::error::Result<()> {
         let id = crate::node::link::b32_encode(channel_id);
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -167,12 +172,14 @@ impl RetentionConfig {
                 out.push('\n');
             }
         }
-        let value = if secs == 0 {
-            "forever".to_owned()
-        } else {
-            secs.to_string()
-        };
-        out.push_str(&format!("{id} {value}\n"));
+        if let Some(secs) = secs {
+            let value = if secs == 0 {
+                "forever".to_owned()
+            } else {
+                secs.to_string()
+            };
+            out.push_str(&format!("{id} {value}\n"));
+        }
         let tmp = path.with_extension("tmp");
         let written = (|| {
             if let Some(dir) = path.parent() {

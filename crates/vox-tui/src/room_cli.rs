@@ -2865,11 +2865,20 @@ pub async fn retention(
                 0 => "forever".to_owned(),
                 t => format!("for {}", vox_core::node::retention::describe(t)),
             };
-            println!(
-                "vox: set your own retention for {}: this node keeps its messages {}",
-                short(&channel_id),
-                say(own)
-            );
+            if own == room {
+                println!(
+                    "vox: you follow the room's retention for {} again: this node keeps its \
+                     messages {}",
+                    short(&channel_id),
+                    say(own)
+                );
+            } else {
+                println!(
+                    "vox: set your own retention for {}: this node keeps its messages {}",
+                    short(&channel_id),
+                    say(own)
+                );
+            }
             println!(
                 "     the room's is {}, and only its creator or an admin changes that; nothing \
                  changed for anyone else",
