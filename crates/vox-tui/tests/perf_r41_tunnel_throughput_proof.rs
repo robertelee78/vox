@@ -27,7 +27,8 @@
 //! loss; on a link it shares with a Cubic flow (200 Mbit/s through a one-BDP and a quarter-BDP queue,
 //! and a 400 Mbit/s, 2 ms LAN-like link through a one-BDP queue, each over [`CONGESTED_MEASURE`]), its rate is
 //! between [`FAIR_LOW`] and [`FAIR_HIGH`] of that flow's; on a lossy link shared with a Cubic flow
-//! (1% and 6% loss, one-BDP queue) that flow keeps at least [`SHARED_KEEP`] of its solo rate; and on
+//! (1% and 6% loss, one-BDP queue), and one that joins vox on a 6%-loss link with a deep queue, that
+//! flow keeps at least [`SHARED_KEEP`] of its solo rate; and on
 //! a link that goes clean, lossy and
 //! clean again under one transfer, every 2 s window of each clean phase (past [`RECOVER_WITHIN`] after
 //! the loss) is at the clean bar and the lossy phase clears the lossy bar. These are judged by the
@@ -1135,6 +1136,20 @@ const LOSSY_SHARED: [Link; 2] = [
         ..WIFI
     },
 ];
+/// The joined arm's link: 6% loss and a deep (4-BDP) queue. Vox runs alone on it until it has had
+/// time to reach tier 3, then a Cubic flow starts beside it: a second download starting while a
+/// tunnel is already busy. The Cubic flow keeps at least [`SHARED_KEEP`] of its solo rate (the lead,
+/// 2026-10-02: gated; fix-adr024-bbr's spike measured 55% here with tier 3 as it was then).
+const JOINED: Link = Link {
+    name: "joined, 200 Mbit/s, 10 ms RTT, 6% loss, 4-BDP queue, a Cubic flow joins vox",
+    loss: 0.06,
+    queue_bdps: Some(4.0),
+    ..WIFI
+};
+/// How long vox runs alone on the joined link before the Cubic flow joins: tier 1's dwell, three
+/// losses, tier 2's dwell and 32 MiB of trend at a few tens of Mbit/s, then tier 3's 20 rounds and
+/// 2 s, with room to spare.
+const JOINED_ALONE: Duration = Duration::from_secs(30);
 /// The decider: on a lossy shared link the Cubic flow keeps at least this share of its solo rate.
 const SHARED_KEEP: f64 = 0.90;
 /// Beside the Cubic flow, vox must carry at least this share of that flow's solo rate on the same
@@ -1531,6 +1546,7 @@ fn competitor_sender(
             return;
         };
         let Ok(conn) = connecting.await else { return };
+        *COMPARISON_CONN.lock().unwrap() = Some(conn.clone());
         let Ok(mut tx) = conn.open_uni().await else {
             return;
         };
@@ -1566,6 +1582,32 @@ fn windows_below(w: &[Window], bar: f64) -> usize {
     w.windows(2)
         .filter(|p| (p[0].vox + p[1].vox) / 2.0 < bar)
         .count()
+}
+
+/// The comparison flow's connection while it runs, for [`comparison_stats`].
+static COMPARISON_CONN: Mutex<Option<quinn::Connection>> = Mutex::new(None);
+
+/// What the comparison flow's own congestion control says, read from quinn as an arm ends: its
+/// window, smoothed round trip, packets lost and congestion events. With it, a comparison flow that
+/// carried little names its side. A small window with many congestion events means Vox's traffic
+/// pressed it (the product); a large window with little carried means its own sender was short of
+/// CPU in this test process (the apparatus).
+fn comparison_stats() -> String {
+    COMPARISON_CONN
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or("the comparison flow's stats: not connected".to_owned(), |c| {
+            let p = c.stats().path;
+            format!(
+                "the comparison flow's own controller: window {} KB, srtt {:.1} ms, {} packets lost, \
+                 {} congestion events",
+                p.cwnd / 1024,
+                p.rtt.as_secs_f64() * 1000.0,
+                p.lost_packets,
+                p.congestion_events
+            )
+        })
 }
 
 /// The comparison flow must have run, or there was nothing to compare with.
@@ -1919,6 +1961,92 @@ fn taper_arms(
             mbit(&after, |x| x.vox)
         ));
     }
+    // The joined link: the Cubic flow alone (its solo rate), then vox alone long enough to climb,
+    // then the Cubic flow joins vox.
+    'joined: {
+        if !wanted(JOINED.name) {
+            break 'joined;
+        }
+        *link.lock().unwrap() = Some(JOINED);
+        let stop_c = Arc::new(AtomicBool::new(false));
+        competitor_sender(&rt, competitor, Arc::clone(&stop_c));
+        let alone = windows(SETTLE + SHARED_MEASURE, |_| {});
+        let alone = alone[SETTLE.as_secs() as usize..].to_vec();
+        stop_c.store(true, Relaxed);
+        std::thread::sleep(Duration::from_secs(2));
+        let stop_v = Arc::new(AtomicBool::new(false));
+        let pump = stream_to(tunnel, Arc::clone(&stop_v));
+        let vox_alone = windows(JOINED_ALONE, |_| {});
+        let stop_c = Arc::new(AtomicBool::new(false));
+        competitor_sender(&rt, competitor, Arc::clone(&stop_c));
+        let both = windows(SETTLE + SHARED_MEASURE, |_| {});
+        let both = both[SETTLE.as_secs() as usize..].to_vec();
+        let stats = comparison_stats();
+        stop_c.store(true, Relaxed);
+        stop_v.store(true, Relaxed);
+        let _ = pump.join();
+        std::thread::sleep(Duration::from_secs(1));
+        if let Some(e) = late_fault(JOINED.name, &alone)
+            .or_else(|| late_fault(JOINED.name, &both))
+            .or_else(|| crossed_fault(JOINED.name, &both))
+            .or_else(|| competed_fault(JOINED.name, &alone))
+        {
+            cant(cannot, e);
+            break 'joined;
+        }
+        let (solo, kept, vm) = (
+            mean_of(&alone, |x| x.other),
+            mean_of(&both, |x| x.other),
+            mean_of(&both, |x| x.vox),
+        );
+        let share = kept / solo;
+        let verdict = if vm < solo * SHARED_VOX_FLOOR {
+            failed.push(format!(
+                "{}: the emulator was on time; beside the Cubic flow vox carried {:.1} Mbit/s, under \
+                 {:.0}% of that flow's solo {:.1}: the tunnel stalls when a flow joins it",
+                JOINED.name,
+                vm / 1e6,
+                SHARED_VOX_FLOOR * 100.0,
+                solo / 1e6
+            ));
+            "BELOW (vox stalled)".to_owned()
+        } else if share >= SHARED_KEEP {
+            format!("ok (kept >= {:.0}%)", SHARED_KEEP * 100.0)
+        } else {
+            failed.push(format!(
+                "{}: the emulator was on time; the Cubic flow carried {:.1} Mbit/s alone and {:.1} \
+                 after joining vox, {:.1}% of its solo rate, under {:.0}%; vox carried {:.1}: vox \
+                 pushes a joining flow below its own rate",
+                JOINED.name,
+                solo / 1e6,
+                kept / 1e6,
+                share * 100.0,
+                SHARED_KEEP * 100.0,
+                vm / 1e6
+            ));
+            format!("BELOW {:.0}%", SHARED_KEEP * 100.0)
+        };
+        note(
+            report,
+            format!(
+            "{}: the Cubic flow alone {:.1} Mbit/s; vox alone before it joined {:.1}; after it \
+             joined, the Cubic flow {:.1} ({:.1}%) and vox {:.1} — {verdict}; {stats}; alone: {}; \
+             both: {}; per-second vox alone {:?}, Cubic joined {:?}, vox joined {:?}",
+            JOINED.name,
+            solo / 1e6,
+            mean_of(&vox_alone[vox_alone.len() / 3..], |x| x.vox) / 1e6,
+            kept / 1e6,
+            share * 100.0,
+            vm / 1e6,
+            lateness(&alone),
+            lateness(&both),
+            mbit(&vox_alone, |x| x.vox),
+            mbit(&both, |x| x.other),
+            mbit(&both, |x| x.vox)
+        ),
+        );
+    }
+
     // The lossy shared links: the Cubic flow alone, then with Vox, on the same link.
     for shared in LOSSY_SHARED {
         if !wanted(shared.name) {
@@ -1932,6 +2060,7 @@ fn taper_arms(
         let pump = stream_to(tunnel, Arc::clone(&stop));
         let both = windows(SETTLE + SHARED_MEASURE, |_| {});
         let both = both[SETTLE.as_secs() as usize..].to_vec();
+        let stats = comparison_stats();
         stop.store(true, Relaxed);
         let _ = pump.join();
         std::thread::sleep(Duration::from_secs(1));
@@ -1979,12 +2108,13 @@ fn taper_arms(
         };
         note(report, format!(
             "{}: the Cubic flow alone {:.1} Mbit/s, beside vox {:.1} ({:.1}%), vox {:.1} — {verdict}; \
-             alone: {}; both: {}; per-second Cubic alone {:?}, Cubic beside vox {:?}, vox {:?}",
+             {}; alone: {}; both: {}; per-second Cubic alone {:?}, Cubic beside vox {:?}, vox {:?}",
             shared.name,
             solo / 1e6,
             kept / 1e6,
             share * 100.0,
             vm / 1e6,
+            stats,
             lateness(&alone),
             lateness(&both),
             mbit(&alone, |x| x.other),
@@ -2004,6 +2134,7 @@ fn taper_arms(
         let pump = stream_to(tunnel, Arc::clone(&stop));
         let all = windows(SETTLE + CONGESTED_MEASURE, |_| {});
         let w = all[SETTLE.as_secs() as usize..].to_vec();
+        let stats = comparison_stats();
         stop.store(true, Relaxed);
         let _ = pump.join();
         std::thread::sleep(Duration::from_secs(1));
@@ -2052,12 +2183,13 @@ fn taper_arms(
         note(
             report,
             format!(
-                "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.3}x over {} s — {verdict}; {}; \
+                "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.3}x over {} s — {verdict}; {}; {}; \
              per-second vox {:?}, Cubic {:?}",
                 congested.name,
                 vm / 1e6,
                 cm / 1e6,
                 CONGESTED_MEASURE.as_secs(),
+                stats,
                 lateness(&w),
                 mbit(&w, |x| x.vox),
                 mbit(&w, |x| x.other)
