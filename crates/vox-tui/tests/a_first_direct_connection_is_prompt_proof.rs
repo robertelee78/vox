@@ -51,10 +51,8 @@
 //!   comes online, so the host must reach a guest it cannot dial; she must be reached with no
 //!   circuit at all, the anchor carrying none (see `dial_back_is_asked_for`).
 //!
-//! - **the host asks for no circuit either** (V030-27): its own `vox status --json` counts 0
-//!   circuits asked to the guest for the whole run. Its mutant: the circuit's wait for the
-//!   dial-back's word removed from `NodeNet::reach_ladder` — the host asks 4–5 circuits a run, 0 ms
-//!   into each reach: red, as PRODUCT.
+//! - **the host asks for no circuit either** (V030-27): proved in its own blocking arm,
+//!   `a_host_asks_no_circuit_of_a_guest_that_can_dial_it_proof`; the host's count is printed here.
 //!
 //! For V030-22 the whole-run "anchor carried 0" assertion is supporting evidence only: it is red
 //! only in a run where the host happens to reach for a guest that is online but not connected to
@@ -649,18 +647,6 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         ever == 0,
         "PRODUCT: the guest can dial the host, yet the anchor reported carrying up to {ever} \
          circuit(s) for the pair (the host asked for {host_asked}).\nhost:\n{}\nanchor:\n{}",
-        w.host.transcript(),
-        w.anchor.proc.transcript()
-    );
-    // **Nor does the host ask for one** (V030-27, #349): every reach the host makes for the guest
-    // it cannot dial asks the guest to dial back first, and a relay that could not reach the guest
-    // for that dial-back is not asked to carry a circuit to it either. Before, the host asked a
-    // circuit 0 ms into every such reach — 4 or 5 a run, refused only while the guest was not on
-    // the anchor; in 1 of 3 runs one was carried.
-    assert!(
-        host_asked == 0,
-        "PRODUCT: the guest can dial the host, yet the host asked the anchor for {host_asked} \
-         circuit(s) to the guest instead of waiting on its dial-back.\nhost:\n{}\nanchor:\n{}",
         w.host.transcript(),
         w.anchor.proc.transcript()
     );
