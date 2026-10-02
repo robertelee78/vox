@@ -39,6 +39,9 @@ pub enum Call {
     /// A clone or copy onto `path` (`clonefile`, `clonefileat`, `fclonefileat`, `copyfile`,
     /// `fcopyfile`): `std::fs::copy` on macOS fills a file this way, without `write`.
     Copy { path: PathBuf, from: PathBuf },
+    /// `setsockopt(SO_RCVBUF)` under `VOX_INTERPOSE_RCVBUF_CAP`: the bytes asked for and the bytes
+    /// actually set (#174).
+    RcvBuf { asked: u64, set: u64 },
 }
 
 impl Call {
@@ -213,6 +216,13 @@ pub fn parse(log: &str) -> Vec<Event> {
                         from: f[5].into(),
                     },
                     &f[6..],
+                ),
+                Some("rcvbuf") if f.len() == 7 => (
+                    Call::RcvBuf {
+                        asked: f[3].parse().unwrap_or_else(|_| bad()),
+                        set: f[4].parse().unwrap_or_else(|_| bad()),
+                    },
+                    &f[5..],
                 ),
                 Some("chmod") if f.len() == 8 => (
                     Call::Chmod {
