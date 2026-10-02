@@ -197,10 +197,16 @@ pub(crate) fn note_held(paths: &Paths, room: &str, session: &str, resource: &str
     }
 }
 
-/// **The claims this session no longer holds, and why** (ADR-021 M21.9).
+/// What every lapse notice ends with: where the truth is, and what to do with the news.
+const LAPSE_POINTER: &str = "A room claim records nothing: the work item's GitHub issue says \
+     who holds the task (its open attempt). Check the issue, and say in the room what you are doing.";
+
+/// **The room claims this session no longer holds, and why** (ADR-021 M21.9).
 ///
-/// A lapse ends a session's ownership without any message addressed to it, so a busy
-/// holder can keep working on something it no longer owns. (A handoff or release is the
+/// A lapse ends a session's room claim without any message addressed to it, so the drain says
+/// so. **It is information, never an order** (V210-131): a room claim records nothing — the
+/// work item's GitHub issue, maintained through awa, is the only record of who holds a task —
+/// so the notice points at the issue and never tells the agent to stop. (A handoff or release is the
 /// holder's own act, so it is not news; once lapsed, the item may already be held by, or
 /// reserved for, someone else, and the notice says which.) Each is told **once**: `prev` is what the session held at its last
 /// drain, and the caller records `now` afterwards. A loss the session caused itself —
@@ -238,20 +244,20 @@ fn lost_claims(
             // above, so a claim that is gone and not by this session's own act LAPSED
             // first; what state it is in now is the rest of the news.
             Some(State::Held { owner, .. }) => format!(
-                "You no longer hold `{r}`: your claim lapsed, and it is now held by {}. \
-                 Stop work on it.",
+                "Your room claim on `{r}` lapsed, and {} has since claimed it in the room. \
+                 {LAPSE_POINTER}",
                 who(&owner.author, &owner.session)
             ),
             Some(State::Pending {
                 to_fp, to_session, ..
             }) => format!(
-                "You no longer hold `{r}`: your claim lapsed, and it is now reserved for {}. \
-                 Stop work on it.",
+                "Your room claim on `{r}` lapsed, and it is now reserved in the room for {}. \
+                 {LAPSE_POINTER}",
                 who(to_fp, to_session.as_deref().unwrap_or("any session"))
             ),
             None => format!(
-                "You no longer hold `{r}`: your claim lapsed (its ttl ran out without a renew). \
-                 Claim it again before continuing, or stop."
+                "Your room claim on `{r}` lapsed (its ttl ran out without a renew). \
+                 {LAPSE_POINTER}"
             ),
         })
         .collect()
