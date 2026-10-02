@@ -32,6 +32,11 @@
 //! - **A refusal tells the refused side nothing new** (R23, ADR-013 dark services): to a
 //!   stranger, a port the host offers and one it does not are refused the same way — the same
 //!   ending, no bytes, the same SOCKS reply and the same words on its own terminal.
+//! - **A refusal this node makes itself sends the host nothing** (R23, "the remote side learns
+//!   nothing new", read the other way): a CONNECT that `vox up` refuses on its own — a name that
+//!   is not `.vox`, a room this machine does not have, a node it has not trusted — is refused
+//!   with the reason on this node's terminal, and the host logs no attempt. The host is first
+//!   shown to log a refusal it made, so its silence afterwards is a measurement.
 //! - **A tunnel can be closed by itself, from either end, and nothing else changes** (V030-11).
 //!   On the host, `vox tunnel close <member> <service>` closes that member's session to the
 //!   service; on the guest, `vox tunnel close --id N` closes one session its `vox forward`
@@ -463,6 +468,98 @@ fn a_refusal_tells_the_refused_side_nothing_new() {
         codes[0].1, codes[1].1,
         "PRODUCT: the SOCKS reply told a stranger which port the host offers: {codes:?}"
     );
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+fn a_local_refusal_sends_the_host_nothing() {
+    watchdog::arm();
+    // A stranger, so that anything that does reach the host is refused there and logged.
+    let mut w = World::new(echo_service(), false);
+    let guest_dir = w.guest_dir.clone();
+    let (mut up, proxy) = w.up("stranger-up", &guest_dir);
+    let room = w.room.clone();
+    let host_heard = |w: &World, since: Instant| -> Vec<String> {
+        let host = w.host.as_ref().expect("APPARATUS: the world has no host");
+        host.timed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(at, l)| *at >= since && l.contains("a tunnel"))
+            .map(|(_, l)| l.clone())
+            .collect()
+    };
+
+    // The control: a CONNECT the host refuses is one the host logs. Without it, the host's
+    // silence below would prove nothing.
+    let t0 = Instant::now();
+    let (code, _s) = socks5_connect(proxy, &format!("{room}.vox"), w.service_port);
+    let mut logged = Vec::new();
+    while logged.is_empty() && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+        logged = host_heard(&w, t0);
+    }
+    eprintln!("[test] control: SOCKS reply {code}; the host logged {logged:?}");
+    assert!(
+        code == 0x02 && !logged.is_empty(),
+        "CANNOT MEASURE: the host did not log the refusal it made itself (reply {code}, logged \
+         {logged:?}), so its silence for a local refusal would prove nothing"
+    );
+    let host_line = refusal_line(&mut up, "vox up");
+    eprintln!("[test] control: vox up said: {host_line}");
+
+    // Each refusal this node makes on its own: the name, what it is, and the reason it says.
+    let stranger = format!("stranger.{room}.vox");
+    let cases = [
+        (
+            "printer.example.com",
+            "not a .vox name",
+            "is not a .vox name",
+        ),
+        (
+            "nosuchroom.vox",
+            "a room this machine does not have",
+            "neither a room id nor a node",
+        ),
+        (
+            "nas.nosuchroom.vox",
+            "a room name this machine does not have",
+            "no room on this machine is called",
+        ),
+        (
+            stranger.as_str(),
+            "a node this machine has not trusted",
+            "no node you trust is called",
+        ),
+    ];
+    for (name, what, reason) in cases {
+        let t = Instant::now();
+        let (code, _s) = socks5_connect(proxy, name, w.service_port);
+        let said = up.expect_within(
+            Duration::from_secs(10),
+            &format!("vox up to say why it refused {what}"),
+            |l| l.starts_with("! ") && l.contains(reason),
+        );
+        // Long enough for anything sent to reach the host and be logged: the control was
+        // logged within its first round trip.
+        std::thread::sleep(Duration::from_secs(3));
+        let heard = host_heard(&w, t);
+        eprintln!(
+            "[test] {what} ({name}): SOCKS reply {code}; vox up said: {said}; the host logged \
+             {heard:?}"
+        );
+        assert_ne!(
+            code, 0x00,
+            "PRODUCT: vox up told the application that a CONNECT to {what} ({name}) succeeded"
+        );
+        assert!(
+            heard.is_empty(),
+            "PRODUCT: vox up refused {what} ({name}) on its own, and the host still heard of it: \
+             {heard:?}"
+        );
+    }
+    drop(up);
+    drop(w.host.take());
 }
 
 /// A port the host does not offer: `offered`'s neighbour.
