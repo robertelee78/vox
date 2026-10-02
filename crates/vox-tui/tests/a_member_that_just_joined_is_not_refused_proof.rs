@@ -217,9 +217,15 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         let their = fp(d);
         names.push((their.clone(), name));
         let (ok, out, err) = vox_once(&alice_dir, &args(&["trust", "add", &their, "--name", name]));
-        assert!(ok, "CANNOT MEASURE (staging not achieved): alice trusts {name}: {out}{err}");
+        assert!(
+            ok,
+            "CANNOT MEASURE (staging not achieved): alice trusts {name}: {out}{err}"
+        );
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", &alice_fp, "--name", "alice"]));
-        assert!(ok, "CANNOT MEASURE (staging not achieved): {name} trusts alice: {out}{err}");
+        assert!(
+            ok,
+            "CANNOT MEASURE (staging not achieved): {name} trusts alice: {out}{err}"
+        );
     }
 
     let mut alice = daemon("alice", &alice_dir, &spec, &idpass, &[]);
@@ -228,9 +234,15 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         &["room", "create", "--name", "family"],
         &format!("{ROOM_PASS}\n"),
     );
-    assert!(ok, "CANNOT MEASURE (staging not achieved): vox room create: {out}{err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE (staging not achieved): vox room create: {out}{err}"
+    );
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "CANNOT MEASURE (staging not achieved): vox room list: {err}");
+    assert!(
+        ok,
+        "CANNOT MEASURE (staging not achieved): vox room list: {err}"
+    );
     let room = list
         .lines()
         .find(|l| l.contains("family"))
@@ -243,7 +255,13 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     let mut procs: Vec<(&str, std::path::PathBuf, VoxProc)> = joiners
         .into_iter()
         .map(|(name, d)| {
-            let p = daemon(name, &d, &spec, &idpass, &[("VOX_TEST_HOLD_ADDRESS_MS", &hold)]);
+            let p = daemon(
+                name,
+                &d,
+                &spec,
+                &idpass,
+                &[("VOX_TEST_HOLD_ADDRESS_MS", &hold)],
+            );
             (name, d, p)
         })
         .collect();
@@ -254,7 +272,10 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         let _load = Load::start();
         for (name, d, _) in &procs {
             let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-            assert!(ok, "CANNOT MEASURE (staging not achieved): vox room invite: {err}");
+            assert!(
+                ok,
+                "CANNOT MEASURE (staging not achieved): vox room invite: {err}"
+            );
             let (ok, out, err) = vox_in(
                 d,
                 &["room", "join", link.trim(), "--name", "family"],
