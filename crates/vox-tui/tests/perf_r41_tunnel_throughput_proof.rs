@@ -190,14 +190,18 @@ fn take_lateness() -> Duration {
 /// tunnel, never speed it, so a tunnel that held [`MIN_RATIO`] across a late emulator held it in
 /// spite of it.
 ///
-/// **This bound, not ADR-024 c5's 4 ms rule** (4 ms late in more than 10% of judged seconds or in
-/// the median one). This emulator releases each packet by sleeping until it is due, and a sleep
+/// **This bound, not a per-slice maximum** (an early ADR-024 draft's rule: a slice counted late
+/// if its single latest release was 4 ms late, and the link CANNOT MEASURE if more than 10% of
+/// judged slices or the median one were). This emulator releases each packet by sleeping until it is due, and a sleep
 /// overshoots by a few ms when packets are sparse, so its lateness is largest exactly when vox is
 /// slow. Measured in 100 ms slices (a spike; a transfer here lasts about a second), a tunnel held
 /// to 1% of raw by a 64 KiB stream window ran with 714 of 768 slices 4 ms late (median 9.0 ms,
-/// worst 16.9 ms): the c5 rule would have called that product shortfall CANNOT MEASURE. A healthy
+/// worst 16.9 ms): that rule would have called that product shortfall CANNOT MEASURE. A healthy
 /// tunnel at 103% of raw on WAN, at load 7-10, ran with 12-25 of about 60 slices 4-10 ms late
-/// (V210-98 c3).
+/// (V210-98 c3). ADR-024's arms use a different rule, by packet share ([`LATE_PACKET_SHARE`]): a
+/// second counts late only when most of its packets were released late, so a sleep's overshoot
+/// on a few sparse packets does not count; that rule applies to those arms only, not to these
+/// links.
 const MAX_EMULATOR_LATENESS: Duration = Duration::from_millis(25);
 
 /// Write `line` to stderr directly, so it is shown on a passing run too: libtest captures
