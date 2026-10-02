@@ -13,8 +13,12 @@
 //!
 //! # Decisions, evaluated once per round trip
 //! - **Climb 1 → 2** when the last [`CLIMB_1_ROUNDS`] rounds held at least [`CLIMB_1_LOSSES`]
-//!   losses with no queue building, once tier 1's dwell is over, and the loss share over the last
-//!   32 MiB is at least [`TIER2_ENTRY_SHARE`]. That share is marked as tier 2's baseline, which
+//!   losses and no queue held for [`CLIMB_3_QUEUE_ROUNDS`] rounds in a row, once tier 1's dwell is
+//!   over, and the loss share over the last 32 MiB is at least [`TIER2_ENTRY_SHARE`]. Losses of any
+//!   classification count: `PathSignals` calls every loss congestion once the share is past
+//!   [`GENTLE_LOSS_CAP`] (tier 2's rule for its own cut), and counting only the others kept a link
+//!   losing 6% in tier 1 for 18 s and more (measured, R41 changing arm), climbing only when the
+//!   share happened to dip. The delay test is what says the losses are not a queue. That share is marked as tier 2's baseline, which
 //!   follows the trend up until tier 2 has sent 32 MiB of its own: loss that then grows with Vox's
 //!   own sending is congestion.
 //! - **Climb 2 → 3** when the loss share over the last 32 MiB sent (`PathSignals::trend_share`)
@@ -30,7 +34,8 @@
 //! - **Leave tier 3 when it is slower than tier 2 was.** ADR-024 guarantees speed only (the
 //!   decider, 2026-10-02): tier 3 exists to be faster, and is kept only while it is. Vox's
 //!   delivered rate over the last [`RATE_WINDOW`] is recorded at 2 → 3; once tier 3 has dwelt, a
-//!   round whose rate over the same window is under [`TIER3_SLOWER`] of it takes the connection
+//!   round whose rate over the same window, all of it sent at the window (no application-limited
+//!   round in it), is under [`TIER3_SLOWER`] of it takes the connection
 //!   back to tier 2 and locks tier 3 out for a back-off: [`BACKOFF_FIRST`], doubling with each
 //!   such exit up to [`BACKOFF_MAX`], and back to the first only after a tier-3 stay of
 //!   [`BACKOFF_RESET`] without one. Earlier candidates also left tier 3 on a queue another flow
@@ -231,6 +236,8 @@ pub(crate) struct Tapered {
     /// [`RATE_POINT`].
     acked: std::collections::VecDeque<(Instant, u64)>,
     acked_total: u64,
+    /// When the last application-limited round finished.
+    last_app_limited: Option<Instant>,
     /// Tier 2's loss baseline while it settles: bytes sent since 1 -> 2, and the baseline marked.
     tier2_sent: u64,
     tier2_baseline: Option<f64>,
@@ -256,6 +263,7 @@ impl Tapered {
             tier3_entry_rate: 0.0,
             acked: std::collections::VecDeque::new(),
             acked_total: 0,
+            last_app_limited: None,
             tier2_sent: 0,
             tier2_baseline: None,
             backoff: Tier3Backoff::default(),
@@ -283,6 +291,13 @@ impl Tapered {
         self.backoff
     }
 
+    /// Whether every round of the last [`RATE_WINDOW`] had Vox sending at its window: only then
+    /// does a low delivered rate say tier 3 is slower, rather than that the application sent less.
+    fn sending_at_window(&self, now: Instant) -> bool {
+        self.last_app_limited
+            .is_none_or(|t| now.saturating_duration_since(t) > RATE_WINDOW)
+    }
+
     /// Vox's delivered rate over the last [`RATE_WINDOW`] (or what there is of it), bytes per
     /// second: acknowledged bytes, which is what reached the peer.
     fn delivered_rate(&self, now: Instant) -> f64 {
@@ -305,6 +320,7 @@ impl Tapered {
             self.backoff.forgive();
         }
         if self.signals.app_limited() {
+            self.last_app_limited = Some(now);
             return;
         }
         self.settle_tier2_baseline();
@@ -322,7 +338,9 @@ impl Tapered {
         let dwelt = self.rounds_in_tier >= DWELL_ROUNDS && in_tier >= DWELL_TIME;
         let decision = match self.tier_id {
             TierId::Three
-                if dwelt && self.delivered_rate(now) < TIER3_SLOWER * self.tier3_entry_rate =>
+                if dwelt
+                    && self.sending_at_window(now)
+                    && self.delivered_rate(now) < TIER3_SLOWER * self.tier3_entry_rate =>
             {
                 Some((TierId::Two, "tier 3 is slower than tier 2 was", true))
             }
@@ -331,7 +349,9 @@ impl Tapered {
             }
             TierId::One
                 if dwelt
+                    && self.unqueued.rounds >= CLIMB_1_ROUNDS as u32
                     && self.signals.losses_without_queue_in_last(CLIMB_1_ROUNDS)
+                        + self.signals.losses_with_queue_in_last(CLIMB_1_ROUNDS)
                         >= CLIMB_1_LOSSES
                     && self.signals.trend_share() >= TIER2_ENTRY_SHARE =>
             {
