@@ -39,6 +39,9 @@ mod watchdog;
 #[path = "support/previous_release.rs"]
 mod previous_release;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -59,6 +62,7 @@ fn signal(pid: u32, sig: &str) {
 
 /// One arm; what was wrong with it, if anything.
 fn arm(label: &str, data: &Path, mode: &str, holder_args: &[&str], answer: &[&str]) -> Vec<String> {
+    test_knobs::require(&["VOX_TEST_LOCK_HOLD_MS"]);
     let mut a = VoxProc::spawn_env(
         &format!("{label} holder"),
         data,

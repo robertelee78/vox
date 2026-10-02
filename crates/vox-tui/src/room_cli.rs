@@ -727,6 +727,33 @@ pub async fn read(
     Ok(())
 }
 
+/// The services of the tunnels open to or from `member`, each with its count (`22 ×2`), from
+/// `vox status`. Empty when the node does not say.
+async fn tunnels_to(paths: &Paths, member: &Digest32) -> Vec<String> {
+    let Ok(json) = vox_core::node::status::request(&paths.socket_file()).await else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return Vec::new();
+    };
+    let member = vox_core::node::link::b32_encode(member);
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for t in v
+        .get("tunnels")
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|t| t.get("peer").and_then(|p| p.as_str()) == Some(member.as_str()))
+    {
+        let service = t.get("service").and_then(|s| s.as_str()).unwrap_or("?");
+        *counts.entry(service.to_owned()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(s, n)| if n == 1 { s } else { format!("{s} ×{n}") })
+        .collect()
+}
+
 /// The members the node holds back for equivocating in `room` (V210-63), from `vox status`.
 /// Empty when the node does not say: the rows are still worth printing.
 async fn equivocations_in(paths: &Paths, room: &Digest32) -> Vec<(Digest32, u64)> {
@@ -822,6 +849,9 @@ pub async fn tail(
     let mut by_hash: std::collections::HashMap<Digest32, vox_core::node::api::MessageRow> =
         std::collections::HashMap::new();
     let mut last: Option<Digest32> = None;
+    // How far this stream has READ the node's timeline — the last row a read returned, not the
+    // last one emitted, since an own post arrives as `NewEntry` ahead of rows synced before it.
+    let mut read_to: Option<Digest32> = all.last().map(|r| r.entry_hash);
     let mut out = std::io::stdout().lock();
 
     // Index everything, emit only what follows the cursor.
@@ -870,9 +900,17 @@ pub async fn tail(
     // arrive as `NewEntry`; an entry that arrives from another member by sync is
     // announced as `Synced`, and one that becomes readable when a sender key arrives as
     // `SenderKeyReceived` — neither carries the row. So on any of them, and on
-    // `Lagged`, the room is re-read and whatever this stream has not emitted is emitted.
-    // A full re-read rather than `since <last>`, because an entry rendered late (its key
-    // arrived after it did) is not guaranteed to sit after the last one emitted.
+    // `Lagged`, the room is read from where this stream last read it, and whatever it has
+    // not emitted is emitted.
+    //
+    // **From where it last read, never the whole room** (V210-113): a whole re-read made
+    // every arriving message cost the room's history (one run: 122 re-reads of ~7.4 MB).
+    // It is complete because a node's timeline only grows at its end: an entry rendered
+    // late (its key arrived after it did) is appended when it is rendered, so it sits
+    // after every row any earlier read returned — though not necessarily after the last
+    // row *emitted*, which may be an own post that came as `NewEntry`; hence `read_to`.
+    // A reopened room rebuilds its timeline in the same order (its cache rows'); should
+    // the cursor be gone from it anyway, the room is read whole, once.
     loop {
         let reread = match stream.next().await {
             Ok(Some(Frame::Event(vox_core::node::api::NodeEvent::NewEntry {
@@ -910,7 +948,21 @@ pub async fn tail(
             Err(e) => return Err(AppError::Usage(e.to_string())),
         };
         if reread {
-            for r in coord::read_all(&mut lookup, channel_id, None).await? {
+            let rows = match lookup
+                .read_rows(channel_id, read_to)
+                .await
+                .map_err(|e| AppError::Usage(e.to_string()))?
+            {
+                Frame::Rows { rows } => rows,
+                Frame::Error { .. } if read_to.is_some() => {
+                    coord::read_all(&mut lookup, channel_id, None).await?
+                }
+                other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            };
+            if let Some(r) = rows.last() {
+                read_to = Some(r.entry_hash);
+            }
+            for r in rows {
                 deliver(r, &mut out, &mut ops, &mut last);
             }
         }
@@ -1718,6 +1770,10 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// How long a stopped `vox room send` waits for its daemon to withdraw the offer: as long as
+/// `vox daemon` gives its own node to stop.
+const REMOVE_SERVICE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `vox room send` — offer a file to a room and announce it.
 ///
 /// Runs until interrupted: the bytes are served live, so stopping this stops the
@@ -1803,45 +1859,95 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
     println!("     Ctrl-C stops the offer; the announcement stays on the log");
 
     let path = path.to_owned();
+    // Every transfer in flight, and the word to stop them: a stopped offer ends each one with a
+    // reset, never a clean close (see below).
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let mut transfers = tokio::task::JoinSet::new();
     // One stop listener for the whole loop, taken above: one made per turn misses a SIGINT that
     // lands in the same turn as another arm (see `app::run_node`).
     tokio::pin!(interrupted);
     let signal = loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((mut sock, _)) = accepted else { continue };
-                let p = path.clone();
-                // `std::fs` because this workspace's tokio has no `fs` feature, and
-                // widening a dependency for one CLI verb is the wrong trade. The
-                // reads are chunked, so a large file is not held in memory.
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt as _;
-                    let Ok(mut f) = std::fs::File::open(&p) else { return };
-                    let mut buf = vec![0u8; 64 * 1024];
-                    loop {
-                        match std::io::Read::read(&mut f, &mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                if sock.write_all(&buf[..n]).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    let _ = sock.flush().await;
-                });
+                let Ok((sock, _)) = accepted else { continue };
+                while transfers.try_join_next().is_some() {}
+                transfers.spawn(serve_file(path.clone(), sock, stopping.clone()));
             }
             signal = &mut interrupted => break signal,
         }
     };
     crate::app::say(format_args!("vox: no longer offering {tag}"));
-    let _ = client
-        .request(&Request::RemoveService {
+    // Bounded: a daemon that does not answer (stopped, wedged) left this waiting for ever, and
+    // a stop that only SIGKILL could end. Its sessions are reset below either way.
+    let removed = tokio::time::timeout(
+        REMOVE_SERVICE_PATIENCE,
+        client.request(&Request::RemoveService {
             channel_id,
             service_tag: tag,
-        })
-        .await;
+        }),
+    )
+    .await;
+    if removed.is_err() {
+        eprintln!(
+            "vox: the daemon did not answer within {}s; stopping anyway — the offer's transfers \
+             are reset, and there is nothing left for it to serve",
+            REMOVE_SERVICE_PATIENCE.as_secs()
+        );
+    }
+    // Then reset what is still in flight, and wait for the resets to leave before exiting:
+    // an exit would close these sockets gracefully.
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(
+        vox_core::tunnel::session::DRAIN_BOUND + std::time::Duration::from_secs(1),
+        async { while transfers.join_next().await.is_some() {} },
+    )
+    .await;
     Err(AppError::stopped_by(signal))
+}
+
+/// Send the file at `path` to one collector's connection, and close it cleanly only if all of
+/// it was sent.
+///
+/// **Any other ending is a reset** — the offer stopped (`stopping`), or the file could not be
+/// read. A clean close says "that was all of it", so a transfer cut short that way reached the
+/// collector as a clean, truncated end (V210-81): when `vox room send` was stopped, its exit
+/// closed each connection gracefully, and that close could reach the collector before the
+/// node's own cut of the session did.
+async fn serve_file(
+    path: std::path::PathBuf,
+    mut sock: tokio::net::TcpStream,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+) {
+    use tokio::io::AsyncWriteExt as _;
+    // `std::fs` because this workspace's tokio has no `fs` feature, and widening a dependency
+    // for one CLI verb is the wrong trade. The reads are chunked, so a large file is not held
+    // in memory.
+    let whole = {
+        let send = async {
+            let Ok(mut f) = std::fs::File::open(&path) else {
+                return false;
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match std::io::Read::read(&mut f, &mut buf) {
+                    Ok(0) => return sock.flush().await.is_ok(),
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            return false;
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+        };
+        tokio::select! {
+            whole = send => whole,
+            _ = stopping.wait_for(|stop| *stop) => false,
+        }
+    };
+    if !whole {
+        vox_core::tunnel::session::abort_after_drain(sock).await;
+    }
 }
 
 fn room_of_label(channel_id: Digest32) -> String {
@@ -2105,6 +2211,21 @@ async fn collect_offer(
         .await
     {
         Ok(Frame::Bound { local }) => local,
+        // The sender was reached and is serving; this member's connection to it is full. Which
+        // tunnels hold it is said too, from the node's own list (`vox status`).
+        Ok(Frame::Error { reason })
+            if reason == vox_core::node::api::Fault::TunnelLimit.explain() =>
+        {
+            let open = tunnels_to(paths, &offer.author).await;
+            return Err(AppError::Usage(format!(
+                "cannot collect the offer: {reason}{}",
+                if open.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n       open to it now: {}", open.join(", "))
+                }
+            )));
+        }
         Ok(Frame::Error { reason }) => {
             return Err(AppError::Usage(format!(
                 "cannot reach the offer: {reason} — the sender may have stopped serving it, or \
@@ -2457,8 +2578,11 @@ pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Invite { channel_id }).await {
-        Ok(Frame::Link { url }) => {
+        Ok(Frame::Link { url, note }) => {
             println!("{url}");
+            if !note.is_empty() {
+                eprintln!("vox: {note}");
+            }
             eprintln!("vox: send the passphrase by a different channel than this address");
             eprintln!("     joining grants nothing — use `vox trust add` to decide who reads you");
             Ok(())

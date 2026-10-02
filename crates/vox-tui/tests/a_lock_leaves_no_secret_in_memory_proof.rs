@@ -82,10 +82,9 @@
 //! macOS, or leave a memory claim half-run on Linux.
 //!
 //! **Test-only knobs** (`VOX_TEST_SECRET_WORK_DELAY_MS`, `VOX_TEST_SOLVE_AT_LEAST_MS`) stage what a
-//! person's situation is — a slow derivation, a slow device — and nothing a `vox` command can. Once
-//! #300 compiles them out of the shipped binary, this proof is to build with
-//! `--features vox-tui/test-knobs` and refuse as CANNOT MEASURE a `vox` without them
-//! (`support/test_knobs.rs`'s `require`).
+//! person's situation is — a slow derivation, a slow device — and nothing a `vox` command can. They
+//! are compiled into `vox` only with `--features vox-tui/test-knobs` (#300), and each case refuses
+//! as CANNOT MEASURE a `vox` without them (`support/test_knobs.rs`'s `require`).
 //!
 //! What is not measured here, and rests on review: that the seal's thread is given the passphrase
 //! alone (not the signer or the room key), since neither the identity's key nor a random room key
@@ -101,6 +100,9 @@ mod pty_driver;
 
 #[path = "support/syscalls.rs"]
 mod syscalls;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -469,6 +471,7 @@ impl Tui {
 
 /// The environment bob's TUI runs with: the scanner loaded, and each secret-holding thread slow.
 fn tui_env(scan: &Path) -> Vec<String> {
+    test_knobs::require(&["VOX_TEST_SECRET_WORK_DELAY_MS"]);
     vec![
         format!("VOX_PTY_DYLD_INSERT={}", syscalls::interposer().display()),
         format!("VOX_INTERPOSE_SCAN={}", scan.display()),
@@ -769,6 +772,7 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     );
     let mut env = tui_env(&scanner.dir);
     env.retain(|e| !e.starts_with("VOX_TEST_SECRET_WORK_DELAY_MS="));
+    test_knobs::require(&["VOX_TEST_SOLVE_AT_LEAST_MS"]);
     env.push(format!("VOX_TEST_SOLVE_AT_LEAST_MS={GRIND_MS}"));
     env.push(format!("VOX_ANCHORS={spec}"));
     let mut tui = Tui::start(&bob, &identity, tmp.path().join("cues"), "bob", &env);

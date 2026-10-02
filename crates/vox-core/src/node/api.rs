@@ -61,6 +61,157 @@ pub struct MessageRow {
     pub text: String,
 }
 
+/// A room's rendered timeline as the view carries it, oldest first (V210-120).
+///
+/// **A new message costs what it adds, not what came before it.** Each new row was published by
+/// rebuilding the room's whole timeline, so the work a node did per message grew with the room's
+/// history: a member reading a long room behind a burst spent seconds on rows nobody had changed.
+/// Rows are held in shared, immutable chunks. A message adds a small chunk, small chunks merge
+/// into larger ones only up to [`Timeline::CHUNK`] rows, and a full chunk is never copied again.
+/// So an append copies at most a chunk's worth of rows, and a clone of the view copies one pointer
+/// per chunk.
+#[derive(Clone, Default)]
+pub struct Timeline {
+    chunks: Vec<std::sync::Arc<[MessageRow]>>,
+    len: usize,
+}
+
+impl Timeline {
+    /// The most rows a chunk holds before it is frozen.
+    pub const CHUNK: usize = 1024;
+
+    /// How many rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether there are no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Every row, oldest first.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &MessageRow> + '_ {
+        self.chunks.iter().flat_map(|c| c.iter())
+    }
+
+    /// Every row from position `start` on, oldest first, skipping whole chunks before it.
+    pub fn iter_from(&self, start: usize) -> impl Iterator<Item = &MessageRow> + '_ {
+        let mut skip = start;
+        self.chunks.iter().flat_map(move |c| {
+            let from = skip.min(c.len());
+            skip -= from;
+            c[from..].iter()
+        })
+    }
+
+    /// The row at position `i`, oldest first.
+    #[must_use]
+    pub fn get(&self, mut i: usize) -> Option<&MessageRow> {
+        for c in &self.chunks {
+            if i < c.len() {
+                return c.get(i);
+            }
+            i -= c.len();
+        }
+        None
+    }
+
+    /// The oldest row.
+    #[must_use]
+    pub fn first(&self) -> Option<&MessageRow> {
+        self.chunks.first().and_then(|c| c.first())
+    }
+
+    /// The newest row.
+    #[must_use]
+    pub fn last(&self) -> Option<&MessageRow> {
+        self.chunks.last().and_then(|c| c.last())
+    }
+
+    /// This timeline with `rows` added after its newest row. Nothing already held is copied but
+    /// the open chunks that the new rows merge into, which are at most [`Self::CHUNK`] rows.
+    #[must_use]
+    pub fn appended(&self, rows: impl IntoIterator<Item = MessageRow>) -> Self {
+        let added: std::sync::Arc<[MessageRow]> = rows.into_iter().collect();
+        if added.is_empty() {
+            return self.clone();
+        }
+        let mut next = self.clone();
+        next.len += added.len();
+        next.chunks.push(added);
+        // Merge the newest chunks while the older of the two is no larger than the newer, as a
+        // binary counter carries, and never into a chunk past `CHUNK`: chunks stay few, and an
+        // append copies a bounded number of rows.
+        while let [.., older, newer] = next.chunks.as_slice() {
+            if older.len() > newer.len() || older.len() + newer.len() > Self::CHUNK {
+                break;
+            }
+            let merged: std::sync::Arc<[MessageRow]> =
+                older.iter().chain(newer.iter()).cloned().collect();
+            next.chunks.pop();
+            next.chunks.pop();
+            next.chunks.push(merged);
+        }
+        next
+    }
+
+    /// Whether both hold the very same chunks: equal without reading a row.
+    fn shares_chunks(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.chunks.len() == other.chunks.len()
+            && self
+                .chunks
+                .iter()
+                .zip(&other.chunks)
+                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+    }
+}
+
+impl FromIterator<MessageRow> for Timeline {
+    fn from_iter<I: IntoIterator<Item = MessageRow>>(rows: I) -> Self {
+        let mut t = Self::default();
+        let mut chunk = Vec::with_capacity(Self::CHUNK);
+        for row in rows {
+            chunk.push(row);
+            if chunk.len() == Self::CHUNK {
+                t.len += chunk.len();
+                t.chunks.push(std::mem::take(&mut chunk).into());
+            }
+        }
+        if !chunk.is_empty() {
+            t.len += chunk.len();
+            t.chunks.push(chunk.into());
+        }
+        t
+    }
+}
+
+impl<'a> IntoIterator for &'a Timeline {
+    type Item = &'a MessageRow;
+    type IntoIter = Box<dyn DoubleEndedIterator<Item = &'a MessageRow> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+impl PartialEq for Timeline {
+    fn eq(&self, other: &Self) -> bool {
+        self.shares_chunks(other) || (self.len == other.len && self.iter().eq(other.iter()))
+    }
+}
+
+impl Eq for Timeline {}
+
+impl std::fmt::Debug for Timeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
@@ -73,8 +224,9 @@ pub struct ChannelDetail {
     /// Members, in fingerprint order.
     pub members: Vec<Digest32>,
     /// The render-gated timeline, oldest first. Shared, not copied: every clone of the view — each
-    /// IPC read page takes one — used to copy every room's whole timeline (V210-71).
-    pub timeline: std::sync::Arc<[MessageRow]>,
+    /// IPC read page takes one — used to copy every room's whole timeline (V210-71); and a new
+    /// message adds its row without rebuilding the rest (V210-120).
+    pub timeline: Timeline,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
@@ -239,8 +391,9 @@ pub enum NodeCommand {
         /// The text.
         text: String,
     },
-    /// Produce a `vox://` invite link for a channel this node holds open, naming
-    /// this node as anchor and responder. The link arrives as
+    /// Produce a `vox://` invite link for a channel this node holds open, naming this
+    /// node, and any anchors the room uses, as where to reach the room, with this node as
+    /// responder. The link arrives as
     /// [`NodeEvent::InviteLink`]; it carries no secret (ADR-016).
     Invite {
         /// The channel to invite to.
@@ -454,14 +607,14 @@ pub enum Fault {
     /// board was reached after 20s, held nothing for the room, and the advice pointed at the
     /// address.
     RoomNotOnBoard,
-    /// A join could not reach any board: every anchor it knew of (the link's, and this node's
-    /// own) failed to answer within the join's patience, or stopped answering while it read the
-    /// room. No member was asked anything.
+    /// A join could not reach any board: every board it knew of — the link's entries, the room's
+    /// host among them, and this node's anchors — failed to answer within the join's patience,
+    /// or stopped answering while it read the room. No member was asked anything.
     ///
     /// **Not [`Fault::Unreachable`].** A join reported both as one, and the CLI's words for it
     /// said "every member the board knows is offline" — a claim about members, made when the
-    /// board itself was never reached (#192). The two need different fixes: an anchor that is
-    /// down, or a member that is.
+    /// board itself was never reached (#192). The two need different fixes: a host (or the anchor
+    /// it uses) that is down or out of reach, or a member that is.
     BoardUnreachable,
     /// A peer could not be reached (no live endpoint, or the dial failed).
     Unreachable,
@@ -513,6 +666,10 @@ pub enum Fault {
     /// A forward was to be stopped at a local address where no forward is listening. Not
     /// [`Fault::UnknownChannel`] either: no room was named at all (V210-83).
     NoSuchForward,
+    /// A tunnel was refused because the connection to that member already carries
+    /// [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER) tunnels (V210-81). Not
+    /// [`Fault::Unreachable`]: the member was reached, and closing a tunnel is the remedy.
+    TunnelLimit,
     /// An internal invariant failed (a bug, never user input).
     Internal,
 }
@@ -523,6 +680,8 @@ impl Fault {
     ///
     // `Fault::KeyringFull`'s explanation names the cap in words; this holds them together.
     const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
+    // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
+    const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
 
     /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
     /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,
@@ -574,7 +733,7 @@ impl Fault {
                 "the board holds nothing for that room\n       either its host has not published it there yet (the host must be online; then try again)\n       or the room part of the address is wrong: check it against the address you were sent"
             }
             Fault::BoardUnreachable => {
-                "the anchor could not be reached, so no member was asked\n       check that the anchor is running and that this node can reach its address"
+                "no board the join tried could be read — the room's host, or an anchor if one was tried — so no member was asked\n       check that the host is running and that this machine can reach its address"
             }
             Fault::Unreachable => {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
@@ -611,6 +770,9 @@ impl Fault {
                 "that service is not offered in this room\n       check its name: it is the tag that was given to `vox service add`"
             }
             Fault::NoSuchForward => "no forward is listening at that local address",
+            Fault::TunnelLimit => {
+                "16 tunnels are already open to this member\n       to free one: close the program using it, or restart the `vox up` or `vox forward` carrying it; on the host, `vox service remove` the service, or `vox trust remove` the member\n       `vox status` lists every tunnel, and when each last moved"
+            }
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
             }
@@ -686,6 +848,7 @@ fault_names!(
     NotAServiceRoom,
     NotOffered,
     NoSuchForward,
+    TunnelLimit,
     Internal,
 );
 
@@ -871,6 +1034,21 @@ pub enum NodeEvent {
         /// What happened, for the operator.
         note: String,
     },
+    /// More peers dialled this node at once than it runs handshakes for, and the ones past the
+    /// cap waited for a slot or were refused (V210-86): said once per burst, when none is left
+    /// waiting, so an operator can see a burst was absorbed, or how many were turned away.
+    HandshakesQueued {
+        /// How many attempts waited for a slot.
+        waited: usize,
+        /// The most that waited at once.
+        most_waiting: usize,
+        /// The most handshakes that ran at once meanwhile: never more than the cap.
+        most_running: usize,
+        /// How many were refused: no place left to wait, or no slot in time.
+        refused: usize,
+        /// The longest any waited, in milliseconds.
+        longest_ms: u64,
+    },
     /// A join failed, with what each responder that was tried reported.
     ///
     /// `Outcome::Failed(Fault)` is a single token with no room for a reason, so this carries the
@@ -949,6 +1127,25 @@ pub enum NodeEvent {
         service_tag: String,
         /// The local address actually bound (a requested port 0 is resolved here).
         local: std::net::SocketAddr,
+    },
+    /// An address for a room was asked for and is **not** handed out (V210-96): it would name no
+    /// route of this node's own (none discovered within the wait) and no anchor it names held the
+    /// room, so it would lead nowhere. `reason` names each board and what kept the room off it; the
+    /// verb itself fails with [`Fault::BoardUnreachable`].
+    AddressWithheld {
+        /// The room.
+        channel_id: Digest32,
+        /// Board by board, why none holds the room.
+        reason: String,
+    },
+    /// What an address handed out for a room carries, in plain words (V210-96): the kinds of route
+    /// to this node it names, and any anchor it names that has not taken the room yet; then, for
+    /// each such anchor, whether it took it within the wait.
+    AddressNote {
+        /// The room.
+        channel_id: Digest32,
+        /// The note.
+        note: String,
     },
     /// An invite link for a channel (public: it carries no secret).
     InviteLink {

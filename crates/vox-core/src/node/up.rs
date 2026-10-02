@@ -180,8 +180,8 @@ where
 /// **Why it is minutes rather than seconds.** The bound was 20s, then 90s, and both were
 /// calibrated on an idle machine. The measured first-connect wait on a quiet box has been
 /// 7.7s and 88s across runs — an order of magnitude apart for the same code — because what
-/// the wait covers is a cold node connecting to an anchor, syncing a board and dialling a
-/// peer through the ADR-012 ladder, possibly relayed. Under a loaded machine the 90s bound
+/// the wait covers is a cold node connecting to the host, or to an anchor when it needs one,
+/// syncing a board and dialling a peer through the ADR-012 ladder, possibly relayed. Under a loaded machine the 90s bound
 /// expired and the *original* defect reappeared: the proxy refused a real request that would
 /// have succeeded shortly after. A bound that turns into the bug it fixed whenever the
 /// machine is busy is not a fix, so this is generous on purpose. A host that is genuinely
@@ -242,30 +242,49 @@ async fn reach_host_with_patience<D: HostDialer>(
 /// `ConnectionManager::retire_expired` closes the old one only once nothing holds it, so a
 /// tunnel that let go of it here would be cut the moment the retirement grace ran out.
 ///
+/// **So does the tunnel's credit** ([`VoxConnection::carry_tunnel`]), taken before the stream is
+/// opened and held by the caller for the same span: a receive window of the tunnel's own, and
+/// its place among the [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER) the
+/// connection may carry.
+///
 /// # Errors
-/// [`Error::TunnelDenied`] when the host refused; otherwise the last reason the host could
-/// not be reached.
+/// [`Error::TunnelDenied`] when the host refused; [`Error::TunnelLimit`] when the connection
+/// to the host already carries all the tunnels it may (not retried: only a tunnel closing
+/// changes it); otherwise the last reason the host could not be reached.
 pub async fn open_tunnel<D: HostDialer>(
     dialer: &D,
     host: &Digest32,
     channel_id: &Digest32,
     service_tag: &str,
-) -> Result<(quinn::SendStream, quinn::RecvStream, Arc<VoxConnection>)> {
+) -> Result<(
+    quinn::SendStream,
+    quinn::RecvStream,
+    Arc<VoxConnection>,
+    crate::transport::quic::TunnelCredit,
+)> {
     let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
     loop {
         let attempt = async {
             let conn = reach_host_with_patience(dialer, host).await?;
+            let credit = conn.carry_tunnel(service_tag, true)?;
             let (mut send, mut recv) = crate::transport::streams::open_typed(
                 &conn,
                 crate::transport::streams::StreamKind::Tunnel,
             )
             .await?;
-            crate::tunnel::session::request(&mut send, &mut recv, channel_id, service_tag).await?;
-            Ok::<_, Error>((send, recv, conn))
+            match crate::tunnel::session::request(&mut send, &mut recv, channel_id, service_tag)
+                .await
+            {
+                // The host refused at the cap, in a race this side's own count lost: said as the
+                // cap, with this node's list of the member's tunnels (#272 c5).
+                Err(Error::TunnelLimit(_)) => return Err(conn.tunnel_limit()),
+                other => other?,
+            }
+            Ok::<_, Error>((send, recv, conn, credit))
         };
         match attempt.await {
             Ok(streams) => return Ok(streams),
-            Err(e @ Error::TunnelDenied(_)) => return Err(e),
+            Err(e @ (Error::TunnelDenied(_) | Error::TunnelLimit(_))) => return Err(e),
             Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
             Err(_) => tokio::time::sleep(HOST_POLL).await,
         }
@@ -284,6 +303,7 @@ pub fn refusal(e: &Error, what: &str) -> String {
             "the host refused {what} — it has not trusted this identity (`vox trust add`), \
              or offers nothing there, or its service did not answer"
         ),
+        Error::TunnelLimit(_) => format!("{what} was not opened: {e}"),
         other => format!("could not reach the host for {what}: {other}"),
     }
 }
@@ -334,24 +354,25 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
     // **The port is the service tag** (ADR-017 decision 4), so nothing here invents a name,
     // and the **host** decides whether the dial is allowed — this side claims nothing.
     let tag = port.to_string();
-    // `_carried` is held for the whole splice: see [`open_tunnel`].
-    let (send, recv, _carried) = match open_tunnel(dialer, &room.host, &room.channel_id, &tag).await
-    {
-        Ok(streams) => streams,
-        Err(why) => {
-            // The SOCKS reply is a code, and a coarse one; the sentence goes to this node's
-            // own operator. Neither says anything the host did not.
-            refused(&refusal(&why, &format!("{name}:{port}")));
-            let reply = match why {
-                Error::TunnelDenied(_) => Reply::NotAllowed,
-                _ => Reply::GeneralFailure,
-            };
-            socks::write_reply(&mut stream, reply, UNSPECIFIED).await?;
-            return Err(why);
-        }
-    };
+    // `_carried` and `_credit` are held for the whole splice (see [`open_tunnel`]): the path, and
+    // the tunnel's receive window of its own on it.
+    let (send, recv, _carried, credit) =
+        match open_tunnel(dialer, &room.host, &room.channel_id, &tag).await {
+            Ok(streams) => streams,
+            Err(why) => {
+                // The SOCKS reply is a code, and a coarse one; the sentence goes to this node's
+                // own operator. Neither says anything the host did not.
+                refused(&refusal(&why, &format!("{name}:{port}")));
+                let reply = match why {
+                    Error::TunnelDenied(_) => Reply::NotAllowed,
+                    _ => Reply::GeneralFailure,
+                };
+                socks::write_reply(&mut stream, reply, UNSPECIFIED).await?;
+                return Err(why);
+            }
+        };
     socks::write_reply(&mut stream, Reply::Succeeded, UNSPECIFIED).await?;
-    match crate::tunnel::session::splice(send, recv, stream).await {
+    match crate::tunnel::session::splice_moving(send, recv, stream, credit.moved()).await {
         // The session was established and then cut by a decision. Report it; every other
         // ending is silent (M17.11).
         Err(Error::TunnelRevoked(why)) => {

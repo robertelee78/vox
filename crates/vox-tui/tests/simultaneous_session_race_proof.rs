@@ -44,6 +44,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/world.rs"]
 mod world;
 
@@ -257,6 +260,9 @@ fn digits(fp: &str) -> Vec<u8> {
 
 /// The race, losing the hellos `lose` names.
 fn race(lose: Lose) {
+    if lose != Lose::None {
+        test_knobs::require(&[LOSE_HELLOS]);
+    }
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let dirs: Vec<std::path::PathBuf> = ["alice", "bob", "carol"]

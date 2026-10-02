@@ -1,0 +1,23 @@
+timing-slot: took slot2 of 3 at 21:42:00Z, load 37.27 35.08 36.68, 1 waiting
+run-slot: took slot3 of 6 at 21:42:01Z, load 37.27 35.08 36.68, 4 waiting
+
+running 1 test
+uptime at start: 14:42  up 21:44, 4 users, load averages: 37.27 35.08 36.68
+test r41_a_tunnel_does_not_throttle_the_link_it_runs_over has been running for over 60 seconds
+R41: unshaped (efficiency, not gated; bounded by the emulator): tunnel 508.0 MB/s, raw loopback TCP 6855.4 MB/s, 7.4%
+R41: Wi-Fi-like, 200 Mbit/s, 10 ms RTT, 5% loss: vox 34.4 Mbit/s, Cubic on the same loss 24.2 Mbit/s, 1.42x — BELOW 2.0x; per-second vox ["39", "62", "48", "29", "32", "18", "31", "42", "31", "32", "35", "24", "45", "20", "27"], Cubic ["28", "24", "24", "24", "26", "22", "31", "24", "22", "25", "25", "21", "22", "22", "23"]
+R41: changing, 200 Mbit/s, 10 ms RTT: clean, 5% loss, clean: clean bar 173.7 Mbit/s (90% of raw 193.0), lossy bar 48.4 Mbit/s; per-second clean ["199", "198", "199", "177", "219", "198", "199", "199", "198", "199", "198", "199", "199", "187", "199", "198", "198", "199", "198", "198"], lossy ["151", "28", "25", "28", "26", "22", "22", "24", "24", "27", "21", "28", "24", "25", "28", "22", "16", "25", "23", "28"], clean ["110", "192", "199", "198", "199", "199", "198", "199", "198", "198", "199", "198", "198", "198", "199", "198", "198", "198", "198", "198"] — BELOW
+uptime at end: 14:44  up 21:46, 4 users, load averages: 28.22 32.48 35.41
+
+thread 'r41_a_tunnel_does_not_throttle_the_link_it_runs_over' (73410757) panicked at crates/vox-tui/tests/perf_r41_tunnel_throughput_proof.rs:961:5:
+CANNOT MEASURE: the tunnel fell back to a relay during the timed transfers: ["vox node: 2 peer(s) connected, 1 circuit(s) carried, 1 room(s) on the board"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test r41_a_tunnel_does_not_throttle_the_link_it_runs_over ... FAILED
+
+failures:
+
+failures:
+    r41_a_tunnel_does_not_throttle_the_link_it_runs_over
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 143.50s
+
