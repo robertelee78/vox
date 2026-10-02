@@ -19,14 +19,9 @@
 //! SIGINT, SIGTERM, SIGHUP and SIGQUIT in turn. Each must exit within [`STOP_WITHIN`] with status 0,
 //! not by the signal, and say which signal stopped it and that it is shutting down.
 //!
-//! **A red names its side.** An anchor that never wrote its anchors file is PRODUCT (staging); a
-//! `kill` that failed is CANNOT MEASURE (the scene was not staged). Anything after the signal is the product's: it
-//! did not exit, died by the signal, or exited without saying why. The wait for each exit is
-//! polled every 50 ms, and the proof measures its own clock on the same timeline: how far the
-//! deschedule's sleep overshot, and the longest gap between two polls. An anchor still running
-//! while that apparatus stalled past [`APPARATUS_BUDGET`] cannot be told from a runner that
-//! stalled, and reads `CANNOT MEASURE: apparatus took X`; otherwise it reads `PRODUCT: … (apparatus
-//! Y)`.
+//! **A red names its side.** An anchor that never wrote its anchors file, or a `kill` that failed,
+//! is CANNOT MEASURE (the scene was not staged). Anything after the signal is the product's: it
+//! did not exit, died by the signal, or exited without saying why.
 //!
 //! Mutations: the listener made inside the `select!` again → red (13 of 20 anchors never exited);
 //! SIGHUP or SIGQUIT not taken → those trials die by the signal → red.
@@ -92,9 +87,6 @@ const DESCHEDULED: Duration = Duration::from_millis(1200);
 const STOP_WITHIN: Duration = Duration::from_secs(10);
 /// How long an anchor may take to start and write its anchors file.
 const LINE_PATIENCE: Duration = Duration::from_secs(60);
-/// The most the proof's own clock may stall (the deschedule's sleep overshooting, or the longest
-/// gap between two 50 ms polls) before an anchor still running is the runner's, not the anchor's.
-const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
 fn signal(pid: u32, sig: &str) {
     let sent = std::process::Command::new("kill")
@@ -108,36 +100,29 @@ fn signal(pid: u32, sig: &str) {
 #[ignore = "real binaries; CI runs it in release"]
 fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let tmp = tempfile::tempdir().unwrap();
     let mut stuck = Vec::new();
-    let mut stalled = Vec::new();
     for trial in 0..TRIALS {
         let (sig, name) = SIGNALS[trial % SIGNALS.len()];
         let dir = tmp.path().join(format!("anchor{trial}"));
-        std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: cannot make a directory");
+        std::fs::create_dir_all(dir.join("cfg")).unwrap();
         let mut anchor =
             VoxProc::spawn("anchor", &dir, &args(&["node", "--listen", "127.0.0.1:0"]));
         if let Err(why) = anchor.try_expect_within(LINE_PATIENCE, "the anchors file written", |l| {
             l.starts_with("vox node: wrote ")
         }) {
-            panic!("PRODUCT (staging): anchor {trial} never settled: {why}");
+            panic!("CANNOT MEASURE: anchor {trial} never settled: {why}");
         }
         let pid = anchor.child.id();
         signal(pid, "-STOP");
-        let slept = Instant::now();
         std::thread::sleep(DESCHEDULED);
-        let overshoot = slept.elapsed().saturating_sub(DESCHEDULED);
         signal(pid, sig);
         signal(pid, "-CONT");
         let signalled = Instant::now();
-        let (mut last_poll, mut longest_gap) = (signalled, Duration::ZERO);
         while anchor.child.try_wait().ok().flatten().is_none() && signalled.elapsed() < STOP_WITHIN
         {
             std::thread::sleep(Duration::from_millis(50));
-            longest_gap = longest_gap.max(last_poll.elapsed());
-            last_poll = Instant::now();
         }
-        let apparatus = overshoot.max(longest_gap);
         let status = anchor.child.try_wait().ok().flatten();
         let said = anchor.transcript();
         let shut = said.lines().any(|l| l == "vox node: shutting down");
@@ -146,33 +131,28 @@ fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
             .any(|l| l == format!("vox node: stopped by {name}"));
         eprintln!(
             "[proof] anchor {trial}, {name}: exited {status:?} after {:?}, said it was stopped by \
-             {name}: {named}, shutting down: {shut} (apparatus {apparatus:?})",
+             {name}: {named}, shutting down: {shut}",
             signalled.elapsed()
         );
         let Some(status) = status else {
             let _ = anchor.child.kill();
             let _ = anchor.child.wait();
-            let what = format!("anchor {trial} ({name}, apparatus {apparatus:?}):\n{said}");
-            if apparatus > APPARATUS_BUDGET {
-                stalled.push(what);
-            } else {
-                stuck.push(what);
-            }
+            stuck.push(format!("anchor {trial} ({name}):\n{said}"));
             continue;
         };
         assert_eq!(
             status.signal(),
             None,
-            "PRODUCT: anchor {trial}: `vox node` died by {name} instead of stopping:\n{said}"
+            "anchor {trial}: `vox node` died by {name} instead of stopping:\n{said}"
         );
         assert_eq!(
             status.code(),
             Some(0),
-            "PRODUCT: anchor {trial}: `vox node` stopped by {name} ended with {status}:\n{said}"
+            "anchor {trial}: `vox node` stopped by {name} ended with {status}:\n{said}"
         );
         assert!(
             named && shut,
-            "PRODUCT: anchor {trial} exited on {name} without saying it was stopped by {name} and is \
+            "anchor {trial} exited on {name} without saying it was stopped by {name} and is \
              shutting down:\n{said}"
         );
     }
@@ -182,18 +162,10 @@ fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
     );
     assert!(
         stuck.is_empty(),
-        "PRODUCT: {} of {TRIALS} anchors did not stop within {STOP_WITHIN:?} of a stop signal that landed \
+        "{} of {TRIALS} anchors did not stop within {STOP_WITHIN:?} of a stop signal that landed \
          with a tick:\n{}",
         stuck.len(),
         stuck.join("\n")
-    );
-    assert!(
-        stalled.is_empty(),
-        "CANNOT MEASURE: {} of {TRIALS} anchors were still running {STOP_WITHIN:?} after the \
-         signal, but the apparatus stalled past {APPARATUS_BUDGET:?} meanwhile, so a slow anchor \
-         cannot be told from a stalled runner:\n{}",
-        stalled.len(),
-        stalled.join("\n")
     );
 }
 
@@ -369,9 +341,7 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
                 if n == 0 {
                     break;
                 }
-                into.lock()
-                    .expect("APPARATUS: the screen buffer's lock")
-                    .extend_from_slice(&buf[..n]);
+                into.lock().unwrap().extend_from_slice(&buf[..n]);
             }
         });
     }
@@ -384,10 +354,7 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
             }
         }
     });
-    let screen = || {
-        String::from_utf8_lossy(&shown.lock().expect("APPARATUS: the screen buffer's lock"))
-            .into_owned()
-    };
+    let screen = || String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
     let echo = |t: &std::fs::File| {
         rustix::termios::tcgetattr(t)
             .map(|m| m.local_modes.contains(LocalModes::ECHO))
@@ -478,9 +445,7 @@ fn daemon(w: &World, dir: &Path, pass_file: &Path) -> VoxProc {
         &args(&[
             "daemon",
             "--passphrase-file",
-            pass_file
-                .to_str()
-                .expect("APPARATUS: a temp path is not UTF-8"),
+            pass_file.to_str().unwrap(),
             "--anchor",
             &w.anchor_spec,
             "--listen",
@@ -571,14 +536,7 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
         let mut send = VoxProc::spawn(
             "send",
             &guest,
-            &args(&[
-                "room",
-                "send",
-                &w.room,
-                offered
-                    .to_str()
-                    .expect("APPARATUS: a temp path is not UTF-8"),
-            ]),
+            &args(&["room", "send", &w.room, offered.to_str().unwrap()]),
         );
         staged("`vox room send` offering", || {
             send.expect_line("the offer", |l| l.starts_with("vox: offering "))
