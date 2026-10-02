@@ -292,6 +292,13 @@ impl LiveCore {
                             } else {
                                 crate::ident::member_name(&nv.trusted, &r.author)
                             },
+                            addressed: if r.owed {
+                                String::new()
+                            } else {
+                                crate::ident::addressed(&r.text, |fp| {
+                                    crate::ident::keyring_name(&nv.trusted, me.as_ref(), fp)
+                                })
+                            },
                             // Displayed as a time of day, so seconds; the full precision is kept for ordering.
                             timestamp: r.created_millis / 1_000,
                             body: Some(if r.owed {

@@ -36,7 +36,7 @@ message. Let `vox` build the envelope: it fills in your session, your repository
 branch, an operation id and its version, which a hand-written envelope would lack.
 
 ```bash
-echo "port the wire codec" | vox room post "$VOX_ROOM" --type assign --to bob \
+echo "port the wire codec" | vox room post "$VOX_ROOM" --type assign --to 7xq2mfk3/bob \
     --work "gh:acme/widgets#42" -
 ```
 
@@ -70,7 +70,11 @@ that you cannot act on. An unknown type is carried unchanged.
 
 Two fields change how a message is delivered:
 
-- `--to` — petnames. A message names who should act on it.
+- `--to` — who should act on it: a room member's fingerprint (a unique prefix of one
+  in `vox room roster`, or of the author shown beside its messages), optionally
+  followed by `/` and the agent name (`VOX_AGENT_NAME`) or session it answers to.
+  Without the `/…`, every session of that member is addressed. The message carries
+  the full fingerprint, so every reader knows exactly who is meant.
 - `--urgent` — **interrupts** the named agent mid-turn instead of waiting for its
   next one. Use it when work is blocked on the answer, and not otherwise. An
   interrupt that fires on everything is a wall of noise, and the operator will turn

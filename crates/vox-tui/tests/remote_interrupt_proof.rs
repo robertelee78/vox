@@ -163,6 +163,8 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let tmp = tempfile::tempdir().unwrap();
     let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
+    // Addressees are named by fingerprint, then the agent name (PRD-001 R15).
+    let (to_bob, to_other) = (format!("{}/bob", bob.b32()), format!("{}/carol", alice.b32()));
     let room = r.id.clone();
     let err_path = tmp.path().join("bob.daemon.err");
 
@@ -203,19 +205,23 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["carol"],"urgent":true,"body":"carol: OTHER-ADDRESSEE"}"#,
+        &format!(
+            r#"{{"v":1,"type":"ask","to":["{to_other}"],"urgent":true,"body":"carol: OTHER-ADDRESSEE"}}"#
+        ),
     );
     // ---- (3) addressed to bob, not urgent: nothing ----
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"body":"bob: NOT-URGENT"}"#,
+        &format!(r#"{{"v":1,"type":"ask","to":["{to_bob}"],"body":"bob: NOT-URGENT"}}"#),
     );
     // ---- (1) addressed to bob and urgent: woken ----
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WAKE-UP-FROM-ALICE"}"#,
+        &format!(
+            r#"{{"v":1,"type":"ask","to":["{to_bob}"],"urgent":true,"body":"bob: WAKE-UP-FROM-ALICE"}}"#
+        ),
     );
     until(
         bob,
@@ -359,7 +365,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
             alice,
             &room,
             &format!(
-                r#"{{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WEDGE-TEST-{n}"}}"#
+                r#"{{"v":1,"type":"ask","to":["{to_bob}"],"urgent":true,"body":"bob: WEDGE-TEST-{n}"}}"#
             ),
         );
     }

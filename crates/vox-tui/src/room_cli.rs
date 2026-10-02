@@ -263,7 +263,9 @@ pub struct PostOpts {
     pub work: Option<String>,
     /// The attempt, carried in `data.attempt`; defaults to this session's claim.
     pub attempt: Option<String>,
-    /// Addressees, by petname.
+    /// Addressees as typed: each a room member's fingerprint (or a unique prefix of one),
+    /// optionally followed by `/` and an agent name or session. Resolved once, here, to the
+    /// full fingerprints the wire carries (PRD-001 R15).
     pub to: Vec<String>,
     /// May interrupt an addressed session.
     pub urgent: bool,
@@ -400,6 +402,7 @@ pub async fn post_cmd(
         None => coord::new_op()?,
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
+    let to = resolve_addressees(&mut client, cid, &opts.to).await?;
     let snap = if work.is_some() {
         coord::participate(&mut client, cid, &room_key, &session).await?
     } else {
@@ -434,7 +437,7 @@ pub async fn post_cmd(
     }
     let draft = Draft {
         kind,
-        to: opts.to.clone(),
+        to,
         urgent: opts.urgent,
         re: opts.re.clone(),
         thread: opts.thread.clone(),
@@ -491,9 +494,62 @@ pub async fn post_cmd(
     Ok(())
 }
 
+/// `--to` as typed, resolved **once, by the sender**, to what the wire carries: each entry a
+/// room member's full fingerprint, optionally followed by `/` and an agent name or session
+/// (PRD-001 R15).
+///
+/// A name the sender gave someone is local to the sender, so a message that carried it would
+/// address a different member, or nobody, on every other node. A fingerprint is the same
+/// everywhere, and each reader shows it by its own keyring's name.
+async fn resolve_addressees(
+    client: &mut IpcClient,
+    cid: Digest32,
+    typed: &[String],
+) -> Result<Vec<String>, AppError> {
+    if typed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let members = match client.request(&Request::Roster { channel_id: cid }).await {
+        Ok(Frame::Members { members }) => members,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let mut out: Vec<String> = Vec::with_capacity(typed.len());
+    for t in typed {
+        let (who, sub) = match t.split_once('/') {
+            Some((who, sub)) => (who, Some(sub)),
+            None => (t.as_str(), None),
+        };
+        if let Some(s) = sub.filter(|s| !vox_agentcomms::envelope::is_valid_sub(s)) {
+            return Err(AppError::Usage(format!(
+                "--to {t:?}: {s:?} is not an agent name or session (1–{} of \
+                 [A-Za-z0-9._@:+-])",
+                vox_agentcomms::envelope::MAX_NAME
+            )));
+        }
+        let fp = resolve_prefix(who, &members).map_err(|e| {
+            AppError::Usage(format!(
+                "--to {t:?} names a room member by fingerprint (a unique prefix of one in \
+                 `vox room roster`), optionally followed by /<agent name or session>: {e}"
+            ))
+        })?;
+        let wire = vox_agentcomms::envelope::Addressee {
+            fp,
+            sub: sub.map(str::to_owned),
+        }
+        .to_wire();
+        if !out.contains(&wire) {
+            out.push(wire);
+        }
+    }
+    Ok(out)
+}
+
 /// Messages addressed to this session that its drain has not delivered yet: past its
-/// drain cursor, not its own, naming it in `to` — by `VOX_AGENT_NAME`, the name it is
-/// addressed by, or by its session id. The one just posted is excluded.
+/// drain cursor, not its own, naming this node's fingerprint in `to` — alone, or with
+/// `VOX_AGENT_NAME` (the name it is addressed by) or its session id. The one just posted is
+/// excluded.
 fn unread_addressed(
     paths: &Paths,
     room_key: &str,
@@ -501,13 +557,7 @@ fn unread_addressed(
     posting: &coord::Posting,
 ) -> Vec<(String, String, String, String)> {
     let snap = &posting.after;
-    let names: Vec<String> = std::iter::once(session.to_owned())
-        .chain(
-            std::env::var("VOX_AGENT_NAME")
-                .ok()
-                .filter(|n| !n.trim().is_empty()),
-        )
-        .collect();
+    let name = std::env::var("VOX_AGENT_NAME").unwrap_or_default();
     let start = crate::agent_hook::load_cursor(paths, room_key, session)
         .and_then(|c| snap.rows.iter().position(|r| r.entry_hash == c))
         .map_or(0, |i| i + 1);
@@ -517,7 +567,7 @@ fn unread_addressed(
         .filter_map(|r| {
             let env = Envelope::parse(&r.text).ok()?;
             let own = r.author == snap.me && env.from == session;
-            (!own && names.iter().any(|n| env.is_addressed_to(n))).then(|| {
+            (!own && env.is_addressed_to(&snap.me, session, name.trim())).then(|| {
                 let body: String = env
                     .body
                     .lines()
@@ -605,6 +655,15 @@ fn row_json(
             "group": group.iter().map(claim::b32).collect::<Vec<_>>(),
         }))
     });
+    // **Who it is addressed to, as fingerprints** (PRD-001 R15): `envelope.to` read, with any
+    // entry that is not a fingerprint left out, since it addresses nobody.
+    let addressed: Vec<serde_json::Value> = parsed
+        .as_ref()
+        .map(Envelope::addressees)
+        .unwrap_or_default()
+        .iter()
+        .map(|a| serde_json::json!({ "fp": claim::b32(&a.fp), "sub": a.sub }))
+        .collect();
     serde_json::json!({
         "schema": "vox.room.row/1",
         "room": room_key,
@@ -614,6 +673,7 @@ fn row_json(
         "text": r.text,
         "owed": r.owed,
         "envelope": envelope,
+        "addressed": addressed,
         "parse_error": parse_error,
         "op": op,
     })

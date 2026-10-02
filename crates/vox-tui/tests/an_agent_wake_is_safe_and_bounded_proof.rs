@@ -201,6 +201,9 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     let daemon_err =
         || std::fs::read_to_string(tmp.path().join("bob.daemon.err")).unwrap_or_default();
     let mut failures = Vec::new();
+    // Addressees are named by fingerprint, then the agent name (PRD-001 R15).
+    let at = |w: &support::Worker, name: &str| format!("{}/{name}", w.b32());
+    let (to_bob, to_bob2, to_alice) = (at(bob, "bob"), at(bob, "bob2"), at(alice, "alice"));
 
     // ---- bob's sessions register with his daemon, as a harness hook does every turn ----
     let sock = tmp.path().join("session.sock");
@@ -249,7 +252,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         alice,
         "alice-s",
         r,
-        &["--type", "ask", "--to", "bob", "--urgent"],
+        &["--type", "ask", "--to", &to_bob, "--urgent"],
         forged,
     );
     let got = collect(&inbox, Duration::from_secs(60), |g| {
@@ -296,8 +299,10 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         ),
     );
     // The name is the signer's: carol posts an envelope that says it is from alice.
-    let posing = r#"{"v":1,"from":"alice","type":"ask","to":["bob"],"urgent":true,"body":"POSING-AS-ALICE"}"#;
-    let o = carol.vox_in(Some("carol-s"), &["room", "post", r, "-"], Some(posing));
+    let posing = format!(
+        r#"{{"v":1,"from":"alice","type":"ask","to":["{to_bob}"],"urgent":true,"body":"POSING-AS-ALICE"}}"#
+    );
+    let o = carol.vox_in(Some("carol-s"), &["room", "post", r, "-"], Some(&posing));
     assert!(o.ok, "carol could not post: {o:?}");
     let got = collect(&inbox, Duration::from_secs(60), |g| {
         g.iter().any(|f| f.contains("POSING-AS-ALICE"))
@@ -345,7 +350,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         bob,
         "bob-s",
         r,
-        &["--type", "ask", "--to", "bob2"],
+        &["--type", "ask", "--to", &to_bob2],
         "OWN-NOT-URGENT",
     );
     for n in 1..=3 {
@@ -353,7 +358,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
             bob,
             "bob-s",
             r,
-            &["--type", "ask", "--to", "bob2", "--urgent"],
+            &["--type", "ask", "--to", &to_bob2, "--urgent"],
             &format!("OWN-URGENT-{n}"),
         );
     }
@@ -414,9 +419,9 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     let mut hashes: Vec<String> = Vec::new();
     for i in 0..=8u32 {
         let (who, session, to) = if i % 2 == 0 {
-            (alice, "alice-s", "bob")
+            (alice, "alice-s", to_bob.as_str())
         } else {
-            (bob, "bob-s", "alice")
+            (bob, "bob-s", to_alice.as_str())
         };
         if i > 0 {
             // The replier must hold what it answers, or it cannot count the hops.
@@ -452,7 +457,8 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .collect();
     // A reply that writes itself a fresh budget, answering the link that had 1 hop left.
     let forged_reply = format!(
-        r#"{{"v":1,"type":"answer","to":["bob"],"urgent":true,"re":"{}","hops":8,"body":"CHAIN-FORGED-LINK"}}"#,
+        r#"{{"v":1,"type":"answer","to":["{}"],"urgent":true,"re":"{}","hops":8,"body":"CHAIN-FORGED-LINK"}}"#,
+        to_bob,
         hashes[7]
     );
     let o = alice.vox_in(
@@ -817,7 +823,7 @@ fn live(
         alice,
         "alice-s",
         r,
-        &["--type", "ask", "--to", "bobby", "--urgent"],
+        &["--type", "ask", "--to", &format!("{}/bobby", bob.b32()), "--urgent"],
         body,
     );
     let (seen, replies) = settled(&base, &ses, users + 1, Duration::from_secs(180));

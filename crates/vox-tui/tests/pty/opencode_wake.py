@@ -83,11 +83,26 @@ env.update(TERM="xterm-256color", XDG_CONFIG_HOME=XDG, VOX_DATA_DIR=DATA, VOX_CO
            VOX_ROOM=ROOM, VOX_AGENT_NAME="bobby")
 
 
-def post(to, body):
-    """`vox room post` by the person, on the daemon's profile."""
+def own_fp():
+    """This node's fingerprint prefix: the room's only member, as `vox room roster` lists it."""
     out = subprocess.run(
-        [VOX, "room", "post", ROOM, "--session", "person", "--type", "ask", "--to", to,
-         "--urgent", body],
+        [VOX, "room", "roster", ROOM],
+        env={**{k: v for k, v in env.items() if not k.startswith("VOX_")},
+             "VOX_DATA_DIR": DATA, "VOX_CONFIG_DIR": CFG},
+        capture_output=True, text=True, timeout=60)
+    members = out.stdout.split()
+    if out.returncode != 0 or len(members) != 1:
+        print(f"{TAG} APPARATUS: the room's roster is not this one node: {out!r}")
+        sys.exit(2)
+    return members[0]
+
+
+def post(to, body):
+    """`vox room post` by the person, on the daemon's profile, to the agent name `to` on this
+    node: addressees are named by fingerprint, then agent name (PRD-001 R15)."""
+    out = subprocess.run(
+        [VOX, "room", "post", ROOM, "--session", "person", "--type", "ask", "--to",
+         f"{own_fp()}/{to}", "--urgent", body],
         env={**{k: v for k, v in env.items() if not k.startswith("VOX_")},
              "VOX_DATA_DIR": DATA, "VOX_CONFIG_DIR": CFG},
         capture_output=True, text=True, timeout=60)

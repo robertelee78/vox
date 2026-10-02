@@ -279,7 +279,11 @@ fn render_timeline(
                 ));
             }
             spans.push(Span::styled(
-                format!("{}: ", m.author_nick),
+                if m.addressed.is_empty() {
+                    format!("{}: ", m.author_nick)
+                } else {
+                    format!("{} → {}: ", m.author_nick, m.addressed)
+                },
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(body));

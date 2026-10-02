@@ -1147,7 +1147,10 @@ pub struct RoomPostArgs {
     /// starts nothing: an attempt becomes active on `--type working`.
     #[arg(long)]
     pub attempt: Option<String>,
-    /// Address a session by petname; repeat for several.
+    /// Address a room member by fingerprint (a unique prefix of one in `vox room roster`),
+    /// optionally followed by `/<agent name or session>` to address one session of it; repeat
+    /// for several. The message carries the full fingerprint, and each reader shows it by its
+    /// own name for that member.
     #[arg(long)]
     pub to: Vec<String>,
     /// May interrupt an addressed session mid-turn.

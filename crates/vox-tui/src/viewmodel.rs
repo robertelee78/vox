@@ -77,6 +77,9 @@ pub struct MessageView {
     pub author: Digest32,
     /// The author's local nickname.
     pub author_nick: String,
+    /// Who it is addressed to, each by this node's own name for them, or empty for the whole
+    /// room ([`crate::ident::addressed`], PRD-001 R15).
+    pub addressed: String,
     /// Wall-clock send time (epoch-seconds) as recorded in the entry.
     pub timestamp: u64,
     /// The rendered body if decryptable to you, else `None` (shown as a marker).

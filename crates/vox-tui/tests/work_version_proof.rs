@@ -215,6 +215,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
         .last()
         .and_then(|x| x["entry_hash"].as_str().map(str::to_owned))
         .expect("APPARATUS: alice's own read shows no row to reply to");
+    let to_b1 = format!("{}/b1", &bob.b32()[..16]);
     let o = alice.vox(
         Some("a1"),
         &[
@@ -224,7 +225,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
             "--type",
             "say",
             "--to",
-            "b1",
+            &to_b1,
             "--urgent",
             "--re",
             &re,

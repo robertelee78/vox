@@ -318,12 +318,15 @@ fn is_line_break(c: char) -> bool {
 /// Other control characters are replaced rather than passed through, for the same
 /// reason line breaks are: whatever displays this must not be steered by the text.
 fn render_row(out: &mut String, r: &vox_core::node::api::MessageRow) {
-    render_attributed(
-        out,
-        &r.entry_hash,
-        &crate::ident::author_id(&r.author),
-        &words(&r.text),
-    );
+    // **Addressees by fingerprint** (PRD-001 R15): what the wire carries, and the only name this
+    // surface has for anyone, since a socket client cannot read the keyring (`ident`).
+    let to = crate::ident::addressed(&r.text, crate::ident::author_id);
+    let who = if to.is_empty() {
+        crate::ident::author_id(&r.author)
+    } else {
+        format!("{} to {to}", crate::ident::author_id(&r.author))
+    };
+    render_attributed(out, &r.entry_hash, &who, &words(&r.text));
 }
 
 /// What a message says, as its author wrote it (V210-112).

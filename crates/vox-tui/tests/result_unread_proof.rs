@@ -82,13 +82,16 @@ fn a_result_names_the_addressed_messages_its_session_has_not_read() {
     let r = room.id.as_str();
 
     drain(alice, r, "s1"); // s1 is up to date
+    // Addressees are named by fingerprint, then the session or agent name (PRD-001 R15).
+    let to = |sub: &str| format!("{}/{sub}", &alice.b32()[..16]);
+    let (to_s1, to_s9, to_alpha) = (to("s1"), to("s9"), to("alpha"));
 
     // Bob redirects s1, and also broadcasts and writes to somebody else.
     post(
         bob,
         "b1",
         r,
-        &["--type", "ask", "--to", "s1"],
+        &["--type", "ask", "--to", &to_s1],
         "stop: use the v2 schema",
     );
     post(bob, "b1", r, &["--type", "status"], "a note to the room");
@@ -96,7 +99,7 @@ fn a_result_names_the_addressed_messages_its_session_has_not_read() {
         bob,
         "b1",
         r,
-        &["--type", "ask", "--to", "s9"],
+        &["--type", "ask", "--to", &to_s9],
         "for someone else",
     );
     until(
@@ -153,7 +156,7 @@ fn a_result_names_the_addressed_messages_its_session_has_not_read() {
         bob,
         "b1",
         r,
-        &["--type", "ask", "--to", "alpha"],
+        &["--type", "ask", "--to", &to_alpha],
         "alpha: please rebase first",
     );
     until(

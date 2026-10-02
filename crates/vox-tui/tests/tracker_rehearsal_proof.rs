@@ -524,7 +524,12 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         .ndjson()
         .last()
         .map(|x| x["entry_hash"].as_str().unwrap().to_owned());
-    for (item, to) in [(item1, "w1"), (item2, "w2")] {
+    // Each worker addressed by its node's fingerprint and its agent name (PRD-001 R15).
+    let (to_w1, to_w2) = (
+        format!("{}/w1", &alice.b32()[..16]),
+        format!("{}/w2", &bob.b32()[..16]),
+    );
+    for (item, to) in [(item1, to_w1.as_str()), (item2, to_w2.as_str())] {
         let o = bob.vox_in(
             Some("tracker"),
             &[

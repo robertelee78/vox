@@ -21,8 +21,86 @@ pub const SAY: &str = "say";
 /// agents looped there anyway.
 pub const DEFAULT_HOPS: u32 = 8;
 
-/// Longest petname accepted in [`Envelope::to`], matching the keyring's bound.
+/// Longest type, and longest sub-address after an addressee's fingerprint, accepted in an
+/// envelope.
 pub const MAX_NAME: usize = 64;
+
+/// Base32 characters of a full fingerprint, as [`crate::claim::b32`] writes one.
+pub const FP_CHARS: usize = 52;
+
+/// Longest entry accepted in [`Envelope::to`]: a fingerprint, a `/` and a sub-address.
+pub const MAX_ADDRESSEE: usize = FP_CHARS + 1 + MAX_NAME;
+
+/// One addressee as the wire carries it (PRD-001 R15): a node's full fingerprint, and
+/// optionally one name under it — the agent name (`VOX_AGENT_NAME`) or session id the
+/// addressee itself answers to.
+///
+/// **Never a petname.** A petname is local to whoever typed it, so two nodes that name one
+/// member differently would address two different strings, and a reader whose keyring names
+/// someone else that way would be woken by a message meant for another. The sender resolves
+/// its own name to a fingerprint once, and every reader shows the fingerprint by its own
+/// keyring's name for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Addressee {
+    /// The addressed node's fingerprint.
+    pub fp: [u8; 32],
+    /// One agent name or session of it, or `None` for every session of the node.
+    pub sub: Option<String>,
+}
+
+impl Addressee {
+    /// Read one [`Envelope::to`] entry: `<fingerprint>` or `<fingerprint>/<sub-address>`.
+    /// `None` for anything else, which addresses nobody.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let (fp, sub) = match text.split_once('/') {
+            Some((fp, sub)) => (fp, Some(sub)),
+            None => (text, None),
+        };
+        let fp = crate::claim::from_b32(fp)?;
+        match sub {
+            None => Some(Self { fp, sub: None }),
+            Some(s) if is_valid_sub(s) => Some(Self {
+                fp,
+                sub: Some(s.to_owned()),
+            }),
+            Some(_) => None,
+        }
+    }
+
+    /// The entry as [`Envelope::to`] carries it.
+    #[must_use]
+    pub fn to_wire(&self) -> String {
+        match &self.sub {
+            Some(s) => format!("{}/{s}", crate::claim::b32(&self.fp)),
+            None => crate::claim::b32(&self.fp),
+        }
+    }
+
+    /// Whether this names the session `session`, answering to `name`, on the node `me`.
+    #[must_use]
+    pub fn names(&self, me: &[u8; 32], session: &str, name: &str) -> bool {
+        self.fp == *me
+            && self
+                .sub
+                .as_deref()
+                .is_none_or(|s| s == session || (!name.is_empty() && s == name))
+    }
+}
+
+/// Whether `s` can follow an addressee's fingerprint: 1–[`MAX_NAME`] of
+/// `[A-Za-z0-9._@:+-]`.
+///
+/// Narrow on purpose: every reader prints it beside the addressee's name, so it must not be
+/// able to close the bracket a row's attribution sits in, or carry anything a terminal or a
+/// model would read as structure. Agent names (`codex@host2`) and harness session ids fit.
+#[must_use]
+pub fn is_valid_sub(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_NAME
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@' | b':' | b'+' | b'-'))
+}
 
 /// The data key naming the work item a message is about (ADR-021 §2). Its **shape** is
 /// checked ([`is_valid_work`]); its meaning never is — carried, compared byte for byte
@@ -124,7 +202,8 @@ pub struct Envelope {
     /// Where that session is working.
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub at: Context,
-    /// Petnames addressed. **Empty addresses the room.**
+    /// Who is addressed, each as an [`Addressee`] on the wire: a full fingerprint, optionally
+    /// followed by `/` and an agent name or session (PRD-001 R15). **Empty addresses the room.**
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<String>,
     /// The message type. `hello`, `bye` and `say` are reserved; anything else is
@@ -175,7 +254,7 @@ pub enum ParseError {
     NotAnEnvelope,
     /// An envelope from a newer format version.
     UnsupportedVersion(u64),
-    /// A field is present but unusable (an over-long petname, an empty type).
+    /// A field is present but unusable (an over-long addressee, an empty type).
     Malformed(&'static str),
 }
 
@@ -216,11 +295,18 @@ impl Envelope {
         Self::new(SAY, body)
     }
 
-    /// Address this message to `names`.
+    /// Address this message to `whom`.
     #[must_use]
-    pub fn addressed_to(mut self, names: &[&str]) -> Self {
-        self.to = names.iter().map(|n| (*n).to_owned()).collect();
+    pub fn addressed_to(mut self, whom: &[Addressee]) -> Self {
+        self.to = whom.iter().map(Addressee::to_wire).collect();
         self
+    }
+
+    /// Every entry of [`Envelope::to`] that is an [`Addressee`]. An entry that is not (a
+    /// petname from a build before R15) addresses nobody.
+    #[must_use]
+    pub fn addressees(&self) -> Vec<Addressee> {
+        self.to.iter().filter_map(|t| Addressee::parse(t)).collect()
     }
 
     /// Mark it as able to interrupt.
@@ -273,7 +359,7 @@ impl Envelope {
         if self.kind.len() > MAX_NAME {
             return Err(ParseError::Malformed("type too long"));
         }
-        if self.to.iter().any(|n| n.is_empty() || n.len() > MAX_NAME) {
+        if self.to.iter().any(|n| n.is_empty() || n.len() > MAX_ADDRESSEE) {
             return Err(ParseError::Malformed("addressee name length"));
         }
         Ok(())
@@ -304,10 +390,14 @@ impl Envelope {
             && !self.body.trim_start().starts_with('{')
     }
 
-    /// Whether this message names `me`.
+    /// Whether this message addresses the session `session`, answering to `name` (empty for
+    /// none), on the node whose fingerprint is `me`.
+    ///
+    /// Matched on the fingerprint the sender resolved, never on a name: a name is local to
+    /// whoever gave it, and a match on one would wake whichever reader happened to use it.
     #[must_use]
-    pub fn is_addressed_to(&self, me: &str) -> bool {
-        self.to.iter().any(|n| n == me)
+    pub fn is_addressed_to(&self, me: &[u8; 32], session: &str, name: &str) -> bool {
+        self.addressees().iter().any(|a| a.names(me, session, name))
     }
 
     /// Whether this message is to the room rather than to anyone in particular.
@@ -322,8 +412,8 @@ impl Envelope {
     /// interrupt anybody: if it were allowed to, one agent could stop the whole
     /// room, which is the wall-of-noise failure this design exists to avoid.
     #[must_use]
-    pub fn may_interrupt(&self, me: &str) -> bool {
-        self.urgent && self.is_addressed_to(me)
+    pub fn may_interrupt(&self, me: &[u8; 32], session: &str, name: &str) -> bool {
+        self.urgent && self.is_addressed_to(me, session, name)
     }
 
     /// Whether `me` may answer this without being asked (ADR-020 §9).
@@ -334,8 +424,8 @@ impl Envelope {
     /// when addressed: a terminal acknowledgement must not beget another, which is
     /// the acknowledgement loop other systems hit.
     #[must_use]
-    pub fn may_auto_reply(&self, me: &str) -> bool {
-        if !self.is_addressed_to(me) {
+    pub fn may_auto_reply(&self, me: &[u8; 32], session: &str, name: &str) -> bool {
+        if !self.is_addressed_to(me, session, name) {
             return false;
         }
         !matches!(

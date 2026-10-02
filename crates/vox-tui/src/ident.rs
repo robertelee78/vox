@@ -49,3 +49,48 @@ pub fn member_name(trusted: &[(Digest32, String)], fp: &Digest32) -> String {
         _ => format!("{} {NOT_IN_KEYRING}", author_id(fp)),
     }
 }
+
+/// A member as named beside a message where the keyring is known: `you` for this node, the
+/// petname the operator gave it, or its fingerprint at [`AUTHOR_CHARS`].
+#[must_use]
+pub fn keyring_name(trusted: &[(Digest32, String)], me: Option<&Digest32>, fp: &Digest32) -> String {
+    if me == Some(fp) {
+        return "you".to_owned();
+    }
+    match trusted.iter().find(|(id, _)| id == fp) {
+        Some((_, petname)) if !petname.trim().is_empty() => petname.clone(),
+        _ => author_id(fp),
+    }
+}
+
+/// Who a message is addressed to, as this reader is shown it (PRD-001 R15): each addressee by
+/// `name` of its fingerprint — the reader's own keyring name where the reader has the keyring,
+/// otherwise the fingerprint at [`AUTHOR_CHARS`] — followed by `/<agent name or session>` when
+/// the sender named one. Empty for prose and for a message to the whole room.
+///
+/// The wire carries only fingerprints, so two readers who name a member differently are each
+/// shown their own name, and neither is shown the sender's. An entry that is not a fingerprint
+/// (a petname from a build before R15) addresses nobody; it is counted, never printed, because
+/// its text is the author's and could pass for a name.
+#[must_use]
+pub fn addressed(text: &str, name: impl Fn(&Digest32) -> String) -> String {
+    let Ok(env) = vox_agentcomms::envelope::Envelope::parse(text) else {
+        return String::new();
+    };
+    if env.to.is_empty() {
+        return String::new();
+    }
+    let whom = env.addressees();
+    let mut out: Vec<String> = whom
+        .iter()
+        .map(|a| match &a.sub {
+            Some(s) => format!("{}/{s}", name(&a.fp)),
+            None => name(&a.fp),
+        })
+        .collect();
+    let unreadable = env.to.len() - whom.len();
+    if unreadable > 0 {
+        out.push(format!("(+{unreadable} not a fingerprint)"));
+    }
+    out.join(", ")
+}

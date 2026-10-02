@@ -907,11 +907,17 @@ async fn judge(
         .find(|c| c.channel_id == *channel_id)
         .and_then(|c| c.local_name.clone())
         .unwrap_or_default();
+    // **Addressed by fingerprint** (PRD-001 R15): the sender resolved its own name for the
+    // addressee to a fingerprint, so whatever this node calls itself, or its sessions, a
+    // message is for it when it carries this node's fingerprint.
+    let Some(me) = view.identity.as_ref().map(|i| i.fingerprint) else {
+        return;
+    };
     for session in crate::wake::registered(paths) {
-        if session.room != room || session.name.is_empty() {
+        if session.room != room {
             continue;
         }
-        if !envelope.may_interrupt(&session.name) {
+        if !envelope.may_interrupt(&me, &session.session, &session.name) {
             continue;
         }
         // **Attributed and framed as the drain is** (V210-79): the wake arrives as the
