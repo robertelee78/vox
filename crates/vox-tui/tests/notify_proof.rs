@@ -173,6 +173,31 @@ fn notify_script(tmp: &tempfile::TempDir, file: &Path) -> PathBuf {
     script
 }
 
+/// A directory holding a recording stand-in for the desktop's own notification command, put on
+/// the daemon's `PATH` ahead of the real one: `osascript` on macOS, `notify-send` on Linux. Each
+/// call appends one line to `file`, so what is counted is the shipped binary invoking the real
+/// notifier by name, with the arguments it would give it. On macOS the line is the AppleScript
+/// `osascript -e` was handed; on Linux it is `<title>|<body>`.
+fn desktop_stub(tmp: &tempfile::TempDir, file: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp.path().join("desktop-bin");
+    std::fs::create_dir_all(&dir).expect("APPARATUS: the stub's directory");
+    let (name, body) = if cfg!(target_os = "macos") {
+        ("osascript", "[ \"$1\" = -e ] && printf '%s\\n' \"$2\"")
+    } else {
+        ("notify-send", "printf '%s|%s\\n' \"$1\" \"$2\"")
+    };
+    let stub = dir.join(name);
+    std::fs::write(
+        &stub,
+        format!("#!/bin/sh\n{body} >> '{}'\n", file.display()),
+    )
+    .expect("APPARATUS: write the stub");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("APPARATUS: make the stub executable");
+    dir
+}
+
 /// The scene both proofs share: an anchor, and alice's and bob's daemons trusting each other
 /// in one room, alice's notifying through `script`. Returns when alice's `vox status` shows
 /// bob connected.
@@ -453,13 +478,25 @@ fn anchor_reached(s: &Value, id: &str) -> Option<bool> {
 /// is killed by its PID: exactly one "unreachable" notification naming it, after
 /// `ANCHOR_UNREACHABLE_SECS` (60 s) and not before, and still one half a minute later. The anchor
 /// is started again on the same port with the same profile: exactly one "recovered".
+///
+/// **Through the desktop's own notifier**, not `VOX_NOTIFY_COMMAND`: alice's daemon finds a
+/// recording `osascript` (macOS) or `notify-send` (Linux) first on its `PATH`, so this shows the
+/// shipped binary invoking the platform notifier, and that it hands it the right title and body.
+/// The other proofs here observe through `VOX_NOTIFY_COMMAND`.
 #[test]
 #[ignore = "an anchor and a real daemon, the anchor killed for over a minute; CI runs it in release"]
 fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let file = tmp.path().join("notifications.log");
-    let script = notify_script(&tmp, &file);
+    // The desktop's own notifier, not `VOX_NOTIFY_COMMAND`: a recording `osascript` (macOS) or
+    // `notify-send` (Linux) ahead of the real one on the daemon's PATH.
+    let stub_dir = desktop_stub(&tmp, &file);
+    let path = format!(
+        "{}:{}",
+        stub_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let anchor_dir = member_dir(&tmp, "anchor");
     let alice_dir = member_dir(&tmp, "alice");
     let pass_file = tmp.path().join("passphrases");
@@ -486,10 +523,7 @@ fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
         free_udp_port(),
         &spec,
         &pass_file,
-        &[(
-            "VOX_NOTIFY_COMMAND",
-            script.to_str().expect("APPARATUS: utf-8 path"),
-        )],
+        &[("PATH", path.as_str())],
     );
     let reached = Instant::now() + SETUP;
     while anchor_reached(&status(&alice_dir), &anchor_id) != Some(true) {
@@ -540,6 +574,25 @@ fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
         count(&held, "unreachable", &anchor_short),
         1,
         "PRODUCT: one condition is one notification, not one per check: {held:?}"
+    );
+    // What the desktop was handed: the title and the body, in the notifier's own form.
+    let raised = held
+        .iter()
+        .find(|l| l.contains("unreachable") && l.contains(&anchor_short))
+        .cloned()
+        .unwrap_or_default();
+    let title = "Vox: needs attention";
+    let body = format!("anchor {anchor_short} unreachable for");
+    let well_formed = if cfg!(target_os = "macos") {
+        raised.starts_with(&format!("display notification \"{body}"))
+            && raised.ends_with(&format!("with title \"{title}\""))
+    } else {
+        raised.starts_with(&format!("{title}|{body}"))
+    };
+    assert!(
+        well_formed,
+        "PRODUCT: the desktop notifier was not handed the title {title:?} and a body starting \
+         {body:?}: it got {raised:?}"
     );
 
     // The anchor again, same profile, same port.
