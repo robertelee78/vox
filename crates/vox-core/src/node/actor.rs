@@ -1848,6 +1848,37 @@ fn test_stopped_delay_ms() -> Option<u64> {
     std::env::var(TEST_STOPPED_DELAY_ENV).ok()?.parse().ok()
 }
 
+/// **For proofs only.** When set, this node keeps its own member **address** record off every
+/// board for this many milliseconds after it first publishes a room's records (its bundle still
+/// goes), which stands for an address record still on its way. V210-43's proof uses it to make a
+/// just-joined member sync with its anchor while the anchor knows it only by its pre-join record
+/// and the bundle that admits it: the window in which it must be told "not a member yet", never
+/// refused as a stranger. Nothing a person runs sets it; unset, nothing changes. Not compiled in
+/// without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_ADDRESS_ENV: &str = "VOX_TEST_HOLD_ADDRESS_MS";
+
+/// Whether [`TEST_HOLD_ADDRESS_ENV`] still keeps this node's address record for `channel_id` off
+/// the boards: its time counts from the first call for that room.
+#[cfg(feature = "test-knobs")]
+fn test_hold_address(channel_id: &Digest32) -> bool {
+    static FIRST: std::sync::Mutex<BTreeMap<Digest32, std::time::Instant>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let Some(ms) = std::env::var(TEST_HOLD_ADDRESS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let mut first = FIRST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let since = *first
+        .entry(*channel_id)
+        .or_insert_with(std::time::Instant::now);
+    since.elapsed() < Duration::from_millis(ms)
+}
+
 /// **For proofs only.** When set, each blocking task that holds a secret (`secret_blocking`)
 /// waits this many milliseconds, holding what it was given, before it starts its work: a stand-in
 /// for a slow Argon2id or a large room, so a proof can lock while one runs (V210-94). Nothing a
@@ -4243,11 +4274,16 @@ impl Node {
         // The ordering above still holds whenever the board answers. A board that answers nothing within
         // `ANCHOR_PUBLISH_PATIENCE` is given up on for this round. A transport error ends the round,
         // since the rest would ride the same dead stream; a refusal does not.
-        let own = [
+        #[cfg_attr(not(feature = "test-knobs"), allow(unused_mut))]
+        let mut own = vec![
             ("the room's genesis", genesis_wire),
             ("our member bundle", bundle.to_wire()),
             ("our address", address.to_wire()),
         ];
+        #[cfg(feature = "test-knobs")]
+        if test_hold_address(channel_id) {
+            own.pop();
+        }
         let mirrored = net.board_records(channel_id, epoch);
         // **Off the actor, and still in order.** The round awaits a board's answers, which on a
         // connection that died without saying so is `ANCHOR_PUBLISH_PATIENCE` of waiting, and that
@@ -5043,7 +5079,13 @@ impl Node {
             stamp,
             admission,
         ) {
-            let _ = net.publish_local(&address.to_wire());
+            #[cfg(feature = "test-knobs")]
+            let held = test_hold_address(channel_id);
+            #[cfg(not(feature = "test-knobs"))]
+            let held = false;
+            if !held {
+                let _ = net.publish_local(&address.to_wire());
+            }
             let _ = net.publish_local(&bundle.to_wire());
         }
     }
