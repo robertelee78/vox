@@ -1,228 +1,150 @@
 # ADR-002: Identity and Key Model
 
-**Status**: implemented (M1, `crates/vox-core/src/identity/`)
-**Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M1) added; all private-key accessors now return non-`Copy` zeroizing buffers. 2026-09-20 — §2 rotation cadence and retain-previous logic implemented (`node::prekeys`, ADR-016 M14.3); at-rest restore constructors added; that known gap is closed. The prekey ring now uses the identity's own X25519 DH key rather than generating one (M14.7c).
-**Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: identity, keys, gpg, ed25519, multi-device, pseudonymity, post-quantum
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status:** accepted; built in `crates/vox-core/src/identity/` and `node::prekeys` except where a
+requirement says planned:
+- §GPG: import and `gpg-agent` delegation are planned. The only `RootSigner` backends are
+  `SoftwareRootSigner` and the at-rest `VaultRootSigner`. Armored OpenPGP export with a user ID and
+  self-signature is planned (ADR-015).
+- §Lifecycle: the succession statement (L2) is planned; no code exists.
+- §Backup: the backup bundle is built in the core (`identity::backup`); a user-facing encrypted export
+  is planned (ADR-015).
+- §Multi-device: shared-root sync over the self-channel (D2) is planned; only the strategy model
+  (`identity::device`) exists.
+- §Pseudonymity: per-channel identity selection as a client operation is planned.
+- §3: deniable mode was removed (PRD-001 R43).
+
+**Deciders:** Robert E. Lee <robert@agidreams.us>
 
 ## Context
 
-Vox has no accounts and no central key directory (ADR-001). Identity must be self-sovereign,
-verifiable peer-to-peer, and must root every other mechanism: key agreement (ADR-004), channel
-join (ADR-005), the signed admin/governance certificate tree (ADR-007), per-author log
-authentication (ADR-008), and deniable content authentication (ADR-009). It must satisfy the
-hybrid post-quantum policy (ADR-003), support per-channel pseudonymity, and accommodate a
-member-chosen multi-device strategy. This ADR specifies the complete key model: every key, its
-purpose, its lifecycle, and its representation.
+Vox has no accounts and no central key directory (ADR-001). Identity roots key agreement (ADR-004),
+channel join (ADR-005), governance (ADR-007) and per-author log authentication (ADR-008), and follows
+the hybrid policy (ADR-003). This ADR specifies every key, its role, its lifecycle and its
+encoding. Role separation limits the blast radius of a compromise.
 
-## Decision
+## Requirements
 
-### Key hierarchy
+### §1 Root (identity and governance) key
 
-A Vox identity is a set of keys with strictly separated roles. Role separation is load-bearing:
-it is what lets governance be attributable (ADR-007) while message content can be deniable
-(ADR-009), and it limits blast radius on compromise.
+- **R1.1.** The root MUST be a long-term Ed25519 signing key paired with an ML-DSA-65 signing key
+  (ADR-003). It signs sub-keys, admin-delegation and governance certificates, and per-sender consent
+  grants (ADR-007); there is no membership certificate.
+- **R1.2.** The identity fingerprint MUST be `SHA-256(Ed25519_pub ‖ ML-DSA_pub)`.
+- **R1.3.** A composite signature MUST be accepted only if both the Ed25519 and the ML-DSA signatures
+  verify.
+- **R1.4.** The composite public key and signature MUST be the ADR-003 registry type `0x0304`,
+  serialized canonically (ADR-008) in fixed component order: `composite_pubkey = Ed25519_pub (32 B) ‖
+  ML-DSA-65_pub (1952 B)` and `composite_sig = Ed25519_sig (64 B) ‖ ML-DSA-65_sig (3309 B)`, carried
+  inside the canonical struct tag with no separate length prefix.
+- **R1.5.** Every key MUST carry an explicit, versioned ADR-003 algorithm identifier (ADR-003
+  requirement 1).
 
-1. **Identity / governance key (root).** A long-term **Ed25519** signing key, paired for hybrid
-   PQ with an **ML-DSA-65** signing key (ADR-003). The pair is the root of trust: it signs
-   sub-keys, admin-delegation and governance certificates and per-sender consent grants (ADR-007;
-   there is no membership certificate), and — in attributable channels — message
-   metadata. The human-verifiable **identity fingerprint** is `SHA-256(Ed25519_pub ‖ ML-DSA_pub)`,
-   rendered for manual verification (UX in ADR-014). Both components are always verified together;
-   a signature is valid only if *both* the Ed25519 and ML-DSA signatures verify. The composite
-   public key and signature are the registry's `0x03/0x04` type (ADR-003) and serialized canonically
-   (ADR-008) in **fixed component order**, lengths implied by the algorithm IDs:
-   `composite_pubkey = Ed25519_pub(32 B) ‖ ML-DSA-65_pub(1952 B)`,
-   `composite_sig = Ed25519_sig(64 B) ‖ ML-DSA-65_sig(3309 B)`, each carried inside the canonical
-   struct tag so no separate length prefix or domain tag is needed at the concat itself.
+### §2 Key-agreement keys (for ADR-004 PQXDH)
 
-2. **Key-agreement keys** (for ADR-004 PQXDH):
-   - **X25519 identity DH key**, used in the DH legs of PQXDH.
-   - **Signed prekey**: an X25519 key plus an **ML-KEM-768** KEM keypair, both signed by the root.
-     Rotated on a fixed cadence (default: every 7 days; previous signed prekey retained one cadence
-     period to decrypt in-flight sessions).
-   - **One-time prekeys**: a replenished pool of X25519 one-time keys and ML-KEM-768 one-time KEM
-     keys, each signed by the root, consumed once per inbound session and never reused. The pool is
-     refilled whenever it drops below a low-water mark; depletion falls back to the signed
-     (last-resort) prekey, never to no-prekey.
+- **R2.1.** An identity MUST hold an X25519 identity DH key, used in PQXDH's DH legs. It is part of the
+  identity: a prekey ring MUST take it from the identity's secret, not generate its own, so an identity
+  restored from backup advertises the same key.
+- **R2.2.** A signed prekey MUST be an X25519 key plus an ML-KEM-768 keypair, both signed by the root.
+  It MUST rotate every 7 days (`SIGNED_PREKEY_CADENCE_SECS`), and the previous signed prekey MUST be
+  retained for one cadence to complete in-flight sessions.
+- **R2.3.** One-time prekeys MUST be X25519 and ML-KEM-768 keys, each signed by the root, each consumed
+  at most once per inbound session. The pool MUST be refilled when it drops below its low-water mark
+  (`ONE_TIME_PREKEY_LOW_WATER`). When the pool is empty a session MUST fall back to the signed
+  (last-resort) prekey, never to no prekey.
+- **R2.4.** A restored prekey ring MUST re-derive each public key from its stored secret and refuse a
+  mismatch, re-verify each root signature over the canonical body, and refuse a one-time prekey id at
+  or above `next_id` or a duplicate id, so a tampered ring is refused and no published id is reissued.
 
-3. **Message-authentication keys** (per channel, ADR-006/ADR-009):
-   - **Attributable mode**: the Sender-Key signing key (per author, per channel) — an
-     Ed25519+ML-DSA pair bound to `(channelID, epoch)` (ADR-006), cross-signed by the root so
-     recipients tie it to the identity.
-   - **Deniable mode**: a **per-epoch ephemeral composite (Ed25519+ML-DSA-65) signing key**,
-     bootstrapped through a deniable exchange (ADR-009), *not* cross-signed by the root in a
-     transferable way — so live origin authentication is post-quantum, yet message content carries no
-     transferable proof of authorship to outsiders (deniability comes from publishing the ephemeral
-     private key at epoch end, ADR-009).
+### §3 Message-authentication keys (ADR-006)
 
-All keys carry explicit, versioned algorithm identifiers with pairwise-disjoint encoding ranges
-and algorithm-prefix bytes (the ADR-003 type-confusion rule).
+- **R3.1.** Each author MUST hold, per channel, a Sender-Key signing key: an Ed25519 + ML-DSA-65 pair
+  bound to `(channelID, epoch)` and cross-signed by the root.
+- **R3.2.** There is no deniable mode (PRD-001 R43). The per-epoch ephemeral signing key of ADR-009 is
+  withdrawn with it.
 
-### GPG integration
+### §Domain labels (identity-layer signing inputs)
 
-The root identity is an OpenPGP-representable Ed25519 key, so it interoperates with existing PGP
-key material and fingerprint-verification culture (ADR-001 principle 3):
+- **R4.1.** Identity-layer artifacts MUST NOT take an ADR-008 struct tag. Each MUST be signed over
+  `domain ‖ canonical_body`, with these labels and bodies (ADR-008 arrays, fixed order):
 
-- **Import**: a user may bind an existing GPG Ed25519 primary (or signing subkey) as the Vox root;
-  signing operations are delegated to `gpg-agent`, so the private key need never leave the agent /
-  smartcard / Secure Enclave.
-- **Generate**: otherwise Vox generates a native Ed25519 root and exports it in OpenPGP format for
-  backup and external verification.
-- The ML-DSA co-key is a Vox-managed companion key, committed to alongside the OpenPGP key via a
-  **signed binding statement** — a canonical-CBOR struct `{ openpgp_fpr, mldsa_pub, created }`
-  (ADR-008 encoding, domain `"vox/ml-dsa-binding/v1"`) signed by the OpenPGP Ed25519 primary. The
-  identity fingerprint `SHA-256(Ed25519_pub ‖ ML-DSA_pub)` covers both keys, so the binding cannot be
-  swapped without changing the fingerprint that peers verify. A verifier MUST check **both** that the
-  statement's `openpgp_fpr` equals the fingerprint of the OpenPGP key it trusts **and** that the
-  Ed25519 signature verifies — checking the signature alone would let an attacker present key A's valid
-  statement while the verifier trusts fingerprint B (a confused-deputy gap).
+  | Artifact | Domain label | Canonical body | Signer |
+  |---|---|---|---|
+  | ML-DSA binding statement | `vox/ml-dsa-binding/v1` | `[openpgp_fpr, mldsa_pub, created]` | OpenPGP Ed25519 primary |
+  | Identity DH key (IK_B) | `vox/identity-dh-key/v1` | `[algo_X25519, x25519_pub, created]` | composite root |
+  | Signed prekey | `vox/signed-prekey/v1` | `[algo_X25519, algo_ML_KEM_768, prekey_id, created, x25519_pub, ml_kem_pub]` | composite root |
+  | One-time prekey | `vox/one-time-prekey/v1` | `[algo_X25519, algo_ML_KEM_768, prekey_id, created, x25519_pub, ml_kem_pub]` | composite root |
 
-### Identity-layer domain labels (normative)
+- **R4.2.** The X25519 identity DH key MUST be root-signed, because ADR-004 consumes it as the
+  authenticated `IK_B`.
+- **R4.3.** `created` MUST be inside each signed body, so a key cannot be re-dated.
 
-The signed prekeys and the identity DH key are **identity-layer artifacts**, not log/wire structures,
-so they have no tag in the ADR-008 struct-tag registry (`0x0001..0x0012`). Like the GPG binding
-statement, each is signed under its own ASCII domain label prefixed directly onto the canonical-CBOR
-body — signing input `domain ‖ canonical_body` — so independent implementations sign and verify
-byte-identical inputs. The labels are fixed normatively here:
+### §GPG OpenPGP integration
 
-| Artifact | Domain label | Canonical body (ADR-008 array, fixed order) | Signer |
-|---|---|---|---|
-| ML-DSA binding statement | `vox/ml-dsa-binding/v1` | `[openpgp_fpr, mldsa_pub, created]` | OpenPGP Ed25519 primary |
-| Identity DH key (IK_B) | `vox/identity-dh-key/v1` | `[algo_X25519, x25519_pub, created]` | composite root |
-| Signed prekey | `vox/signed-prekey/v1` | `[algo_X25519, algo_ML_KEM_768, prekey_id, created, x25519_pub, ml_kem_pub]` | composite root |
-| One-time prekey | `vox/one-time-prekey/v1` | `[algo_X25519, algo_ML_KEM_768, prekey_id, created, x25519_pub, ml_kem_pub]` | composite root |
+- **R5.1.** The Ed25519 root MUST be representable as an OpenPGP key. For a generated root, Vox MUST
+  build the v4 public-key packet (algorithm 22 EdDSALegacy, the Ed25519 OID, the `0x40`-prefixed
+  263-bit MPI) and its v4 fingerprint (`identity::openpgp`), and the backup MUST carry that
+  fingerprint.
+- **R5.2. (planned)** A user MAY bind an existing GPG Ed25519 primary or signing subkey as the root;
+  its signing MUST then be delegated to `gpg-agent`, so the private key never leaves the agent,
+  smartcard or Secure Enclave.
+- **R5.3. (planned)** Vox MUST export a generated root in armored OpenPGP form, with a user ID and
+  self-signature (ADR-015).
+- **R5.4.** The ML-DSA key MUST be committed to the OpenPGP key by a signed binding statement (R4.1).
+- **R5.5.** A verifier of a binding statement MUST check both that its `openpgp_fpr` equals the
+  fingerprint of the OpenPGP key it trusts and that the Ed25519 signature verifies. Checking the
+  signature alone MUST NOT be accepted.
 
-The long-term **X25519 identity DH key is root-signed** (the `vox/identity-dh-key/v1` record above):
-ADR-004's PQXDH consumes it as the authenticated `IK_B`, so it cannot be an unauthenticated bare key
-— an active attacker would otherwise substitute their own. Each prekey body carries its component
-algorithm IDs explicitly (ADR-003 requirement 1: a curve field can never be parsed as a KEM field),
-and the `created` timestamp is inside the signed body so a stale key cannot be silently re-dated.
+### §Lifecycle
 
-### Lifecycle
+- **L1.** Prekey rotation and one-time-prekey replenishment MUST be automatic (R2.2, R2.3).
+- **L2. (planned)** Root-key rotation is identity replacement. Vox MAY carry a succession statement
+  (the old root signing the new root's fingerprint). A peer MUST surface a succession as a key-change
+  event that needs explicit user acknowledgement (ADR-014), and MUST NOT migrate trust on the signature
+  alone.
+- **L3.** Root compromise is unrecoverable: recovery MUST be out-of-band re-verification of a new
+  fingerprint.
 
-- **Prekey rotation** is automatic on cadence; **one-time prekeys** are replenished continuously.
-- **Root-key rotation is identity replacement, migrated by TOFU-on-succession (never silently).**
-  A new root is a new identity. Vox supports a root-signed *succession statement* (old root signs the
-  new root's fingerprint), but peers MUST **surface it as a key-change event requiring explicit user
-  acknowledgement** (ADR-014) — never auto-migrate trust on the signature alone. This is critical
-  because the root can be *compromised*: a leaked old root can sign a succession to an
-  attacker-controlled key, so silent auto-migration would convert "lose this identity" into "attacker
-  silently inherits all your channel trust." Therefore a succession only *prompts* migration; genuine
-  recovery against a compromised root is out-of-band re-verification of the new fingerprint. Root
-  compromise remains unrecoverable by design — there is no central authority to appeal to.
-- **Backup** of the root (and its OpenPGP representation) is the user's responsibility; Vox
-  provides an explicit, encrypted export. The export also includes the **`self_seed`** — a 256-bit
-  random secret generated once at identity creation that keys the personal self-channel (ADR-008,
-  multi-device consent sync). It lives in the identity vault next to the root and is synced to a new
-  device at enrollment; it is a *private* secret (never derived from the public identity key), so the
-  self-channel rendezvous is not locatable by third parties.
+### §Backup
 
-### Multi-device
+- **B1.** Backing up the root is the user's responsibility; Vox MUST provide an explicit, encrypted
+  export (the user-facing export is planned, ADR-015).
+- **B2.** The backup MUST include the `self_seed`: a 256-bit random secret generated once at identity
+  creation, kept in the identity vault, that keys the personal self-channel (ADR-008). It MUST NOT be
+  derived from the public identity key.
 
-Per the project decision, the multi-device strategy is the member's choice and Vox provides **no
-device↔identity attestation**:
+### §Multi-device
 
-- **Shared-root**: the same root identity on multiple devices (root key synced by the user out of
-  band, e.g. via the OpenPGP export). Devices are indistinguishable; consent/membership operate on
-  the one identity. Because consent binds to the *identity* (ADR-006), the devices share **received
-  consent (SKDMs) and channel state over the identity-keyed self-channel** (ADR-008), so adding or
-  restoring a shared-root device requires no re-consent by peers.
-- **Per-device keys**: each device a distinct identity. Consent and membership then operate on
-  device keys as identities. A member who wants their devices recognized as one persona MAY publish
-  device sub-keys cross-signed by a shared root and present that linkage to peers — but this is
-  member-managed convention, not a Vox-enforced attestation. Clients MUST represent device-keys
-  clearly so consent is never granted to an unrecognized device by accident (ADR-014).
+- **D1.** The multi-device strategy MUST be the member's choice, and Vox MUST NOT attest a link
+  between a device and an identity.
+- **D2. (planned)** Shared root: the same root on several devices. Devices MUST share received consent
+  (SKDMs) and channel state over the identity-keyed self-channel (ADR-008), so adding a device needs no
+  re-consent by peers.
+- **D3.** Per-device keys: each device is a distinct identity. A member MAY publish device sub-keys
+  cross-signed by a shared root as a convention Vox does not enforce. Clients MUST represent device
+  keys so consent is never granted to an unrecognized device by accident (ADR-014).
 
-### Pseudonymity
+### §Pseudonymity
 
-Membership is attributable (ADR-009), so unlinkability is achieved operationally: a member joins a
-channel under a **dedicated identity key** rather than their main one. Per-channel identity-key
-selection is a first-class, explicit client operation (ADR-014); Vox never reuses an identity
-across channels without the user choosing to.
+- **Y1. (planned)** A member MAY join a channel under a dedicated identity key, chosen explicitly per
+  channel (ADR-014). Vox MUST NOT reuse an identity across channels unless the user chooses to.
+
+### §Secret hygiene
+
+- **H1.** Every accessor that returns private key material (root seeds, X25519 scalars, ML-KEM seeds,
+  backup secrets) MUST return a non-`Copy` zeroize-on-drop buffer, never a bare array.
 
 ## Consequences
 
-### Positive
-- No central trust anchor; identity is fully user-controlled, portable, and interoperates with PGP.
-- Strict role separation enables attributable governance and deniable content simultaneously, and
-  contains compromise blast radius.
-- Operational pseudonymity needs no protocol-level anonymity system — just key choice.
-- Hybrid Ed25519+ML-DSA root and ML-KEM prekeys make identity post-quantum from day one.
+- No central trust anchor; identity is user-controlled and interoperates with OpenPGP fingerprints.
+- Manual fingerprint verification is a UX burden (ADR-014).
+- Root loss is unrecoverable; backup is on the user.
+- Composite signatures and ML-KEM prekeys are larger and slower than classical keys alone (ADR-003,
+  ADR-008).
 
-### Negative
-- Manual fingerprint verification is a real UX burden and a foot-gun if skipped (mitigated in ADR-014).
-- No device attestation means per-device-key users manage persona coherence themselves.
-- Root-key loss is unrecoverable; backup discipline is on the user.
-- Composite (Ed25519+ML-DSA) signatures and ML-KEM prekeys are larger and slower than classical
-  alone (sizing addressed in ADR-003/ADR-008).
+## Related ADRs
 
-### Neutral
-- Reuses OpenPGP key material and fingerprint culture instead of minting an app-specific identity.
-
-## Implementation notes (M1)
-
-These record the concrete decisions made building this ADR (`crates/vox-core/src/identity/`), so the spec and code stay in lockstep:
-
-- **Secret-hygiene rule for accessors.** Every accessor that hands out private key material — the
-  composite root's Ed25519/ML-DSA seeds, the X25519 identity-DH scalar, signed-prekey and one-time-prekey
-  X25519 scalars and ML-KEM-768 seeds, the backup bundle's secrets — returns a non-`Copy`
-  `zeroize::Zeroizing` buffer that is wiped on drop, never a bare `[u8; N]`. Callers deref-copy into
-  their own zeroize-on-drop fields and the temporary wipes itself, so no bare secret copy lingers at
-  a call site. A type-level test (`identity::keyagreement::tests::secret_getters_return_zeroizing_buffers`)
-  fails to compile if any getter regresses. *(2026-09-19 review: the key-agreement getters predated the
-  ADR-010 secret-hygiene audit and returned bare `Copy` arrays; PQXDH re-wrapped them, the ratchet did
-  not.)*
-- **The identity DH key comes from the identity, not from the ring (fixed 2026-09-20, M14.7c).** §2 lists
-  the X25519 identity DH key as part of the *identity*, and it is carried in the ADR-002 backup
-  (`x25519_identity_secret`). `PrekeyRing::generate` therefore takes that secret as an input and signs
-  the corresponding public record, rather than generating a fresh DH key of its own: otherwise an identity
-  restored from its backup would advertise a *different* identity DH key than the one every previously
-  published bundle names, and the key would not be an identity-level artifact at all. A test pins that two
-  rings built from the same identity secret advertise the same key, and that the advertised key is the one
-  the secret derives.
-- **Prekey persistence and rotation live one layer up (`node::prekeys`, M14.3).** `keyagreement` owns
-  the primitives; the *policy* — the 7-day signed-prekey cadence, retaining the previous prekey exactly
-  one cadence, refilling the one-time pool at its low-water mark, and consuming a one-time prekey once —
-  is the [`crate::node::prekeys::PrekeyRing`], which persists the whole ring at rest (ADR-010
-  Implementation notes). To make that possible the key-agreement types gained **restore constructors**
-  (`SignedIdentityDhKey::from_parts`, `SignedPrekey::from_parts`, `OneTimePrekey::from_parts`,
-  `OneTimePrekeyPool::from_parts`): each re-derives the public key from the stored secret and refuses a
-  mismatch, and re-verifies the root signature over the ADR-002 canonical body, so a tampered or
-  swapped-in at-rest ring is refused rather than adopted. `OneTimePrekeyPool::from_parts` additionally
-  rejects an id at or above `next_id`, or a duplicate, so a restored pool can never re-issue a prekey id
-  that was already published. The pool also gained `iter`/`first`/`take_by_id` so a caller can advertise
-  the lowest-id prekey and consume exactly the one an initial message targeted.
-- **Known gaps (recorded 2026-09-19; prekey rotation closed 2026-09-20).** No succession statement
-  (§Lifecycle) exists in code; the only `RootSigner` backends are `SoftwareRootSigner` and the at-rest
-  `VaultRootSigner` — the gpg-agent/hardware backends are the documented seam. Test-vector
-  obligation: composite pubkey/sig layout is asserted structurally with a fixed-seed signer, but no
-  pinned known-answer bytes exist yet for the pubkey, signature, fingerprint, or binding statement.
-- **OpenPGP representation of the native root (M13.2, 2026-09-19).** `identity::openpgp` builds the
-  v4 public-key packet for the Ed25519 half (algo 22 EdDSALegacy, Ed25519 OID, 263-bit MPI with the
-  `0x40` prefix) and its v4 fingerprint; the construction is pinned by the draft-bre "Alice" sample
-  key and by a GnuPG-generated key whose fingerprint was reproduced from `(pubkey, created)` alone.
-  A generated identity's backup therefore carries its real OpenPGP fingerprint. Armored export with
-  a user ID and self-signature (the "exports it in OpenPGP format" half) is the ADR-015 identity
-  export surface, still a known gap.
-
-## Links
-**Depends on**: ADR-001.
-- Depended on by: ADR-003, ADR-004, ADR-005, ADR-007, ADR-008, ADR-009, ADR-010, ADR-011, ADR-014.
-
-> Note: ADR-002 names the concrete PQ algorithms (ML-DSA, ML-KEM) as direct references; the hybrid
-> and crypto-agility *policy* that governs them is ADR-003, which builds on this key model. The
-> dependency is one-directional (003 → 002) to keep the ADR graph acyclic.
-
-## Engineering Mantra
-
-These principles are binding on all work under this ADR:
-
-- **Do not be lazy.** Plenty of time to do it right.
-- **No shortcuts.** Every component is built to production quality from day one.
-- **Never make assumptions.** Dive deep before writing a single line of code.
-- **Measure three times, cut once.** Verify designs, implementations, and outputs.
-- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
-- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
-- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.
+Depends on ADR-001. Depended on by ADR-003, ADR-004, ADR-005, ADR-007, ADR-008, ADR-009, ADR-010,
+ADR-011, ADR-014. ADR-002 names ML-DSA and ML-KEM directly; the policy governing them is ADR-003
+(one-directional, ADR-003 → ADR-002). The engineering rules of ADR-001 bind all work under this ADR.
