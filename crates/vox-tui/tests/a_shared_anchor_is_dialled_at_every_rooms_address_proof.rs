@@ -451,12 +451,18 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
         "[proof] after the anchor's restart bob reached it again: {back:?} (bound {BACK_WITHIN:?}, \
          apparatus {apparatus:?}); said it went: {said_it_went}; anchor alive: {alive}"
     );
-    assert!(
-        alive,
-        "CANNOT MEASURE: the restarted anchor exited (its port may have been taken meanwhile), \
-         so bob had nothing to reach: {:?}",
-        std::fs::read_to_string(anchor_dir.join("anchor-again.err")).unwrap_or_default()
-    );
+    if !alive {
+        let said = std::fs::read_to_string(anchor_dir.join("anchor-again.err")).unwrap_or_default();
+        // Its port is handed back to it; another process taking it meanwhile is this machine's.
+        assert!(
+            !said.contains("in use"),
+            "CANNOT MEASURE: the restarted anchor's port was taken meanwhile, so bob had nothing to \
+             reach: {said:?}"
+        );
+        panic!(
+            "PRODUCT (staging): the restarted anchor exited, so bob had nothing to reach: {said:?}"
+        );
+    }
     let back = back.unwrap_or_else(|| {
         panic!(
             "PRODUCT: bob never reached the anchor again within {:?} of its restart. Two rooms name it: \

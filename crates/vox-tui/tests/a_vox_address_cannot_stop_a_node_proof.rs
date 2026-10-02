@@ -33,13 +33,14 @@
 //!    silent streams were opened, and the first is still open at the victim's end — accepted
 //!    and waited on, not refused.
 //!
-//! **Which side a slow post is on.** Before the attack, one quiet `vox room post` is timed, and it
-//! must answer within [`PATIENCE`] (else CANNOT MEASURE: the node is slow with no attack, so the
-//! attack's effect cannot be told apart). A post during the attack that misses the bound is
-//! followed at once by a `vox --version` on the same timeline, the cost of starting `vox` at all.
-//! If that apparatus took more than [`APPARATUS_BUDGET`], the red is `CANNOT MEASURE: apparatus
-//! took X`; otherwise it is `PRODUCT: took X (apparatus Y, quiet Z)`. Fixture failures are
-//! `APPARATUS:`.
+//! **Which side a slow post is on.** The apparatus clock is only the apparatus: a `vox --version`
+//! on the same timeline, the cost of starting `vox` at all. Before the attack, one quiet `vox room
+//! post` is timed as the product's baseline, never as part of that clock. It must answer within
+//! [`PATIENCE`]: a quiet post that fails, or misses the bound while the clock is within
+//! [`APPARATUS_BUDGET`], is `PRODUCT (staging):` (the node is slow with no attack at all). A post
+//! during the attack that misses the bound is followed at once by the clock. If that apparatus
+//! took more than [`APPARATUS_BUDGET`], the red is `CANNOT MEASURE: apparatus took X`; otherwise
+//! it is `PRODUCT: took X (apparatus Y, quiet Z)`. Fixture failures are `APPARATUS:`.
 //!
 //! **Mutation that must turn it red.** Put the join-request read back on the actor: in
 //! `node::actor`'s per-connection stream loop, forward `Inbound::Join` to the actor unread,
@@ -350,18 +351,26 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     });
     println!("[proof] escalation: the victim accepted the stranger's pre-join for the room");
 
-    // ---- the apparatus clock: a quiet post, before any attack ----------------------------------
+    // ---- the product's baseline: a quiet post, before any attack -------------------------------
     let (ok, quiet, said) = vox_timed(
         &victim_dir,
         &["room", "post", &room, "a quiet post before the attack"],
         PATIENCE * 8,
     );
     println!("[proof] quiet post: ok={ok} in {quiet:?}");
-    assert!(
-        ok && quiet < PATIENCE,
-        "CANNOT MEASURE: a post on the victim took {quiet:?} (ok={ok}) with no attack, over \
-         {PATIENCE:?}, so the attack's effect cannot be told apart. It said: {said}"
-    );
+    if !(ok && quiet < PATIENCE) {
+        let (_, apparatus, _) = vox_timed(&victim_dir, &["--version"], PATIENCE * 8);
+        assert!(
+            ok || apparatus <= APPARATUS_BUDGET,
+            "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+             {APPARATUS_BUDGET:?}) right after the quiet post took {quiet:?}, so the runner, not \
+             the node, may be slow. The post said: {said}"
+        );
+        panic!(
+            "PRODUCT (staging): a post on the victim took {quiet:?} (ok={ok}; bound {PATIENCE:?}; \
+             apparatus {apparatus:?}) with no attack at all. It said: {said}"
+        );
+    }
 
     // ---- the attack holds while a person uses the node -------------------------------------
     let silent = Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -33,10 +33,13 @@
 //! said; a `vox` step of the setup that failed (an identity, a room, the first post) is
 //! `PRODUCT (staging):`; the escalation or the attack not holding is `CANNOT MEASURE:`; a fault of this proof's own (a file, a runtime, a signal) is `APPARATUS:`.
 //! Mallory joins **once**: a join turned away is the product's red, not something to retry past.
-//! The bound is read against an **apparatus clock**: a quiet baseline post on the victim before
-//! the attack starts, and the time to start a `vox --version` right after any slow post. A post
-//! over [`PATIENCE`] while either was over [`APPARATUS_BUDGET`] is CANNOT MEASURE; otherwise it is
-//! the product's.
+//! The bound is read against an **apparatus clock** that is only the apparatus: the time to start
+//! a `vox --version` right after any slow post. A quiet post on the victim before the attack is
+//! the product's baseline, never part of that clock: one that fails, or misses [`PATIENCE`] while
+//! the clock is within [`APPARATUS_BUDGET`], is `PRODUCT (staging):` (the node is slow with no
+//! attack at all). A post during the attack over [`PATIENCE`] while the clock was over
+//! [`APPARATUS_BUDGET`] is CANNOT MEASURE; otherwise it is the product's, with the quiet post's
+//! time quoted.
 //!
 //! **Mutation that must turn it red.** Put the sync-preamble read back on the actor: in
 //! `node::actor`'s per-connection stream loop, forward `Inbound::Sync` to the actor unread,
@@ -73,8 +76,8 @@ const SILENT_EVERY: Duration = Duration::from_secs(2);
 /// are open by the last one.
 const GAP: Duration = Duration::from_secs(2);
 const SETUP: Duration = Duration::from_secs(120);
-/// The most the apparatus may take, on the same timeline, for a slow post to be the product's: a
-/// quiet post before the attack, or starting a `vox` that does nothing.
+/// The most the apparatus may take, on the same timeline, for a slow post to be the product's:
+/// starting a `vox` that does nothing.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 const ROOM_PASS: &str = "room passphrase";
 
@@ -387,17 +390,26 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
         honest.frontiers, honest.entries
     );
 
-    // ---- the apparatus clock: a quiet post, before the attack ------------------------------
+    // ---- the product's baseline: a quiet post, before the attack ----------------------------
     let (ok, quiet, said) = vox_timed(
         &victim_dir,
         &["room", "post", &room, "a quiet post before the attack"],
         PATIENCE * 8,
     );
-    assert!(
-        ok,
-        "PRODUCT: the quiet post before the attack failed: {said}"
-    );
-    println!("[proof] apparatus: a quiet post took {quiet:?} before the attack");
+    println!("[proof] baseline: a quiet post took {quiet:?} (ok={ok}) before the attack");
+    if !(ok && quiet < PATIENCE) {
+        let apparatus = apparatus_spawn(&victim_dir);
+        assert!(
+            ok || apparatus <= APPARATUS_BUDGET,
+            "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+             {APPARATUS_BUDGET:?}) right after the quiet post took {quiet:?}, so the runner, not \
+             the node, may be slow. The post said: {said}"
+        );
+        panic!(
+            "PRODUCT (staging): the quiet post before the attack took {quiet:?} (ok={ok}; bound \
+             {PATIENCE:?}; apparatus {apparatus:?}) with no attack at all. It said: {said}"
+        );
+    }
 
     // ---- 2. the attack holds while a person uses the node -------------------------------
     let silent = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -451,15 +463,15 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
              silent Sync streams open. It said: {said}"
         );
         if t >= PATIENCE || !ok {
-            let apparatus = quiet.max(apparatus_spawn(&victim_dir));
+            let apparatus = apparatus_spawn(&victim_dir);
             assert!(
                 apparatus <= APPARATUS_BUDGET,
-                "CANNOT MEASURE: apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}; a quiet \
-                 post took {quiet:?}) while post {i} took {t:?}"
+                "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+                 {APPARATUS_BUDGET:?}) while post {i} took {t:?}"
             );
             panic!(
                 "PRODUCT: post {i} of {POSTS} on the victim took {t:?} (ok={ok}; bound \
-                 {PATIENCE:?}, apparatus {apparatus:?}) while a member held silent Sync streams \
+                 {PATIENCE:?}, apparatus {apparatus:?}, quiet {quiet:?}) while a member held silent Sync streams \
                  open — a stream carrying zero bytes stops the node. It said: {said}"
             );
         }
