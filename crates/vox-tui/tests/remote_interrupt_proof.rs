@@ -378,3 +378,137 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         "a wedged session stalled another session's wakes; received: {got}"
     );
 }
+
+/// V030-17 — **a sender is told how each addressee can be reached.** Two profiles in one room,
+/// trusting each other. On bob's node a Codex-shaped session (a session id, `VOX_AGENT_NAME=codex`,
+/// and no wake endpoint, which is how Codex runs today) takes part in work coordination, so its
+/// `hello` is posted, and alice's node receives it by sync. Alice then posts an urgent `ask` with
+/// `vox room post --to codex --to ghost`. Asserted, from what the shipped binaries print:
+///
+/// 1. the `hello` alice reads says `data.wake` is `turn`, under the name `codex`;
+/// 2. alice is told, for `codex`, "urgent will not interrupt it; it reads at its next turn", that
+///    each side trusts the other, and when it last posted;
+/// 3. for `ghost`, a name nobody announced, "no session has announced itself under this name";
+/// 4. nothing she is told says "overdue": her node cannot see another node's reads.
+///
+/// **Mutation.** Drop `data.wake` from the `hello` (`coord::participate`), and (1) and (2) go red:
+/// alice is told the hello does not say whether it can be interrupted.
+#[test]
+#[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
+fn a_sender_is_told_how_each_addressee_can_be_reached() {
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not build a runtime: {e}"));
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
+    let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let (alice, bob) = (&r.workers[0], &r.workers[1]);
+    let room = r.id.clone();
+
+    // ---- bob's Codex-shaped session takes part in work coordination, so it says hello ----
+    let codex_env = [("VOX_AGENT_NAME", "codex"), ("VOX_HARNESS", "codex")];
+    let o = bob.vox_env(
+        Some("codex-thread-1"),
+        &codex_env,
+        &[
+            "room",
+            "post",
+            &room,
+            "--type",
+            "status",
+            "--work",
+            "test:v030-17",
+            "-",
+        ],
+        Some("looking at the reach report"),
+    );
+    assert!(
+        o.ok,
+        "PRODUCT (staging): the Codex-shaped session's `vox room post --work` failed: {o:?}"
+    );
+
+    // ---- (1) alice's node reads bob's hello, which says how that session is reached ----
+    let read = until(
+        alice,
+        None,
+        "bob's Codex-shaped session's hello to reach alice",
+        &["room", "read", &room, "--json"],
+        |o| {
+            o.ok && o.ndjson().iter().any(|row| {
+                row["envelope"]["type"] == "hello" && row["envelope"]["from"] == "codex-thread-1"
+            })
+        },
+    );
+    let hello = read
+        .ndjson()
+        .into_iter()
+        .find(|row| {
+            row["envelope"]["type"] == "hello" && row["envelope"]["from"] == "codex-thread-1"
+        })
+        .unwrap_or_else(|| panic!("APPARATUS: the hello `until` found is gone: {read:?}"));
+    println!("[proof] alice reads bob's hello: {}", hello["envelope"]);
+    assert_eq!(
+        (
+            hello["envelope"]["data"]["wake"].as_str(),
+            hello["envelope"]["data"]["name"].as_str()
+        ),
+        (Some("turn"), Some("codex")),
+        "PRODUCT: a session with no wake endpoint must say in its hello that it is reached at its \
+         turn (data.wake = turn), under its name; alice reads: {}",
+        hello["envelope"]
+    );
+
+    // ---- (2)-(4) alice addresses it, and a name nobody announced ----
+    let o = alice.vox_env(
+        Some("alice-session"),
+        &[("VOX_AGENT_NAME", "alice")],
+        &[
+            "room", "post", &room, "--type", "ask", "--to", "codex", "--to", "ghost", "--urgent",
+            "-",
+        ],
+        Some("can you look at this now?"),
+    );
+    assert!(
+        o.ok,
+        "PRODUCT: alice's urgent `vox room post --to` failed: {o:?}"
+    );
+    let told = |name: &str| {
+        o.stderr
+            .lines()
+            .find(|l| l.starts_with(&format!("vox: to {name}: ")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: `vox room post --to {name}` told alice nothing about {name}; its \
+                     stderr: {}",
+                    o.stderr
+                )
+            })
+            .to_owned()
+    };
+    let (codex, ghost) = (told("codex"), told("ghost"));
+    println!("[proof] alice is told:\n  {codex}\n  {ghost}");
+    assert!(
+        codex.contains("urgent will not interrupt it; it reads at its next turn"),
+        "PRODUCT: an urgent message to a session that cannot be interrupted must say so: {codex}"
+    );
+    assert!(
+        codex.contains("you trust it") && codex.contains("it trusts you"),
+        "PRODUCT: alice and bob trust each other, and alice must be told so in both directions: \
+         {codex}"
+    );
+    assert!(
+        codex.contains("last posted "),
+        "PRODUCT: the Codex-shaped session posted, and alice must be told when: {codex}"
+    );
+    assert!(
+        ghost.contains("no session has announced itself under this name"),
+        "PRODUCT: a name no session announced must be reported as unannounced: {ghost}"
+    );
+    assert!(
+        !o.stderr.to_lowercase().contains("overdue"),
+        "PRODUCT: a sender cannot see another node's reads, so nothing may say overdue: {}",
+        o.stderr
+    );
+}

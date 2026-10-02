@@ -449,6 +449,23 @@ pub async fn post_cmd(
     };
     let is_result = draft.kind == vox_agentcomms::envelope::work::RESULT;
     let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
+    // **What to expect of each addressee** (V030-17), from the room as it stands after the post.
+    let reach = if draft.to.is_empty() {
+        Vec::new()
+    } else {
+        let (outbound, inbound) = match client.request(&Request::Consents { channel_id: cid }).await
+        {
+            Ok(Frame::Consents { outbound, inbound }) => (outbound, inbound),
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+        draft
+            .to
+            .iter()
+            .map(|name| reach_of(&posting.after, name, draft.urgent, &outbound, &inbound))
+            .collect()
+    };
     // **A `result` says what it has not read** (ADR-021 M21.10). A redirect addressed
     // to this session can land after its last drain and before it reports; the result
     // still posts, and the caller is shown every such message so it can follow up.
@@ -466,6 +483,9 @@ pub async fn post_cmd(
             "status": posting.status,
             "session": session,
         });
+        if !reach.is_empty() {
+            out["reach"] = reach.iter().map(Reach::json).collect();
+        }
         if is_result {
             out["unread_addressed"] = serde_json::Value::Array(
                 unread
@@ -478,6 +498,9 @@ pub async fn post_cmd(
         }
         println!("{out}");
     }
+    for r in &reach {
+        eprintln!("vox: to {}: {}", r.name, r.says);
+    }
     if !unread.is_empty() {
         eprintln!(
             "vox: your result is posted, but {} message(s) addressed to you are unread — \
@@ -489,6 +512,150 @@ pub async fn post_cmd(
         }
     }
     Ok(())
+}
+
+/// What a sender can expect of one name it addressed (V030-17): whether a session has announced
+/// itself under it, whether an urgent message can interrupt it, when it last posted, and trust in
+/// each direction. Only what this node can see: it never says a reply is overdue, because it
+/// cannot see another node's reads.
+struct Reach {
+    name: String,
+    /// The `data.wake` of the latest `hello` under this name; `Some("")` when that hello did not
+    /// say; `None` when no session announced itself under the name.
+    wake: Option<String>,
+    /// When a session under this name last posted, ms since the epoch.
+    last_posted: Option<u64>,
+    /// Whether this identity consents to the announcing identity reading it, and it to this one;
+    /// `None` for a session of this identity, or no announcement.
+    you_trust: Option<bool>,
+    it_trusts: Option<bool>,
+    /// The line shown.
+    says: String,
+}
+
+impl Reach {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "announced": self.wake.is_some(),
+            "wake": self.wake.as_deref().filter(|w| !w.is_empty()),
+            "last_posted_millis": self.last_posted,
+            "you_trust": self.you_trust,
+            "it_trusts": self.it_trusts,
+            "says": self.says,
+        })
+    }
+}
+
+/// How long ago `then` was, at `now` (both ms), coarsely: `40s`, `12m`, `3h`, `2d`.
+fn ago(now: u64, then: u64) -> String {
+    let s = now.saturating_sub(then) / 1000;
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+/// [`Reach`] for `name`, from `snap`, the room after the post, and this identity's consents in
+/// the room in each direction.
+fn reach_of(
+    snap: &coord::Snapshot,
+    name: &str,
+    urgent: bool,
+    outbound: &[Digest32],
+    inbound: &[Digest32],
+) -> Reach {
+    use vox_agentcomms::envelope::HELLO;
+    let under = |e: &Envelope| {
+        e.from == name
+            || e.data
+                .get(crate::wake::NAME_KEY)
+                .and_then(serde_json::Value::as_str)
+                == Some(name)
+    };
+    let hello = snap
+        .posted
+        .iter()
+        .filter(|p| p.envelope.kind == HELLO && under(&p.envelope))
+        .max_by_key(|p| p.created_millis);
+    let last_posted = snap
+        .posted
+        .iter()
+        .filter(|p| {
+            p.envelope.kind != HELLO
+                && (p.envelope.from == name
+                    || hello.is_some_and(|h| {
+                        p.author == h.author && p.envelope.from == h.envelope.from
+                    }))
+        })
+        .map(|p| p.created_millis)
+        .max();
+    let mut parts = Vec::new();
+    let (wake, you_trust, it_trusts) = match hello {
+        None => {
+            parts.push("no session has announced itself under this name".to_owned());
+            (None, None, None)
+        }
+        Some(h) => {
+            let wake = h
+                .envelope
+                .data
+                .get(crate::wake::WAKE_KEY)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            parts.push(
+                match (wake.as_str(), urgent) {
+                    ("turn", true) => "urgent will not interrupt it; it reads at its next turn",
+                    ("interrupt", true) => "urgent may interrupt it",
+                    ("turn" | "interrupt", false) => "not urgent, so it reads at its next turn",
+                    (_, true) => {
+                        "its hello does not say whether it can be interrupted; it reads at its \
+                         next turn"
+                    }
+                    (_, false) => "it reads at its next turn",
+                }
+                .to_owned(),
+            );
+            if h.author == snap.me {
+                parts.push("a session of this identity".to_owned());
+                (Some(wake), None, None)
+            } else {
+                let a = h.author;
+                let (you, it) = (outbound.contains(&a), inbound.contains(&a));
+                parts.push(
+                    if you {
+                        "you trust it"
+                    } else {
+                        "you have not trusted it, so it cannot read this"
+                    }
+                    .to_owned(),
+                );
+                parts.push(
+                    if it {
+                        "it trusts you"
+                    } else {
+                        "it has not trusted you"
+                    }
+                    .to_owned(),
+                );
+                (Some(wake), Some(you), Some(it))
+            }
+        }
+    };
+    if let Some(t) = last_posted {
+        parts.push(format!("last posted {} ago", ago(snap.now_millis, t)));
+    }
+    Reach {
+        name: name.to_owned(),
+        wake,
+        last_posted,
+        you_trust,
+        it_trusts,
+        says: parts.join("; "),
+    }
 }
 
 /// Messages addressed to this session that its drain has not delivered yet: past its

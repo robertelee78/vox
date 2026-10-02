@@ -68,6 +68,27 @@ pub struct Session {
     pub token: String,
 }
 
+/// The `data` key of a session's `hello` saying how it can be reached (V030-17).
+pub const WAKE_KEY: &str = "wake";
+/// The `data` key of a session's `hello` naming the petname it answers to (V030-17).
+pub const NAME_KEY: &str = "name";
+
+/// How this session can be reached, from what the harness put in the environment, as its
+/// `hello` says it (`data.wake`, V030-17): `interrupt` when [`register`] would record a wake
+/// channel (Claude Code's messaging socket, or the Vox OpenCode plugin's), else `turn` — it
+/// reads the room at its next turn, and nothing can start one (Codex today).
+#[must_use]
+pub fn reachability() -> &'static str {
+    let set = |k: &str| std::env::var_os(k).is_some();
+    if (set("CLAUDE_CODE_MESSAGING_SOCKET") && set("CLAUDE_CODE_MESSAGING_TOKEN"))
+        || (set("VOX_OPENCODE_WAKE_SOCKET") && set("VOX_OPENCODE_WAKE_TOKEN"))
+    {
+        "interrupt"
+    } else {
+        "turn"
+    }
+}
+
 /// Record how this session can be woken, from what the harness put in the
 /// environment.
 ///

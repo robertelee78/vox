@@ -476,9 +476,25 @@ pub async fn participate(
 ) -> Result<Snapshot, AppError> {
     let mut snap = snapshot(client, channel_id).await?;
     if !snap.announced(session) {
+        // **How it can be reached rides the hello** (V030-17): a sender on another node cannot
+        // see this node's session registrations, so it learns from the room whether an urgent
+        // message can interrupt this session, and under which name it answers.
+        let mut data = serde_json::Map::new();
+        data.insert(
+            crate::wake::WAKE_KEY.into(),
+            crate::wake::reachability().into(),
+        );
+        if let Some(name) = std::env::var("VOX_AGENT_NAME")
+            .ok()
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
+        {
+            data.insert(crate::wake::NAME_KEY.into(), name.into());
+        }
         let hello = Draft {
             kind: HELLO.into(),
             body: format!("session {session} runs vox {VERSION}"),
+            data,
             ..Draft::default()
         };
         let op = new_op()?;
