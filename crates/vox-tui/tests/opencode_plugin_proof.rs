@@ -102,7 +102,9 @@
 //! plugin-fed turns may also read the run's own vox profile, which the plugin's hook needs;
 //! the `--pure` control may not. Before any model runs, a shell in the sandbox must fail to
 //! read or find a canary file planted in the operator's real HOME, and no OpenCode's output
-//! may ever hold the canary: either is APPARATUS, and stops the run.
+//! may ever hold the canary: either is APPARATUS, and stops the run. The sandbox holds a copy of
+//! OpenCode's own provider credential alone, removed when the run ends; the operator's other
+//! providers' keys never enter it.
 //!
 //! OpenCode absent, or no usable credential, is reported **unproven and fails** —
 //! an absent prover is missing evidence, not evidence of correctness. Set
@@ -117,6 +119,7 @@ mod watchdog;
 mod pty_driver;
 
 use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -127,7 +130,9 @@ const IDENTITY: &str = "identity passphrase";
 /// Cheap and fast; overridable because pinning a model name in a test is brittle.
 fn model() -> String {
     std::env::var("VOX_PROOF_OPENCODE_MODEL")
-        .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
+        // The decider, 2026-10-02: live-model proofs use opencode/kimi-k3 (or `claude -p`,
+        // `codex exec`), never a free model.
+        .unwrap_or_else(|_| "opencode/kimi-k3".to_owned())
 }
 
 fn allow_unproven(name: &str) -> bool {
@@ -285,6 +290,47 @@ impl Canary {
              ({:?}). Stop every live-model run until it is fixed.",
             self.path
         );
+    }
+}
+
+/// The sandbox's copy of **only** OpenCode's own provider credential, not the operator's
+/// other providers': the least a turn needs, and the most a confined shell could leak, to that
+/// same provider. Removed however the test ends.
+struct Credential(std::path::PathBuf);
+
+impl Credential {
+    fn copy(from: &Path, home: &Path) -> Self {
+        let all: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(from)
+                .unwrap_or_else(|e| panic!("APPARATUS: cannot read OpenCode's credentials: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("APPARATUS: OpenCode's credentials are not JSON: {e}"));
+        let own = all.get("opencode").unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: OpenCode holds no credential of its own provider (`opencode`)")
+        });
+        let dir = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make the sandbox's {dir:?}: {e}"));
+        let path = dir.join("auth.json");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox's credential: {e}"));
+        f.write_all(
+            serde_json::json!({ "opencode": own })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox's credential: {e}"));
+        Self(path)
+    }
+}
+
+impl Drop for Credential {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -638,9 +684,9 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         .to_string(),
     )
     .unwrap_or_else(|e| panic!("APPARATUS: cannot write the fixture's opencode.json: {e}"));
-    // The credential is only *located* through the real data dir: nothing is copied, and the
-    // sandbox cannot read it.
-    let _ = &auth;
+    // The sandbox cannot read the operator's credentials; it gets a copy of OpenCode's own
+    // provider's alone (see `Credential`).
+    let _credential = Credential::copy(&auth, &fed.home);
 
     // Every OpenCode here runs with this run's own `TMPDIR`, where its plugin makes its wake
     // directory: (9) counts exactly this run's. Short, because a Unix socket's path is.
