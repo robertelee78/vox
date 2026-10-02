@@ -28,9 +28,13 @@
 //! patience, a stop that waited out an unacknowledged tail ran into the patience: the daemon
 //! printed "the node did not stop within 5s … stopping anyway" and left with its ordered stop
 //! cut short. Staging, all real processes: Alice and Bob are `vox daemon`s in one room; Alice
-//! offers a [`FILE_BYTES`]-byte file (under a tunnel's window) with `vox room send`, Bob starts
-//! `vox room get`, and at its first bytes Bob's daemon is frozen (SIGSTOP), so Alice's tunnel
-//! finishes its stream with the tail unacknowledged; then Alice's daemon gets SIGINT.
+//! offers a [`FILE_BYTES`]-byte file (under a tunnel's window) with `vox room send`, which is then
+//! frozen (SIGSTOP); Bob starts `vox room get`; once Bob's `vox status` lists the tunnel, Bob's
+//! daemon is frozen, and only then does the sender go on, so the whole file goes out with nothing
+//! acknowledged and Alice's tunnel finishes its stream with the tail unacknowledged, every time;
+//! then Alice's daemon gets SIGINT. (Freezing Bob at the collector's first bytes, as this did,
+//! staged the scene on 1 attempt in 4 on a fast machine: the rest of the file had already been
+//! acknowledged.)
 //! Asserted: it exits within [`PATIENCE`], never says it gave up, and reports the stop as a
 //! success (it says "stopped by SIGINT" and exits 0, as a service manager expects of a service it
 //! stopped). The node's worst-case stop is budgeted under the patience, each wait named
@@ -375,6 +379,16 @@ fn read_offsets(pid: u32, name: &str) -> Option<Vec<u64>> {
     listed.then_some(offsets)
 }
 
+/// Send `sig` to `pid`, by PID.
+fn signal_pid(pid: u32, sig: &str) {
+    let ok = Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(ok, "APPARATUS: kill {sig} {pid} did not take");
+}
+
 /// One staging. `None` when a precondition did not hold; else how long Alice's daemon took to
 /// exit after SIGINT, and what it said.
 fn attempt(root: &Path, n: usize) -> Option<(Duration, std::process::ExitStatus, String)> {
@@ -421,6 +435,14 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, std::process::ExitStatus,
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The sender is held still until Bob's daemon is frozen: nothing it sends can be
+    // acknowledged before the stop, whatever the machine's speed.
+    let tag = std::fs::read_to_string(&send_out)
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.split(" as ").nth(1).map(|t| t.trim().to_owned()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room send` never named its offer's tag"));
+    signal_pid(send.0.id(), "-STOP");
     let dir = root.join(format!("get{n}"));
     std::fs::create_dir_all(&dir).expect("APPARATUS: create the download directory");
     let get_out = root.join(format!("get{n}.out"));
@@ -438,39 +460,39 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, std::process::ExitStatus,
         ],
         &get_out,
     );
+    // The tunnel is up when Bob's own `vox status` lists it (V210-81).
     let t1 = Instant::now();
-    while bytes_in(&dir) == 0 {
+    loop {
+        let listed = bob.status()["tunnels"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|t| t["service"].as_str() == Some(tag.as_str()) && t["direction"] == "out")
+        });
+        if listed {
+            break;
+        }
         assert!(
             t1.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: the collector received nothing"
+            "CANNOT MEASURE: Bob's `vox status` never listed the tunnel to {tag}"
         );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    // Nothing more Alice sends is acknowledged from here on.
-    bob_d.signal("-STOP");
-    let held = bytes_in(&dir);
-    // Alice's `vox room send` writes the whole file into her daemon, and closes.
-    let t2 = Instant::now();
-    // `vox room send` closes the file as soon as it has read all of it; the collector already
-    // holds bytes read from it, so a file no longer open was read to its end (nothing has
-    // stopped the offer, and a read error is not staged here).
-    let (read, open) = loop {
-        let (read, open): (u64, &str) = match read_offsets(send.0.id(), &offered) {
-            Some(offsets) if offsets.is_empty() => (FILE_BYTES as u64, "closed"),
-            Some(offsets) => (offsets.iter().sum(), "open"),
-            None => (0, "not listed"),
-        };
-        if read >= FILE_BYTES as u64 || t2.elapsed() > Duration::from_secs(10) {
-            break (read, open);
-        }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    // Nothing Alice sends from here on is acknowledged; then the sender goes on.
+    bob_d.signal("-STOP");
+    signal_pid(send.0.id(), "-CONT");
+    let held = bytes_in(&dir);
+    // Alice's `vox room send` writes the whole file into her daemon, and closes it: under a
+    // tunnel's window, so nothing holds it back with Bob frozen. A file it still has open after
+    // that was not read to its end.
+    std::thread::sleep(Duration::from_secs(3));
+    let (read, open): (u64, &str) = match read_offsets(send.0.id(), &offered) {
+        Some(offsets) if offsets.is_empty() => (FILE_BYTES as u64, "closed"),
+        Some(offsets) => (offsets.iter().sum(), "open"),
+        None => (0, "not listed"),
     };
     eprintln!(
         "[proof] attempt {n}: the sender read {read} of {FILE_BYTES} (its file {open}); the \
          collector held {held} at the freeze"
     );
-    // Let the daemon read the rest of the file and finish the tunnel's stream.
-    std::thread::sleep(Duration::from_secs(1));
     if read < FILE_BYTES as u64 || held >= FILE_BYTES as u64 {
         eprintln!("[proof] attempt {n}: not staged");
         bob_d.signal("-CONT");
