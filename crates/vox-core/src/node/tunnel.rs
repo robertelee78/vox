@@ -301,7 +301,7 @@ impl Forward {
             .await
             .map_err(|e| Error::LocalBind {
                 addr: local,
-                in_use: e.kind() == std::io::ErrorKind::AddrInUse,
+                cause: crate::error::BindCause::of(&e),
                 reason: e.to_string(),
             })?;
         let bound = listener

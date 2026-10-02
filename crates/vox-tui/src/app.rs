@@ -1186,14 +1186,15 @@ pub fn run_daemon(
                      `vox daemon` is the identity passphrase; lines after it open rooms."
                         .to_owned()
                 }
-                // Unlocking also brings the node onto the network, so a `--listen` port that
-                // is taken fails here. It said `Failed(Internal)` — a bug report for an
-                // occupied port (PRD-001 R36).
-                Outcome::Failed(Fault::AddressInUse) => format!(
-                    "cannot listen on {listen}: something else already holds that UDP port\n\
-                     \x20      Pick another with --listen, or stop whatever holds it \
-                     (`lsof -i :{}` names it).",
-                    listen.port()
+                // Unlocking also brings the node onto the network, so a `--listen` address
+                // that cannot be bound fails here. It said `Failed(Internal)` — a bug report for
+                // an occupied port (PRD-001 R36) — and then "something else already holds that
+                // UDP port" for every cause, an address this machine does not have included
+                // (V210-134). Now it names the cause and quotes the operating system.
+                Outcome::Failed(fault) if fault.is_bind() => format!(
+                    "cannot listen on {listen}: {}",
+                    crate::tunnel_cli::bind_failure(listen, crate::tunnel_cli::Socket::Udp, fault)
+                        .unwrap_or_default()
                 ),
                 other => format!("could not unlock this profile's identity: {other}"),
             }));
