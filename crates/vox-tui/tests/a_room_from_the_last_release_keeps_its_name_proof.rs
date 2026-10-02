@@ -119,6 +119,13 @@ fn daemon(exe: &Path, name: &str, data: &Path) -> VoxProc {
     );
 }
 
+/// A line the previous release must print for the staging to go on. Whatever v0.2.9 does instead
+/// — exits, or says nothing — is the staging failing, never this build's verdict.
+fn staged(p: &mut VoxProc, what: &str, pred: impl Fn(&str) -> bool) -> String {
+    p.try_expect_within(TIMEOUT, what, pred)
+        .unwrap_or_else(|why| panic!("CANNOT MEASURE: {PREVIOUS}'s staging did not happen: {why}"))
+}
+
 /// The room's 12-character prefix as `vox room list` prints it, for the room named `name`.
 fn listed(list: &str, name: &str) -> Option<String> {
     list.lines()
@@ -174,6 +181,19 @@ fn a_room_made_by_the_last_release_keeps_its_name() {
     });
     drop(old_daemon);
 
+    // v0.2.9's `vox serve` will not mint an address without an anchor; it gets its own.
+    let mut anchor = VoxProc::spawn_exe(
+        &old,
+        &format!("{PREVIOUS}'s anchor"),
+        &tmp.path().join("anchor"),
+        &args(&["node", "--listen", "127.0.0.1:0"]),
+        &[],
+    );
+    let spec = staged(&mut anchor, "its --anchor spec", |l| {
+        l.trim_start().contains("@/ip4/127.0.0.1/udp/")
+    })
+    .trim()
+    .to_owned();
     let mut serve = VoxProc::spawn_exe(
         &old,
         &format!("{PREVIOUS}'s vox serve"),
@@ -185,17 +205,20 @@ fn a_room_made_by_the_last_release_keeps_its_name() {
             "svc",
             "--listen",
             "127.0.0.1:0",
+            "--anchor",
+            &spec,
         ]),
         &[],
     );
     let address = after_label(
-        &serve.expect_staging("its address", |l| l.starts_with("address ")),
+        &staged(&mut serve, "its address", |l| l.starts_with("address ")),
         "address",
     );
     let svc_id = room_of(&address).unwrap_or_else(|| {
         panic!("CANNOT MEASURE: {PREVIOUS}'s `vox serve` printed no room address: {address}")
     });
     drop(serve);
+    drop(anchor);
     eprintln!("[proof] {PREVIOUS} made chat {chat_id} and svc {svc_id}");
 
     // ---- this build, on the same profile ----
