@@ -68,7 +68,8 @@ const PATIENCE: Duration = Duration::from_secs(30);
 
 /// A stand-in Claude Code messaging socket: each connection's bytes, and when they arrived.
 fn claude_socket(path: &std::path::Path) -> mpsc::Receiver<(Instant, String)> {
-    let listener = UnixListener::bind(path).expect("bind the stand-in Claude Code socket");
+    let listener =
+        UnixListener::bind(path).expect("APPARATUS: bind the stand-in Claude Code socket");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -87,7 +88,8 @@ fn claude_socket(path: &std::path::Path) -> mpsc::Receiver<(Instant, String)> {
 /// when OpenCode accepts it, and records when it arrived, the auth line and the prompt line.
 fn opencode_socket(path: &std::path::Path) -> mpsc::Receiver<(Instant, String, String)> {
     use std::io::{BufRead as _, Write as _};
-    let listener = UnixListener::bind(path).expect("bind the stand-in OpenCode plugin socket");
+    let listener =
+        UnixListener::bind(path).expect("APPARATUS: bind the stand-in OpenCode plugin socket");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -130,16 +132,18 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
         })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox agent hook");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn `vox agent hook`");
     if let Some(input) = stdin {
         child
             .stdin
             .take()
-            .unwrap()
+            .expect("APPARATUS: `vox agent hook`'s stdin")
             .write_all(input.as_bytes())
-            .unwrap();
+            .expect("APPARATUS: write the hook input to `vox agent hook`");
     }
-    let out = child.wait_with_output().expect("vox agent hook ran");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: wait for `vox agent hook`");
     eprintln!(
         "[receipt] vox {} -> {:?}; stderr: {}",
         args.join(" "),
@@ -158,7 +162,7 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
 /// The `(harness, endpoint)` bob's daemon will wake `session` by, as the hook registered it.
 fn registered(bob: &Worker, session: &str) -> (String, String) {
     let body = std::fs::read(bob.paths.session_file(session)).unwrap_or_else(|e| {
-        panic!("APPARATUS: `vox agent hook` registered no session {session}: {e}")
+        panic!("PRODUCT (staging): `vox agent hook` registered no session {session}: {e}")
     });
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
         panic!("PRODUCT: the session record `vox agent hook` wrote does not parse: {e}")
@@ -172,7 +176,10 @@ fn registered(bob: &Worker, session: &str) -> (String, String) {
 /// Alice posts `text` exactly as given on her daemon; when the post returned.
 fn post(alice: &Worker, room: &str, text: &str) -> Instant {
     let o = alice.vox_in(None, &["room", "post", room, "-"], Some(text));
-    assert!(o.ok, "APPARATUS: alice could not post: {o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT (staging): alice's `vox room post` failed: {o:?}"
+    );
     Instant::now()
 }
 
@@ -211,11 +218,17 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
     // the stand-in's directory and `/usr/bin:/bin`, nothing from the user's PATH, and an empty
     // CODEX_HOME. The stand-in records every call and runs nothing; a call it does not expect
     // fails loudly. Set before anything else starts, so every child inherits it.
-    let tmp = tempfile::tempdir().unwrap();
+    //
+    // **Nor the operator's home.** HOME and XDG_CONFIG_HOME are empty temp dirs too, so no daemon
+    // or hook this proof starts can read or write anything under the real home (#170's verifier).
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let bin = tmp.path().join("bin");
     let codex_home = tmp.path().join("codex-home");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::create_dir_all(&codex_home).unwrap();
+    let home = tmp.path().join("home");
+    let xdg_config = home.join(".config");
+    for d in [&bin, &codex_home, &xdg_config] {
+        std::fs::create_dir_all(d).expect("APPARATUS: create a temp dir");
+    }
     let ran = tmp.path().join("codex-ran");
     let codex = bin.join("codex");
     {
@@ -235,13 +248,27 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
                 ran = ran.display()
             ),
         )
-        .unwrap();
-        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        .expect("APPARATUS: write the stand-in `codex`");
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))
+            .expect("APPARATUS: make the stand-in `codex` executable");
     }
     let path = format!("{}:/usr/bin:/bin", bin.display());
     // Before any other thread exists: the watchdog and the runtime start below.
     std::env::set_var("PATH", &path);
     std::env::set_var("CODEX_HOME", &codex_home);
+    std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
+    let seen = std::process::Command::new("/bin/sh")
+        .args(["-c", "printf '%s\\n%s' \"$HOME\" \"$XDG_CONFIG_HOME\""])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        seen,
+        format!("{}\n{}", home.display(), xdg_config.display()),
+        "CANNOT MEASURE (APPARATUS): a child of this test must see the temp HOME and \
+         XDG_CONFIG_HOME, never the operator's; it saw {seen:?}. Stopped before anything started."
+    );
     let found = std::process::Command::new("/bin/sh")
         .args(["-c", "command -v codex"])
         .output()
@@ -258,7 +285,7 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .expect("APPARATUS: a tokio runtime");
     let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
     let room = r.id.clone();
@@ -338,8 +365,8 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
         assert_eq!(
             registered(bob, session),
             want,
-            "APPARATUS: {session} must be registered as its harness at the test's own endpoint, \
-             never a real session's"
+            "PRODUCT (staging): `vox agent hook` must register {session} as the harness and at the \
+             endpoint it was given (the test's own, never a real session's)"
         );
     }
 
@@ -428,7 +455,7 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
         let oc_read = oc_turn();
         assert!(
             cc_read.contains(&canary) && oc_read.contains(&canary),
-            "APPARATUS (3) round {n}: the woken sessions' turns must read the message, or the \
+            "PRODUCT (staging) (3) round {n}: the woken sessions' turns (`vox agent hook`) must read the message, or the \
              next round's wake is held back by the outstanding notice; cc read {cc_read:?}, oc \
              read {oc_read:?}"
         );
@@ -474,7 +501,7 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
 
     assert!(
         failures.is_empty(),
-        "{} claim(s) failed:\n- {}",
+        "PRODUCT: {} claim(s) failed:\n- {}",
         failures.len(),
         failures.join("\n- ")
     );
