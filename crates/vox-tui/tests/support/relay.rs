@@ -15,6 +15,9 @@
 //!
 //! Every process is a [`VoxProc`], killed by its own PID and reaped on drop.
 //!
+//! **Every red here names its side** (V210-106), as in `world.rs`. An anchor count is only ever
+//! read from a status line the anchor printed: with none to read, it is `CANNOT MEASURE`, never 0.
+//!
 //! Included with `#[path]`, next to `world.rs`, whose process harness it uses.
 
 #![allow(dead_code)]
@@ -23,7 +26,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::world::{after_label, args, echo_service, vox_once, VoxProc, IDENTITY};
+use crate::world::{
+    address_in, after_label, args, echo_service, fingerprint, mkdir, room_pass_file, tempdir, utf8,
+    vox_once, VoxProc, IDENTITY,
+};
 
 /// Whether host and guest are split by address family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +52,7 @@ pub struct Anchor {
 impl Anchor {
     /// Start an anchor with its data under `dir`.
     pub fn start(dir: &std::path::Path) -> Self {
-        std::fs::create_dir_all(dir.join("cfg")).unwrap();
+        mkdir(&dir.join("cfg"));
         let mut anchor = VoxProc::spawn("anchor", dir, &args(&["node", "--listen", "[::]:0"]));
         let spec = anchor
             .expect_line("an --anchor spec", |l| {
@@ -56,12 +62,14 @@ impl Anchor {
             })
             .trim()
             .to_owned();
-        let (anchor_fp, addr) = spec.split_once('@').expect("fp@addr");
+        let (anchor_fp, addr) = spec
+            .split_once('@')
+            .unwrap_or_else(|| panic!("PRODUCT: the anchor's spec {spec:?} is not fp@address"));
         let port: u16 = addr
             .rsplit('/')
             .next()
             .and_then(|p| p.parse().ok())
-            .unwrap_or_else(|| panic!("no port in the anchor spec {spec:?}"));
+            .unwrap_or_else(|| panic!("PRODUCT: no port in the anchor's spec {spec:?}"));
         Self {
             v4_spec: format!("{anchor_fp}@/ip4/127.0.0.1/udp/{port}"),
             v6_spec: format!("{anchor_fp}@/ip6/::1/udp/{port}"),
@@ -78,11 +86,23 @@ impl Anchor {
             .rsplit('/')
             .next()
             .and_then(|p| p.parse().ok())
-            .expect("the anchor's port");
+            .unwrap_or_else(|| {
+                panic!(
+                    "APPARATUS: no port in this harness's spec {:?}",
+                    self.v4_spec
+                )
+            });
         let listen = format!("[::]:{port}");
-        // The old one first, by its own handle, so the port is free for the new one.
-        let _ = self.proc.child.kill();
-        let _ = self.proc.child.wait();
+        // The old one first, by its own handle, so the port is free for the new one. A kill that
+        // did not take would leave the port held, and the restart would measure nothing.
+        let killed = self.proc.child.kill();
+        match self.proc.child.wait() {
+            Ok(status) => eprintln!("[relay] the old anchor stopped ({status})"),
+            Err(e) => panic!(
+                "APPARATUS: the old anchor (pid {}) could not be stopped: kill {killed:?}, wait {e}",
+                self.proc.child.id()
+            ),
+        }
         let before = self.proc.transcript();
         self.proc = VoxProc::spawn("anchor", dir, &args(&["node", "--listen", &listen]));
         self.proc
@@ -97,33 +117,51 @@ impl Anchor {
     /// How many circuits the anchor says it carries, from the latest report it printed. It prints
     /// on change, so this drains its output (waiting `settle` for a line in flight) and reads the
     /// last one.
+    ///
+    /// An anchor prints its first report at start-up, so **no report at all** — after waiting up
+    /// to [`FIRST_REPORT`] for one — is `CANNOT MEASURE`: the count is unknown, and reading it as 0
+    /// would pass every "the pair is direct" check against an anchor that stopped reporting.
     pub fn circuits(&mut self, settle: Duration) -> usize {
-        let deadline = Instant::now() + settle;
+        let t0 = Instant::now();
+        let deadline = t0 + settle;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            match self
-                .proc
-                .lines
-                .recv_timeout(left.min(Duration::from_millis(200)))
-            {
-                Ok(line) => {
+            if left.is_zero() {
+                while let Ok(line) = self.proc.lines.try_recv() {
                     eprintln!("[anchor] {line}");
                     self.proc.seen.push(line);
                 }
-                Err(_) if left.is_zero() => break,
-                Err(_) => {}
+                if let Some(n) = self.last_report() {
+                    return n;
+                }
+                assert!(
+                    t0.elapsed() < FIRST_REPORT,
+                    "CANNOT MEASURE: the anchor printed no `vox node: … peer(s) connected, … \
+                     circuit(s) carried` report in {:?}, so how many circuits it carries is \
+                     unknown. It said:\n{}",
+                    t0.elapsed(),
+                    self.proc.transcript()
+                );
+            }
+            let wait = if left.is_zero() {
+                Duration::from_millis(200)
+            } else {
+                left.min(Duration::from_millis(200))
+            };
+            if let Ok(line) = self.proc.lines.recv_timeout(wait) {
+                eprintln!("[anchor] {line}");
+                self.proc.seen.push(line);
             }
         }
-        self.proc
-            .seen
-            .iter()
-            .rev()
-            .find_map(|l| {
-                let rest = l.strip_prefix("vox node: ")?;
-                let (_, after) = rest.split_once(" peer(s) connected, ")?;
-                after.split_whitespace().next()?.parse().ok()
-            })
-            .unwrap_or(0)
+    }
+
+    /// The circuit count in the latest status report this anchor printed, if it printed one.
+    fn last_report(&self) -> Option<usize> {
+        self.proc.seen.iter().rev().find_map(|l| {
+            let rest = l.strip_prefix("vox node: ")?;
+            let (_, after) = rest.split_once(" peer(s) connected, ")?;
+            after.split_whitespace().next()?.parse().ok()
+        })
     }
 
     /// Assert the anchor is carrying a circuit **now** — before or after a measurement. `when`
@@ -132,8 +170,8 @@ impl Anchor {
         let n = self.circuits(Duration::from_secs(2));
         assert!(
             n >= 1,
-            "NOT RELAYED {when}: the anchor reports {n} circuit(s) carried — this is not measuring \
-             a relayed path.\nanchor:\n{}",
+            "CANNOT MEASURE: staging not achieved: NOT RELAYED {when}: the anchor reports {n} \
+             circuit(s) carried, so this is not measuring a relayed path.\nanchor:\n{}",
             self.proc.transcript()
         );
     }
@@ -167,11 +205,10 @@ impl Anchor {
                 t0.elapsed()
             );
         }
-        assert_eq!(
-            n,
-            0,
-            "NOT DIRECT {when}: the anchor still reports {n} circuit(s) carried after {within:?}, \
-             past a retired circuit's grace.\nanchor:\n{}",
+        assert!(
+            n == 0,
+            "PRODUCT: NOT DIRECT {when}: a pair with a direct path still rides the anchor — it \
+             reports {n} circuit(s) carried after {within:?}, past a retired circuit's grace.\nanchor:\n{}",
             self.proc.transcript()
         );
     }
@@ -195,6 +232,10 @@ impl Split {
     }
 }
 
+/// How long [`Anchor::circuits`] waits for an anchor's first status report before it calls the
+/// count unknown. The anchor prints one on its first tick after start-up.
+pub const FIRST_REPORT: Duration = Duration::from_secs(10);
+
 pub struct RelayWorld {
     pub split: Split,
     pub tmp: tempfile::TempDir,
@@ -214,9 +255,7 @@ impl RelayWorld {
     /// The room passphrase in a file, for `--passphrase-file`: a room passphrase is never
     /// taken from argv or the environment (V210-72).
     pub fn passphrase_file(&self) -> String {
-        let at = self.tmp.path().join("room-passphrase");
-        std::fs::write(&at, &self.passphrase).unwrap();
-        at.to_str().unwrap().to_owned()
+        room_pass_file(self.tmp.path(), &self.passphrase)
     }
 
     /// The guest's `--listen` and the anchor spec it can use.
@@ -239,28 +278,28 @@ impl RelayWorld {
 
     /// Anchor, and a host serving a loopback echo service with the guest already trusted.
     pub fn new(split: Split) -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let (anchor_dir, host_dir, guest_dir) = (
             tmp.path().join("anchor"),
             tmp.path().join("host"),
             tmp.path().join("guest"),
         );
         for d in [&anchor_dir, &host_dir, &guest_dir] {
-            std::fs::create_dir_all(d.join("cfg")).unwrap();
+            mkdir(&d.join("cfg"));
         }
         let anchor = Anchor::start(&anchor_dir);
         let v4_spec = anchor.v4_spec.clone();
 
-        let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-        assert!(ok, "vox id (guest): {err}");
-        let (ok, host_fp, err) = vox_once(&host_dir, &args(&["id"]));
-        assert!(ok, "vox id (host): {err}");
-        let host_fp = host_fp.trim().to_owned();
+        let guest_fp = fingerprint(&guest_dir, "guest");
+        let host_fp = fingerprint(&host_dir, "host");
         let (ok, out, err) = vox_once(
             &host_dir,
-            &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
+            &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
         );
-        assert!(ok, "trust add: {out}\n{err}");
+        assert!(
+            ok,
+            "PRODUCT (staging): the host's `vox trust add` of the guest failed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
 
         let service = echo_service().to_string();
         let mut host = VoxProc::spawn(
@@ -349,12 +388,7 @@ impl RelayWorld {
         let line = fwd.expect_line("the forward's bound address", |l| {
             l.starts_with("vox: 127.0.0.1:") && l.contains('→')
         });
-        let at = line
-            .split_whitespace()
-            .nth(1)
-            .expect("an address")
-            .parse()
-            .expect("a socket address");
+        let at = address_in(&mut fwd, &line, 1);
         self.fwd = Some(fwd);
         at
     }
@@ -363,31 +397,38 @@ impl RelayWorld {
     /// a punch and reports that neither landed. Without this line nothing here is staging a
     /// relayed path, and the caller must not report anything.
     pub fn expect_still_relayed(&mut self) {
-        self.fwd.as_mut().expect("a forward").expect_within(
-            Duration::from_secs(60),
-            "`still relayed` for the host",
-            |l| l.starts_with("! vox: still relayed to"),
-        );
+        self.fwd
+            .as_mut()
+            .expect("APPARATUS: the proof asked for `still relayed` before it started a forward")
+            .expect_staging_within(
+                Duration::from_secs(60),
+                "`still relayed` for the host",
+                |l| l.starts_with("! vox: still relayed to"),
+            );
     }
 
     /// Crash the host — `SIGKILL` by its PID, reaped, so its QUIC close never leaves — and bring
     /// the same identity and room back as `vox daemon`, still on IPv4. Returns when it crashed and
     /// when the daemon held the room open again.
     pub fn crash_and_restart_host(&mut self) -> (Instant, Instant) {
-        let host = self.host.take().expect("a host");
+        let host = self
+            .host
+            .take()
+            .expect("APPARATUS: the proof crashed a host it had not started");
         let pid = host.child.id();
         drop(host);
         let crashed = Instant::now();
         eprintln!("[test] host pid {pid} killed and reaped");
         let pass_file = self.tmp.path().join("daemon-passphrases");
-        std::fs::write(&pass_file, format!("{IDENTITY}\n{}\n", self.passphrase)).unwrap();
+        std::fs::write(&pass_file, format!("{IDENTITY}\n{}\n", self.passphrase))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
         let mut daemon = VoxProc::spawn(
             "host-daemon",
             &self.host_dir,
             &args(&[
                 "daemon",
                 "--passphrase-file",
-                pass_file.to_str().unwrap(),
+                &utf8(&pass_file),
                 "--anchor",
                 &self.anchor.v4_spec,
                 "--listen",

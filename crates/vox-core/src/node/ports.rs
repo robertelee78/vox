@@ -78,6 +78,8 @@ pub struct Attempt {
     pub abort: Option<tokio::task::AbortHandle>,
     /// Its fence (ADR-025 D1a).
     pub fence: Arc<Fence>,
+    /// Its place among the port's running sessions in `vox status`, removed when it drops.
+    pub running: crate::node::status::Running,
 }
 
 impl Attempt {

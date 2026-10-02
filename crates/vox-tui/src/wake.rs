@@ -159,7 +159,11 @@ pub fn forget(paths: &Paths, session: &Session) -> bool {
 /// does not reset it; and a chain longer than [`DEFAULT_HOPS`] has none left whatever
 /// its members claim. A parent this room does not hold ends the walk.
 #[must_use]
-pub fn hops_left(envelope: &Envelope, rows: &[MessageRow]) -> u32 {
+pub fn hops_left<'a, R>(envelope: &Envelope, rows: &'a R) -> u32
+where
+    R: ?Sized,
+    &'a R: IntoIterator<Item = &'a MessageRow>,
+{
     let mut left = envelope.hops;
     let mut re = envelope.re.clone();
     let mut depth: u32 = 0;
@@ -180,15 +184,23 @@ pub fn hops_left(envelope: &Envelope, rows: &[MessageRow]) -> u32 {
 /// The budget a reply to entry `re` starts with: its parent's less one (see [`hops_left`]),
 /// or the default when the room does not hold that entry.
 #[must_use]
-pub fn reply_hops(re: &str, rows: &[MessageRow]) -> u32 {
+pub fn reply_hops<'a, R>(re: &str, rows: &'a R) -> u32
+where
+    R: ?Sized,
+    &'a R: IntoIterator<Item = &'a MessageRow>,
+{
     let mut reply = Envelope::new(vox_agentcomms::envelope::SAY, "");
     reply.re = Some(re.to_owned());
     hops_left(&reply, rows)
 }
 
-fn find<'a>(rows: &'a [MessageRow], re: &str) -> Option<&'a MessageRow> {
+fn find<'a, R>(rows: &'a R, re: &str) -> Option<&'a MessageRow>
+where
+    R: ?Sized,
+    &'a R: IntoIterator<Item = &'a MessageRow>,
+{
     let hash = vox_core::node::link::b32_decode(re.trim(), "re").ok()?;
-    rows.iter().find(|r| r.entry_hash == hash)
+    rows.into_iter().find(|r| r.entry_hash == hash)
 }
 
 /// Why a wake did not arrive.

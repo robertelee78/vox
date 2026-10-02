@@ -109,6 +109,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 /// **Every red names its kind** (decider rule 1). A verdict on the product says `PRODUCT:` and
 /// quotes what the product said; a staging, precondition or harness failure says `APPARATUS`.
 /// Anything else that panics — an `unwrap` or `expect` on spawning a process, a file, a thread — is
@@ -124,7 +127,10 @@ fn label_reds() {
                 .map(String::as_str)
                 .or_else(|| payload.downcast_ref::<&str>().copied())
                 .unwrap_or("");
-            if !(message.starts_with("PRODUCT") || message.starts_with("APPARATUS")) {
+            if !(message.starts_with("PRODUCT")
+                || message.starts_with("APPARATUS")
+                || message.starts_with("CANNOT MEASURE"))
+            {
                 eprintln!(
                     "APPARATUS (harness error): the panic below is this proof's own, not a \
                      verdict on the product"
@@ -347,6 +353,11 @@ fn stage(
     layout: Layout,
     stranger_env: &[(&'static str, String)],
 ) -> Staged {
+    let mut knobs: Vec<&str> = stranger_env.iter().map(|(k, _)| *k).collect();
+    if layout == Layout::TwoAddresses {
+        knobs.push("VOX_TEST_ADVERTISE");
+    }
+    test_knobs::require(&knobs);
     let anchor_who = Who::new(tmp, "anchor");
     let out = tmp.join("anchor.out");
     let anchor = Proc(

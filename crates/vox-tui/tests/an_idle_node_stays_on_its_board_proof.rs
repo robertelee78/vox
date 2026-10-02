@@ -50,6 +50,9 @@ mod world;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -110,7 +113,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, ttl: &str) -> V
             "--passphrase-file",
             pass_file.to_str().unwrap(),
         ]),
-        &[(vox_core::nat::store::TEST_RECORD_TTL_ENV, ttl)],
+        &[("VOX_TEST_RECORD_TTL_SECS", ttl)],
     );
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
@@ -198,12 +201,14 @@ fn without_endpoint_of(address: &str, who: &str) -> String {
 #[test]
 #[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; CI runs it in release"]
 fn an_idle_node_stays_findable_on_its_board() {
+    test_knobs::require(&["VOX_TEST_RECORD_TTL_SECS"]);
     idle_then_join(false);
 }
 
 #[test]
 #[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; CI runs it in release"]
 fn a_round_to_one_anchor_does_not_put_off_the_others() {
+    test_knobs::require(&["VOX_TEST_RECORD_TTL_SECS"]);
     idle_then_join(true);
 }
 
@@ -222,7 +227,7 @@ fn anchor_on(name: &str, data: &Path, port: u16, ttl: &str) -> (VoxProc, String)
         name,
         data,
         &args(&["node", "--listen", &format!("127.0.0.1:{port}")]),
-        &[(vox_core::nat::store::TEST_RECORD_TTL_ENV, ttl)],
+        &[("VOX_TEST_RECORD_TTL_SECS", ttl)],
     );
     let spec = p
         .expect_line("an --anchor spec", |l| {

@@ -28,6 +28,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
 
@@ -141,6 +144,7 @@ fn seconds_after(said: &str, what: &str) -> Option<f64> {
 #[test]
 #[ignore = "a real vox daemon and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
+    test_knobs::require(&["VOX_TEST_STOPPED_DELAY_MS"]);
     // One join, through the TUI; 6 unlocks: two `vox id`s, alice's daemon, the room, and the
     // TUI's unlock and unlock again.
     watchdog::arm_for_setup(1, 6);

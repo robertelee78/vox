@@ -49,6 +49,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/world.rs"]
 mod world;
 
@@ -118,6 +121,7 @@ fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn a_fresh_process_is_taken_by_its_board() {
+    test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
     watchdog::arm();
     // A fixed skew, in place of SKEW_MS beyond B's start, for a manual experiment.
     let fixed_skew: Option<i64> = std::env::var("VOX_PROOF_230_SKEW_MS")

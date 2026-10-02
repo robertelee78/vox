@@ -1,12 +1,13 @@
 # ADR-021: Work-item interop — the contract Vox exposes to an external work tracker
 
-**Status**: **implemented on `feat/adr021-work-interop` (PR #14), not yet merged to `main`** —
-2026-09-24, M21.1–M21.8, each proved through the shipped `vox` binary and mutation-checked; the plan below
-names the proof, its mutations and the commit for each. **M21.9 and M21.10 are decided (2026-09-24) and
-not built.** Vox holds no work state: an external tracker owns it. Open defects found while building this
-sit outside its boundary and are recorded rather than accepted — F12 in `vox-core` key distribution (half
-fixed in PR #20), F15 in the daemon's interrupt path (fix in PR #16) and F17, OpenCode delivery (fixed
-2026-10-01 for v0.2.10); F14 is retired. Statements about the tree before this change describe `main` at `96c47ed`
+**Status**: **implemented, on `main` since v0.2.9** (PR #14) — M21.1–M21.8 built 2026-09-24 and M21.9–M21.10
+2026-09-25, each proved through the shipped `vox` binary and mutation-checked; the plan below names the
+proof, its mutations and the commit for each. **2026-10-01:** mutation found proof gaps in M21.1, M21.2,
+M21.6 and M21.8 (the product passed); they are being closed for v0.2.10. Vox holds no work state: an
+external tracker owns it. Defects found while building this sit outside its boundary and are recorded
+rather than accepted — F12 in `vox-core` key distribution (fixed, on `main` since v0.2.9), F15 in the
+daemon's interrupt path (fixed, PR #16), F17, OpenCode delivery (fixed 2026-10-01 for v0.2.10), and F18–F20
+(open, v0.2.10); F14 is retired. Statements about the tree before this change describe `main` at `96c47ed`
 (v0.2.7).
 **Date**: 2026-09-23
 **Updated**: 2026-09-24 — implemented; see the revision history below.
@@ -727,20 +728,31 @@ that proves it.**
     `claim` by Carol succeeds.
   - **expiry**: the sender's claim had **no TTL**. The handoff's deadline still lapses, and the item is
     `Free`. A recipient's `claim` after the deadline is an ordinary claim on a free item.
+  - **order**: the two nodes log the same two claims of one item in **opposite local orders** (each
+    claims while the other's daemon is stopped, the anchor stopped with Alice's), and both boards
+    show the earlier claim holding. Precondition, else CANNOT MEASURE: `room read --json` shows the
+    two claims in different orders on the two nodes.
 
   *Mutations*:
   - restore `resolve(.., |_| None)` — "handoff did not move ownership";
   - resolve by the local petname instead of `to_fp` — the two nodes' boards must disagree;
   - inherit the holding's expiry — the no-TTL case never lapses;
-  - make a pending item return to the sender on decline.
+  - make a pending item return to the sender on decline;
+  - fold in local order instead of `(created_millis, entry_hash)` — the two boards must disagree.
 
   > **DONE 2026-09-24** (`ca267d5`). `work_handoff_proof` passes. **One change from the plan:** it runs
   > on **two nodes with five sessions**, not three nodes, because of open defect F12 (two joiners cannot
   > read each other); the reason is written at the top of the proof. The nodes name each other by
   > petnames the other never uses, and their folded boards are compared field by field. Five mutations
   > caught: the handoff inert (F1), `to_session` ignored, a no-TTL holding's expiry inherited, a decline
-  > returning to the sender, and the owner compared by author only (F3). Also `agentcomms_gate` (17
-  > tests) folds every permutation — 120 orders of a contested claim plus handoff — to one state.
+  > returning to the sender, and the owner compared by author only (F3).
+  >
+  > **2026-10-01:** the order claim had no proof. `agentcomms_gate`, cited here for "folds every
+  > permutation", was deleted with the non-product tests (V29-17), and every step of
+  > `work_handoff_proof` waits for the other node, so both nodes logged every row in the same order
+  > and a fold in local order stayed green. Case (6), **order**, now stages opposite local orders
+  > through the shipped binary; the local-order fold mutant goes red on it as PRODUCT ("alice and bob
+  > fold different boards for h-order").
 
 - **M21.3 — renewal bound to one acquisition.**
 
@@ -839,6 +851,13 @@ that proves it.**
   - `blocked` may change Health but never Work phase;
   - a `failed` attempt leaves the item retryable;
   - **the operator runs no command.**
+
+  The second and third assertions (`release` is never Done; `result` reaches Acceptance at most) are
+  **the stub tracker's own rules, not product proofs**: Vox has no Work phase, so only the stub's own
+  code can move an item past Acceptance, and no change to Vox can turn them red or green (verifier-261c6
+  found no mutant for them, 2026-10-01). They test the stand-in tracker only. What Vox contributes to
+  them — the typed `result` row with its attempt and evidence, and the board after a `release` — is
+  proved by the other assertions. The proof names a red on them APPARATUS.
 
   *Mutation*: `--pure` models, which must turn it red.
 

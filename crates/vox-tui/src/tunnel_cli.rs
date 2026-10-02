@@ -13,9 +13,6 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use vox_core::hash::Digest32;
-use vox_core::nat::bootstrap::BootstrapSet;
-use vox_core::nat::multiaddr::Multiaddr;
-use vox_core::nat::reachability::is_routable;
 use vox_core::node::actor::{Bind, EventStreamItem, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome, Secret};
 use vox_core::node::link::{b32_decode, b32_encode, vox_hostname};
@@ -525,24 +522,6 @@ pub async fn forward(
     Ok(())
 }
 
-/// Whether this node could be reached by someone who was handed its address — a
-/// routable advertised endpoint, or an anchor that will relay for it.
-///
-/// `vox serve` refuses to start when neither holds (ADR-017 decision 4): minting an
-/// address nobody can use is worse than saying so, because the host would hand it out
-/// and only learn later.
-fn reachable_or_relayed(node: &NodeHandle, anchors: &BootstrapSet) -> bool {
-    if !anchors.nodes().is_empty() {
-        return true;
-    }
-    node.view().listening.iter().any(|text| {
-        Multiaddr::parse(text)
-            .ok()
-            .and_then(|m| m.socket_addr())
-            .is_some_and(|sa: SocketAddr| is_routable(&sa.ip()))
-    })
-}
-
 /// `vox serve <port>` — create a service room, offer the port in it, and serve until
 /// interrupted (ADR-017 decisions 3 and 4).
 ///
@@ -550,20 +529,14 @@ fn reachable_or_relayed(node: &NodeHandle, anchors: &BootstrapSet) -> bool {
 /// address is a rendezvous, and the passphrase is what turns it into access (ADR-005).
 pub async fn serve(
     node: &NodeHandle,
-    anchors: &BootstrapSet,
     name: &str,
     port: u16,
     at: Option<SocketAddr>,
 ) -> Result<(), AppError> {
-    if !reachable_or_relayed(node, anchors) {
-        return Err(AppError::Usage(
-            "this machine has no address a guest could reach and no anchor to relay \
-             through.\n       Run `vox node` somewhere reachable and pass its \
-             `<fingerprint>@<multiaddr>` here as --anchor,\n       or open a port on \
-             your router. Refusing to mint an address nobody can use."
-                .into(),
-        ));
-    }
+    // **No anchor, no refusal** (V210-96, C1): a host on a LAN or on this machine is found
+    // directly by a guest there, and an anchor bridges only hosts that cannot otherwise find each
+    // other. Whether the address would lead anywhere is the node's to say when it mints it:
+    // `NodeEvent::AddressNote`, or `NodeEvent::AddressWithheld` when it would name no route at all.
     let passphrase = vox_core::node::passphrase::generate(PASSPHRASE_GROUPS)?;
     let before: Vec<Digest32> = node.view().channels.iter().map(|c| c.channel_id).collect();
     let out = node
@@ -585,9 +558,22 @@ pub async fn serve(
         .find(|id| !before.contains(id))
         .ok_or_else(|| AppError::Usage("the room was not created".into()))?;
 
+    // Answered once the room is on a board the address names (V210-96): printed before, a guest
+    // who joined at once was told the board had nothing for the room.
     let out = node.apply(NodeCommand::Invite { channel_id }).await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot mint an address: {out}")));
+        // With why, which the node says anchor by anchor, in place of the fault's general advice
+        // (which speaks of an anchor even when none was named).
+        let mut why = out.to_string();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), node.next_event()).await
+        {
+            if let NodeEvent::AddressWithheld { reason, .. } = ev {
+                why = format!("the address was not handed out: {reason}");
+                break;
+            }
+        }
+        return Err(AppError::Usage(format!("cannot mint an address: {why}")));
     }
     let url = loop {
         match node.next_event().await {
@@ -847,6 +833,12 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         NodeEvent::JoinFailed { reason } => {
             eprintln!("vox: a join did not complete — {reason}");
         }
+        NodeEvent::AddressWithheld { reason, .. } => {
+            eprintln!("vox: the address was not handed out — {reason}");
+        }
+        NodeEvent::AddressNote { note, .. } => {
+            eprintln!("vox: {note}");
+        }
         NodeEvent::RoomNotRemembered { channel_id, why } => {
             eprintln!(
                 "vox: room {} is open, but will not reopen by itself after a restart — {why}",
@@ -979,13 +971,52 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
 /// advice — "no member it knows could be reached … ask a member to come online" — sent a person to
 /// bring online a member that had been online and reached, and then stopped answering. A join that
 /// got as far as the exchange says so in its steps (`<member>: exchange …`).
+///
+/// **A board that failed is named for what it was** (V210-107). `BoardUnreachable`'s one sentence
+/// said "the anchor could not be reached" when the board that failed was the room's host, and its
+/// replacement named "the room's host nor any anchor" whatever was tried. The node names each board
+/// it tried as the room's host or an anchor (`Joiner::boards_tried`), so the advice follows it: a
+/// host that did not answer is the host, an anchor is named only when one was tried, and a board
+/// that answered and then closed is not called unreachable.
 pub(crate) fn join_advice_after(fault: Option<Fault>, said: &str) -> &'static str {
     let reached = said.contains(": exchange: ") || said.contains(": exchange (incl. solve) ");
     match fault {
         Some(Fault::Unreachable) if reached => {
             "a member was reached, but did not answer the join exchange in time\n       your passphrase was never checked — this is not a verdict on it\n       the member may have gone offline part-way, or be too busy to answer; try again while it is online"
         }
+        Some(Fault::BoardUnreachable) => board_unreachable_advice(said),
         other => join_advice(other),
+    }
+}
+
+/// `BoardUnreachable`'s advice, naming the board that failed from what the node said about it.
+/// With nothing said (the reason was lost), [`join_advice`]'s, which names neither.
+fn board_unreachable_advice(said: &str) -> &'static str {
+    let host = said.contains("the room's host ");
+    let anchor = said.contains("anchor ");
+    if said.contains("then its connection closed before the room was fetched") {
+        return if host {
+            "the room's host answered, then its connection closed before the room was read, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       run the join again; if it repeats, the host is going offline or losing its connection"
+        } else {
+            "the anchor answered, then its connection closed before the room was read, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       run the join again; if it repeats, the anchor is going offline or losing its connection"
+        };
+    }
+    if said.contains("names only this node") {
+        return "the address names only this node itself, so there was no board to ask\n       check it is the address you were sent, not one this node made";
+    }
+    if !said.contains("no answer from ") {
+        return join_advice(Some(Fault::BoardUnreachable));
+    }
+    match (host, anchor) {
+        (true, false) => {
+            "the room's host did not answer, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the host is running and that this machine can reach its address"
+        }
+        (false, true) => {
+            "no anchor tried for the room answered, and the address does not name the room's host, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the anchor is running (`vox node`) and that this machine can reach it, or ask the host for an address that names the host itself"
+        }
+        _ => {
+            "neither the room's host nor any anchor tried for it answered, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the host is running and that this machine can reach its address; an anchor matters only when the host cannot be reached directly"
+        }
     }
 }
 
@@ -1022,11 +1053,18 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         // **And say which side was unreachable (#192).** One sentence covered both, and it said
         // "every member the board knows is offline" when the board itself had never answered: a
         // claim about members, made with no word from the board about any of them.
+        //
+        // **And do not blame an anchor (V210-107).** The boards a join tries are the link's
+        // entries — the room's host itself among them — and any anchors; a link from a host with
+        // no anchor names only the host. This said "the anchor could not be reached" and sent the
+        // person to check `vox node`, which they may never have needed. When the node said which
+        // boards it tried, [`join_advice_after`] names the one that failed; this is for a join
+        // whose reason was lost, so it names neither.
         Some(Fault::BoardUnreachable) => {
-            "the anchor could not be reached, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the anchor is running (`vox node`) and that this node can reach its address"
+            "no board the join tried could be read — the room's host, or an anchor if one was tried — so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the host is running and that this machine can reach its address"
         }
         Some(Fault::Unreachable) => {
-            "the anchor answered, but no member it knows could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online, or check `vox node` on the anchor shows more than `1m` for this room"
+            "the room's board answered, but no member it names could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online"
         }
         Some(Fault::SolveTooSlow) => Fault::SolveTooSlow.explain(),
         Some(Fault::MembersBusy) => Fault::MembersBusy.explain(),
@@ -1105,7 +1143,7 @@ pub struct RoomTarget {
     pub paths: Paths,
     /// Where the node binds while the verb runs.
     pub listen: SocketAddr,
-    /// The anchors to reach the swarm through.
+    /// The anchors, if any, that bridge this node to peers it cannot reach directly.
     pub anchors: vox_core::nat::bootstrap::BootstrapSet,
     /// The identity passphrase.
     pub identity_passphrase: String,

@@ -418,29 +418,41 @@ const SOLVE_BUDGET_PER_EXPECTED_SOLVE: std::time::Duration = std::time::Duration
 /// Test-only: make this joiner's grind last at least this many milliseconds, as it does on a
 /// slower device. **For proofs; nothing in a real deployment sets it.** A proof cannot otherwise
 /// stage a joiner slower than the responder's patience with the release build, whose solve takes a
-/// second or two. Unset, empty or unparsable is no floor.
+/// second or two. Unset, empty or unparsable is no floor. Not compiled in without the `test-knobs`
+/// feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_SOLVE_AT_LEAST_ENV: &str = "VOX_TEST_SOLVE_AT_LEAST_MS";
 
 /// Test-only: once this joiner has sent its solution, wait this many milliseconds before reading
 /// the member's answer — a join that has done its work and then goes quiet, which the member's
 /// [`ADMISSION_PATIENCE`] exists for (V210-92). It says so on stderr when it starts waiting, so a
 /// proof can tell the work was done. **For proofs; nothing in a real deployment sets it.** Unset,
-/// empty or unparsable is no wait.
+/// empty or unparsable is no wait. Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_STALL_AFTER_SOLVE_ENV: &str = "VOX_TEST_STALL_AFTER_SOLVE_MS";
 
 /// Test-only: once this joiner's proof of work is in, wait this many milliseconds before **each**
 /// frame it still owes the member (its proof, then its init) — a join that has done its work and
 /// then sends every remaining frame just inside the per-frame bound, which only the member's
 /// [`ADMISSION_PATIENCE`] limits as a whole (V210-92). It says so on stderr when it starts. **For
-/// proofs; nothing in a real deployment sets it.** Unset, empty or unparsable is no wait.
+/// proofs; nothing in a real deployment sets it.** Unset, empty or unparsable is no wait. Not
+/// compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_DRIP_AFTER_SOLVE_ENV: &str = "VOX_TEST_DRIP_AFTER_SOLVE_MS";
 
-/// The test-only wait of [`TEST_DRIP_AFTER_SOLVE_ENV`], before one frame the joiner owes.
+/// The test-only wait of `TEST_DRIP_AFTER_SOLVE_ENV`, before one frame the joiner owes.
+#[cfg(feature = "test-knobs")]
 fn test_drip() -> Option<std::time::Duration> {
     std::env::var(TEST_DRIP_AFTER_SOLVE_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(std::time::Duration::from_millis)
+}
+
+/// Without the `test-knobs` feature there is no wait, and nothing reads the environment.
+#[cfg(not(feature = "test-knobs"))]
+const fn test_drip() -> Option<std::time::Duration> {
+    None
 }
 
 /// Tells a joiner's grind to give up when the join that started it is dropped — finished, failed,
@@ -595,6 +607,7 @@ pub async fn run_initiator(
     //    (On a current-thread runtime there is no other thread: it grinds inline, as before.)
     join_check_challenge(&ctx, &challenge, &responder_pub, &challenge_sig)?;
     let grinding = std::time::Instant::now();
+    #[cfg(feature = "test-knobs")]
     let floor = std::env::var(TEST_SOLVE_AT_LEAST_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -610,6 +623,7 @@ pub async fn run_initiator(
         move || {
             let token = solve_token_until(params, &challenge, 1 << 24, &stop)?;
             // The test-only floor on a joiner's grind (V210-87), stopped like the grind.
+            #[cfg(feature = "test-knobs")]
             while grinding.elapsed() < floor && !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(50).min(floor));
             }
@@ -661,6 +675,7 @@ pub async fn run_initiator(
             _ => e,
         });
     }
+    #[cfg(feature = "test-knobs")]
     if let Some(stall) = std::env::var(TEST_STALL_AFTER_SOLVE_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -668,6 +683,7 @@ pub async fn run_initiator(
         eprintln!("vox: test: solved, now silent for {stall}ms ({TEST_STALL_AFTER_SOLVE_ENV})");
         tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
     }
+    #[cfg(feature = "test-knobs")]
     if let Some(drip) = test_drip() {
         eprintln!(
             "vox: test: solved, now {drip:?} before each frame ({TEST_DRIP_AFTER_SOLVE_ENV})"

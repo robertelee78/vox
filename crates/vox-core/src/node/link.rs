@@ -6,8 +6,11 @@
 //! ```
 //!
 //! It carries **only** what is needed to find the swarm: the channelID, one or more
-//! anchor nodes — each its identity fingerprint followed by the multiaddrs it is
-//! reached at — and optionally a pin of the responder's identity fingerprint.
+//! places to reach the room — the inviting host itself and any anchors it uses, each
+//! its identity fingerprint followed by the multiaddrs it is reached at (the `a=` key
+//! names each, host or anchor) — and optionally a pin of the responder's identity
+//! fingerprint. An anchor is needed only to bridge hosts that cannot otherwise reach
+//! each other (ADR-012); a link from a host with none names only the host.
 //!
 //! ## Anchors are named, not just addressed
 //! ADR-011 pins the expected identity on every dial; there is no "connect to whoever
@@ -259,10 +262,17 @@ fn resolve_host(host: &str, port: &str, want6: Option<bool>) -> Result<Vec<Multi
 /// failures are hard to attribute. Failing the whole file was worse the other way: one host that
 /// did not resolve took every anchor with it, and the error named neither the line nor the reason.
 ///
+/// **A file that cannot be read is skipped and named the same way** (V210-107): not UTF-8, not
+/// readable, or a directory. It was an [`Error::Path`] that said "profile path read: anchors
+/// file" — neither which file nor why — and every verb, `vox id` included, refused on it: the
+/// anchors-file refusal V210-107 removed for unusable lines, back by another door. An anchor only
+/// bridges hosts that cannot otherwise reach each other (ADR-012), so a file nobody can read
+/// costs at most that bridge, and the verb carries on to whoever it can reach directly.
+///
 /// A host is resolved here, which blocks: an async caller runs this on a blocking thread.
 ///
 /// # Errors
-/// [`Error::Path`] if the file exists and cannot be read.
+/// None today; the `Result` is kept for the callers' `?`.
 pub fn merge_anchors_file(
     set: &mut crate::nat::bootstrap::BootstrapSet,
     path: &std::path::Path,
@@ -270,11 +280,13 @@ pub fn merge_anchors_file(
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => {
-            return Err(Error::Path {
-                op: "read",
-                detail: "anchors file".to_owned(),
-            })
+        Err(e) => {
+            let why = if e.kind() == std::io::ErrorKind::InvalidData {
+                "it is not text (UTF-8)".to_owned()
+            } else {
+                format!("it cannot be read: {e}")
+            };
+            return Ok(vec![format!("{} is skipped whole: {why}", path.display())]);
         }
     };
     let mut skipped = Vec::new();
@@ -334,8 +346,9 @@ pub struct InviteLink {
     /// The channelID (ADR-005: `SHA-256(genesis)`), which the joiner checks the
     /// fetched genesis against.
     pub channel_id: Digest32,
-    /// The anchors to bootstrap from (at least one), in preference order, each with
-    /// the identity the joiner pins when it dials.
+    /// Where to reach the room (at least one entry): the inviting host itself and any
+    /// anchors it uses, in preference order, each with the identity the joiner pins when
+    /// it dials. The field keeps its wire name, `a=`.
     pub anchors: Vec<BootstrapNode>,
     /// An optional pin of the responder's identity fingerprint. When present the
     /// joiner joins through that member specifically; otherwise through any member
@@ -344,16 +357,18 @@ pub struct InviteLink {
 }
 
 impl InviteLink {
-    /// Build a link. At least one anchor is required — a link with none names no
-    /// way to reach the swarm — and at most [`MAX_LINK_ANCHORS`]; a duplicate anchor
-    /// identity is refused.
+    /// Build a link. At least one entry is required — a link with none names nowhere
+    /// to reach the room — and at most [`MAX_LINK_ANCHORS`]; a duplicate identity is
+    /// refused.
     pub fn new(
         channel_id: Digest32,
         anchors: Vec<BootstrapNode>,
         responder: Option<Digest32>,
     ) -> Result<Self> {
         if anchors.is_empty() {
-            return Err(Error::MalformedLink("invite link has no anchors"));
+            return Err(Error::MalformedLink(
+                "invite link names nowhere to reach the room",
+            ));
         }
         if anchors.len() > MAX_LINK_ANCHORS {
             return Err(Error::MalformedLink("invite link anchor count"));
@@ -465,7 +480,9 @@ impl InviteLink {
         }
         close(current.take(), &mut anchors)?;
         if anchors.is_empty() {
-            return Err(Error::MalformedLink("invite link has no anchors"));
+            return Err(Error::MalformedLink(
+                "invite link names nowhere to reach the room",
+            ));
         }
         Ok(Self {
             channel_id,
