@@ -225,17 +225,17 @@ These are known and not fixed. Each stays until it is fixed, with the fixing com
 
 | # | Defect or limit | Where | Tracked |
 |---|---|---|---|
-| D1 | An anchor tracks epoch 0 only, so an epoch change is not carried on its board. | `node/anchor.rs:123`, `:154` | to be filed |
-| D2 | The member→anchor session failed every time in the deleted `node_m19_untrust_lock_gate` (`sync failed: transport`). No proof isolates it now, and its state is unknown. | old gate, deleted (V29-17) | to be filed |
-| D3 | A member that restarts under the same identity while its old session still waits is refused as the same pair until that session ends. 582f18a0 closes the dead held connection when the newcomer is filed; no proof isolates the waiting case. | `node/net.rs` | to be filed |
-| D4 | ADR-008's golden-vector obligation is unmet, including for `0x0012`: no golden-vector test exists. | ADR-008 | to be filed |
+| D1 | An anchor tracks epoch 0 only, so an epoch change is not carried on its board. | `node/anchor.rs:123`, `:154` | #356 |
+| D2 | The member→anchor session failed every time in the deleted `node_m19_untrust_lock_gate` (`sync failed: transport`). No proof isolates it now, and its state is unknown. | old gate, deleted (V29-17) | #358 |
+| D3 | A member that restarts under the same identity while its old session still waits is refused as the same pair until that session ends. 582f18a0 closes the dead held connection when the newcomer is filed; no proof isolates the waiting case. | `node/net.rs` | #358 |
+| D4 | ADR-008's golden-vector obligation is unmet, including for `0x0012`: no golden-vector test exists. | ADR-008 | open, awaiting the decider (V030-29 question 19) |
 | L1 | A first `ssh` into a fresh room can wait up to `HOST_PATIENCE` (300 s). | `node/up.rs:214` | limit, by design |
 
 Fixed since the old text, with evidence:
-- A cross-process join through an anchor failing about half the time: `cross_process_join_proof` is in the blocking gate (V210-19, #192).
+- A cross-process join through an anchor failing about half the time: `cross_process_join_proof` is back in the blocking gate (fb2f3618, V210-19, #192).
 - Opening a stream had no deadline: `OPEN_STREAM_PATIENCE` (2afa020b).
-- A failed join did not name the rung that refused: it prints its steps and what each responder said (#192).
-- Sessions this node starts were not checked: NR-41 (V29-04).
+- A failed join did not name the rung that refused: it prints its steps and what each responder said (79ece6f4, #192).
+- Sessions this node starts were not checked: NR-41 (ce4a55f2, V29-04).
 
 ## Consequences
 

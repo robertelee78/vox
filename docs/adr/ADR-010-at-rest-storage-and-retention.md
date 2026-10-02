@@ -24,7 +24,7 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 - **AR-5.** A generated identity MUST be held in an identity vault (`vault.cbor`), wrapped under an identity factor: Argon2id over the identity passphrase. An imported identity (gpg-agent, smartcard) MAY delegate signing to its agent; the private key then never leaves it.
 - **AR-5a.** For a key that cannot sign deterministically (some ML-DSA or smartcard configurations), the identity factor MUST instead unwrap a hardware-stored random secret released only to that identity, never touching raw private-key bytes. That variant is also the fully post-quantum identity factor (AR-9).
 - **AR-5b.** Where a platform gates unlock with biometrics, the biometric MAY replace only the identity factor's unlock. It MUST NOT replace the room-passphrase factor.
-- **AR-5c. Planned.** The gpg-agent and smartcard signers (AR-5), the hardware-stored secret (AR-5a) and biometric unlock (AR-5b) exist as trait seams only.
+- **AR-5c. Planned.** The gpg-agent and smartcard signers (AR-5), the hardware-stored secret (AR-5a) and biometric unlock (AR-5b) exist as trait seams only: a design limit, put to the decider (V030-29).
 
 ### Double-lock key derivation
 
@@ -116,10 +116,10 @@ These are known and not fixed. Each stays until it is fixed, with the fixing com
 
 | # | Defect or limit | Where | Tracked |
 |---|---|---|---|
-| D1 | Segment seals use random 96-bit GCM nonces with no nonce-count accounting, so the 2^32 random-nonce bound is not enforced. | `atrest/store.rs:145` | to be filed |
-| D2 | A room's SEK never rotates: it is generated only at create and at join. | `node/channel.rs:1195`, `:1865` | to be filed |
-| D3 | A peer is served the skeleton of a pruned entry, because the DAG holds only the skeleton. No proof isolates it. | `log/sync.rs` | to be filed |
-| L1 | Only the SEK is `mlock`ed. Derived factors, the KEK, the vault key and opened plaintext are zeroizing but not pinned (AR-16). | `atrest/sek.rs` | limit |
+| D1 | Segment seals use random 96-bit GCM nonces with no nonce-count accounting, so the 2^32 random-nonce bound is not enforced. | `atrest/store.rs:145` | #355 |
+| D2 | A room's SEK never rotates: it is generated only at create and at join. | `node/channel.rs:1195`, `:1865` | #355 |
+| D3 | A peer is served the skeleton of a pruned entry, because the DAG holds only the skeleton. No proof isolates it. | `log/sync.rs` | #357 (v0.3.0) |
+| L1 | Only the SEK is `mlock`ed. Derived factors, the KEK, the vault key and opened plaintext are zeroizing but not pinned (AR-16). | `atrest/sek.rs` | design limit; decider question (V030-29) |
 
 ## Consequences
 
