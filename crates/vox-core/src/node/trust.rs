@@ -104,7 +104,7 @@ pub const MAX_TRUSTED: usize = 1024;
 pub const TEST_KEYRING_CAP_ENV: &str = "VOX_TEST_KEYRING_CAP";
 
 /// How many identities [`Keyring::trust_with`] takes: [`MAX_TRUSTED`], or the test-only
-/// [`TEST_KEYRING_CAP_ENV`] when it names fewer.
+/// `VOX_TEST_KEYRING_CAP` when it names fewer.
 #[must_use]
 pub fn trust_cap() -> usize {
     #[cfg(feature = "test-knobs")]
@@ -124,7 +124,7 @@ pub fn trust_cap_words() -> String {
     let digits = trust_cap().to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
