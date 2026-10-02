@@ -650,7 +650,8 @@ fn circuits_asked(who: &Who) -> u64 {
 /// **In [`Layout::Relayed`] a join that got in and does not say `relayed` is the product's red**
 /// (V210-124 c3): alice is IPv6-only and carol IPv4-only, so no direct join between them exists,
 /// and a line that says `direct`, or names no path, misreports the join. A join that did not get
-/// in is left to the caller's `PRODUCT:` assert.
+/// in is left to the caller's `PRODUCT:` assert, in either layout (c4: a refused carol prints no
+/// `join got in` line, and case 3 reported that as CANNOT MEASURE).
 fn paths(s: &Staged, case: &str, got_in: bool) -> Result<(), String> {
     std::thread::sleep(Duration::from_secs(2));
     // Carol's daemon says how each join it ran went, `vox: join got in — …`, with its path.
@@ -672,9 +673,10 @@ fn paths(s: &Staged, case: &str, got_in: bool) -> Result<(), String> {
     let direct = carol_said.contains(": direct") && !carol_said.contains(": relayed");
     let relayed = carol_said.contains(": relayed");
     match s.layout {
+        Layout::TwoAddresses if !got_in => Ok(()),
         Layout::TwoAddresses if !direct => Err(format!(
-            "APPARATUS, CANNOT MEASURE: {case}: carol's join did not say it went direct, so it was \
-             not her address that was measured: {carol_said:?}"
+            "APPARATUS, CANNOT MEASURE: {case}: carol's join got in but did not say it went \
+             direct, so it was not her address that was measured: {carol_said:?}"
         )),
         Layout::Relayed if !got_in => Ok(()),
         Layout::Relayed if !relayed => Err(format!(
