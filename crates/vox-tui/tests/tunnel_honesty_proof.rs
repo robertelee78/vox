@@ -45,8 +45,18 @@
 //!   echo; then the second's own longer prefix closes only the second's.
 //! - **A quiet session is not dropped** (RP-09). quinn's defaults are a 30 s idle timeout and
 //!   no keep-alive, so on defaults an `ssh` session through a forward dies while its person
-//!   reads. Two things keep it up today, either one enough on its own: the transport's
-//!   keep-alive and the members' periodic sync over the same connection.
+//!   reads. Three things keep the guest's connection to the host up, and any one of them is
+//!   enough on its own:
+//!   - the transport's keep-alive (`KEEP_ALIVE`, 20 s);
+//!   - the members' periodic sync over the same connection (`SYNC_INTERVAL_SECS`, 30 s);
+//!   - V210-93's liveness probe of a quiet anchor connection (`close_if_unanswering`): the
+//!     invite names the host itself as one of the places to reach the room, so the guest keeps
+//!     it as an anchor and probes it once it falls quiet.
+//!
+//!   So this proves what a person sees: a quiet forwarded session survives with the product as
+//!   it is. It goes red only when all three are gone, so it guards against losing every one of
+//!   them, not against losing any single one; removing the keep-alive alone, or using quinn's
+//!   defaults, stays green while the other two hold.
 //!
 //! ## Why it is `#[ignore]`d
 //!
