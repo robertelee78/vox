@@ -87,8 +87,12 @@ friction for this audience can be fixed later.
 
 ### 3.5 Tunnels and naming
 
-- **R20.** `ssh nas.family.vox` **must** work, where `nas` is my keyring name for the node and `family` is
-  my local nickname for the room. The same node reached through two rooms has two names.
+- **R20.** (Restated by the decider, 2026-10-02; delivered as V030-25, #339.) A node shares a service with a
+  room under a name it chooses, and a member reaches it as `ssh <service>.<node>.<room>.vox`, e.g.
+  `ssh nas-ssh.rob.home.vox`, where `rob` is my keyring alias for that node and `home` is my alias for the
+  room (a fingerprint works in place of either alias). Only the full `service.node.room.vox` form connects:
+  `room.vox` and `node.room.vox` resolve to nothing. Addresses Vox shows me use my aliases where I set
+  them. A node is a person or an agent, never a computer.
 - **R21.** `.vox` lookups leaking to system DNS is **accepted**.
 - **R22.** Untrusting a node **and** removing a service **must** both cut live sessions immediately.
 - **R23.** A refused connection through `vox up` or `vox forward` **must** fail immediately for the app. The
