@@ -10,7 +10,8 @@
 //! **Staging**, every node the shipped `vox`, built with the `test-knobs` feature: an anchor; the
 //! host's `vox daemon` with `VOX_TEST_MAX_AUTHORS` = [`CAP`], so the room is full at [`CAP`]
 //! members, not 1,024; the host creates the room, and [`CAP`] − 1 members join it through their own
-//! daemons, which are then stopped, so the host is the only member left to answer a join (a member
+//! daemons, which are then stopped (SIGINT, as a person stops one), so the host is the only member
+//! left to answer a join (a member
 //! that had not yet learned every other would count fewer). The room is now full.
 //!
 //! **Asserted:** one more person's `vox room join`, asked once,
@@ -36,25 +37,37 @@
 //! **Every red says which it is:** `PRODUCT:` quotes what `vox` said or did; `CANNOT MEASURE:`
 //! names staging that was not achieved (a `vox` without the knob, a room not full when asked).
 //!
-//! **Joins that race converge** ([`joins_answered_at_once_by_two_members_converge`], V210-128):
-//! each member checks the cap against its own view, so two newcomers answered at the same moment
-//! by two different members can each take the room's last place. Before, each member then
-//! refused the newcomer the other had admitted, as over the cap: the room split, each newcomer a
-//! member on one side only, told it had joined. Now a member admits what another admitted, up to
-//! the cap plus the join slots (`AUTHORS_CEILING`): the cap is soft by at most that. Staged with
-//! the cap at [`CAP`]: the host and one member, both up, and the room one place short; two
-//! newcomers join at once, one from each member's invite (an invite names its member as the
-//! first to answer), each held by `VOX_TEST_ADMISSION_GATE` (test-knobs only) at its admission
-//! until both members are about to admit, then let go together. Asserted: every newcomer told it joined is on **both** members' rosters
-//! within [`CONVERGE_WITHIN`], and neither roster ever lists more than the ceiling. If only one
-//! newcomer got in, the joins did not race: CANNOT MEASURE.
+//! **Joins at once never take a room past its cap** ([`joins_at_once_never_take_a_room_past_its_cap`],
+//! V210-128; the decider ruled the cap strict): a newcomer is admitted only once every member
+//! online to the one answering it agreed. Staged with the cap at [`STRICT_CAP`]: the host, bob
+//! and carol all up and answering, dave offline (his daemon stopped), the room one place short.
+//! Three newcomers join at once, one through each answering member's invite (an invite names its
+//! member as the first to answer), each answering member holding a place for its newcomer at
+//! `VOX_TEST_ADMISSION_GATE` (test-knobs only) until all three have reserved, then all asking at
+//! once — the symmetric race where every one of them loses the last place. Asserted:
+//! - at most one gets in;
+//! - each refused newcomer exits non-zero, refused as full or as losing the last place to another
+//!   join — anything else is `PRODUCT:`, quoted;
+//! - **liveness**: when every racer lost the last place, a lone retry gets in (offline dave blocks
+//!   nothing); the others are then refused as full;
+//! - every answering member's roster lists exactly the cap, the same members, within
+//!   [`CONVERGE_WITHIN`], and never more.
+//!
+//! **An online member that does not answer fails the join in time**
+//! ([`a_member_that_does_not_answer_fails_the_join_in_time`]): bob is up and heard from, and never
+//! answers whether a newcomer may join (`VOX_TEST_ADMIT_SILENT`, test-knobs only); a newcomer's
+//! join fails non-zero, says a member did not answer in time, within a minute.
+//!
+//! **A frozen member is offline and blocks no join** ([`a_frozen_member_is_offline_and_blocks_no_join`]):
+//! bob frozen (SIGSTOP), his connection still open and carrying nothing back, is what a member
+//! that died without a word or a machine asleep looks like; a newcomer's join gets in.
 //!
 //! **Mutations that must turn it red:** the admission's result dropped again (in
 //! `NetEvent::JoinAdmit`, the ack answered `Ok(())` whatever `admit_author` returned): the
 //! newcomer is told it joined. A failed admission answered with `JoinReject::Refused` again (in
-//! `run_responder`): the second arm's joiner is told its passphrase is likely wrong. A member
-//! learned from a board refused past the cap again (`admit_from_board` limited to the cap, not
-//! the ceiling): the racing arm's rosters never converge.
+//! `run_responder`): the second arm's joiner is told its passphrase is likely wrong. Admission on
+//! the answering member's own view only (`admit_agreed` asks nobody): the race lets all three in,
+//! `PRODUCT:` at "at most one gets in".
 
 #![cfg(unix)]
 
@@ -67,18 +80,35 @@ mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use sync_pair::{anchor, Member, ROOM_PASS};
+use sync_pair::{anchor, Member, Proc, ROOM_PASS};
+
+/// Stop a member's daemon as a person does (SIGINT), and wait for it to exit: it says goodbye on
+/// every connection, so the others count it offline at once (a SIGKILLed one stays "online" to
+/// them until its silence shows, and a join asking it then fails as unanswered).
+fn stop(mut d: Proc) {
+    d.signal("-INT");
+    let t = std::time::Instant::now();
+    while d.child.try_wait().ok().flatten().is_none() {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(30),
+            "PRODUCT: a daemon did not stop within 30 s of SIGINT"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
 
 /// How many members the room holds when full, the host among them.
 const CAP: usize = 3;
 /// The knob that lowers the room's cap.
 const KNOB: &str = "VOX_TEST_MAX_AUTHORS";
-/// How soon both members' rosters must list every newcomer told it joined.
+/// How soon every answering member's roster must agree at the cap.
 const CONVERGE_WITHIN: std::time::Duration = std::time::Duration::from_secs(90);
-/// How far past the cap joins answered at once can take a room (`JOIN_OVERSHOOT`).
-const OVERSHOOT: usize = 16;
+/// The cap the strict-cap arms stage: three answering members, one offline, one place short.
+const STRICT_CAP: usize = 5;
 /// The knob that holds a member's admissions until a file appears.
 const GATE: &str = "VOX_TEST_ADMISSION_GATE";
+/// The knob that makes a member take every admission question and never answer it.
+const SILENT: &str = "VOX_TEST_ADMIT_SILENT";
 /// The knob that fails every joiner's admission on the member answering it.
 const FAILS: &str = "VOX_TEST_ADMISSION_FAILS";
 
@@ -104,7 +134,7 @@ fn a_join_to_a_full_room_is_refused() {
         let m = Member::new(root, name);
         let d = m.daemon_with_anchor(Some(&spec), &knob);
         m.join(&link, "full");
-        drop(d);
+        stop(d);
     }
     let roster = |who: &str| -> Vec<String> {
         let (ok, out, err) = host.vox(&["room", "roster", &room], None);
@@ -219,16 +249,62 @@ fn a_join_a_member_cannot_admit_says_why() {
     );
 }
 
+/// Run `vox room join` for each `(member, link)` at once, as many people would; what each said.
+fn join_all<'a>(joins: &[(&'a Member, &str)], room: &str) -> Vec<(&'a Member, bool, String)> {
+    std::thread::scope(|s| {
+        let handles: Vec<_> = joins
+            .iter()
+            .map(|(m, link)| {
+                let m: &Member = m;
+                s.spawn(move || m.vox(&["room", "join", link, "--name", room], Some(ROOM_PASS)))
+            })
+            .collect();
+        joins
+            .iter()
+            .zip(handles)
+            .map(|((m, _), h)| {
+                let (ok, out, err) = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                (*m, ok, format!("{out}{err}"))
+            })
+            .collect()
+    })
+}
+
+/// A refused join says why, as one of the two refusals a racing join may get; anything else is
+/// the product's, quoted.
+fn refused_as_full_or_busy(m: &Member, said: &str) -> bool {
+    let full = said.contains("the room is full");
+    let busy = said.contains("the room's last place is being taken by another join; try again");
+    assert!(
+        full || busy,
+        "PRODUCT: {}'s join was refused, and not as full or as losing the last place to another \
+         join:\n{said}",
+        m.name
+    );
+    busy
+}
+
+/// A member's `vox room roster`, one fingerprint per entry.
+fn roster_of(m: &Member, room: &str) -> Vec<String> {
+    let (ok, out, err) = m.vox(&["room", "roster", room], None);
+    assert!(ok, "PRODUCT: {}'s `vox room roster` failed: {err}", m.name);
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
-fn joins_answered_at_once_by_two_members_converge() {
-    // A debug build's budget: three joins; an unlock for each `vox id` and daemon.
-    watchdog::arm_for_setup(3, 8);
+fn joins_at_once_never_take_a_room_past_its_cap() {
+    // A debug build's budget: seven joins; an unlock for each `vox id` and daemon.
+    watchdog::arm_for_setup(9, 20);
     test_knobs::require(&[KNOB, GATE]);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let (_anchor, spec) = anchor(root);
-    let cap = CAP.to_string();
+    let cap = STRICT_CAP.to_string();
     // The admission gate, open (the file is there) until the race: see below.
     let gate = root.join("gate");
     std::fs::write(&gate, b"").expect("APPARATUS: cannot open the admission gate");
@@ -238,25 +314,44 @@ fn joins_answered_at_once_by_two_members_converge() {
         .to_owned();
     let knob = [(KNOB, cap.as_str()), (GATE, gate_s.as_str())];
 
-    // ---- the host and one member, both up: the room one place short of CAP = 3 ---------------
+    // ---- three members answering, all up; a fourth offline: the room one place short ----------
     let host = Member::new(root, "host");
     let _host_d = host.daemon_with_anchor(Some(&spec), &knob);
-    let room = host.create("race");
+    let room = host.create("strict");
     let host_link = host.invite(&room);
     let bob = Member::new(root, "bob");
     let _bob_d = bob.daemon_with_anchor(Some(&spec), &knob);
-    bob.join(&host_link, "race");
-    let bob_link = bob.invite(&room);
+    bob.join(&host_link, "strict");
+    let carol = Member::new(root, "carol");
+    let _carol_d = carol.daemon_with_anchor(Some(&spec), &knob);
+    carol.join(&host_link, "strict");
+    // Offline from here on: its daemon is stopped, so nobody holds a connection to it and it
+    // blocks no join (the ruling: an offline member does not block).
+    let dave = Member::new(root, "dave");
+    let dave_d = dave.daemon_with_anchor(Some(&spec), &knob);
+    dave.join(&host_link, "strict");
+    stop(dave_d);
+    let answerers = [&host, &bob, &carol];
+    let links: Vec<String> = answerers.iter().map(|m| m.invite(&room)).collect();
+    let before = roster_of(&host, &room);
+    assert_eq!(
+        before.len(),
+        STRICT_CAP - 1,
+        "PRODUCT: three joins exited 0, but the host's roster lists {} of {} before the race\n\
+         {before:?}",
+        before.len(),
+        STRICT_CAP - 1
+    );
 
-    // ---- two newcomers at once: x from the host's invite, y from bob's -------------------------
-    let x = Member::new(root, "x");
-    let y = Member::new(root, "y");
-    let _x_d = x.daemon_with_anchor(Some(&spec), &knob);
-    let _y_d = y.daemon_with_anchor(Some(&spec), &knob);
-    // **Held at the gate until both members are about to admit**, then let go together: a join
-    // finished a second ahead is mirrored to the other member before that one decides, and the
-    // two would never race (measured: the first run, ungated, admitted one and refused the
-    // other as full).
+    // ---- three newcomers at once, one through each answering member, held and let go together --
+    let newcomers: Vec<Member> = ["x", "y", "z"]
+        .iter()
+        .map(|n| Member::new(root, n))
+        .collect();
+    let _newcomer_ds: Vec<_> = newcomers
+        .iter()
+        .map(|m| m.daemon_with_anchor(Some(&spec), &knob))
+        .collect();
     std::fs::remove_file(&gate).expect("APPARATUS: cannot close the admission gate");
     let reached = || {
         std::fs::read_dir(root)
@@ -265,123 +360,222 @@ fn joins_answered_at_once_by_two_members_converge() {
             .filter(|e| e.file_name().to_string_lossy().starts_with("gate.reached."))
             .count()
     };
-    let joined: Vec<(&Member, bool, String)> = std::thread::scope(|s| {
+    let joins: Vec<(&Member, &str)> = newcomers
+        .iter()
+        .zip(links.iter())
+        .map(|(m, l)| (m, l.as_str()))
+        .collect();
+    let raced = std::thread::scope(|s| {
         let opener = s.spawn(|| {
             let t0 = std::time::Instant::now();
-            while reached() < 2 && t0.elapsed() < std::time::Duration::from_secs(50) {
+            while reached() < 3 && t0.elapsed() < std::time::Duration::from_secs(50) {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             let held = reached();
             std::fs::write(&gate, b"").expect("APPARATUS: cannot open the admission gate");
             held
         });
-        let hx = s.spawn(|| {
-            x.vox(
-                &["room", "join", &host_link, "--name", "race"],
-                Some(ROOM_PASS),
-            )
-        });
-        let hy = s.spawn(|| {
-            y.vox(
-                &["room", "join", &bob_link, "--name", "race"],
-                Some(ROOM_PASS),
-            )
-        });
+        let raced = join_all(&joins, "strict");
         let held = opener
             .join()
             .unwrap_or_else(|e| std::panic::resume_unwind(e));
         assert!(
-            held == 2,
-            "CANNOT MEASURE: {held} of the 2 members reached the admission gate within 50 s, so the \
-             joins were not held to race"
+            held == 3,
+            "CANNOT MEASURE: {held} of the 3 answering members reached the admission gate within \
+             50 s, so the joins were not held to race"
         );
-        [(&x, hx), (&y, hy)]
-            .into_iter()
-            .map(|(m, h)| {
-                let (ok, out, err) = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
-                (m, ok, format!("{out}{err}"))
-            })
-            .collect()
+        raced
     });
-    for (m, ok, said) in &joined {
-        println!("[proof] {}'s join exited ok={ok}:\n{said}", m.name);
+    for (m, ok, said) in &raced {
+        println!("[proof] race: {}'s join exited ok={ok}:\n{said}", m.name);
     }
-    // A newcomer that did not get in is the staging's only when **every** member that answered
-    // it refused it as full: then one member learned of the other's newcomer before deciding,
-    // and the joins did not race. Refused by any member for anything else, it is the product's,
-    // quoted (ac-fix93 on c3) — even when a later member then found the room full.
-    let only_full = |said: &str| {
-        said.contains("the room is full")
-            && said
-                .lines()
-                .filter_map(|l| l.trim_start().strip_prefix("said: "))
-                .flat_map(|l| l.split("; "))
-                .filter(|r| r.contains(": exchange"))
-                .all(|r| r.contains("the room is full"))
-    };
-    for (m, ok, said) in &joined {
-        if !ok && !only_full(said) {
-            panic!(
-                "PRODUCT: {}'s join failed, and a member refused it for something other than a full \
-                 room:\n{said}",
-                m.name
-            );
+    let got_in: Vec<&Member> = raced.iter().filter(|r| r.1).map(|r| r.0).collect();
+    assert!(
+        got_in.len() <= 1,
+        "PRODUCT: {} newcomers got into a room one place short of its cap of {STRICT_CAP}: {:?}",
+        got_in.len(),
+        got_in.iter().map(|m| m.name).collect::<Vec<_>>()
+    );
+    let mut busy: Vec<&Member> = Vec::new();
+    for (m, ok, said) in &raced {
+        if !ok && refused_as_full_or_busy(m, said) {
+            busy.push(m);
         }
     }
-    let told_joined: Vec<&Member> = joined.iter().filter(|j| j.1).map(|j| j.0).collect();
-    assert!(
-        told_joined.len() == 2,
-        "CANNOT MEASURE: only {} of the 2 newcomers got in, and every member refused the other \
-         as full, so the joins did not race (one member learned of the other's newcomer before it \
-         answered its own): nothing measured whether raced joins converge",
-        told_joined.len()
+    println!(
+        "[proof] race: {} got in, {} told the last place was being taken",
+        got_in.len(),
+        busy.len()
     );
 
-    // ---- both rosters converge on every member told it joined, never past the ceiling ---------
-    let roster = |m: &Member| -> Vec<String> {
-        let (ok, out, err) = m.vox(&["room", "roster", &room], None);
-        assert!(ok, "PRODUCT: {}'s `vox room roster` failed: {err}", m.name);
-        out.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let want: Vec<&str> = [&host, &bob, &x, &y]
-        .iter()
-        .map(|m| m.fp.as_str())
-        .collect();
+    // ---- liveness: when every racer lost the last place, a retry gets one of them in ----------
+    if got_in.is_empty() {
+        let first = busy
+            .first()
+            .copied()
+            .expect("PRODUCT: no newcomer got in and none was told to try again");
+        let link = &links[newcomers
+            .iter()
+            .position(|n| n.name == first.name)
+            .expect("APPARATUS: a newcomer of the race")];
+        let (ok, out, err) =
+            first.vox(&["room", "join", link, "--name", "strict"], Some(ROOM_PASS));
+        println!(
+            "[proof] liveness: {}'s retry exited ok={ok}:\n{out}{err}",
+            first.name
+        );
+        assert!(
+            ok,
+            "PRODUCT: every racer lost the last place, and a lone retry still did not get in:\n\
+             {out}{err}"
+        );
+    }
+    // The others, asked again, are told the room is full: it is now.
+    let inside = |m: &Member| roster_of(&host, &room).contains(&m.fp);
+    for m in &newcomers {
+        if inside(m) {
+            continue;
+        }
+        let link = &links[newcomers.iter().position(|n| n.name == m.name).unwrap()];
+        let (ok, out, err) = m.vox(&["room", "join", link, "--name", "strict"], Some(ROOM_PASS));
+        let said = format!("{out}{err}");
+        assert!(
+            !ok && said.contains("the room is full"),
+            "PRODUCT: a join to the room at its cap, after the race, was not refused as full \
+             (exit ok: {ok}):\n{said}"
+        );
+    }
+
+    // ---- every answering member's roster: the cap exactly, and the same members ---------------
     let t0 = std::time::Instant::now();
-    let (mut on_host, mut on_bob);
     loop {
-        on_host = roster(&host);
-        on_bob = roster(&bob);
-        for (who, r) in [("host", &on_host), ("bob", &on_bob)] {
+        let rosters: Vec<Vec<String>> = answerers.iter().map(|m| roster_of(m, &room)).collect();
+        for (m, r) in answerers.iter().zip(&rosters) {
             assert!(
-                r.len() <= CAP + OVERSHOOT,
-                "PRODUCT: {who}'s roster lists {} members, past the ceiling of {} (cap {CAP} + \
-                 {OVERSHOOT})",
-                r.len(),
-                CAP + OVERSHOOT
+                r.len() <= STRICT_CAP,
+                "PRODUCT: {}'s roster lists {} members, past the cap of {STRICT_CAP}\n{r:?}",
+                m.name,
+                r.len()
             );
         }
-        let has_all = |r: &Vec<String>| want.iter().all(|w| r.iter().any(|m| m == w));
-        if has_all(&on_host) && has_all(&on_bob) {
+        let agree = rosters
+            .iter()
+            .all(|r| r.len() == STRICT_CAP && sorted(r) == sorted(&rosters[0]));
+        if agree {
+            println!(
+                "[proof] every answering member's roster lists the cap, {STRICT_CAP}, and the same \
+                 members, {:?} after the joins",
+                t0.elapsed()
+            );
             break;
         }
         assert!(
             t0.elapsed() < CONVERGE_WITHIN,
-            "PRODUCT: both newcomers were told they joined, but {CONVERGE_WITHIN:?} later the room \
-             is split: the host lists {} and bob lists {} (want all 4 of {want:?} on both)\nhost: \
-             {on_host:?}\nbob: {on_bob:?}",
-            on_host.len(),
-            on_bob.len()
+            "PRODUCT: {CONVERGE_WITHIN:?} after the joins, the answering members' rosters do not \
+             agree at the cap of {STRICT_CAP}: {rosters:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    println!(
-        "[proof] both rosters list all 4 ({} past the cap of {CAP}) {:?} after the joins",
-        4 - CAP,
-        t0.elapsed()
+}
+
+fn sorted(v: &[String]) -> Vec<String> {
+    let mut v = v.to_vec();
+    v.sort();
+    v
+}
+
+/// A room of `host` and `bob`, bob's daemon started with `bob_env`, and bob on the host's roster.
+fn host_and_bob(
+    root: &std::path::Path,
+    spec: &str,
+    bob_env: &[(&str, &str)],
+) -> (Member, Proc, Member, Proc, String, String) {
+    let cap = STRICT_CAP.to_string();
+    let knob = [(KNOB, cap.as_str())];
+    let host = Member::new(root, "host");
+    let host_d = host.daemon_with_anchor(Some(spec), &knob);
+    let room = host.create("bound");
+    let link = host.invite(&room);
+    let bob = Member::new(root, "bob");
+    let mut env: Vec<(&str, &str)> = knob.to_vec();
+    env.extend_from_slice(bob_env);
+    let bob_d = bob.daemon_with_anchor(Some(spec), &env);
+    bob.join(&link, "bound");
+    let t0 = std::time::Instant::now();
+    while !roster_of(&host, &room).contains(&bob.fp) {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(30),
+            "PRODUCT: bob's join exited 0, but the host's roster never listed him"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    (host, host_d, bob, bob_d, room, link)
+}
+
+#[test]
+#[ignore = "real binaries and production Argon2id: the release gate runs it"]
+fn a_member_that_does_not_answer_fails_the_join_in_time() {
+    // A debug build's budget: three joins; an unlock for each `vox id` and daemon.
+    watchdog::arm_for_setup(3, 8);
+    test_knobs::require(&[KNOB, SILENT]);
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let root = tmp.path();
+    let (_anchor, spec) = anchor(root);
+    // Bob is up, his connection heard from, and he never answers whether a newcomer may join.
+    let (_host, _host_d, _bob, _bob_d, _room, link) = host_and_bob(root, &spec, &[(SILENT, "1")]);
+    let late = Member::new(root, "late");
+    let _late_d = late.daemon_with_anchor(Some(&spec), &[]);
+    let t = std::time::Instant::now();
+    let (ok, out, err) = late.vox(&["room", "join", &link, "--name", "bound"], Some(ROOM_PASS));
+    let took = t.elapsed();
+    let said = format!("{out}{err}");
+    println!("[proof] the join with bob never answering exited ok={ok} after {took:?}:\n{said}");
+    assert!(
+        !ok,
+        "PRODUCT: a join was admitted while an online member (bob, up and not answering) never \
+         agreed:\n{said}"
     );
+    assert!(
+        said.contains("did not answer in time"),
+        "PRODUCT: the join refused while bob did not answer did not say a member did not answer \
+         in time:\n{said}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(60),
+        "PRODUCT: the join took {took:?} to fail: an unanswering member must end it within its \
+         bound, not hang"
+    );
+}
+
+#[test]
+#[ignore = "real binaries and production Argon2id: the release gate runs it"]
+fn a_frozen_member_is_offline_and_blocks_no_join() {
+    // A debug build's budget: two joins; an unlock for each `vox id` and daemon.
+    watchdog::arm_for_setup(2, 6);
+    test_knobs::require(&[KNOB]);
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let root = tmp.path();
+    let (_anchor, spec) = anchor(root);
+    let (host, _host_d, bob, bob_d, room, link) = host_and_bob(root, &spec, &[]);
+    // Bob frozen: his connection to the host is still open, and carries nothing back — as a
+    // process that died without a word, or a machine asleep. Offline: it blocks nothing.
+    let late = Member::new(root, "late");
+    let _late_d = late.daemon_with_anchor(Some(&spec), &[]);
+    bob_d.signal("-STOP");
+    let t = std::time::Instant::now();
+    let (ok, out, err) = late.vox(&["room", "join", &link, "--name", "bound"], Some(ROOM_PASS));
+    let took = t.elapsed();
+    bob_d.signal("-CONT");
+    let said = format!("{out}{err}");
+    println!("[proof] the join with bob frozen exited ok={ok} after {took:?}:\n{said}");
+    assert!(
+        ok,
+        "PRODUCT: a frozen member (bob, his connection carrying nothing back) blocked a join; an \
+         offline member must not:\n{said}"
+    );
+    assert!(
+        roster_of(&host, &room).contains(&late.fp),
+        "PRODUCT: the join exited 0 and the host's roster does not list the newcomer"
+    );
+    let _ = bob;
 }

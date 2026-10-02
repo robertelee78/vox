@@ -405,6 +405,8 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::MembersBusy => UiError::JoinMembersBusy,
         Fault::RoomFull => UiError::JoinRoomFull,
         Fault::NotAdmittedAfterJoin => UiError::JoinNotAdmitted,
+        Fault::LastPlaceTaken => UiError::JoinLastPlaceTaken,
+        Fault::AdmissionUnanswered => UiError::JoinAdmissionUnanswered,
         Fault::Refused => UiError::Refused,
         Fault::NotAdmitted => UiError::NotAdmitted,
         Fault::NotConsented => UiError::NotConsented,

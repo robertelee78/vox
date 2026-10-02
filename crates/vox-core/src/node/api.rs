@@ -835,6 +835,13 @@ pub enum Fault {
     /// closing mid-join, or its store refused the write (V210-128). **Not [`Fault::Refused`]**,
     /// whose advice is "usually the passphrase is wrong": this one was accepted.
     NotAdmittedAfterJoin,
+    /// The room's last place was held for another join while every online member agreed on it
+    /// (V210-128). Not [`Fault::RoomFull`]: the room was not full for this joiner, and a later try
+    /// may get in.
+    LastPlaceTaken,
+    /// A member online to the one answering the join did not answer in time, so the room could
+    /// not agree to admit the joiner (V210-128).
+    AdmissionUnanswered,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
     /// A consent named a member this node has not admitted to the room (yet): it holds no
@@ -954,10 +961,16 @@ impl Fault {
                 "a member answered, but it is busy answering other joins\n       your passphrase was never checked — this is not a verdict on it\n       try the join again shortly"
             }
             Fault::RoomFull => {
-                "the room is full\n       your passphrase was accepted; nobody else can join this room\n       (the cap is soft: joins answered at the same moment by different members can take a room a little past it)"
+                "the room is full\n       your passphrase was accepted; nobody else can join this room"
             }
             Fault::NotAdmittedAfterJoin => {
                 "a member accepted your passphrase, then could not admit you: it was locked or closing, or could not write its store\n       your passphrase was accepted — this is not a verdict on it\n       run the join again; another member, or this one once it is running, can admit you"
+            }
+            Fault::LastPlaceTaken => {
+                "the room's last place is being taken by another join; try again\n       your passphrase was accepted — this is not a verdict on it"
+            }
+            Fault::AdmissionUnanswered => {
+                "a member of the room did not answer in time, so the room could not agree to admit you\n       your passphrase was accepted — this is not a verdict on it\n       try again; if it repeats, that member is online but not answering"
             }
             Fault::Refused => "the other side refused",
             Fault::NotAdmitted => {
@@ -1055,6 +1068,8 @@ fault_names!(
     MembersBusy,
     RoomFull,
     NotAdmittedAfterJoin,
+    LastPlaceTaken,
+    AdmissionUnanswered,
     Refused,
     NotAdmitted,
     NotConsented,

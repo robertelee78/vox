@@ -386,7 +386,7 @@ pub enum Error {
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
 
-    /// The room is at its cap (`MAX_AUTHORS`; soft by `JOIN_OVERSHOOT`), so the member that
+    /// The room is at its cap (`MAX_AUTHORS`, strict: every online member agreed), so the member that
     /// answered the join could not admit the joiner, and refused it. Before this the refusal was
     /// dropped and the joiner was told it was in: it exited 0, a member of nothing.
     #[error("the room is full: {members} members, cap {cap}")]
@@ -395,6 +395,21 @@ pub enum Error {
         members: u64,
         /// The room's cap, as the refusing member enforces it.
         cap: u64,
+    },
+
+    /// The room's last place is held for another join while every online member agrees on it
+    /// (V210-128): this one lost the race for it, and may try again. Not [`Error::RoomFull`]: the
+    /// room was not full for it.
+    #[error("the room's last place is being taken by another join; try again")]
+    RoomBusy,
+
+    /// A member online to the one answering the join did not answer in time, so the room could
+    /// not agree to admit the joiner (V210-128). Never skipped: a connected member that is not
+    /// asked could admit somebody else at the same moment.
+    #[error("member {member} did not answer in time, so the room could not agree to admit you")]
+    AdmissionUnanswered {
+        /// The member, as a short id.
+        member: String,
     },
 
     /// The member answering a join accepted the passphrase, and then could not admit the joiner:

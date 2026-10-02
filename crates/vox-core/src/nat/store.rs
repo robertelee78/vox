@@ -126,7 +126,7 @@ pub const MAX_PREJOIN_PER_CHANNEL: usize = 256;
 /// Maximum distinct member authors retained per `(channel, epoch)` bucket. Member
 /// records are already membership-bounded; this is defense in depth against a
 /// permissive membership lookup.
-pub const MAX_AUTHORS_PER_BUCKET: usize = crate::node::channel::AUTHORS_CEILING;
+pub const MAX_AUTHORS_PER_BUCKET: usize = crate::node::channel::AUTHORS_HARD_LIMIT;
 
 /// Maximum distinct channels whose **genesis** this store retains on a peer's word
 /// (M14.7b). A genesis is immutable and self-validating (its hash *is* the channelID),

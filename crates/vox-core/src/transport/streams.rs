@@ -40,6 +40,10 @@ pub enum StreamKind {
     /// as up until its probing says otherwise, and reports a clean stop as silence. A stream is
     /// delivered like any data, so this is said while the connection still runs.
     Goodbye = 8,
+    /// **May a newcomer take a place in a room?** (V210-128): the member answering a join asks
+    /// every member it is connected to, and joins only with every answer a yes, so a room never
+    /// exceeds its cap. See `node::admitstream`. Members only.
+    Admit = 9,
 }
 
 /// The largest kind frame we will read: `[kind]` is 2 bytes; anything bigger is
@@ -59,6 +63,7 @@ impl StreamKind {
             6 => Some(Self::Coord),
             7 => Some(Self::Circuit),
             8 => Some(Self::Goodbye),
+            9 => Some(Self::Admit),
             _ => None,
         }
     }

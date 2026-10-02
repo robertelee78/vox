@@ -347,9 +347,6 @@ const SETUP_PATIENCE: Duration = Duration::from_secs(5);
 /// never finished and keep everyone else out for as long as a member waits on a proof of work.
 /// Past the cap the heaviest source gives up its newest slot; see [`crate::node::joinslots`].
 const JOINS_IN_FLIGHT: usize = 16;
-// A room's soft cap overshoots by at most the joins answered at once (V210-128).
-const _OVERSHOOT_IS_THE_JOIN_SLOTS: () =
-    assert!(JOINS_IN_FLIGHT == crate::node::channel::JOIN_OVERSHOOT);
 
 /// How many identity-passphrase checks may run at once.
 ///
@@ -418,6 +415,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
         NetEvent::LockSettled => "answering a lock that has settled",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
+        NetEvent::AdmitReserve { .. } => "holding a place for a newcomer",
+        NetEvent::AdmitAsk { .. } => "answering whether a newcomer may take a place",
+        NetEvent::AdmitDecided { .. } => "applying an admission decision",
         NetEvent::HandshakesQueued { .. } => "saying how a burst of connection attempts went",
         NetEvent::Stopped { .. } => "shutting the network down",
     }
@@ -1038,6 +1038,39 @@ enum NetEvent {
         /// admitted the joiner.
         ack: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
     },
+    /// **The member answering a join holds a place for its newcomer** (V210-128): the room's
+    /// cap and the places already held are checked, a place is held, and the members to ask —
+    /// every other member this node holds a live connection to — come back on `ack`. A full or
+    /// busy room is refused here, before anybody is asked.
+    AdmitReserve {
+        /// The room.
+        channel_id: Digest32,
+        /// The newcomer.
+        newcomer: Digest32,
+        /// The members to ask, with their connections; or the refusal.
+        ack: tokio::sync::oneshot::Sender<crate::error::Result<ToAsk>>,
+    },
+    /// Another member asks whether `ask.newcomer` may take a place (V210-128). The actor
+    /// answers from its own state at once; a task carries the answer and waits for the decision.
+    AdmitAsk {
+        /// The member asking.
+        peer: Digest32,
+        /// Its question.
+        ask: crate::node::admitstream::Ask,
+        /// The stream's send half.
+        send: quinn::SendStream,
+        /// The stream's receive half.
+        recv: quinn::RecvStream,
+    },
+    /// What became of a place held for `newcomer` (V210-128).
+    AdmitDecided {
+        /// The room.
+        channel_id: Digest32,
+        /// The newcomer.
+        newcomer: Digest32,
+        /// Commit or abort.
+        decision: crate::node::admitstream::Decision,
+    },
     /// A joiner's task dialled a peer: adopt the connection now, so its streams are served while
     /// the join is still running over it.
     Dialed {
@@ -1440,6 +1473,26 @@ async fn serve_typed(
                         peer,
                         channel_id,
                         epoch,
+                        send,
+                        recv,
+                    })
+                    .await;
+            });
+        }
+        // The question is read off the actor, like a sync preamble: answering needs the actor,
+        // waiting for a member that opened a stream and says nothing must not (V210-128).
+        Ok(Inbound::Admit { peer, send, recv }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok(ask) = crate::node::admitstream::read_ask(&mut recv).await else {
+                    return;
+                };
+                let _ = tx
+                    .send(NetEvent::AdmitAsk {
+                        peer,
+                        ask,
                         send,
                         recv,
                     })
@@ -2912,6 +2965,10 @@ const fn worth_another_responder(fault: Fault) -> bool {
             | Fault::SolveTooSlow
             // Every member holds the same room: another would refuse it as full too.
             | Fault::RoomFull
+            // Every member is asked the same question: another would hold the same race, or wait
+            // on the same member that did not answer.
+            | Fault::LastPlaceTaken
+            | Fault::AdmissionUnanswered
     )
 }
 
@@ -3211,6 +3268,9 @@ pub struct Node {
     publish_refusal_first_seen: BTreeMap<(Digest32, String), u64>,
     /// Slots for answering inbound joins; see [`JOINS_IN_FLIGHT`].
     join_slots: Arc<std::sync::Mutex<crate::node::joinslots::JoinSlots>>,
+    /// Places held for newcomers per room while every online member agrees (V210-128), see
+    /// [`crate::node::admitstream`].
+    admit_held: std::collections::HashMap<Digest32, crate::node::admitstream::Reservations>,
     /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
     verify_slots: Arc<tokio::sync::Semaphore>,
     /// The join exchanges running right now, both sides of them, the room creations sealing
@@ -3529,6 +3589,7 @@ impl Node {
             last_publish_refusal: BTreeMap::new(),
             publish_refusal_first_seen: BTreeMap::new(),
             join_slots: crate::node::joinslots::JoinSlots::new(JOINS_IN_FLIGHT),
+            admit_held: std::collections::HashMap::new(),
             verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
             join_tasks: tokio::task::JoinSet::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
@@ -5293,6 +5354,55 @@ impl Node {
             } => {
                 self.apply_join_outcome(peer, channel_id, *outcome).await;
             }
+            NetEvent::AdmitReserve {
+                channel_id,
+                newcomer,
+                ack,
+            } => {
+                let _ = ack.send(self.admit_reserve(channel_id, newcomer).await);
+            }
+            NetEvent::AdmitAsk {
+                peer,
+                ask,
+                send,
+                recv,
+            } => {
+                // **Test-only** (`test-knobs`): this node takes the question and never answers it,
+                // its process alive and its connection heard from, so a proof can see a join fail
+                // on a member that does not answer (V210-128).
+                #[cfg(feature = "test-knobs")]
+                if std::env::var_os(TEST_ADMIT_SILENT_ENV).is_some() {
+                    tokio::spawn(async move {
+                        let _held = (send, recv);
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    });
+                    return;
+                }
+                let verdict = self.admit_judge(peer, &ask).await;
+                let tx = self.net_tx.clone();
+                let (channel_id, newcomer) = (ask.channel_id, ask.newcomer);
+                tokio::spawn(async move {
+                    let decision = crate::node::admitstream::answer(send, recv, verdict).await;
+                    if verdict == crate::node::admitstream::Verdict::Yes {
+                        let _ = tx
+                            .send(NetEvent::AdmitDecided {
+                                channel_id,
+                                newcomer,
+                                decision,
+                            })
+                            .await;
+                    }
+                });
+            }
+            NetEvent::AdmitDecided {
+                channel_id,
+                newcomer,
+                decision,
+            } => {
+                if let Some(r) = self.admit_held.get_mut(&channel_id) {
+                    r.decide(&newcomer, decision);
+                }
+            }
             NetEvent::JoinAdmit {
                 channel_id,
                 identity,
@@ -6159,6 +6269,10 @@ impl Node {
                         // Unreachable: the stream loop converts these into
                         // `NetEvent::SyncRequest` once the preamble is read.
                     }
+                    Inbound::Admit { .. } => {
+                        // Unreachable: the stream loop reads these and sends
+                        // `NetEvent::AdmitAsk` once the question is in hand.
+                    }
                     Inbound::Punch {
                         peer,
                         coordinator,
@@ -6365,6 +6479,8 @@ impl Node {
         let tx = self.net_tx.clone();
         self.reap_join_tasks();
         let admit_tx = self.net_tx.clone();
+        let admit_net = Arc::clone(&net);
+        let epoch = ctx.epoch;
         let signals = Some((slot.worked(), slot.take_ended()));
         self.join_tasks.spawn(async move {
             let _slot = slot;
@@ -6385,28 +6501,7 @@ impl Node {
                     // this task, so the actor is never the thing waiting — which is the whole point
                     // of the slot. See `NetEvent::JoinAdmit`.
                     |identity| async move {
-                        #[cfg(feature = "test-knobs")]
-                        test_admission_gate().await;
-                        let (ack, wait) = tokio::sync::oneshot::channel();
-                        if admit_tx
-                            .send(NetEvent::JoinAdmit {
-                                channel_id,
-                                identity: Box::new(identity),
-                                ack,
-                            })
-                            .await
-                            .is_ok()
-                        {
-                            // A dropped sender resolves this too, so a shutting-down actor cannot
-                            // strand a joiner mid-exchange; nothing admitted it, so it is refused.
-                            wait.await.unwrap_or(Err(Error::JoinRefused(
-                                "the member stopped before it admitted the joiner",
-                            )))
-                        } else {
-                            Err(Error::JoinRefused(
-                                "the member stopped before it admitted the joiner",
-                            ))
-                        }
+                        admit_agreed(&admit_tx, &admit_net, channel_id, epoch, identity).await
                     },
                 )
                 .await
@@ -6432,6 +6527,86 @@ impl Node {
     /// this change removes from the exchange itself. Nothing here needs the result.
     fn spawn_refuse_join(send: quinn::SendStream) {
         tokio::spawn(crate::node::joinstream::refuse_join(send));
+    }
+
+    /// The room's admitted count and cap, with the places held in it pruned of what ran out or
+    /// was admitted since; `None` for a room this node does not hold.
+    async fn admit_room(
+        &mut self,
+        channel_id: Digest32,
+    ) -> Option<(usize, usize, Vec<Digest32>, u64)> {
+        let shared = self.channels.get(&channel_id).map(Arc::clone)?;
+        let c = shared.lock().await;
+        let authors = c.author_fingerprints();
+        let held = self.admit_held.entry(channel_id).or_default();
+        held.prune(|n| authors.contains(n));
+        Some((
+            authors.len(),
+            crate::node::channel::max_authors(),
+            authors,
+            c.epoch(),
+        ))
+    }
+
+    /// **The member answering a join holds a place for its newcomer, and names who to ask**
+    /// (V210-128; [`NetEvent::AdmitReserve`]): every other member, with where the board says it
+    /// is. Which of them are online is found out by reaching them ([`admit_agreed`]).
+    async fn admit_reserve(
+        &mut self,
+        channel_id: Digest32,
+        newcomer: Digest32,
+    ) -> crate::error::Result<ToAsk> {
+        let Some((admitted, cap, authors, _)) = self.admit_room(channel_id).await else {
+            return Err(Error::Profile("no such channel in this profile"));
+        };
+        if authors.contains(&newcomer) {
+            return Ok(Vec::new()); // already a member: nothing to agree
+        }
+        let held = self.admit_held.entry(channel_id).or_default();
+        match held.judge(newcomer, admitted, cap) {
+            crate::node::admitstream::Verdict::Yes => {}
+            crate::node::admitstream::Verdict::Full { members, cap } => {
+                return Err(Error::RoomFull { members, cap })
+            }
+            _ => return Err(Error::RoomBusy),
+        }
+        let me = self.profile.as_ref().map(|p| p.fingerprint());
+        let Some(net) = self.net.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(authors
+            .into_iter()
+            .filter(|a| Some(*a) != me && *a != newcomer)
+            .map(|a| (a, net.board_endpoints(&channel_id, &a)))
+            .collect())
+    }
+
+    /// **A member's answer to another member's [`crate::node::admitstream::Ask`]** (V210-128),
+    /// from its own state, at once: it never waits on anyone.
+    async fn admit_judge(
+        &mut self,
+        peer: Digest32,
+        ask: &crate::node::admitstream::Ask,
+    ) -> crate::node::admitstream::Verdict {
+        use crate::node::admitstream::Verdict;
+        let Some((admitted, cap, authors, epoch)) = self.admit_room(ask.channel_id).await else {
+            return Verdict::NotHeld;
+        };
+        if epoch != ask.epoch {
+            return Verdict::NotHeld;
+        }
+        // An asker this node does not know as a member yet joined after its last view: it could
+        // still be answering joins on that view, so it is not skipped — the join tries again.
+        if !authors.contains(&peer) {
+            return Verdict::Busy;
+        }
+        if authors.contains(&ask.newcomer) {
+            return Verdict::Yes;
+        }
+        self.admit_held
+            .entry(ask.channel_id)
+            .or_default()
+            .judge(ask.newcomer, admitted, cap)
     }
 
     /// Drop the bookkeeping for join tasks that have already finished.
@@ -7146,6 +7321,7 @@ impl Node {
                 &set.bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
+                self.net.as_deref(),
             )
             .await;
         }
@@ -8179,6 +8355,7 @@ impl Node {
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
+                self.net.as_deref(),
             )
             .await;
         }
@@ -8835,6 +9012,7 @@ impl Node {
                                     &set.bundles,
                                     ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                                     now,
+                                    Some(&net),
                                 )
                                 .await;
                                 // What the peer's board holds is filed on this node's own, so its board
@@ -9373,6 +9551,7 @@ impl Node {
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
+                self.net.as_deref(),
             )
             .await;
             return shared.lock().await.is_author(peer);
@@ -11447,6 +11626,7 @@ async fn admit_board_records(
     records: &[crate::nat::record::MemberBundleRecord],
     quota: usize,
     now: u64,
+    net: Option<&NodeNet>,
 ) -> usize {
     // **Only records for keys not yet admitted are verified, and outside the room's lock**
     // (V210-71). Every record on a board was verified again on every outbound session, under the
@@ -11494,6 +11674,20 @@ async fn admit_board_records(
             match channel.admit_from_board(store, key, &record.admission, now) {
                 Ok(true) => {
                     admitted += 1;
+                    // **Past the cap only after a network split** (V210-128): said, so a room that
+                    // went past its cap shows how.
+                    let (members, cap) = (channel.author_count(), crate::node::channel::max_authors());
+                    if members > cap {
+                        if let Some(net) = net {
+                            net.manager().note(
+                                key.fingerprint(),
+                                format!(
+                                    "admitted past the room's cap of {cap} (now {members} members): \
+                                     another member admitted it while this node could not reach it"
+                                ),
+                            );
+                        }
+                    }
                     false
                 }
                 // Already admitted: nothing to do and nothing to retry.
@@ -11510,16 +11704,22 @@ async fn admit_board_records(
     admitted
 }
 
+/// **Test-only**: set, this node takes every admission question another member asks it and never
+/// answers, alive and heard from (V210-128), so a proof can see a join fail on a member that does
+/// not answer. Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_ADMIT_SILENT_ENV: &str = "VOX_TEST_ADMIT_SILENT";
+
 /// **Test-only**: set, this node fails every joiner's admission after the exchange, as a node
 /// locked or closing mid-join does (V210-128), so a proof can see what the joiner is told. Not
 /// compiled in without the `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
 pub const TEST_ADMISSION_FAILS_ENV: &str = "VOX_TEST_ADMISSION_FAILS";
 
-/// **Test-only**: a path. While no file is there, every joiner this node answers waits at its
-/// admission, with `<path>.reached.<pid>` written to say so, so a proof can hold joins answered by
-/// two members until both are about to admit, then let them go at once (V210-128's race). Bounded
-/// at a minute. Not compiled in without the `test-knobs` feature (V210-105).
+/// **Test-only**: a path. While no file is there, every joiner this node answers waits with a place
+/// reserved for it and no member asked yet, with `<path>.reached.<pid>` written to say so, so a
+/// proof can hold joins answered by several members until all have reserved, then let them ask at
+/// once (V210-128's race). Bounded at a minute. Not compiled in without the `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
 pub const TEST_ADMISSION_GATE_ENV: &str = "VOX_TEST_ADMISSION_GATE";
 
@@ -11539,6 +11739,216 @@ async fn test_admission_gate() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
+
+/// **A newcomer is admitted only once every online member agreed** (V210-128): hold a place,
+/// then reach and ask every other member, all at once and bounded by
+/// [`crate::node::admitstream::ASK_PATIENCE`], and admit on every answer a yes.
+///
+/// **Online is what this node can observe**: a member it holds a connection to, or reaches —
+/// directly or through a relay, which only carries the bytes — within the bound. One it cannot
+/// reach in that time is offline and blocks nothing. One it reaches and that does not answer in
+/// that time fails the join: skipped, it could admit somebody else at the same moment. Otherwise every
+/// place held for the newcomer is let go, and the refusal says why: the room is full, its last
+/// place is being taken by another join, or a member did not answer in time.
+async fn admit_agreed(
+    admit_tx: &mpsc::Sender<NetEvent>,
+    net: &Arc<NodeNet>,
+    channel_id: Digest32,
+    epoch: u64,
+    identity: crate::identity::composite::CompositePublicKey,
+) -> crate::error::Result<()> {
+    use crate::node::admitstream::{self, Decision, Verdict};
+    let stopped = || Error::JoinRefused("the member stopped before it admitted the joiner");
+    let newcomer = identity.fingerprint();
+    let (ack, wait) = tokio::sync::oneshot::channel();
+    if admit_tx
+        .send(NetEvent::AdmitReserve {
+            channel_id,
+            newcomer,
+            ack,
+        })
+        .await
+        .is_err()
+    {
+        return Err(stopped());
+    }
+    let members = wait.await.unwrap_or_else(|_| Err(stopped()))?;
+    // **Test-only** (`test-knobs`): held here, a place reserved and nobody asked yet, so a proof
+    // can let several answering members ask at once (the race V210-128's strict cap must win).
+    #[cfg(feature = "test-knobs")]
+    {
+        test_admission_gate().await;
+        // The place was held across the wait: hold it again, so it does not run out before the
+        // asking below has had its full bound.
+        let (ack, wait) = tokio::sync::oneshot::channel();
+        if admit_tx
+            .send(NetEvent::AdmitReserve {
+                channel_id,
+                newcomer,
+                ack,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = wait.await;
+        }
+    }
+    let release = || async {
+        let _ = admit_tx
+            .send(NetEvent::AdmitDecided {
+                channel_id,
+                newcomer,
+                decision: Decision::Abort,
+            })
+            .await;
+    };
+
+    let question = admitstream::Ask {
+        channel_id,
+        epoch,
+        newcomer,
+    };
+    let deadline = tokio::time::Instant::now() + admitstream::ASK_PATIENCE;
+    let mut asking = tokio::task::JoinSet::new();
+    for (member, endpoints) in members {
+        let question = question.clone();
+        let net = Arc::clone(net);
+        let tx = admit_tx.clone();
+        asking.spawn(async move {
+            let reached = match net.manager().existing(&member) {
+                Some(conn) => Some(conn),
+                None => {
+                    // **Reached quickly or not at all**: a member this node holds no connection to
+                    // and cannot reach within `REACH_PATIENCE` is offline, so a room with one
+                    // member away does not make every join wait out the whole bound.
+                    let by = std::cmp::min(
+                        deadline,
+                        tokio::time::Instant::now() + admitstream::REACH_PATIENCE,
+                    );
+                    match tokio::time::timeout_at(by, net.reach(member, &endpoints)).await {
+                        Ok(Ok(conn)) => {
+                            let _ = tx
+                                .send(NetEvent::Dialed {
+                                    conn: Arc::clone(&conn),
+                                    endpoints,
+                                    board: false,
+                                })
+                                .await;
+                            Some(conn)
+                        }
+                        // Not reached in time: offline, and it blocks nothing. Said, so a join that
+                        // went ahead without a member's word shows why.
+                        Ok(Err(e)) => {
+                            net.manager().note(
+                                member,
+                                format!("counted offline for a join's agreement: not reached ({e})"),
+                            );
+                            None
+                        }
+                        Err(_) => {
+                            net.manager().note(
+                                member,
+                                "counted offline for a join's agreement: not reached within the bound"
+                                    .to_owned(),
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+            let Some(conn) = reached else {
+                return (member, None);
+            };
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let answered = admitstream::ask(&conn, member, &question, left).await;
+            (member, Some(answered))
+        });
+    }
+    let mut asked = Vec::new();
+    let mut refusal: Option<Error> = None;
+    let rank = |e: &Error| match e {
+        Error::RoomFull { .. } => 3,
+        Error::RoomBusy => 2,
+        _ => 1,
+    };
+    let refuse = |e: Error, refusal: &mut Option<Error>| {
+        if refusal.as_ref().is_none_or(|r| rank(&e) > rank(r)) {
+            *refusal = Some(e);
+        }
+    };
+    while let Some(done) = asking.join_next().await {
+        let Ok((member, answered)) = done else {
+            refuse(stopped(), &mut refusal);
+            continue;
+        };
+        let Some(answered) = answered else {
+            continue; // offline
+        };
+        match answered {
+            admitstream::Asking::Answered(a, Verdict::Yes) => asked.push(a),
+            // It does not hold the room open, so it cannot admit anyone either.
+            admitstream::Asking::Answered(a, Verdict::NotHeld) => a.decide(Decision::Abort).await,
+            admitstream::Asking::Answered(a, Verdict::Full { members, cap }) => {
+                a.decide(Decision::Abort).await;
+                refuse(Error::RoomFull { members, cap }, &mut refusal);
+            }
+            admitstream::Asking::Answered(a, Verdict::Busy) => {
+                a.decide(Decision::Abort).await;
+                refuse(Error::RoomBusy, &mut refusal);
+            }
+            admitstream::Asking::Offline => net.manager().note(
+                member,
+                "counted offline for a join's agreement: its connection carried nothing back"
+                    .to_owned(),
+            ),
+            admitstream::Asking::Unanswered => refuse(
+                Error::AdmissionUnanswered {
+                    member: crate::node::network::short_id(member),
+                },
+                &mut refusal,
+            ),
+        }
+    }
+    if let Some(e) = refusal {
+        for a in asked {
+            a.decide(Decision::Abort).await;
+        }
+        release().await;
+        return Err(e);
+    }
+
+    let (ack, wait) = tokio::sync::oneshot::channel();
+    let admitted = if admit_tx
+        .send(NetEvent::JoinAdmit {
+            channel_id,
+            identity: Box::new(identity),
+            ack,
+        })
+        .await
+        .is_ok()
+    {
+        // A dropped sender resolves this too, so a shutting-down actor cannot strand a joiner
+        // mid-exchange; nothing admitted it, so it is refused.
+        wait.await.unwrap_or_else(|_| Err(stopped()))
+    } else {
+        Err(stopped())
+    };
+    let decision = if admitted.is_ok() {
+        Decision::Commit
+    } else {
+        Decision::Abort
+    };
+    for a in asked {
+        a.decide(decision).await;
+    }
+    if admitted.is_err() {
+        release().await;
+    }
+    admitted
+}
+
+/// The members to ask whether a newcomer may take a place, each with where the board says it is.
+type ToAsk = Vec<(Digest32, crate::nat::multiaddr::EndpointList)>;
 
 fn fault_of(e: &Error) -> Fault {
     match e {
@@ -11564,6 +11974,8 @@ fn fault_of(e: &Error) -> Fault {
         Error::JoinResponderBusy | Error::JoinEndedForNewcomer => Fault::MembersBusy,
         Error::RoomFull { .. } => Fault::RoomFull,
         Error::JoinNotAdmitted => Fault::NotAdmittedAfterJoin,
+        Error::RoomBusy => Fault::LastPlaceTaken,
+        Error::AdmissionUnanswered { .. } => Fault::AdmissionUnanswered,
         Error::Path {
             op: crate::node::profile::VAULT_WRITE,
             ..

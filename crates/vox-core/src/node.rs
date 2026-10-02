@@ -24,6 +24,7 @@
 //! useful unit.
 
 pub mod actor;
+pub mod admitstream;
 pub mod anchor;
 pub mod api;
 pub mod channel;

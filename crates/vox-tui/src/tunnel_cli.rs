@@ -992,10 +992,7 @@ pub(crate) fn join_advice_after(
 /// `RoomFull`'s advice, with the cap **in force**: the count and cap the member that refused the
 /// join gave ("the room is full: N members, cap C"), never a constant this side assumes — a test
 /// build's lowered cap and the shipped 1,024 are both stated as they are. Without them, no number.
-///
-/// **The cap is soft, and says so** (V210-128): joins answered at the same moment by different
-/// members can each take the last place, and every member then admits them all rather than split
-/// the room, up to the cap plus [`JOIN_OVERSHOOT`](vox_core::node::channel::JOIN_OVERSHOOT).
+/// The cap is strict (V210-128): every online member agrees before anyone is admitted.
 fn room_full_advice(said: &str) -> String {
     fn number_after(said: &str, label: &str) -> Option<u64> {
         let at = said.find(label)? + label.len();
@@ -1017,13 +1014,7 @@ fn room_full_advice(said: &str) -> String {
         ),
         _ => "the room is full".to_owned(),
     };
-    let soft = cap.map_or(String::new(), |c| {
-        format!(
-            "\n       (the cap is soft: joins answered at the same moment by different members can take a room to {})",
-            thousands(c + vox_core::node::channel::JOIN_OVERSHOOT as u64)
-        )
-    });
-    format!("{head}\n       your passphrase was accepted; nobody else can join this room{soft}")
+    format!("{head}\n       your passphrase was accepted; nobody else can join this room")
 }
 
 /// `n` with a comma between each three digits, as the house style writes a count (1,024).
@@ -1130,6 +1121,8 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::MembersBusy) => Fault::MembersBusy.explain(),
         Some(Fault::RoomFull) => Fault::RoomFull.explain(),
         Some(Fault::NotAdmittedAfterJoin) => Fault::NotAdmittedAfterJoin.explain(),
+        Some(Fault::LastPlaceTaken) => Fault::LastPlaceTaken.explain(),
+        Some(Fault::AdmissionUnanswered) => Fault::AdmissionUnanswered.explain(),
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
         // responder, so it is the responder that says no. Leading with "the refusal is

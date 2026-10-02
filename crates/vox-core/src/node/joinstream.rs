@@ -100,6 +100,8 @@ const OP_ACCEPTED: u64 = 6;
 const OP_OPEN: u64 = 8;
 const OP_REJECTED: u64 = 7;
 const OP_FULL: u64 = 9;
+const OP_BUSY: u64 = 10;
+const OP_UNANSWERED: u64 = 11;
 
 /// Why a responder refused a join (see the module docs: deliberately coarse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +224,13 @@ pub enum JoinFrame {
         /// The room's cap, as the refusing member enforces it.
         cap: u64,
     },
+    /// Refused because the room's last place is held for another join (V210-128).
+    Busy,
+    /// Refused because an online member did not answer in time (V210-128).
+    Unanswered {
+        /// The member, as a short id.
+        member: String,
+    },
     /// **Step 8, joiner → responder:** one ratchet message with an empty plaintext,
     /// whose only job is to open the responder's sending direction (M17.6).
     ///
@@ -303,6 +312,12 @@ impl JoinFrame {
             Self::Rejected(r) => {
                 e.array(2).uint(OP_REJECTED).uint(u64::from(*r as u8));
             }
+            Self::Busy => {
+                e.array(1).uint(OP_BUSY);
+            }
+            Self::Unanswered { member } => {
+                e.array(2).uint(OP_UNANSWERED).bytes(member.as_bytes());
+            }
             Self::Full { members, cap } => {
                 e.array(3).uint(OP_FULL).uint(*members).uint(*cap);
             }
@@ -368,6 +383,16 @@ impl JoinFrame {
                 let v = u8::try_from(d.uint()?)
                     .map_err(|_| Error::MalformedJoin("reject reason range"))?;
                 Self::Rejected(JoinReject::from_u8(v).ok_or(Error::MalformedJoin("reject reason"))?)
+            }
+            (OP_BUSY, 1) => Self::Busy,
+            (OP_UNANSWERED, 2) => {
+                let raw = d.bytes()?;
+                if raw.len() > 64 {
+                    return Err(Error::MalformedJoin("unanswered member"));
+                }
+                Self::Unanswered {
+                    member: String::from_utf8_lossy(raw).into_owned(),
+                }
             }
             (OP_FULL, 3) => Self::Full {
                 members: d.uint()?,
@@ -763,6 +788,8 @@ pub async fn run_initiator(
         JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
         JoinFrame::Rejected(r) => return Err(rejected(r)),
         JoinFrame::Full { members, cap } => return Err(Error::RoomFull { members, cap }),
+        JoinFrame::Busy => return Err(Error::RoomBusy),
+        JoinFrame::Unanswered { member } => return Err(Error::AdmissionUnanswered { member }),
         _ => return Err(Error::MalformedJoin("expected accepted")),
     };
     // Checked here, against the identity the handshake pinned, so a responder cannot
@@ -903,8 +930,15 @@ where
             // room could not take (it was full) heard `Accepted`, exited 0, and was a member of
             // nothing.
             if let Err(e) = admit_before_accepting(outcome.peer.identity.clone()).await {
-                let refusal = match e {
-                    Error::RoomFull { members, cap } => JoinFrame::Full { members, cap },
+                let refusal = match &e {
+                    Error::RoomFull { members, cap } => JoinFrame::Full {
+                        members: *members,
+                        cap: *cap,
+                    },
+                    Error::RoomBusy => JoinFrame::Busy,
+                    Error::AdmissionUnanswered { member } => JoinFrame::Unanswered {
+                        member: member.clone(),
+                    },
                     // The passphrase was accepted: never the refusal that reads as a wrong one.
                     _ => JoinFrame::Rejected(JoinReject::NotAdmitted),
                 };

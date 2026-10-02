@@ -220,6 +220,10 @@ pub enum UiError {
     JoinRoomFull,
     /// A member accepted the passphrase and then could not admit this identity (V210-128).
     JoinNotAdmitted,
+    /// The room's last place was being taken by another join (V210-128).
+    JoinLastPlaceTaken,
+    /// A member did not answer in time, so the room could not agree (V210-128).
+    JoinAdmissionUnanswered,
     /// Join proof-of-possession / identity mismatch.
     JoinProofMismatch,
     /// No reachable peer / your node — "both must be online" for a 2-member channel.
@@ -305,6 +309,12 @@ impl UiError {
             }
             UiError::JoinNotAdmitted => {
                 "a member accepted your passphrase but could not admit you (it was locking or closing) — try again"
+            }
+            UiError::JoinLastPlaceTaken => {
+                "the room's last place is being taken by another join — try again"
+            }
+            UiError::JoinAdmissionUnanswered => {
+                "a member did not answer in time, so the room could not agree to admit you — try again"
             }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — the host or a member must be online",
