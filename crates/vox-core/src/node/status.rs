@@ -34,6 +34,9 @@
 //! backoff a port is in — and a `"reach"` row per peer, counting reachability ladders and outbound
 //! circuits (V210-53). They are what a person cannot see directly: that nothing was refused,
 //! skipped or left stale. They live in a [`SyncBook`] the actor writes and every handle reads.
+//!
+//! `"tunnels"` lists every live tunnel (V210-81): the member, the service, which way it was
+//! opened, and when it was opened and last moved a byte.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -1126,6 +1129,24 @@ impl SyncBook {
                 "{{\"room\":\"{}\",\"entries\":[{}]}}",
                 b32_encode(room),
                 list.join(",")
+            );
+        }
+        // **Every live tunnel** (V210-81): the member, the service, which way it was opened, and
+        // when it was opened and last moved a byte (Unix seconds), so a stale one is visible.
+        s.push_str("],\"tunnels\":[");
+        for (i, t) in crate::transport::quic::live_tunnels().iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(
+                s,
+                "{{\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\"opened\":{},\
+                 \"last_moved\":{}}}",
+                b32_encode(&t.peer),
+                q(&t.service),
+                if t.outbound { "out" } else { "in" },
+                t.opened,
+                t.last_moved
             );
         }
         s.push(']');

@@ -11,6 +11,17 @@
 //!
 //! Mutation: take out the prompt pass-on (`note_new_members`). Bob then learns of Carol only on his
 //! periodic sync, and the proof goes red.
+//!
+//! **And the anchor's operator sees them as members, not as people still waiting to join**
+//! (V210-102, #297). `vox node` prints each room it serves as `<room> <members>m/<pending>p`, and a
+//! joiner's pre-join record — its announcement that it is waiting to join — lived its full two
+//! hours after the join, so every member who joined in that time was also counted as waiting: a
+//! room of 301 showed `301m/256p`. Once Bob and Carol are in, the anchor's last board line must show
+//! the room with all three members and nobody pending, within [`BOARD_PATIENCE`]. Its first line
+//! naming three members not printed in that time is CANNOT MEASURE (the anchor never learned the
+//! room's members, which is not this claim); three members with anyone pending is the product red,
+//! quoting the line. Mutation: a pre-join record kept after its joiner is admitted
+//! (`RendezvousStore::forget_prejoin` a no-op) — the line reads `3m/2p`.
 
 #![cfg(unix)]
 
@@ -169,6 +180,28 @@ fn spawn_anchor(root: &Path) -> (Proc, String) {
 /// How soon after Carol's join returns Bob must list her.
 const BOUND: Duration = Duration::from_secs(3);
 
+/// How long the anchor may take to print a board line counting all three members.
+const BOARD_PATIENCE: Duration = Duration::from_secs(60);
+
+/// The anchor's latest `vox node: board — …` entry. It serves one room, so its board line has one
+/// entry.
+fn board_entry(anchor_out: &Path) -> Option<String> {
+    std::fs::read_to_string(anchor_out)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("vox node: board — "))
+        .rfind(|e| counts(e).is_some())
+        .map(str::to_owned)
+}
+
+/// `(members, pending)` from a board entry `<room> <m>m/<p>p[/<e>e]`.
+fn counts(entry: &str) -> Option<(usize, usize)> {
+    let mut parts = entry.split_whitespace().nth(1)?.split('/');
+    let m = parts.next()?.strip_suffix('m')?.parse().ok()?;
+    let p = parts.next()?.strip_suffix('p')?.parse().ok()?;
+    Some((m, p))
+}
+
 #[test]
 #[ignore = "a real anchor and three real daemons with production Argon2id; CI runs it in release"]
 fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
@@ -176,6 +209,7 @@ fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let (_anchor, spec) = spawn_anchor(root);
+    let anchor_out = root.join("anchor.out");
     let members = [
         Member::new(root, "alice"),
         Member::new(root, "bob"),
@@ -244,6 +278,38 @@ fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
     eprintln!(
         "bob listed carol {} after her join returned (bound {BOUND:?}); alice lists her: {alice_lists}",
         seen.map_or("never within 60 s".to_owned(), |d| format!("{d:?}"))
+    );
+    // The anchor's operator: all three as members, nobody still waiting to join.
+    let since = Instant::now();
+    let entry = loop {
+        let entry = board_entry(&anchor_out);
+        if entry
+            .as_deref()
+            .and_then(counts)
+            .is_some_and(|(m, p)| m >= 3 && p == 0)
+            || since.elapsed() > BOARD_PATIENCE
+        {
+            break entry;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    eprintln!("the anchor's last board line: {entry:?}");
+    let (members, pending) = entry
+        .as_deref()
+        .and_then(counts)
+        .filter(|(m, _)| *m >= 3)
+        .unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE: the anchor printed no board line counting the room's 3 members \
+                 within {BOARD_PATIENCE:?}; its last entry for the room was {entry:?}"
+            )
+        });
+    assert_eq!(
+        pending,
+        0,
+        "the anchor tells its operator {pending} people are still waiting to join a room whose \
+         {members} members have all joined: `{}`",
+        entry.unwrap_or_default()
     );
     let seen = seen.expect("bob never listed carol within 60 s");
     assert!(

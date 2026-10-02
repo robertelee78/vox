@@ -28,12 +28,20 @@
 //! 1. addressed to bob and urgent — bob's session is woken, exactly once;
 //! 2. urgent but addressed to someone else — nothing;
 //! 3. addressed to bob but not urgent — nothing;
-//! 4. a wedged session (an OpenCode endpoint, registered by `vox agent hook --session` with
-//!    `OPENCODE_SERVER_URL`, that accepts and never answers) does not stall bob's wakes.
+//! 4. a wedged session (an OpenCode plugin's wake socket, registered by `vox agent hook
+//!    --session` with `VOX_OPENCODE_WAKE_SOCKET`/`_TOKEN`, that accepts and never answers) does
+//!    not stall bob's wakes;
+//! 5. **the wake is not given to the model a second time** (V210-112). Claude Code runs its
+//!    `UserPromptSubmit` hook for a message written to its messaging socket, with that message
+//!    as the hook's `prompt` (measured against a live Claude Code 2.1.287). So bob's hook runs
+//!    again with the wake it received as `prompt`, exactly as his harness would, and its room
+//!    read must carry the two messages that woke nothing, and not the one the wake delivered.
 //!
 //! **Mutation.** Put the pre-F15 loop back — the daemon judges only `NewEntry`, treating
 //! `Synced`/`SenderKeyReceived` and its two-second sweep as nothing to do — and this goes red
-//! at (1): the urgent message reaches bob's node and his session is never woken.
+//! at (1): the urgent message reaches bob's node and his session is never woken. Drop the
+//! drain's reading of its own prompt (`woken_by_prompt`) and it goes red at (5), the woken
+//! message in the room read too.
 
 #![cfg(unix)]
 
@@ -69,7 +77,7 @@ fn listen(path: &std::path::Path) -> mpsc::Receiver<String> {
 /// `vox agent hook …` as bob's harness runs it, in a **cleared** environment: `PATH`, `HOME`,
 /// bob's profile directories, and exactly the harness variables in `env`. Nothing this test
 /// process inherited — a real Claude Code session's messaging socket above all — reaches it.
-fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) {
+fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) -> String {
     use std::io::Write as _;
     let mut cmd = std::process::Command::new(support::VOX);
     cmd.env_clear();
@@ -106,6 +114,7 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
         String::from_utf8_lossy(&out.stderr).trim()
     );
     assert!(out.status.success(), "`vox agent hook` must exit 0");
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// The endpoint bob's daemon will wake `session` at, as the hook registered it.
@@ -253,10 +262,61 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         "one urgent message wakes the session once: {woken:?}"
     );
 
+    // ---- (5) the wake's own turn: the drain does not give the model the wake again ----
+    let wake_text = woken
+        .iter()
+        .flat_map(|f| f.lines())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["type"] == "user")
+        .and_then(|v| v["message"]["content"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE (5): no user message among the frames bob's session received: {woken:?}")
+        });
+    let wake_turn = serde_json::json!({
+        "session_id": "session-bob",
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": "/tmp",
+        "permission_mode": "default",
+        "prompt": wake_text,
+        "prompt_id": "p-2",
+        "transcript_path": "/tmp/t.jsonl",
+    })
+    .to_string();
+    let read = hook(
+        bob,
+        &[
+            ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
+            ("VOX_AGENT_NAME", "bob"),
+        ],
+        &["agent", "hook", "--room", &room],
+        Some(&wake_turn),
+    );
+    println!(
+        "[proof] the wake's own turn read: woken message {} time(s), other-addressee {}, \
+         not-urgent {}",
+        read.matches("WAKE-UP-FROM-ALICE").count(),
+        read.matches("OTHER-ADDRESSEE").count(),
+        read.matches("NOT-URGENT").count()
+    );
+    assert!(
+        read.matches("OTHER-ADDRESSEE").count() == 1 && read.matches("NOT-URGENT").count() == 1,
+        "CANNOT MEASURE (5): the wake's turn must read the two messages that woke nothing, once \
+         each, or the read did not reach them: {read}"
+    );
+    assert_eq!(
+        read.matches("WAKE-UP-FROM-ALICE").count(),
+        0,
+        "PRODUCT (5): the message a wake delivered must not be given to the model again in the \
+         room read of the turn that wake started: {read}"
+    );
+
     // ---- (4) a wedged session must not stall anybody else's wake ----
-    // An OpenCode endpoint that accepts and never answers: its wake would wait for ever.
-    let wedge = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let wedge_url = format!("http://{}", wedge.local_addr().unwrap());
+    // An OpenCode plugin's wake socket that accepts and never answers: its wake would wait
+    // for ever.
+    let wedge_path = tmp.path().join("wedge.sock");
+    let wedge = UnixListener::bind(&wedge_path).expect("bind the wedged session socket");
+    let wedge_url = wedge_path.to_str().unwrap().to_owned();
     std::thread::spawn(move || {
         let mut held = Vec::new();
         for s in wedge.incoming().flatten() {
@@ -266,7 +326,8 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     hook(
         bob,
         &[
-            ("OPENCODE_SERVER_URL", wedge_url.as_str()),
+            ("VOX_OPENCODE_WAKE_SOCKET", wedge_url.as_str()),
+            ("VOX_OPENCODE_WAKE_TOKEN", "wedge-token"),
             ("VOX_AGENT_NAME", "bob"),
         ],
         &[

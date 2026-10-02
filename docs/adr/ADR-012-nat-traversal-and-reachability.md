@@ -2,7 +2,7 @@
 
 **Status**: implemented and composed — all four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`, `crates/vox-core/src/node/{network,coordstream,circuitstream}.rs`, `crates/vox-core/src/transport/mux.rs`), proved against simulated RFC 4787 NATs; rung 2 complete including UPnP-IGD (proved against a specification-faithful in-process gateway, real-router validation pending); DHT not started (see Known gaps)
 **Date**: 2026-06-19
-**Updated**: 2026-10-01 — **the anchor principle restated** (a restatement of the original design, not a new decision): an anchor only bridges hosts both behind NAT that cannot otherwise find each other, and no create, serve, invite, join or connect requires one; prose that had drifted from it (Context (c), the Decision's 2-member sentence, Bootstrap, the honest limit, Consequences) amended to match. 2026-09-24 — each circuit's relay is recorded where the circuit is attached (`MuxSocket::attach_via`), so `vox status` names the relay carrying a relayed path (PRD-001 R35). 2026-09-24 — relay circuits carry the inner QUIC packets as **datagrams** on flows bound to each leg's circuit stream, not as frames on the stream (ADR-022 M22.2); the circuit-stream note below says what changed and why. 2026-09-21 — recorded that **preferring a direct path is deliberate and address privacy is not a goal**; a relay-mandatory "location-hidden" mode was specified and reverted the same day (see the Decision). 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
+**Updated**: 2026-10-01 — **the anchor principle restated** (a restatement of the original design, not a new decision): an anchor only bridges hosts both behind NAT that cannot otherwise find each other, and no create, serve, invite, join or connect requires one; prose that had drifted from it (Context (c), the Decision's 2-member sentence, Bootstrap, the honest limit, Consequences) amended to match; later the same day two of its known departures are gone (V210-107): a bad anchors file stops nothing, and a failed join names the board that failed instead of blaming "the anchor". 2026-09-24 — each circuit's relay is recorded where the circuit is attached (`MuxSocket::attach_via`), so `vox status` names the relay carrying a relayed path (PRD-001 R35). 2026-09-24 — relay circuits carry the inner QUIC packets as **datagrams** on flows bound to each leg's circuit stream, not as frames on the stream (ADR-022 M22.2); the circuit-stream note below says what changed and why. 2026-09-21 — recorded that **preferring a direct path is deliberate and address privacy is not a goal**; a relay-mandatory "location-hidden" mode was specified and reverted the same day (see the Decision). 2026-09-19 — status reconciled; Known gaps recorded. 2026-09-20 — member bundle record (`0x0012`, ADR-016 M14.1) added to `nat::record` and to the store policy (`BUNDLE_MAX_TTL_SECS`, `accept_bundle`, `current_bundles`, `bundle`). The rendezvous **service** (`nat::service`, ADR-016 M14.2) makes the board reachable over a typed QUIC stream. 2026-09-20 — the connection manager keeps those reads open to unknown peers by gating stream *kinds* rather than the transport (`node::net`, M14.4); the board now also serves a channel's genesis, which a cold join needs (M14.7b). 2026-09-20 (evening) — the ladder composed rung by rung: publish side (M14.8a), IPv6 pinhole + real route + renewal (M14.8b), hole punch through a coordinator (M14.9), relay circuits (M14.10), anchors as node configuration so the helpers exist (ADR-016 M15.1); Status line updated to match.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, dht, ipv6, port-mapping, relay
 
@@ -33,12 +33,16 @@ So:
   needed.
 
 **Known departures, to be fixed in v0.2.10** (found by the 2026-10-01 anchor sweep, read in code on
-`integrate/v0.2.10` 69616f40; none is fixed by this change): `vox serve` with no anchor refuses on a
-host whose only addresses are private; a join stops at the first board that lacks the room instead of
-trying the host named in the link; an anchors file whose every line is unusable stops verbs that
-need no anchor; four or more anchors push the host out of the invite link; a join waits up to 20 s for
-the host's address on the board while the link carries it; and the join failure texts blame "the
-anchor" when the board was the host.
+`integrate/v0.2.10` 69616f40): `vox serve` with no anchor refuses on a host whose only addresses are
+private; a join stops at the first board that lacks the room instead of trying the host named in the
+link; four or more anchors push the host out of the invite link; and a join waits up to 20 s for the
+host's address on the board while the link carries it.
+
+Two departures the sweep found are gone (V210-107). An anchors file whose every line is unusable no
+longer stops any verb: each bad line is named and the verb carries on with no anchor. And a join that
+reaches no board names each board it tried as the room's host or an anchor, with its addresses, and
+its advice names the one that failed: a host that did not answer is the host, an anchor is named
+only when one was tried, and a board that answered and then closed is not called unreachable.
 
 ## Circuit addressing
 
