@@ -161,11 +161,28 @@ fn hook(
     args: &[&str],
     stdin: &str,
 ) -> (bool, String, String) {
-    let mut child = Command::new(VOX)
+    hook_as(data, cfg, args, stdin, None)
+}
+
+/// [`hook`], as a session that answers to the petname `name` (`VOX_AGENT_NAME`).
+fn hook_as(
+    data: &std::path::Path,
+    cfg: &std::path::Path,
+    args: &[&str],
+    stdin: &str,
+    name: Option<&str>,
+) -> (bool, String, String) {
+    let mut cmd = Command::new(VOX);
+    match name {
+        Some(n) => cmd.env("VOX_AGENT_NAME", n),
+        None => cmd.env_remove("VOX_AGENT_NAME"),
+    };
+    let mut child = cmd
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
         .env_remove("VOX_ROOM")
+        .env_remove("VOX_SESSION")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -309,6 +326,160 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     assert!(
         out.is_empty(),
         "a quiet room must cost nothing per turn, got: {out:?}"
+    );
+
+    // (7) V030-18: a turn spends its tokens on what is addressed to the agent. Other sessions'
+    // coordination traffic goes in as one counted line; what is addressed to this session goes
+    // in full whatever its type, and prose stays in full. Every row is posted by the shipped
+    // binary's own verbs, as two other agents and a person would post it.
+    let label: String = daemon.room_key.chars().take(12).collect();
+    let run = |args: &[&str]| {
+        let (ok, _, err) = hook(&data, &cfg, args, "");
+        assert!(
+            ok,
+            "APPARATUS: staging failed, `vox {}`: {err}",
+            args.join(" ")
+        );
+    };
+    // worker-a: hello + claim, a status, then a release; worker-b: hello + claim.
+    run(&[
+        "room",
+        "claim",
+        &label,
+        "wire-codec",
+        "--session",
+        "worker-a",
+    ]);
+    run(&[
+        "room",
+        "post",
+        &label,
+        "--type",
+        "status",
+        "--session",
+        "worker-a",
+        "CHATTER-CANARY halfway through the codec",
+    ]);
+    run(&[
+        "room",
+        "claim",
+        &label,
+        "store-layer",
+        "--session",
+        "worker-b",
+    ]);
+    run(&[
+        "room",
+        "release",
+        &label,
+        "wire-codec",
+        "--session",
+        "worker-a",
+    ]);
+    // Addressed to the reader by its petname, and by its session id: in full, status or not.
+    run(&[
+        "room",
+        "post",
+        &label,
+        "--type",
+        "status",
+        "--to",
+        "reader",
+        "--session",
+        "worker-b",
+        "ADDRESSED-STATUS your review is next",
+    ]);
+    run(&[
+        "room",
+        "post",
+        &label,
+        "--to",
+        "codex-session-1",
+        "--session",
+        "worker-b",
+        "ADDRESSED-SAY ping me when the codec lands",
+    ]);
+    // Prose to the room, and a request to someone else: never collapsed.
+    run(&[
+        "room",
+        "post",
+        &label,
+        "PROSE-CANARY the build is green again",
+    ]);
+    run(&[
+        "room",
+        "post",
+        &label,
+        "--type",
+        "ask",
+        "--to",
+        "someone-else",
+        "--session",
+        "worker-b",
+        "OTHER-ASK which branch?",
+    ]);
+    let (ok, all, err) = hook(&data, &cfg, &["room", "read", &label], "");
+    assert!(ok, "APPARATUS: room read failed: {err}");
+    let staged = all.lines().count();
+    let (ok, out, err) = hook_as(
+        &data,
+        &cfg,
+        &["agent", "hook", "--room", &room, "--format", "text"],
+        &codex_input("codex-session-1"),
+        Some("reader"),
+    );
+    assert!(ok, "APPARATUS: the hook failed: {err}");
+    eprintln!(
+        "[proof] V030-18 injected {} bytes for 10 unread rows (6 chatter, 4 full):\n{out}",
+        out.len()
+    );
+    for want in [
+        "ADDRESSED-STATUS",
+        "ADDRESSED-SAY",
+        "PROSE-CANARY",
+        "OTHER-ASK",
+    ] {
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.starts_with('[') && l.contains(want))
+                .count(),
+            1,
+            "PRODUCT: `{want}` must reach the agent as one full row; the drain injected:\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("CHATTER-CANARY"),
+        "PRODUCT: another session's status was injected in full, not counted:\n{out}"
+    );
+    let summary = format!(
+        "6 coordination message(s) from other sessions, not shown (2 claim, 2 hello, 1 release, \
+         1 status); `vox room read {label}` has them"
+    );
+    assert!(
+        out.lines().any(|l| l == summary),
+        "PRODUCT: the chatter must go in as the one line {summary:?}; the drain injected:\n{out}"
+    );
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with('[')).count(),
+        4,
+        "PRODUCT: exactly the four addressed and prose rows go in full:\n{out}"
+    );
+    // The cursor passed what was counted as surely as what was shown.
+    let (ok, again, _) = hook_as(
+        &data,
+        &cfg,
+        &["agent", "hook", "--room", &room, "--format", "text"],
+        &codex_input("codex-session-1"),
+        Some("reader"),
+    );
+    assert!(
+        ok && again.is_empty(),
+        "PRODUCT: counted rows came back next turn:\n{again}"
+    );
+    // `vox room read` still has the whole of what was counted.
+    assert!(
+        all.contains("CHATTER-CANARY"),
+        "PRODUCT: `vox room read` lacks the status the drain counted ({staged} lines):\n{all}"
     );
 
     // (6) the remaining failures: still exit 0, still inject nothing.
