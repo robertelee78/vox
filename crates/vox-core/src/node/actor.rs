@@ -225,6 +225,7 @@ fn over_of(ch: &ChannelState) -> Option<String> {
 /// added since when it has (V210-120). A room's timeline only grows at its end, so the published
 /// one is a prefix of it: rebuilding it whole made every message cost the room's whole history.
 fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
+    let (frozen, refused_below_checkpoint) = ch.fork_watch();
     // A room with a message not received yet (V030-10) is shown with it in place, rebuilt each
     // time: filling one in changes a row inside the timeline, so the published one is no longer
     // a prefix of it. Only a timeline with none on either side may be shared or extended.
@@ -269,6 +270,10 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         creator: ch.genesis().creator_pubkey().fingerprint(),
         consented: ch.consented().into_iter().collect(),
         admins: ch.admins(),
+        retention: ch.effective_retention(),
+        key_generations: ch.key_generations(),
+        frozen,
+        refused_below_checkpoint,
     }
 }
 
@@ -11931,25 +11936,17 @@ impl Node {
                     last_sync: self.status.member_synced.get(m).copied(),
                 })
                 .collect();
-            let watch = self
-                .channels
-                .get(&room.channel_id)
-                .and_then(|shared| shared.try_lock().ok().map(|c| c.fork_watch()));
+            // From the room as last published, never its lock: a sync session holds that lock
+            // while it runs, and a status read must not wait on it or come back blank (#58).
             report.rooms.push(RoomStatus {
                 id: room.channel_id,
                 name: room.local_name.clone(),
                 epoch: room.epoch,
                 last_sync: self.status.room_synced.get(&room.channel_id).copied(),
-                retention: self
-                    .channels
-                    .get(&room.channel_id)
-                    .and_then(|shared| shared.try_lock().ok().map(|c| c.effective_retention())),
-                key_generations: self
-                    .channels
-                    .get(&room.channel_id)
-                    .and_then(|shared| shared.try_lock().ok().map(|c| c.key_generations())),
-                frozen: watch.as_ref().map(|(f, _)| f.clone()),
-                refused_below_checkpoint: watch.map(|(_, n)| n),
+                retention: room.retention,
+                key_generations: room.key_generations,
+                frozen: room.frozen.clone(),
+                refused_below_checkpoint: room.refused_below_checkpoint,
                 members,
             });
         }
@@ -12147,6 +12144,9 @@ impl Node {
         };
         let mut pruned = 0usize;
         let mut checkpointed: Vec<Digest32> = Vec::new();
+        // A node retention applied here changes what `vox status` reports from the published
+        // view, so it is published even when it prunes nothing yet.
+        let mut applied = false;
         for (cid, shared) in &self.channels {
             // A room mid-session is skipped, not waited for: the actor must not park behind a
             // sync, and the next tick comes round in a second.
@@ -12155,6 +12155,7 @@ impl Node {
             };
             if self.retention_dirty.remove(cid) {
                 ch.set_node_retention(self.node_retention.for_room(cid));
+                applied = true;
             }
             // **A node may keep less than its room, never more** (V030-32). A file value above the
             // room's is ignored — the shorter wins — and the node says so, once.
@@ -12191,7 +12192,7 @@ impl Node {
         for cid in &checkpointed {
             self.note_local_append(cid);
         }
-        pruned > 0 || !checkpointed.is_empty()
+        pruned > 0 || !checkpointed.is_empty() || applied
     }
 
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {

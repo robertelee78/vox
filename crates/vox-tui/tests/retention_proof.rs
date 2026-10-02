@@ -171,6 +171,53 @@ fn until(dir: &Path, room: &str, what: &str, secs: u64, done: impl Fn(&[String])
     );
 }
 
+/// What a stream of `vox status --json` reads on one node showed while it synced: how many reads
+/// listed a room, and the first room listed **without** its retention, keys held, frozen members
+/// or refusals below a checkpoint. A sync session holds a room's lock while it runs; a status read
+/// must answer for the room anyway, never with a `null` (#58).
+struct StatusWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<(usize, Option<String>)>,
+}
+
+impl StatusWatch {
+    fn start(dir: &Path) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (dir, flag) = (dir.to_path_buf(), std::sync::Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            let (mut listed, mut first_null) = (0usize, None);
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) && first_null.is_none() {
+                let (ok, out, _) = vox(&dir, &["status", "--json"], None);
+                let Some(v) = ok
+                    .then(|| serde_json::from_str::<serde_json::Value>(&out).ok())
+                    .flatten()
+                else {
+                    continue;
+                };
+                for room in v["rooms"].as_array().into_iter().flatten() {
+                    listed += 1;
+                    let whole = room["retention"].is_u64()
+                        && room["key_generations"].is_u64()
+                        && room["frozen"].is_array()
+                        && room["refused_below_checkpoint"].is_u64();
+                    if !whole {
+                        first_null = Some(room.to_string());
+                    }
+                }
+            }
+            (listed, first_null)
+        });
+        Self { stop, handle }
+    }
+
+    fn finish(self) -> (usize, Option<String>) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle
+            .join()
+            .expect("APPARATUS: the status watcher thread panicked")
+    }
+}
+
 fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
     assert!(ok, "PRODUCT (staging): vox room post {text:?}: {err}");
@@ -266,6 +313,9 @@ fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
     std::thread::sleep(Duration::from_secs(45));
 
     // ---- 60 more, then 30 s retention: the 40 are 45 s old, the 60 a few seconds ------------
+    // bob's `vox status --json`, read over and over while these 60 sync to him: every read that
+    // lists the room must name its retention and the rest, sessions or not (#58).
+    let watch = StatusWatch::start(&bob);
     for i in 1..=60 {
         post(&alice, &room, &format!("new {i}"));
     }
@@ -275,6 +325,21 @@ fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
         "PRODUCT (staging): bob to read all 100",
         60,
         |t| count(t, "old ") + count(t, "new ") == 100,
+    );
+    let (listed, first_null) = watch.finish();
+    println!(
+        "bob's `vox status --json` while the 60 synced: {listed} room readings; first blank: \
+         {first_null:?}"
+    );
+    assert!(
+        first_null.is_none(),
+        "PRODUCT: bob's `vox status --json`, read while the room synced, listed the room with a \
+         blank (null) retention, keys held, frozen members or refusals: {}",
+        first_null.unwrap_or_default()
+    );
+    assert!(
+        listed > 0,
+        "PRODUCT (staging): bob's `vox status --json` never listed the room while it synced"
     );
     let (ok, out, err) = vox(&alice, &["room", "retention", &room, "30"], None);
     assert!(ok, "PRODUCT: the admin's vox room retention 30: {err}");
@@ -403,18 +468,25 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     let first = {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let (ok, out, _) = vox(&alice, &["status", "--json"], None);
-            let v: serde_json::Value = if ok {
-                serde_json::from_str(&out).unwrap_or_default()
-            } else {
-                serde_json::Value::Null
-            };
-            if let Some(r) = v["rooms"][0]["retention"].as_u64() {
-                break r;
+            // The room may still be reopening, which lists no room yet; once it is listed it must
+            // name its retention, also while a session holds it (#58).
+            let (ok, out, err) = vox(&alice, &["status", "--json"], None);
+            assert!(ok, "PRODUCT: alice's `vox status --json` failed: {err}");
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| {
+                panic!("PRODUCT: alice's `vox status --json` did not parse ({e}): {out}")
+            });
+            if let Some(room) = v["rooms"].get(0) {
+                break room["retention"].as_u64().unwrap_or_else(|| {
+                    panic!(
+                        "PRODUCT: alice's `vox status --json` lists her reopened room with no \
+                         retention: {room}"
+                    )
+                });
             }
             assert!(
                 Instant::now() < deadline,
-                "PRODUCT (staging): alice's `vox status --json` never named a retention within 30 s"
+                "PRODUCT (staging): alice's `vox status --json` listed no room within 30 s of her \
+                 restart"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
