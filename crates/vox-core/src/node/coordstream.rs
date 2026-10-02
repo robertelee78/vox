@@ -444,6 +444,37 @@ async fn copy_coord(mut recv: RecvStream, mut send: SendStream) {
     let _ = send.finish();
 }
 
+/// Dial-backs this process has asked for and had answered, per target peer (`vox status --json`'s
+/// `reach.dial_backs` and `reach.dial_backs_answered`, V030-22): a reach with no direct path of
+/// its own asks the peer, through a coordinator, to dial it back, before any circuit is asked for.
+/// Asked is a session the coordinator relayed; answered is one whose peer completed the exchange
+/// and fired its dial. One process is one node, so a process-wide count is that node's.
+static DIAL_BACKS: std::sync::Mutex<std::collections::BTreeMap<Digest32, (u64, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Count a dial-back to `peer`: `asked` once its session is relayed, `answered` once the peer
+/// completed the exchange.
+pub fn count_dial_back(peer: Digest32, answered: bool) {
+    let mut all = DIAL_BACKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let row = all.entry(peer).or_default();
+    if answered {
+        row.1 += 1;
+    } else {
+        row.0 += 1;
+    }
+}
+
+/// This node's dial-backs per target peer: (asked, answered).
+#[must_use]
+pub fn dial_backs() -> std::collections::BTreeMap<Digest32, (u64, u64)> {
+    DIAL_BACKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// Open a punch session to `target` through `coordinator`: the `RELAY` ask and the
 /// `RELAYING` acknowledgement, leaving the streams ready for
 /// [`run_punch_initiator`].
@@ -483,7 +514,9 @@ pub async fn run_punch_initiator(
     send_coord(send, &opening).await?;
     let peer_observed = match recv_coord(recv).await? {
         CoordMessage::Connect { observed } => observed,
-        CoordMessage::Sync => return Err(Error::HolePunchFailed("coord: Sync before Connect")),
+        CoordMessage::Sync | CoordMessage::Dialled { .. } => {
+            return Err(Error::HolePunchFailed("coord: Sync before Connect"))
+        }
     };
     let rtt = started.elapsed();
     match coordinator.on_peer_connect(&peer_observed, Some(rtt))? {
@@ -507,7 +540,9 @@ pub async fn run_punch_responder(
     let mut coordinator = Coordinator::new(Role::Responder, local);
     let peer_observed = match recv_coord(recv).await? {
         CoordMessage::Connect { observed } => observed,
-        CoordMessage::Sync => return Err(Error::HolePunchFailed("coord: Sync before Connect")),
+        CoordMessage::Sync | CoordMessage::Dialled { .. } => {
+            return Err(Error::HolePunchFailed("coord: Sync before Connect"))
+        }
     };
     match coordinator.on_peer_connect(&peer_observed, None)? {
         Step::Send(reply) => send_coord(send, &reply).await?,
@@ -517,7 +552,7 @@ pub async fn run_punch_responder(
     }
     match recv_coord(recv).await? {
         CoordMessage::Sync => {}
-        CoordMessage::Connect { .. } => {
+        CoordMessage::Connect { .. } | CoordMessage::Dialled { .. } => {
             return Err(Error::HolePunchFailed("coord: duplicate Connect"))
         }
     }
@@ -526,6 +561,23 @@ pub async fn run_punch_responder(
         Step::Send(_) | Step::SyncThenPunch { .. } => {
             Err(Error::HolePunchFailed("coord: responder out of sequence"))
         }
+    }
+}
+
+/// The responder's last word (V030-22): whether its dial back connected. Best effort — the
+/// initiator bounds its wait in any case.
+pub async fn send_dial_outcome(send: &mut SendStream, reached: bool) -> Result<()> {
+    send_coord(send, &CoordMessage::Dialled { reached }).await?;
+    let _ = send.finish();
+    Ok(())
+}
+
+/// The initiator's wait for the responder's [`send_dial_outcome`]: whether the peer's dial back
+/// connected.
+pub async fn recv_dial_outcome(recv: &mut RecvStream) -> Result<bool> {
+    match recv_coord(recv).await? {
+        CoordMessage::Dialled { reached } => Ok(reached),
+        _ => Err(Error::HolePunchFailed("coord: not a dial outcome")),
     }
 }
 

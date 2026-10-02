@@ -31,9 +31,16 @@
 //! next one is at most 60 s away: [`UPGRADED_WITHIN`] = 75 s and [`TRIED_AGAIN_WITHIN`] = 75 s allow
 //! that interval and 15 s of margin, written here as literals so a longer interval goes red.
 //!
+//! - **the relay is not held back** (V210-122): with the forward closed, a `vox forward` reaches the
+//!   host over the anchor's circuit within [`RELAYED_REACH_WITHIN`] = 1000 ms, and the anchor
+//!   carries that circuit. The direct dial's head start is the whole extra cost.
+//!
 //! **The mutations that must turn it red:** `retry_upgrades_if_due` returning at once (nothing
 //! retries — no second attempt, and the opened forward is never found); and `UPGRADE_RETRY` raised
-//! to 600 s (the retry comes too late for both bounds).
+//! to 600 s (the retry comes too late for both bounds). And for V210-122: `DIRECT_HEAD_START` raised
+//! to 2 s, so the relay is held back past the bound. And for V030-22: the initiator of a dial-back
+//! holding its circuits for its own dial after the peer said its dial failed (`Dialled { reached:
+//! false }`) — measured 3017 ms, red past the same bound.
 //!
 //! Replaces `crates/vox-core/tests/relayed_path_is_retried.rs`, which ran every node in process on
 //! a NAT simulator with an injected clock.
@@ -70,6 +77,46 @@ const FIRST_ATTEMPT_WITHIN: Duration = Duration::from_secs(90);
 /// Big enough that a request which rode the forward is unmistakable in its byte count.
 const PAYLOAD: usize = 16 * 1024;
 
+/// How long a `vox forward` may take to reach the host when only the anchor's circuit can (V210-122):
+/// the direct dial's 250 ms head start, the circuit (measured: 255 ms and 268 ms in all on the
+/// candidate), and margin for a loaded box. A number, not the product constant: a longer head start
+/// goes red.
+const RELAYED_REACH_WITHIN: Duration = Duration::from_millis(1000);
+
+/// Start the guest's `vox forward` to the host's service through the closed forward, and read how
+/// long it says reaching the host took; it is returned still running, for the caller to stop.
+fn relayed_reach_ms(w: &ForwardedWorld) -> (u128, world::VoxProc) {
+    use world::{args, room_pass_file, VoxProc};
+    let mut fwd = VoxProc::spawn(
+        "forward",
+        &w.guest_dir,
+        &args(&[
+            "forward",
+            &w.room,
+            &w.host_fp,
+            &w.service_port.to_string(),
+            "127.0.0.1:0",
+            "--passphrase-file",
+            &room_pass_file(&w.guest_dir, &w.passphrase),
+            "--anchor",
+            &w.anchor.v6_spec,
+            "--listen",
+            "[::1]:0",
+        ]),
+    );
+    let line = fwd.expect_line(
+        "`vox forward` saying how long reaching the host took",
+        |l| l.contains("vox: reached ") && l.contains(" ms ("),
+    );
+    let ms = line
+        .split(" in ")
+        .nth(1)
+        .and_then(|r| r.split(" ms").next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: no duration in `vox forward`'s line {line:?}"));
+    (ms, fwd)
+}
+
 fn is_still_relayed(l: &str) -> bool {
     l.starts_with("! vox: still relayed to")
 }
@@ -86,6 +133,26 @@ fn a_relayed_pair_finds_a_direct_path_once_one_becomes_possible() {
     );
     let hostname = w.hostname();
     let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
+
+    // **The relay is not held back for long** (V210-122). A direct dial now gets a head start
+    // before any circuit is asked for; for a pair that cannot reach each other directly, that head
+    // start is the whole cost. A `vox forward` says how long reaching the host took; through the
+    // closed forward, only the anchor's circuit can reach it, and it must still do so promptly.
+    let (reached_ms, mut fwd) = relayed_reach_ms(&w);
+    eprintln!(
+        "[proof] `vox forward` reached the host over the anchor's circuit in {reached_ms} ms"
+    );
+    // Read while the forward still holds its circuit: stopped, it closes it.
+    w.anchor
+        .assert_relayed("after `vox forward` reached the host");
+    interrupt(&mut fwd, Duration::from_secs(15));
+    drop(fwd);
+    assert!(
+        reached_ms < RELAYED_REACH_WITHIN.as_millis(),
+        "PRODUCT: a pair with no direct path took {reached_ms} ms to reach each other through the \
+         anchor, past {RELAYED_REACH_WITHIN:?}: the direct dial's head start held the relay back"
+    );
+
     let (mut up, proxy, _ready) = w.up("up");
 
     // Relayed, observed three ways.
