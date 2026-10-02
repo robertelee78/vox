@@ -154,8 +154,12 @@ fn dial_back_is_asked_for(w: &mut ForwardedWorld) {
 
 /// How many fresh guests [`dial_back_is_asked_for`] stages before it says it could not measure.
 const STAGINGS: usize = 5;
-/// The forward's one-way latency, guest to host, while a dial-back is staged: a real path's.
-const STAGING_DELAY: Duration = Duration::from_millis(200);
+/// The forward's one-way latency, guest to host, while a dial-back is staged: a real path's, and
+/// short enough that a direct handshake over it (two flights, measured about 2× this plus the
+/// crypto) lands well inside the direct dial's 250 ms head start (V210-122). At 200 ms a guest's own
+/// direct dial took over 400 ms, its circuit started on the head start's expiry, and the anchor
+/// carried it — the head start's designed limit, not this claim.
+const STAGING_DELAY: Duration = Duration::from_millis(50);
 
 enum Staging {
     /// Measured and asserted.
@@ -167,39 +171,7 @@ enum Staging {
 /// One staging, with a fresh guest `carol-<n>`: see [`dial_back_is_asked_for`].
 fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
     use world::{args, room_pass_file, vox_once, VoxProc};
-    let carol = w.tmp.path().join(format!("carol-{n}"));
-    world::mkdir(&carol.join("cfg"));
-    let carol_fp = world::fingerprint(&carol, "carol");
-    let (ok, out, err) = vox_once(
-        &w.host_dir,
-        &args(&["trust", "add", &carol_fp, "--name", &format!("carol-{n}")]),
-    );
-    assert!(
-        ok,
-        "CANNOT MEASURE: the host's `vox trust add` of carol:\n{out}{err}"
-    );
-    let anchor_only = without_entry_of(&w.address, &w.host_fp);
-    assert!(
-        !anchor_only.contains(&format!("a={}", w.host_fp)),
-        "CANNOT MEASURE: the host's entry is still in carol's address: {anchor_only}"
-    );
-    let (ok, out, err) = vox_once(
-        &carol,
-        &args(&[
-            "connect",
-            &anchor_only,
-            "--passphrase-file",
-            &room_pass_file(&carol, &w.passphrase),
-            "--anchor",
-            &w.anchor.v6_spec,
-            "--listen",
-            "[::1]:0",
-        ]),
-    );
-    assert!(
-        ok,
-        "CANNOT MEASURE: carol could not join from the anchor-only address:\n{out}{err}"
-    );
+    let (carol, carol_fp) = anchor_only_guest(w, &format!("carol-{n}"));
     // Counted from before carol comes online: the host reaches for her as soon as she does.
     let before = (
         reach_count(&w.host_dir, &carol_fp, "the host", "circuits"),
@@ -275,6 +247,103 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
         w.anchor.proc.transcript()
     );
     Staging::Staged
+}
+
+/// A guest, `name`, trusted by the host and joined from an address that names **only the anchor**
+/// (the host's own entries taken out): its room holds no address for the host, so whatever it
+/// knows of where the host is, it must learn from a board. Returns its profile and fingerprint.
+fn anchor_only_guest(w: &ForwardedWorld, name: &str) -> (std::path::PathBuf, String) {
+    use world::{args, room_pass_file, vox_once};
+    let carol = w.tmp.path().join(name);
+    world::mkdir(&carol.join("cfg"));
+    let carol_fp = world::fingerprint(&carol, name);
+    let (ok, out, err) = vox_once(
+        &w.host_dir,
+        &args(&["trust", "add", &carol_fp, "--name", name]),
+    );
+    assert!(
+        ok,
+        "CANNOT MEASURE: the host's `vox trust add` of {name}:\n{out}{err}"
+    );
+    let anchor_only = without_entry_of(&w.address, &w.host_fp);
+    assert!(
+        !anchor_only.contains(&format!("a={}", w.host_fp)),
+        "CANNOT MEASURE: the host's entry is still in {name}'s address: {anchor_only}"
+    );
+    let (ok, out, err) = vox_once(
+        &carol,
+        &args(&[
+            "connect",
+            &anchor_only,
+            "--passphrase-file",
+            &room_pass_file(&carol, &w.passphrase),
+            "--anchor",
+            &w.anchor.v6_spec,
+            "--listen",
+            "[::1]:0",
+        ]),
+    );
+    assert!(
+        ok,
+        "CANNOT MEASURE: {name} could not join from the anchor-only address:\n{out}{err}"
+    );
+    (carol, carol_fp)
+}
+
+/// **A node reads the board before it bridges** (V030-22, #335). Dave joins from an anchor-only
+/// address, so his node holds no address for the host, and starts a `vox forward` to the host's
+/// service — which reaches the host the moment it starts. The host's only address dave can use is
+/// its record on the anchor's board (the forward it advertises); the host cannot dial dave at all
+/// (`[::1]`), so a dial-back cannot help either. Asserted: the forward reached the host, dave asked
+/// for **no** circuit to it, and the anchor carried none from the forward's start. Without the board
+/// read, the reach knows no address, its dial-back fails, and it bridges.
+#[test]
+#[ignore = "production Argon2id + a real PoW, a third member staged; run in release"]
+fn a_node_reads_the_board_before_bridging() {
+    use world::{args, room_pass_file, VoxProc};
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
+    watchdog::arm();
+    let mut w = ForwardedWorld::new(true);
+    let (dave, _dave_fp) = anchor_only_guest(&w, "dave");
+    let mark = w.anchor.mark();
+    let mut fwd = VoxProc::spawn(
+        "dave-forward",
+        &dave,
+        &args(&[
+            "forward",
+            &w.room,
+            &w.host_fp,
+            &w.service_port.to_string(),
+            "127.0.0.1:0",
+            "--passphrase-file",
+            &room_pass_file(&dave, &w.passphrase),
+            "--anchor",
+            &w.anchor.v6_spec,
+            "--listen",
+            "[::1]:0",
+        ]),
+    );
+    let reached = fwd.expect_line("dave's `vox forward` saying it reached the host", |l| {
+        l.contains("vox: reached ") && l.contains(" ms (")
+    });
+    let asked = circuits_asked(&dave, &w.host_fp, "dave's `vox forward`");
+    let dial_backs = reach_count(&dave, &w.host_fp, "dave's `vox forward`", "dial_backs");
+    std::thread::sleep(Duration::from_secs(2));
+    let carried = w.anchor.circuits_since(mark, Duration::from_secs(2));
+    eprintln!(
+        "[proof] dave's forward: {reached}; it asked for {asked} circuit(s) and {dial_backs} \
+         dial-back(s) to the host; the anchor carried up to {carried}"
+    );
+    let said = fwd.transcript();
+    interrupt(&mut fwd, Duration::from_secs(15));
+    assert!(
+        asked == 0 && carried == 0,
+        "PRODUCT: dave's node held no address for the host, and the host's board record on the \
+         anchor gave one dave could dial; it must read the board and go direct, yet it asked for \
+         {asked} circuit(s) ({dial_backs} dial-back(s)) and the anchor carried up to {carried}.\n\
+         dave:\n{said}\nanchor:\n{}",
+        w.anchor.proc.transcript()
+    );
 }
 
 /// `address` with `who`'s entry (its `a=` and the `b=` addresses after it) taken out.
