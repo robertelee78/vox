@@ -45,11 +45,15 @@
 //! - **one client dying disturbs no other** (RP-18): across the first's three SIGKILLs it
 //!   keeps running and ends holding every one of the 1,800 messages, with no restart.
 //!
-//! And across the node's restart: `read --json` holds every row it held before **at the
-//! same position**, and `tail --since` the
-//! consumer's pre-restart cursor resumes with exactly the rows that followed it. The order
-//! is local and is rebuilt from the sealed cache on reopen; without this the cursor's
-//! meaning across a reboot was read from the code, not proved.
+//! And across the node's restart (ADR-021 F19, on ADR-023's one order): a room is shown in one
+//! deterministic order, and a cursor means **what arrived after it** (`--since` is
+//! arrival-based, so a late row that lands *above* the cursor in the room's order is still
+//! after it). Both are rebuilt from the sealed cache when the node reopens. So the proof stages
+//! a cursor with a late row after it: bob's own post, which bob holds before alice's earlier
+//! one reaches him. It asserts:
+//! - `vox room read` shows every row in **the same order** after the restart;
+//! - `tail --since` that cursor resumes with **exactly the rows that arrived after it, in the
+//!   order they arrived**, the late row included.
 //!
 //! Every red says whose it is: `PRODUCT:` for what the node or `vox room tail` did,
 //! `CANNOT MEASURE:` for staging that was not achieved.
@@ -668,48 +672,51 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             })
             .collect()
     };
+    let rows_with = |rows: &[serde_json::Value], text: &str| -> String {
+        rows.iter()
+            .find(|x| x["text"].as_str() == Some(text))
+            .and_then(|x| x["entry_hash"].as_str())
+            .unwrap_or_else(|| {
+                panic!("PRODUCT (staging): bob's `room read --json` has no {text:?}")
+            })
+            .to_owned()
+    };
     let held = order(bob);
     let before = hashes(&held);
-    let mut canonical = held.clone();
-    canonical.sort_by_key(|x| {
-        (
-            x["created_millis"].as_u64().unwrap_or_else(|| {
-                panic!("PRODUCT: a row of `room read --json` has no created_millis: {x}")
-            }),
-            x["entry_hash"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!("PRODUCT: a row of `room read --json` has no entry_hash: {x}")
-                })
-                .to_owned(),
-        )
-    });
-    let off_canonical = before
+    // The cursor a consumer of bob's node holds partway through the interleave: bob's own post,
+    // processed when it arrived. What follows it is what arrived after it, in arrival order:
+    // `room read --since` reads it so.
+    let mid = rows_with(&held, "F19 bob 10");
+    let since = |w: &Worker| -> Vec<String> {
+        let o = w.vox(None, &["room", "read", &r, "--since", &mid, "--json"]);
+        assert!(o.ok, "PRODUCT: `room read --since` failed: {o:?}");
+        hashes(&o.ndjson())
+    };
+    let followed = since(bob);
+    // The late rows: arrived after the cursor, but above it in the room's order. A node that
+    // rebuilt "after the cursor" from the room's order on reopen would skip them for good.
+    let place = |h: &str| before.iter().position(|x| x == h);
+    let at_mid = place(&mid).expect("APPARATUS: the cursor was taken from bob's own rows");
+    let late: Vec<&String> = followed
         .iter()
-        .zip(hashes(&canonical))
-        .filter(|(a, b)| **a != *b)
-        .count();
-    // The consumer's persisted cursor: the last row it processed, before the interleave.
-    let followed: Vec<String> = before
-        .iter()
-        .skip_while(|h| **h != cursor)
-        .skip(1)
-        .cloned()
+        .filter(|h| place(h).is_some_and(|i| i < at_mid))
         .collect();
     eprintln!(
-        "[proof] before bob's node restarts: {} rows, {off_canonical} of them off canonical \
-         order; {} rows follow the consumer's cursor",
+        "[proof] before bob's node restarts: {} rows; {} arrived after the cursor (bob's post \
+         10), {} of them above it in the room's order",
         before.len(),
-        followed.len()
+        followed.len(),
+        late.len()
     );
     assert!(
-        off_canonical > 0,
-        "CANNOT MEASURE (staging not achieved): bob's local order equals canonical order, so a node \
-         that rebuilt it canonically on reopen could not be told apart"
+        !late.is_empty(),
+        "CANNOT MEASURE (staging not achieved): no row that arrived after the cursor sits above it \
+         in the room's order, so a node that read \"after the cursor\" by position could not be \
+         told apart"
     );
     assert!(
-        followed.len() >= 40,
-        "CANNOT MEASURE (staging not achieved): only {} rows follow the consumer's cursor {cursor}",
+        followed.len() >= 10,
+        "CANNOT MEASURE (staging not achieved): only {} rows arrived after the cursor {mid}",
         followed.len()
     );
 
@@ -729,15 +736,15 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         .collect();
     assert!(
         moved.is_empty(),
-        "PRODUCT: {} of {} rows are at a different position in `read --json` after the restart \
-         (first at {:?})",
+        "PRODUCT: {} of {} rows are at a different place in `vox room read` after the restart \
+         (first at {:?}): the room's one order did not survive it",
         moved.len(),
         before.len(),
         moved.first()
     );
 
-    // The consumer resumes from its pre-restart cursor and gets exactly what followed it.
-    let mut run = start(bob, &r, &cursor, &stderr);
+    // The consumer resumes from its cursor and gets exactly what arrived after it, in order.
+    let mut run = start(bob, &r, &mid, &stderr);
     let mut resumed = Vec::new();
     while resumed.len() < followed.len() {
         let Ok(line) = run.rx.recv_timeout(Duration::from_secs(20)) else {
@@ -757,18 +764,22 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     }
     let _ = run.child.kill();
     let _ = run.child.wait();
+    let late_resumed = late.iter().filter(|h| resumed.contains(h)).count();
     eprintln!(
-        "[proof] after the restart: same {} rows in the same order, \
-         tail --since the consumer's cursor resumed with {} of {} rows",
+        "[proof] after the restart: the same {} rows in the same order; tail --since the cursor \
+         resumed with {} of {} rows, {late_resumed} of the {} late",
         before.len(),
         resumed.len(),
-        followed.len()
+        followed.len(),
+        late.len()
     );
     assert!(
         resumed == followed,
-        "PRODUCT: `tail --since` the consumer's pre-restart cursor did not resume with exactly \
-         the rows that followed it: {} of {} rows, {resumed:?} against {followed:?}",
+        "PRODUCT: `tail --since` a cursor held across the restart did not resume with exactly \
+         the rows that arrived after it, in that order: {} of {} rows ({late_resumed} of the {} \
+         late), {resumed:?} against {followed:?}",
         resumed.len(),
-        followed.len()
+        followed.len(),
+        late.len()
     );
 }
