@@ -1,247 +1,179 @@
 # ADR-011: Transport Substrate
 
-**Status**: implemented (M9, `crates/vox-core/src/transport/`)
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status**: built (M9, `crates/vox-core/src/transport/`), except where a requirement says
+otherwise: the Vox IANA Private Enterprise Number (requirement 6), the session record's observed
+group (requirement 12) and the interop matrix (requirement 14) are not built. A TCP fallback
+(requirement 2) does not exist.
 **Date**: 2026-06-19
-**Updated**: 2026-09-25 — **path-MTU discovery searches to 8192 bytes and the UDP socket buffers are 4 MiB** (PRD-001 R41; see "Throughput (R41)" under Implementation notes). 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline). 2026-09-20 — stream framing lifted into `transport::framing`; typed streams (`transport::streams`, ADR-016 M14.2). 2026-09-24 — the datagram sequence number and replay window are **removed** (ADR-022 M22.1): datagrams travel on stream-bound flows routed by one reader per connection; see §"Datagram flows". 2026-09-19 — Implementation notes (M9) added; datagram sequence framing + anti-replay window moved into the connection (was caller discipline). 2026-09-20 — stream framing lifted into `transport::framing`; typed streams (`transport::streams`, ADR-016 M14.2).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
 
 ## Context
 
-Vox must carry two workloads over one overlay (ADR-001): low-latency *interactive* tunnels (`ssh`
-over Vox, ADR-013) and *store-and-forward* log replication (ADR-008), with different
-reliability/latency contracts, without one degrading the other. It must compose with identity
-(ADR-002), the messaging crypto core (ADR-004), and NAT traversal (ADR-012). A prior review
-correctly flagged that "key the QUIC streams from PQXDH/Noise/QUIC-TLS, pending validation" was not
-a security spec but a false deferral. This ADR specifies the concrete transport security design.
-Grounded in the libp2p TLS spec, IETF `draft-ietf-tls-ecdhe-mlkem`, and RFC 7250.
+Vox carries two workloads over one overlay (ADR-001): low-latency interactive tunnels (ADR-013) and
+store-and-forward log replication (ADR-008). They have different reliability and latency contracts,
+and neither may degrade the other. The transport composes with identity (ADR-002), the messaging
+crypto core (ADR-004) and NAT traversal (ADR-012). This ADR is the concrete transport security
+design, grounded in the libp2p TLS specification, IETF `draft-ietf-tls-ecdhe-mlkem` and RFC 7250.
 
-## Decision
+## Requirements
 
 ### Substrate = QUIC
 
-A single QUIC connection per peer provides built-in security plus transport-level multiplexing of
-independent, ordered, reliable streams with no head-of-line blocking between streams (RFC 9000/9308).
-Each tunneled byte stream (ADR-013) and the log-sync traffic (ADR-008) get their own stream; with
-QUIC no separate stream muxer is needed. (TCP fallback, if ever required, uses yamux — never mplex,
-which lacks per-stream backpressure — but QUIC is primary.)
+1. **Substrate = QUIC.** Vox MUST use one QUIC connection per peer (RFC 9000/9308). Each tunneled byte stream (ADR-013)
+   and the log-sync traffic (ADR-008) MUST get their own stream; no separate stream muxer is used.
+2. If a TCP fallback is ever added, it MUST use yamux and MUST NOT use mplex (no per-stream
+   backpressure). QUIC is primary.
+3. **Two contracts on one connection.** Reliable, ordered QUIC streams MUST carry bulk traffic (log replication, file transfer); RFC 9221
+   datagrams carry low-latency, loss-tolerant flows, under the same handshake. Bulk traffic MUST be
+   kept off interactive flows by separate streams. Separate QUIC connections SHOULD be used only
+   where differential network treatment (DSCP/QoS) is genuinely required, since QUIC has one
+   congestion controller per connection; otherwise the connection count SHOULD be minimal.
 
 ### Transport security (concrete)
 
-- **PQ-hybrid key exchange.** The QUIC TLS 1.3 handshake uses the hybrid named group
-  **X25519MLKEM768** (code point 0x11EC): the key-schedule secret is `concat(ML-KEM-768 secret,
-  X25519 secret)`, secure if *either* component holds — PQ confidentiality for the transport from day
-  one. Only hybrid PQ groups are offered or accepted (no classical-only group), so there is no
-  downgrade target.
-- **Identity authentication (libp2p-style, no CA/PKI).** Each peer presents a **self-signed
-  certificate carrying its Vox identity public key in a custom X.509 extension**, and signs
-  `"vox-tls-handshake:" ‖ cert_public_key` with its **identity private key** (the composite
-  Ed25519+ML-DSA key, ADR-002) — a proof-of-possession that binds the ephemeral TLS certificate key
-  to the long-term Vox identity. The PoP string `"vox-tls-handshake:" ‖ cert_public_key` is a
-  **TLS-layer signed string, deliberately outside** the ADR-008 CBOR struct-domain regime (it is not a
-  log struct). **Extension layout (concrete):** OID **`1.3.6.1.4.1.<VOX-PEN>.1.1`** where `<VOX-PEN>` is
-  a **Vox-owned IANA Private Enterprise Number** (registration pending; until assigned, builds use the
-  documented provisional arc and the interop matrix pins the exact OID — Vox does **not** squat on
-  libp2p's PEN 53594), `critical = false`, value = canonical-CBOR (ADR-008, tag `0x0009`)
-  `{ composite_pubkey, pop_sig }` (ADR-003 `0x03/0x04` composite encodings). The verifier derives the Vox
-  identity from the extension and **MUST require it to match the expected peer, aborting on mismatch**
-  (ADR-008 error `0x05`). This authenticates Vox identities without a CA and without RFC-7250's
-  out-of-band gap. (Production Rust prior art: the `libp2p-tls` crate's extension mechanism.)
-- **PQ authentication.** Because the identity-binding signature is the composite Ed25519+ML-DSA key,
-  handshake authentication is post-quantum; the TLS certificate's own self-signature may be classical
-  since authentication is carried by the PQ composite extension signature and confidentiality by the
-  hybrid group.
-
-### Layering vs PQXDH (resolves the prior ambiguity)
-
-Two distinct, separately-keyed layers, each binding the Vox identity:
-- **Transport layer (this ADR):** QUIC-TLS 1.3 with X25519MLKEM768 + the identity-extension PoP.
-  Authenticates the peer and secures the link.
-- **Messaging layer (ADR-004):** PQXDH + Double Ratchet provides the per-author/pairwise *message*
-  keys, run **over** the authenticated transport. Vox does **not** run PQXDH as the transport
-  handshake, and **application/message keys are NOT derived from the TLS exporter** — so a transport
-  compromise does not expose message forward-secrecy / post-compromise security, which remain owned
-  by the ratchet. Tunnel streams (ADR-013), which are not ratcheted messages, use the transport's
-  AEAD directly.
+4. **PQ-hybrid key exchange.** The QUIC TLS 1.3 handshake MUST use the hybrid group X25519MLKEM768
+   (code point `0x11EC`), whose key-schedule secret is `concat(ML-KEM-768 secret, X25519 secret)`.
+   Only hybrid PQ groups MUST be offered or accepted; no classical-only group. The provider's
+   `kx_groups` MUST be exactly `[X25519MLKEM768]`, enforced at every config boundary
+   (`provider::assert_pq_only`).
+5. **Identity authentication, no CA.** Each peer MUST present a self-signed certificate carrying its
+   Vox identity public key in a custom X.509 extension, and MUST sign
+   `"vox-tls-handshake:" ‖ cert_public_key` with its composite Ed25519+ML-DSA identity key
+   (ADR-002), binding the ephemeral certificate key to the long-term identity. `cert_public_key` is
+   the certificate's raw subject-public-key bytes, not the SPKI DER. This signing string is a
+   TLS-layer string, deliberately outside ADR-008's CBOR struct-domain regime.
+6. **Extension layout.** OID `1.3.6.1.4.1.<VOX-PEN>.1.1`, where `<VOX-PEN>` MUST be a Vox-owned IANA
+   Private Enterprise Number; Vox MUST NOT use libp2p's PEN 53594. `critical = false`. The value is
+   canonical CBOR (ADR-008, tag `0x0009`) `{ composite_pubkey, pop_sig }` in ADR-003's `0x03`/`0x04`
+   composite encodings. *Not built:* the PEN is unregistered and builds use the placeholder
+   `1234567` (`identity_cert.rs`); the interop matrix (requirement 14) MUST pin the exact OID.
+7. The verifier MUST derive the Vox identity from the extension and MUST require it to match the
+   expected peer, aborting on mismatch (ADR-008 error `0x05`). A missing or duplicated extension
+   MUST be rejected.
+8. **PQ authentication.** Handshake authentication is carried by the composite identity signature
+   in the extension; the certificate's own self-signature MAY be classical.
+9. **Layering.** The transport (this ADR) and messaging (ADR-004: PQXDH + Double Ratchet, run over
+   the authenticated transport) MUST stay separately keyed. Vox MUST NOT run PQXDH as the transport
+   handshake, and application or message keys MUST NOT be derived from the TLS exporter. Tunnel
+   streams (ADR-013), which are not ratcheted messages, use the transport's AEAD directly.
 
 ### Replay, 0-RTT, downgrade
 
-- **0-RTT is disabled.** QUIC/TLS 1.3 0-RTT early data is replayable; for a security overlay that
-  risk is unacceptable, so Vox never offers or accepts 0-RTT.
-- **Datagram flows, and no Vox replay window (ADR-022).** Each RFC 9221 datagram is
-  `varint flow_id ‖ varint context ‖ body` and belongs to a flow bound to a stream. Replay and
-  duplication are QUIC's concern: a datagram is a frame inside a protected QUIC packet, and QUIC
-  refuses a replayed or duplicated packet (RFC 9000 §12.3), so an on-path replay never reaches Vox.
-  *(Until 2026-09-24 datagrams carried an 8-byte sequence behind a 1024-packet DTLS-style window. It
-  protected nothing QUIC did not already, could wrongly drop legitimate packets that arrived far out of
-  order, and cost 8 bytes a packet; ADR-022 decision 2 removed it.)*
-- **Downgrade prevention.** TLS 1.3's Finished MAC already binds the full transcript (including the
-  negotiated group); offering only hybrid PQ groups removes any downgrade target; the negotiated
-  suite is additionally recorded in the application **session-establishment** entry (ADR-008 canonical
-  struct, tag `0x0011`, body `{ peer_id, suite_id, negotiated_group, ts }`) so downgrade is detectable
-  end-to-end.
-- **Interop is a release criterion, and failure is hard (no silent fallback).** Because Vox offers
-  *no* classical-only group, a peer or library that cannot negotiate the required hybrid group simply
-  **fails to connect with a clear, surfaced error** — it never silently downgrades. The supported
-  provider set (quinn + rustls with the X25519MLKEM768 hybrid provider, version-pinned) and a
-  cross-version **interop test matrix** (each supported client/library pair must complete the handshake
-  + identity-PoP) are explicit release gates, not assumptions. The required-suite floor is versioned
-  (ADR-003) so the matrix advances deliberately.
+10. **0-RTT is disabled.** Vox MUST NOT offer or accept TLS 1.3 early data
+    (`max_early_data_size = 0`) and MUST NOT issue resumption tickets (`send_tls13_tickets = 0`).
+11. **No Vox replay window.** Each datagram is `varint flow_id ‖ varint context ‖ body` on a flow
+    bound to a stream (ADR-022). Replay and duplication are QUIC's concern (RFC 9000 §12.3); Vox
+    MUST NOT add its own datagram sequence number or replay window.
+12. **Downgrade auditability.** The negotiated suite MUST be recorded in a session-establishment entry (ADR-008
+    canonical struct, tag `0x0011`, body `{ peer_id, suite_id, negotiated_group, ts }`). *Gap:*
+    quinn 0.11 does not expose the negotiated group, so `SessionEstablishment::new` fills
+    `negotiated_group` from the constant this build offers, not from the handshake. The guarantee
+    rests on requirement 4 and on TLS 1.3 binding the negotiated parameters into the Finished MAC.
+    The post-handshake check confirms only the ALPN `vox/1` (`confirm_vox_alpn`), and MUST NOT be
+    described as confirming the group.
+13. **Hard failure.** A peer or library that cannot negotiate the required hybrid group MUST fail to
+    connect with a clear, surfaced error and MUST NOT silently downgrade. A failure of
+    authentication is reported as `SignatureInvalid`; any other handshake failure (refused, timed
+    out, closed) is reported by its own cause (`quic::handshake_failed`).
+14. **Interop is a release gate.** The supported provider set (quinn + rustls with the
+    X25519MLKEM768 provider, version-pinned) and a cross-version interop matrix (each supported
+    client and library pair completes the handshake and identity proof of possession, with the OID
+    and the raw-key binding pinned) MUST be release gates. The required-suite floor is versioned
+    (ADR-003). *Not built:* there is no second implementation, matrix or CI job.
 
-### Two contracts on one connection
+### Datagram flows (ADR-022 M22.1)
 
-Reliable/ordered QUIC streams carry async/bulk traffic (log replication, file transfer); the RFC
-9221 unreliable-DATAGRAM extension carries low-latency/loss-tolerant flows — all under one handshake.
-To stop bulk traffic degrading interactive flows: separate **streams** for isolation, and separate
-QUIC **connections** only where genuinely differential network treatment (DSCP/QoS) is required
-(QUIC has one congestion controller per connection); otherwise minimize connection count.
+15. `VoxConnection` MUST start one `DatagramRouter` with the connection, and it MUST be the only
+    reader of the connection's datagrams. It routes by flow ID to the flow's bounded inbox, and MUST
+    drop and count (`datagram_stats()`) a datagram for an unknown or ended flow, a full inbox, an
+    unknown context, or one it cannot parse.
+16. A flow MUST be bound to a stream (`bind_flow`) and end when the stream ends. The flow ID is the
+    stream's full QUIC stream ID.
+17. A packet larger than one datagram MUST be fragmented and reassembled (`transport::datagram`:
+    at most 255 fragments, 500 ms, 32 partial packets per flow, 1 MiB per connection) and MUST NOT
+    be retransmitted. Callers MUST NOT read datagrams through the raw `quinn()` accessor, which
+    would race the router.
 
-### Rust building blocks
+### Stream framing and typed streams (ADR-016 M14.2)
 
-`quinn` (QUIC) + `rustls` with the post-quantum/hybrid provider (X25519MLKEM768), and
-`libp2p-tls`-style self-signed-cert + identity-extension handling for the PoP binding. All
-production-ready as of 2026.
+18. Every stream flow MUST use the u32-BE length-prefixed framing of
+    `transport::framing::{write_frame, read_frame}`. A clean FIN exactly at a frame boundary is the
+    success half-close; a FIN mid-frame, a reset, or a length above the caller's per-flow cap MUST
+    be an error.
+19. Each bi-stream MUST be typed by its first frame, the one-element canonical-CBOR array `[kind]`
+    (`transport::streams::StreamKind`). This ADR fixes `sync` 1, `join` 2, `pairwise` 3,
+    `rendezvous` 4, `tunnel` 5, `coord` 6; later kinds belong to the ADRs that define them.
+    `accept_typed` MUST refuse an unknown kind before reading any flow bytes.
+
+`open_typed` writes the kind frame and `accept_typed` reads it; `quic::close_code` is public, so any
+flow can reset its stream with the ADR-008 code. M5 sync opens a typed `sync` stream through
+`node::syncstream::open_sync` (M14.6); `QuicStreamTransport::open`/`accept` remain for callers that
+pair streams themselves.
+
+### Accepting connections
+
+20. A server's accept loop MUST NOT let one failed handshake end the loop. `accept_incoming` yields
+    the next connection attempt, and `finish_incoming` completes one handshake and admission,
+    bounded by a 30-second handshake timeout. The node's own loop accepts in these two phases
+    (`0653e050`); the convenience `VoxEndpoint::accept*` still returns `Err` for a single failed
+    handshake, so a caller looping on it has to catch and continue.
+
+### Throughput (R41)
+
+21. **Path MTU.** When the socket's granted receive buffer is at least 4 MiB, both
+    `MtuDiscoveryConfig::upper_bound` and `EndpointConfig::max_udp_payload_size` MUST be 8192
+    (`quic::MAX_UDP_PAYLOAD`); quinn searches only up to the smaller of the two. Otherwise both MUST
+    stay at quinn's 1452, and the node MUST print one line saying why (`quic::mtu_ceiling_for`).
+    The node MUST read the receive buffer back after setting it, since Linux caps `SO_RCVBUF`
+    silently.
+22. **Socket buffers.** UDP send and receive buffers MUST be requested at 4 MiB each
+    (`UDP_SOCKET_BUFFER`).
+23. **Batched sends.** quinn-udp's `fast-apple-datapath` MUST be enabled on every platform, iOS
+    included (decider).
+24. **Flow-control windows.** The stream receive window MUST be 16 MiB (`quic::STREAM_WINDOW`) and
+    the send window 32 MiB. The connection receive window MUST be bounded (`quic::CONNECTION_WINDOW`,
+    two stream windows), never quinn's unlimited default, so one peer writing into streams nobody
+    reads cannot park unbounded memory in a node. On integrate/v0.3.0 that is the base: each
+    running tunnel this node authorized adds one `STREAM_WINDOW` on its own connection, up to
+    `TUNNELS_PER_PEER` (16) per member (`quic.rs`, V210-81; the tunnel cap is ADR-013's).
+25. **Restart after idle.** After 1 s with nothing sent, and at least 4 smoothed RTTs, the next send
+    MUST start from a fresh congestion controller: initial window, slow start
+    (`transport::congestion::IdleRestart`). Unlike RFC 5681 §4.1 it MUST NOT keep the slow-start
+    threshold.
+26. R41 MUST be measured against an emulated link, not against loopback (decider, PRD-001 R41 as
+    clarified 2026-09-25), by `perf_r41_tunnel_throughput_proof`.
+
+## Known limits
+
+- **A small receive buffer on macOS.** With the granted receive buffer forced to 256 KiB, macOS
+  black-holed even at 1452 bytes (2 of 3 runs, 2026-09-25). That is below any OS default, and was
+  recorded, not bounded. It has not been re-measured since quinn-proto 0.11.18 (#206), which stopped
+  reading overflow loss as a black hole. Tracked: #381 (V210-158).
+- **The PEN placeholder** (requirement 6) and **the session record's constant group**
+  (requirement 12) are open: #382 (V030-33).
+- **The interop matrix** (requirement 14) is an open release gate, awaiting the decider (V030-29
+  decider question 32).
 
 ## Consequences
 
-### Positive
-- A concrete, PQ-hybrid, identity-authenticated transport — no deferral, modeled on deployed prior
-  art (libp2p, IETF hybrid TLS).
-- Clean layering: transport compromise cannot undermine message FS/PCS (owned by ADR-004).
-- One encrypted connection carries interactive tunnels + async sync without cross-stream HOL blocking.
+- **Positive.** A concrete PQ-hybrid, identity-authenticated transport modelled on deployed prior
+  art; a transport compromise cannot undermine message forward secrecy or post-compromise security
+  (owned by ADR-004); one encrypted connection carries tunnels and sync without cross-stream
+  head-of-line blocking. QUIC is also the substrate for ADR-012's UDP NAT traversal.
+- **Negative.** Disabling 0-RTT costs a round trip on every reconnection. Per-connection congestion
+  control means true QoS separation needs more connections. The custom extension and composite
+  signature path is security-critical: a wrong binding breaks peer authentication. The 8192-byte
+  ceiling helps only loopback and jumbo-frame links; a 1500-byte link keeps 1452.
 
-### Negative
-- Disabling 0-RTT costs a round trip on resumption — accepted for the replay-safety it buys.
-- Per-connection congestion control means true QoS separation needs multiple connections (overhead).
-- The custom identity-extension + composite-PQ-signature cert path needs careful implementation and
-  review (a wrong binding would break peer authentication).
+## Related ADRs
 
-### Neutral
-- QUIC is also the natural substrate for ADR-012's UDP-based NAT traversal.
-
-## Implementation notes (M9)
-
-These record the concrete decisions made building this ADR (`crates/vox-core/src/transport/`), so the spec and code stay in lockstep:
-
-- **Datagram flows are a property of the connection (ADR-022 M22.1).** `VoxConnection` starts a
-  `transport::router::DatagramRouter` with the connection; it is the **only** reader of the
-  connection's datagrams. It reads the flow ID off each one and hands it to that flow's bounded inbox,
-  and drops and counts (`datagram_stats()`) a datagram for an unknown or ended flow, one whose inbox is
-  full, one with an unknown context, and one it cannot parse. A flow is bound to a stream
-  (`bind_flow`), takes it, and ends when it ends — so ending a flow is not caller discipline. The flow
-  ID is the stream's full QUIC stream ID (ADR-022 §1 explains why not a quarter of it). Packets larger
-  than one datagram are fragmented and reassembled (`transport::datagram`, ≤255 fragments, 500 ms,
-  32 partial packets per flow, 1 MiB per connection), never retransmitted. The old
-  `send_datagram`/`recv_datagram`/`datagrams_dropped` and the sequence window are deleted, and so are
-  the two unit tests that asserted the window. Proved by `crates/vox-core/tests/datagram_flows_gate.rs`.
-  The raw `quinn()` accessor still exists for advanced callers (M11); reading datagrams through it
-  would race the router, and nothing does.
-- **Stream framing and typed streams (ADR-016 M14.2).** The u32-BE length prefix that
-  `QuicStreamTransport` applied to M5 frames is now the async pair `transport::framing::{write_frame,
-  read_frame}` (a clean FIN exactly at a frame boundary is the success half-close → `None`; a FIN
-  mid-frame, a reset, or a length above the caller's per-flow cap is an error), and every stream flow
-  — M5 sync, the rendezvous service, the join stream — uses it. Each bi-stream is **typed by its
-  first frame**, the one-element canonical-CBOR array `[kind]` (`transport::streams::StreamKind`:
-  `sync` 1, `join` 2, `pairwise` 3, `rendezvous` 4, `tunnel` 5, `coord` 6); `open_typed` writes it,
-  `accept_typed` reads it and refuses an unknown kind before any flow bytes are read. `close_code`
-  is public so any flow can reset its stream with the ADR-008 code. M5 sync opens a **typed** `sync`
-  stream via `node::syncstream::open_sync` (M14.6); `QuicStreamTransport::open/accept` remain for
-  callers that pair streams themselves.
-- **Known gaps (recorded 2026-09-19).** `confirm_hybrid_group` checks only ALPN `vox/1`, and
-  `SessionEstablishment::new` **hardcodes** the group code point `0x11EC`, so the "downgrade
-  auditability" record documents a constant rather than an observation — the real guarantee is
-  `assert_pq_only` on both providers plus TLS transcript binding, which is sound but should be what
-  the record reports. All connect/accept failures collapse to `SignatureInvalid` (unreachable vs
-  handshake vs identity are indistinguishable to callers). The identity-extension OID uses the
-  placeholder PEN `1234567`. `VoxEndpoint::accept*` returns `Err` on a single failed handshake, so a
-  server loop must catch-and-continue. Gate obligation: the cross-version interop matrix
-  (handshake + identity-PoP) does not exist — no second implementation, no version-pinned matrix, no
-  CI job; the PoP is over the raw subject-public-key bits (not SPKI DER), which such a matrix must pin.
-- **Throughput (R41), 2026-09-25.** A direct tunnel through `vox forward` on one machine ran at ~290
-  MB/s (2.3 Gbit/s) against ~10 GB/s (80 Gbit/s) for plain loopback TCP. Profiled with macOS
-  `sample` during a transfer: the **receiving** node was mostly idle; the **sending** node spent
-  its time in `__sendmsg` (one syscall per 1452-byte packet) and in the connection lock that
-  `sendmsg` runs under, which the splice's stream writes wait on. AES-GCM (aws-lc) was a few
-  percent; the flow-control windows did not bind. Changes, each A/B-measured against the others in
-  interleaved rounds on one box (quiet-round medians):
-  - `MtuDiscoveryConfig::upper_bound` and `EndpointConfig::max_udp_payload_size` raised to **8192**
-    (`quic::MAX_UDP_PAYLOAD`): ~290 → ~1100 MB/s on loopback. Discovery probes, so a 1500-byte link
-    keeps 1452 and gains nothing — this helps loopback and jumbo-frame links only. 16356 (the
-    loopback MTU) broke connections on macOS, whose `net.inet.udp.maxdgram` is 9216.
-  - UDP socket buffers 4 MiB each way (`quic::UDP_SOCKET_BUFFER`): no gain alone, but without them
-    a burst overflowed the default buffer and quinn's black-hole detection dropped the MTU to 1200.
-  - **The 8192 ceiling follows the buffer the OS actually granted (2026-09-25, v0.2.9 release
-    blocker).** Linux caps `SO_RCVBUF` at `net.core.rmem_max` (about 208 KiB) without an error,
-    and the result was ignored. So on Linux the 8192 ceiling ran on a tenth of the buffer it needs:
-    CI's loopback proof pinned the dialler at 1200 bytes with a black hole, below stock quinn's
-    1452.
-    - The endpoint now reads the receive buffer back after setting it. It takes the 8192 ceiling
-      (both `max_udp_payload_size` and `upper_bound`) only when at least 4 MiB was granted, the
-      buffer the ceiling was measured with. Otherwise it keeps quinn's 1452 and prints one line
-      saying why (`quic::mtu_ceiling_for`).
-    - Proved, `transport_mtu_and_window_proof`:
-      - Linux container: buffer 416 KiB, so the ceiling stays 1452. Path 1452/1452, 0 black holes,
-        5 of 5.
-      - The previous tree on Linux: dialler at 1200 with 1–2 black holes, 3 of 3 red.
-      - macOS: 8192 is granted; path 7973–8192, 0 black holes.
-      - macOS with the granted buffer forced to 416 KiB or 768 KiB: the fix keeps 1452 and passes
-        5 of 5 at each. The old 8192-regardless rule went red 1 of 5 at each.
-    - Forced to 256 KiB, macOS black-holed even at 1452 (2 of 3) on quinn-proto 0.11.14. That was
-      quinn-proto mistaking overflow loss for a black hole, fixed in 0.11.18 (#206). Re-measured
-      on 2026-10-02 (#381): release build, every `SO_RCVBUF` capped at 256 KiB by the test
-      interposer, a 32 MiB echo through `vox forward`, 10 runs each. On 0.11.18: 0 of 10 black
-      holes, path 1452 throughout, with 105–2293 packets lost to overflow per process. Pinned back
-      to 0.11.14: 3 of 10, the dialler dropping to 1200 with 2–3 black holes.
-  - Measured and **not** kept: 4 runtime workers instead of 2 (no change). A 16 MiB stream window
-    with a **64 MiB** send window (more in flight, more overflow loss, and the MTU collapsed) was
-    also not kept; the windows that were kept are below.
-  - **quinn-udp `fast-apple-datapath`** (batched `sendmsg_x`): +18% at a 1452-byte MTU, +4% at
-    8192. It calls a private Apple API. The decider adopted it for every platform, iOS included.
-  - **Stream window 16 MiB, send window 32 MiB** (`quic::STREAM_WINDOW`). quinn's default 1.25 MB
-    stream window is sized for 100 Mbit/s at 100 ms, so a longer or faster path is capped by credit,
-    not by the link. **History, withdrawn method:** these were measured over macOS dummynet shaping
-    set up with `sudo`, which agents may no longer run (2026-09-25). Vox/raw-TCP ratios at 1 Gbit/s
-    were 0.94–1.01 (1 ms and 20 ms RTT), and restoring quinn's default window dropped the 20 ms
-    class to 0.46. They stand as history only. R41 against an emulated link is measured by
-    `perf_r41` (its own owner and method).
-  - **Connection receive window 32 MiB** (`quic::CONNECTION_WINDOW`, two stream windows). quinn's
-    default connection window is unlimited, which was safe only while stream windows were small.
-    At 16 MiB per stream and quinn's default 100 concurrent streams, one peer writing into streams
-    nobody reads could park 1.6 GiB in this node. Proved on real endpoints
-    (`crates/vox-core/tests/transport_mtu_and_window_proof.rs`):
-    - 100 streams, 100 MiB offered to a reader that reads nothing: 33.75 MB received (3 runs), with
-      a bound of 32 MiB + 10% for packet overhead;
-    - mutation (no connection window): 105.4 MB received, red.
-  - **The 8192 ceiling needs both settings**: `MtuDiscoveryConfig::upper_bound` and
-    `EndpointConfig::max_udp_payload_size`. quinn searches only up to the smaller of its own ceiling
-    and the peer's advertised maximum. Same proof file, after a 32 MiB transfer on loopback:
-    - path MTU 7973–8082 (dialler) and 8192 (acceptor), 0 black holes, 3 runs;
-    - with `max_udp_payload_size` removed, both sides stop at 1472, red;
-    - with `upper_bound` removed, both stop at 1452, red.
-  - **Cubic restarts after idle** (`transport::congestion::IdleRestart`). A node keeps one QUIC
-    connection per peer, so every tunnel shares one congestion controller for the connection's
-    life. After ordinary drop-tail losses, Cubic's slow-start threshold and `W_max` stayed low, and a
-    later bulk transfer on a longer path grew one segment at a time. Measured with R41's gate
-    (`perf_r41_tunnel_throughput_proof`, 1 Gbit/s at 50 ms, run after the 2 ms LAN arm) and quinn's
-    own stats logged on both ends: cwnd plateaued at ~3.75 MB, which is ~590 Mbit/s. Flow control
-    never bound: 0 STREAM_DATA_BLOCKED and 0 DATA_BLOCKED on either side. With the WAN arm run first,
-    the same binary reached 98.4%.
-    - Now, after 1 s with nothing sent (and at least 4 smoothed RTTs), the next send starts from a
-      fresh Cubic: initial window, slow start. That is what a plain TCP transfer, a fresh
-      connection each time, always gets. RFC 5681 §4.1 restarts too but keeps ssthresh, which would
-      keep the plateau.
-    - Gate, 3 runs: WAN 95.5 / 97.9 / 92.7%, LAN 98.4 / 98.3 / 98.4%.
-    - Mutation (plain Cubic, same tree): WAN 56.9%, red.
-    - A quinn `black_hole_cooldown` of 3 s was tried and not kept: LAN 83.9%, WAN 28.8%.
-  - **Unshaped loopback: ~1.1–1.2 GB/s (8.8–9.6 Gbit/s), about 11–12% of loopback TCP.** The decider
-    has ruled that loopback is the wrong yardstick (PRD-001 R41 as clarified 2026-09-25): R41 is
-    measured against a link.
-  - **Observed, unexplained:** on unshaped loopback, 2 of 54 transfers collapsed to ~14 MB/s for the
-    whole transfer, with and without the window change. Recorded, not investigated.
-
-## Links
-**Depends on**: ADR-002, ADR-004, ADR-008.
-- Depended on by: ADR-012, ADR-013, ADR-024 (tapered congestion control, which replaces quinn's default Cubic with a Cubic → loss-aware Cubic → BBR taper).
+- **Depends on:** ADR-002, ADR-004, ADR-008.
+- **Depended on by:** ADR-012, ADR-013, ADR-022 (datagram flows), ADR-024 (tapered congestion
+  control).
+- **ADR-019** proposes removing the AWS-LC provider this ADR uses.
 
 ## Engineering Mantra
 
