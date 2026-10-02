@@ -171,12 +171,18 @@ pub trait TerminalIo {
     /// Leave the alternate screen (clearing it), purge scrollback, restore the
     /// terminal. Idempotent; also performed on drop by real backends.
     fn leave(&mut self) -> io::Result<()>;
+    /// Whether the process was asked to stop (SIGTERM), so the loop ends as a quit does. The
+    /// loop checks it at least every poll.
+    fn stop_requested(&self) -> bool {
+        false
+    }
 }
 
 /// The real crossterm/ratatui backend with a RAII restore on every exit path.
 pub struct CrosstermIo {
     terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
     entered: bool,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CrosstermIo {
@@ -186,7 +192,14 @@ impl CrosstermIo {
         Self {
             terminal: None,
             entered: false,
+            stop: std::sync::Arc::default(),
         }
+    }
+
+    /// Set to stop the loop as a quit would (see [`TerminalIo::stop_requested`]).
+    #[must_use]
+    pub fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.stop)
     }
 }
 
@@ -238,6 +251,10 @@ impl TerminalIo for CrosstermIo {
             Event::Key(key) if key.kind != KeyEventKind::Release => Ok(Some(key)),
             _ => Ok(None),
         }
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// **A passphrase is read past crossterm** (V210-94). crossterm reads the terminal into a
@@ -1541,8 +1558,24 @@ pub fn run_live(
         }
     };
     let cancel = CancellationToken::new();
+    let io = CrosstermIo::new();
     #[cfg(unix)]
     {
+        // **SIGTERM quits as `q` does** (V210-93): the terminal is restored and the node shut
+        // down, so its connections close and its peers learn at once. Left to its default it
+        // killed the process with nothing sent and the terminal left raw.
+        let stop = io.stop_flag();
+        let term = {
+            let _in_rt = rt.enter();
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        };
+        if let Ok(mut term) = term {
+            rt.spawn(async move {
+                if term.recv().await.is_some() {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
         // SIGHUP (terminal went away) locks the node (ADR-015).
         let n = node.clone();
         let c = cancel.clone();
@@ -1560,7 +1593,7 @@ pub fn run_live(
         });
     }
     let core = LiveCore::new(node.clone(), rt.handle().clone());
-    let result = run_loop(CrosstermIo::new(), core, system_clock());
+    let result = run_loop(io, core, system_clock());
     cancel.cancel();
     // Shutdown locks (wipes every SEK and the signer) before the process exits.
     let _ = rt.block_on(node.apply(NodeCommand::Shutdown));
@@ -1600,6 +1633,9 @@ fn event_loop(
     let mut last_input = clock();
     let mut was_locked: Option<bool> = None;
     loop {
+        if io.stop_requested() {
+            return Ok(());
+        }
         let vm = core.view();
         ui.settle(&vm);
 
