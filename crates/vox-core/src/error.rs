@@ -398,7 +398,7 @@ pub enum Error {
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
 
-    /// The room is at its cap (`MAX_AUTHORS`; soft by `JOIN_OVERSHOOT`), so the member that
+    /// The room is at its cap (`MAX_AUTHORS`, as the answering member counts it), so the member that
     /// answered the join could not admit the joiner, and refused it. Before this the refusal was
     /// dropped and the joiner was told it was in: it exited 0, a member of nothing.
     #[error("the room is full: {members} members, cap {cap}")]
