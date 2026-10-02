@@ -420,6 +420,27 @@ pub struct ConnectionManager {
     /// Where [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote)s go,
     /// once the node that owns this manager says.
     notes: Mutex<Option<tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>>>,
+    /// Direct dials under way, per peer (V210-122): a reach that knows no address of its own
+    /// holds its circuits back while one of these may yet land (see `NodeNet::reach_ladder`).
+    dialling: Arc<Mutex<HashMap<Digest32, usize>>>,
+}
+
+/// A direct dial counted in [`ConnectionManager::direct_dial_under_way`] until dropped.
+pub struct DirectDial {
+    dialling: Arc<Mutex<HashMap<Digest32, usize>>>,
+    peer: Digest32,
+}
+
+impl Drop for DirectDial {
+    fn drop(&mut self) {
+        let mut dialling = lock(&self.dialling);
+        if let Some(n) = dialling.get_mut(&self.peer) {
+            *n -= 1;
+            if *n == 0 {
+                dialling.remove(&self.peer);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for ConnectionManager {
@@ -450,7 +471,24 @@ impl ConnectionManager {
             retire_grace_secs: grace_secs,
             clock,
             notes: Mutex::new(None),
+            dialling: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Count a direct dial to `peer` as under way until the returned guard is dropped.
+    #[must_use]
+    pub fn direct_dial(&self, peer: Digest32) -> DirectDial {
+        *lock(&self.dialling).entry(peer).or_insert(0) += 1;
+        DirectDial {
+            dialling: Arc::clone(&self.dialling),
+            peer,
+        }
+    }
+
+    /// Whether a direct dial to `peer` is under way anywhere in this node (V210-122).
+    #[must_use]
+    pub fn direct_dial_under_way(&self, peer: &Digest32) -> bool {
+        lock(&self.dialling).contains_key(peer)
     }
 
     /// Say what happens to this manager's connections on `events`, as
@@ -747,9 +785,13 @@ impl ConnectionManager {
         if let Some(conn) = self.existing(&peer) {
             return Ok(conn);
         }
+        // Counted until the connection is filed, so a reach waiting on it never sees neither.
+        let dial = self.direct_dial(peer);
         let conn =
             connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
-        Ok(self.file(conn).await)
+        let filed = self.file(conn).await;
+        drop(dial);
+        Ok(filed)
     }
 
     /// Accept the next inbound connection under `admission` and file it under the
