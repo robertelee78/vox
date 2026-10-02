@@ -23,7 +23,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 
   `NodeView`, `NodeEvent` and `Outcome`/`Fault` MUST carry no keys, SKDMs, SEKs or `self_seed`. `Outcome` and `Fault` MUST be closed `Copy` types with no free text. A passphrase MUST enter as a zeroizing `Secret`.
 - **NR-3.** The client MUST embed the node in its own process: the TUI runs it in-process (ADR-015), and the macOS client is to (ADR-014).
-- **NR-4.** `vox node`, the headless node, MUST be constructed without a vault (`NodeConfig::headless`). It has a file-backed transport identity, rebuilt identically at every start, and no SEK, no sender keys and no pairwise sessions. The absence MUST be structural: the secret-bearing fields are `Option`s the headless constructor leaves `None`. A headless node MUST NOT be able to decrypt.
+- **NR-4.** `vox node`, the headless node, MUST be constructed without a vault (`NodeConfig::headless`). It has a file-backed transport identity, rebuilt identically at every start, and no SEK, no sender keys and no pairwise sessions. The absence MUST be structural: the secret-bearing fields are `Option`s the headless constructor leaves `None`. A headless node MUST NOT be able to decrypt (ADR-015 requirement 1.2).
 - **NR-5.** Commands MUST be processed in order, each answered on its own `oneshot`.
 
 ### Persistence: redb, sealed segments, XDG layout
@@ -35,7 +35,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
   - A newer or unreadable schema MUST be `Error::Storage`, never a panic.
 - **NR-8.** A log append, its plaintext row and its chain-state advance MUST commit in one write transaction. A dropped batch writes nothing. A failed commit MUST poison the room until it is reopened.
 - **NR-9.** On open, the node MUST rebuild a room's DAG from its log segments through `Dag::accept`, and MUST accept a cache row only if its entry is in the DAG.
-- **NR-10.** Paths MUST follow ADR-015's precedence: explicit, then `VOX_DATA_DIR`/`VOX_CONFIG_DIR`, then `XDG_*`, then the platform default. Data lives in `<data>/vox/<profile>/`. Files MUST be `0600` and directories `0700` (Unix). A profile name MUST be a single path component.
+- **NR-10.** Paths MUST follow ADR-015 requirement 12.1 and its precedence: explicit, then `VOX_DATA_DIR`/`VOX_CONFIG_DIR`, then `XDG_*`, then the platform default. Data lives in `<data>/vox/<profile>/`. Files MUST be `0600` and directories `0700` (Unix). A profile name MUST be a single path component.
 - **NR-11.** A profile holds one identity, and a second create MUST be refused. An existing profile MUST open locked. Unlock MUST refuse a vault whose identity disagrees with the store's recorded fingerprint.
 - **NR-12. Planned.** The node is to reclaim space with `redb` compaction after pruning. `Profile::compact_store` exists, but nothing calls it.
 
