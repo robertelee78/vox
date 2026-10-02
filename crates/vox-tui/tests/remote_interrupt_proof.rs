@@ -298,6 +298,15 @@ fn label_reds() {
                 .map(String::as_str)
                 .or_else(|| payload.downcast_ref::<&str>().copied())
                 .unwrap_or("");
+            // `assert_eq!` and `assert_ne!` put their own words before the message, so the
+            // label is read after them.
+            let message = [
+                "assertion `left == right` failed: ",
+                "assertion `left != right` failed: ",
+            ]
+            .iter()
+            .find_map(|p| message.strip_prefix(p))
+            .unwrap_or(message);
             if !(message.starts_with("PRODUCT") || message.starts_with("APPARATUS")) {
                 eprintln!(
                     "APPARATUS (harness error): the panic below is this proof's own, not a \
@@ -475,8 +484,15 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
 
     // ---- (5) the wake's own turn reads the message once, first ----
     let Some(wake_text) = wakes.first().cloned() else {
+        // What failed already is the product's; (5)-(7) only could not be staged after it.
         panic!(
-            "APPARATUS (5)-(7): bob's session was never woken; {} claim(s) failed:\n- {}",
+            "{} (5)-(7): bob's session was never woken, so they could not be staged; {} claim(s) \
+             failed:\n- {}",
+            if failures.is_empty() {
+                "APPARATUS"
+            } else {
+                "PRODUCT"
+            },
             failures.len(),
             failures.join("\n- ")
         );

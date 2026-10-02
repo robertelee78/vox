@@ -213,6 +213,15 @@ fn label_reds() {
                 .map(String::as_str)
                 .or_else(|| payload.downcast_ref::<&str>().copied())
                 .unwrap_or("");
+            // `assert_eq!` and `assert_ne!` put their own words before the message, so the
+            // label is read after them.
+            let message = [
+                "assertion `left == right` failed: ",
+                "assertion `left != right` failed: ",
+            ]
+            .iter()
+            .find_map(|p| message.strip_prefix(p))
+            .unwrap_or(message);
             if !(message.starts_with("PRODUCT")
                 || message.starts_with("APPARATUS")
                 || message.starts_with("CANNOT MEASURE")
