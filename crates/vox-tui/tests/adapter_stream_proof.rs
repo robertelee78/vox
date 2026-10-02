@@ -189,6 +189,11 @@ fn consume(
 struct Steady {
     run: Run,
     rows: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The entry hashes of the rows that are the proof's own burst messages ([`say`]).
+    bursts: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// Every other row it emitted, as `hash text`, for the record: a room's own traffic (a
+    /// setup row arriving late) is not one of the counted messages.
+    others: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Steady {
@@ -198,16 +203,29 @@ impl Steady {
         let feed = std::mem::replace(&mut run.rx, rx);
         drop(tx);
         let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let into = rows.clone();
+        let bursts = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+        let others = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (into, into_bursts, into_others) = (rows.clone(), bursts.clone(), others.clone());
         std::thread::spawn(move || {
             while let Ok(line) = feed.recv() {
                 let row: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_default();
                 if let Some(h) = row["entry_hash"].as_str() {
                     into.lock().unwrap().push(h.to_owned());
+                    let text = row["text"].as_str().unwrap_or("");
+                    if text.starts_with(BURST) {
+                        into_bursts.lock().unwrap().insert(h.to_owned());
+                    } else {
+                        into_others.lock().unwrap().push(format!("{h} {text:.80}"));
+                    }
                 }
             }
         });
-        Self { run, rows }
+        Self {
+            run,
+            rows,
+            bursts,
+            others,
+        }
     }
 
     /// The distinct rows it has emitted so far.
@@ -215,11 +233,13 @@ impl Steady {
         self.rows.lock().unwrap().iter().cloned().collect()
     }
 
-    /// Wait up to `secs` for it to hold at least `n` distinct rows; how many it holds.
+    /// Wait up to `secs` for it to hold at least `n` of the proof's burst messages; how many
+    /// it holds. Only those are counted: any other row the room carries is not a message this
+    /// proof sent, and counting it once read a wedge as 901 of 900.
     fn wait_for(&self, n: usize, secs: u64) -> usize {
         let end = std::time::Instant::now() + Duration::from_secs(secs);
         loop {
-            let have = self.distinct().len();
+            let have = self.bursts.lock().unwrap().len();
             if have >= n || std::time::Instant::now() >= end {
                 return have;
             }
@@ -228,8 +248,11 @@ impl Steady {
     }
 }
 
+/// What every one of the proof's own messages starts with.
+const BURST: &str = "burst message ";
+
 fn say(i: usize, pad: usize) -> String {
-    format!("burst message {i:05}{}", " ".repeat(pad))
+    format!("{BURST}{i:05}{}", " ".repeat(pad))
 }
 
 /// Padding for the burst that must make the consumer lag.
@@ -293,13 +316,32 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         last = b;
         std::thread::sleep(Duration::from_secs(1));
     }
+    // **The starting cursor is a row bob posts now**, after the room settled: last to arrive on
+    // bob's node and, posted last, last in the room's order too. `tail --since` follows arrival
+    // and `read` follows the room's order, and on v0.3.0 the two differ; the last row of a read
+    // can have arrived before a row it sorts after, which `tail --since` then rightly emits (a
+    // late setup row did, read as "a row from before the cursor").
+    let o = bob.vox(
+        None,
+        &["room", "post", &r, "harness: the stream starts here"],
+    );
+    assert!(o.ok, "PRODUCT: bob's start marker was refused: {o:?}");
     let rows = bob.vox(None, &["room", "read", &r, "--json"]).ndjson();
 
     // ---- the stream half ----
-    let start_cursor = rows.last().unwrap()["entry_hash"]
-        .as_str()
-        .unwrap()
+    let start_cursor = rows
+        .iter()
+        .find(|x| x["text"] == "harness: the stream starts here")
+        .and_then(|x| x["entry_hash"].as_str())
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: bob's own start marker is not in his `read --json`: {rows:?}")
+        })
         .to_owned();
+    assert_eq!(
+        rows.last().and_then(|x| x["entry_hash"].as_str()),
+        Some(start_cursor.as_str()),
+        "CANNOT MEASURE: bob's start marker is not the last row of the settled room"
+    );
     let stderr = tmp.path().join("tail.stderr");
 
     // The producer, driven in phases by the proof so a burst lands exactly while the
@@ -365,7 +407,11 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     // **A wedged client cannot stall the node** (RP-45): while the first is still frozen,
     // the second receives every one of bob's 900 appends.
     let during = steady.wait_for(900, 60);
-    eprintln!("[proof] while one client was frozen, the other received {during} of 900 rows");
+    eprintln!(
+        "[proof] while one client was frozen, the other received {during} of bob's 900 messages \
+         (other rows it emitted: {:?})",
+        steady.others.lock().unwrap()
+    );
     assert_eq!(
         during, 900,
         "PRODUCT: while one `vox room tail` was frozen, the other received only {during} of \
