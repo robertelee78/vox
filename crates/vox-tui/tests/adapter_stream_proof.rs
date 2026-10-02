@@ -394,12 +394,29 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     );
     // Both clients are attached and live before one is frozen: the staging RP-18 and RP-45
     // need.
-    assert_eq!(
-        steady.wait_for(1, 10),
-        1,
-        "CANNOT MEASURE: staging not achieved — the second consumer was not subscribed and \
-         live before the first was to be frozen (no row within 10s)"
-    );
+    // **The red says what it saw** (the lead, on c2): no row at all, the one message, more than
+    // it, or rows that were not it are four different things.
+    let live = steady.wait_for(1, 10);
+    let others = steady.others.lock().unwrap().clone();
+    match (live, others.is_empty()) {
+        // Live, and the one message arrived. Another row beside it is the room's own traffic,
+        // not counted (`wait_for` counts only the proof's messages), and is printed below.
+        (1, _) => {}
+        (0, true) => panic!(
+            "CANNOT MEASURE: staging not achieved — the second consumer emitted no row within 10s \
+             of bob's first message, so it was not subscribed and live before the first was to \
+             be frozen"
+        ),
+        (0, false) => panic!(
+            "PRODUCT: the second consumer was live — it emitted {} other row(s): {others:?} — but \
+             not bob's first message within 10s of its posting",
+            others.len()
+        ),
+        (n, _) => panic!(
+            "APPARATUS: the second consumer emitted {n} of the proof's messages where 1 was \
+             posted, and other rows {others:?}: the staging posted more than it counts on"
+        ),
+    }
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     signal(&run, "-STOP"); // frozen: it reads nothing, so only the kernel buffer absorbs
     burst(bob, 899, LAG_PAD);
