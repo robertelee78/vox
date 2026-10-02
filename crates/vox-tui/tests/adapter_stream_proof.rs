@@ -25,13 +25,17 @@
 //!   on how many *bytes* a machine's buffers hold, and failed for exactly that reason;
 //! - the consumer **killed three times** with SIGKILL at points inside the bursts, each
 //!   time restarted from the cursor it had persisted.
+//! - then the consumer's **node** killed with SIGKILL and started again (ADR-021 F19), after
+//!   alice and bob have posted alternately so bob's local order differs from canonical
+//!   order (the proof says CANNOT MEASURE if it does not).
 //!
 //! - a **second consumer** of the same room on the same node, attached at the same time
 //!   and never paused or killed, as a second tracker's adapter would be (RP-18, RP-45).
 //!
 //! What it asserts: the union of every row the consumer emitted, after the starting
 //! cursor, **equals** the room's log after that cursor — no gap — and every duplicate
-//! is explained by a restart. Then, separately: `board --json` shows what a person expects
+//! is explained by a restart, and while one consumer runs every row synced to it is emitted
+//! **once** (V210-113). Then, separately: `board --json` shows what a person expects
 //! of the claims made through the CLI — the contested resource held by alice's session, the
 //! handed-off one by bob's, the lapsed claim gone.
 //!
@@ -42,6 +46,12 @@
 //!   second receives all 900 of bob's appends before the first is continued;
 //! - **one client dying disturbs no other** (RP-18): across the first's three SIGKILLs it
 //!   keeps running and ends holding every one of the 1,800 messages, with no restart.
+//!
+//! And across the node's restart: `read --json` holds every row it held before **at the
+//! same position**, `board --json`'s `position` is unchanged, and `tail --since` the
+//! consumer's pre-restart cursor resumes with exactly the rows that followed it. The order
+//! is local and is rebuilt from the sealed cache on reopen; without this the cursor's
+//! meaning across a reboot was read from the code, not proved.
 //!
 //! Every red says whose it is: `PRODUCT:` for what the node or `vox room tail` did,
 //! `CANNOT MEASURE:` for staging that was not achieved.
@@ -248,15 +258,22 @@ const LAG_PAD: usize = 8 * 1024;
 #[ignore = "two networked nodes, production Argon2id and a 1,800-message burst; CI runs it in release"]
 fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     watchdog::arm();
+    let t0 = std::time::Instant::now();
+    macro_rules! mark {
+        ($n:expr) => {
+            eprintln!("[phase] {:>7.1}s {}", t0.elapsed().as_secs_f64(), $n)
+        };
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
-    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let mut room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
+    mark!("room ready");
 
     // ---- the fold half: a contested claim, a completed handoff, a lapse ----
     let o = alice.vox(Some("a1"), &["room", "claim", &r, "contested"]);
@@ -357,6 +374,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         "PRODUCT: board --json still shows a claim whose ttl lapsed: {board}"
     );
     eprintln!("[proof] board --json: {from_board:?}");
+    mark!("fold half done");
 
     // ---- the stream half ----
     let start_cursor = rows.last().unwrap()["entry_hash"]
@@ -424,6 +442,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     signal(&run, "-STOP"); // frozen: it reads nothing, so only the kernel buffer absorbs
     burst(bob, 899, LAG_PAD);
+    mark!("run1 burst 899 posted");
     // **A wedged client cannot stall the node** (RP-45): while the first is still frozen,
     // the second receives every one of bob's 900 appends.
     let during = steady.wait_for(900, 60);
@@ -437,34 +456,59 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     signal(&run, "-CONT");
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     consume(&run, 300, idle, &mut cursor, &mut seen);
+    mark!("run1 consumed 300");
     kill(&mut run, &mut restarts, &cursor, &seen);
     // Run 2: die in the middle of a synced burst from the other node.
     let mut run = start(bob, &r, &cursor, &stderr);
     // First drain the backlog run 1 left, so every row counted below is one that
     // arrived by sync WHILE this consumer was running.
     while consume(&run, 1000, Duration::from_secs(3), &mut cursor, &mut seen) > 0 {}
+    mark!("run2 backlog drained");
     burst(alice, 300, 0);
     // LIVENESS, not just completeness: rows synced from another node must reach a
     // consumer while it runs. A stream that only delivered them after a restart would
     // still have no gap — the defect `tail` shipped with — so this is its own assertion.
-    let live = consume(&run, 200, idle, &mut cursor, &mut seen);
+    let mut live_seen: BTreeMap<String, u32> = BTreeMap::new();
+    let live = consume(&run, 200, idle, &mut cursor, &mut live_seen);
+    mark!("run2 live 200");
     assert_eq!(
         live, 200,
         "PRODUCT: rows synced from another node must reach a LIVE consumer, not only a \
          restarted one"
     );
+    // **ONCE each, within one run** (V210-113). The tail reads from where it last read rather
+    // than re-reading the whole room on every `Synced`, so nothing it has emitted may come
+    // again. With no restart in between, a row emitted twice in this phase, or one the
+    // consumer had already processed (up to its persisted cursor, or in this run's backlog),
+    // is the tail's own repeat.
+    let again: Vec<(&String, &u32)> = live_seen
+        .iter()
+        .filter(|(h, c)| **c > 1 || seen.contains_key(*h))
+        .collect();
+    assert!(
+        again.is_empty(),
+        "PRODUCT: one running `vox room tail` emitted {} rows it had already emitted: {:?}",
+        again.len(),
+        &again[..again.len().min(5)]
+    );
+    for (h, c) in live_seen {
+        *seen.entry(h).or_default() += c;
+    }
     kill(&mut run, &mut restarts, &cursor, &seen);
     // Run 3: stall under another synced burst, then die.
     let mut run = start(bob, &r, &cursor, &stderr);
     consume(&run, 50, idle, &mut cursor, &mut seen);
+    mark!("run3 consumed 50");
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     burst(alice, 300, 0);
     std::thread::sleep(Duration::from_secs(2));
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     consume(&run, 250, idle, &mut cursor, &mut seen);
+    mark!("run3 consumed 250");
     kill(&mut run, &mut restarts, &cursor, &seen);
     // The rest, while nobody is listening.
     burst(alice, 300, 0);
+    mark!("all bursts posted");
 
     let all = until(
         bob,
@@ -497,6 +541,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         "CANNOT MEASURE: staging not achieved — the log after the starting cursor is not the \
          1,800-message burst"
     );
+    mark!("log holds 1800");
 
     let mut run = start(bob, &r, &cursor, &stderr);
     let expected: BTreeSet<&String> = after.iter().collect();
@@ -509,6 +554,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     }
     let _ = run.child.kill();
     let _ = run.child.wait();
+    mark!("final drain done");
 
     // **One client dying disturbs no other** (RP-18): the second consumer, attached
     // throughout, survived the first's three SIGKILLs and holds every message.
@@ -577,5 +623,182 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     assert!(
         dups as u32 <= restarts * 600,
         "PRODUCT: duplicates beyond what restarts explain: {dups}"
+    );
+
+    // ---- the consumer's NODE restarts (ADR-021 F19) ----
+    // The cursor only means "everything after this row" if the rows before it are still
+    // before it once bob's node has restarted. bob's order is local, not canonical, and the
+    // node rebuilds it from its sealed cache on reopen. So bob's local order is made to
+    // differ from the canonical one, without a race: bob's daemon is stopped, alice posts
+    // (her row cannot reach him), bob's `vox room post` is issued and waits on his control
+    // socket, and his daemon is continued. His post is then a row created after hers and
+    // taken in one step, while hers needs a sync session of several round trips, so bob holds
+    // his later row before her earlier one. A node that rebuilt canonically, or in any other
+    // order, is then told apart from one that kept its order.
+    let bob_pid = bob.daemon_pid().unwrap_or_else(|| {
+        panic!("CANNOT MEASURE: staging not achieved — bob's daemon has no pid")
+    });
+    let to_bob = |sig: &str| {
+        let ok = Command::new("kill")
+            .args([sig, &bob_pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(
+            ok,
+            "CANNOT MEASURE: staging not achieved — `kill {sig} {bob_pid}` failed"
+        );
+    };
+    for i in 0..20 {
+        to_bob("-STOP");
+        let o = alice.vox(None, &["room", "post", &r, &format!("F19 alice {i:02}")]);
+        let posted = std::thread::scope(|s| {
+            let bobs = s.spawn(|| bob.vox(None, &["room", "post", &r, &format!("F19 bob {i:02}")]));
+            // Long enough for bob's request to be written to his control socket.
+            std::thread::sleep(Duration::from_millis(200));
+            to_bob("-CONT");
+            bobs.join()
+        });
+        assert!(o.ok, "PRODUCT: alice's post {i} was refused: {o:?}");
+        let o = posted.unwrap_or_else(|_| panic!("CANNOT MEASURE: bob's post {i} thread panicked"));
+        assert!(o.ok, "PRODUCT: bob's post {i} was refused: {o:?}");
+    }
+    until(
+        bob,
+        None,
+        "alice's last interleaved post to reach bob",
+        &["room", "read", &r],
+        |o: &Out| o.ok && o.stdout.contains("F19 alice 19"),
+    );
+    let order = |w: &Worker| -> Vec<serde_json::Value> {
+        let o = w.vox(None, &["room", "read", &r, "--json"]);
+        assert!(o.ok, "PRODUCT: `room read --json` failed: {o:?}");
+        o.ndjson()
+    };
+    let hashes = |rows: &[serde_json::Value]| -> Vec<String> {
+        rows.iter()
+            .map(|x| {
+                x["entry_hash"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("PRODUCT: a row of `room read --json` has no entry_hash: {x}")
+                    })
+                    .to_owned()
+            })
+            .collect()
+    };
+    let position = |w: &Worker| -> serde_json::Value {
+        let o = w.vox(None, &["room", "board", &r, "--json"]);
+        assert!(o.ok, "PRODUCT: `room board --json` failed: {o:?}");
+        o.json()["position"].clone()
+    };
+    let held = order(bob);
+    let before = hashes(&held);
+    let before_position = position(bob);
+    let mut canonical = held.clone();
+    canonical.sort_by_key(|x| {
+        (
+            x["created_millis"].as_u64().unwrap_or_else(|| {
+                panic!("PRODUCT: a row of `room read --json` has no created_millis: {x}")
+            }),
+            x["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("PRODUCT: a row of `room read --json` has no entry_hash: {x}")
+                })
+                .to_owned(),
+        )
+    });
+    let off_canonical = before
+        .iter()
+        .zip(hashes(&canonical))
+        .filter(|(a, b)| **a != *b)
+        .count();
+    // The consumer's persisted cursor: the last row it processed, before the interleave.
+    let followed: Vec<String> = before
+        .iter()
+        .skip_while(|h| **h != cursor)
+        .skip(1)
+        .cloned()
+        .collect();
+    eprintln!(
+        "[proof] before bob's node restarts: {} rows, {off_canonical} of them off canonical \
+         order, position {before_position}; {} rows follow the consumer's cursor",
+        before.len(),
+        followed.len()
+    );
+    assert!(
+        off_canonical > 0,
+        "CANNOT MEASURE (staging not achieved): bob's local order equals canonical order, so a node \
+         that rebuilt it canonically on reopen could not be told apart"
+    );
+    assert!(
+        followed.len() >= 40,
+        "CANNOT MEASURE (staging not achieved): only {} rows follow the consumer's cursor {cursor}",
+        followed.len()
+    );
+
+    room.restart(1); // SIGKILL by PID, then `vox daemon` with the identity passphrase alone
+    let bob = &room.workers[1];
+
+    let after = hashes(&order(bob));
+    eprintln!("[proof] after bob's node restarted: {} rows", after.len());
+    assert!(
+        after.len() >= before.len(),
+        "PRODUCT: rows lost across the restart: {} before, {} after",
+        before.len(),
+        after.len()
+    );
+    let moved: Vec<usize> = (0..before.len())
+        .filter(|&i| after[i] != before[i])
+        .collect();
+    assert!(
+        moved.is_empty(),
+        "PRODUCT: {} of {} rows are at a different position in `read --json` after the restart \
+         (first at {:?})",
+        moved.len(),
+        before.len(),
+        moved.first()
+    );
+    let after_position = position(bob);
+    assert!(
+        after_position == before_position,
+        "PRODUCT: board.position changed across a restart that posted nothing: \
+         {before_position} before, {after_position} after"
+    );
+
+    // The consumer resumes from its pre-restart cursor and gets exactly what followed it.
+    let mut run = start(bob, &r, &cursor, &stderr);
+    let mut resumed = Vec::new();
+    while resumed.len() < followed.len() {
+        let Ok(line) = run.rx.recv_timeout(Duration::from_secs(20)) else {
+            break;
+        };
+        let row: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
+            panic!("PRODUCT: `room tail` printed a line that is not JSON ({e}): {line:?}")
+        });
+        resumed.push(
+            row["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("PRODUCT: a row `room tail` printed has no entry_hash: {row}")
+                })
+                .to_owned(),
+        );
+    }
+    let _ = run.child.kill();
+    let _ = run.child.wait();
+    eprintln!(
+        "[proof] after the restart: same {} rows in the same order, position {after_position}, \
+         tail --since the consumer's cursor resumed with {} of {} rows",
+        before.len(),
+        resumed.len(),
+        followed.len()
+    );
+    assert!(
+        resumed == followed,
+        "PRODUCT: `tail --since` the consumer's pre-restart cursor did not resume with exactly \
+         the rows that followed it: {} of {} rows, {resumed:?} against {followed:?}",
+        resumed.len(),
+        followed.len()
     );
 }

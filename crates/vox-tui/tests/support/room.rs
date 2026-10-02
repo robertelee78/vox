@@ -42,7 +42,7 @@ const ROOM_PASS: &str = "channel passphrase";
 /// silently name a session. **This test process may itself be running inside Claude
 /// Code or Codex**, and a leaked `CLAUDE_CODE_SESSION_ID` would make every worker the
 /// same session — the exact defect these proofs exist to catch.
-pub const HARNESS_SESSION_VARS: [&str; 10] = [
+pub const HARNESS_SESSION_VARS: [&str; 11] = [
     "VOX_SESSION",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
@@ -56,7 +56,8 @@ pub const HARNESS_SESSION_VARS: [&str; 10] = [
     // wants a wake endpoint sets its own.
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
-    "OPENCODE_SERVER_URL",
+    "VOX_OPENCODE_WAKE_SOCKET",
+    "VOX_OPENCODE_WAKE_TOKEN",
     "VOX_HARNESS",
 ];
 
@@ -265,6 +266,32 @@ pub struct Room {
     pub id: String,
     pub cid: [u8; 32],
     _anchor: Proc,
+    anchor: String,
+    tmp: std::path::PathBuf,
+}
+
+impl Room {
+    /// Restart worker `i`'s daemon as an operator does after a crash: killed (SIGKILL) and
+    /// reaped by its own PID, then `vox daemon` again with the identity passphrase alone, which
+    /// reopens every room it held (#208). Returns once this room reads on that node again.
+    pub fn restart(&mut self, i: usize) {
+        let w = &mut self.workers[i];
+        w.daemon = None;
+        let err = self.tmp.join(format!("{}.daemon.restart.err", w.name));
+        start_daemon(w, &self.anchor, &err);
+        let deadline = Instant::now() + TIMEOUT;
+        while !w.vox(None, &["room", "read", &self.id]).ok {
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: {}'s restarted daemon answers but never reopened the room in {}s; its \
+                 stderr:\n{}",
+                w.name,
+                TIMEOUT.as_secs(),
+                std::fs::read_to_string(&err).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
 }
 
 impl Room {
@@ -616,6 +643,8 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         cid,
         workers,
         _anchor: anchor,
+        anchor: spec,
+        tmp: tmp.to_path_buf(),
     }
 }
 

@@ -13,9 +13,6 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use vox_core::hash::Digest32;
-use vox_core::nat::bootstrap::BootstrapSet;
-use vox_core::nat::multiaddr::Multiaddr;
-use vox_core::nat::reachability::is_routable;
 use vox_core::node::actor::{Bind, EventStreamItem, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome, Secret};
 use vox_core::node::link::{b32_decode, b32_encode, vox_hostname};
@@ -525,24 +522,6 @@ pub async fn forward(
     Ok(())
 }
 
-/// Whether this node could be reached by someone who was handed its address — a
-/// routable advertised endpoint, or an anchor that will relay for it.
-///
-/// `vox serve` refuses to start when neither holds (ADR-017 decision 4): minting an
-/// address nobody can use is worse than saying so, because the host would hand it out
-/// and only learn later.
-fn reachable_or_relayed(node: &NodeHandle, anchors: &BootstrapSet) -> bool {
-    if !anchors.nodes().is_empty() {
-        return true;
-    }
-    node.view().listening.iter().any(|text| {
-        Multiaddr::parse(text)
-            .ok()
-            .and_then(|m| m.socket_addr())
-            .is_some_and(|sa: SocketAddr| is_routable(&sa.ip()))
-    })
-}
-
 /// `vox serve <port>` — create a service room, offer the port in it, and serve until
 /// interrupted (ADR-017 decisions 3 and 4).
 ///
@@ -550,20 +529,14 @@ fn reachable_or_relayed(node: &NodeHandle, anchors: &BootstrapSet) -> bool {
 /// address is a rendezvous, and the passphrase is what turns it into access (ADR-005).
 pub async fn serve(
     node: &NodeHandle,
-    anchors: &BootstrapSet,
     name: &str,
     port: u16,
     at: Option<SocketAddr>,
 ) -> Result<(), AppError> {
-    if !reachable_or_relayed(node, anchors) {
-        return Err(AppError::Usage(
-            "this machine has no address a guest could reach and no anchor to relay \
-             through.\n       Run `vox node` somewhere reachable and pass its \
-             `<fingerprint>@<multiaddr>` here as --anchor,\n       or open a port on \
-             your router. Refusing to mint an address nobody can use."
-                .into(),
-        ));
-    }
+    // **No anchor, no refusal** (V210-96, C1): a host on a LAN or on this machine is found
+    // directly by a guest there, and an anchor bridges only hosts that cannot otherwise find each
+    // other. Whether the address would lead anywhere is the node's to say when it mints it:
+    // `NodeEvent::AddressNote`, or `NodeEvent::AddressWithheld` when it would name no route at all.
     let passphrase = vox_core::node::passphrase::generate(PASSPHRASE_GROUPS)?;
     let before: Vec<Digest32> = node.view().channels.iter().map(|c| c.channel_id).collect();
     let out = node
@@ -585,9 +558,22 @@ pub async fn serve(
         .find(|id| !before.contains(id))
         .ok_or_else(|| AppError::Usage("the room was not created".into()))?;
 
+    // Answered once the room is on a board the address names (V210-96): printed before, a guest
+    // who joined at once was told the board had nothing for the room.
     let out = node.apply(NodeCommand::Invite { channel_id }).await;
     if !out.is_done() {
-        return Err(AppError::Usage(format!("cannot mint an address: {out}")));
+        // With why, which the node says anchor by anchor, in place of the fault's general advice
+        // (which speaks of an anchor even when none was named).
+        let mut why = out.to_string();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), node.next_event()).await
+        {
+            if let NodeEvent::AddressWithheld { reason, .. } = ev {
+                why = format!("the address was not handed out: {reason}");
+                break;
+            }
+        }
+        return Err(AppError::Usage(format!("cannot mint an address: {why}")));
     }
     let url = loop {
         match node.next_event().await {
@@ -846,6 +832,12 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         }
         NodeEvent::JoinFailed { reason } => {
             eprintln!("vox: a join did not complete — {reason}");
+        }
+        NodeEvent::AddressWithheld { reason, .. } => {
+            eprintln!("vox: the address was not handed out — {reason}");
+        }
+        NodeEvent::AddressNote { note, .. } => {
+            eprintln!("vox: {note}");
         }
         NodeEvent::RoomNotRemembered { channel_id, why } => {
             eprintln!(

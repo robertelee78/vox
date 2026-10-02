@@ -146,7 +146,7 @@ pub async fn serve(
     recv: quinn::RecvStream,
     snapshot: HostSnapshot,
 ) -> Result<()> {
-    serve_reporting(client, send, recv, snapshot, None).await
+    serve_reporting(client, send, recv, snapshot, None, None).await
 }
 
 /// [`serve`], emitting [`NodeEvent::TunnelServed`] for each authorized request.
@@ -161,14 +161,24 @@ pub async fn serve(
 /// emission is a non-blocking broadcast (ADR-020 §7), so the plain `send` below cannot
 /// wait on anybody. The event remains best-effort for a live client and is **not** an
 /// audit record — ADR-013's signed session events remain its own item.
+///
+/// `carried` is the connection the stream arrived on: an authorized tunnel is credited a
+/// receive window of its own on it for as long as it runs ([`VoxConnection::carry_tunnel`]),
+/// and a refused one is not. One past the member's
+/// [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER), counted across all of its
+/// connections, is refused.
+///
+/// [`VoxConnection::carry_tunnel`]: crate::transport::quic::VoxConnection::carry_tunnel
 pub async fn serve_reporting(
     client: Digest32,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     snapshot: HostSnapshot,
     events: Option<tokio::sync::broadcast::Sender<NodeEvent>>,
+    carried: Option<&crate::transport::quic::VoxConnection>,
 ) -> Result<()> {
-    session::accept_reporting(
+    let credit = std::sync::Mutex::new(None);
+    let served = session::accept_reporting(
         send,
         recv,
         &client,
@@ -184,6 +194,14 @@ pub async fn serve_reporting(
             })
         },
         |channel_id, tag| {
+            let mut moved = None;
+            if let Some(conn) = carried {
+                let taken = conn.carry_tunnel(tag, false)?;
+                moved = Some(taken.moved());
+                *credit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(taken);
+            }
             if let Some(tx) = events {
                 let _ = tx.send(NodeEvent::TunnelServed {
                     channel_id: *channel_id,
@@ -191,9 +209,12 @@ pub async fn serve_reporting(
                     service_tag: tag.to_owned(),
                 });
             }
+            Ok(moved)
         },
     )
-    .await
+    .await;
+    drop(credit);
+    served
 }
 
 /// A live local port forwarded to a member's service over the overlay.
@@ -303,10 +324,11 @@ impl Forward {
                 tokio::spawn(async move {
                     // One stream per connection, on whatever connection reaches the host now.
                     match up::open_tunnel(dialer.as_ref(), &host, &channel_id, &tag).await {
-                        // `_carried` is held for the whole splice: see `up::open_tunnel`.
-                        Ok((send, recv, _carried)) => {
+                        // `_carried` and `_credit` are held for the whole splice (see
+                        // `up::open_tunnel`): the path, and the tunnel's receive window on it.
+                        Ok((send, recv, _carried, credit)) => {
                             if let Err(Error::TunnelRevoked(_)) =
-                                session::splice(send, recv, app).await
+                                session::splice_moving(send, recv, app, credit.moved()).await
                             {
                                 report(format!(
                                     "the host withdrew access to {tag:?} — that session was cut"

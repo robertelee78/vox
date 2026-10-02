@@ -910,6 +910,14 @@ pub struct AgentHookArgs {
     /// stdin. So the id arrives as a flag instead.
     #[arg(long)]
     pub session: Option<String>,
+    /// An entry this session was already shown by a wake, so the drain does not show it again.
+    /// Repeatable.
+    ///
+    /// A wake arrives as the harness's own prompt, and the drain then runs on that prompt. The
+    /// OpenCode plugin relays wakes itself, so it knows which entries it delivered and passes
+    /// them here.
+    #[arg(long, value_name = "ENTRY")]
+    pub woken: Vec<String>,
 }
 
 /// Naming a room on a running node. No passphrase: the node is already unlocked.
@@ -1566,11 +1574,11 @@ pub fn run() -> ExitCode {
                 args.identity_passphrase_file.clone(),
                 Some(crate::tunnel_cli::Waiting::server()),
                 || Ok(()),
-                move |node, anchors, ()| async move {
+                move |node, _anchors, ()| async move {
                     // Only the verbs that keep running serve the socket: `vox id` and the trust
                     // verbs share this path and are done in a moment (V210-83, #263).
                     let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
-                    crate::tunnel_cli::serve(&node, &anchors, &a.name, a.port, a.at).await
+                    crate::tunnel_cli::serve(&node, &a.name, a.port, a.at).await
                 },
             )
         }
@@ -1792,6 +1800,7 @@ pub fn run() -> ExitCode {
                 args.room.as_deref(),
                 format,
                 args.session.as_deref(),
+                &args.woken,
             ));
             // Always success: a hook that fails must not break the turn.
             ExitCode::SUCCESS
@@ -1852,9 +1861,12 @@ pub fn run() -> ExitCode {
                 args.passphrase_file.clone(),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
+                // Not `eprintln!`: after a hangup stderr can be a terminal that is gone, and a
+                // write that fails there must not turn the reason into a panic.
                 Err(e) => {
-                    eprintln!("vox: {e}");
-                    ExitCode::FAILURE
+                    use std::io::Write as _;
+                    let _ = writeln!(io::stderr(), "vox: {e}");
+                    e.exit_code()
                 }
             }
         }

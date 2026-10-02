@@ -49,6 +49,49 @@
 //! before printing what is unread): the codeword must not reach the model, and the proof
 //! goes red at "the room never reached the model".
 //!
+//! ## A plain `opencode`, opened by hand, can be interrupted (ADR-020 §6, ADR-021 F17)
+//!
+//! The same daemon, room and installed plugin, then what a person does: open `opencode` in
+//! the project with **no flags** — `VOX_ROOM` and `VOX_AGENT_NAME` exported, nothing else —
+//! in a pty, and ask it for a turn that runs `sleep`. While the tool runs, they post an urgent
+//! message addressed to someone else, then one addressed to this agent. The work is in
+//! `tests/pty/opencode_wake.py` (the screen read through `pyte`); this asserts what it saw:
+//!
+//! 1. the session's own drain registered it with the daemon as **OpenCode, reachable** (the
+//!    plugin's wake socket) — a plain `opencode` has no listener of its own, and before F17 it
+//!    registered as `unknown`;
+//! 2. the message addressed to someone else **never reaches the screen** while the turn runs;
+//! 3. the one addressed to this agent **reaches the screen mid-turn**, before the tool ends;
+//! 4. and the tool that was running **still runs to its end** (its output reaches the screen):
+//!    the interrupt queues into the running turn, never aborts it.
+//!
+//! Then, once the turn the wake started has answered, what the model was **given** — the
+//! session's user messages as OpenCode stored them, after the plugin rewrote them (V210-112):
+//!
+//! 5. the message that woke it appears **once**, as the wake itself: the `<vox-room>` read that
+//!    follows does not repeat it; and the one addressed to someone else, which woke nothing,
+//!    appears exactly once, in that read;
+//! 6. and every message is shown as its words, never as its envelope JSON.
+//!
+//! Mutation-checked: `vox agent hook` not registering the plugin's socket (the session stays
+//! `unknown`) goes red at (1) and (3); the plugin taking the wake and never relaying it goes
+//! red at (3); the drain re-emitting a woken message goes red at (5); the text format printing
+//! a message's raw envelope goes red at (6).
+//!
+//! ## The wake directory goes with the session, however the person quits (ADR-021 F17)
+//!
+//! The plugin's socket lives in a `vox-oc-*` directory of the temp directory. Every OpenCode in
+//! this proof runs with this run's own `TMPDIR`, so the directories counted are exactly its own.
+//! The person quits that session by closing its terminal (SIGHUP), then opens three more plain
+//! `opencode`s:
+//!
+//! 7. each quit — terminal closed, ctrl+C, `/exit` — **removes that session's directory**;
+//! 8. one SIGKILLed together with the helper that removes its directory leaves it, as a crash
+//!    does, and **the next `opencode` opened removes it**;
+//! 9. after every OpenCode of the run has exited, **no `vox-oc-*` is left** in its `TMPDIR`.
+//!
+//! Mutation-checked: no cleanup helper goes red at (7); no sweep at start goes red at (8).
+//!
 //! OpenCode absent, or no usable credential, is reported **unproven and fails** —
 //! an absent prover is missing evidence, not evidence of correctness. Set
 //! `VOX_PROOF_ALLOW_UNPROVEN=opencode` to accept that gap deliberately and visibly.
@@ -57,6 +100,9 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -181,7 +227,8 @@ fn opencode_turn(
 #[test]
 #[ignore = "drives a real model through a real harness; CI runs it in release"]
 fn a_real_model_reads_the_room_through_the_opencode_plugin() {
-    watchdog::arm();
+    // Five or six real model turns, one of them a 45 s tool, plus the pty driver's own bound.
+    watchdog::arm_for(Duration::from_secs(900));
 
     if which("opencode").is_none() {
         assert!(
@@ -286,22 +333,53 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     //    dir is tied to a path that ceases to exist, and nothing of the operator's
     //    is touched.
     let plugin_log = tmp.path().join("plugin.log");
-    // **A persistent fixture directory, not a fresh one per run.** OpenCode installs
-    // a `node_modules` tree into BOTH `.opencode/` in the project and
-    // `$XDG_CONFIG_HOME/opencode/`, and until both exist the plugin is loaded but
-    // its `chat.message` hook never fires — the turn answers with no injection. A
-    // fresh temp directory every run means that install never completes in time,
-    // and the proof concludes the plugin does not work. It reproduces the state any
-    // real project is in after its first turn.
-    let fixture = std::env::temp_dir().join("vox-opencode-proof");
+    // **This run's own fixture**, so two runs at once never share a project. OpenCode
+    // installs a `node_modules` tree into `.opencode/` in the project and
+    // `$XDG_CONFIG_HOME/opencode/` the first time it is used there, and until it has, the
+    // plugin may load while its `chat.message` never fires: the warm-up turns below take
+    // the fresh project through that, to the state any real project is in after its first
+    // turn.
+    let fixture = tmp.path().join("oc");
     let oc_cfg = fixture.join("config");
     let project = fixture.join("project");
     std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
     std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
+    // What a plain `opencode` (no `-m`) runs with: the model, and a shell tool it may use
+    // without asking — the interrupt case needs a turn that is busy running one.
+    std::fs::write(
+        project.join("opencode.json"),
+        serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "model": model(),
+            "permission": { "bash": "allow" }
+        })
+        .to_string(),
+    )
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot write the fixture's opencode.json: {e}"));
     // The credential is only *located* through the real data dir; nothing is copied.
     let _ = &auth;
 
+    // Every OpenCode here runs with this run's own `TMPDIR`, where its plugin makes its wake
+    // directory: (9) counts exactly this run's. Short, because a Unix socket's path is.
+    let oc_tmp = tmp.path().join("t");
+    std::fs::create_dir_all(&oc_tmp)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make this run's TMPDIR {oc_tmp:?}: {e}"));
+    let wake_dirs = || {
+        std::fs::read_dir(&oc_tmp)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("vox-oc-"))
+                    .map(|e| e.path().display().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    println!(
+        "[proof] vox-oc-* in this run's TMPDIR before it: {}",
+        wake_dirs().len()
+    );
     let env: Vec<(&str, &std::ffi::OsStr)> = vec![
+        ("TMPDIR", oc_tmp.as_os_str()),
         ("XDG_CONFIG_HOME", oc_cfg.as_os_str()),
         ("VOX_DATA_DIR", data.as_os_str()),
         ("VOX_CONFIG_DIR", cfg.as_os_str()),
@@ -372,5 +450,162 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         !without.contains(&codeword),
         "`--pure` disables external plugins, so the codeword must be unreachable — if it still \
          appears, this test is not measuring the plugin. Got: {without:?}"
+    );
+
+    // ---- a plain `opencode`, opened by hand, interrupted mid-turn (F17) ----
+    let _ = std::fs::write(&plugin_log, "");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/opencode_wake.py");
+    let out = pty_driver::run(
+        script,
+        &[
+            VOX,
+            data.to_str().unwrap(),
+            cfg.to_str().unwrap(),
+            &room,
+            project.to_str().unwrap(),
+            oc_cfg.to_str().unwrap(),
+            plugin_log.to_str().unwrap(),
+            oc_tmp.to_str().unwrap(),
+            "wake",
+        ],
+    );
+    let said = out.stdout.clone();
+    eprintln!(
+        "{said}\n[proof] the driver took {:?}; its last stage: {:?}{}",
+        out.took,
+        out.stage,
+        plugin_diag("hand-opened")
+    );
+    // **The product's verdicts first, whatever the driver did next.** A line the driver printed
+    // is what the person saw; judged only after the exit code, a plugin that made no wake
+    // channel (so the driver could not go on) read as the apparatus's failure.
+    let seen = |key: &str| {
+        said.lines()
+            .find_map(|l| l.strip_prefix(&format!("wake {key}: ")))
+            .map(str::to_owned)
+    };
+    println!(
+        "[proof] hand-opened `opencode`: registered {:?}; addressed to someone else: {:?}; \
+         addressed to it: {:?}; its running turn: {:?}",
+        seen("REGISTERED"),
+        seen("OTHER"),
+        seen("WAKE"),
+        seen("TURN")
+    );
+    if let Some(registered) = seen("REGISTERED") {
+        assert!(
+            registered.starts_with("opencode /") && registered.ends_with("wake.sock"),
+            "PRODUCT (1): a plain `opencode` must register as OpenCode, reachable through the \
+             plugin's wake socket; its drain registered {registered:?}"
+        );
+    }
+    if let Some(other) = seen("OTHER") {
+        assert!(
+            other == "absent",
+            "PRODUCT (2): an urgent message addressed to someone else must not interrupt this \
+             session; it was {other}: {said}"
+        );
+    }
+    if let Some(wake) = seen("WAKE") {
+        assert!(
+            wake.starts_with("shown mid-turn"),
+            "PRODUCT (3): an urgent message addressed to this session must interrupt it while its \
+             turn runs; it was {wake}: {said}"
+        );
+    }
+    if let Some(turn) = seen("TURN") {
+        assert!(
+            turn == "completed",
+            "PRODUCT (4): the interrupt must queue into the running turn, not abort its tool; the \
+             turn {turn}: {said}"
+        );
+    }
+    if let Some(given) = seen("RECEIVED") {
+        println!("[proof] what the model was given: {given}");
+        let count = |key: &str| {
+            given
+                .split_whitespace()
+                .find_map(|f| f.strip_prefix(&format!("{key}=")))
+                .unwrap_or("(none)")
+                .to_owned()
+        };
+        if given == "never" || count("woken") == "(none)" {
+            panic!(
+                "CANNOT MEASURE: the turn the wake started never answered, so what the model was \
+                 given could not be read: {said}"
+            );
+        }
+        assert!(
+            count("woken") == "1" && count("other") == "1",
+            "PRODUCT (5): the message that woke the session must reach the model once — as the \
+             wake, not again in the room read that follows — and the one that woke nothing \
+             exactly once; the model was given woken={} other={}: {said}",
+            count("woken"),
+            count("other")
+        );
+        assert!(
+            count("envelope") == "no",
+            "PRODUCT (6): the room read must show each message as written, never as its envelope \
+             JSON; envelope={}: {said}",
+            count("envelope")
+        );
+    }
+    // Only the plugin makes a wake directory, so a session that has none is the product's.
+    if let Some(nodir) = seen("NODIR") {
+        panic!(
+            "PRODUCT (7): a plain `opencode`'s plugin made no wake directory: {nodir}{}",
+            plugin_diag("no directory")
+        );
+    }
+    match out.code {
+        Some(0) => {}
+        Some(2) => panic!("CANNOT MEASURE: the hand-opened session's apparatus failed: {said}"),
+        _ if out.has_verdict("wake") => {
+            panic!("CANNOT MEASURE: the hand-opened session's driver hung or went red: {said}")
+        }
+        _ => panic!(
+            "CANNOT MEASURE: the hand-opened session's driver was stopped before it gave a \
+             verdict, at stage {:?} (exit {:?}; its stack is above): {said}",
+            out.stage.as_deref().unwrap_or("(before its first stage)"),
+            out.code
+        ),
+    }
+    // The driver ran to its end (exit 0), so a line it did not print is the driver's fault.
+    let line = |key: &str| {
+        seen(key).unwrap_or_else(|| {
+            panic!("APPARATUS: the driver exited 0 without its `wake {key}:` line: {said}")
+        })
+    };
+    for key in ["REGISTERED", "OTHER", "WAKE", "TURN", "RECEIVED"] {
+        line(key);
+    }
+
+    // ---- each session's wake directory goes with it (F17) ----
+    for how in ["hup", "ctrl+c", "/exit"] {
+        let quit = line(&format!("QUIT {how}"));
+        println!("[proof] quit by {how}: its wake directory {quit}");
+        assert!(
+            quit.starts_with("removed "),
+            "PRODUCT (7): a hand-opened `opencode` quit by {how} must take its wake directory with it; \
+             it was {quit}{}",
+            plugin_diag("quits")
+        );
+    }
+    let swept = line("SWEPT");
+    println!("[proof] killed with its cleanup, then another opened: its wake directory {swept}");
+    assert!(
+        swept.starts_with("removed "),
+        "PRODUCT (8): the next `opencode` opened must remove a wake directory whose OpenCode was killed \
+         with its cleanup; it was {swept}{}",
+        plugin_diag("sweep")
+    );
+    let left = wake_dirs();
+    println!(
+        "[proof] vox-oc-* in this run's TMPDIR after it: {}",
+        left.len()
+    );
+    assert!(
+        left.is_empty(),
+        "PRODUCT (9): no wake directory may outlive the OpenCode that made it; this run left {left:?}"
     );
 }
