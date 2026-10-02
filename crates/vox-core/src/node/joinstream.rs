@@ -116,6 +116,10 @@ pub enum JoinReject {
     /// (V210-92). Sent before the challenge, so before anything about the passphrase is known: it
     /// says only that this member is busy, and nothing about the joiner.
     Busy = 4,
+    /// The exchange succeeded — the passphrase was accepted — and the responder then could not
+    /// admit the joiner (V210-128): locked or closing mid-join, its store refused the write, or a
+    /// key conflict. A full room has its own frame, [`JoinFrame::Full`].
+    NotAdmitted = 5,
 }
 
 impl JoinReject {
@@ -125,6 +129,7 @@ impl JoinReject {
             2 => Some(Self::Malformed),
             3 => Some(Self::Refused),
             4 => Some(Self::Busy),
+            5 => Some(Self::NotAdmitted),
             _ => None,
         }
     }
@@ -137,6 +142,7 @@ impl JoinReject {
             Self::Malformed => "responder refused: malformed frame",
             Self::Refused => "responder refused",
             Self::Busy => "responder refused: busy answering other joins",
+            Self::NotAdmitted => "responder refused: it could not admit this identity",
         }
     }
 }
@@ -387,6 +393,7 @@ async fn send_frame(send: &mut SendStream, frame: &JoinFrame) -> Result<()> {
 fn rejected(r: JoinReject) -> Error {
     match r {
         JoinReject::Busy => Error::JoinResponderBusy,
+        JoinReject::NotAdmitted => Error::JoinNotAdmitted,
         r => Error::JoinRefused(r.as_str()),
     }
 }
@@ -842,8 +849,8 @@ pub async fn refuse_join_as(mut send: SendStream, reason: JoinReject) {
 /// Called with the joiner's proven identity **after the exchange succeeds and before the
 /// acceptance frame goes out**, and awaited. That ordering is the whole reason it exists. An
 /// `Err` is an admission that did not happen: the joiner is refused instead of accepted —
-/// [`JoinFrame::Full`] for a room already full, a plain refusal otherwise — and the exchange
-/// returns that error.
+/// [`JoinFrame::Full`] for a room already full, [`JoinReject::NotAdmitted`] otherwise, never the
+/// refusal a wrong passphrase gets — and the exchange returns that error.
 ///
 /// The joiner treats `Accepted` as "I am in", and the very next thing it does is publish its
 /// records to this node's board. Those records are refused unless this node has already admitted
@@ -893,7 +900,8 @@ where
             if let Err(e) = admit_before_accepting(outcome.peer.identity.clone()).await {
                 let refusal = match e {
                     Error::RoomFull { members } => JoinFrame::Full { members },
-                    _ => JoinFrame::Rejected(JoinReject::Refused),
+                    // The passphrase was accepted: never the refusal that reads as a wrong one.
+                    _ => JoinFrame::Rejected(JoinReject::NotAdmitted),
                 };
                 let _ = send_frame(&mut send, &refusal).await;
                 let _ = send.finish();

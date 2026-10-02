@@ -399,6 +399,13 @@ pub enum Error {
         members: u64,
     },
 
+    /// The member answering a join accepted the passphrase, and then could not admit the joiner:
+    /// it was locked or closing mid-join, its store would not take the write, or it already holds
+    /// another key under the joiner's fingerprint (V210-128). Not [`Error::JoinRefused`], which a
+    /// joiner reads as a wrong passphrase: this one was checked, and accepted.
+    #[error("a member accepted the passphrase but could not admit this identity")]
+    JoinNotAdmitted,
+
     /// Every one of the responder's join slots was held, so it refused before the exchange began
     /// (V210-92). The passphrase was never checked.
     #[error("a member is busy answering other joins")]
