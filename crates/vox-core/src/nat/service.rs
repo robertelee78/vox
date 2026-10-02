@@ -698,20 +698,24 @@ impl RendezvousService {
                 let w =
                     BoardWithdraw::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
                 let mut store = lock(&self.store);
-                let creator = store
-                    .genesis(&w.channel_id)
-                    .map(|g| g.body.creator_pubkey.clone());
                 let key = match w.scope {
                     WithdrawScope::Member => {
                         self.known_key(&store, &w.channel_id, w.epoch, &w.author_id, now)
                     }
-                    WithdrawScope::Room => creator.as_ref().and_then(|c| {
-                        if c.fingerprint() == w.author_id {
-                            Some(c.clone())
-                        } else {
-                            w.admin_key(c)
+                    // The creator, or a member its current roster names: an admin whose admin
+                    // was taken back is refused.
+                    WithdrawScope::Room => {
+                        let creator = store
+                            .genesis(&w.channel_id)
+                            .map(|g| g.body.creator_pubkey.clone());
+                        match creator {
+                            Some(c) if c.fingerprint() == w.author_id => Some(c),
+                            Some(_) if store.is_roster_admin(&w.channel_id, &w.author_id) => {
+                                self.known_key(&store, &w.channel_id, w.epoch, &w.author_id, now)
+                            }
+                            _ => None,
                         }
-                    }),
+                    }
                 };
                 let Some(key) = key else {
                     return Err(RejectReason::NotMember);
@@ -725,6 +729,22 @@ impl RendezvousService {
                         store.withdraw_room(&w.channel_id);
                     }
                 }
+                Ok(())
+            }
+            // A room's admins, from its creator (V030-14).
+            StructTag::AdminRoster => {
+                let r = crate::nat::withdraw::AdminRoster::from_wire(record)
+                    .map_err(|e| RejectReason::for_error(&e))?;
+                let mut store = lock(&self.store);
+                let Some(creator) = store
+                    .genesis(&r.channel_id)
+                    .map(|g| g.body.creator_pubkey.clone())
+                else {
+                    return Err(RejectReason::NotMember);
+                };
+                r.verify(&creator)
+                    .map_err(|e| RejectReason::for_error(&e))?;
+                store.accept_roster(&r.channel_id, r.timestamp_ms, r.admins);
                 Ok(())
             }
             _ => return Err(RejectReason::UnknownKind),

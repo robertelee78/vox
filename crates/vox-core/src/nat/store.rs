@@ -293,6 +293,9 @@ pub struct RendezvousStore {
     withdrawn_members: HashMap<(Digest32, Digest32), u64>,
     /// Rooms withdrawn whole (V030-14): nothing of them is taken again.
     withdrawn_rooms: std::collections::HashSet<Digest32>,
+    /// `channelID` → its newest admin roster as the creator signed it: `(timestamp_ms, admins)`
+    /// (V030-14). Who besides the creator may take the room off this board.
+    rosters: HashMap<Digest32, (u64, BTreeSet<Digest32>)>,
     /// The channels whose genesis this node filed itself — its own rooms and the ones it
     /// anchors. Never displaced and not counted against [`MAX_GENESIS_CHANNELS`].
     pinned: HashSet<Digest32>,
@@ -360,8 +363,38 @@ impl RendezvousStore {
         self.pinned.remove(channel_id);
         self.genesis_arrived.remove(channel_id);
         self.genesis_sources.remove(channel_id);
+        self.rosters.remove(channel_id);
         self.withdrawn_rooms.insert(*channel_id);
         gone
+    }
+
+    /// Take the room's admin roster, if it is newer than the one held (V030-14). The caller has
+    /// checked it is the creator's. Whether it was taken.
+    pub fn accept_roster(
+        &mut self,
+        channel_id: &Digest32,
+        timestamp_ms: u64,
+        admins: impl IntoIterator<Item = Digest32>,
+    ) -> bool {
+        if self.withdrawn_rooms.contains(channel_id) {
+            return false;
+        }
+        match self.rosters.get(channel_id) {
+            Some((at, _)) if *at >= timestamp_ms => false,
+            _ => {
+                self.rosters
+                    .insert(*channel_id, (timestamp_ms, admins.into_iter().collect()));
+                true
+            }
+        }
+    }
+
+    /// Whether `who` is on the room's current admin roster here (V030-14).
+    #[must_use]
+    pub fn is_roster_admin(&self, channel_id: &Digest32, who: &Digest32) -> bool {
+        self.rosters
+            .get(channel_id)
+            .is_some_and(|(_, admins)| admins.contains(who))
     }
 
     /// Whether a withdraw refuses a record of `author` in `channel_id` stamped `timestamp`.

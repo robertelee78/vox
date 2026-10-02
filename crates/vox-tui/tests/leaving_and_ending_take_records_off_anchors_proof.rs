@@ -10,15 +10,21 @@
 //!
 //! **Asserted:**
 //! - before anything, the anchor's board holds the room with its three members (the control);
+//! - alice, the creator, makes bob and carol admins and takes carol's back (`vox room admin`);
+//!   carol's node then runs the mutant sender build in its `withdraw-unentitled` mode — the faulty
+//!   peer a board must not obey — and `vox room end` makes it put a room withdraw it is not
+//!   entitled to: [`SETTLE`] later the board still holds the room with all three members;
 //! - carol leaves: within [`WITHIN`] the board holds two, and still two [`SETTLE`] later, while
 //!   alice and bob post, sync and publish — nothing put carol's records back;
-//! - alice, the creator, ends the room: within [`WITHIN`] the board no longer holds it at all, and
-//!   still not [`SETTLE`] later.
+//! - bob, a current admin, ends the room: within [`WITHIN`] the board no longer holds it at all,
+//!   and still not [`SETTLE`] later.
 //!
-//! Every red names which it is: `PRODUCT:` quotes what the anchor said; `APPARATUS:` is a setup
-//! that did not hold (the room never reached the board), so nothing was measured.
+//! Every red names which it is: `PRODUCT:` quotes what the anchor said; `PRODUCT (staging):` a
+//! `vox` step of the staging that failed; `APPARATUS:` a setup that did not hold (the mutant sender
+//! build missing, its withdraw never put), so nothing was measured.
 //!
-//! **Mutation that must turn it red:** a board that answers a withdraw and keeps the records.
+//! **Mutations that must turn it red:** a board that answers a withdraw and keeps the records; a
+//! board that takes a room withdraw from any member, not only the creator and its current admins.
 
 #![cfg(unix)]
 
@@ -39,14 +45,9 @@ const SETTLE: Duration = Duration::from_secs(15);
 /// `vox node: board — …` line it printed, `None` when that line does not name the room.
 fn board_members(out: &std::path::Path, short: &str) -> Option<usize> {
     let text = std::fs::read_to_string(out).unwrap_or_default();
-    let line = text
-        .lines()
-        .filter(|l| {
-            l.starts_with("vox node: board — ")
-                && !l.contains(" holding ")
-                && !l.contains(" holds ")
-        })
-        .next_back()?;
+    let line = text.lines().rfind(|l| {
+        l.starts_with("vox node: board — ") && !l.contains(" holding ") && !l.contains(" holds ")
+    })?;
     line.trim_start_matches("vox node: board — ")
         .split(", ")
         .find_map(|entry| {
@@ -76,7 +77,7 @@ fn board_until(
 }
 
 #[test]
-#[ignore = "a real anchor and real daemons, production Argon2id; CI runs it in release"]
+#[ignore = "a real anchor, real daemons and the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
 fn a_leave_and_an_end_take_their_records_off_the_anchor() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -85,23 +86,82 @@ fn a_leave_and_an_end_take_their_records_off_the_anchor() {
         .unwrap_or_else(|e| panic!("APPARATUS: no tokio runtime: {e}"));
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
-    let room = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let mutant = std::env::var("VOX_MUTANT_SENDER").unwrap_or_else(|_| {
+        panic!(
+            "APPARATUS (harness): VOX_MUTANT_SENDER does not name the mutant sender build \
+             (VOX_MUTANT_SENDER=$(scripts/build-mutant-sender.sh))"
+        )
+    });
+    let carries = |path: &str| {
+        std::fs::read(path)
+            .map(|b| b.windows(17).any(|w| w == b"VOX-MUTANT-SENDER"))
+            .unwrap_or(false)
+    };
+    assert!(
+        carries(&mutant) && !carries(support::VOX),
+        "APPARATUS (harness): VOX_MUTANT_SENDER={mutant} is not the mutant sender build, or the \
+         shipped binary carries its marker"
+    );
+    let mut room = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(support::room(tmp.path(), &["alice", "bob", "carol"]))
     }))
-    .unwrap_or_else(|_| panic!("APPARATUS: the room could not be set up, so nothing was measured"));
-    let [alice, bob, carol] = &room.workers[..] else {
-        unreachable!()
-    };
-    let id = room.id.as_str();
+    .unwrap_or_else(|_| panic!("PRODUCT (staging): the room could not be set up"));
+    let id = room.id.clone();
+    let id = id.as_str();
     let short: String = id.chars().take(12).collect();
     let out = tmp.path().join("anchor.out");
+    let anchor = || std::fs::read_to_string(&out).unwrap_or_default();
 
     let (held, n) = board_until(&out, &short, WITHIN, |n| n == Some(3));
     assert!(
         held,
         "APPARATUS: the anchor's board never held the room with its three members (last: {n:?}), \
          so a withdraw could not be seen.\nanchor:\n{}",
-        std::fs::read_to_string(&out).unwrap_or_default()
+        anchor()
+    );
+
+    // The creator names bob and carol admins and takes carol's back; it puts each roster on the
+    // boards.
+    {
+        let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
+        for (what, member) in [("add", bob), ("add", carol), ("remove", carol)] {
+            let o = alice.vox(None, &["room", "admin", what, id, &member.b32()]);
+            assert!(
+                o.ok,
+                "PRODUCT (staging): `vox room admin {what}` {} was refused: {o:?}",
+                member.name
+            );
+        }
+    }
+    // Carol, an admin no longer, runs the faulty build: it takes the room off boards anyway.
+    let carol_err = tmp.path().join("carol.mutant.err");
+    room.workers[2].restart_daemon_as(
+        &mutant,
+        &[("VOX_MUTANT_SENDER_MODE", "withdraw-unentitled")],
+        &carol_err,
+    );
+    let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
+    let o = carol.vox(None, &["room", "end", id]);
+    assert!(
+        !o.ok,
+        "PRODUCT: carol, whose admin was taken back, was not refused `vox room end`: {o:?}"
+    );
+    let said = std::fs::read_to_string(&carol_err).unwrap_or_default();
+    assert!(
+        said.contains("putting a room withdraw"),
+        "APPARATUS: carol's faulty node never put its room withdraw, so a board's refusal of it was \
+         not staged. It said:\n{said}"
+    );
+    let (moved, n) = board_until(&out, &short, SETTLE, |n| n != Some(3));
+    assert!(
+        !moved,
+        "PRODUCT: the anchor took a room withdraw from carol, whose admin was taken back: its board \
+         now counts {n:?}.\nanchor:\n{}",
+        anchor()
+    );
+    eprintln!(
+        "[proof] withdraw: the anchor refused a removed admin's room withdraw; still 3 members \
+         {SETTLE:?} later"
     );
 
     let o = carol.vox(None, &["room", "leave", id]);
@@ -112,7 +172,7 @@ fn a_leave_and_an_end_take_their_records_off_the_anchor() {
         gone,
         "PRODUCT: {WITHIN:?} after carol left, the anchor's board still counts {n:?} member(s) \
          for the room, not 2.\nanchor:\n{}",
-        std::fs::read_to_string(&out).unwrap_or_default()
+        anchor()
     );
     let took = t.elapsed();
     for i in 0..3 {
@@ -130,7 +190,7 @@ fn a_leave_and_an_end_take_their_records_off_the_anchor() {
         !back,
         "PRODUCT: carol's records came back on the anchor's board after her leave took them off: \
          it counts {n:?}.\nanchor:\n{}",
-        std::fs::read_to_string(&out).unwrap_or_default()
+        anchor()
     );
     eprintln!(
         "[proof] withdraw: carol's records left the anchor's board {:.1}s after her leave, and \
@@ -138,29 +198,29 @@ fn a_leave_and_an_end_take_their_records_off_the_anchor() {
         took.as_secs_f64()
     );
 
-    let o = alice.vox(None, &["room", "end", id]);
+    let o = bob.vox(None, &["room", "end", id]);
     assert!(
         o.ok,
-        "PRODUCT: the creator's `vox room end` was refused: {o:?}"
+        "PRODUCT: bob's `vox room end`, as a current admin, was refused: {o:?}"
     );
     let t = Instant::now();
     let (gone, n) = board_until(&out, &short, WITHIN, |n| n.is_none());
     assert!(
         gone,
-        "PRODUCT: {WITHIN:?} after the room ended, the anchor's board still holds it ({n:?} \
-         member(s)).\nanchor:\n{}",
-        std::fs::read_to_string(&out).unwrap_or_default()
+        "PRODUCT: {WITHIN:?} after bob, an admin, ended the room, the anchor's board still holds it \
+         ({n:?} member(s)).\nanchor:\n{}",
+        anchor()
     );
     let took = t.elapsed();
     let (back, n) = board_until(&out, &short, SETTLE, |n| n.is_some());
     assert!(
         !back,
         "PRODUCT: the ended room came back on the anchor's board ({n:?} member(s)).\nanchor:\n{}",
-        std::fs::read_to_string(&out).unwrap_or_default()
+        anchor()
     );
     eprintln!(
-        "[proof] withdraw: the room left the anchor's board {:.1}s after its end, and stayed off \
-         {SETTLE:?}",
+        "[proof] withdraw: the room left the anchor's board {:.1}s after an admin ended it, and \
+         stayed off {SETTLE:?}",
         took.as_secs_f64()
     );
 }

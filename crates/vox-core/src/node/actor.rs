@@ -5420,9 +5420,17 @@ impl Node {
                     )
                     .await;
                 }
-                // An anchor that was away when a room was left or ended is told now (V030-14).
-                let withdraws: Vec<Vec<u8>> = self.withdrawn.values().cloned().collect();
-                Self::put_withdraws(&conn, withdraws);
+                // An anchor that was away when a room was left or ended is told now, and is given
+                // each room's admin roster this node signs (V030-14).
+                let mut puts: Vec<Vec<u8>> = Vec::new();
+                let rooms: Vec<Digest32> = self.channels.keys().copied().collect();
+                for room in rooms {
+                    if let Some(r) = self.admin_roster(&room).await {
+                        puts.push(r);
+                    }
+                }
+                puts.extend(self.withdrawn.values().cloned());
+                Self::put_withdraws(&conn, puts);
             }
             NetEvent::BetterPath { conn } => {
                 self.adopt_connection(conn);
@@ -10397,20 +10405,9 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let (epoch, cert) = {
-            let ch = shared.lock().await;
-            let cert = match scope {
-                crate::nat::withdraw::WithdrawScope::Room
-                    if ch.me() != ch.genesis().creator_pubkey().fingerprint() =>
-                {
-                    ch.my_admin_cert().unwrap_or_default()
-                }
-                _ => Vec::new(),
-            };
-            (ch.epoch(), cert)
-        };
+        let epoch = shared.lock().await.epoch();
         let Ok(w) =
-            crate::nat::withdraw::BoardWithdraw::build(signer, channel_id, epoch, scope, now, cert)
+            crate::nat::withdraw::BoardWithdraw::build(signer, channel_id, epoch, scope, now)
         else {
             return;
         };
@@ -10423,6 +10420,43 @@ impl Node {
             .filter_map(|id| net.manager().existing(id))
             .collect();
         for conn in anchors {
+            Self::put_withdraws(&conn, vec![wire.clone()]);
+        }
+    }
+
+    /// The room's admin roster, signed (V030-14), when this node is its creator: who besides it a
+    /// board takes the room off from. Stamped with the newest admin change on the log, so putting
+    /// it again changes nothing on a board that holds it.
+    async fn admin_roster(&self, channel_id: &Digest32) -> Option<Vec<u8>> {
+        let profile = self.profile.as_ref()?;
+        let signer = profile.signer().ok()?;
+        let shared = self.channels.get(channel_id).map(Arc::clone)?;
+        let ch = shared.lock().await;
+        let me = ch.me();
+        if me != ch.genesis().creator_pubkey().fingerprint() {
+            return None;
+        }
+        let stamp = ch.admin_change_clock()?;
+        let admins: Vec<Digest32> = ch.admins().into_iter().filter(|a| *a != me).collect();
+        crate::nat::withdraw::AdminRoster::build(signer, channel_id, stamp, admins)
+            .ok()
+            .map(|r| r.to_wire())
+    }
+
+    /// Put the room's admin roster on this node's board and every anchor connected now (V030-14).
+    async fn publish_admin_roster(&mut self, channel_id: &Digest32) {
+        let Some(wire) = self.admin_roster(channel_id).await else {
+            return;
+        };
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let _ = net.publish_local(&wire);
+        for conn in self
+            .anchor_ids
+            .iter()
+            .filter_map(|id| net.manager().existing(id))
+        {
             Self::put_withdraws(&conn, vec![wire.clone()]);
         }
     }
@@ -10458,6 +10492,22 @@ impl Node {
                 return Outcome::Failed(Fault::RoomEnded);
             }
             if let Err(e) = ch.end(profile, now) {
+                // The faulty peer a board must not obey (V030-14's proof): it takes the room off
+                // boards though it may not end it.
+                #[cfg(feature = "mutant-sender")]
+                if crate::log::sync::mutant::withdraws_unentitled() {
+                    drop(ch);
+                    eprintln!(
+                        "{}: putting a room withdraw for {} though this node may not end it",
+                        crate::log::sync::mutant::MARKER,
+                        crate::node::network::short_id(*channel_id)
+                    );
+                    self.withdraw_from_boards(
+                        channel_id,
+                        crate::nat::withdraw::WithdrawScope::Room,
+                    )
+                    .await;
+                }
                 return Outcome::Failed(fault_of(&e));
             }
             self.fresh_details
@@ -10499,6 +10549,8 @@ impl Node {
                 .insert(*channel_id, (summary_of(&ch), detail_of(&ch, None)));
         }
         self.note_local_append(channel_id);
+        // The boards learn who may take the room off them (V030-14).
+        self.publish_admin_roster(channel_id).await;
         Outcome::Done
     }
 

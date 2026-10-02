@@ -5535,31 +5535,16 @@ impl ChannelState {
         Ok(certs.len())
     }
 
-    /// The admin certificate the creator issued this identity, wire form, if it holds one not
-    /// revoked: what a room withdraw signed by an admin carries to a board (V030-14).
+    /// When the room's admins last changed, on the room's own clock (V030-14): the newest admin
+    /// certificate or revocation on the log. `None` when the room never had one.
     #[must_use]
-    pub fn my_admin_cert(&self) -> Option<Vec<u8>> {
+    pub fn admin_change_clock(&self) -> Option<u64> {
         use crate::governance::entry::GovBody;
-        let me = self.me();
-        let root = self.evaluator.root_admin();
-        let revoked: BTreeSet<Digest32> = self
-            .gov_entries
+        self.gov_entries
             .iter()
-            .filter_map(|e| match &e.body {
-                GovBody::AdminRevocation(r) => Some(r.body.revoked_delegation_hash),
-                _ => None,
-            })
-            .collect();
-        self.gov_entries.iter().rev().find_map(|e| match &e.body {
-            GovBody::AdminCert(c)
-                if c.body.issuer_id == root
-                    && c.body.delegate_pubkey.fingerprint() == me
-                    && !revoked.contains(&e.entry_hash) =>
-            {
-                Some(c.to_wire())
-            }
-            _ => None,
-        })
+            .filter(|e| matches!(e.body, GovBody::AdminCert(_) | GovBody::AdminRevocation(_)))
+            .filter_map(|e| self.dag.order_key(&e.entry_hash).map(|(c, _)| c))
+            .max()
     }
 
     /// The room's admins, the creator first (V030-08).

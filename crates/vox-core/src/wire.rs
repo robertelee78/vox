@@ -89,11 +89,14 @@ pub enum StructTag {
     /// `0x0018` — board withdraw (V030-14): takes a member's records, or a whole room, off a
     /// rendezvous board at once.
     BoardWithdraw = 0x0018,
+    /// `0x0019` — admin roster (V030-14): a room's current admins as its creator signed them, so
+    /// a board can tell a current admin's room withdraw from a removed admin's.
+    AdminRoster = 0x0019,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 24] = [
+    pub const ALL: [StructTag; 25] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -118,6 +121,7 @@ impl StructTag {
         StructTag::KeyPackage,
         StructTag::RoomLifecycle,
         StructTag::BoardWithdraw,
+        StructTag::AdminRoster,
     ];
 
     /// The 2-byte tag value.
@@ -128,7 +132,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 24-element table: trivial and avoids an
+        // Linear scan over a 25-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -166,6 +170,7 @@ impl StructTag {
             StructTag::KeyPackage => "vox/key-package/v1",
             StructTag::RoomLifecycle => "vox/room-lifecycle/v1",
             StructTag::BoardWithdraw => "vox/board-withdraw/v1",
+            StructTag::AdminRoster => "vox/admin-roster/v1",
         }
     }
 }
