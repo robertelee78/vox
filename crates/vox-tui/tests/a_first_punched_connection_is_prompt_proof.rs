@@ -96,19 +96,20 @@ struct NatWorld {
 impl NatWorld {
     fn new(kind: Kind) -> Self {
         let started = Instant::now();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()
+            .unwrap_or_else(|e| panic!("APPARATUS: no temporary directory: {e}"));
         let (anchor_dir, host_dir, guest_dir) = (
             tmp.path().join("anchor"),
             tmp.path().join("host"),
             tmp.path().join("guest"),
         );
         for d in [&anchor_dir, &host_dir, &guest_dir] {
-            std::fs::create_dir_all(d.join("cfg")).unwrap();
+            std::fs::create_dir_all(d.join("cfg"))
+                .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
         }
         let anchor_port = UdpSocket::bind("[::]:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
+            .and_then(|s| s.local_addr())
+            .unwrap_or_else(|e| panic!("APPARATUS: no free UDP port for the anchor: {e}"))
             .port();
         let nats = TwoNats::start(kind, anchor_port);
         let advertise = format!("{},{}", nats.anchor_for_host, nats.anchor_for_guest);
@@ -126,19 +127,21 @@ impl NatWorld {
             })
             .trim()
             .to_owned();
-        let (fp, _) = spec.split_once('@').expect("fp@addr");
+        let (fp, _) = spec
+            .split_once('@')
+            .unwrap_or_else(|| panic!("PRODUCT: the anchor's spec {spec:?} is not fp@address"));
         let host_spec = format!("{fp}@/ip4/127.0.0.1/udp/{}", nats.anchor_for_host.port());
         let guest_spec = format!("{fp}@/ip6/::1/udp/{}", nats.anchor_for_guest.port());
 
         let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-        assert!(ok, "vox id (guest): {err}");
+        assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
         let (ok, _host_fp, err) = vox_once(&host_dir, &args(&["id"]));
-        assert!(ok, "vox id (host): {err}");
+        assert!(ok, "PRODUCT (staging): vox id (host): {err}");
         let (ok, out, err) = vox_once(
             &host_dir,
             &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
         );
-        assert!(ok, "trust add: {out}\n{err}");
+        assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
         let service_port = echo_service();
         let mut host = VoxProc::spawn(
             "host",
@@ -222,9 +225,8 @@ impl NatWorld {
         let bound = line
             .split_whitespace()
             .nth(3)
-            .expect("an address")
-            .parse()
-            .expect("a socket address");
+            .and_then(|a| a.parse().ok())
+            .unwrap_or_else(|| panic!("PRODUCT: no proxy address in `vox up`'s line {line:?}"));
         (up, bound, ready)
     }
 
@@ -338,7 +340,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         let answered = Instant::now();
         let Some(first_direct) = first else {
             panic!(
-                "sample {i}: the first request to the host was not answered.\nup:\n{}",
+                "PRODUCT: sample {i}: the first request to the host was not answered.\nup:\n{}",
                 up.transcript()
             );
         };
@@ -482,7 +484,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
     }
     assert!(
         never == 0 && over_any == 0 && over_punched == 0,
-        "R42 punch: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
+        "PRODUCT: R42 punch: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
          first answers took longer (slowest {any_max:?}); {over_punched} of {SAMPLES} reached the \
          punched path at or past it (slowest {punched_max:?}), {never} never within {GIVE_UP:?}"
     );

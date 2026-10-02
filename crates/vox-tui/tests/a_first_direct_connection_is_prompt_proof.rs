@@ -378,7 +378,9 @@ fn a_node_reads_the_board_before_bridging() {
 
 /// `address` with `who`'s entry (its `a=` and the `b=` addresses after it) taken out.
 fn without_entry_of(address: &str, who: &str) -> String {
-    let (head, query) = address.split_once('?').expect("an address with a query");
+    let (head, query) = address.split_once('?').unwrap_or_else(|| {
+        panic!("PRODUCT: the room address {address:?} has no query naming its boards")
+    });
     let mut kept = Vec::new();
     let mut skipping = false;
     for part in query.split('&') {
@@ -503,7 +505,7 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         assert_eq!(
             code,
             0,
-            "sample {i}: the first CONNECT to {hostname} was refused (SOCKS {code}).\nup:\n{}",
+            "PRODUCT: sample {i}: the first CONNECT to {hostname} was refused (SOCKS {code}).\nup:\n{}",
             up.transcript()
         );
         let sent = w.forward.to_host();
@@ -511,7 +513,7 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         let answered = Instant::now();
         assert!(
             echoed,
-            "sample {i}: the first CONNECT succeeded but no whole echo came back.\nup:\n{}",
+            "PRODUCT: sample {i}: the first CONNECT succeeded but no whole echo came back.\nup:\n{}",
             up.transcript()
         );
         requests += 1;
@@ -658,7 +660,7 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
     let over_direct = direct.iter().filter(|d| **d >= TARGET).count();
     assert!(
         never == 0 && over_direct == 0 && over_any == 0,
-        "R42 open: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
+        "PRODUCT: R42 open: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
          first answers took longer (slowest {any_max:?}); {over_direct} of {SAMPLES} reached the \
          direct path at or past it (slowest {direct_max:?}), {never} never within {GIVE_UP:?}"
     );
