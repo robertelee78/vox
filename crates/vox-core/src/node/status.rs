@@ -1398,16 +1398,42 @@ pub async fn bind_metrics(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
         })
 }
 
+/// The most of a request's head [`read_request_head`] reads: far more than a scraper's request
+/// line and headers, so a client cannot hold the reader on a head without end.
+const REQUEST_HEAD_MAX: usize = 16 * 1024;
+
+/// Read `sock` until the end of an HTTP request's head (`\r\n\r\n`), the peer's end of stream,
+/// [`REQUEST_HEAD_MAX`] bytes, or `within`, whichever comes first (V210-126).
+async fn read_request_head(sock: &mut tokio::net::TcpStream, within: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut head: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while head.len() < REQUEST_HEAD_MAX {
+        match tokio::time::timeout_at(deadline, sock.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => {
+                // Only the last three bytes of what came before can begin the terminator.
+                let from = head.len().saturating_sub(3);
+                head.extend_from_slice(&chunk[..n]);
+                if head[from..].windows(4).any(|w| w == b"\r\n\r\n") {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
 /// Serve Prometheus text on every connection to `listener`, until it is dropped.
 pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle) {
     while let Ok((mut sock, _)) = listener.accept().await {
         let handle = handle.clone();
         tokio::spawn(async move {
-            // The request itself is not interpreted: every path answers the metrics. A
-            // bounded read is enough to consume a scraper's request line and headers.
-            let mut buf = [0u8; 2048];
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(2), sock.read(&mut buf)).await;
+            // The request itself is not interpreted: every path answers the metrics. But it is
+            // **read to its end** first, the blank line after its headers, within the same 2 s
+            // (V210-126): one read took only the first segment of a request that arrived in
+            // pieces, and closing with the rest unread made the OS reset the connection, so the
+            // scraper lost the answer (`Connection reset by peer`).
+            read_request_head(&mut sock, std::time::Duration::from_secs(2)).await;
             let body = match handle.status().await {
                 Ok(r) => r.to_prometheus(),
                 Err(_) => "vox_up 0\n".to_owned(),
