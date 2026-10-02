@@ -336,11 +336,15 @@ fn port_free(port: u16) {
     }
 }
 
-/// Poll `f` until it is true, up to [`TIMEOUT`]; panic with `what` if it never is.
-fn until(what: &str, mut f: impl FnMut() -> bool) {
+/// Poll `f` until it is true, up to [`TIMEOUT`]; panic with `side` (`PRODUCT`,
+/// `PRODUCT (staging)`) and `what` if it never is.
+fn until(side: &str, what: &str, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + TIMEOUT;
     while !f() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        assert!(
+            Instant::now() < deadline,
+            "{side}: timed out after {TIMEOUT:?} waiting for {what}"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -775,7 +779,7 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
     };
 
     // ---- 1. one plan ----
-    until("all four plans to hold all four members", || {
+    until("PRODUCT", "all four plans to hold all four members", || {
         [&*a, &*b, &*d, &*c].iter().all(|h| {
             h.stats()["members"]
                 .as_object()
@@ -845,7 +849,10 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         if Instant::now() >= deadline {
             eprintln!("---- the anchor ----\n{}", anchor.transcript());
             report(&mut [&mut *a, &mut *b, &mut *d, &mut *c]);
-            panic!("timed out waiting for the three trusted members to link to each other");
+            panic!(
+                "PRODUCT (staging): timed out after {TIMEOUT:?} waiting for the three trusted \
+                 members to link to each other, so the gate on carol cannot be judged"
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -853,7 +860,11 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
     // 8 s apart: watched for longer than that, she must never hold a link.
     let watched = Instant::now();
     while watched.elapsed() < Duration::from_secs(10) {
-        assert!(c.links().is_empty(), "carol linked to {:?}", c.links());
+        assert!(
+            c.links().is_empty(),
+            "PRODUCT: carol, whom nobody trusts, linked to {:?}",
+            c.links()
+        );
         std::thread::sleep(Duration::from_millis(250));
     }
     eprintln!(
@@ -864,7 +875,11 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         c.links().len(),
         watched.elapsed()
     );
-    assert!(c.links().is_empty(), "carol linked to {:?}", c.links());
+    assert!(
+        c.links().is_empty(),
+        "PRODUCT: carol, whom nobody trusts, linked to {:?}",
+        c.links()
+    );
     // alice's running LAN answers for her profile, and counts carol's dials as refused.
     let (ok, out, err) = vox_once(&a.dir, &args(&["status", "--json"]));
     assert!(
@@ -1188,7 +1203,8 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         "PRODUCT: `vox trust remove` did not reach alice's running LAN: {out}{said}"
     );
     until(
-        "alice to link with dave again, and alice and bob not at all",
+        "PRODUCT",
+        "alice to link with dave again, and alice and bob not at all, after she untrusted bob",
         || a.links() == want(&[&d.id]) && !b.links().contains(&a.id),
     );
     for i in 0..20 {
@@ -1218,8 +1234,17 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         a.links(),
         b.links()
     );
-    assert_eq!((at_a, at_b), (0, 0));
-    assert!(at_d >= 18, "dave stopped hearing alice: {at_d}");
+    assert_eq!(
+        (at_a, at_b),
+        (0, 0),
+        "PRODUCT: after alice untrusted bob, {at_a}/20 of bob's packets reached alice and \
+         {at_b}/20 of alice's floods reached bob; both must be 0"
+    );
+    assert!(
+        at_d >= 18,
+        "PRODUCT: after alice untrusted bob, dave stopped hearing her: {at_d}/20 of her floods \
+         reached him"
+    );
     drop(anchor);
 }
 
