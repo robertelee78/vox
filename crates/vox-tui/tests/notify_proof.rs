@@ -426,3 +426,237 @@ fn notify_off_raises_nothing() {
         "and the daemon must say they are off"
     );
 }
+
+/// The anchor named `id` in alice's `vox status --json`: `Some(reached)`, or `None` if she does
+/// not list it.
+fn anchor_reached(s: &Value, id: &str) -> Option<bool> {
+    s["anchors"]
+        .as_array()?
+        .iter()
+        .find(|a| a["id"].as_str() == Some(id))
+        .and_then(|a| a["reached"].as_bool())
+}
+
+/// **An anchor that cannot be reached** (PRD-001 R37). alice's daemon keeps one anchor; the anchor
+/// is killed by its PID: exactly one "unreachable" notification naming it, after
+/// `ANCHOR_UNREACHABLE_SECS` (60 s) and not before, and still one half a minute later. The anchor
+/// is started again on the same port with the same profile: exactly one "recovered".
+#[test]
+#[ignore = "an anchor and a real daemon, the anchor killed for over a minute; CI runs it in release"]
+fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    let file = tmp.path().join("notifications.log");
+    let script = notify_script(&tmp, &file);
+    let anchor_dir = member_dir(&tmp, "anchor");
+    let alice_dir = member_dir(&tmp, "alice");
+    let pass_file = tmp.path().join("passphrases");
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: passphrase file");
+
+    let anchor_port = free_udp_port();
+    let listen = format!("127.0.0.1:{anchor_port}");
+    let node = |dir: &Path| VoxProc::spawn("anchor", dir, &args(&["node", "--listen", &listen]));
+    let mut anchor = node(&anchor_dir);
+    let spec = anchor
+        .expect_line("an --anchor spec", |l| {
+            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
+        })
+        .trim()
+        .to_owned();
+    let anchor_id = spec.split('@').next().unwrap_or_default().to_owned();
+    let anchor_short: String = anchor_id.chars().take(12).collect();
+
+    let (ok, _, err) = vox_once(&alice_dir, &args(&["id"]));
+    assert!(ok, "PRODUCT: vox id: {err}");
+    let _alice = daemon(
+        "alice",
+        &alice_dir,
+        free_udp_port(),
+        &spec,
+        &pass_file,
+        &[(
+            "VOX_NOTIFY_COMMAND",
+            script.to_str().expect("APPARATUS: utf-8 path"),
+        )],
+    );
+    let reached = Instant::now() + SETUP;
+    while anchor_reached(&status(&alice_dir), &anchor_id) != Some(true) {
+        assert!(
+            Instant::now() < reached,
+            "CANNOT MEASURE: precondition unmet: alice never reached her anchor {anchor_short}: \
+             {}",
+            status(&alice_dir)["anchors"]
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Two checks' worth, so a notification for a healthy anchor would have fired by now.
+    std::thread::sleep(Duration::from_secs(11));
+    let healthy = notes(&file);
+    assert_eq!(
+        count(&healthy, "unreachable", &anchor_short),
+        0,
+        "PRODUCT: a notification about the anchor while it is up: {healthy:?}"
+    );
+
+    // Kill the anchor by its PID.
+    let killed = Instant::now();
+    let _ = anchor.child.kill();
+    let _ = anchor.child.wait();
+    let until = killed + Duration::from_secs(150);
+    while count(&notes(&file), "unreachable", &anchor_short) == 0 {
+        assert!(
+            Instant::now() < until,
+            "PRODUCT: no notification {:?} after alice's anchor {anchor_short} was killed; her \
+             status says {}; notifications: {:?}",
+            killed.elapsed(),
+            status(&alice_dir)["unhealthy"],
+            notes(&file)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let raised_after = killed.elapsed();
+    // Half a minute more of the same condition.
+    std::thread::sleep(Duration::from_secs(30));
+    let held = notes(&file);
+    eprintln!("[proof] raised {raised_after:?} after the anchor was killed; 30 s later: {held:?}");
+    assert!(
+        raised_after >= Duration::from_secs(60),
+        "PRODUCT: the anchor was called unreachable after {raised_after:?}, before the 60 s an \
+         anchor restarting is given: {held:?}"
+    );
+    assert_eq!(
+        count(&held, "unreachable", &anchor_short),
+        1,
+        "PRODUCT: one condition is one notification, not one per check: {held:?}"
+    );
+
+    // The anchor again, same profile, same port.
+    drop(anchor);
+    port_free(anchor_port);
+    let _anchor_again = node(&anchor_dir);
+    let back = Instant::now();
+    let until = back + Duration::from_secs(120);
+    while count(&notes(&file), "recovered", &anchor_short) == 0 {
+        assert!(
+            Instant::now() < until,
+            "PRODUCT: no \"recovered\" notification {:?} after the anchor was back; alice's \
+             anchors: {}; notifications: {:?}",
+            back.elapsed(),
+            status(&alice_dir)["anchors"],
+            notes(&file)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let recovered_after = back.elapsed();
+    std::thread::sleep(Duration::from_secs(11));
+    let end = notes(&file);
+    eprintln!("[proof] recovered {recovered_after:?} after the anchor was back: {end:?}");
+    assert_eq!(
+        (
+            count(&end, "unreachable", &anchor_short),
+            count(&end, "recovered", &anchor_short)
+        ),
+        (2, 1),
+        "PRODUCT: exactly one raised (the recovered line repeats its text) and one cleared: \
+         {end:?}"
+    );
+}
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again);
+
+/// **A room that has not synced** (PRD-001 R37), optional because the condition takes
+/// `STALE_SYNC_SECS` (ten minutes) to start. bob, alice's only other member, is killed: once the
+/// room has gone ten minutes with no completed sync, exactly one notification names the room;
+/// bob back, exactly one "recovered" for it.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "optional: an anchor and two daemons, one killed for over ten minutes; run in release"]
+fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
+    watchdog::arm_for(Duration::from_secs(1_800));
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    let file = tmp.path().join("notifications.log");
+    let script = notify_script(&tmp, &file);
+    let Scene {
+        _anchor,
+        anchor,
+        alice: _alice,
+        alice_dir,
+        mut bob,
+        bob_dir,
+        bob_port,
+        pass_file,
+        ..
+    } = scene(&tmp, &script, |_| {});
+    let room: String = status(&alice_dir)["rooms"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: alice's status lists no room"))
+        .chars()
+        .take(12)
+        .collect();
+    let stale = |lines: &[String]| count(lines, "no completed sync", &room);
+
+    let killed = Instant::now();
+    let _ = bob.child.kill();
+    let _ = bob.child.wait();
+    let until = killed + Duration::from_secs(10 * 60 + 120);
+    while stale(&notes(&file)) == 0 {
+        assert!(
+            Instant::now() < until,
+            "PRODUCT: no notification for room {room} {:?} after its only other member was \
+             killed; alice's status says {}; notifications: {:?}",
+            killed.elapsed(),
+            status(&alice_dir)["unhealthy"],
+            notes(&file)
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let raised_after = killed.elapsed();
+    std::thread::sleep(Duration::from_secs(30));
+    let held = notes(&file);
+    eprintln!("[proof] room {room} raised {raised_after:?} after bob was killed: {held:?}");
+    assert_eq!(
+        stale(&held),
+        1,
+        "PRODUCT: one condition is one notification: {held:?}"
+    );
+
+    drop(bob);
+    port_free(bob_port);
+    let mut bob_again = daemon("bob", &bob_dir, bob_port, &anchor, &pass_file, &[]);
+    bob_again.expect_within(TIMEOUT, "bob's daemon to hold the room", |l| {
+        l.contains("holding room")
+    });
+    let back = Instant::now();
+    let cleared = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|l| {
+                l.contains("recovered") && l.contains("no completed sync") && l.contains(&room)
+            })
+            .count()
+    };
+    let until = back + Duration::from_secs(120);
+    while cleared(&notes(&file)) == 0 {
+        assert!(
+            Instant::now() < until,
+            "PRODUCT: no \"recovered\" for room {room} {:?} after bob was back; notifications: \
+             {:?}",
+            back.elapsed(),
+            notes(&file)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    std::thread::sleep(Duration::from_secs(11));
+    let end = notes(&file);
+    eprintln!(
+        "[proof] room {room} recovered {:?} after bob was back: {end:?}",
+        back.elapsed()
+    );
+    assert_eq!(
+        (stale(&end), cleared(&end)),
+        (2, 1),
+        "PRODUCT: exactly one raised (the recovered line repeats its text) and one cleared: {end:?}"
+    );
+}

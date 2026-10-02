@@ -14,7 +14,10 @@
 //! A line in [`StatusReport::unhealthy`] is something an operator should look at:
 //!
 //! - a room with other members that has not completed a sync in [`STALE_SYNC_SECS`];
-//! - a **trusted** member of an open room this node was connected to and no longer is.
+//! - a **trusted** member of an open room this node was connected to and no longer is;
+//! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_SECS`]. An
+//!   anchor only bridges hosts that cannot otherwise find each other (ADR-012), so the line says
+//!   what that costs and what it does not: peers this node reaches directly are unaffected.
 //!
 //! An untrusted member that is offline is not flagged: nothing this node does depends on
 //! reaching it. A trusted one is who this node reads, and is read by.
@@ -58,6 +61,11 @@ use crate::transport::router::DatagramStats;
 
 /// A room with other members and no completed sync for this long is flagged.
 pub const STALE_SYNC_SECS: u64 = 10 * 60;
+
+/// An anchor this node keeps and has not reached for this long is flagged (PRD-001 R37). Long
+/// enough that an anchor restarting, which members are back from within seconds (V210-86), never
+/// interrupts anyone.
+pub const ANCHOR_UNREACHABLE_SECS: u64 = 60;
 
 /// One tunnel this node is serving right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,15 +247,26 @@ pub struct StatusReport {
     pub datagrams: DatagramStats,
     /// The app layer's counters.
     pub app: AppStats,
+    /// The anchors this node keeps, and whether it reaches them.
+    pub anchors: Vec<AnchorStatus>,
     /// What needs looking at.
     pub unhealthy: Vec<Unhealthy>,
+}
+
+/// One anchor this node keeps: configured, or named by an open room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorStatus {
+    /// Its identity.
+    pub id: Digest32,
+    /// Since when this node has not reached it (unix seconds); `None` while it is reached.
+    pub unreached_since: Option<u64>,
 }
 
 /// One condition that needs looking at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unhealthy {
-    /// A stable name for the condition — `peer-unreachable:<room>:<peer>` or
-    /// `room-stale:<room>` — the same for as long as the condition holds, so a notifier
+    /// A stable name for the condition — `peer-unreachable:<room>:<peer>`, `room-stale:<room>`
+    /// or `anchor-unreachable:<anchor>` — the same for as long as the condition holds, so a notifier
     /// can tell it starting from it continuing (PRD-001 R37).
     pub key: String,
     /// What a person reads. May change while the condition holds ("last seen 12s ago").
@@ -300,6 +319,25 @@ impl StatusReport {
                             room.name,
                             short(&m.id),
                             self.now.saturating_sub(seen)
+                        ),
+                    });
+                }
+            }
+        }
+        if self.networked {
+            for a in &self.anchors {
+                let Some(since) = a.unreached_since else {
+                    continue;
+                };
+                let for_secs = self.now.saturating_sub(since);
+                if for_secs > ANCHOR_UNREACHABLE_SECS {
+                    out.push(Unhealthy {
+                        key: format!("anchor-unreachable:{}", b32_encode(&a.id)),
+                        message: format!(
+                            "anchor {} unreachable for {for_secs}s: a host that can find this \
+                             node only through it cannot reach it until it is back; peers this \
+                             node reaches directly are unaffected",
+                            short(&a.id)
                         ),
                     });
                 }
@@ -405,6 +443,16 @@ impl StatusReport {
             a.refused_unaccepted,
             a.refused_locally,
             a.withdrawn
+        );
+        let _ = write!(
+            j,
+            "\"anchors\":[{}],",
+            list(self.anchors.iter().map(|a| format!(
+                "{{\"id\":{},\"reached\":{},\"unreached_since\":{}}}",
+                q(&b32_encode(&a.id)),
+                a.unreached_since.is_none(),
+                opt(a.unreached_since)
+            )))
         );
         let _ = write!(
             j,
