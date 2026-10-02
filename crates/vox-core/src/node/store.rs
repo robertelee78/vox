@@ -47,6 +47,11 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
+/// The codes of the anchor's ciphertext copy of a room it was not a member of — its log pages (6)
+/// and its metadata (7) — **retired** with that copy (ADR-023 decision 6, PRD-001 R34, R45). Never
+/// reused, and deleted wherever they are found ([`Store::delete_retired_anchor_pages`]).
+const RETIRED_ANCHOR_CODES: [u8; 2] = [6, 7];
+
 /// Stable on-disk code for a [`SegmentKind`] (part of the key; never reordered).
 const fn kind_code(kind: SegmentKind) -> u8 {
     match kind {
@@ -55,8 +60,6 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::Index => 3,
         SegmentKind::KeyMaterial => 4,
         SegmentKind::PrekeyRing => 5,
-        SegmentKind::AnchorLog => 6,
-        SegmentKind::AnchorMeta => 7,
         // The keyring is not stored as a segment (it is a sealed blob in `meta`,
         // because it belongs to no channel), but a kind must map to a stable code
         // or this match stops being exhaustive.
@@ -485,18 +488,43 @@ impl Store {
         Ok(out)
     }
 
-    /// Every channel this store holds an **anchor** copy of (an `AnchorMeta` segment),
-    /// in unspecified order — how a restarted anchor finds the rooms it was serving.
-    pub fn anchored_channels(&self) -> Result<Vec<Digest32>> {
+    /// Delete every page of the anchor's old ciphertext copy of a room (the retired segment
+    /// codes, 6 and 7): an anchor stores nothing for a room it is not a member
+    /// of (ADR-023 decision 6), and pages an earlier build stored are deleted when it next opens
+    /// the store. Returns how many were deleted.
+    pub fn delete_retired_anchor_pages(&self) -> Result<usize> {
+        let txn = self.begin_write()?;
+        let mut deleted = 0;
+        {
+            let mut t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
+            let keys: Vec<SegmentKey> = t
+                .iter()
+                .map_err(storage("iterate segments"))?
+                .filter_map(std::result::Result::ok)
+                .map(|(k, _)| k.value())
+                .filter(|(_, kind, _)| RETIRED_ANCHOR_CODES.contains(kind))
+                .collect();
+            for key in keys {
+                if t.remove(key).map_err(storage("delete segment"))?.is_some() {
+                    deleted += 1;
+                }
+            }
+        }
+        txn.commit().map_err(storage("commit"))?;
+        Ok(deleted)
+    }
+
+    /// How many pages of any kind this store holds, per room — what a node keeps of each room
+    /// on disk, whatever it is. A node that is a member of no room (an anchor) is to hold none
+    /// (ADR-023 decision 6).
+    pub fn pages_by_channel(&self) -> Result<std::collections::BTreeMap<Digest32, usize>> {
         let txn = self.begin_read()?;
         let t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
-        let mut out: Vec<Digest32> = Vec::new();
+        let mut out: std::collections::BTreeMap<Digest32, usize> =
+            std::collections::BTreeMap::new();
         for item in t.iter().map_err(storage("iterate segments"))? {
             let (k, _) = item.map_err(storage("iterate segments"))?;
-            let (channel, kind, _) = k.value();
-            if kind == kind_code(SegmentKind::AnchorMeta) && !out.contains(&channel) {
-                out.push(channel);
-            }
+            *out.entry(k.value().0).or_default() += 1;
         }
         Ok(out)
     }

@@ -21,6 +21,11 @@
 //!    it, never before).
 //! 5. With every daemon stopped, the stores are read at rest: C carries the key-packages for B
 //!    and **cannot open one**; B's own ring opens every one.
+//! 6. **And the anchor holds nothing** (ADR-023 decision 6, proof 6; PRD-001 R34, R45, R11): A,
+//!    B and C all run with `--anchor` at a `vox node` that is a member of nothing. Its board
+//!    serves the room (it says so), and after the whole exchange its data directory holds **zero
+//!    pages** of any room, read at rest: no log, no key-package, nothing. The keys travelled
+//!    through C, the always-on member, not through the anchor.
 //!
 //! The second test removes C before A comes back: B reads none of A's messages, and B's log
 //! holds no key-package for B — nothing was online with both. That is "keys wait for overlap"
@@ -34,7 +39,8 @@
 //! and reached only through the log. B, reading through C alone, must read the same six D reads;
 //! and neither reads the message A posted before trusting them (never wider).
 //!
-//! Mutations: no key-package posted → B reads 0. The log path releasing forward-only from the key
+//! Mutations: the anchor keeping its old ciphertext copy of the room (as before ADR-023 decision
+//! 6) → the anchor's data directory holds pages for the room. No key-package posted → B reads 0. The log path releasing forward-only from the key
 //! held when the consent fell due (what it did before #226) → B reads 0 of the six, D all six.
 //! R14 deleting every superseded generation whatever V210-45 still owes (as the merge had it) →
 //! D and B each read 3 of the six: generation one's key was gone before either joined.
@@ -44,6 +50,7 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -52,6 +59,12 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
+
+thread_local! {
+    /// The `--anchor` every daemon this test's thread starts names, if it set one. Per thread,
+    /// since the tests of this file run side by side and only the first uses an anchor.
+    static ANCHOR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// A daemon, killed by its own PID however the test ends, with stdout and stderr collected.
 struct Daemon {
@@ -85,9 +98,13 @@ impl Daemon {
     fn start(name: &'static str, dir: &std::path::Path) -> Self {
         let pass = dir.join("pass");
         std::fs::write(&pass, format!("{IDPASS}\n{ROOMPASS}\n")).unwrap();
-        let mut child = Command::new(VOX)
-            .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
-            .arg(&pass)
+        let mut cmd = Command::new(VOX);
+        cmd.args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+            .arg(&pass);
+        if let Some(spec) = ANCHOR.with(|a| a.borrow().clone()) {
+            cmd.args(["--anchor", &spec]);
+        }
+        let mut child = cmd
             .env("VOX_DATA_DIR", dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
             .env_remove("VOX_ROOM")
@@ -232,6 +249,79 @@ fn packages_at_rest(dir: &std::path::Path, recipient: &vox_core::hash::Digest32)
     (held, opened)
 }
 
+/// A `vox node` anchor, killed by its own PID however the test ends, with its stdout collected.
+struct Anchor {
+    child: Child,
+    out: Arc<Mutex<Vec<String>>>,
+    spec: String,
+}
+
+impl Anchor {
+    fn start(dir: &std::path::Path) -> Self {
+        let mut child = Command::new(VOX)
+            .args(["node", "--listen", "127.0.0.1:0"])
+            .env("VOX_DATA_DIR", dir)
+            .env("VOX_CONFIG_DIR", dir.join("cfg"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn the anchor: {e}"));
+        let out = collect(child.stdout.take().expect("APPARATUS: the anchor's stdout"));
+        // Held from here, so its `Drop` kills and reaps the anchor on every path out.
+        let mut anchor = Self {
+            child,
+            out,
+            spec: String::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let spec = anchor.out.lock().unwrap().iter().find_map(|l| {
+                let l = l.trim();
+                (l.contains('@') && l.starts_with(|c: char| c.is_alphanumeric()))
+                    .then(|| l.to_owned())
+            });
+            if let Some(spec) = spec {
+                anchor.spec = spec;
+                return anchor;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE (staging): the anchor never printed its --anchor spec"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn out(&self) -> String {
+        self.out.lock().unwrap().join("\n")
+    }
+}
+
+impl Drop for Anchor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The pages `dir`'s node stores, per room, read at rest with it stopped. No store file is no
+/// pages: a node that keeps nothing need not keep a file.
+fn pages_at_rest(
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<vox_core::hash::Digest32, usize> {
+    let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
+        .expect("APPARATUS: the anchor's paths");
+    let file = paths.store_file();
+    if !file.is_file() {
+        eprintln!("[R34] the anchor has no store file at {}", file.display());
+        return std::collections::BTreeMap::new();
+    }
+    vox_core::node::store::Store::open_read_only(&file)
+        .and_then(|s| s.pages_by_channel())
+        .unwrap_or_else(|e| panic!("APPARATUS: read the anchor's store at rest: {e}"))
+}
+
 struct Cast {
     _tmp: tempfile::TempDir,
     a: std::path::PathBuf,
@@ -351,6 +441,11 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
 fn keys_reach_an_offline_member_through_an_always_on_member() {
     watchdog::arm();
     let mut k = cast();
+    // A `vox node` that is a member of nothing: every daemon names it as its anchor.
+    let anchor_dir = k._tmp.path().join("anchor");
+    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    let anchor = Anchor::start(&anchor_dir);
+    ANCHOR.with(|a| *a.borrow_mut() = Some(anchor.spec.clone()));
     let before = "r11-before-the-grant".to_owned();
     let c = set_up(&mut k, &before);
     let b_short: String = k.fps[1].chars().take(12).collect();
@@ -415,6 +510,19 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
     let b_said = b.stderr();
     b.stop();
     c.stop();
+    // The anchor served the room: its board said so. Without that, zero pages would say nothing.
+    let room_short: String = k.room.chars().take(12).collect();
+    let anchor_out = anchor.out();
+    let served = anchor_out
+        .lines()
+        .any(|l| l.contains("vox node: board — ") && l.contains(&room_short));
+    drop(anchor);
+    assert!(
+        served,
+        "CANNOT MEASURE (staging): the anchor never said its board serves room {room_short}, so \
+         what it stores proves nothing\nanchor:\n{anchor_out}"
+    );
+    let anchor_pages = pages_at_rest(&anchor_dir);
 
     // ---- at rest: who holds the packages for B, and who can open them ----
     let for_b = b32(&k.fps[1]);
@@ -429,6 +537,14 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
     eprintln!(
         "[R11] key-packages for B: A posted {a_held}; C holds {c_held}, opens {c_opened}; B holds \
          {b_held}, opens {b_opened}"
+    );
+    eprintln!(
+        "[R34] the anchor, a member of nothing, holds pages per room at rest: {anchor_pages:?}"
+    );
+    assert!(
+        anchor_pages.is_empty(),
+        "PRODUCT: an anchor that is not a member of a room must store nothing for it (ADR-023 \
+         decision 6): its data directory holds {anchor_pages:?}"
     );
     assert_eq!(
         got,

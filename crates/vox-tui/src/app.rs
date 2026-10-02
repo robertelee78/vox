@@ -554,7 +554,7 @@ pub fn run_node(
         .bind(vox_core::node::actor::Bind::Addr(listen))
         .anchors(anchors)
         .headless(signer)
-        .anchor_logs(true);
+        .anchor_boards(true);
     let cfg = match serve_only {
         Some(creators) => {
             println!(
@@ -579,7 +579,6 @@ pub fn run_node(
         // What the board actually holds per room, reported when it changes. See below.
         let mut last_board: Vec<String> = Vec::new();
         let mut last_holding: Vec<String> = Vec::new();
-        let mut last_held: Vec<String> = Vec::new();
         let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
         // **One Ctrl-C listener for the whole loop, not one per turn.** A listener sees only
@@ -662,11 +661,10 @@ pub fn run_node(
                         .iter()
                         .map(|a| {
                             format!(
-                                "{} {}m/{}p{}",
+                                "{} {}m/{}p",
                                 crate::tunnel_cli::short_id_of(&a.channel_id),
                                 a.members,
                                 a.pending,
-                                a.entries.map_or(String::new(), |e| format!("/{e}e"))
                             )
                         })
                         .collect();
@@ -697,29 +695,6 @@ pub fn run_node(
                         println!("vox node: board — {line}");
                     }
                     last_holding = holding;
-                    // **Who this anchor's copy holds back for equivocating** (V210-66): said on
-                    // change, and again after a restart, since the freeze is kept.
-                    let held: Vec<String> = view
-                        .anchoring
-                        .iter()
-                        .flat_map(|a| {
-                            a.equivocations.iter().map(|(author, seq)| {
-                                format!(
-                                    "{} holds {} back: {}",
-                                    crate::tunnel_cli::short_id_of(&a.channel_id),
-                                    crate::ident::author_id(author),
-                                    crate::ident::equivocation_notice(
-                                        &crate::ident::author_id(author),
-                                        *seq
-                                    )
-                                )
-                            })
-                        })
-                        .collect();
-                    for line in held.iter().filter(|l| !last_held.contains(*l)) {
-                        println!("vox node: board — {line}");
-                    }
-                    last_held = held;
                     // Drained without blocking: this arm also has an anchors file to
                     // write, and a status line nobody reads is better than a tick nobody
                     // reaches.
@@ -800,22 +775,6 @@ pub fn run_node(
                                         "vox node: connection to {} — {note}",
                                         crate::ident::author_id(&peer)
                                     );
-                                }
-                                vox_core::node::api::NodeEvent::Synced {
-                                    channel_id,
-                                    applied,
-                                    ..
-                                } => {
-                                    // Not a failure — but on an anchor it is the whole job, and
-                                    // seeing it arrive is how "the anchor has it but nobody else
-                                    // does" becomes distinguishable from "nobody sent it".
-                                    if applied > 0 {
-                                        eprintln!(
-                                            "vox node: took {applied} entr{} for room {}",
-                                            if applied == 1 { "y" } else { "ies" },
-                                            crate::tunnel_cli::short_id_of(&channel_id)
-                                        );
-                                    }
                                 }
                                 _ => {}
                             },
