@@ -18,8 +18,12 @@
 //! Real child processes of the shipped `vox` binary, three separate profiles, and a real
 //! TCP service:
 //!
-//! 1. a **real TCP echo service** on loopback — standing in for `sshd`, and enough,
-//!    because what is under test is whether bytes cross the overlay untouched;
+//! 1. a **real TCP service** on loopback — standing in for `sshd`, and enough, because what
+//!    is under test is whether bytes cross the overlay untouched. It records what it
+//!    received and answers with a different, fixed reply, so **each direction is checked on
+//!    its own against bytes held outside the overlay** (RP-42). An echo could not do that: a
+//!    corruption applied the same way on both legs (a byte flipped by each end's splice) was
+//!    undone on the way back, and the echo came home intact;
 //! 2. `vox node` — the headless anchor, whose printed `<fingerprint>@<addr>` line this
 //!    test **parses and uses**, so an unusable spec (defect 2 above) fails here;
 //! 3. `vox serve <port>` — the host. Its printed room id, `vox://` address and
@@ -28,11 +32,20 @@
 //! 4. `vox connect <address>` — the guest joining with that passphrase, one-shot;
 //! 5. `vox up <room>` — the guest's SOCKS5 entry point, whose bound address is parsed;
 //! 6. a **real SOCKS5 client** in this test, sending the `.vox` hostname (`socks5h`
-//!    style, the name not an address), then real bytes through it, which must come back
-//!    byte-identical.
+//!    style, the name not an address), then real bytes through it: the service must have
+//!    received exactly what was sent, and the client must receive exactly what the service
+//!    replied.
 //!
 //! Nothing here reaches into `vox_core`. If a person could not do it from a shell, this
 //! test does not do it either.
+//!
+//! ## Every red names its side
+//!
+//! The processes, one-shot verbs and SOCKS client are the shared harness's (`support/world.rs`),
+//! whose reds are labelled: `PRODUCT:` when `vox` said or did the wrong thing, quoting it, and
+//! `APPARATUS:` or `CANNOT MEASURE:` when the fault is the harness's or the machine's — a waited
+//! line that did not come while the harness itself was not scheduled is a stalled runner, not a
+//! silent product. What is left in this file is labelled the same way (RP-42's verifier).
 //!
 //! ## Why it is `#[ignore]`d
 //!
@@ -43,275 +56,167 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+#[path = "support/world.rs"]
+mod world;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Write the room passphrase `pass` beside the profile at `dir`, for `--passphrase-file`: a
-/// room passphrase is never taken from argv or the environment (V210-72).
-fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
-    std::fs::create_dir_all(dir).expect("APPARATUS: create the profile dir");
-    let at = dir.join("room-passphrase");
-    std::fs::write(&at, pass).expect("APPARATUS: write the room passphrase file");
-    at.to_str()
-        .expect("APPARATUS: a non-UTF-8 temp path")
-        .to_owned()
-}
-const VOX: &str = env!("CARGO_BIN_EXE_vox");
-/// Generous: three production Argon2id derivations and a real PoW happen inside it.
-const LINE_TIMEOUT: Duration = Duration::from_secs(180);
+use world::{
+    address_in, after_label, args, fingerprint, mkdir, room_pass_file, socks5_connect, tempdir,
+    vox_once, VoxProc, STALL,
+};
 
-/// A `vox` child process whose stdout is read line by line on its own thread, so a
-/// long-running command can be waited on for a specific line without blocking it.
-struct VoxProc {
-    name: &'static str,
-    child: Child,
-    lines: mpsc::Receiver<String>,
-    seen: Vec<String>,
-}
+/// The bytes the client sends: [`REQUEST_LEN`] of them, several of the tunnel's 16 KiB splice
+/// chunks, from a fixed seed.
+const REQUEST_LEN: usize = 64 * 1024;
+/// The bytes the service answers with: different from the request, so a reply is never the
+/// request carried back.
+const REPLY_LEN: usize = 48 * 1024;
 
-impl VoxProc {
-    fn spawn(name: &'static str, data: &std::path::Path, args: &[String]) -> Self {
-        let mut child = Command::new(VOX)
-            .args(args)
-            .env("VOX_DATA_DIR", data)
-            .env("VOX_CONFIG_DIR", data.join("cfg"))
-            // Every profile's identity passphrase, supplied the way a script would.
-            .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox for {name}: {e}"));
-        let out = child
-            .stdout
-            .take()
-            .expect("APPARATUS: the piped stdout was not opened");
-        let (tx, rx) = mpsc::channel();
-        let tx_err = tx.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        // Stderr is drained too — a full pipe would block the child, which is a hang rather
-        // than a failure (ADR-018 §6) — and joins the stream prefixed `! `, because the
-        // reasons a person is shown (a refusal, above all) are printed there. The prefix
-        // keeps every stdout pattern below from matching one by accident.
-        if let Some(err) = child.stderr.take() {
-            std::thread::spawn(move || {
-                for line in BufReader::new(err).lines().map_while(Result::ok) {
-                    if tx_err.send(format!("! {line}")).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        Self {
-            name,
-            child,
-            lines: rx,
-            seen: Vec::new(),
-        }
-    }
-
-    /// Wait for the first line matching `pred`, returning it. Every line seen is kept so
-    /// a failure can show what the command actually said.
-    fn expect_line(&mut self, what: &str, pred: impl Fn(&str) -> bool) -> String {
-        let deadline = Instant::now() + LINE_TIMEOUT;
-        for line in &self.seen {
-            if pred(line) {
-                return line.clone();
-            }
-        }
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !left.is_zero(),
-                "PRODUCT: {} did not say {what} within {LINE_TIMEOUT:?}. It said:\n{}",
-                self.name,
-                self.seen.join("\n")
-            );
-            match self.lines.recv_timeout(left.min(Duration::from_secs(5))) {
-                Ok(line) => {
-                    eprintln!("[{} ] {line}", self.name);
-                    let hit = pred(&line);
-                    self.seen.push(line.clone());
-                    if hit {
-                        return line;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
-                    "PRODUCT: {} exited before saying {what}. It said:\n{}",
-                    self.name,
-                    self.seen.join("\n")
-                ),
-            }
-        }
-    }
-
-    /// Everything the command has said so far, for a red that quotes it.
-    fn transcript(&mut self) -> String {
-        while let Ok(line) = self.lines.try_recv() {
-            self.seen.push(line);
-        }
-        self.seen.join("\n")
-    }
-}
-
-impl Drop for VoxProc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Run a one-shot `vox` verb to completion.
-fn vox_once(data: &std::path::Path, args: &[String]) -> (bool, String, String) {
-    let out = Command::new(VOX)
-        .args(args)
-        .env("VOX_DATA_DIR", data)
-        .env("VOX_CONFIG_DIR", data.join("cfg"))
-        .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox {args:?}: {e}"));
-    (
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
-}
-
-/// The value after a fixed-width label, as `vox` prints its key/value lines.
-fn after_label(line: &str, label: &str) -> String {
-    line.strip_prefix(label)
-        .unwrap_or_else(|| {
-            panic!("PRODUCT: vox printed {line:?}, which does not start with {label:?}")
+/// `len` deterministic, non-repeating bytes from `seed` (xorshift).
+fn pattern(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
         })
-        .trim()
-        .to_owned()
+        .collect()
 }
 
-/// A real TCP echo service on loopback: `sshd`'s stand-in. Returns its port.
-fn echo_service() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the echo service");
+fn request() -> Vec<u8> {
+    pattern(0x5eed_5eed_5eed_5eed, REQUEST_LEN)
+}
+
+fn reply() -> Vec<u8> {
+    pattern(0x0dd0_ba11_c0de_0001, REPLY_LEN)
+}
+
+/// What the service got on one connection: the [`REQUEST_LEN`] bytes, or how far it got before the
+/// overlay's side of the connection ended or failed.
+type Received = Result<Vec<u8>, String>;
+
+/// A real TCP service on loopback: `sshd`'s stand-in. Each connection: read
+/// [`REQUEST_LEN`] bytes, hand them to the returned receiver (outside the overlay, for the
+/// proof to compare), then answer with [`reply`]. A connection that ends or fails before the
+/// request is whole is handed over too, with how many bytes came. Returns its port.
+fn recording_service() -> (u16, mpsc::Receiver<Received>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not bind the proof's service: {e}"));
     let port = listener
         .local_addr()
-        .expect("APPARATUS: the echo service's address")
+        .unwrap_or_else(|e| panic!("APPARATUS: the proof's service has no local address: {e}"))
         .port();
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
+            let tx = tx.clone();
             std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = s.read(&mut buf) {
-                    if n == 0 || s.write_all(&buf[..n]).is_err() {
-                        break;
+                let mut got = vec![0u8; REQUEST_LEN];
+                let mut have = 0;
+                while have < REQUEST_LEN {
+                    match s.read(&mut got[have..]) {
+                        Ok(0) => {
+                            let _ = tx.send(Err(format!(
+                                "the overlay closed the service's connection {have} of \
+                                 {REQUEST_LEN} bytes into the request"
+                            )));
+                            return;
+                        }
+                        Ok(n) => have += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            let _ = tx.send(Err(format!(
+                                "the service's connection failed {have} of {REQUEST_LEN} bytes \
+                                 into the request: {e}"
+                            )));
+                            return;
+                        }
                     }
                 }
+                let _ = tx.send(Ok(got));
+                let _ = s.write_all(&reply());
+                // Held open until the client closes: the reply is not cut short by our side.
+                let _ = s.read(&mut [0u8; 1]);
             });
         }
     });
-    port
+    (port, rx)
 }
 
-/// Speak RFC 1928 to `proxy`, asking it to CONNECT to `host:port` **by name** — which is
-/// the `socks5h` behaviour `vox up` requires, and the reason a `.vox` name never reaches
-/// a resolver.
-///
-/// Every way the proxy can fail the handshake is returned, not asserted, so the caller's red
-/// can quote what `vox up` said alongside it: each one is the product's answer.
-fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> std::io::Result<TcpStream> {
-    let mut s = TcpStream::connect(proxy)?;
-    // Longer than `node::up::HOST_PATIENCE`, or this times out on the proxy's own wait and
-    // reports EAGAIN instead of what the proxy decided.
-    //
-    // **Derived, not restated.** This was a hand-written 150s beside that comment; when
-    // HOST_PATIENCE was raised to 300s the comment stayed true and the number stopped being,
-    // and this gate then failed at ~155s with `Resource temporarily unavailable` — which
-    // reads like a race in the service path and is not one. Two of us spent real time on it.
-    // Adding to the constant makes the invariant hold by construction.
-    s.set_read_timeout(Some(
-        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
-    ))?;
-    // Greeting: one method, "no authentication".
-    s.write_all(&[0x05, 0x01, 0x00])?;
-    let mut hello = [0u8; 2];
-    s.read_exact(&mut hello)?;
-    if hello != [0x05, 0x00] {
-        return Err(std::io::Error::other(format!(
-            "proxy refused the no-auth method: {hello:02x?}"
-        )));
-    }
-    // CONNECT, address type 3 (domain name).
-    let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
-    req.extend_from_slice(host.as_bytes());
-    req.extend_from_slice(&port.to_be_bytes());
-    s.write_all(&req)?;
-    let mut head = [0u8; 4];
-    s.read_exact(&mut head)?;
-    if head[0] != 0x05 {
-        return Err(std::io::Error::other(format!(
-            "not a SOCKS5 reply: {head:02x?}"
-        )));
-    }
-    // A refusal is returned rather than asserted, so the caller's retry can tell a
-    // not-ready-yet from a never-works. Asserting here made the retry loop dead code and
-    // turned the first transient refusal into a failure.
-    if head[1] != 0x00 {
-        return Err(std::io::Error::other(format!(
-            "proxy refused the CONNECT, SOCKS reply code {}",
-            head[1]
-        )));
-    }
-    // Drain the bound address so the stream is positioned at the payload.
-    let skip = match head[3] {
-        0x01 => 4 + 2,
-        0x03 => {
-            let mut l = [0u8; 1];
-            s.read_exact(&mut l)?;
-            usize::from(l[0]) + 2
+/// The next thing the service got, within `within`: `PRODUCT:` if nothing came while this proof
+/// was watching, `CANNOT MEASURE: the runner stalled` if it was not scheduled to watch (one
+/// wait overslept by more than the harness's [`STALL`]), as the harness's own waits do.
+fn service_receipt(rx: &mpsc::Receiver<Received>, within: Duration) -> Received {
+    let deadline = Instant::now() + within;
+    let mut overslept = Duration::ZERO;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            assert!(
+                overslept <= STALL,
+                "CANNOT MEASURE: the runner stalled: the service received nothing within \
+                 {within:?}, but this proof overslept one wait by {overslept:?}, so it was not \
+                 watching"
+            );
+            panic!(
+                "PRODUCT: the service never received the {REQUEST_LEN} bytes sent through the \
+                 overlay within {within:?} (this proof overslept one wait by at most \
+                 {overslept:?}, so it was watching)"
+            );
         }
-        0x04 => 16 + 2,
-        other => {
-            return Err(std::io::Error::other(format!(
-                "unknown address type {other} in reply"
-            )))
+        let ask = left.min(Duration::from_secs(1));
+        let asked = Instant::now();
+        let got = rx.recv_timeout(ask);
+        overslept = overslept.max(asked.elapsed().saturating_sub(ask));
+        match got {
+            Ok(r) => return r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("APPARATUS: the proof's service stopped listening")
+            }
         }
-    };
-    let mut sink = vec![0u8; skip];
-    s.read_exact(&mut sink)?;
-    Ok(s)
+    }
+}
+
+/// Where two byte strings first differ, for a red that says what changed.
+fn first_difference(got: &[u8], want: &[u8]) -> String {
+    match got.iter().zip(want).position(|(a, b)| a != b) {
+        Some(i) => format!(
+            "first difference at byte {i}: got {:#04x}, sent {:#04x}",
+            got[i], want[i]
+        ),
+        None => format!("lengths differ: got {}, sent {}", got.len(), want.len()),
+    }
 }
 
 #[test]
 #[ignore = "three production Argon2id profiles + a real PoW, and drives the real binary; CI runs it in release"]
 fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let tmp = tempdir();
     let anchor_dir = tmp.path().join("anchor");
     let host_dir = tmp.path().join("host");
     let guest_dir = tmp.path().join("guest");
     for d in [&anchor_dir, &host_dir, &guest_dir] {
-        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a profile dir");
+        mkdir(&d.join("cfg"));
     }
 
     // 1. the service a person is actually trying to reach
-    let service_port = echo_service();
+    let (service_port, service_got) = recording_service();
 
     // 2. `vox node` — the anchor. Its printed --anchor spec is what everything else uses,
     //    so a spec nobody can dial fails right here.
     let mut anchor = VoxProc::spawn(
         "anchor",
         &anchor_dir,
-        &["node".into(), "--listen".into(), "127.0.0.1:0".into()],
+        &args(&["node", "--listen", "127.0.0.1:0"]),
     );
     let spec_line = anchor.expect_line("an --anchor spec", |l| {
         !l.starts_with("! ")
@@ -331,26 +236,10 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     //
     //    It happens before `vox serve` starts because redb is single-writer: a one-shot
     //    verb cannot open a profile a running `vox serve` holds.
-    let (ok, guest_id, err) = vox_once(&guest_dir, &["id".into()]);
-    assert!(
-        ok,
-        "PRODUCT: vox id must print the guest's fingerprint: {err}"
-    );
-    let guest_fp = guest_id.trim().to_owned();
-    assert_eq!(
-        guest_fp.len(),
-        52,
-        "PRODUCT: a fingerprint is 52 base32 characters, alone on the line: {guest_fp:?}"
-    );
+    let guest_fp = fingerprint(&guest_dir, "the guest");
     let (ok, out, err) = vox_once(
         &host_dir,
-        &[
-            "trust".into(),
-            "add".into(),
-            guest_fp.clone(),
-            "--name".into(),
-            "the guest".into(),
-        ],
+        &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
     );
     assert!(
         ok,
@@ -358,10 +247,10 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     );
     assert!(
         out.contains("reach every service"),
-        "PRODUCT: trusting must say plainly that it grants service reach, since that is the whole \
-         decision a person is making:\n{out}"
+        "PRODUCT: trusting must say plainly that it grants service reach, since that is the \
+         whole decision a person is making:\n{out}"
     );
-    let (ok, listed, list_err) = vox_once(&host_dir, &["trust".into(), "list".into()]);
+    let (ok, listed, list_err) = vox_once(&host_dir, &args(&["trust", "list"]));
     assert!(
         ok && listed.contains(&guest_fp),
         "PRODUCT: `vox trust list` must show the guest:\n{listed}\nstderr:\n{list_err}"
@@ -372,14 +261,14 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     let mut host = VoxProc::spawn(
         "host",
         &host_dir,
-        &[
-            "serve".into(),
-            service_port.to_string(),
-            "--anchor".into(),
-            anchor_spec.clone(),
-            "--listen".into(),
-            "127.0.0.1:0".into(),
-        ],
+        &args(&[
+            "serve",
+            &service_port.to_string(),
+            "--anchor",
+            &anchor_spec,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
     );
     let room = after_label(
         &host.expect_line("the room id", |l| l.starts_with("room ")),
@@ -431,16 +320,16 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     //    A passphrase that does not match itself fails here, which is defect 1.
     let (ok, out, err) = vox_once(
         &guest_dir,
-        &[
-            "connect".into(),
-            address.clone(),
-            "--passphrase-file".into(),
-            room_pass_file(&guest_dir, &passphrase),
-            "--anchor".into(),
-            anchor_spec.clone(),
-            "--listen".into(),
-            "127.0.0.1:0".into(),
-        ],
+        &args(&[
+            "connect",
+            &address,
+            "--passphrase-file",
+            &room_pass_file(&guest_dir, &passphrase),
+            "--anchor",
+            &anchor_spec,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
     );
     assert!(
         ok,
@@ -452,35 +341,32 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     );
 
     // 5. `vox up` — the guest's entry point. Parse where it bound.
+    //
+    //    `vox up` needs the room passphrase even though the join is durable: the room's store
+    //    is sealed under it (ADR-010), so opening the room requires it every time. A guest
+    //    therefore keeps the passphrase for as long as it wants to reach the service, not
+    //    merely to join once.
     let mut up = VoxProc::spawn(
         "up",
         &guest_dir,
-        &[
-            "up".into(),
-            room.clone(),
-            // `vox up` needs the room passphrase even though the join is durable: the
-            // room's store is sealed under it (ADR-010), so opening the room requires it
-            // every time. A guest therefore keeps the passphrase for as long as it wants
-            // to reach the service, not merely to join once.
-            "--passphrase-file".into(),
-            room_pass_file(&guest_dir, &passphrase),
-            "--bind".into(),
-            "127.0.0.1:0".into(),
-            "--anchor".into(),
-            anchor_spec.clone(),
-            "--listen".into(),
-            "127.0.0.1:0".into(),
-        ],
+        &args(&[
+            "up",
+            &room,
+            "--passphrase-file",
+            &room_pass_file(&guest_dir, &passphrase),
+            "--bind",
+            "127.0.0.1:0",
+            "--anchor",
+            &anchor_spec,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
     );
     let up_line = up.expect_line("the proxy's bound address", |l| l.starts_with("vox up on "));
-    let bound: SocketAddr = up_line
-        .split_whitespace()
-        .nth(3)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or_else(|| panic!("PRODUCT: `vox up` printed no socket address: {up_line:?}"));
+    let bound = address_in(&mut up, &up_line, 3);
 
     // 6. A real SOCKS5 client, the `.vox` NAME (not an address), and real bytes.
-    let payload = b"the product works or it does not";
+    let payload = request();
     // **One CONNECT, first try, no retry loop** — and that is an assertion about the
     // product, not test convenience.
     //
@@ -491,38 +377,51 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     // waits inside the request instead, so a single CONNECT succeeds. If that regresses,
     // this line goes red rather than quietly costing every user their first attempt.
     let t0 = Instant::now();
-    let mut stream = socks5_connect(bound, &hostname, service_port).unwrap_or_else(|e| {
-        panic!(
-            "PRODUCT: the FIRST SOCKS5 CONNECT to {hostname}:{service_port} must succeed: {e}\n\
-             vox up said:\n{}\nvox serve said:\n{}",
-            up.transcript(),
-            host.transcript()
-        )
-    });
+    let (code, mut stream) = socks5_connect(bound, &hostname, service_port);
+    assert!(
+        code == 0,
+        "PRODUCT: the FIRST SOCKS5 CONNECT to {hostname}:{service_port} must succeed; the proxy \
+         answered code {code} after {:?}\nvox up said:\n{}\nvox serve said:\n{}",
+        t0.elapsed(),
+        up.transcript(),
+        host.transcript()
+    );
     eprintln!(
         "[test] first CONNECT succeeded after {:?} — this is what a person waits for \
          between `vox up` and their first `ssh`",
         t0.elapsed()
     );
-    if let Err(e) = stream.write_all(payload) {
+    // Each direction against bytes held outside the overlay (RP-42): what the service
+    // received is compared with what was sent, and what came back with what the service sent.
+    if let Err(e) = stream.write_all(&payload) {
         panic!(
             "PRODUCT: the overlay stream refused a write: {e}\nvox up said:\n{}\nvox serve said:\n{}",
             up.transcript(),
             host.transcript()
         );
     }
-    let mut back = vec![0u8; payload.len()];
+    let received = service_receipt(&service_got, Duration::from_secs(60))
+        .unwrap_or_else(|why| panic!("PRODUCT: {why}"));
+    assert!(
+        received == payload,
+        "PRODUCT: bytes must cross the overlay unchanged, toward the service — this is the whole \
+         feature; {}",
+        first_difference(&received, &payload)
+    );
+    let mut back = vec![0u8; REPLY_LEN];
     if let Err(e) = stream.read_exact(&mut back) {
         panic!(
-            "PRODUCT: the echo never came back through the overlay: {e}\nvox up said:\n{}\n\
-             vox serve said:\n{}",
+            "PRODUCT: the service's reply never came back through the overlay: {e} (kind {:?})\n\
+             vox up said:\n{}\nvox serve said:\n{}",
+            e.kind(),
             up.transcript(),
             host.transcript()
         );
     }
-    assert_eq!(
-        back, payload,
-        "PRODUCT: bytes must cross the overlay unchanged — this is the whole feature"
+    assert!(
+        back == reply(),
+        "PRODUCT: bytes must cross the overlay unchanged, back from the service; {}",
+        first_difference(&back, &reply())
     );
 
     // And the host reports who reached it, which is the only place attribution can come
@@ -545,75 +444,69 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     // was sufficient: a room created by `vox serve` authorized every admitted member, so
     // joining WAS the authorization. It must now reach nothing.
     let stranger_dir = tmp.path().join("stranger");
-    std::fs::create_dir_all(stranger_dir.join("cfg")).expect("APPARATUS: create a profile dir");
+    mkdir(&stranger_dir.join("cfg"));
     let (ok, out, err) = vox_once(
         &stranger_dir,
-        &[
-            "connect".into(),
-            address.clone(),
-            "--passphrase-file".into(),
-            room_pass_file(&stranger_dir, &passphrase),
-            "--anchor".into(),
-            anchor_spec.clone(),
-            "--listen".into(),
-            "127.0.0.1:0".into(),
-        ],
+        &args(&[
+            "connect",
+            &address,
+            "--passphrase-file",
+            &room_pass_file(&stranger_dir, &passphrase),
+            "--anchor",
+            &anchor_spec,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
     );
     assert!(
         ok,
-        "PRODUCT: the stranger must still be able to JOIN — the passphrase is the join credential and \
-         always was; what changed is that joining grants no reach.\nstdout:\n{out}\nstderr:\n{err}"
+        "PRODUCT: the stranger must still be able to JOIN — the passphrase is the join credential \
+         and always was; what changed is that joining grants no reach.\nstdout:\n{out}\nstderr:\n\
+         {err}"
     );
     let mut stranger_up = VoxProc::spawn(
         "stranger-up",
         &stranger_dir,
-        &[
-            "up".into(),
-            room.clone(),
-            "--passphrase-file".into(),
-            room_pass_file(&stranger_dir, &passphrase),
-            "--bind".into(),
-            "127.0.0.1:0".into(),
-            "--anchor".into(),
-            anchor_spec.clone(),
-            "--listen".into(),
-            "127.0.0.1:0".into(),
-        ],
+        &args(&[
+            "up",
+            &room,
+            "--passphrase-file",
+            &room_pass_file(&stranger_dir, &passphrase),
+            "--bind",
+            "127.0.0.1:0",
+            "--anchor",
+            &anchor_spec,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
     );
     let s_line = stranger_up.expect_line("the stranger's proxy address", |l| {
         l.starts_with("vox up on ")
     });
-    let s_bound: SocketAddr = s_line
-        .split_whitespace()
-        .nth(3)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or_else(|| panic!("PRODUCT: `vox up` printed no socket address: {s_line:?}"));
+    let s_bound = address_in(&mut stranger_up, &s_line, 3);
     // **The reply is the host's answer** (PRD-001 R23, D6). The proxy used to reply
     // "succeeded" before it had asked the host, so this control had to accept a success and
     // then look for a stream that carried nothing — which is to say it asserted the defect.
     // The host answers before a single byte flows, so the refusal must be the SOCKS reply
     // itself: code 2, "connection not allowed by ruleset".
     let t0 = Instant::now();
-    let refused = socks5_connect(s_bound, &hostname, service_port);
+    let (code, _refused) = socks5_connect(s_bound, &hostname, service_port);
     let waited = t0.elapsed();
-    match refused {
-        Ok(_) => panic!(
-            "PRODUCT: an untrusted joiner holding the address AND the passphrase was told its \
-             CONNECT succeeded — the proxy must answer with the host's refusal (PRD-001 R23)\n\
-             the stranger's vox up said:\n{}\nvox serve said:\n{}",
-            stranger_up.transcript(),
-            host.transcript()
-        ),
-        Err(e) => {
-            eprintln!("[test] the untrusted joiner was refused after {waited:?}: {e}");
-            assert!(
-                e.to_string().contains("SOCKS reply code 2"),
-                "PRODUCT: the refusal must be SOCKS code 2 (not allowed), not a transport \
-                 error: {e}\nthe stranger's vox up said:\n{}",
-                stranger_up.transcript()
-            );
-        }
-    }
+    assert!(
+        code != 0,
+        "PRODUCT: an untrusted joiner holding the address AND the passphrase was told its \
+         CONNECT succeeded — the proxy must answer with the host's refusal (PRD-001 R23)\n\
+         the stranger's vox up said:\n{}\nvox serve said:\n{}",
+        stranger_up.transcript(),
+        host.transcript()
+    );
+    eprintln!("[test] the untrusted joiner was refused after {waited:?}: SOCKS reply code {code}");
+    assert!(
+        code == 2,
+        "PRODUCT: the refusal must be SOCKS code 2 (not allowed), not code {code}\nthe \
+         stranger's vox up said:\n{}",
+        stranger_up.transcript()
+    );
     // And the stranger's own node says why, on its own terminal — the remote side learns
     // nothing it did not already say.
     let why = stranger_up.expect_line("the refusal's reason on the stranger's terminal", |l| {
