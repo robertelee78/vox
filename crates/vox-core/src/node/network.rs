@@ -1070,7 +1070,20 @@ impl NodeNet {
         let started = tokio::time::Instant::now();
         let punching = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let helpers = self.helpers(peer);
+        // **What each coordinator said of the dial-back**, for the circuit through it (V030-27):
+        // `None` until the dial-back through it has been asked or refused; `Some(true)` when the
+        // coordinator held no connection to the peer. A circuit through that relay waits for the
+        // word, and is not asked when it is `Some(true)`: a host reaching a guest that had just
+        // joined asked a circuit 0 ms into the reach, before its dial-back had been refused, and
+        // when the guest reached the anchor in between the anchor carried the circuit for a pair
+        // the guest could have joined directly (1 of 3 runs of R42's direct arm).
+        let mut said_of_dial_back: std::collections::HashMap<
+            Digest32,
+            tokio::sync::watch::Receiver<Option<bool>>,
+        > = std::collections::HashMap::new();
         for coordinator in &helpers {
+            let (said_tx, said_rx) = tokio::sync::watch::channel(None::<bool>);
+            said_of_dial_back.insert(coordinator.peer_id(), said_rx);
             let observed = self.observed_or_ask(coordinator.peer_id()).await;
             let Ok(local_eps) = self.local_endpoints() else {
                 continue;
@@ -1098,8 +1111,12 @@ impl NodeNet {
                 }
                 punching.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let session = async {
-                    let (mut send, mut recv) =
-                        coordstream::open_punch_session(&coordinator, peer).await?;
+                    let opened = coordstream::open_punch_session(&coordinator, peer).await;
+                    let _ = said_tx.send(Some(matches!(
+                        opened,
+                        Err(Error::HolePunchFailed(why)) if why == coordstream::COORDINATOR_CANNOT_REACH
+                    )));
+                    let (mut send, mut recv) = opened?;
                     coordstream::count_dial_back(peer, false);
                     let plan =
                         coordstream::run_punch_initiator(&mut send, &mut recv, local).await?;
@@ -1108,7 +1125,18 @@ impl NodeNet {
                 }
                 .await;
                 let result = match session {
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        // Said, so a pair that bridges shows why: a dial-back the coordinator could
+                        // not even carry leaves the circuits nothing to wait for (V030-27).
+                        manager.note(
+                            peer,
+                            format!(
+                                "a dial-back could not be asked {} ms into the reach: {e}",
+                                started.elapsed().as_millis()
+                            ),
+                        );
+                        Err(e)
+                    }
                     // **The peer's dial is the point**, not this node's: a node that cannot dial
                     // its peer fails its own half at once. So this waits for the peer's word on its
                     // own dial (`Dialled`) — not a guessed time: a post-quantum handshake on a
@@ -1189,6 +1217,7 @@ impl NodeNet {
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
             let punching = Arc::clone(&punching);
+            let mut said = said_of_dial_back.remove(&relay.peer_id());
             set.spawn(async move {
                 let deadline = started + DIRECT_HEAD_START;
                 loop {
@@ -1216,8 +1245,39 @@ impl NodeNet {
                         () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                     }
                 }
-                // A dial-back under way: wait for the peer's connection, within its patience.
+                // The dial-back through this relay asked or refused first (V030-27). A relay that
+                // could not reach the peer for a dial-back is not asked to carry a circuit to it in
+                // this reach: had the peer reached it since, the peer could dial this node itself.
                 let patience = started + DIAL_BACK_PATIENCE;
+                // Only once that dial-back can have been asked: with a direct rung still under way
+                // it is not asked yet, and a stale address must not hold the circuit past the head
+                // start for it.
+                let asked_yet = !has_direct || *failed.borrow();
+                if let Some(said) = said.as_mut().filter(|_| asked_yet) {
+                    let word = tokio::time::timeout_at(patience, said.wait_for(Option::is_some))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .and_then(|w| *w);
+                    if word == Some(true) {
+                        manager.note(
+                            peer,
+                            format!(
+                                "not asking {} for a circuit: it could not reach the peer for a \
+                                 dial-back, {} ms into the reach",
+                                short_id(relay.peer_id()),
+                                started.elapsed().as_millis()
+                            ),
+                        );
+                        return (
+                            label,
+                            Err(Error::Unreachable(
+                                "not asked for: the relay could not reach the peer for a dial-back",
+                            )),
+                        );
+                    }
+                }
+                // A dial-back under way: wait for the peer's connection, within its patience.
                 while punching.load(std::sync::atomic::Ordering::SeqCst) > 0
                     && tokio::time::Instant::now() < patience
                 {
@@ -1231,6 +1291,23 @@ impl NodeNet {
                         )),
                     );
                 }
+                // Said, so a pair that bridges shows why (V210-122, V030-27): how long the reach
+                // waited, and whether its direct dial had failed or was still under way.
+                manager.note(
+                    peer,
+                    format!(
+                        "asking {} for a circuit {} ms into the reach; its direct dial {}",
+                        short_id(relay.peer_id()),
+                        started.elapsed().as_millis(),
+                        if !has_direct {
+                            "there was none"
+                        } else if *failed.borrow() {
+                            "failed"
+                        } else {
+                            "had not finished"
+                        }
+                    ),
+                );
                 (
                     label,
                     circuitstream::connect_through(&relay, peer, &endpoint, now).await,
