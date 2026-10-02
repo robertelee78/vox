@@ -1,0 +1,22 @@
+# SPIKE ONLY (V210-125, #333): never merged. Runs the two proofs V210-125 changes on ubuntu.
+name: linux-spike-v210-125
+on: pull_request
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+jobs:
+  proofs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustc --version && cargo --version && uname -a && ip -br addr show lo
+      - name: Clippy, the two proofs, on Linux
+        run: cargo clippy -p vox-tui --tests --features vox-tui/test-knobs -- -D warnings
+      - name: The two proofs (release)
+        run: >
+          cargo test --release -p vox-tui --features vox-tui/test-knobs
+          --test a_stranger_keeping_rooms_live_cannot_crowd_out_a_real_room_proof
+          --test a_cli_failure_tells_the_truth_proof
+          --no-fail-fast -- --ignored --nocapture
