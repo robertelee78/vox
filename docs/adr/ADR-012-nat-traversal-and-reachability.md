@@ -39,8 +39,11 @@ fine, sans anchor".
   node MUST connect directly, MUST NOT wait for an anchor, and MUST NOT fail because one is absent.
 - **N-3.** An invite link MUST always name the inviting host. When the link's anchors exceed
   `MAX_LINK_ANCHORS` (4), anchors MUST be dropped before the host is.
-- **N-4.** `vox serve` MUST NOT refuse for lack of an anchor. A node MUST withhold its address record
-  only when it knows no address of its own at all (V210-96).
+- **N-4.** `vox serve` MUST NOT refuse for lack of an anchor. A verb that hands out a room's address
+  (`vox serve`, an invite) MUST withhold that address only when it would name no route of this node's
+  own, and only after waiting `ADDRESS_PATIENCE` for this node's addresses to be discovered or for an
+  anchor to take the room. It MUST then say why (`NodeEvent::AddressWithheld`), naming each anchor and
+  whether it took the room (V210-96, `withhold_address`).
 - **N-5.** A join MUST dial the host's address carried in the link before waiting on any board for
   it. It MAY then wait up to `JOIN_ADDRESS_PATIENCE` (20 s) for an address on a board, but only when
   the link carries none or the link's address failed (V210-96).
@@ -87,8 +90,10 @@ fine, sans anchor".
   Status: built and proved against a specification-faithful in-process gateway; not yet validated on
   a real router.
 - **N-15. Finding a PCP server.** Candidates MUST be the real default route where the platform
-  exposes it (Linux), then the IPv4 `.1` convention, then the RFC 7723 anycast addresses `192.0.0.9`
-  and `2001:1::1`. Candidates within a rung, and the IPv4 and IPv6 work, MUST be raced.
+  exposes it, then the IPv4 `.1` convention, then the RFC 7723 anycast addresses `192.0.0.9` and
+  `2001:1::1`. Candidates within a rung, and the IPv4 and IPv6 work, MUST be raced. **Known limit:**
+  the real default route is read only on Linux (`/proc/net/route`, `/proc/net/ipv6_route`).
+  Elsewhere the rung depends on the anycast address being answered.
 - **N-16. Publish side.** A node MUST advertise, in order: its routable addresses (IPv6 first), then
   any mapped address, then loopback. A node with no dialable address is not broken: it MUST still reach
   out and be reached through a punch or a relay.
@@ -99,7 +104,8 @@ fine, sans anchor".
   `coord` stream using DCUtR Connect/Sync. The initiator MUST fire RTT/2 after `Sync`, and the
   responder MUST fire on receiving `Sync`.
   - **Observed addresses.** `WHOAMI` MUST be answered with the source address the helper sees, to any
-    authenticated peer. A node MUST NOT publish an observed address in its address record.
+    authenticated peer. A node MUST keep the answers per reporter and use the one most reporters agree
+    on. It MUST NOT publish an observed address in its address record.
   - **Signalling relay.** `RELAY`/`FROM`/`RELAYING`/`COORD` MUST carry only encoded `CoordMessage`
     frames, at most `MAX_RELAYED_FRAMES` (8) per direction within `RELAY_SESSION_TIMEOUT` (30 s). Both
     ends MUST be a member, an anchor or a pending joiner of the helper.
@@ -146,11 +152,20 @@ fine, sans anchor".
   - One stream failing MUST NOT end the connection's service. The per-connection stream loop MUST
     end only when the connection is gone, or after `MAX_CONSECUTIVE_STREAM_FAILURES` (16) failures in
     a row.
+  - A worse newcomer MUST be closed. This is also what settles a simultaneous dial.
   - On an equal path the survivor MUST be the lower `tie_key`, which is identical at both ends.
-  - A connection MUST be judged dead by silence, never by address: one that has received nothing for
-    `SILENCE_IS_DEATH` (30 s) MUST be replaced by a newcomer, or closed by a once-a-second task
-    (`tend_liveness`).
-- **N-23.** Before a newcomer is filed, every connection held for that peer MUST be probed with one
+  - A connection MUST be judged dead by silence, never by address (v0.2.9 #6): one that has received
+    nothing for `SILENCE_IS_DEATH` (30 s) MUST be replaced by a newcomer. When a held connection
+    crosses that line later, a retired connection to the same peer that is still being heard from
+    MUST be promoted in its place (`promote_heard`), or, with none, the silent one MUST be closed. This
+    runs on a once-a-second task (`tend_liveness`) and on the next lookup.
+  - A newcomer from another process of the same identity MUST supersede every connection to the
+    process before it (V210-57).
+  - **Known limit:** liveness is the count of datagrams routed to a connection, taken before
+    authentication, so an on-path attacker who knows a connection ID can keep a dead connection
+    looking alive. That returns the node to QUIC's 60 s idle timeout, no worse than without the rule.
+- **N-23.** Before a newcomer is filed, each live, not-yet-dead connection held for that peer to the
+  newcomer's own process, primary or retired (`probe_held`), MUST be probed with one
   ack-eliciting datagram, with a patience of 3 × RTT clamped to 250 ms–2 s. A held connection that does
   not answer MUST be retired, not closed, so that what it carries finishes; one already retiring MUST
   be left to finish. Every unanswered probe MUST be noted (V210-104, #299; V210-93). Status: built on
@@ -194,6 +209,9 @@ fine, sans anchor".
     (new epoch, ADR-007) invalidates every earlier record.
   - Pre-join records convey no log authority and MUST be used only as join-bootstrap material
     (ADR-004/ADR-005).
+  - Swarm presence is not consent-gated. A party whose message consent was revoked stays present at
+    the ciphertext level until the epoch rotates; there is no per-member rendezvous revocation
+    (ADR-007).
 - **N-28. Refresh floor.** A record whose claim matches the one held, inside `MIN_REFRESH_SECS`
   (60 s), MUST be answered as a no-op success and leave the held record untouched. A record whose claim
   changed MUST be accepted as soon as it strictly advances `(seq, timestamp)`. A non-advancing record
@@ -211,6 +229,8 @@ fine, sans anchor".
     `Stale` 6.
   - Reads MUST be open to any authenticated peer that knows the channelID, and records come back
     unverified for the reader to verify.
+  - A record is self-authenticating, so the connection's peer need not be its author: a member MAY
+    re-publish a peer's current record to a second board.
   - Frames MUST be capped at `MAX_RENDEZVOUS_FRAME` (48 KiB) and a reply at `MAX_GET_RECORDS` frames.
   - A frame that is not a request MUST reset the stream with the ADR-008 coded close.
 - **N-31. Rendezvous key and DHT.**
@@ -263,8 +283,16 @@ fine, sans anchor".
 - **N-38.** Two peers both behind NAT, with no IPv6 path, no port mapping and no helper both can
   reach, cannot connect, and when both NATs are symmetric only a relaying helper can join them. The
   product MUST say so rather than claim a connection.
-- **N-39.** A helper MUST already be connected to both peers. It is found by trial over the node's
-  current connections; `Multiaddr::Relay` hints in address records are not consulted.
+- **N-39.** A helper MUST already be connected to both peers. **Known limit:** it is found by trial
+  over the node's current connections. `Multiaddr::Relay` hints in address records are not
+  consulted, and there is no "who can reach X?" query.
+- **N-40. Known defect, SOCKS to a service (open finding 2026-09-22).** `vox up` → SOCKS5 → `.vox`
+  name failed roughly 40% of runs in `crates/vox-tui/tests/service_rehearsal_proof.rs`: the first
+  CONNECT refused (up to 314 s, past `up::HOST_PATIENCE`), or a mid-stream read failing 55–84 s in.
+  `NodeCommand::Forward` over the same overlay was reliable, so the defect was placed in the `vox up`
+  path (name resolution, `reach_host_with_patience`, or how the proxy establishes and holds the
+  stream). Re-measured 2026-10-02 on integrate/v0.2.10 `f47aafb3`, release: 5 of 5 runs passed
+  (23.5–31.4 s). No fixing commit is identified, so it stays recorded here.
 
 ## Consequences
 

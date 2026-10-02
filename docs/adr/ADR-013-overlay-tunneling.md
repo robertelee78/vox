@@ -13,8 +13,9 @@ Built on integrate/v0.3.0:
 
 Built and not yet proved: the family LAN's macOS `utun` path, which needs the decider's root run.
 
-Not built: the general TUN model, the family LAN on Linux, signed tunnel-session events, and
-audience-sealed service advertisements. Requirements say which.
+Not built: the general TUN model, the family LAN on Linux, signed tunnel-session events,
+audience-sealed service advertisements, and tunnel stream priority. Requirements say which.
+
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: tunneling, tcp, udp, socks, tun, lan, authorization
@@ -40,8 +41,10 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   - The port in a `.vox` request is a Vox-layer identifier that the host MUST translate to the local
     endpoint it declared. It binds nothing on the host.
 - **T-2. TUN, optional.** A TUN virtual interface MAY be offered. Per-service authorization MUST
-  still apply on that path. Status: not built, except the family LAN (T-21 to T-27). Its addressing
-  is defined in T-28.
+  still apply on that path. Its datapath (a privileged helper or `NetworkExtension`, and a userspace
+  TCP stack) belongs to the client (ADR-014), not to `vox-core`; the family LAN's engine is the one
+  exception, because both ends of it are real kernels and it needs no userspace TCP stack. Status:
+  not built, except the family LAN (T-21 to T-27). Its addressing is defined in T-28.
 
 ### Authorization
 
@@ -70,20 +73,29 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
 - **T-8. Advertisements.** A service advertisement MUST NOT be posted as cleartext on the replicated
   log (ADR-008). If advertised, it MUST be sealed to exactly the host's explicitly approved readers in
   that room (ADR-017, third revision: consent-bound services), per recipient like an SKDM (ADR-006),
-  as a `ServiceAdvertisement` (ADR-008 tag `0x000F`). A member the host has not approved MUST NOT be
-  able to read one. Status: the struct and the sealing exist in `tunnel::service` with no caller. A
+  as a `ServiceAdvertisement` (ADR-008 tag `0x000F`), delivered over each reader's pairwise channel
+  (ADR-004) or as a log entry sealed to that audience. A member the host has not approved MUST NOT be
+  able to read one. A requester MUST resolve a service only by decrypting the advertisements it can
+  open; there is no responder-side filter. When the approved readers change, the host MUST re-seal
+  and re-publish its advertisement. Status: the struct and the sealing exist in `tunnel::service` with no caller. A
   member learns another's service tags out of band, and closing that is ADR-017 M17.4.
 - **T-9. Accountability.** Tunnel session establishment SHOULD be recorded as a signed event in
   attributable rooms (ADR-009). Status: not built; no entry type exists.
 - **T-10. SSH certificate authority, optional.** A Vox-issued OpenSSH certificate authority MAY be
   built later, under its own ADR. It is not a requirement here. `tunnel::sshca` is an unwired seam.
   "`ssh` over Vox" means forwarding to a real `sshd`, which authenticates its users as it always does.
+  **Known gaps of the seam,** for that future ADR to close: no binding to the capability tree;
+  `verify_user_cert` ignores extensions and critical options; the capability is carried as an
+  extension rather than a critical option.
 
 ### The tunnel stream
 
 - **T-11.** Each tunneled TCP connection MUST get its own QUIC stream (`StreamKind::Tunnel`), so
   that tunnels never suffer head-of-line blocking from messaging, sync or each other. Backpressure
-  MUST come from QUIC per-stream flow control.
+  MUST come from QUIC per-stream flow control. Interactive tunnel streams SHOULD be prioritized, and
+  genuinely bulk transfers SHOULD use separate streams, or separate connections for true QoS
+  (ADR-011). Status: priority is planned, not built; nothing on the tunnel path sets a stream
+  priority.
 - **T-12. UDP.** A UDP service MUST be tunneled as `udp/<port>`: a datagram flow bound to its tunnel
   stream after the same gate (ADR-022 decision 6, M22.3/M22.4). This covers `vox serve 53/udp`,
   `vox forward <name>.vox 53/udp <port>` and SOCKS5 `UDP ASSOCIATE` in `vox up`.
@@ -198,6 +210,17 @@ proven when the decider runs `sudo scripts/family-lan-proof.sh`. Linux is not bu
   composite_identity_pubkey))`, a self-certifying /128 that a peer verifies by recomputing it. It is
   not RFC 4193 addressing and MUST NOT be expected to interoperate with other ULA users on a link. An
   address MUST confer no reach. Status: `tunnel::addr` exists with no caller (T-2).
+
+### Verbs
+
+- **T-29.**
+  - `vox forward` MUST bind its local port before it dials, so that a port already in use is an error
+    the person sees.
+  - Dropping a forward MUST stop its listener and MUST leave connections already spliced to finish.
+  - Room and member ids MAY be given as unique prefixes of their base32 rendering; an ambiguous
+    prefix MUST be refused with a count, never guessed.
+  - Passphrases MUST be read without echo on a terminal, or from a pipe when stdin is not a terminal,
+    so that nothing lands in shell history.
 
 ## Consequences
 
