@@ -171,12 +171,18 @@ pub trait TerminalIo {
     /// Leave the alternate screen (clearing it), purge scrollback, restore the
     /// terminal. Idempotent; also performed on drop by real backends.
     fn leave(&mut self) -> io::Result<()>;
+    /// Whether the process was asked to stop (SIGTERM), so the loop ends as a quit does. The
+    /// loop checks it at least every poll.
+    fn stop_requested(&self) -> bool {
+        false
+    }
 }
 
 /// The real crossterm/ratatui backend with a RAII restore on every exit path.
 pub struct CrosstermIo {
     terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
     entered: bool,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CrosstermIo {
@@ -186,7 +192,14 @@ impl CrosstermIo {
         Self {
             terminal: None,
             entered: false,
+            stop: std::sync::Arc::default(),
         }
+    }
+
+    /// Set to stop the loop as a quit would (see [`TerminalIo::stop_requested`]).
+    #[must_use]
+    pub fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.stop)
     }
 }
 
@@ -238,6 +251,10 @@ impl TerminalIo for CrosstermIo {
             Event::Key(key) if key.kind != KeyEventKind::Release => Ok(Some(key)),
             _ => Ok(None),
         }
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// **A passphrase is read past crossterm** (V210-94). crossterm reads the terminal into a
@@ -829,6 +846,8 @@ const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long `vox daemon` waits for its node to stop on SIGTERM or Ctrl-C before leaving anyway.
 /// A clean stop takes milliseconds; this is for a node stuck waiting on a peer that vanished.
+/// It must stay longer than the node's own wait for finished tunnels (`STOP_ACK_BOUND`, 3 s), so a
+/// stop that waits that out still closes its connections before the daemon leaves.
 const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long one wake may take before it is abandoned.
@@ -862,11 +881,12 @@ async fn judge(
     let room = vox_core::node::link::b32_encode(channel_id);
     // **A message with no hops left interrupts nobody** (ADR-020 §9, V210-79): the budget
     // is the only loop guard that provably ends an urgent reply chain. It still queues.
+    let empty = vox_core::node::api::Timeline::default();
     let timeline = view
         .open_channels
         .iter()
         .find(|d| d.channel_id == *channel_id)
-        .map_or(&[][..], |d| &d.timeline[..]);
+        .map_or(&empty, |d| &d.timeline);
     if crate::wake::hops_left(&envelope, timeline) == 0 {
         eprintln!(
             "vox daemon: not interrupting anyone for {}: its hop budget is spent; it waits for \
@@ -876,6 +896,12 @@ async fn judge(
         return;
     }
     let author = crate::ident::member_name(&view.trusted, &row.author);
+    let room_name = view
+        .channels
+        .iter()
+        .find(|c| c.channel_id == *channel_id)
+        .and_then(|c| c.local_name.clone())
+        .unwrap_or_default();
     for session in crate::wake::registered(paths) {
         if session.room != room || session.name.is_empty() {
             continue;
@@ -887,16 +913,19 @@ async fn judge(
         // harness's own user message, so the bare body read as the operator speaking.
         let text = crate::agent_hook::render_wake(
             &room[..12.min(room.len())],
+            &room_name,
             &row.entry_hash,
             &author,
             &envelope.body,
         );
+        let entry = vox_core::node::link::b32_encode(&row.entry_hash);
         let paths = paths.clone();
         // **One wedged session must not stall every other wake.** Each is its own task,
         // bounded by a deadline: a session endpoint that accepts and never reads would
         // otherwise hold this loop — and so every later interrupt — indefinitely.
         tokio::spawn(async move {
-            match tokio::time::timeout(WAKE_DEADLINE, crate::wake::wake(&session, &text)).await {
+            let woke = crate::wake::wake(&session, &entry, &text);
+            match tokio::time::timeout(WAKE_DEADLINE, woke).await {
                 Ok(Ok(())) => {}
                 // A session that has ended is forgotten, so its name's later messages are
                 // not tried against it for ever.
@@ -1386,6 +1415,24 @@ pub fn run_daemon(
                 .iter()
                 .flat_map(|d| d.timeline.iter().map(|r| r.entry_hash))
                 .collect();
+            // How far each room's timeline has been swept, and its row there. A timeline grows at
+            // its end, so a sweep reads only what was added since the last one (V210-120): it read
+            // the whole room on every sync, so each message cost the room's history. A room whose
+            // timeline no longer has that row there (it was closed and reopened) is read whole.
+            let mut swept: std::collections::HashMap<
+                vox_core::hash::Digest32,
+                (usize, Option<vox_core::hash::Digest32>),
+            > = node
+                .view()
+                .open_channels
+                .iter()
+                .map(|d| {
+                    (
+                        d.channel_id,
+                        (d.timeline.len(), d.timeline.last().map(|r| r.entry_hash)),
+                    )
+                })
+                .collect();
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 let sweep = tokio::select! {
@@ -1423,11 +1470,24 @@ pub fn run_daemon(
                     // someone is copied out to be judged.
                     let mut fresh = Vec::new();
                     for d in &view.open_channels {
-                        for r in d.timeline.iter() {
+                        let from = match swept.get(&d.channel_id) {
+                            Some(&(n, last))
+                                if n > 0
+                                    && d.timeline.get(n - 1).map(|r| r.entry_hash) == last =>
+                            {
+                                n
+                            }
+                            _ => 0,
+                        };
+                        for r in d.timeline.iter_from(from) {
                             if seen.insert(r.entry_hash) && may_wake(&r.text) {
                                 fresh.push((d.channel_id, r.clone()));
                             }
                         }
+                        swept.insert(
+                            d.channel_id,
+                            (d.timeline.len(), d.timeline.last().map(|r| r.entry_hash)),
+                        );
                     }
                     for (cid, row) in fresh {
                         judge(&paths, &view, &cid, &row).await;
@@ -1535,8 +1595,24 @@ pub fn run_live(
         }
     };
     let cancel = CancellationToken::new();
+    let io = CrosstermIo::new();
     #[cfg(unix)]
     {
+        // **SIGTERM quits as `q` does** (V210-93): the terminal is restored and the node shut
+        // down, so its connections close and its peers learn at once. Left to its default it
+        // killed the process with nothing sent and the terminal left raw.
+        let stop = io.stop_flag();
+        let term = {
+            let _in_rt = rt.enter();
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        };
+        if let Ok(mut term) = term {
+            rt.spawn(async move {
+                if term.recv().await.is_some() {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
         // SIGHUP (terminal went away) locks the node (ADR-015).
         let n = node.clone();
         let c = cancel.clone();
@@ -1554,7 +1630,7 @@ pub fn run_live(
         });
     }
     let core = LiveCore::new(node.clone(), rt.handle().clone());
-    let result = run_loop(CrosstermIo::new(), core, system_clock());
+    let result = run_loop(io, core, system_clock());
     cancel.cancel();
     // Shutdown locks (wipes every SEK and the signer) before the process exits.
     let _ = rt.block_on(node.apply(NodeCommand::Shutdown));
@@ -1594,6 +1670,9 @@ fn event_loop(
     let mut last_input = clock();
     let mut was_locked: Option<bool> = None;
     loop {
+        if io.stop_requested() {
+            return Ok(());
+        }
         let vm = core.view();
         ui.settle(&vm);
 

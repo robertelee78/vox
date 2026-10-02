@@ -1352,6 +1352,7 @@ pub mod mutant {
         OldRowIds,
         AuthorMisbound,
         WithdrawUnentitled,
+        AdminUnentitled,
     }
 
     fn mode() -> Mode {
@@ -1367,6 +1368,7 @@ pub mod mutant {
                 "old-row-ids" => Mode::OldRowIds,
                 "author-misbound" => Mode::AuthorMisbound,
                 "withdraw-unentitled" => Mode::WithdrawUnentitled,
+                "admin-unentitled" => Mode::AdminUnentitled,
                 _ => Mode::Correct,
             };
             eprintln!(
@@ -1381,6 +1383,13 @@ pub mod mutant {
     #[must_use]
     pub fn withdraws_unentitled() -> bool {
         mode() == Mode::WithdrawUnentitled
+    }
+
+    /// Whether this build names admins though its identity is not the room's creator (#319): the
+    /// admin with a modified client whose certificate no node may honour.
+    #[must_use]
+    pub fn admins_unentitled() -> bool {
+        mode() == Mode::AdminUnentitled
     }
 
     /// The `HAVE` to send, and the entries to serve unasked.
@@ -1432,7 +1441,8 @@ pub mod mutant {
             | Mode::AuthorUnclassifiable
             | Mode::OldRowIds
             | Mode::AuthorMisbound
-            | Mode::WithdrawUnentitled => asked,
+            | Mode::WithdrawUnentitled
+            | Mode::AdminUnentitled => asked,
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
             Mode::StripPayload => asked

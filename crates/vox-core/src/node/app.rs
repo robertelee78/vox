@@ -11,7 +11,7 @@
 //! ## The exchange
 //!
 //! ```text
-//! opener → responder   [kind 8]                                (the stream kind frame)
+//! opener → responder   [kind 9]                                (the stream kind frame)
 //! opener → responder   [1, channel_id, [label, … ≤8], flags]   (AppOpen, within 5 s)
 //! responder → opener   [1, label]  |  [0, reason]              (answer)
 //! ```

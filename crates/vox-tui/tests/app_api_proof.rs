@@ -695,7 +695,14 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
             e.finish()
         };
         let before = s.alice.app();
-        let app = probe(&conn, &kind(8), &open).await;
+        let app = probe(
+            &conn,
+            &kind(u64::from(
+                vox_core::transport::streams::StreamKind::App.as_u8(),
+            )),
+            &open,
+        )
+        .await;
         let after = s.alice.app();
         let unknown = probe(&conn, &kind(99), &open).await;
         (app, unknown, before, after)

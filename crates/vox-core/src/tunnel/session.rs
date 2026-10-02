@@ -19,6 +19,8 @@
 //! topology.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use quinn::{RecvStream, SendStream};
 use tokio::net::TcpStream;
@@ -26,7 +28,6 @@ use tokio::net::TcpStream;
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
-use std::sync::Arc;
 
 /// Maximum length of a service tag carried in a tunnel request (matches the
 /// capability-token bound; rejects an oversized field before allocation).
@@ -94,6 +95,11 @@ pub enum TunnelStatus {
     /// The request is refused — unauthorized *or* no such service (deliberately
     /// indistinguishable, ADR-013 dark services).
     Denied,
+    /// The request was authorized, and refused because the member already has as many tunnels
+    /// with the host as it may ([`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER)).
+    /// Said apart from [`TunnelStatus::Denied`] because it reveals nothing to a member the host
+    /// already lets in, and "not trusted" sent that member after the wrong cause (#272 c5).
+    Full,
 }
 
 impl TunnelStatus {
@@ -101,12 +107,14 @@ impl TunnelStatus {
         match self {
             TunnelStatus::Accepted => 1,
             TunnelStatus::Denied => 0,
+            TunnelStatus::Full => 2,
         }
     }
     fn from_byte(b: u8) -> Result<Self> {
         match b {
             1 => Ok(TunnelStatus::Accepted),
             0 => Ok(TunnelStatus::Denied),
+            2 => Ok(TunnelStatus::Full),
             _ => Err(Error::MalformedTunnel("tunnel status byte")),
         }
     }
@@ -188,12 +196,15 @@ pub async fn request(
     };
     write_frame(send, &req.to_bytes()).await?;
     let status_frame = read_frame(recv).await?;
-    if status_frame.len() != 1
-        || TunnelStatus::from_byte(status_frame[0])? != TunnelStatus::Accepted
-    {
-        return Err(Error::TunnelDenied("dial refused"));
+    match status_frame.as_slice() {
+        [b] => match TunnelStatus::from_byte(*b)? {
+            TunnelStatus::Accepted => Ok(()),
+            // Worded by the caller, which knows the member's tunnels (`VoxConnection::tunnel_limit`).
+            TunnelStatus::Full => Err(Error::TunnelLimit(String::new())),
+            TunnelStatus::Denied => Err(Error::TunnelDenied("dial refused")),
+        },
+        _ => Err(Error::TunnelDenied("dial refused")),
     }
-    Ok(())
 }
 
 /// What the host knows about one `(channel, service)` pair a dialer named: where the
@@ -261,7 +272,7 @@ pub async fn accept<F>(
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
 {
-    accept_reporting(send, recv, client_id, resolve, |_, _| {}, None).await
+    accept_reporting(send, recv, client_id, resolve, |_, _| Ok(None), None).await
 }
 
 /// What a host needs to serve a UDP service (ADR-022 decision 6): the connection the
@@ -318,6 +329,11 @@ async fn accept_udp(
 /// to a queue. It is informational for a live client, *not* an audit log — a durable,
 /// signed record of session establishment is ADR-013's own open item.
 ///
+/// `served` may still refuse the tunnel with an error, which the dialer sees as the same
+/// uniform denial: the host's one such refusal is a connection already carrying all the tunnels
+/// it may ([`Error::TunnelLimit`]). It may hand back where the splice is to mark the time it
+/// last moved a byte (`vox status`).
+///
 /// `udp` lets it serve `udp/<port>` services (ADR-022 decision 6); `None` refuses them.
 pub async fn accept_reporting<F, S>(
     mut send: SendStream,
@@ -329,7 +345,7 @@ pub async fn accept_reporting<F, S>(
 ) -> Result<()>
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
-    S: FnOnce(&Digest32, &str),
+    S: FnOnce(&Digest32, &str) -> Result<Option<Arc<AtomicU64>>>,
 {
     let req = TunnelRequest::from_bytes(&read_frame(&mut recv).await?)?;
 
@@ -380,7 +396,19 @@ where
     };
     // Authorized, and not before: the host learns who reached what, and learns nothing
     // about a refusal it did not grant.
-    served(&req.channel_id, &req.service_tag);
+    let moved = match served(&req.channel_id, &req.service_tag) {
+        Ok(moved) => moved,
+        Err(e) => {
+            let status = if matches!(e, Error::TunnelLimit(_)) {
+                TunnelStatus::Full
+            } else {
+                TunnelStatus::Denied
+            };
+            write_frame(&mut send, &[status.as_byte()]).await?;
+            let _ = send.finish();
+            return Err(e);
+        }
+    };
 
     if crate::tunnel::udp::is_udp(&req.service_tag) {
         let cut = withdrawn(reachers, offered, *client_id, req.service_tag.clone());
@@ -404,7 +432,7 @@ where
     };
     write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
     let cut = withdrawn(reachers, offered, *client_id, req.service_tag);
-    splice_until(send, recv, tcp, cut).await
+    splice_until(send, recv, tcp, cut, moved).await
 }
 
 /// The QUIC application error code a host resets a tunnel stream with when it withdraws
@@ -467,7 +495,55 @@ async fn withdrawn(
 /// backend that resets reaches the far client as a reset, not as a clean EOF after a
 /// truncated reply.
 pub async fn splice(send: SendStream, recv: RecvStream, tcp: TcpStream) -> Result<()> {
-    splice_until(send, recv, tcp, std::future::pending()).await
+    splice_until(send, recv, tcp, std::future::pending(), None).await
+}
+
+/// [`splice`], marking in `moved` the time (Unix seconds) it last moved a byte either way, so
+/// `vox status` can show a tunnel that has gone still.
+pub async fn splice_moving(
+    send: SendStream,
+    recv: RecvStream,
+    tcp: TcpStream,
+    moved: Arc<AtomicU64>,
+) -> Result<()> {
+    splice_until(send, recv, tcp, std::future::pending(), Some(moved)).await
+}
+
+/// How long a tunnel that has sent its last byte waits for the peer to acknowledge it.
+///
+/// Bounded because the peer may be gone: a connection that has died fails the wait long before
+/// this, and a peer that stays silent must not hold a finished tunnel for ever.
+pub const ACK_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Tunnels in this process that have finished their stream and are waiting for the peer to
+/// acknowledge the last bytes (see [`all_acknowledged`]).
+static FINISHING: AtomicUsize = AtomicUsize::new(0);
+
+/// One tunnel between its `finish` and the peer's acknowledgement of everything it sent.
+struct Finishing;
+
+impl Finishing {
+    fn start() -> Self {
+        FINISHING.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        FINISHING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait, up to `bound`, until no tunnel in this process is waiting for its last bytes to be
+/// acknowledged. A node calls this before it closes its connections: `finish` only queues the
+/// end of the stream, and a close drops whatever the peer has not acknowledged, so a node
+/// stopped just after a reply was finished cut that reply short at the far end (V210-81).
+pub async fn all_acknowledged(bound: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while FINISHING.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// How one direction of a splice ended.
@@ -482,15 +558,22 @@ enum Leg {
 }
 
 /// [`splice`], ending early — and abortively, with [`REACH_WITHDRAWN_CODE`] — when `cut`
-/// resolves.
+/// resolves, and marking `moved` as [`splice_moving`] does.
 async fn splice_until(
     mut send: SendStream,
     mut recv: RecvStream,
     mut tcp: TcpStream,
     cut: impl core::future::Future<Output = ()>,
+    moved: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     const CHUNK: usize = 16 * 1024;
+    let mark = |moved: &Option<Arc<AtomicU64>>| {
+        if let Some(m) = moved {
+            m.store(crate::transport::quic::unix_now(), Ordering::Relaxed);
+        }
+    };
+    let moved_in = moved.clone();
     let outcome = {
         let (mut tcp_r, mut tcp_w) = tcp.split();
         let (send, recv) = (&mut send, &mut recv);
@@ -501,12 +584,20 @@ async fn splice_until(
                 match tcp_r.read(&mut buf).await {
                     Ok(0) => {
                         let _ = send.finish();
+                        // **Acknowledged, not just queued.** `finish` hands the end of the
+                        // stream to quinn; the bytes before it may still be in flight. Held
+                        // until the peer has them, this task keeps its connection carried
+                        // (so a retired connection is not closed under it), and a node that
+                        // is stopping waits for it (`all_acknowledged`).
+                        let _finishing = Finishing::start();
+                        let _ = tokio::time::timeout(ACK_BOUND, send.stopped()).await;
                         return Leg::Clean;
                     }
                     Ok(n) => {
                         if send.write_all(&buf[..n]).await.is_err() {
                             return Leg::Abort;
                         }
+                        mark(&moved);
                     }
                     Err(_) => return Leg::Abort,
                 }
@@ -525,6 +616,7 @@ async fn splice_until(
                         if tcp_w.write_all(&buf[..n]).await.is_err() {
                             return Leg::Abort;
                         }
+                        mark(&moved_in);
                     }
                     Err(quinn::ReadError::Reset(code))
                         if code == quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE) =>
@@ -560,13 +652,13 @@ async fn splice_until(
             let code = quinn::VarInt::from_u32(TUNNEL_ABORT_CODE);
             let _ = send.reset(code);
             let _ = recv.stop(code);
-            abort_local(&tcp);
+            abort_after_drain(tcp).await;
             Err(Error::MalformedTunnel("tunnel splice aborted"))
         }
         Some(Leg::Withdrawn) => {
             let _ = recv.stop(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
             let _ = send.reset(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
-            abort_local(&tcp);
+            abort_after_drain(tcp).await;
             Err(Error::TunnelRevoked(
                 "the host withdrew access to this service",
             ))
@@ -577,10 +669,39 @@ async fn splice_until(
             let code = quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE);
             let _ = send.reset(code);
             let _ = recv.stop(code);
-            abort_local(&tcp);
+            abort_after_drain(tcp).await;
             Err(Error::TunnelRevoked("withdrawn mid-session"))
         }
     }
+}
+
+/// How long a deliberate cut waits for the bytes already queued toward the local application
+/// to be read before it resets the connection (see `abort_after_drain`).
+pub const DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reset `tcp` once the bytes queued toward the local application have left it, or after
+/// [`DRAIN_BOUND`].
+///
+/// **An RST sent over queued bytes can be lost.** On macOS loopback a zero-linger close of a
+/// socket that still holds unsent data, while the application is reading it, lost the reset in
+/// 33–62 of 100 runs (a reader at full speed and a slow one): the application was left with an
+/// ESTABLISHED socket that never delivered another byte, and a cut Vox made on purpose — reach
+/// withdrawn, a service removed — read as a hang (V210-81). With the queue empty first, 400 of
+/// 400 were reset.
+///
+/// The queue is not readable without `unsafe` (macOS `SO_NWRITE`), so it is watched instead: with
+/// the send buffer shrunk to 2048 bytes — the kernel's write low-water mark — the socket reports
+/// writable only once nothing is queued. It is registered afresh, so that report reflects the
+/// socket now rather than a readiness remembered from an earlier write. The zero linger is set
+/// first, so any path out of here resets.
+pub async fn abort_after_drain(tcp: TcpStream) {
+    abort_local(&tcp);
+    let _ = socket2::SockRef::from(&tcp).set_send_buffer_size(2048);
+    let Ok(std) = tcp.into_std() else { return };
+    let Ok(tcp) = TcpStream::from_std(std) else {
+        return;
+    };
+    let _ = tokio::time::timeout(DRAIN_BOUND, tcp.writable()).await;
 }
 
 /// Make the imminent drop of `tcp` an RST rather than a FIN.

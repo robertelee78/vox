@@ -1,8 +1,9 @@
 //! The headless node's identity (ADR-016 `vox node`, M15.2a).
 //!
 //! A `vox node` is the user's always-on anchor: it serves the board, coordinates
-//! punches, carries circuits and stores ciphertext, and it must come up on a box
-//! with nobody at a keyboard. So its identity is not a vault behind a passphrase; it
+//! punches, carries circuits and stores ciphertext for hosts that cannot otherwise
+//! reach each other (peers that can reach each other directly need none, ADR-012),
+//! and it must come up on a box with nobody at a keyboard. So its identity is not a vault behind a passphrase; it
 //! is a **file-backed composite key** — two 32-byte seeds in a private file — from
 //! which the same [`SoftwareRootSigner`] is rebuilt at every start, so peers can pin
 //! its fingerprint once and keep pinning it.

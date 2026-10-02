@@ -37,9 +37,10 @@
 //! since. Its cause is **not named**, and those runs bound its rate; they do not show it is gone.
 //! What changed is that the next red names itself:
 //!
-//! - `vox room join` now says **which side** was unreachable — the anchor (`BoardUnreachable`) or
-//!   every member it knows (`Unreachable`) — and prints the join's recorded steps and what each
-//!   responder said, so the failing step is in the error;
+//! - `vox room join` now says **which side** was unreachable — the board, named as the room's
+//!   host or an anchor (`BoardUnreachable`), or every member it knows (`Unreachable`) — and
+//!   prints the join's recorded steps and what each responder said, so the failing step is in
+//!   the error;
 //! - each daemon's and the anchor's output is read line by line as it is written (the shared
 //!   harness's `VoxProc`), so a red prints what they said up to that moment. It used to read
 //!   stderr to EOF, which only arrives when the child exits — after the panic — so every red's

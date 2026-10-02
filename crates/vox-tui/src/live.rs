@@ -154,6 +154,12 @@ impl LiveCore {
                 NodeEvent::InviteLink { url, .. } => {
                     self.notice = Some(format!("invite link: {url}"));
                 }
+                NodeEvent::AddressNote { note, .. } => {
+                    self.notice = Some(note);
+                }
+                NodeEvent::AddressWithheld { reason, .. } => {
+                    self.notice = Some(format!("no invite link: {reason}"));
+                }
                 NodeEvent::Joined { responder, .. } => {
                     self.notice = Some(format!("joined via {}", self.member_name(&responder)));
                 }
@@ -360,7 +366,7 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::AlreadyMember => UiError::AlreadyMember,
         Fault::RoomEnded => UiError::RoomEnded,
         Fault::LeftRoom => UiError::LeftRoom,
-        Fault::NotCreator => UiError::NotCreator,
+        Fault::NotCreator | Fault::NotRoomCreator => UiError::NotCreator,
         Fault::StillJoining => UiError::StillJoining,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,

@@ -736,3 +736,86 @@ fn the_tui_leaves_ends_and_forgets() {
     );
     eprintln!("[proof] tui: :leave, :end and :forget each did what the CLI verb does");
 }
+
+#[test]
+#[ignore = "real daemons, an anchor and the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
+fn an_admin_cannot_name_another_admin() {
+    watchdog::arm();
+    let mutant = std::env::var("VOX_MUTANT_SENDER").unwrap_or_else(|_| {
+        panic!(
+            "APPARATUS (harness): VOX_MUTANT_SENDER does not name the mutant sender build \
+             (VOX_MUTANT_SENDER=$(scripts/build-mutant-sender.sh))"
+        )
+    });
+    let carries = |path: &str| {
+        std::fs::read(path)
+            .map(|b| b.windows(17).any(|w| w == b"VOX-MUTANT-SENDER"))
+            .unwrap_or(false)
+    };
+    assert!(
+        carries(&mutant) && !carries(support::VOX),
+        "APPARATUS (harness): VOX_MUTANT_SENDER={mutant} is not the mutant sender build, or the \
+         shipped binary carries its marker"
+    );
+    let rt = runtime();
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    {
+        let (alice, bob) = (&room.workers[0], &room.workers[1]);
+        setup(alice, &["room", "admin", "add", id, &bob.b32()]);
+        let (named, o) = poll(bob, &["room", "admin", "list", id], WITHIN, |o| {
+            o.ok && o.stdout.contains(&bob.b32())
+        });
+        assert!(
+            named,
+            "PRODUCT (staging): bob's `vox room admin list` does not name him {WITHIN:?} after \
+             alice made him an admin: {o:?}"
+        );
+    }
+    // Bob, an admin, runs a modified client that names admins though it did not create the room —
+    // the attacker, as apparatus. Its certificate for carol must verify on no node.
+    let bob_err = tmp.path().join("bob.mutant.err");
+    room.workers[1].restart_daemon_as(
+        &mutant,
+        &[("VOX_MUTANT_SENDER_MODE", "admin-unentitled")],
+        &bob_err,
+    );
+    let [alice, bob, carol] = &room.workers[..] else {
+        unreachable!()
+    };
+    let o = bob.vox(None, &["room", "admin", "add", id, &carol.b32()]);
+    assert!(
+        o.ok,
+        "APPARATUS: bob's modified client did not sign an admin certificate for carol, so the \
+         room's refusal of it was not staged: {o:?}\nits daemon said:\n{}",
+        std::fs::read_to_string(&bob_err).unwrap_or_default()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        for w in [alice, carol] {
+            let o = setup(w, &["room", "admin", "list", id]);
+            assert!(
+                !o.stdout.contains(&carol.b32()),
+                "PRODUCT: {} honours the admin certificate bob, an admin but not the creator, \
+                 issued carol: {}",
+                w.name,
+                o.stdout
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let o = carol.vox(None, &["room", "end", id]);
+    assert!(
+        !o.ok,
+        "PRODUCT: carol, named admin only by bob, ended the room: {o:?}"
+    );
+    let listed = setup(alice, &["room", "list"]).stdout;
+    assert!(
+        !listed.contains("ended"),
+        "PRODUCT: the room ended on alice after carol, named admin only by bob, tried: {listed}"
+    );
+    eprintln!("[proof] admin: no node honoured the admin bob's modified client named");
+}

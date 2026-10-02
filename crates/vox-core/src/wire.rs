@@ -345,6 +345,18 @@ pub enum WireError {
     /// "sync failed: authenticator invalid" — an integrity failure — for a record still in flight.
     #[error("the peer does not know this node as a member of the room yet")]
     NotYetMember = 0x0C,
+    /// `0x0D` — this end is **stopping**: a node shutting down (Ctrl-C, SIGTERM, a restart) or
+    /// locking closes every connection with this (V210-93). Nothing about the peer was wrong.
+    /// Before this code existed those closes carried `0x05`, and a peer that reported its anchor
+    /// gone said "authenticator invalid" every time the anchor was simply stopped.
+    #[error("the peer stopped")]
+    ShuttingDown = 0x0D,
+    /// `0x0E` — this end closed a **duplicate** connection to the same peer process: one that lost
+    /// the tie-break against the connection kept, or a retired one whose grace was over
+    /// (V210-93). The peer is still connected over the other. Before this code existed those
+    /// closes carried `0x05` too.
+    #[error("a duplicate connection was retired")]
+    Superseded = 0x0E,
 }
 
 impl WireError {
@@ -368,6 +380,8 @@ impl WireError {
             0x0A => Some(WireError::Unresponsive),
             0x0B => Some(WireError::SessionBusy),
             0x0C => Some(WireError::NotYetMember),
+            0x0D => Some(WireError::ShuttingDown),
+            0x0E => Some(WireError::Superseded),
             _ => None,
         }
     }

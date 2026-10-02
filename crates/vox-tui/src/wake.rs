@@ -24,9 +24,16 @@
 //!   here** — a message written this way arrived in a live session. Delivered
 //!   between tool calls, and it starts a new turn when the session is idle, which
 //!   is the property that makes it an interrupt rather than a queue.
-//! - **OpenCode** — `POST /session/:id/prompt_async` against the server URL the
-//!   plugin is handed on startup. The plugin records it, because a bare `opencode`
-//!   has no listener an outside process could find.
+//! - **OpenCode** — a plain `opencode` has **no listener** an outside process could
+//!   find: the server URL its plugins are handed is a placeholder unless it was started
+//!   with `--port`, and it sets no variable naming one (ADR-021 F17, measured against
+//!   1.18.32). So Vox's plugin owns the channel: a Unix socket in a private directory,
+//!   with a token, whose path and token it puts in the drain hook's environment
+//!   (`VOX_OPENCODE_WAKE_SOCKET`, `_TOKEN`). The wire is Claude Code's shape — an
+//!   `auth` frame, then a `prompt` frame naming the session — and the plugin relays it
+//!   with its in-process client's `promptAsync`, which starts a turn when the session is
+//!   idle and is taken at the next step boundary mid-turn. It answers one line, so a
+//!   session OpenCode no longer knows is told apart from one that took the prompt.
 //! - **Codex** — reachable in principle through its app-server: `turn/start` when the
 //!   thread is idle, `turn/steer` with `expectedTurnId` when a turn is running (a
 //!   mid-turn `turn/start` is folded into that turn — ADR-020 M19.12). But
@@ -53,10 +60,10 @@ pub struct Session {
     /// The petname this session answers to, when it has one.
     #[serde(default)]
     pub name: String,
-    /// Claude Code's messaging socket, or OpenCode's server URL.
+    /// Claude Code's messaging socket, or the Vox OpenCode plugin's wake socket.
     #[serde(default)]
     pub endpoint: String,
-    /// Claude Code's messaging token.
+    /// The token that socket wants.
     #[serde(default)]
     pub token: String,
 }
@@ -80,14 +87,17 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
             endpoint,
             token,
         }
-    } else if let Ok(endpoint) = std::env::var("OPENCODE_SERVER_URL") {
+    } else if let (Ok(endpoint), Ok(token)) = (
+        std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
+        std::env::var("VOX_OPENCODE_WAKE_TOKEN"),
+    ) {
         Session {
             session: session.to_owned(),
             harness: "opencode".into(),
             room: room.to_owned(),
             name,
             endpoint,
-            token: String::new(),
+            token,
         }
     } else {
         Session {
@@ -149,7 +159,11 @@ pub fn forget(paths: &Paths, session: &Session) -> bool {
 /// does not reset it; and a chain longer than [`DEFAULT_HOPS`] has none left whatever
 /// its members claim. A parent this room does not hold ends the walk.
 #[must_use]
-pub fn hops_left(envelope: &Envelope, rows: &[MessageRow]) -> u32 {
+pub fn hops_left<'a, R>(envelope: &Envelope, rows: &'a R) -> u32
+where
+    R: ?Sized,
+    &'a R: IntoIterator<Item = &'a MessageRow>,
+{
     let mut left = envelope.hops;
     let mut re = envelope.re.clone();
     let mut depth: u32 = 0;
@@ -170,15 +184,23 @@ pub fn hops_left(envelope: &Envelope, rows: &[MessageRow]) -> u32 {
 /// The budget a reply to entry `re` starts with: its parent's less one (see [`hops_left`]),
 /// or the default when the room does not hold that entry.
 #[must_use]
-pub fn reply_hops(re: &str, rows: &[MessageRow]) -> u32 {
+pub fn reply_hops<'a, R>(re: &str, rows: &'a R) -> u32
+where
+    R: ?Sized,
+    &'a R: IntoIterator<Item = &'a MessageRow>,
+{
     let mut reply = Envelope::new(vox_agentcomms::envelope::SAY, "");
     reply.re = Some(re.to_owned());
     hops_left(&reply, rows)
 }
 
-fn find<'a>(rows: &'a [MessageRow], re: &str) -> Option<&'a MessageRow> {
+fn find<'a, R>(rows: &'a R, re: &str) -> Option<&'a MessageRow>
+where
+    R: ?Sized,
+    &'a R: IntoIterator<Item = &'a MessageRow>,
+{
     let hash = vox_core::node::link::b32_decode(re.trim(), "re").ok()?;
-    rows.iter().find(|r| r.entry_hash == hash)
+    rows.into_iter().find(|r| r.entry_hash == hash)
 }
 
 /// Why a wake did not arrive.
@@ -199,14 +221,23 @@ impl std::fmt::Display for WakeError {
     }
 }
 
-/// Wake one session with `text`.
+/// Wake one session with `text`, which carries the room entry `entry` (its full base32 hash).
 ///
 /// # Errors
 /// If the harness has no implemented wake path, or delivery fails.
-pub async fn wake(session: &Session, text: &str) -> Result<(), WakeError> {
+pub async fn wake(session: &Session, entry: &str, text: &str) -> Result<(), WakeError> {
     match session.harness.as_str() {
         "claude" => wake_claude(Path::new(&session.endpoint), &session.token, text).await,
-        "opencode" => wake_opencode(&session.endpoint, &session.session, text).await,
+        "opencode" => {
+            wake_opencode(
+                Path::new(&session.endpoint),
+                &session.token,
+                &session.session,
+                entry,
+                text,
+            )
+            .await
+        }
         "codex" => Err(WakeError::Failed(
             "codex sessions cannot be interrupted by this build; the message waits for the \
              session's next turn"
@@ -218,11 +249,9 @@ pub async fn wake(session: &Session, text: &str) -> Result<(), WakeError> {
     }
 }
 
-/// NDJSON over Claude Code's messaging socket: an `auth` frame, then a user
-/// message. Verified against a live session.
-async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), WakeError> {
-    use tokio::io::AsyncWriteExt as _;
-    let mut stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| {
+/// Connect to a session's socket; a socket that is gone or refuses means the session ended.
+async fn connect(socket: &Path) -> Result<tokio::net::UnixStream, WakeError> {
+    tokio::net::UnixStream::connect(socket).await.map_err(|e| {
         let why = format!("connecting to the session socket: {e}");
         // No socket file, or nobody listening on it: the session has ended.
         match e.kind() {
@@ -231,13 +260,16 @@ async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), WakeE
             }
             _ => WakeError::Failed(why),
         }
-    })?;
-    let auth = serde_json::json!({ "type": "auth", "token": token });
-    let message = serde_json::json!({
-        "type": "user",
-        "message": { "role": "user", "content": text },
-    });
-    let payload = format!("{auth}\n{message}\n");
+    })
+}
+
+/// Write `frames` (each one NDJSON line) and flush.
+async fn send(
+    stream: &mut tokio::net::UnixStream,
+    frames: &[serde_json::Value],
+) -> Result<(), WakeError> {
+    use tokio::io::AsyncWriteExt as _;
+    let payload: String = frames.iter().map(|f| format!("{f}\n")).collect();
     stream
         .write_all(payload.as_bytes())
         .await
@@ -245,45 +277,62 @@ async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), WakeE
     stream
         .flush()
         .await
-        .map_err(|e| WakeError::Failed(format!("flushing the session socket: {e}")))?;
-    Ok(())
+        .map_err(|e| WakeError::Failed(format!("flushing the session socket: {e}")))
 }
 
-/// OpenCode's `prompt_async`, which works mid-turn.
-async fn wake_opencode(base: &str, session: &str, text: &str) -> Result<(), WakeError> {
-    let url = format!(
-        "{}/session/{session}/prompt_async",
-        base.trim_end_matches('/')
-    );
-    let body = serde_json::json!({
-        "parts": [{ "type": "text", "text": text }],
+/// NDJSON over Claude Code's messaging socket: an `auth` frame, then a user
+/// message. Verified against a live session.
+async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), WakeError> {
+    let mut stream = connect(socket).await?;
+    let auth = serde_json::json!({ "type": "auth", "token": token });
+    let message = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": text },
     });
-    // The body is set directly rather than through reqwest's `json` helper, which
-    // would need a feature this workspace does not enable. One CLI verb is not a
-    // reason to widen a dependency.
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
+    send(&mut stream, &[auth, message]).await
+}
+
+/// The Vox OpenCode plugin's wake socket: an `auth` frame, then a `prompt` frame for
+/// `session`, answered with one line saying whether OpenCode took it.
+///
+/// The frame names the `entry` it carries, so the plugin can tell the session's drain that
+/// this message was delivered already, and the drain does not give it to the model a second
+/// time (V210-112).
+async fn wake_opencode(
+    socket: &Path,
+    token: &str,
+    session: &str,
+    entry: &str,
+    text: &str,
+) -> Result<(), WakeError> {
+    use tokio::io::AsyncBufReadExt as _;
+    let mut stream = connect(socket).await?;
+    let auth = serde_json::json!({ "type": "auth", "token": token });
+    let prompt = serde_json::json!({
+        "type": "prompt",
+        "session": session,
+        "entry": entry,
+        "text": text,
+    });
+    send(&mut stream, &[auth, prompt]).await?;
+    let mut line = String::new();
+    tokio::io::BufReader::new(stream)
+        .read_line(&mut line)
         .await
-        .map_err(|e| {
-            let why = format!("posting to {url}: {e}");
-            // Nothing listening at the server's address: that OpenCode has exited.
-            if e.is_connect() {
-                WakeError::Gone(why)
-            } else {
-                WakeError::Failed(why)
-            }
-        })?;
-    let status = response.status();
-    if status.is_success() {
-        Ok(())
-    } else if status == reqwest::StatusCode::NOT_FOUND {
-        // The server is up and does not know this session.
-        Err(WakeError::Gone(format!("{url} answered {status}")))
+        .map_err(|e| WakeError::Failed(format!("reading the plugin's answer: {e}")))?;
+    let reply: serde_json::Value = serde_json::from_str(line.trim())
+        .map_err(|_| WakeError::Failed(format!("the plugin answered {line:?}")))?;
+    if reply["ok"] == true {
+        return Ok(());
+    }
+    let why = format!(
+        "the OpenCode plugin answered: {}",
+        reply["error"].as_str().unwrap_or("nothing")
+    );
+    // OpenCode is up and does not know this session.
+    if reply["gone"] == true {
+        Err(WakeError::Gone(why))
     } else {
-        Err(WakeError::Failed(format!("{url} answered {status}")))
+        Err(WakeError::Failed(why))
     }
 }

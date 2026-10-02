@@ -437,7 +437,12 @@ where
             send_frame(&mut send, &CircuitFrame::Opened).await?;
             let mut flow = carrier.bind_flow(send, recv)?;
             flow.cap_datagrams(CIRCUIT_DATAGRAM_MAX);
-            let port = endpoint.attach_inbound_circuit(&origin, &peer, source)?;
+            let port = endpoint.attach_inbound_circuit(
+                &origin,
+                &peer,
+                source,
+                Some(carrier.as_carrier()),
+            )?;
             tokio::spawn(terminate(port, Arc::clone(carrier), flow));
             Ok(())
         }
@@ -495,7 +500,7 @@ pub async fn connect_through(
     }
     let mut flow = relay.bind_flow(send, recv)?;
     flow.cap_datagrams(CIRCUIT_DATAGRAM_MAX);
-    let port = endpoint.attach_circuit_via(&peer, &relay.peer_id())?;
+    let port = endpoint.attach_circuit_via(&peer, &relay.peer_id(), Some(relay.as_carrier()))?;
     // Read before the port moves into the driver: the address is allocated per circuit,
     // so the port is the only thing that knows it.
     let target = port.addr();
