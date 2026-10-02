@@ -143,17 +143,24 @@ fn summary_of(ch: &ChannelState) -> ChannelSummary {
 
 /// A room's detail for the view, from its state. `prev` is the room's detail last published: its
 /// timeline is shared rather than rebuilt when the room's timeline has not changed since
-/// (V210-71), since most publishes are about something else.
+/// (V210-71), since most publishes are about something else, and is **extended** by the rows
+/// added since when it has (V210-120). A room's timeline only grows at its end, so the published
+/// one is a prefix of it: rebuilding it whole made every message cost the room's whole history.
 fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
     let rows = ch.timeline();
-    let same = |p: &&ChannelDetail| {
+    let prefix = |p: &&ChannelDetail| {
+        let n = p.timeline.len();
         p.channel_id == ch.channel_id()
-            && p.timeline.len() == rows.len()
+            && n <= rows.len()
             && p.timeline.first().map(|r| r.entry_hash) == rows.first().map(|r| r.entry_hash)
-            && p.timeline.last().map(|r| r.entry_hash) == rows.last().map(|r| r.entry_hash)
+            && p.timeline.last().map(|r| r.entry_hash)
+                == n.checked_sub(1).map(|i| rows[i].entry_hash)
     };
-    let timeline = match prev.filter(same) {
-        Some(p) => std::sync::Arc::clone(&p.timeline),
+    let timeline = match prev.filter(prefix) {
+        Some(p) if p.timeline.len() == rows.len() => p.timeline.clone(),
+        Some(p) => p
+            .timeline
+            .appended(rows[p.timeline.len()..].iter().map(row_of)),
         None => rows.iter().map(row_of).collect(),
     };
     ChannelDetail {

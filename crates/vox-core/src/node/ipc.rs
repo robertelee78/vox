@@ -2015,7 +2015,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             let limit = usize::try_from(limit).unwrap_or(usize::MAX);
             let mut rows: Vec<MessageRow> = Vec::new();
             let mut bytes = 0usize;
-            for r in &detail.timeline[start.min(detail.timeline.len())..] {
+            for r in detail.timeline.iter_from(start) {
                 if limit > 0 && rows.len() >= limit {
                     break;
                 }
