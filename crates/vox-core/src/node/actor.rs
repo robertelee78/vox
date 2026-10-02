@@ -3695,11 +3695,15 @@ impl Node {
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
         if node.headless.is_some() {
-            // **Stored anchor pages are deleted on upgrade** (ADR-023 decision 6): an anchor
-            // kept a ciphertext copy of every room it served until then, and holds none now.
-            if node.anchor_boards && node.paths.store_file().is_file() {
-                crate::node::store::Store::open(&node.paths.store_file())?
-                    .delete_retired_anchor_pages()?;
+            // **An upgraded anchor deletes its store file** (ADR-023 decision 6; decider,
+            // 2026-10-02, R45): an anchor kept a ciphertext copy of every room it served in it
+            // until then, and keeps nothing on disk for a room now, so the file goes whole.
+            let store = node.paths.store_file();
+            if node.anchor_boards && store.is_file() {
+                std::fs::remove_file(&store).map_err(|e| Error::Path {
+                    op: "delete the anchor's retired store",
+                    detail: format!("{}: {e}", store.display()),
+                })?;
             }
             node.start_network()?;
         }

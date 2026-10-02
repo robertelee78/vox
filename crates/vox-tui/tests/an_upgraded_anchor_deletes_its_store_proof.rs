@@ -1,26 +1,25 @@
-//! PRD-001 R34, ADR-023 decision 6 — **an anchor upgraded from a release that kept room pages
-//! deletes them**, through the shipped binaries.
+//! PRD-001 R45, ADR-023 decision 6 — **an anchor upgraded from a release that kept room pages
+//! deletes its store file**, through the shipped binaries.
 //!
-//! Before ADR-023 an anchor kept a ciphertext log of every room whose members synced with it
-//! (`SegmentKind::AnchorLog` / `AnchorMeta`, codes 6 and 7). This build keeps nothing for a room it
-//! is not a member of, and decision 6 says "stored anchor pages on existing nodes are deleted on
-//! upgrade": no migration, no copy kept.
+//! Before ADR-023 an anchor kept a ciphertext log of every room whose members synced with it, in
+//! its store file. This build keeps nothing on disk for a room it is not a member of, and the
+//! decider ruled (2026-10-02, #95): "Delete the store file." An upgraded anchor removes it whole;
+//! it has no use for one.
 //!
 //! **The scene.** [`PREVIOUS`] (`support/previous_release.rs`, its published binary checked
 //! against its SHA-256) runs everything first: an anchor (`vox node`) and two member daemons, A and
 //! B, both naming it. A makes a room, B joins, they trust each other, A posts and B reads every
-//! post. Everything stops, and the anchor's store is read at rest: it must hold pages for the room,
-//! or the old release did not stage what this proof is about (CANNOT MEASURE). Then **this build's**
+//! post. Everything stops, and the anchor's data directory must hold a store file — else the old
+//! release did not stage what this proof is about (CANNOT MEASURE). Then **this build's**
 //! `vox node` starts on the same data directory, as an upgrade leaves it, says its `--anchor` spec,
 //! and is stopped.
 //!
-//! **What is asserted.** The anchor's store, read at rest after this build ran on it, holds no page
-//! for the room (`PRODUCT:` otherwise).
+//! **What is asserted.** What a person sees in the anchor's data directory: no store file remains
+//! (`PRODUCT:` otherwise). Nothing is opened in this process.
 //!
 //! **Why a file of its own.** It needs the previous release's binary, which no anchor proof uses.
 //!
-//! **Mutation.** The headless start not calling `Store::delete_retired_anchor_pages`: the old
-//! pages stay, and the proof goes red.
+//! **Mutation.** The headless start keeping the file: it stays, and the proof goes red.
 
 #![cfg(unix)]
 
@@ -30,7 +29,6 @@ mod previous_release;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -189,20 +187,6 @@ fn anchor(exe: &Path, name: &str, dir: &Path) -> (Proc, String) {
     (a, spec)
 }
 
-/// The pages `dir`'s node stores, per room, read at rest with it stopped. No store file is no
-/// pages.
-fn pages_at_rest(dir: &Path) -> BTreeMap<vox_core::hash::Digest32, usize> {
-    let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
-        .expect("APPARATUS: the anchor's paths");
-    let file = paths.store_file();
-    if !file.is_file() {
-        return BTreeMap::new();
-    }
-    vox_core::node::store::Store::open_read_only(&file)
-        .and_then(|s| s.pages_by_channel())
-        .unwrap_or_else(|e| panic!("APPARATUS: read the anchor's store at rest: {e}"))
-}
-
 fn mk(root: &Path, name: &str) -> PathBuf {
     let d = root.join(name);
     std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: make a profile directory");
@@ -280,22 +264,30 @@ fn an_anchor_upgraded_from_a_release_that_kept_room_pages_deletes_them() {
     da.stop();
     db.stop();
     old_anchor.stop();
-    let before = pages_at_rest(&n);
-    println!("[proof] under {PREVIOUS}, the anchor holds pages per room at rest: {before:?}");
+    // The store file, where an anchor kept what it kept; the path a person would look in.
+    let store = n.join("default").join("store.redb");
+    println!(
+        "[proof] under {PREVIOUS}, the anchor's store file {} exists: {}",
+        store.display(),
+        store.is_file()
+    );
     assert!(
-        before.values().sum::<usize>() > 0,
-        "CANNOT MEASURE (staging): {PREVIOUS}'s anchor kept no page, so there is nothing for an \
-         upgrade to delete"
+        store.is_file(),
+        "CANNOT MEASURE (staging): {PREVIOUS}'s anchor kept no store file, so there is nothing for \
+         an upgrade to delete"
     );
 
     // ---- this build's anchor on the same data directory ----
     let (new_anchor, _) = anchor(Path::new(VOX), "the upgraded anchor", &n);
     new_anchor.stop();
-    let after = pages_at_rest(&n);
-    println!("[proof] after this build's `vox node` ran on it: {after:?}");
+    println!(
+        "[proof] after this build's `vox node` ran on it, the store file exists: {}",
+        store.exists()
+    );
     assert!(
-        after.is_empty(),
-        "PRODUCT: an anchor upgraded from {PREVIOUS} must delete the room pages it kept (ADR-023 \
-         decision 6); its store still holds {after:?}"
+        !store.exists(),
+        "PRODUCT: an anchor upgraded from {PREVIOUS} must delete its store file (ADR-023 decision \
+         6; the decider, #95): {} is still there",
+        store.display()
     );
 }
