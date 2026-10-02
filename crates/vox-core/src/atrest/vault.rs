@@ -273,6 +273,10 @@ impl RootSigner for VaultRootSigner {
         self.signer.public_key()
     }
 
+    fn fingerprint(&self) -> crate::hash::Digest32 {
+        self.signer.fingerprint()
+    }
+
     fn sign(&self, msg: &[u8]) -> Result<CompositeSignature> {
         self.signer.sign(msg)
     }

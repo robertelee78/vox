@@ -49,14 +49,15 @@ pub const IDLE_RESTART: Duration = Duration::from_secs(1);
 /// restarted between two flights of the same transfer.
 const IDLE_RTTS: u32 = 4;
 
-/// Builds `IdleRestart` controllers around `VoxCubic`.
+/// Builds `IdleRestart` controllers around the tapered controller (`taper::Tapered`), which starts
+/// every connection, and every restart after idle, in tier 1.
 #[derive(Debug, Default)]
 pub struct IdleRestartConfig;
 
 impl ControllerFactory for IdleRestartConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         Box::new(IdleRestart {
-            inner: Box::new(VoxCubic::new(now, current_mtu)),
+            inner: super::taper::Tapered::new(now, current_mtu),
             mtu: current_mtu,
             last_sent: None,
             srtt: Duration::ZERO,
@@ -64,9 +65,10 @@ impl ControllerFactory for IdleRestartConfig {
     }
 }
 
-/// Cubic, rebuilt from scratch when the connection goes idle. See the module docs.
+/// The tapered controller, rebuilt at tier 1 when the connection goes idle (keeping only its tier-3
+/// lockout). See the module docs.
 struct IdleRestart {
-    inner: Box<dyn Controller>,
+    inner: super::taper::Tapered,
     mtu: u16,
     last_sent: Option<Instant>,
     srtt: Duration,
@@ -79,7 +81,11 @@ impl Controller for IdleRestart {
             .last_sent
             .is_some_and(|t| now.saturating_duration_since(t) > idle)
         {
-            self.inner = Box::new(VoxCubic::new(now, self.mtu));
+            self.inner = super::taper::Tapered::with_tier3_backoff(
+                now,
+                self.mtu,
+                self.inner.tier3_backoff(),
+            );
         }
         self.last_sent = Some(now);
         self.inner.on_sent(now, bytes, last_packet_number);
@@ -134,7 +140,7 @@ impl Controller for IdleRestart {
 
     fn clone_box(&self) -> Box<dyn Controller> {
         Box::new(Self {
-            inner: self.inner.clone_box(),
+            inner: self.inner.clone(),
             mtu: self.mtu,
             last_sent: self.last_sent,
             srtt: self.srtt,
@@ -195,10 +201,10 @@ struct CubicState {
 }
 
 impl CubicState {
-    // K = cbrt(w_max * (1 - beta_cubic) / C)  (RFC 8312 Eq. 2)
-    fn cubic_k(&self, mtu: u64) -> f64 {
+    // K = cbrt(w_max * (1 - beta) / C)  (RFC 8312 Eq. 2)
+    fn cubic_k(&self, mtu: u64, beta: f64) -> f64 {
         let w_max = self.w_max / mtu as f64;
-        (w_max * (1.0 - BETA_CUBIC) / C).cbrt()
+        (w_max * (1.0 - beta) / C).cbrt()
     }
     // W_cubic(t) = C * (t - K)^3 + w_max  (Eq. 1)
     fn w_cubic(&self, t: Duration, mtu: u64) -> f64 {
@@ -237,6 +243,7 @@ pub(crate) struct VoxCubic {
     last_round_min: Option<Duration>,
     round_min: Option<Duration>,
     round_samples: u32,
+    loss_aware: bool,
 }
 
 impl VoxCubic {
@@ -253,6 +260,80 @@ impl VoxCubic {
             last_round_min: None,
             round_min: None,
             round_samples: 0,
+            loss_aware: false,
+        }
+    }
+
+    /// A Cubic already in congestion avoidance at `window`, as if it had just grown there: the
+    /// hand-off when the taper leaves BBR (ADR-024 rule 5), so stepping down does not cost a slow
+    /// start. `last_sent_pn` lets its rounds continue from the connection's packet numbers.
+    pub(crate) fn seeded(now: Instant, current_mtu: u16, last_sent_pn: u64, window: u64) -> Self {
+        let mut c = Self::new(now, current_mtu);
+        c.window = window.max(c.minimum_window());
+        c.ssthresh = c.window;
+        c.state.w_max = c.window as f64;
+        c.phase = Phase::Done;
+        c.last_sent_pn = last_sent_pn;
+        c
+    }
+
+    /// Tier 2 on or off (ADR-024): when on, a loss that [`PathSignals`] does not call congestion
+    /// does not cut the window at all.
+    ///
+    /// **No cut, not a smaller one** (ADR-024 M24.1, measured on R41's lossy arm, 200 Mbit/s, 10 ms,
+    /// 1% loss). With 8192-byte datagrams the window there is about 15 packets, Cubic regrows about a
+    /// quarter of a packet per round trip, and a loss arrives every ten or so: a cut of 15% (beta
+    /// 0.85) per such loss held Vox at 1.01x a Cubic flow on the same loss, where no cut reached
+    /// 2.77x. What stops Vox overrunning the path is the classification: the queue it builds shows as
+    /// delay, and past [`GENTLE_LOSS_CAP`] every loss is congestion.
+    pub(crate) fn set_loss_aware(&mut self, on: bool) {
+        self.loss_aware = on;
+    }
+
+    /// A loss, already classified: `congestion` is what [`PathSignals::on_loss`] answered. Cubic's
+    /// cut for congestion, for persistent congestion, for an ECN mark (`lost_bytes == 0`), and
+    /// whenever tier 2 is off; no cut otherwise.
+    pub(crate) fn on_loss(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+        congestion: bool,
+    ) {
+        if self.loss_aware && !congestion && !is_persistent_congestion && lost_bytes > 0 {
+            return;
+        }
+        self.cut(now, sent, is_persistent_congestion, BETA_CUBIC);
+    }
+
+    /// Cubic's multiplicative decrease with `beta` (RFC 8312 §4.5-4.6), once per recovery period.
+    fn cut(&mut self, now: Instant, sent: Instant, is_persistent_congestion: bool, beta: f64) {
+        if self
+            .recovery_start_time
+            .is_some_and(|recovery_start_time| sent <= recovery_start_time)
+        {
+            return;
+        }
+        // Loss ends HyStart++ whatever its phase: from here it is Cubic's.
+        self.phase = Phase::Done;
+        self.recovery_start_time = Some(now);
+        let window = self.window as f64;
+        self.state.w_max = if window < self.state.w_max {
+            window * (1.0 + beta) / 2.0
+        } else {
+            window
+        };
+        self.ssthresh = ((window * beta) as u64).max(self.minimum_window());
+        self.window = self.ssthresh;
+        self.state.k = self.state.cubic_k(self.mtu, beta);
+        self.state.cwnd_inc = (self.state.cwnd_inc as f64 * beta) as u64;
+        if is_persistent_congestion {
+            self.recovery_start_time = None;
+            self.state.w_max = self.window as f64;
+            self.ssthresh = ((self.window as f64 * BETA_CUBIC) as u64).max(self.minimum_window());
+            self.state.cwnd_inc = 0;
+            self.window = self.minimum_window();
         }
     }
 
@@ -391,32 +472,7 @@ impl Controller for VoxCubic {
         is_persistent_congestion: bool,
         _lost_bytes: u64,
     ) {
-        if self
-            .recovery_start_time
-            .is_some_and(|recovery_start_time| sent <= recovery_start_time)
-        {
-            return;
-        }
-        // Loss ends HyStart++ whatever its phase: from here it is Cubic's.
-        self.phase = Phase::Done;
-        self.recovery_start_time = Some(now);
-        let window = self.window as f64;
-        self.state.w_max = if window < self.state.w_max {
-            window * (1.0 + BETA_CUBIC) / 2.0
-        } else {
-            window
-        };
-        self.ssthresh = ((window * BETA_CUBIC) as u64).max(self.minimum_window());
-        self.window = self.ssthresh;
-        self.state.k = self.state.cubic_k(self.mtu);
-        self.state.cwnd_inc = (self.state.cwnd_inc as f64 * BETA_CUBIC) as u64;
-        if is_persistent_congestion {
-            self.recovery_start_time = None;
-            self.state.w_max = self.window as f64;
-            self.ssthresh = ((self.window as f64 * BETA_CUBIC) as u64).max(self.minimum_window());
-            self.state.cwnd_inc = 0;
-            self.window = self.minimum_window();
-        }
+        self.cut(now, sent, is_persistent_congestion, BETA_CUBIC);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
@@ -445,5 +501,373 @@ impl Controller for VoxCubic {
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
+    }
+}
+
+// ---- PathSignals: what the path is doing, for every tier of the taper (ADR-024) -----------------
+
+/// How long the path's base round trip is remembered. A path changes (a tunnel's connection outlives
+/// the network it started on), so the base is the minimum of the samples of this window, never the
+/// connection's lifetime minimum: quinn's `RttEstimator::min` is lifetime, and on a connection that
+/// first ran over a faster path it reads that path's round trip for as long as the connection lives.
+pub(crate) const BASE_RTT_WINDOW: Duration = Duration::from_secs(10);
+/// A round that acknowledged no more than this carried too little to queue behind itself: four
+/// 8192-byte datagrams. Its minimum round trip is the path's (see [`PathSignals::min_rtt`]), as long
+/// as it acknowledged at least two packets: a peer acknowledges every second packet at once, but a
+/// lone packet only when its delayed-acknowledgement timer fires (up to 25 ms), and these samples are
+/// `now - sent`, with that delay in them.
+pub(crate) const SMALL_ROUND_BYTES: u64 = 32 << 10;
+/// A round that acknowledged fewer packets than this cannot time the path, so it is no evidence of a
+/// queue. Its samples are `now - sent`, and a peer acknowledges a lone packet only when its
+/// delayed-acknowledgement timer fires (up to 25 ms), so a round of one or two packets carries that
+/// delay in every sample. At tier 2's floor of two 8192-byte datagrams on R41's 6%-loss link, the
+/// round minimum read 12.5 / 39.5 / 40.6 ms (p10 / p50 / p90) on a 10.6 ms base, a queue in 62 of 84
+/// rounds where there was none; each loss then counted as congestion and cut the window back to the
+/// floor, which kept the rounds that small: Vox carried 1.7 Mbit/s against a Cubic flow's 22.6
+/// (fix-adr024-bbr, R41 at 493b5453).
+pub(crate) const TIMED_ROUND_PACKETS: u32 = 4;
+/// A queue is building when a round's minimum round trip exceeds the base by this much…
+///
+/// Measured on R41's lossy arm, where no loss is congestion: at each loss, the last round's minimum
+/// stood 2.2 ms above the base at the median, 4.3 ms at the 90th percentile and 9 ms at the 99th
+/// (emulator jitter and the peer's acknowledgement delay). Above that noise, and below the 7.4 ms
+/// median a Cubic flow sharing a one-BDP queue raised it to on the congested arm.
+pub(crate) const QUEUE_DELAY_MIN: Duration = Duration::from_millis(4);
+/// …or by this share of the base, whichever is larger.
+pub(crate) const QUEUE_DELAY_SHARE: f64 = 0.4;
+/// Past this share of the bytes sent over the last [`LOSS_ROUNDS`], a loss is congestion whatever
+/// the delay says: a queue too shallow to show as delay, or a policer.
+///
+/// Measured on R41's arms: Vox's own loss share was 1.0% on the 1%-loss Wi-Fi link, 0.2% sharing a
+/// one-BDP queue with a Cubic flow, and 35.6% sharing a quarter-BDP queue (about 2.5 ms, under the
+/// delay threshold) when nothing capped it, where it took 5.26x the Cubic flow's rate. With this
+/// cap it took 1.35x, the Cubic flow kept what it got against another Cubic (40 against 38 Mbit/s),
+/// and tail drops fell from 44 thousand to 2.3 thousand.
+pub(crate) const GENTLE_LOSS_CAP: f64 = 0.05;
+/// Loss that grows with Vox's own sending is congestion, whatever the delay says: the loss share
+/// has risen past `max(LOSS_RISE_FACTOR × baseline, baseline + rise)` over the share recorded when
+/// the tier began (`mark_loss_baseline`). Random loss does not move with the rate Vox sends at;
+/// loss Vox causes does. `TIER2_LOSS_RISE` is the absolute rise for tier 2; tier 3's trial uses its
+/// own, in `taper.rs`.
+pub(crate) const LOSS_RISE_FACTOR: f64 = 1.5;
+pub(crate) const TIER2_LOSS_RISE: f64 = 0.005;
+/// The trend is judged over the last this-many bytes sent, never over [`LOSS_ROUNDS`]: at 8192-byte
+/// datagrams eight rounds hold a couple of hundred packets, and 1% random loss over that many reads
+/// above 1.5% by chance often enough to cost tier 2 its gain (measured: 1.62x a Cubic flow instead of
+/// 2.8x). 32 MiB is about four thousand such packets.
+pub(crate) const TREND_BYTES: u64 = 32 << 20;
+/// How many finished rounds are kept for the trend: enough for [`TREND_BYTES`] at any rate a round
+/// can carry.
+const TREND_ROUNDS: usize = 4096;
+/// How many recent rounds the loss counts cover.
+pub(crate) const LOSS_ROUNDS: usize = 8;
+
+/// One finished round: packets the controller saw sent and lost in it, and whether a queue showed.
+#[derive(Debug, Clone, Copy, Default)]
+struct RoundLoss {
+    sent: u64,
+    lost: u64,
+    gentle_losses: u32,
+    queued_losses: u32,
+}
+
+/// The path, as every tier sees it: a base round trip, each round's minimum round trip, and recent
+/// losses with and without a queue. Rounds are counted in packet numbers, as HyStart++'s are: a round ends when a
+/// packet sent after it began is acknowledged. Each acknowledgement's sample is its own `now - sent`.
+#[derive(Debug, Clone)]
+pub(crate) struct PathSignals {
+    /// Monotonic deque of (when, sample): the front is the base round trip.
+    base: std::collections::VecDeque<(Instant, Duration)>,
+    srtt: Duration,
+    last_sent_pn: u64,
+    round_end_pn: Option<u64>,
+    round_min: Option<Duration>,
+    round_acked: u64,
+    round_sent: u64,
+    round_lost: u64,
+    round_gentle: u32,
+    round_queued: u32,
+    last_round_min: Option<Duration>,
+    last_app_limited: bool,
+    rounds: u64,
+    recent: std::collections::VecDeque<RoundLoss>,
+    loss_baseline: Option<f64>,
+    small_round_min: Option<Duration>,
+    round_packets: u32,
+    /// The last finished round acknowledged at least [`TIMED_ROUND_PACKETS`].
+    last_round_timed: bool,
+}
+
+impl Default for PathSignals {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PathSignals {
+    pub(crate) fn new() -> Self {
+        Self {
+            base: std::collections::VecDeque::new(),
+            srtt: Duration::ZERO,
+            last_sent_pn: 0,
+            round_end_pn: None,
+            round_min: None,
+            round_acked: 0,
+            round_sent: 0,
+            round_lost: 0,
+            round_gentle: 0,
+            round_queued: 0,
+            last_round_min: None,
+            last_app_limited: false,
+            rounds: 0,
+            recent: std::collections::VecDeque::with_capacity(LOSS_ROUNDS + 1),
+            loss_baseline: None,
+            small_round_min: None,
+            round_packets: 0,
+            last_round_timed: false,
+        }
+    }
+
+    pub(crate) fn on_sent(&mut self, _now: Instant, bytes: u64, last_packet_number: u64) {
+        self.last_sent_pn = last_packet_number;
+        self.round_sent += bytes;
+        if self.round_end_pn.is_none() {
+            self.round_end_pn = Some(last_packet_number);
+        }
+    }
+
+    pub(crate) fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        _app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        self.srtt = rtt.get();
+        let sample = now.saturating_duration_since(sent);
+        while self.base.back().is_some_and(|&(_, m)| m >= sample) {
+            self.base.pop_back();
+        }
+        self.base.push_back((now, sample));
+        while self
+            .base
+            .front()
+            .is_some_and(|&(t, _)| now.saturating_duration_since(t) > BASE_RTT_WINDOW)
+        {
+            self.base.pop_front();
+        }
+        self.round_min = Some(self.round_min.map_or(sample, |m| m.min(sample)));
+        self.round_acked += bytes;
+        self.round_packets += 1;
+    }
+
+    pub(crate) fn on_end_acks(
+        &mut self,
+        _now: Instant,
+        _in_flight: u64,
+        app_limited: bool,
+        largest: Option<u64>,
+    ) {
+        let (Some(acked), Some(end)) = (largest, self.round_end_pn) else {
+            return;
+        };
+        if acked < end {
+            return;
+        }
+        // A round has ended.
+        self.last_app_limited = app_limited;
+        if self.round_acked <= SMALL_ROUND_BYTES && self.round_packets >= 2 {
+            if let Some(m) = self.round_min {
+                self.small_round_min = Some(m);
+            }
+        }
+        self.last_round_timed = self.round_packets >= TIMED_ROUND_PACKETS;
+        if self.last_round_timed {
+            self.last_round_min = self.round_min.or(self.last_round_min);
+        }
+        self.recent.push_back(RoundLoss {
+            sent: self.round_sent,
+            lost: self.round_lost,
+            gentle_losses: self.round_gentle,
+            queued_losses: self.round_queued,
+        });
+        while self.recent.len() > TREND_ROUNDS {
+            self.recent.pop_front();
+        }
+        self.rounds += 1;
+        self.round_min = None;
+        self.round_acked = 0;
+        self.round_packets = 0;
+        self.round_sent = 0;
+        self.round_lost = 0;
+        self.round_gentle = 0;
+        self.round_queued = 0;
+        self.round_end_pn = Some(self.last_sent_pn);
+    }
+
+    /// Record a loss and say whether it is congestion: persistent congestion, an ECN mark
+    /// (`lost_bytes == 0`), a queue building, or losses over the last [`LOSS_ROUNDS`] already past
+    /// [`GENTLE_LOSS_CAP`] of what was sent. Pass the answer to [`VoxCubic::on_loss`].
+    pub(crate) fn on_loss(&mut self, _now: Instant, lost_bytes: u64, persistent: bool) -> bool {
+        self.round_lost += lost_bytes;
+        let congestion = persistent
+            || lost_bytes == 0
+            || self.queue_building()
+            || self.loss_share() > GENTLE_LOSS_CAP
+            || self
+                .loss_baseline
+                .is_some_and(|b| self.loss_risen(b, TIER2_LOSS_RISE));
+        // `loss_share` (the cap) covers the last LOSS_ROUNDS; the trend covers TREND_BYTES.
+        if congestion {
+            self.round_queued += 1;
+        } else {
+            self.round_gentle += 1;
+        }
+        congestion
+    }
+
+    /// The base round trip: the smallest sample of the last [`BASE_RTT_WINDOW`], or the minimum of
+    /// the latest small round ([`SMALL_ROUND_BYTES`]), whichever is lower.
+    ///
+    /// **Why not the windowed minimum alone.** A Cubic flow on a deep buffer keeps a standing queue
+    /// for as long as it sends, and never drains it: fix-adr024-bbr's trace showed the windowed
+    /// minimum drift to 100-114 ms on a 10.6 ms link, after which overflow losses read as losses
+    /// without a queue and a clean link climbed to tier 2. A base that reads high turns congestion
+    /// into "random" loss, and a clean link climbs to tier 2; one that reads low only costs tier 2 its gain. A round
+    /// that carried little data had no queue of its own behind it (slow start's first rounds, and
+    /// the quiet moments between transfers), so its minimum is the path's round trip; it is replaced
+    /// at the next small round, not kept as a minimum, so a path whose round trip grows is followed
+    /// at its next quiet moment.
+    pub(crate) fn min_rtt(&self) -> Option<Duration> {
+        let windowed = self.base.front().map(|&(_, m)| m);
+        match (windowed, self.small_round_min) {
+            (Some(w), Some(q)) => Some(w.min(q)),
+            (w, q) => w.or(q),
+        }
+    }
+
+    /// The last finished round's minimum round trip, or `None` when that round was too small to time
+    /// the path ([`TIMED_ROUND_PACKETS`]).
+    pub(crate) fn round_min_rtt(&self) -> Option<Duration> {
+        self.last_round_min.filter(|_| self.last_round_timed)
+    }
+
+    pub(crate) fn srtt(&self) -> Duration {
+        self.srtt
+    }
+
+    /// Is a queue building? The last finished round's minimum round trip stands above the base by
+    /// at least [`QUEUE_DELAY_MIN`] or [`QUEUE_DELAY_SHARE`] of it, whichever is larger. A round's
+    /// minimum, not its smoothed round trip: one delayed acknowledgement must not read as a queue.
+    /// A round too small to time the path ([`TIMED_ROUND_PACKETS`]) is no evidence of one.
+    pub(crate) fn queue_building(&self) -> bool {
+        let (Some(base), Some(round)) = (self.min_rtt(), self.round_min_rtt()) else {
+            return false;
+        };
+        let rise = round.saturating_sub(base);
+        rise >= QUEUE_DELAY_MIN.max(base.mul_f64(QUEUE_DELAY_SHARE))
+    }
+
+    pub(crate) fn rounds(&self) -> u64 {
+        self.rounds
+    }
+
+    /// Was the last finished round application-limited? Such a round is no evidence about the path.
+    pub(crate) fn app_limited(&self) -> bool {
+        self.last_app_limited
+    }
+
+    /// The largest packet number sent so far: a controller handed the connection continues its
+    /// rounds from here.
+    pub(crate) fn last_sent_pn(&self) -> u64 {
+        self.last_sent_pn
+    }
+
+    /// Did a loss in the current or last finished round come with a queue (or past the cap)?
+    pub(crate) fn loss_with_queue(&self) -> bool {
+        self.round_queued > 0 || self.recent.back().is_some_and(|r| r.queued_losses > 0)
+    }
+
+    /// Losses without a queue, over the last `rounds` finished rounds.
+    pub(crate) fn losses_without_queue_in_last(&self, rounds: usize) -> u32 {
+        self.recent
+            .iter()
+            .rev()
+            .take(rounds)
+            .map(|r| r.gentle_losses)
+            .sum()
+    }
+
+    /// Losses that came with a queue (or past the cap), over the last `rounds` finished rounds.
+    pub(crate) fn losses_with_queue_in_last(&self, rounds: usize) -> u32 {
+        self.recent
+            .iter()
+            .rev()
+            .take(rounds)
+            .map(|r| r.queued_losses)
+            .sum()
+    }
+
+    /// Record the loss share now, over the last [`TREND_BYTES`] (or all there is), as the baseline
+    /// that [`Self::on_loss`] compares against: the taper calls it on entering tier 2, from tier 1's
+    /// sending.
+    pub(crate) fn mark_loss_baseline(&mut self) {
+        self.loss_baseline = Some(self.trend_share());
+    }
+
+    /// Forget the baseline (back in tier 1, every loss is Cubic's anyway).
+    pub(crate) fn clear_loss_baseline(&mut self) {
+        self.loss_baseline = None;
+    }
+
+    /// Has the loss share over the last [`TREND_BYTES`] risen past
+    /// `max(LOSS_RISE_FACTOR × baseline, baseline + rise)`? Never over fewer bytes than that: a
+    /// shorter window is noise. Right after a switch the window still holds the previous tier's
+    /// rounds, which delays the answer and never hastens it.
+    pub(crate) fn loss_risen(&self, baseline: f64, rise: f64) -> bool {
+        let (sent, _) = self.trend_bytes();
+        sent >= TREND_BYTES
+            && self.trend_share() > (LOSS_RISE_FACTOR * baseline).max(baseline + rise)
+    }
+
+    /// Bytes sent and lost over the last [`TREND_BYTES`] (or all there is), newest rounds first.
+    fn trend_bytes(&self) -> (u64, u64) {
+        let (mut sent, mut lost) = (self.round_sent, self.round_lost);
+        for r in self.recent.iter().rev() {
+            if sent >= TREND_BYTES {
+                break;
+            }
+            sent += r.sent;
+            lost += r.lost;
+        }
+        (sent, lost)
+    }
+
+    /// Bytes lost over bytes sent across the last [`TREND_BYTES`].
+    pub(crate) fn trend_share(&self) -> f64 {
+        let (sent, lost) = self.trend_bytes();
+        if sent == 0 {
+            0.0
+        } else {
+            lost as f64 / sent as f64
+        }
+    }
+
+    /// Bytes lost over bytes sent, across the last [`LOSS_ROUNDS`] finished rounds and this one.
+    pub(crate) fn loss_share(&self) -> f64 {
+        let (sent, lost) = self
+            .recent
+            .iter()
+            .rev()
+            .take(LOSS_ROUNDS)
+            .fold((self.round_sent, self.round_lost), |(s, l), r| {
+                (s + r.sent, l + r.lost)
+            });
+        if sent == 0 {
+            0.0
+        } else {
+            lost as f64 / sent as f64
+        }
     }
 }
