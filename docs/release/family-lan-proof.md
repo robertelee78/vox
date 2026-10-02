@@ -43,9 +43,34 @@ fingerprints, and nothing of your own profile.
 
 ## Undo
 
-Nothing, normally: the trap tears everything down and the teardown line says whether it
-worked. If the script was killed outright (`kill -9`, a power cut), the script's header lists
-what can be left (processes, a utun, a route) and the command that removes each.
+Nothing, normally: the trap tears everything down, on a normal end, an error, Ctrl-C or the
+terminal closing, and the `teardown` line says whether it worked. If the script itself was
+killed outright (`kill -9`, a power cut) or the teardown line is a FAIL, undo by hand, in this
+order:
+
+1. **Stop what it started.** List them:
+
+       pgrep -lf 'vox (node|serve|lan)|probe\.py|tcpdump -l -n -i utun'
+
+   then `kill <pid>` each one that is yours, and `sudo kill <pid>` the `vox lan helper` (it runs
+   as root). Check again with the same `pgrep`: it must print nothing of the run's.
+2. **Check the interfaces.** A utun goes when the process holding it exits, so step 1 removes
+   it. `ifconfig -l` lists what exists; the run printed its own (`alice: vox lan up on utunN …`)
+   and the ones that existed before (`before: …`). Any of the run's still there means a process
+   from step 1 is still running.
+3. **Remove a route left behind.** The run printed the room's LAN (`LAN 10.x.y.0/24
+   fdxx:…::/64`). If `netstat -rn` still shows a route to either:
+
+       sudo route -n delete -net 10.x.y.0/24
+       sudo route -n delete -inet6 fdxx:…::/64
+
+   with the addresses the run printed.
+4. **Remove its directory**, the one it printed last (`/tmp/vox-lan-proof.XXXXXX`):
+   `rm -rf /tmp/vox-lan-proof.XXXXXX`, naming that exact directory. It holds test profiles and
+   passphrases only.
+
+Your own vox profile (`~/Library/Application Support/vox`) is never touched, so there is
+nothing to undo there.
 
 ## Without root first
 

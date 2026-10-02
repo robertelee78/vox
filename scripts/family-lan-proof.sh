@@ -48,13 +48,15 @@
 # error): a trap stops everything it started, by PID, and the utun interfaces go away with
 # the helper that made them. Teardown then compares `ifconfig -l` and `netstat -rn` with
 # what they were before and FAILs if anything of the proof's is left. If it was killed
-# outright (`kill -9`, a power cut), the leftovers are:
-# - `vox` processes it started: `pgrep -lf 'vox lan|vox node'`, then `kill <pid>` each;
+# outright (`kill -9`, a power cut), the leftovers and how to remove each, step by step, are
+# in docs/release/family-lan-proof.md ("Undo"):
+# - processes it started: `pgrep -lf 'vox (node|serve|lan)|probe\.py|tcpdump -l -n -i utun'`,
+#   then `kill <pid>` each (`sudo kill` for `vox lan helper`, which runs as root);
 # - a utun interface: it is removed when the process holding it exits, so the step above
 #   removes it (`ifconfig -l` shows what exists);
 # - a route to the room's /24 or /64, if one outlived its interface: `sudo route -n delete
-#   -net <subnet>` (teardown prints the subnet);
-# - the temporary directory it printed: `rm -rf` it.
+#   -net <the /24>` and `sudo route -n delete -inet6 <the /64>` (the run prints both as `LAN`);
+# - the temporary directory it printed last: `rm -rf` that exact directory.
 # It never touches your own vox profile (~/Library/Application Support/vox).
 #
 # What runs as root, and why: `vox lan helper` (it creates the utun interfaces — that is
@@ -117,16 +119,30 @@ else
     if [[ $PREFLIGHT == 1 ]]; then
         (cd "$REPO" && cargo build --release -p vox-tui) || { echo "the build failed" >&2; exit 2; }
     else
-        sudo -u "$SUDO_USER" -i bash -c "cd '$REPO' && cargo build --release -p vox-tui" \
+        # The path goes in as an argument, never spliced into the command's text.
+        sudo -u "$SUDO_USER" -i bash -c 'cd "$1" && cargo build --release -p vox-tui' _ "$REPO" \
             || { echo "the build failed" >&2; exit 2; }
     fi
 fi
 [[ -x $VOX ]] || { echo "no vox binary at $VOX" >&2; exit 2; }
 
-WORK=$("${AS_USER[@]}" mktemp -d /tmp/vox-lan-proof.XXXXXX)
+# **Fail closed**: everything below writes into $WORK, as root in the real run. An empty or
+# unexpected $WORK would put those files at / or somewhere else, so anything but a fresh, real
+# directory made here stops the run before a single write.
+WORK=$("${AS_USER[@]}" mktemp -d /tmp/vox-lan-proof.XXXXXX) || WORK=
+if [[ -z $WORK || $WORK != /tmp/vox-lan-proof.?????? || -L $WORK || ! -d $WORK ]] \
+    || [[ -n $(ls -A "$WORK") ]]; then
+    echo "could not make a fresh temporary directory (mktemp said: ${WORK:-nothing}); nothing was started" >&2
+    exit 2
+fi
 LOG=$WORK/family-lan-proof.log
-# Everything printed from here on also goes to the log to paste back.
-exec > >(tee -a "$LOG") 2>&1
+# Everything printed from here on also goes to the log to paste back. **The teardown must outlive
+# the terminal**: closing it sends SIGHUP to the whole process group, tee included, and a dead
+# tee made the trap's first line a write to a closed pipe — SIGPIPE killed the script before it
+# stopped anything. So tee ignores the stop signals, and so does this script's SIGPIPE: a log
+# that cannot be written never stops the teardown.
+exec > >(trap '' INT TERM HUP PIPE; exec tee -a "$LOG") 2>&1
+trap '' PIPE
 echo "family-lan-proof: $(date -u +%Y-%m-%dT%H:%M:%SZ), $(sw_vers -productName) $(sw_vers -productVersion), $("$VOX" --version 2>/dev/null)"
 [[ $PREFLIGHT == 1 ]] && echo "PREFLIGHT: every step before the root one, as $RUN_AS; no interface is made"
 IDENTITY="lan proof identity"
@@ -172,7 +188,7 @@ bg() { # name command... — background, output to $WORK/<name>.log, PID recorde
     shift
     "$@" >"$WORK/$name.log" 2>&1 &
     PIDS+=($!)
-    eval "PID_$name=$!"
+    printf -v "PID_$name" '%s' "$!"
 }
 
 wait_line() { # log pattern seconds — print the first matching line
@@ -193,12 +209,17 @@ stop_pid() {
         kill -0 "$p" 2>/dev/null || return 0
         sleep 0.1
     done
+    # A `sudo -u` wrapper cannot pass KILL on, so its child (the `vox` it runs) goes first, by
+    # its parent's PID, or it would be left running without the wrapper.
+    pkill -KILL -P "$p" 2>/dev/null
     kill -KILL "$p" 2>/dev/null
 }
 
 teardown() {
     [[ $TORN_DOWN == 1 ]] && return
     TORN_DOWN=1
+    # A second Ctrl-C, or the rest of a closing terminal's signals, must not cut it short.
+    trap '' INT TERM HUP
     say "teardown: stopping ${#PIDS[@]} processes by PID"
     local p
     # The LANs and the helper first, then the rest.
@@ -243,7 +264,8 @@ teardown() {
     if [[ $FAILED == 0 && ${#RESULTS[@]} -gt 0 ]]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; fi
     echo "logs and profiles (test passphrases only): $WORK"
     echo "paste this file back: $LOG"
-    [[ $PREFLIGHT == 0 ]] && chown -R "$SUDO_USER" "$WORK" 2>/dev/null
+    # -h with -R: a link in the run's directory is changed itself, never what it points to.
+    [[ $PREFLIGHT == 0 ]] && chown -hR "$SUDO_USER" "$WORK" 2>/dev/null
 }
 # An exit that no FAIL line explains is the script's own error, named before the summary.
 trap 'rc=$?; if [[ $rc != 0 && $FAILED == 0 ]]; then apparatus "the script stopped on an error of its own (exit $rc, quoted above) before every claim ran"; fi; teardown; exit $FAILED' EXIT
@@ -375,11 +397,30 @@ elif cmd == "mdns-listen":       # ifname addr secs
     heard = sum(1 for data, _ in until(s, secs) if NAME in data)
     print(json.dumps({"heard": heard}))
 PYEOF
-chown "$RUN_AS" "$WORK/probe.py"
+chown -h "$RUN_AS" "$WORK/probe.py"
 PROBE=("${AS_USER[@]}" "$PY" "$WORK/probe.py")
 probe() { "${PROBE[@]}" "$@"; }
-jget() { # file python-expression-over-d
-    "$PY" -c "import json,sys; d=json.load(open(sys.argv[1])); print($2)" "$1"
+jget() { # file python-expression-over-d [values, as a[0], a[1]…] — values never enter the code
+    local f=$1 expr=$2
+    shift 2
+    "$PY" -c "import json,sys; d=json.load(open(sys.argv[1])); a=sys.argv[2:]; print($expr)" "$f" "$@"
+}
+# A probe's reading: the field of the JSON it printed, or nothing if it printed none.
+pget() { # json-text field
+    "$PY" -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]])' "$1" "$2" 2>/dev/null
+}
+fget() { # json-file field
+    "$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2" 2>/dev/null
+}
+# **A probe that crashed is the apparatus's, not vox's**: a claim whose readings are not all
+# there reports APPARATUS, naming the missing one, never a PRODUCT fail on an empty value.
+measured() { # claim name...
+    local claim=$1 n missing=""
+    shift
+    for n in "$@"; do [[ -n ${!n:-} ]] || missing+=" $n"; done
+    [[ -z $missing ]] && return 0
+    apparatus "$claim: a probe crashed or printed nothing, so nothing was measured (missing:$missing)"
+    return 1
 }
 
 # ---- the room: an anchor, alice's room, bob and carol joined ----
@@ -392,7 +433,8 @@ ANCHOR=$(wait_line "$WORK/anchor.log" '^ *[A-Za-z0-9]+@/ip4/' 180 | tr -d '[:spa
 echo "anchor $ANCHOR"
 for m in alice bob carol; do
     FP=$(vox_as "$m" id | tr -d '[:space:]') || { cannot "vox id ($m) failed"; exit 1; }
-    eval "FP_$m=$FP"
+    [[ $FP =~ ^[a-z2-7]{52}$ ]] || { cannot "vox id ($m) printed no fingerprint: $FP"; exit 1; }
+    printf -v "FP_$m" '%s' "$FP"
     echo "$m $FP"
 done
 vox_as alice trust add "$FP_bob" --name bob >/dev/null && vox_as bob trust add "$FP_alice" --name alice >/dev/null \
@@ -412,7 +454,7 @@ echo "room $ROOM"
 # The room passphrase goes in a file: vox refuses it on a command line or in the environment.
 ROOM_PASS_FILE=$WORK/room.pass
 (umask 077 && printf '%s\n' "$ROOM_PP" >"$ROOM_PASS_FILE")
-chown "$RUN_AS" "$ROOM_PASS_FILE"
+chown -h "$RUN_AS" "$ROOM_PASS_FILE"
 for m in bob carol; do
     vox_as "$m" connect "$ADDRESS" --passphrase-file "$ROOM_PASS_FILE" --anchor "$ANCHOR" --listen 127.0.0.1:0 \
         >"$WORK/connect-$m.log" 2>&1 || { cannot "vox connect ($m): $(tail -3 "$WORK/connect-$m.log")"; exit 1; }
@@ -464,7 +506,8 @@ for m in alice bob carol; do
         || { fail "vox lan up ($m) never said which utun it is on: $(tail -3 "$WORK/lan_$m.log")"; exit 1; }
     IF=$(echo "$LINE" | awk '{print $5}')
     IFACES+=("$IF")
-    eval "IF_$m=$IF"
+    [[ $IF =~ ^utun[0-9]+$ ]] || { fail "vox lan up ($m) named no utun: $LINE"; exit 1; }
+    printf -v "IF_$m" '%s' "$IF"
     echo "$m: $LINE"
 done
 for m in alice bob carol; do
@@ -472,7 +515,9 @@ for m in alice bob carol; do
         [[ -s $WORK/$m.json ]] && break
         sleep 0.1
     done
-    eval "V4_$m=$(jget "$WORK/$m.json" 'd["addresses"]["v4"]')"
+    V4=$(jget "$WORK/$m.json" 'd["addresses"]["v4"]')
+    [[ $V4 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail "vox lan up ($m) gave no IPv4 address: $V4"; exit 1; }
+    printf -v "V4_$m" '%s' "$V4"
 done
 SUBNET4=$(jget "$WORK/alice.json" 'd["subnet_v4"]')
 PREFIX6=$(jget "$WORK/alice.json" 'd["prefix_v6"]')
@@ -486,8 +531,8 @@ netstat -rn | grep -E "$(IFS='|'; echo "${IFACES[*]}")" | sed 's/^/    /'
 
 say "waiting for alice and bob to link (carol must not)"
 for ((i = 0; i < 1200; i++)); do
-    A=$(jget "$WORK/alice.json" "'$FP_bob' in d['links']")
-    B=$(jget "$WORK/bob.json" "'$FP_alice' in d['links']")
+    A=$(jget "$WORK/alice.json" "a[0] in d['links']" "$FP_bob")
+    B=$(jget "$WORK/bob.json" "a[0] in d['links']" "$FP_alice")
     [[ $A == True && $B == True ]] && break
     sleep 0.1
 done
@@ -496,7 +541,7 @@ sleep 3
 CAROL_LINKS=$(jget "$WORK/carol.json" 'len(d["links"])')
 echo "alice<->bob linked; carol's links: $CAROL_LINKS"
 
-counter() { jget "$WORK/$1.json" "d['$2']"; }
+counter() { jget "$WORK/$1.json" "d[a[0]]" "$2"; }
 
 # ---- 1. ping ----
 say "1. ping -b $IF_alice -S $V4_alice $V4_bob"
@@ -514,7 +559,8 @@ stop_pid "$TCPDUMP"
 SEEN=$(grep -c "$V4_alice > $V4_bob: ICMP echo request" "$WORK/ping-capture.txt")
 DB=$(($(counter bob from_peers) - B0))
 echo "on $IF_bob: $SEEN echo requests from $V4_alice; bob's LAN: +$DB packets from alice"
-if [[ $PING == 0 && $SEEN -ge 5 && $DB -ge 5 ]]; then
+if ! measured ping SEEN; then :
+elif [[ $PING == 0 && $SEEN -ge 5 && $DB -ge 5 ]]; then
     pass "ping: 5/5 answered, and all 5 requests arrived on bob's interface through the LAN"
 else
     fail "ping: exit $PING, $SEEN requests on $IF_bob, bob's LAN +$DB (0 means the kernel answered without the LAN)"
@@ -530,8 +576,9 @@ ECHO=$(probe udp-echo-client "$IF_alice" "$V4_alice" "$V4_bob" 47010 10)
 sleep 1
 DA=$(($(counter alice from_peers) - A0)); DB=$(($(counter bob from_peers) - B0))
 echo "client: $ECHO; alice's LAN +$DA from bob, bob's LAN +$DB from alice"
-BACK=$(echo "$ECHO" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["echoed_back"])')
-if [[ $BACK -ge 9 && $DA -ge 9 && $DB -ge 9 ]]; then
+BACK=$(pget "$ECHO" echoed_back)
+if ! measured "udp echo" BACK; then :
+elif [[ $BACK -ge 9 && $DA -ge 9 && $DB -ge 9 ]]; then
     pass "udp echo: $BACK/10 came back, crossing both ways (bob's LAN +$DB, alice's LAN +$DA)"
 else
     fail "udp echo: $BACK/10 back, bob's LAN +$DB, alice's LAN +$DA"
@@ -547,9 +594,10 @@ sleep 1
 Q=$(probe mdns-query "$IF_alice" "$V4_alice" 8)
 sleep 4
 echo "alice's query: $Q; bob's responder: $(cat "$WORK/mdns-respond.json"); carol heard: $(cat "$WORK/mdns-carol.json")"
-GOT=$(echo "$Q" | "$PY" -c "import json,sys; print('$V4_bob' in json.load(sys.stdin)['answers'])")
-HEARD=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["heard"])' "$WORK/mdns-carol.json" 2>/dev/null || echo "?")
-if [[ $GOT == True && $HEARD == 0 ]]; then
+GOT=$("$PY" -c 'import json,sys; print(sys.argv[2] in json.loads(sys.argv[1])["answers"])' "$Q" "$V4_bob" 2>/dev/null)
+HEARD=$(fget "$WORK/mdns-carol.json" heard)
+if ! measured mdns GOT HEARD; then :
+elif [[ $GOT == True && $HEARD == 0 ]]; then
     pass "mdns: alice resolved vox-lan-proof.local to bob's $V4_bob; carol heard 0 packets"
 else
     fail "mdns: answer from bob: $GOT; carol heard: $HEARD"
@@ -564,10 +612,11 @@ PIDS+=($!)
 sleep 1
 probe udp-send "$IF_alice" "$V4_alice" "$BCAST" 47020 10 "vox-bcast" >/dev/null
 sleep 5
-BB=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/bcast-bob.json")
-BC=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/bcast-carol.json")
+BB=$(fget "$WORK/bcast-bob.json" got)
+BC=$(fget "$WORK/bcast-carol.json" got)
 echo "bob got $BB/10, carol got $BC/10"
-if [[ $BB -ge 9 && $BC == 0 ]]; then
+if ! measured broadcast BB BC; then :
+elif [[ $BB -ge 9 && $BC == 0 ]]; then
     pass "broadcast: bob got $BB/10, carol 0"
 else
     fail "broadcast: bob $BB/10, carol $BC"
@@ -585,13 +634,14 @@ probe udp-send "$IF_carol" "$V4_carol" "$V4_alice" 47030 10 "vox-carol" >/dev/nu
 probe udp-send "$IF_carol" "$V4_carol" "$V4_bob" 47030 10 "vox-carol" >/dev/null
 probe udp-send "$IF_carol" "$V4_carol" "$BCAST" 47030 10 "vox-carol" >/dev/null
 sleep 4
-CA=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/carol-alice.json")
-CB=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/carol-bob.json")
+CA=$(fget "$WORK/carol-alice.json" got)
+CB=$(fget "$WORK/carol-bob.json" got)
 CL=$(jget "$WORK/carol.json" 'len(d["links"])'); CC=$(counter carol flood_copies); CP=$(counter carol to_peers)
 CO=$(($(counter carol from_os) - CO0))
 echo "alice got $CA/20, bob got $CB/20; carol's LAN: took $CO from carol's kernel, $CL links, $CP unicast sent, $CC flood copies"
 # The attempt must be real: carol's packets entered carol's LAN (CO), and went nowhere.
-if [[ $CO -ge 30 && $CA == 0 && $CB == 0 && $CL == 0 && $CC == 0 && $CP == 0 ]]; then
+if ! measured untrusted CA CB; then :
+elif [[ $CO -ge 30 && $CA == 0 && $CB == 0 && $CL == 0 && $CC == 0 && $CP == 0 ]]; then
     pass "untrusted: carol's LAN took her 30 packets and delivered 0; she has 0 links"
 else
     fail "untrusted: carol's LAN took $CO, alice got $CA, bob $CB, carol links $CL, sent $CP, flood copies $CC"
@@ -611,10 +661,11 @@ probe udp-send "$IF_alice" "$V4_alice" "$V4_bob" 47040 10 "vox-unlisted" >/dev/n
 UNLISTED=$(probe tcp-connect "$IF_alice" "$V4_alice" "$V4_bob" 47041 3)
 LISTED=$(probe tcp-connect "$IF_alice" "$V4_alice" "$V4_bob" 47011 5)
 sleep 5
-WU=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/wl-udp.json")
+WU=$(fget "$WORK/wl-udp.json" got)
 DF=$(($(counter bob filtered) - F0))
 echo "unlisted udp: bob got $WU/10; unlisted tcp: $UNLISTED; listed tcp: $LISTED; bob's LAN filtered +$DF"
-if [[ $WU == 0 && $UNLISTED == *false* && $LISTED == *true* && $DF -ge 11 ]]; then
+if ! measured whitelist WU UNLISTED LISTED; then :
+elif [[ $WU == 0 && $UNLISTED == *false* && $LISTED == *true* && $DF -ge 11 ]]; then
     pass "whitelist: unlisted ports got 0 (bob's LAN filtered $DF), the listed port connected, discovery (3, 4) crossed on unlisted ports"
 else
     fail "whitelist: unlisted udp $WU/10, unlisted tcp $UNLISTED, listed tcp $LISTED, filtered +$DF"
