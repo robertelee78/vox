@@ -135,11 +135,13 @@ optional_proof::not_run!(a_real_model_reads_the_room_through_the_opencode_plugin
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/oc_sandbox.rs"]
+mod oc_sandbox;
+
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
 
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -149,10 +151,7 @@ const IDENTITY: &str = "identity passphrase";
 
 /// Cheap and fast; overridable because pinning a model name in a test is brittle.
 fn model() -> String {
-    std::env::var("VOX_PROOF_OPENCODE_MODEL")
-        // The decider, 2026-10-02: live-model proofs use opencode/kimi-k3 (or `claude -p`,
-        // `codex exec`), never a free model.
-        .unwrap_or_else(|_| "opencode/kimi-k3".to_owned())
+    oc_sandbox::model()
 }
 
 fn which(bin: &str) -> Option<std::path::PathBuf> {
@@ -220,306 +219,20 @@ fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, St
     )
 }
 
-/// Where OpenCode keeps credentials. Copied into the test's own data dir so the run
-/// is isolated from the operator's configuration **and** leaves nothing behind in
-/// it — a proof that pollutes the machine it runs on is a bad neighbour.
-fn auth_json() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share")))?;
-    let p = base.join("opencode/auth.json");
-    p.is_file().then_some(p)
-}
-
-/// **Every OpenCode this proof starts is confined** (macOS `sandbox-exec`): a model's turn may
-/// run a shell, and an unconfined one read the operator's files and sent what it found to the
-/// model's provider. Reads are a whitelist: the system, the OpenCode binary, the `vox` binary,
-/// and `rw` (the run's sandbox root, plus the run's vox profile for the plugin's hook). Writes
-/// go only to `rw`. Nothing under `/Users`, `/opt`, `/private/tmp` or another run's temp
-/// directory is readable, by any path to it.
-fn sandbox_profile(rw: &[&Path], r: &[&Path]) -> String {
-    let q = |p: &Path| format!("{:?}", real(p).display().to_string());
-    let mut s = String::from(
-        "(version 1)\n(allow default)\n\
-         (deny file-read-data file-write* (subpath \"/\"))\n\
-         (allow file-read-metadata)\n\
-         (allow file-read-data (literal \"/\") (subpath \"/System\") (subpath \"/usr\") \
-         (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/Library/Apple\") \
-         (subpath \"/Library/Preferences\") (subpath \"/private/etc\") \
-         (subpath \"/private/var/db/timezone\") (subpath \"/private/var/db/dyld\"))\n\
-         (deny file-read-data (subpath \"/System/Volumes/Data\"))\n\
-         (allow file-read-data file-write* (subpath \"/dev\"))\n",
-    );
-    for p in r {
-        s += &format!("(allow file-read-data (subpath {}))\n", q(p));
-    }
-    for p in rw {
-        s += &format!("(allow file-read-data file-write* (subpath {}))\n", q(p));
-    }
-    s
-}
-
-/// `p` with every symlink resolved: the sandbox matches real paths (`/tmp` is
-/// `/private/tmp`).
-fn real(p: &Path) -> std::path::PathBuf {
-    std::fs::canonicalize(p)
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot resolve {p:?} for the sandbox: {e}"))
-}
-
-/// The OpenCode binary, resolved, and the directory that holds it (all the sandbox lets the
-/// model's shell read of the operator's OpenCode install).
-fn opencode_bin() -> std::path::PathBuf {
-    real(&which("opencode").unwrap_or_else(|| panic!("APPARATUS: opencode is not on PATH")))
-}
-
-/// **What a run leaves outside itself is removed however it ends**: the canary in the real HOME
-/// and the sandbox's credential copy. A panic unwinds into their `Drop`s; an abort (the
-/// watchdog's), SIGTERM, SIGINT or SIGHUP runs no destructor, so a handler unlinks them, using
-/// only async-signal-safe calls, and re-raises the signal; a SIGKILL is swept at the next run's
-/// start (`sweep`).
-mod leftovers {
-    use std::ffi::{c_char, c_int, CString};
-    use std::sync::atomic::{AtomicPtr, Ordering};
-
-    extern "C" {
-        fn signal(sig: c_int, handler: usize) -> usize;
-        fn raise(sig: c_int) -> c_int;
-        fn unlink(path: *const c_char) -> c_int;
-        fn kill(pid: c_int, sig: c_int) -> c_int;
-    }
-
-    const SIGHUP: c_int = 1;
-    const SIGINT: c_int = 2;
-    const SIGABRT: c_int = 6;
-    const SIGTERM: c_int = 15;
-    const SIG_DFL: usize = 0;
-
-    static SLOTS: [AtomicPtr<c_char>; 2] = [
-        AtomicPtr::new(std::ptr::null_mut()),
-        AtomicPtr::new(std::ptr::null_mut()),
-    ];
-
-    extern "C" fn on_fatal(sig: c_int) {
-        for slot in &SLOTS {
-            let p = slot.swap(std::ptr::null_mut(), Ordering::SeqCst);
-            if !p.is_null() {
-                // SAFETY: `p` came from `CString::into_raw` and is never freed while in a slot.
-                unsafe {
-                    unlink(p);
-                }
-            }
-        }
-        // SAFETY: restoring the default action and re-raising ends the process as the signal
-        // would have, crash report included for an abort.
-        unsafe {
-            signal(sig, SIG_DFL);
-            raise(sig);
-        }
-    }
-
-    /// Remove `path` on a fatal signal, until [`forget`] (slot 0: the canary, 1: the copy).
-    pub fn guard(slot: usize, path: &std::path::Path) {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            for sig in [SIGABRT, SIGTERM, SIGINT, SIGHUP] {
-                // SAFETY: `on_fatal` is an `extern "C" fn(c_int)` that never unwinds.
-                unsafe {
-                    signal(sig, on_fatal as extern "C" fn(c_int) as usize);
-                }
-            }
-        });
-        let c = CString::new(path.as_os_str().as_encoded_bytes())
-            .unwrap_or_else(|_| panic!("APPARATUS: a path to guard holds a NUL byte"));
-        let old = SLOTS[slot].swap(c.into_raw(), Ordering::SeqCst);
-        if !old.is_null() {
-            // SAFETY: from `into_raw` above, and no longer in a slot.
-            drop(unsafe { CString::from_raw(old) });
-        }
-    }
-
-    /// The file `guard`ed in `slot` is gone by other means; stop guarding it.
-    pub fn forget(slot: usize) {
-        let old = SLOTS[slot].swap(std::ptr::null_mut(), Ordering::SeqCst);
-        if !old.is_null() {
-            // SAFETY: from `into_raw` in `guard`, and no longer in a slot.
-            drop(unsafe { CString::from_raw(old) });
-        }
-    }
-
-    /// Whether process `pid` is alive (signal 0 probes without signalling).
-    pub fn alive(pid: u32) -> bool {
-        // SAFETY: signal 0 delivers nothing.
-        c_int::try_from(pid).is_ok_and(|p| unsafe { kill(p, 0) } == 0)
-    }
-
-    /// Remove what an earlier run of this proof that was killed (SIGKILL, which no handler
-    /// sees) left behind: its canary in the real HOME and its temp directory with the credential
-    /// copy, each marked with the pid of a process that no longer runs.
-    pub fn sweep(home: &std::path::Path) {
-        let dead = |name: &str, prefix: &str| {
-            name.strip_prefix(prefix)
-                .and_then(|r| r.split('-').next())
-                .and_then(|p| p.parse::<u32>().ok())
-                .is_some_and(|p| !alive(p))
-        };
-        for e in std::fs::read_dir(home).into_iter().flatten().flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if dead(&name, ".vox-proof-canary-") {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-        for e in std::fs::read_dir(std::env::temp_dir())
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let owner = e.path().join("sb/owner");
-            let Ok(pid) = std::fs::read_to_string(&owner) else {
-                continue;
-            };
-            if dead(&format!("x{}", pid.trim()), "x") {
-                // That run's whole temp directory: its credential copy, its vox profile.
-                let _ = std::fs::remove_dir_all(e.path());
-            }
-        }
-    }
-}
-
-/// A file in the operator's real HOME that no model may ever see: the proof that the sandbox
-/// holds. Removed however the test ends (see `leftovers`).
-struct Canary {
-    path: std::path::PathBuf,
-    text: String,
-}
-
-impl Canary {
-    fn plant() -> Self {
-        let home = std::env::var_os("HOME")
-            .unwrap_or_else(|| panic!("APPARATUS: HOME is unset, so no canary can be planted"));
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_else(|e| panic!("APPARATUS: the clock is before 1970: {e}"))
-            .as_nanos();
-        leftovers::sweep(Path::new(&home));
-        let path =
-            Path::new(&home).join(format!(".vox-proof-canary-{}-{nonce}", std::process::id()));
-        let text = format!("VOXCANARY-{nonce:x}");
-        leftovers::guard(0, &path);
-        std::fs::write(&path, &text)
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot plant the canary in the real HOME: {e}"));
-        Self { path, text }
-    }
-
-    /// Its file name only: no red, and nothing sent to a model, names a real path.
-    fn name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    }
-
-    /// Stop if `said`, anything a sandboxed process printed, holds the canary.
-    fn check(&self, said: &str, what: &str) {
-        assert!(
-            !said.contains(&self.text),
-            "APPARATUS: the sandbox leaked: canary {} was readable by {what}. Stop every \
-             live-model run until it is fixed.",
-            self.name()
-        );
-    }
-}
-
-/// The sandbox's copy of **only** OpenCode's own provider credential, not the operator's
-/// other providers': the least a turn needs, and the most a confined shell could leak, to that
-/// same provider. Removed however the test ends.
-struct Credential(std::path::PathBuf);
-
-impl Credential {
-    fn copy(from: &Path, home: &Path) -> Self {
-        let all: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(from)
-                .unwrap_or_else(|e| panic!("APPARATUS: cannot read OpenCode's credentials: {e}")),
-        )
-        .unwrap_or_else(|e| panic!("APPARATUS: OpenCode's credentials are not JSON: {e}"));
-        let own = all.get("opencode").unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: OpenCode holds no credential of its own provider (`opencode`)")
-        });
-        let dir = home.join(".local/share/opencode");
-        std::fs::create_dir_all(&dir)
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot make the sandbox's {dir:?}: {e}"));
-        let path = dir.join("auth.json");
-        leftovers::guard(1, &path);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox's credential: {e}"));
-        f.write_all(
-            serde_json::json!({ "opencode": own })
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox's credential: {e}"));
-        Self(path)
-    }
-}
-
-impl Drop for Credential {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        leftovers::forget(1);
-    }
-}
-
-impl Drop for Canary {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-        leftovers::forget(0);
-    }
-}
-
-/// The PATH every sandboxed OpenCode runs with: the system's alone, never the operator's.
-const SANDBOX_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
-
-/// One OpenCode sandbox: its profile file and the throwaway HOME its turns run with.
-struct Sandbox<'a> {
-    profile: std::path::PathBuf,
-    home: std::path::PathBuf,
-    canary: &'a Canary,
-}
-
-/// Run one `opencode` turn, confined by `sb`, and return its stdout.
+/// Run one `opencode` turn, confined by `sb` under `profile`, and return its stdout.
 fn opencode_turn(
     project: &Path,
     env: &[(&str, &std::ffi::OsStr)],
     pure: bool,
     prompt: &str,
-    sb: &Sandbox<'_>,
+    sb: &oc_sandbox::OcSandbox,
+    profile: &Path,
 ) -> String {
-    let mut cmd = Command::new("/usr/bin/sandbox-exec");
-    cmd.arg("-f").arg(&sb.profile).arg(opencode_bin());
-    // **A cleared environment, not an inherited one.** Run from a shell the plugin
-    // works; run from `cargo test` with the same directory and arguments it loads
-    // and its `chat.message` hook never fires. Something cargo puts in the
-    // environment disables plugin hooks, so the proof passes only what OpenCode
-    // actually needs. This also makes the run reproducible: whatever the operator
-    // happens to export cannot decide whether this passes.
-    cmd.env_clear();
-    // **A fixed, minimal environment**: the operator's PATH names their home and other agents'
-    // scratch directories, and USER names them, and a model that ran `env` would send both to
-    // its provider. OpenCode is started by its absolute path, so nothing needs the real PATH.
-    cmd.env("PATH", SANDBOX_PATH).env("SHELL", "/bin/zsh");
-    if let Some(v) = std::env::var_os("LANG") {
-        cmd.env("LANG", v);
-    }
-    // The sandbox's own HOME, so nothing OpenCode keeps (sessions, caches, state) is the
-    // operator's, and nothing a turn writes outlives the run.
-    cmd.env("HOME", &sb.home)
-        .env("XDG_DATA_HOME", sb.home.join(".local/share"))
-        .env("XDG_CACHE_HOME", sb.home.join(".cache"))
-        .env("XDG_STATE_HOME", sb.home.join(".local/state"));
-    cmd.current_dir(project).arg("run");
+    let mut cmd = sb.opencode(profile, &[], project);
+    // **A cleared environment, not an inherited one** (`OcSandbox::opencode`): run from a shell
+    // the plugin works; run from `cargo test` with the same directory and arguments it loads and
+    // its `chat.message` hook never fires.
+    cmd.arg("run");
     if pure {
         cmd.arg("--pure");
     }
@@ -538,74 +251,17 @@ fn opencode_turn(
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    sb.canary.check(&said, "an `opencode run` turn");
+    sb.check(&said, "an `opencode run` turn");
     // **A model that would not answer measures nothing.** A provider refusing the turn (no
     // funds, a rate limit, a bad key, an overloaded or unknown model) leaves no answer to judge,
     // so every verdict after it would read as the plugin's. Say so, with the provider's words.
-    if let Some(line) = provider_failure(&said) {
+    if let Some(line) = oc_sandbox::provider_failure(&said) {
         panic!(
             "CANNOT MEASURE: the model provider refused the turn ({}): {line}",
             model()
         );
     }
     said
-}
-
-/// The line in an `opencode run`'s output where the model provider refused the turn, if any,
-/// without the terminal's colour codes. Only opencode's own error lines count (`Error: …`, or
-/// the `"name": "…Error"` of an error it prints as JSON): `vox agent hook`'s stderr shares the
-/// stream, and a refusal by `vox` must stay the product's.
-fn provider_failure(said: &str) -> Option<String> {
-    const SIGNS: &[&str] = &[
-        "upstream request failed",
-        "insufficient account funds",
-        "insufficient_quota",
-        "apicallerror",
-        "rate limit",
-        "rate_limit",
-        "overloaded",
-        "unauthorized",
-        "invalid api key",
-        "providermodelnotfound",
-        "unknownerror",
-    ];
-    let plain = |l: &str| {
-        let mut plain = String::new();
-        let mut chars = l.chars();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                // An escape sequence runs to its final letter.
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                plain.push(c);
-            }
-        }
-        plain.trim().to_owned()
-    };
-    let lines: Vec<String> = said.lines().map(plain).collect();
-    let opencodes = |l: &str| l.starts_with("Error:") || l.starts_with("\"name\": \"");
-    lines
-        .iter()
-        .position(|l| {
-            let low = l.to_ascii_lowercase();
-            opencodes(l) && SIGNS.iter().any(|s| low.contains(s))
-        })
-        .map(|i| {
-            if lines[i].starts_with("Error:") {
-                return lines[i].clone();
-            }
-            // A JSON error names its kind on one line and its message on a later one.
-            lines[i..]
-                .iter()
-                .take(4)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -615,14 +271,16 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     // Five or six real model turns, one of them a 45 s tool, plus the pty driver's own bound.
     watchdog::arm_for(Duration::from_secs(900));
 
+    if !oc_sandbox::live_model_allowed(
+        "opencode_plugin_proof::a_real_model_reads_the_room_through_the_opencode_plugin",
+    ) {
+        return;
+    }
     assert!(
         which("opencode").is_some(),
         "CANNOT MEASURE: opencode is not installed, so nothing here can be tested against a real \
          harness"
     );
-    let Some(auth) = auth_json() else {
-        panic!("CANNOT MEASURE: no opencode auth.json, so no model can run; authenticate opencode");
-    };
 
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
@@ -719,77 +377,15 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     //    project directory is a fresh temp dir, any session written to the real data
     //    dir is tied to a path that ceases to exist, and nothing of the operator's
     //    is touched.
-    // ---- the sandbox every OpenCode here runs in ----
+    // ---- the sandbox every OpenCode here runs in (support/oc_sandbox.rs) ----
     // Its root holds everything an OpenCode of this run may touch: the fixture, its TMPDIR,
     // the plugin's log, a throwaway HOME. The run's vox profile stays outside it, readable
-    // only by the plugin-fed turns, whose hook needs it.
-    let sb_root = tmp.path().join("sb");
-    for d in [
-        sb_root.join("home/.local/share"),
-        sb_root.join("home/.cache"),
-    ] {
-        std::fs::create_dir_all(&d)
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot make the sandbox's {d:?}: {e}"));
-    }
-    // Whose sandbox this is, for the next run's sweep should this one be SIGKILLed.
-    std::fs::write(sb_root.join("owner"), std::process::id().to_string())
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot mark the sandbox's owner: {e}"));
-    let canary = Canary::plant();
-    let oc_bin_dir = opencode_bin()
-        .parent()
-        .unwrap_or_else(|| panic!("APPARATUS: opencode's binary has no directory"))
-        .to_path_buf();
-    let fed_profile = tmp.path().join("fed.sb");
-    let pure_profile = tmp.path().join("pure.sb");
-    for (path, profile) in [
-        (
-            &fed_profile,
-            sandbox_profile(&[&sb_root, &data, &cfg], &[&oc_bin_dir, Path::new(VOX)]),
-        ),
-        (&pure_profile, sandbox_profile(&[&sb_root], &[&oc_bin_dir])),
-    ] {
-        std::fs::write(path, profile)
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox profile: {e}"));
-    }
-    let fed = Sandbox {
-        profile: fed_profile.clone(),
-        home: real(&sb_root.join("home")),
-        canary: &canary,
-    };
-    let pure_sb = Sandbox {
-        profile: pure_profile,
-        home: real(&sb_root.join("home")),
-        canary: &canary,
-    };
-    // **The sandbox holds before any model runs.** A shell in the most open of the two
-    // profiles tries to read the canary in the real HOME, by both of its paths, and to find
-    // it; then it lists the operator's HOME. Any of it succeeding stops the run here.
-    let probe = Command::new("/usr/bin/sandbox-exec")
-        .arg("-f")
-        .arg(&fed.profile)
-        .args(["/bin/sh", "-c"])
-        .arg(format!(
-            "cat {p:?} /System/Volumes/Data{p:?}; find / -name {n:?} 2>/dev/null; ls -a {h:?}",
-            p = canary.path.display().to_string(),
-            n = canary.name(),
-            h = std::env::var("HOME").unwrap_or_default(),
-        ))
-        .output()
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot run the sandbox probe: {e}"));
-    let probed = format!(
-        "{}{}",
-        String::from_utf8_lossy(&probe.stdout),
-        String::from_utf8_lossy(&probe.stderr)
-    );
-    canary.check(&probed, "a sandboxed shell");
-    // The probe's output holds the real HOME's path and listing, so the red names the
-    // canary alone.
-    assert!(
-        !String::from_utf8_lossy(&probe.stdout).contains(&canary.name()),
-        "APPARATUS: the sandbox leaked: canary {} was listed or found by a sandboxed shell",
-        canary.name()
-    );
-    println!("[proof] sandbox probe: the canary in the real HOME is unreadable and unfound");
+    // only by the plugin-fed turns, whose hook needs it. Each profile is probed against the
+    // canary before any model runs under it.
+    let sb = oc_sandbox::OcSandbox::new(tmp.path());
+    let sb_root = sb.root.clone();
+    let fed_profile = sb.profile("fed", &[&data, &cfg], &[Path::new(VOX)]);
+    let pure_profile = sb.profile("pure", &[], &[]);
 
     let plugin_log = sb_root.join("plugin.log");
     // **This run's own fixture**, so two runs at once never share a project. OpenCode
@@ -817,9 +413,6 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         .to_string(),
     )
     .unwrap_or_else(|e| panic!("APPARATUS: cannot write the fixture's opencode.json: {e}"));
-    // The sandbox cannot read the operator's credentials; it gets a copy of OpenCode's own
-    // provider's alone (see `Credential`).
-    let _credential = Credential::copy(&auth, &fed.home);
 
     // Every OpenCode here runs with this run's own `TMPDIR`, where its plugin makes its wake
     // directory: (9) counts exactly this run's. Short, because a Unix socket's path is.
@@ -863,7 +456,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     // The prompt names a link in the project, never the real path: what a model is sent goes
     // to its provider. (`cat` follows the link; the sandbox refuses the canary's real path.)
     let link = project.join("canary.txt");
-    std::os::unix::fs::symlink(&canary.path, &link)
+    std::os::unix::fs::symlink(&sb.canary.path, &link)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot link the canary into the project: {e}"));
     let told = opencode_turn(
         &project,
@@ -871,7 +464,8 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         true,
         "Use your shell to run `cat canary.txt` in the current directory, and print exactly \
          what it printed.",
-        &fed,
+        &sb,
+        &fed_profile,
     );
     let _ = std::fs::remove_file(&link);
     println!(
@@ -899,7 +493,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         ("VOX_DATA_DIR", bare_data.as_os_str()),
         ("VOX_CONFIG_DIR", bare_cfg.as_os_str()),
     ];
-    let without = opencode_turn(&project, &control_env, true, prompt, &pure_sb);
+    let without = opencode_turn(&project, &control_env, true, prompt, &sb, &pure_profile);
     println!(
         "[proof] with --pure, the model's answer contains the codeword: {}",
         without.contains(&codeword)
@@ -928,7 +522,14 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     std::fs::write(project.join(".opencode/plugin/vox.js"), plugin)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot install the plugin in the fixture: {e}"));
     for attempt in 0..3 {
-        let _ = opencode_turn(&project, &env, false, "Reply with exactly: READY", &fed);
+        let _ = opencode_turn(
+            &project,
+            &env,
+            false,
+            "Reply with exactly: READY",
+            &sb,
+            &fed_profile,
+        );
         if std::fs::read_to_string(&plugin_log)
             .map(|l| l.contains("chat.message"))
             .unwrap_or(false)
@@ -956,7 +557,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     let _ = std::fs::write(&plugin_log, "");
 
     // ---- the proof: a real model repeats something only the room told it ----
-    let answer = opencode_turn(&project, &env, false, prompt, &fed);
+    let answer = opencode_turn(&project, &env, false, prompt, &sb, &fed_profile);
     println!(
         "[proof] with the plugin, the model's answer contains the codeword: {}",
         answer.contains(&codeword)
@@ -1020,13 +621,13 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             path_arg(&oc_cfg),
             path_arg(&plugin_log),
             path_arg(&oc_tmp),
-            path_arg(&fed.profile),
-            path_arg(&fed.home),
+            path_arg(&fed_profile),
+            path_arg(&sb.home),
             "wake",
         ],
     );
     let said = out.stdout.clone();
-    canary.check(&said, "the hand-opened sessions' driver");
+    sb.check(&said, "the hand-opened sessions' driver");
     eprintln!(
         "{said}\n[proof] the driver took {:?}; its last stage: {:?}{}",
         out.took,

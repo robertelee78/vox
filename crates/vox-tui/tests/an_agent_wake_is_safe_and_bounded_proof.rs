@@ -50,8 +50,8 @@
 //!    wake, and it drains that answer on its next turn. A raw urgent envelope with no `re`, from
 //!    a session with an unanswered wake, is refused with words that say to use `--re`; and once
 //!    two of its wakes are unanswered, so is a structured urgent post with no `--re`, naming both.
-//! 6. **Live — not run until a sandbox lands** (safety stop, 2026-10-02): only a build with the
-//!    `live-model-sandbox` feature runs it; any other prints `OPTIONAL PROOF NOT RUN`. A real
+//! 6. **Live — stopped until its `opencode serve` runs in the live-model sandbox** (safety stop,
+//!    2026-10-02; support/oc_sandbox.rs): every build prints `OPTIONAL PROOF NOT RUN`. A real
 //!    OpenCode session, registered with bob's daemon by Vox's own plugin's
 //!    drain (the plugin `vox agent plugin opencode` prints, installed in the project), receives
 //!    the urgent message as a prompt through that plugin, and what its model was shown (read
@@ -991,15 +991,17 @@ fn live(
     failures: &mut Vec<String>,
     daemon_err: &dyn Fn() -> String,
 ) {
-    // **Not run until a sandbox lands** (safety stop, 2026-10-02). A live-model turn runs the
-    // harness's own shell unsandboxed, and a free model sent the contents of ~/.claude, ~/.codex
-    // and ~/.config to its provider. Only a build with `live-model-sandbox` may run this, and that
-    // feature is to be turned on only once the turn runs in a sandbox.
-    if !cfg!(feature = "live-model-sandbox") {
+    // **Not run until it is sandboxed** (safety stop, 2026-10-02). A live-model turn runs the
+    // harness's own shell, and an unsandboxed free model sent the contents of ~/.claude, ~/.codex
+    // and ~/.config to its provider.
+    // **Stopped, whatever the features** (2026-10-02): `live-model-sandbox` now starts the
+    // live-model proofs whose turns run in support/oc_sandbox.rs; this case's `opencode serve`
+    // does not yet, so it must not run on that switch.
+    const CASE6_SANDBOXED: bool = false;
+    if !CASE6_SANDBOXED {
         println!(
-            "OPTIONAL PROOF NOT RUN: (6) the live model turn needs --features \
-             vox-tui/live-model-sandbox, which is stopped until live-model turns run in a \
-             sandbox; it blocks nothing"
+            "OPTIONAL PROOF NOT RUN: (6) the live model turn is stopped until its `opencode \
+             serve` runs in the live-model sandbox (support/oc_sandbox.rs); it blocks nothing"
         );
         let _ = (bob, alice, r, failures, daemon_err);
         return;

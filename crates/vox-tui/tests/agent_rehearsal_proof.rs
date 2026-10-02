@@ -77,19 +77,19 @@
 mod optional_proof;
 optional_proof::not_run!(two_agent_sessions_and_an_operator_share_one_room);
 
+#[path = "support/oc_sandbox.rs"]
+mod oc_sandbox;
 #[path = "support/room.rs"]
 mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
 use std::path::Path;
-use std::process::Command;
 
 use support::{until, Worker, VOX};
 
 fn model() -> String {
-    std::env::var("VOX_PROOF_OPENCODE_MODEL")
-        .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
+    oc_sandbox::model()
 }
 
 fn which(bin: &str) -> Option<std::path::PathBuf> {
@@ -97,13 +97,6 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&path)
         .map(|d| d.join(bin))
         .find(|p| p.is_file())
-}
-
-fn auth_present() -> bool {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share")))
-        .is_some_and(|b| b.join("opencode/auth.json").is_file())
 }
 
 /// Install this agent's OpenCode plugin the way a person does — `vox agent plugin opencode >
@@ -122,30 +115,34 @@ fn install_plugin(w: &Worker, fixture: &Path) -> std::path::PathBuf {
 }
 
 /// One real model turn for this agent, with its room wired in.
-fn turn(w: &Worker, project: &Path, oc_cfg: &Path, room: &str, prompt: &str) -> String {
-    turn_split(w, project, oc_cfg, room, prompt).1
+fn turn(
+    sb: &oc_sandbox::OcSandbox,
+    profile: &Path,
+    w: &Worker,
+    project: &Path,
+    oc_cfg: &Path,
+    room: &str,
+    prompt: &str,
+) -> String {
+    turn_split(sb, profile, w, project, oc_cfg, room, prompt).1
 }
 
 /// As [`turn`], also returning the model's stdout alone (the answer, without OpenCode's
 /// stderr), for a check that must not be satisfied by a log line.
 fn turn_split(
+    sb: &oc_sandbox::OcSandbox,
+    profile: &Path,
     w: &Worker,
     project: &Path,
     oc_cfg: &Path,
     room: &str,
     prompt: &str,
 ) -> (String, String) {
-    let mut cmd = Command::new("opencode");
-    // A spawned OpenCode that inherits cargo's environment loads the plugin and never
-    // fires its message hook. Measured; see `opencode_plugin_proof`.
-    cmd.env_clear();
-    for key in ["PATH", "HOME", "SHELL", "LANG", "TMPDIR", "USER"] {
-        if let Some(v) = std::env::var_os(key) {
-            cmd.env(key, v);
-        }
-    }
+    // Confined, with a fixed environment (`OcSandbox::opencode`, support/oc_sandbox.rs): a
+    // spawned OpenCode that inherits cargo's environment never fires its message hook, and the
+    // operator's would name their files to the model.
+    let mut cmd = sb.opencode(profile, &[], project);
     let out = cmd
-        .current_dir(project)
         .args(["run", "-m", &model(), prompt])
         .env("XDG_CONFIG_HOME", oc_cfg)
         .env("VOX_DATA_DIR", &w.data)
@@ -153,12 +150,13 @@ fn turn_split(
         .env("VOX_ROOM", room)
         .env("VOX_BIN", VOX)
         .output()
-        .expect("run opencode");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run opencode in its sandbox: {e}"));
     let said = format!(
         "{}\n--- stderr ---\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    sb.check(&said, "an `opencode run` turn");
     eprintln!("[turn {}] {prompt:?} -> {said}", w.name);
     (String::from_utf8_lossy(&out.stdout).into_owned(), said)
 }
@@ -177,18 +175,15 @@ fn nonce(tag: &str) -> String {
 #[ignore = "an anchor, two vox daemons, live model turns; optional, run it in release"]
 fn two_agent_sessions_and_an_operator_share_one_room() {
     watchdog::arm();
+    if !oc_sandbox::live_model_allowed(
+        "agent_rehearsal_proof::two_agent_sessions_and_an_operator_share_one_room",
+    ) {
+        return;
+    }
     assert!(
-        which("opencode").is_some() && auth_present(),
-        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH and a usable credential \
-         (~/.local/share/opencode/auth.json)"
+        which("opencode").is_some(),
+        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH"
     );
-
-    // A persistent fixture: OpenCode installs a `node_modules` tree into both the
-    // project and the config directory on first use, and until it has, the plugin
-    // loads while its hook never fires.
-    let fixture = std::env::temp_dir().join("vox-agent-rehearsal");
-    let oc_cfg = fixture.join("config");
-    std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -198,13 +193,37 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
     let room = r.id.clone();
+    // **Every model turn runs confined** (support/oc_sandbox.rs): a throwaway HOME, a fixed
+    // environment, a whitelist of readable paths, a canary in the real HOME it must never
+    // see. The plugins' hooks need the two agents' vox profiles; nothing else outside the
+    // sandbox is readable. A missing credential is CANNOT MEASURE there.
+    let sb = oc_sandbox::OcSandbox::new(tmp.path());
+    let profile = sb.profile(
+        "rehearsal",
+        &[&alice.data, &alice.cfg, &bob.data, &bob.cfg],
+        &[Path::new(VOX)],
+    );
+    // **This run's own fixture, inside its sandbox**: OpenCode installs a `node_modules` tree
+    // into the project and the config directory on first use (the warm-up turns below).
+    let fixture = sb.root.join("fixture");
+    let oc_cfg = fixture.join("config");
+    std::fs::create_dir_all(oc_cfg.join("opencode"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make the fixture: {e}"));
     let a_proj = install_plugin(alice, &fixture);
     let b_proj = install_plugin(bob, &fixture);
 
     // Warm both projects: the first turn in a fresh directory installs and does not
     // fire the hook. This also consumes the harness's readiness posts from each cursor.
     for (who, proj) in [(alice, &a_proj), (bob, &b_proj)] {
-        let _ = turn(who, proj, &oc_cfg, &room, "Reply with exactly: READY");
+        let _ = turn(
+            &sb,
+            &profile,
+            who,
+            proj,
+            &oc_cfg,
+            &room,
+            "Reply with exactly: READY",
+        );
     }
 
     // ---- the operator speaks, as a person, in plain prose ----
@@ -221,6 +240,8 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
 
     // ---- (1) alice's model reads work it was never prompted with ----
     let answer = turn(
+        &sb,
+        &profile,
         alice,
         &a_proj,
         &oc_cfg,
@@ -248,6 +269,8 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
 
     // ---- (2) bob's model reads what alice wrote, from its own session ----
     let seen = turn(
+        &sb,
+        &profile,
         bob,
         &b_proj,
         &oc_cfg,
@@ -277,6 +300,8 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
         |o| o.stdout.contains(&ask),
     );
     let (answer4, heard) = turn_split(
+        &sb,
+        &profile,
         alice,
         &a_proj,
         &oc_cfg,
