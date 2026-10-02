@@ -112,7 +112,3 @@ name = "a_room_of_many_members_syncs_without_holding_its_lock_proof"
 path = "tests/a_room_of_many_members_syncs_without_holding_its_lock_proof.rs"
 required-features = ["heavy-proofs"]
 
-[[test]]
-name = "a_long_room_reads_in_linear_time_proof"
-path = "tests/a_long_room_reads_in_linear_time_proof.rs"
-required-features = ["heavy-proofs"]

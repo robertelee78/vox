@@ -9,9 +9,9 @@ then sends <posts> short messages from it one after another without waiting, tim
 moment they are written to the pty until the timeline pane shows every one as the sender's own.
 Prints `<tag> SENTALL <ms>`. The verdict on the time is the Rust proof's.
 
-Exit 0 = every message measured, 2 = apparatus (CANNOT MEASURE): pyte missing, the TUI never
-unlocked or never showed the room. A message that never appears within 30 s is exit 1, the
-product's RED. Every process is killed by PID; bounded throughout (`vox_pty.py`, V210-54).
+Exit 0 = every message measured, 2 = apparatus (CANNOT MEASURE): pyte missing, or the driver's
+own budget. A TUI that never lists or opens the room after the unlock is exit 1, `PRODUCT
+(staging)`, and so is a message that never appears: both are the product's. Every process is killed by PID; bounded throughout (`vox_pty.py`, V210-54).
 """
 import os, sys, time
 
@@ -32,6 +32,10 @@ env.update(VOX_DATA_DIR=DATA, VOX_CONFIG_DIR=CFG, TERM="xterm-256color")
 def apparatus(why):
     print(f"{TAG} APPARATUS: {why}"); sys.exit(2)
 
+def staging(why):
+    """A step the product performs while the proof is set up, not done: the product's red."""
+    print(f"{TAG} RED: PRODUCT (staging): {why}"); sys.exit(1)
+
 tui = None
 code = 2
 try:
@@ -40,14 +44,14 @@ try:
     tui.pump(4)
     tui.key(f"{IDPASS}\r", 4)
     if not tui.until(lambda: ROOM in tui.text(), 120, 1):
-        apparatus(f"the TUI never listed the room {ROOM!r} after the unlock:\n{tui.text()}")
+        staging(f"`vox tui` never listed the room {ROOM!r} after the unlock:\n{tui.text()}")
     stage("tui: open the room")
     tui.key("\r", 2)
     # A room that was not reopened by itself asks for its passphrase.
     if "assphrase" in tui.text():
         tui.key(f"{ROOMPASS}\r", 4)
     if not tui.until(lambda: "Timeline" in tui.text(), 120, 1):
-        apparatus(f"the TUI never showed the room's timeline:\n{tui.text()}")
+        staging(f"`vox tui` never showed the room's timeline:\n{tui.text()}")
     tui.key("\t", 1)   # timeline -> composer
     # Settle first: opening a room re-verifies its whole log and the node then catches up on what
     # it held, a one-off cost of opening, not of each message.

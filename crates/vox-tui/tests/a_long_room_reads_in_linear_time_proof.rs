@@ -58,7 +58,15 @@
 //! (and rebuild every room's timeline on each publish), as before V210-71: the read takes many
 //! times longer, past the bound.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_long_room_is_read_in_time_proportional_to_its_length);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -329,6 +337,7 @@ fn spread(took: &[Duration]) -> (Duration, Duration, Duration) {
     (at(0.5), at(0.95), t[t.len() - 1])
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "opt-in (heavy-proofs): a real daemon and thousands of 16 KiB posts; run in release"]
 fn a_long_room_is_read_in_time_proportional_to_its_length() {
@@ -488,14 +497,16 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         .map(|ms| Duration::from_secs_f64(ms / 1000.0));
     match out.code {
         Some(0) if out.stdout.contains("tuilong PASS") => {}
-        Some(2) => panic!(
-            "APPARATUS (precondition not met): the TUI driver: {}",
-            out.stdout
-        ),
+        Some(2) => panic!("APPARATUS (harness): the TUI driver: {}", out.stdout),
         _ if !out.has_verdict("tuilong") => panic!(
             "APPARATUS (watchdog): the TUI driver was stopped before a verdict, at stage {:?} \
              (exit {:?}): {}",
             out.stage, out.code, out.stdout
+        ),
+        _ if out.stdout.contains("PRODUCT (staging)") => panic!(
+            "PRODUCT (staging): `vox tui`, opened on the profile of {POSTS} messages, did not list \
+             or open its room after the unlock (exit {:?}, last stage {:?}): {}",
+            out.code, out.stage, out.stdout
         ),
         _ => panic!(
             "PRODUCT: the TUI did not show a message sent from its composer in the room of \
@@ -523,7 +534,7 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     while !vox(&data, &["room", "list"], "").0 {
         assert!(
             Instant::now() < deadline,
-            "APPARATUS (precondition not met): the daemon never answered after the TUI"
+            "PRODUCT (staging): `vox daemon`, started again after the TUI, never answered `vox room list`"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
