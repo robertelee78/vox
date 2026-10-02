@@ -37,7 +37,10 @@ fn drain(w: &Worker, r: &str, session: &str) {
             session,
         ],
     );
-    assert!(o.ok, "{o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT: `vox agent hook` (the drain) failed for {session}: {o:?}"
+    );
 }
 
 fn post(w: &Worker, session: &str, r: &str, args: &[&str], body: &str) -> Out {
@@ -45,8 +48,14 @@ fn post(w: &Worker, session: &str, r: &str, args: &[&str], body: &str) -> Out {
     a.extend_from_slice(args);
     a.push("-");
     let o = w.vox_in(Some(session), &a, Some(body));
-    assert!(o.ok, "{session} must be able to post: {o:?}");
+    assert!(o.ok, "PRODUCT: `vox room post` failed for {session}: {o:?}");
     o
+}
+
+/// The `--json` object a post printed: a post that printed anything else is the product's red.
+fn json(o: &Out) -> serde_json::Value {
+    serde_json::from_str(o.stdout.trim())
+        .unwrap_or_else(|e| panic!("PRODUCT: `--json` printed no single JSON object ({e}): {o:?}"))
 }
 
 fn result(w: &Worker, r: &str) -> Out {
@@ -75,8 +84,8 @@ fn a_result_names_the_addressed_messages_its_session_has_not_read() {
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: build the test's runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: create a tempdir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
@@ -117,36 +126,41 @@ fn a_result_names_the_addressed_messages_its_session_has_not_read() {
     );
     assert!(
         !note.stderr.contains("unread"),
-        "only a result warns: {note:?}"
+        "PRODUCT: a status post warned about unread messages; only a result warns: {note:?}"
     );
 
     // ---- (1) and (2) the result posts, and names exactly the addressed message ----
     let o = result(alice, r);
-    let unread = o.json()["unread_addressed"]
+    let unread = json(&o)["unread_addressed"]
         .as_array()
         .cloned()
-        .unwrap_or_else(|| panic!("a result must report unread_addressed: {o:?}"));
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: the result's --json has no unread_addressed list: {o:?}")
+        });
     let bodies: Vec<&str> = unread.iter().filter_map(|x| x["body"].as_str()).collect();
     assert_eq!(
         bodies,
         ["stop: use the v2 schema"],
-        "exactly the message addressed to s1 must be named — not the broadcast, not the \
+        "PRODUCT: exactly the message addressed to s1 must be named — not the broadcast, not the \
          one to s9: {o:?}"
     );
     assert!(
         o.stderr.contains("unread") && o.stderr.contains("stop: use the v2 schema"),
-        "the caller must be told on stderr too: {o:?}"
+        "PRODUCT: the result did not name the unread message on stderr: {o:?}"
     );
 
     // ---- (3) after the drain delivers it, nothing to warn about ----
     drain(alice, r, "s1");
     let o = result(alice, r);
     assert_eq!(
-        o.json()["unread_addressed"],
+        json(&o)["unread_addressed"],
         serde_json::json!([]),
-        "a delivered message is not unread: {o:?}"
+        "PRODUCT: a result after the drain still named a delivered message as unread: {o:?}"
     );
-    assert!(!o.stderr.contains("unread"), "{o:?}");
+    assert!(
+        !o.stderr.contains("unread"),
+        "PRODUCT: a result after the drain still warned on stderr: {o:?}"
+    );
 
     // ---- (5) addressed by VOX_AGENT_NAME ----
     post(
@@ -181,8 +195,11 @@ fn a_result_names_the_addressed_messages_its_session_has_not_read() {
         ],
         Some("done again"),
     );
-    assert!(o.ok, "{o:?}");
-    let bodies: Vec<String> = o.json()["unread_addressed"]
+    assert!(
+        o.ok,
+        "PRODUCT: a result posted as VOX_AGENT_NAME=alpha failed: {o:?}"
+    );
+    let bodies: Vec<String> = json(&o)["unread_addressed"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -192,6 +209,6 @@ fn a_result_names_the_addressed_messages_its_session_has_not_read() {
     assert_eq!(
         bodies,
         ["alpha: please rebase first"],
-        "a message to the session's VOX_AGENT_NAME must be named: {o:?}"
+        "PRODUCT: a message to the session's VOX_AGENT_NAME must be named: {o:?}"
     );
 }

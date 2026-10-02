@@ -29,11 +29,17 @@ use std::time::{Duration, Instant};
 
 use world::{args, vox_once, VoxProc, IDENTITY};
 
-fn read_frame(s: &mut UnixStream) -> Vec<u8> {
+/// One frame from the node. A node that closes the socket or goes silent mid-frame is the
+/// product's red: the client did nothing but speak the socket's own framing.
+fn read_frame(s: &mut UnixStream, what: &str) -> Vec<u8> {
     let mut len = [0u8; 4];
-    s.read_exact(&mut len).expect("a frame length");
+    s.read_exact(&mut len).unwrap_or_else(|e| {
+        panic!("PRODUCT: the node closed or stalled before the length of {what}: {e}")
+    });
     let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
-    s.read_exact(&mut body).expect("a frame body");
+    s.read_exact(&mut body).unwrap_or_else(|e| {
+        panic!("PRODUCT: the node closed or stalled in the body of {what}: {e}")
+    });
     body
 }
 
@@ -41,15 +47,15 @@ fn read_frame(s: &mut UnixStream) -> Vec<u8> {
 #[ignore = "a real vox daemon with production Argon2id; CI runs it in release"]
 fn an_unknown_control_request_says_so() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let data = tmp.path().join("d");
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: create the data dir");
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write the passphrase file");
 
     let (ok, _, err) = vox_once(&data, &args(&["id"]));
-    assert!(ok, "vox id: {err}");
-    let _daemon = VoxProc::spawn(
+    assert!(ok, "PRODUCT (staging): `vox id` failed: {err}");
+    let mut daemon = VoxProc::spawn(
         "daemon",
         &data,
         &args(&[
@@ -57,14 +63,20 @@ fn an_unknown_control_request_says_so() {
             "--listen",
             "127.0.0.1:0",
             "--passphrase-file",
-            idpass.to_str().unwrap(),
+            idpass.to_str().expect("APPARATUS: a UTF-8 temp path"),
         ]),
     );
     let deadline = Instant::now() + Duration::from_secs(90);
-    while !vox_once(&data, &args(&["room", "list"])).0 {
+    loop {
+        let (ok, out, err) = vox_once(&data, &args(&["room", "list"]));
+        if ok {
+            break;
+        }
         assert!(
             Instant::now() < deadline,
-            "the daemon never answered `vox room list`"
+            "PRODUCT (staging): the daemon never answered `vox room list` within 90 s; the last \
+             answer: {out}{err}\n--- the daemon said:\n{}",
+            daemon.transcript()
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -72,29 +84,37 @@ fn an_unknown_control_request_says_so() {
     let socket = data.join("default").join("node.sock");
     assert!(
         socket.exists(),
-        "CANNOT MEASURE: no control socket at {} (a long path is hashed elsewhere)",
+        "PRODUCT (staging): no control socket at {} (a long path is hashed elsewhere)",
         socket.display()
     );
-    let mut s = UnixStream::connect(&socket).expect("connect to the control socket");
-    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let hello = read_frame(&mut s);
+    let mut s = UnixStream::connect(&socket)
+        .unwrap_or_else(|e| panic!("PRODUCT: the control socket refused a connection: {e}"));
+    s.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("APPARATUS: set a read timeout");
+    let hello = read_frame(&mut s, "the greeting");
     println!("[proof] the node greeted with {} bytes", hello.len());
 
     // A request with a tag no vox knows: the CBOR array [9999].
     let body = [0x81u8, 0x19, 0x27, 0x0F];
-    s.write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
-        .unwrap();
-    s.write_all(&body).unwrap();
-    let reply = read_frame(&mut s);
+    s.write_all(
+        &u32::try_from(body.len())
+            .expect("APPARATUS: a request body under 4 GiB")
+            .to_be_bytes(),
+    )
+    .unwrap_or_else(|e| panic!("PRODUCT: the node closed the socket before the request: {e}"));
+    s.write_all(&body)
+        .unwrap_or_else(|e| panic!("PRODUCT: the node closed the socket mid-request: {e}"));
+    let reply = read_frame(&mut s, "the reply to the unknown request");
     let text = String::from_utf8_lossy(&reply).into_owned();
     println!("[proof] the node's reply: {text:?}");
 
     assert!(
         !text.contains("identity bundle"),
-        "an unknown control request was reported as an identity-bundle error: {text:?}"
+        "PRODUCT: an unknown control request was reported as an identity-bundle error: {text:?}"
     );
     assert!(
         text.contains("does not know this request"),
-        "the reply to an unknown request does not say the node does not know it: {text:?}"
+        "PRODUCT: the reply to an unknown request does not say the node does not know it: \
+         {text:?}"
     );
 }
