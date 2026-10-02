@@ -45,6 +45,7 @@
 use std::path::Path;
 
 use vox_agentcomms::envelope::{Envelope, DEFAULT_HOPS};
+use vox_core::hash::Digest32;
 use vox_core::node::api::MessageRow;
 use vox_core::node::paths::Paths;
 
@@ -148,7 +149,11 @@ pub fn forget(paths: &Paths, session: &Session) -> bool {
         .ok()
         .and_then(|b| serde_json::from_slice::<Session>(&b).ok())
         .is_some_and(|now| now == *session);
-    still && std::fs::remove_file(&path).is_ok()
+    let removed = still && std::fs::remove_file(&path).is_ok();
+    if removed {
+        let _ = std::fs::remove_file(woke_file(paths, &session.session));
+    }
+    removed
 }
 
 /// The hop budget `envelope` really has left, given the `rows` of its room (ADR-020 §9).
@@ -192,6 +197,100 @@ where
     let mut reply = Envelope::new(vox_agentcomms::envelope::SAY, "");
     reply.re = Some(re.to_owned());
     hops_left(&reply, rows)
+}
+
+/// Where the daemon records the entries that woke `session`: a file of the same name as its
+/// registration in a directory of its own beside the registrations', so the registrations'
+/// directory still holds one file per session.
+fn woke_file(paths: &Paths, session: &str) -> std::path::PathBuf {
+    let reg = paths.session_file(session);
+    let dir = paths.session_dir().with_extension("wakes");
+    dir.join(reg.file_name().unwrap_or_default())
+}
+
+/// Record that entry `entry` of `room` woke `session` (V210-121), so that the session's
+/// next post with no `--re` answers it rather than starting a chain of its own.
+///
+/// Best effort, as registration is: a wake that cannot be recorded still happened. The
+/// record keeps the latest `WOKE_KEPT` wakes, private to the profile like the registration.
+pub fn note_woke(paths: &Paths, session: &str, room: &str, entry: &Digest32) {
+    let path = woke_file(paths, session);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<&str> = old.lines().collect();
+    let new = format!("{room} {}", vox_core::node::link::b32_encode(entry));
+    lines.push(&new);
+    let keep = &lines[lines.len().saturating_sub(WOKE_KEPT)..];
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = vox_core::node::paths::write_private_file(&path, (keep.join("\n") + "\n").as_bytes());
+}
+
+/// How many wakes a session's record keeps: far more than a session leaves unanswered.
+const WOKE_KEPT: usize = 64;
+
+/// The entries of `room` that woke `session` and that it has not answered yet, oldest first
+/// (V210-121): every recorded wake that `rows` still holds, less those a post of this
+/// session's — signed by this node, `me`, and naming the session in `from` — replies to.
+#[must_use]
+pub fn open_wakes(
+    paths: &Paths,
+    session: &str,
+    room: &str,
+    rows: &[MessageRow],
+    me: &Digest32,
+) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(woke_file(paths, session)) else {
+        return Vec::new();
+    };
+    let answered: std::collections::BTreeSet<String> = rows
+        .iter()
+        .filter(|r| r.author == *me)
+        .filter_map(|r| Envelope::parse(&r.text).ok())
+        .filter(|e| e.from == session)
+        .filter_map(|e| e.re.map(|re| re.trim().to_ascii_lowercase()))
+        .collect();
+    let mut open: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let Some((r, entry)) = line.split_once(' ') else {
+            continue;
+        };
+        if r != room || answered.contains(entry) || open.iter().any(|o| o == entry) {
+            continue;
+        }
+        if find(rows, entry).is_some() {
+            open.push(entry.to_owned());
+        }
+    }
+    open
+}
+
+/// Whether `session`, a session of this node (`me`), already spoke in the `re` chain
+/// `envelope` answers (V210-121): a parent, grandparent and so on, signed by `me` and
+/// naming `session` in `from`. Waking it again would answer it with its own conversation,
+/// which is how two agents keep each other awake; the message still queues for its next turn.
+#[must_use]
+pub fn in_chain<'a, R>(envelope: &Envelope, rows: &'a R, me: &Digest32, session: &str) -> bool
+where
+    R: ?Sized,
+    &'a R: IntoIterator<Item = &'a MessageRow>,
+{
+    let mut re = envelope.re.clone();
+    let mut depth: u32 = 0;
+    while let Some(parent) = re.as_deref().and_then(|h| find(rows, h)) {
+        depth += 1;
+        if depth > DEFAULT_HOPS {
+            break;
+        }
+        let Ok(p) = Envelope::parse(&parent.text) else {
+            break;
+        };
+        if parent.author == *me && p.from == session {
+            return true;
+        }
+        re = p.re;
+    }
+    false
 }
 
 fn find<'a, R>(rows: &'a R, re: &str) -> Option<&'a MessageRow>
