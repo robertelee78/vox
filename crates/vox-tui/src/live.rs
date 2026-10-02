@@ -43,6 +43,25 @@ pub struct LiveCore {
     /// The most recent network notice to show (an invite link, a join, a consent).
     /// Public facts only — see [`ViewModel::notice`].
     notice: Option<String>,
+    /// The on-screen room's timeline as last projected (V210-120). See [`Projected`].
+    projected: Option<Projected>,
+}
+
+/// The on-screen room's timeline as projected for the UI, and what it was projected from.
+///
+/// **A frame costs what changed, not the room's history.** Every frame projected the room's whole
+/// timeline again — every row's text copied, every author named — so in a long room the TUI spent
+/// each frame on rows nobody had changed. A room's timeline only grows at its end, so the rows
+/// added since are projected and appended; anything else (another room, a reopened one, a changed
+/// keyring, which renames authors) projects it whole again.
+struct Projected {
+    channel_id: Digest32,
+    me: Option<Digest32>,
+    trusted: Vec<(Digest32, String)>,
+    /// How many of the node's rows are projected, and the newest of them.
+    len: usize,
+    last: Option<Digest32>,
+    rows: std::sync::Arc<Vec<MessageView>>,
 }
 
 impl std::fmt::Debug for LiveCore {
@@ -80,6 +99,7 @@ impl LiveCore {
             rt,
             active: None,
             unread: BTreeMap::new(),
+            projected: None,
         }
     }
 
@@ -199,7 +219,61 @@ impl LiveCore {
         }
     }
 
-    fn project(&self, nv: &NodeView) -> ViewModel {
+    /// The on-screen room's timeline for the UI, extended by the rows the node added since the last
+    /// frame (see [`Projected`]).
+    fn project_timeline(
+        &mut self,
+        d: &vox_core::node::api::ChannelDetail,
+        me: Option<Digest32>,
+        trusted: &[(Digest32, String)],
+    ) -> std::sync::Arc<Vec<MessageView>> {
+        let view_of = |r: &vox_core::node::api::MessageRow| MessageView {
+            author: r.author,
+            author_nick: if me == Some(r.author) {
+                "you".to_owned()
+            } else {
+                crate::ident::member_name(trusted, &r.author)
+            },
+            // Displayed as a time of day, so seconds; the full precision is kept for ordering.
+            timestamp: r.created_millis / 1_000,
+            body: Some(r.text.clone()),
+        };
+        let from = match &self.projected {
+            Some(p)
+                if p.channel_id == d.channel_id
+                    && p.me == me
+                    && p.trusted.as_slice() == trusted
+                    && p.len > 0
+                    && p.len <= d.timeline.len()
+                    && d.timeline.get(p.len - 1).map(|r| r.entry_hash) == p.last =>
+            {
+                Some(p.len)
+            }
+            _ => None,
+        };
+        let rows = match (from, self.projected.take()) {
+            (Some(n), Some(mut p)) => {
+                if n < d.timeline.len() {
+                    // In place when the last frame's view model is gone, as it is between frames.
+                    std::sync::Arc::make_mut(&mut p.rows)
+                        .extend(d.timeline.iter_from(n).map(view_of));
+                }
+                p.rows
+            }
+            _ => std::sync::Arc::new(d.timeline.iter().map(view_of).collect()),
+        };
+        self.projected = Some(Projected {
+            channel_id: d.channel_id,
+            me,
+            trusted: trusted.to_vec(),
+            len: d.timeline.len(),
+            last: d.timeline.last().map(|r| r.entry_hash),
+            rows: std::sync::Arc::clone(&rows),
+        });
+        rows
+    }
+
+    fn project(&mut self, nv: &NodeView) -> ViewModel {
         let me = nv.identity.as_ref().map(|i| i.fingerprint);
         // A room is reachable when this node holds a connection to another of its members. A
         // closed room's members are under its lock, and this node does not sync it: offline.
@@ -230,6 +304,10 @@ impl LiveCore {
                 reachability: reachability(&c.channel_id),
             })
             .collect();
+        let timeline = self.active.and_then(|cid| {
+            let d = nv.open_channels.iter().find(|d| d.channel_id == cid)?;
+            Some(self.project_timeline(d, me, &nv.trusted))
+        });
         let active = self.active.and_then(|cid| {
             nv.open_channels
                 .iter()
@@ -270,21 +348,7 @@ impl LiveCore {
                             }
                         })
                         .collect(),
-                    timeline: d
-                        .timeline
-                        .iter()
-                        .map(|r| MessageView {
-                            author: r.author,
-                            author_nick: if me == Some(r.author) {
-                                "you".to_owned()
-                            } else {
-                                crate::ident::member_name(&nv.trusted, &r.author)
-                            },
-                            // Displayed as a time of day, so seconds; the full precision is kept for ordering.
-                            timestamp: r.created_millis / 1_000,
-                            body: Some(r.text.clone()),
-                        })
-                        .collect(),
+                    timeline: timeline.clone().unwrap_or_default(),
                     // **Every member held back, each on its own line** (V210-66): once one notice in
                     // the one-line hint bar, where a second was cut off at the screen's edge.
                     held_back: d

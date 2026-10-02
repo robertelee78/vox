@@ -196,8 +196,12 @@ fn render_timeline(
             Style::default().add_modifier(Modifier::BOLD),
         ))
     });
-    let lines: Vec<Line> = notices
-        .chain(timeline.iter().map(|m| {
+    // Built newest first and only as far back as the window reaches (V210-120): every frame built
+    // a line for every message the room had ever held, so a long room cost each frame its history.
+    let lines = timeline
+        .iter()
+        .rev()
+        .map(|m| {
             let body = m
                 .body
                 .clone()
@@ -209,8 +213,8 @@ fn render_timeline(
                 ),
                 Span::raw(body),
             ])
-        }))
-        .collect();
+        })
+        .chain(notices.rev());
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
     // top, a room that outgrew the pane hid every new message below its bottom edge. The lines
     // are wrapped here, not by the widget, so the count the window is taken from is the count
@@ -219,7 +223,7 @@ fn render_timeline(
     let height = usize::from(area.height.saturating_sub(2));
     let want = height.saturating_add(scroll);
     let mut rows: Vec<Line> = Vec::new();
-    for l in lines.into_iter().rev() {
+    for l in lines {
         rows.extend(wrap(l, width).into_iter().rev());
         if rows.len() >= want {
             break;

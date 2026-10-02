@@ -12,3 +12,6 @@ agentdb.rvf.lock
 # Rust build output (for when implementation begins)
 /target/
 **/*.rs.bk
+
+# Python bytecode from the pty drivers (they set dont_write_bytecode, but a stray run can write it)
+__pycache__/

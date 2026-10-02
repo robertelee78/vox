@@ -226,6 +226,19 @@ pub fn note_woke(paths: &Paths, session: &str, room: &str, entry: &Digest32) {
     let _ = vox_core::node::paths::write_private_file(&path, (keep.join("\n") + "\n").as_bytes());
 }
 
+/// The entries of `room` recorded as having woken `session` (V210-121), oldest first.
+#[must_use]
+pub fn recorded_wakes(paths: &Paths, session: &str, room: &str) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(woke_file(paths, session)) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(r, _)| *r == room)
+        .map(|(_, e)| e.to_owned())
+        .collect()
+}
+
 /// How many wakes a session's record keeps: far more than a session leaves unanswered.
 const WOKE_KEPT: usize = 64;
 
