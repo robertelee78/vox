@@ -329,6 +329,9 @@ impl LiveCore {
             locking: nv.locking,
             mlock_active: nv.mlock_active,
             has_identity: nv.identity.is_some(),
+            // The tunnels this node carries are this process's (V030-11).
+            tunnels: vox_core::transport::quic::live_tunnels(),
+            closed_tunnels: vox_core::transport::quic::closed_tunnels(),
         }
     }
 }
@@ -433,6 +436,21 @@ impl CoreHandle for LiveCore {
                 channel_id,
                 passphrase: Self::secret(&passphrase),
             }),
+            Command::CloseTunnel { id } => {
+                let which = vox_core::transport::quic::TunnelSelector {
+                    id: Some(id),
+                    ..Default::default()
+                };
+                // By number, so it names one tunnel and is never refused as ambiguous.
+                if vox_core::transport::quic::close_tunnels(&which, "closed by a person in the TUI")
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    CommandStatus::Failed(UiError::NoSuchTunnel)
+                } else {
+                    CommandStatus::Done
+                }
+            }
             Command::CloseChannel { channel_id } => {
                 if self.active == Some(channel_id) {
                     self.active = None;

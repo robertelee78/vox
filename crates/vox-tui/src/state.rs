@@ -154,6 +154,8 @@ pub enum Screen {
     ChannelList,
     /// An open channel: timeline + composer + member pane.
     Channel,
+    /// The live tunnels, to see and close (V030-11): `t` on the channel list, or `:tunnels`.
+    Tunnels,
 }
 
 /// Which pane has focus within the channel screen (cycled by `Tab`).
@@ -234,6 +236,9 @@ pub struct UiState {
     pub status_message: Option<String>,
     /// The composer's pending text (single-line; Enter sends).
     pub composer: String,
+    /// The tunnel selected in the tunnel list, **by its number**, so a tunnel that ends or opens
+    /// does not move the selection onto another (V030-11).
+    pub selected_tunnel: Option<u64>,
 }
 
 impl Default for UiState {
@@ -247,6 +252,7 @@ impl Default for UiState {
             timeline_scroll: 0,
             status_message: None,
             composer: String::new(),
+            selected_tunnel: None,
         }
     }
 }
@@ -262,6 +268,15 @@ impl UiState {
     /// nothing is, or when the member selected is no longer in the pane, so the marker the pane
     /// draws and the member a command acts on are one member, held by identity from then on.
     pub fn settle(&mut self, vm: &ViewModel) {
+        if self.screen == Screen::Tunnels {
+            if self
+                .selected_tunnel
+                .is_none_or(|id| !vm.tunnels.iter().any(|t| t.id == id))
+            {
+                self.selected_tunnel = vm.tunnels.first().map(|t| t.id);
+            }
+            return;
+        }
         if self.screen != Screen::Channel {
             return;
         }
@@ -323,6 +338,14 @@ impl UiState {
                 self.mode = Mode::CommandPalette(String::new());
                 Action::Redraw
             }
+            KeyCode::Char('t') if self.screen == Screen::ChannelList => {
+                self.screen = Screen::Tunnels;
+                self.settle(vm);
+                Action::Redraw
+            }
+            KeyCode::Char('x') | KeyCode::Delete if self.screen == Screen::Tunnels => {
+                self.close_selected_tunnel(vm)
+            }
             KeyCode::Tab if self.screen == Screen::Channel => {
                 self.focus = self.focus.next();
                 Action::Redraw
@@ -331,6 +354,9 @@ impl UiState {
                 if self.screen == Screen::Channel {
                     self.screen = Screen::ChannelList;
                     return Action::Dispatch(Command::SelectChannel { channel_id: None });
+                }
+                if self.screen == Screen::Tunnels {
+                    self.screen = Screen::ChannelList;
                 }
                 Action::Redraw
             }
@@ -503,6 +529,20 @@ impl UiState {
         }
     }
 
+    /// Close the tunnel selected in the tunnel list (V030-11).
+    fn close_selected_tunnel(&mut self, vm: &ViewModel) -> Action {
+        match self
+            .selected_tunnel
+            .filter(|id| vm.tunnels.iter().any(|t| t.id == *id))
+        {
+            Some(id) => Action::Dispatch(Command::CloseTunnel { id }),
+            None => {
+                self.status_message = Some("no tunnel is selected".into());
+                Action::Redraw
+            }
+        }
+    }
+
     /// Up/Down: the channel list's selection, or on a channel screen, the timeline's scroll while
     /// it has focus and the member selection otherwise.
     fn move_selection(&mut self, vm: &ViewModel, delta: isize) {
@@ -514,6 +554,16 @@ impl UiState {
                 if len > 0 {
                     self.selected_channel = step(self.selected_channel, len);
                 }
+            }
+            Screen::Tunnels => {
+                if vm.tunnels.is_empty() {
+                    return;
+                }
+                let cur = self
+                    .selected_tunnel
+                    .and_then(|id| vm.tunnels.iter().position(|t| t.id == id))
+                    .unwrap_or(0);
+                self.selected_tunnel = Some(vm.tunnels[step(cur, vm.tunnels.len())].id);
             }
             Screen::Channel if self.focus == Focus::Timeline => {
                 // Up scrolls toward older messages.
@@ -563,6 +613,12 @@ impl UiState {
                 match parse_command(&line, self, vm) {
                     Some(Parsed::Core(cmd)) => Action::Dispatch(cmd),
                     Some(Parsed::Quit) => Action::Quit,
+                    Some(Parsed::Nav(Nav::Tunnels)) => {
+                        self.screen = Screen::Tunnels;
+                        self.settle(vm);
+                        Action::Redraw
+                    }
+                    Some(Parsed::CloseTunnel) => self.close_selected_tunnel(vm),
                     Some(Parsed::Nav(nav)) => self.apply_nav(nav, vm),
                     Some(Parsed::Prompt(kind, name)) => {
                         let mut p = Prompt::new(kind, None);
@@ -605,6 +661,10 @@ impl UiState {
             }
             Nav::Up => self.move_selection(vm, -1),
             Nav::Down => self.move_selection(vm, 1),
+            Nav::Tunnels => {
+                self.screen = Screen::Tunnels;
+                self.settle(vm);
+            }
         }
         Action::Redraw
     }
@@ -654,6 +714,8 @@ pub enum Nav {
     Up,
     /// Move selection down.
     Down,
+    /// Show the live tunnels (V030-11).
+    Tunnels,
 }
 
 /// The result of parsing a `:`-command line.
@@ -667,6 +729,8 @@ pub enum Parsed {
     Nav(Nav),
     /// Open a masked prompt (with an optional prefilled non-secret first field).
     Prompt(PromptKind, Option<String>),
+    /// Close the tunnel selected in the tunnel list (V030-11).
+    CloseTunnel,
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -717,6 +781,9 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         "focus" => return Some(Parsed::Nav(Nav::FocusNext)),
         "up" => return Some(Parsed::Nav(Nav::Up)),
         "down" => return Some(Parsed::Nav(Nav::Down)),
+        "tunnels" => return Some(Parsed::Nav(Nav::Tunnels)),
+        // On the tunnel list, `close` closes the selected tunnel, not a channel.
+        "close" if ui.screen == Screen::Tunnels => return Some(Parsed::CloseTunnel),
         _ => {}
     }
     // Channel-scoped verbs require an active channel.

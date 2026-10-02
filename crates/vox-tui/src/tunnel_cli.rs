@@ -934,6 +934,9 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         NodeEvent::ProxyRefused { reason } => {
             eprintln!("vox: tunnel refused or cut — {reason}");
         }
+        NodeEvent::TunnelClosed { reason } => {
+            eprintln!("vox: tunnel closed — {reason}");
+        }
         NodeEvent::SyncFailed {
             channel_id,
             peer,

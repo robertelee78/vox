@@ -177,6 +177,10 @@ pub struct ViewModel {
     /// material (ADR-015's rule for the status channel), and never free-form text
     /// derived from a message.
     pub notice: Option<String>,
+    /// Every live tunnel, as `vox status` lists them (V030-11).
+    pub tunnels: Vec<vox_core::transport::quic::LiveTunnel>,
+    /// The tunnels that ended for a reason a person should see, with that reason (V030-11).
+    pub closed_tunnels: Vec<vox_core::transport::quic::ClosedTunnel>,
 }
 
 /// An ordered core→UI event that must never coalesce (`mpsc`).
@@ -252,6 +256,8 @@ pub enum UiError {
     Storage,
     /// This action needs the network milestone (M14) — not available yet.
     NotAvailableYet,
+    /// The tunnel to close is no longer open (V030-11).
+    NoSuchTunnel,
     /// The other side refused: the channel passphrase is wrong, or it is not
     /// accepting joins for that channel. Deliberately coarse — the responder does not
     /// say which, so neither does this (ADR-005).
@@ -328,6 +334,7 @@ impl UiError {
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
             UiError::NotAvailableYet => "not available yet (needs the network milestone)",
+            UiError::NoSuchTunnel => "that tunnel is no longer open",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",
             UiError::AddressInUse => "a local port it needs is in use — pick another --listen",
@@ -423,6 +430,12 @@ pub enum Command {
     EndRoom {
         /// The channelID.
         channel_id: Digest32,
+    },
+    /// Close one live tunnel, by its number (V030-11). Nobody is untrusted and no service
+    /// removed; its far end is told it was closed.
+    CloseTunnel {
+        /// The tunnel's number ([`vox_core::transport::quic::LiveTunnel::id`]).
+        id: u64,
     },
     /// The UI's active channel changed (`None` = back at the channel list); the
     /// core projects `ViewModel::active` and unread counts from it.
