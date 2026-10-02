@@ -30,12 +30,18 @@
 //! 5. **A node's own new name is shown.** After bob adds carol as `cee`, his read names her `cee`
 //!    and his drain shows `to cee/agent-c`, still never `mom`.
 //!
+//! 6. **The TUI too** (`the_tui_shows_each_node_its_own_name_for_the_addressee`, through
+//!    `tests/pty/tui_addressee_names.py`): bob's own `vox tui` shows alice's message to `mom`
+//!    addressed to carol's fingerprint and never to `mom`, and alice's shows it addressed to `mom`.
+//!
 //! **Mutation.** Each claim has a mutant in the product that turns its own assertion red:
 //! - (1) a receiver matches the agent name without the fingerprint: carol is woken;
 //! - (2) the sender sends what was typed instead of resolving it: no wake;
 //! - (3) and (4) **names shared across nodes**: the sender sends what was typed and readers print
 //!   it: `mom` on the wire and on bob's screen;
-//! - (4) and (5) a reader ignores its own keyring: alice and bob are shown fingerprints.
+//! - (4) and (5) a reader ignores its own keyring: alice and bob are shown fingerprints;
+//! - (6) the TUI shows the sender's name for the addressee instead of its own: names shared
+//!   across nodes, as above, turns bob's screen red.
 
 #![cfg(unix)]
 
@@ -43,6 +49,8 @@
 mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 
 use std::io::Read as _;
 use std::os::unix::net::UnixListener;
@@ -331,4 +339,50 @@ fn each_node_addresses_by_fingerprint_and_shows_its_own_name_for_the_addressee()
         failures.len(),
         failures.join("\n")
     );
+}
+
+#[test]
+#[ignore = "real daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
+fn the_tui_shows_each_node_its_own_name_for_the_addressee() {
+    // Bounded as `tui_member_names_proof` is, for the same two joins in a debug build: the driver's
+    // budget is 1260 s, it is stopped from outside at 1290 s, and the watchdog is past both.
+    watchdog::arm_for(Duration::from_secs(1400));
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_addressee_names.py");
+    let out = pty_driver::run_within(
+        script,
+        &[env!("CARGO_BIN_EXE_vox"), "cargo"],
+        Duration::from_secs(1290),
+    );
+    let said = out.stdout.clone();
+    eprintln!(
+        "{said}\n[proof] the driver took {:?}; its last stage: {:?}",
+        out.took, out.stage
+    );
+    // Every red names whose it is: the driver exits 1 only on a product verdict, 2 on its own.
+    match out.code {
+        Some(0) => assert!(
+            said.contains("cargo PASS"),
+            "APPARATUS: exit 0 without a PASS line: {said}"
+        ),
+        Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
+        _ if !out.has_verdict("cargo") => panic!(
+            "CANNOT MEASURE: APPARATUS: the TUI driver gave no verdict after {:?} at stage {:?} \
+             (exit {:?}): stopped from outside at the wrapper's 1290 s bound, by its faulthandler \
+             backstop, or crashed: {said}",
+            out.took,
+            out.stage.as_deref().unwrap_or("(before its first stage)"),
+            out.code
+        ),
+        Some(1) => panic!(
+            "PRODUCT: each node's TUI must show the addressee by its own name, or the \
+             fingerprint, never another node's name: {said}"
+        ),
+        _ => panic!(
+            "CANNOT MEASURE: APPARATUS: the TUI driver ended after {:?} at stage {:?} with exit \
+             {:?} and no verdict this wrapper knows: {said}",
+            out.took,
+            out.stage.as_deref().unwrap_or("(before its first stage)"),
+            out.code
+        ),
+    }
 }

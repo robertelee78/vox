@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""tui_addressee_names.py <vox> <tag> — PRD-001 R15 (#18), the TUI half, through the shipped `vox tui`.
+
+Alice creates a room; Bob and Carol join it, all through real daemons. Alice trusts Bob as "bob" and
+Carol as "mom". Bob trusts Alice as "alice" and has no name for Carol. Alice posts an `ask` with
+`vox room post --to mom`: the message carries Carol's fingerprint, never "mom". Each node's real
+`vox tui` is then opened in a pty (pyte at 160x50), its own daemon stopped first:
+
+- Bob's timeline must show the message addressed to 26 characters of Carol's fingerprint, and never
+  "mom", which is Alice's name for her and not his;
+- Alice's must show it addressed to "mom", her own name.
+
+Exit 0 = pass, 1 = red (the product's), 2 = apparatus (CANNOT MEASURE). Every process is recorded
+and killed by PID. Every wait is bounded by what the product allows, as in `tui_member_names.py`.
+"""
+import json, os, re, subprocess, sys, time
+
+sys.dont_write_bytecode = True  # no __pycache__ in the source tree
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+
+VOX, TAG = sys.argv[1], sys.argv[2]
+# Sized for the debug build, as `tui_member_names.py` is: two joins at JOIN_SECS each, and the rest.
+BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1260"))
+JOIN_SECS = 540
+MARK = "ADDRESSEE-MARK"
+SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix="vox-tui-to-")
+S = f"{SP}/tuito-{TAG}"
+subprocess.run(["rm", "-rf", S])
+for w in ("anchor", "alice", "bob", "carol"):
+    for d in ("data", "cfg"):
+        os.makedirs(f"{S}/{w}/{d}")
+open(f"{S}/idpass", "w").write("id pass")
+PROCS = []
+if pyte is None:
+    print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)"); sys.exit(2)
+arm(BUDGET, TAG)
+
+def env(w):
+    e = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "USER") if k in os.environ}
+    e.update(VOX_DATA_DIR=f"{S}/{w}/data", VOX_CONFIG_DIR=f"{S}/{w}/cfg", TERM="xterm-256color")
+    return e
+
+def run(w, *args, stdin=None):
+    secs = JOIN_SECS if args[:2] == ("room", "join") else 120
+    return subprocess.run([VOX, *args], env=env(w), input=stdin, capture_output=True, text=True, timeout=secs)
+
+def spawn(w, *args, out):
+    p = subprocess.Popen([VOX, *args], env=env(w), stdin=subprocess.DEVNULL,
+                         stdout=open(f"{S}/{out}.out", "w"), stderr=open(f"{S}/{out}.err", "w"))
+    PROCS.append(p)
+    return p
+
+def stop(p):
+    p.terminate()
+    try:
+        p.wait(10)
+    except subprocess.TimeoutExpired:
+        p.kill(); p.wait()
+
+def until(pred, secs, step=0.5):
+    end = time.time() + secs
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(step)
+    return False
+
+class Red(Exception):
+    """A verdict of the product's, printed before it is raised."""
+
+def apparatus(why):
+    print(f"{TAG} APPARATUS: {why}"); sys.exit(2)
+
+def trust(w, who, name):
+    t = run(w, "trust", "add", fp[who], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
+    if t.returncode != 0: apparatus(f"{w} trust add {who}: {t.stderr}")
+
+def screen_of(w):
+    """`w`'s own `vox tui`, opened on the room: the timeline as drawn, once the mark shows."""
+    t = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec], env(w))
+    try:
+        t.pump(4)
+        t.key("id pass\r", 4)
+        t.key("\r", 2)
+        t.key("room pass\r", 4)
+        t.key("\r", 2)
+        t.until(lambda: MARK in "\n".join(t.display()), 60, 1)
+        rows = [r.rstrip() for r in t.display()]
+        print(f"{TAG} {w}'s TUI drew {t.bytes} bytes; rows showing the mark:")
+        for r in rows:
+            if MARK in r or "→" in r:
+                print(f"  |{r}")
+        return rows
+    finally:
+        if not t.stop():
+            print(f"{TAG} APPARATUS: {w}'s vox tui (pid {t.pid}) outlived SIGKILL and could not be reaped")
+            sys.exit(2)
+
+code = 2
+try:
+    stage("anchor")
+    anchor = spawn("anchor", "node", "--listen", "127.0.0.1:0", out="anchor")
+    spec = None
+    def got_spec():
+        global spec
+        m = re.search(r"[a-z2-7]{52}@/ip4/127\.0\.0\.1/udp/\d+", open(f"{S}/anchor.out").read())
+        spec = m.group(0) if m else None
+        return spec
+    if not until(got_spec, 30): apparatus("anchor spec")
+    stage("identities and daemons")
+    fp = {}
+    for w in ("alice", "bob", "carol"):
+        r = run(w, "id", "--identity-passphrase-file", f"{S}/idpass")
+        if r.returncode != 0: apparatus(f"{w} id: {r.stderr}")
+        fp[w] = re.search(r"[a-z2-7]{52}", r.stdout).group(0)
+    daemons = {w: spawn(w, "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
+                        "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol")}
+    for w in daemons:
+        if not until(lambda: run(w, "room", "list").returncode == 0, 60): apparatus(f"{w} daemon")
+    stage("room create, invite, join")
+    if run("alice", "room", "create", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
+    room = run("alice", "room", "list").stdout.split()[0]
+    link = run("alice", "room", "invite", room).stdout.strip()
+    for w in ("bob", "carol"):
+        j = run(w, "room", "join", link, "--name", "m", stdin="room pass")
+        if j.returncode != 0: apparatus(f"{w} join: {j.stderr.strip()}")
+    stage("each node's own names")
+    trust("alice", "bob", "bob")
+    trust("alice", "carol", "mom")
+    trust("bob", "alice", "alice")
+    def roster():
+        r = run("alice", "room", "roster", room)
+        return r.returncode == 0 and fp["carol"][:12] in r.stdout
+    if not until(roster, 90, 1): apparatus("alice never listed carol: " + run("alice", "room", "roster", room).stdout)
+
+    stage("alice posts to mom")
+    p = run("alice", "room", "post", room, "--session", "alice-s", "--type", "ask", "--to", "mom",
+            "-", stdin=f"{MARK} please look")
+    if p.returncode != 0:
+        print(f"{TAG} RED: alice's `vox room post --to mom` was refused: {p.stderr.strip()}")
+        raise Red
+    def bob_has_it():
+        r = run("bob", "room", "read", room)
+        return r.returncode == 0 and MARK in r.stdout
+    if not until(bob_has_it, 90, 1): apparatus("bob never read alice's message")
+    rows = [json.loads(l) for l in run("alice", "room", "read", room, "--json").stdout.splitlines() if l.strip()]
+    sent = next((x for x in rows if MARK in (x.get("text") or "")), None)
+    to = (sent or {}).get("envelope", {}).get("to")
+    if to != [fp["carol"]]:
+        print(f"{TAG} RED: the message must carry exactly carol's fingerprint in `to`, never alice's "
+              f"name for her: {to!r}")
+        raise Red
+
+    stop(daemons["bob"])
+    stage("bob's tui")
+    bob_rows = screen_of("bob")
+    stop(daemons["alice"])
+    stage("alice's tui")
+    alice_rows = screen_of("alice")
+
+    want_fp = fp["carol"][:26]
+    bob_all, alice_all = "\n".join(bob_rows), "\n".join(alice_rows)
+    bob_ok = f"→ {want_fp}" in bob_all and "→ mom" not in bob_all
+    alice_ok = "→ mom" in alice_all
+    print(f"{TAG} bob shown carol's fingerprint and never 'mom': {bob_ok}; alice shown 'mom': {alice_ok}")
+    code = 0 if (bob_ok and alice_ok) else 1
+    print(f"{TAG} {'PASS' if code == 0 else 'RED'}")
+except Red:
+    code = 1
+except Hung as h:
+    print(f"{TAG} HUNG at {h}")
+    print(f"{TAG} APPARATUS: the driver ran past its {BUDGET} s budget at {h} with no product "
+          f"wait past its bound")
+    code = 2
+except subprocess.TimeoutExpired as t:
+    print(f"{TAG} RED: `vox {' '.join(t.cmd[1:3])}` did not return within {t.timeout:.0f} s")
+    code = 1
+finally:
+    disarm()
+    stage("stopping every process")
+    for p in PROCS:
+        if p.poll() is None:
+            stop(p)
+    stage(f"done, exit {code}")
+sys.exit(code)
