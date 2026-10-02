@@ -781,6 +781,20 @@ pub fn run_node(
                                         crate::ident::author_id(&peer)
                                     );
                                 }
+                                vox_core::node::api::NodeEvent::HandshakesQueued {
+                                    waited,
+                                    most_waiting,
+                                    most_running,
+                                    refused,
+                                    longest_ms,
+                                } => {
+                                    eprintln!(
+                                        "vox node: {waited} connection attempt(s) waited for a \
+                                         handshake slot (at most {most_waiting} at once, the \
+                                         longest {longest_ms}ms) while at most {most_running} \
+                                         handshake(s) ran; {refused} refused"
+                                    );
+                                }
                                 vox_core::node::api::NodeEvent::ConnectionNote { peer, note } => {
                                     eprintln!(
                                         "vox node: connection to {} — {note}",
@@ -865,11 +879,12 @@ async fn judge(
     let room = vox_core::node::link::b32_encode(channel_id);
     // **A message with no hops left interrupts nobody** (ADR-020 §9, V210-79): the budget
     // is the only loop guard that provably ends an urgent reply chain. It still queues.
+    let empty = vox_core::node::api::Timeline::default();
     let timeline = view
         .open_channels
         .iter()
         .find(|d| d.channel_id == *channel_id)
-        .map_or(&[][..], |d| &d.timeline[..]);
+        .map_or(&empty, |d| &d.timeline);
     if crate::wake::hops_left(&envelope, timeline) == 0 {
         eprintln!(
             "vox daemon: not interrupting anyone for {}: its hop budget is spent; it waits for \
@@ -1361,6 +1376,24 @@ pub fn run_daemon(
                 .iter()
                 .flat_map(|d| d.timeline.iter().map(|r| r.entry_hash))
                 .collect();
+            // How far each room's timeline has been swept, and its row there. A timeline grows at
+            // its end, so a sweep reads only what was added since the last one (V210-120): it read
+            // the whole room on every sync, so each message cost the room's history. A room whose
+            // timeline no longer has that row there (it was closed and reopened) is read whole.
+            let mut swept: std::collections::HashMap<
+                vox_core::hash::Digest32,
+                (usize, Option<vox_core::hash::Digest32>),
+            > = node
+                .view()
+                .open_channels
+                .iter()
+                .map(|d| {
+                    (
+                        d.channel_id,
+                        (d.timeline.len(), d.timeline.last().map(|r| r.entry_hash)),
+                    )
+                })
+                .collect();
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 let sweep = tokio::select! {
@@ -1398,11 +1431,24 @@ pub fn run_daemon(
                     // someone is copied out to be judged.
                     let mut fresh = Vec::new();
                     for d in &view.open_channels {
-                        for r in d.timeline.iter() {
+                        let from = match swept.get(&d.channel_id) {
+                            Some(&(n, last))
+                                if n > 0
+                                    && d.timeline.get(n - 1).map(|r| r.entry_hash) == last =>
+                            {
+                                n
+                            }
+                            _ => 0,
+                        };
+                        for r in d.timeline.iter_from(from) {
                             if seen.insert(r.entry_hash) && may_wake(&r.text) {
                                 fresh.push((d.channel_id, r.clone()));
                             }
                         }
+                        swept.insert(
+                            d.channel_id,
+                            (d.timeline.len(), d.timeline.last().map(|r| r.entry_hash)),
+                        );
                     }
                     for (cid, row) in fresh {
                         judge(&paths, &view, &cid, &row).await;

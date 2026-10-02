@@ -50,6 +50,7 @@ use crate::nat::record::{MemberBundleRecord, PreJoinRecord, RendezvousRecord};
 pub const MIN_REFRESH_SECS: u64 = 60;
 
 /// The environment variable [`test_record_ttl`] reads. **Test-only.**
+#[cfg(feature = "test-knobs")]
 pub const TEST_RECORD_TTL_ENV: &str = "VOX_TEST_RECORD_TTL_SECS";
 
 /// A shorter lifetime for this node's own address records, read once from
@@ -60,6 +61,7 @@ pub const TEST_RECORD_TTL_ENV: &str = "VOX_TEST_RECORD_TTL_SECS";
 /// shortens the lifetime, clamped to [`MIN_TEST_RECORD_TTL_SECS`]..=[`MAX_TTL_SECS`], and scales
 /// the refresh floor with it ([`min_refresh_secs`]) so a renewal at half the lifetime is still
 /// past the floor. Unset, empty or unparsable is `None`: the real lifetime and floor.
+#[cfg(feature = "test-knobs")]
 #[must_use]
 pub fn test_record_ttl() -> Option<u64> {
     static TTL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -71,7 +73,14 @@ pub fn test_record_ttl() -> Option<u64> {
     })
 }
 
-/// The shortest lifetime [`TEST_RECORD_TTL_ENV`] may set.
+/// Always `None`, the real lifetime and floor: the knob is not compiled in (V210-105).
+#[cfg(not(feature = "test-knobs"))]
+#[must_use]
+pub const fn test_record_ttl() -> Option<u64> {
+    None
+}
+
+/// The shortest lifetime `VOX_TEST_RECORD_TTL_SECS` may set.
 pub const MIN_TEST_RECORD_TTL_SECS: u64 = 8;
 
 /// The lifetime this node gives its own address records: [`MAX_TTL_SECS`], or a proof's shorter

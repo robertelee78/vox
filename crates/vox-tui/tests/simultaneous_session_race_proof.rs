@@ -44,6 +44,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/world.rs"]
 mod world;
 
@@ -203,6 +206,9 @@ fn two_members_whose_hellos_are_both_lost_still_converge_and_read_each_other() {
 
 /// The race; with `lose_hellos`, bob and carol each lose the first hello they receive (V210-89).
 fn race(lose_hellos: bool) {
+    if lose_hellos {
+        test_knobs::require(&[LOSE_HELLOS]);
+    }
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let dirs: Vec<std::path::PathBuf> = ["alice", "bob", "carol"]

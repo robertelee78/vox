@@ -1,0 +1,91 @@
+timing-slot: took slot3 of 3 at 20:40:44Z, load 51.05 54.88 51.40, 2 waiting
+run-slot: took slot3 of 6 at 20:42:58Z, load 45.41 51.17 50.38, 6 waiting
+
+running 1 test
+test spike_adr024 ... SPIKE arm congested rate 1000000000 ow 1 ms loss 0.01 qbdp 1 cc Ok("tier2")
+TL shared t=0.5 vox 470.5 comp 507.9 Mbit/s late 3 ms
+TL shared t=1.0 vox 568.3 comp 386.4 Mbit/s late 10 ms
+TL shared t=1.5 vox 616.2 comp 305.0 Mbit/s late 6 ms
+TL shared t=2.0 vox 617.9 comp 354.3 Mbit/s late 4 ms
+TL shared t=2.5 vox 496.2 comp 475.1 Mbit/s late 6 ms
+TL shared t=3.0 vox 606.4 comp 355.6 Mbit/s late 11 ms
+TL shared t=3.5 vox 587.4 comp 389.6 Mbit/s late 6 ms
+TL shared t=4.0 vox 481.4 comp 500.7 Mbit/s late 2 ms
+TL shared t=4.5 vox 569.7 comp 339.4 Mbit/s late 15 ms
+TL shared t=5.0 vox 564.1 comp 346.1 Mbit/s late 19 ms
+TL shared t=5.5 vox 601.6 comp 387.6 Mbit/s late 3 ms
+TL shared t=6.0 vox 592.2 comp 394.4 Mbit/s late 1 ms
+TL shared t=6.5 vox 593.8 comp 385.9 Mbit/s late 3 ms
+TL shared t=7.0 vox 668.8 comp 307.3 Mbit/s late 1 ms
+TL shared t=7.5 vox 539.3 comp 434.1 Mbit/s late 5 ms
+TL shared t=8.0 vox 656.0 comp 303.5 Mbit/s late 6 ms
+TL shared t=8.5 vox 629.4 comp 348.1 Mbit/s late 2 ms
+TL shared t=9.0 vox 586.3 comp 378.2 Mbit/s late 9 ms
+TL shared t=9.5 vox 624.2 comp 338.1 Mbit/s late 1 ms
+TL shared t=10.0 vox 526.3 comp 434.8 Mbit/s late 2 ms
+TL shared t=10.5 vox 634.0 comp 318.3 Mbit/s late 6 ms
+TL shared t=11.0 vox 546.9 comp 382.7 Mbit/s late 5 ms
+TL shared t=11.5 vox 427.8 comp 541.9 Mbit/s late 4 ms
+TL shared t=12.0 vox 599.5 comp 328.0 Mbit/s late 5 ms
+TL shared t=12.5 vox 557.2 comp 333.8 Mbit/s late 8 ms
+TL shared t=13.0 vox 575.1 comp 336.1 Mbit/s late 11 ms
+TL shared t=13.5 vox 600.4 comp 362.0 Mbit/s late 6 ms
+TL shared t=14.0 vox 546.2 comp 369.2 Mbit/s late 9 ms
+TL shared t=14.5 vox 563.5 comp 328.2 Mbit/s late 9 ms
+TL shared t=15.0 vox 657.0 comp 320.9 Mbit/s late 2 ms
+TL shared t=15.5 vox 567.0 comp 384.4 Mbit/s late 4 ms
+TL shared t=16.0 vox 640.3 comp 328.7 Mbit/s late 4 ms
+TL shared t=16.5 vox 641.4 comp 305.6 Mbit/s late 6 ms
+TL shared t=17.0 vox 513.5 comp 419.5 Mbit/s late 12 ms
+TL shared t=17.5 vox 627.9 comp 342.6 Mbit/s late 3 ms
+TL shared t=18.0 vox 602.3 comp 349.1 Mbit/s late 4 ms
+TL shared t=18.5 vox 591.5 comp 348.5 Mbit/s late 2 ms
+TL shared t=19.0 vox 630.8 comp 333.2 Mbit/s late 3 ms
+TL shared t=19.5 vox 585.5 comp 351.5 Mbit/s late 7 ms
+TL shared t=20.0 vox 624.3 comp 300.4 Mbit/s late 7 ms
+TL shared t=20.5 vox 633.7 comp 357.3 Mbit/s late 3 ms
+TL shared t=21.0 vox 484.6 comp 490.9 Mbit/s late 2 ms
+TL shared t=21.5 vox 465.5 comp 481.1 Mbit/s late 2 ms
+TL shared t=22.0 vox 504.5 comp 430.8 Mbit/s late 7 ms
+TL shared t=22.5 vox 521.3 comp 400.6 Mbit/s late 5 ms
+TL shared t=23.0 vox 621.1 comp 320.7 Mbit/s late 13 ms
+TL shared t=23.5 vox 491.2 comp 418.5 Mbit/s late 4 ms
+TL shared t=24.0 vox 645.0 comp 310.4 Mbit/s late 17 ms
+TL shared t=24.5 vox 685.1 comp 294.7 Mbit/s late 4 ms
+TL shared t=25.0 vox 571.9 comp 394.1 Mbit/s late 3 ms
+TL shared t=25.5 vox 570.9 comp 398.7 Mbit/s late 8 ms
+TL shared t=26.0 vox 562.5 comp 395.4 Mbit/s late 6 ms
+TL shared t=26.5 vox 554.6 comp 357.9 Mbit/s late 21 ms
+TL shared t=27.0 vox 492.9 comp 450.7 Mbit/s late 9 ms
+TL shared t=27.5 vox 498.7 comp 420.6 Mbit/s late 20 ms
+TL shared t=28.0 vox 579.0 comp 395.3 Mbit/s late 3 ms
+TL shared t=28.5 vox 466.8 comp 490.8 Mbit/s late 4 ms
+TL shared t=29.0 vox 615.4 comp 317.2 Mbit/s late 4 ms
+TL shared t=29.5 vox 545.5 comp 420.2 Mbit/s late 2 ms
+TL shared t=30.0 vox 367.2 comp 597.3 Mbit/s late 6 ms
+TL shared t=30.5 vox 550.7 comp 371.4 Mbit/s late 4 ms
+TL shared t=31.0 vox 525.8 comp 371.0 Mbit/s late 15 ms
+TL shared t=31.5 vox 539.2 comp 400.6 Mbit/s late 7 ms
+TL shared t=32.0 vox 537.9 comp 369.0 Mbit/s late 3 ms
+TL shared t=32.5 vox 531.6 comp 382.7 Mbit/s late 10 ms
+TL shared t=33.0 vox 571.6 comp 319.4 Mbit/s late 12 ms
+TL shared t=33.5 vox 615.0 comp 342.4 Mbit/s late 5 ms
+TL shared t=34.0 vox 502.3 comp 457.4 Mbit/s late 3 ms
+TL shared t=34.5 vox 584.5 comp 385.0 Mbit/s late 2 ms
+TL shared t=35.0 vox 564.8 comp 358.5 Mbit/s late 7 ms
+TL shared t=35.5 vox 563.6 comp 370.5 Mbit/s late 5 ms
+TL shared t=36.0 vox 502.1 comp 397.6 Mbit/s late 9 ms
+TL shared t=36.5 vox 555.8 comp 377.9 Mbit/s late 5 ms
+TL shared t=37.0 vox 543.2 comp 427.0 Mbit/s late 3 ms
+TL shared t=37.5 vox 515.4 comp 439.1 Mbit/s late 8 ms
+TL shared t=38.0 vox 299.1 comp 484.4 Mbit/s late 12 ms
+TL shared t=38.5 vox 534.9 comp 350.4 Mbit/s late 7 ms
+TL shared t=39.0 vox 406.2 comp 424.6 Mbit/s late 8 ms
+TL shared t=39.5 vox 437.0 comp 470.0 Mbit/s late 9 ms
+TL shared t=40.0 vox 464.7 comp 450.5 Mbit/s late 7 ms
+RESULT congested vox 548.4 Mbit/s, cubic 387.7 Mbit/s, share ratio vox/cubic 1.41; tail drops 3484
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 70.51s
+
+rc=0

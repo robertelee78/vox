@@ -35,4 +35,9 @@ if grep -aq "$marker" "$target/release/vox"; then
   printf 'build-mutant-sender: the shipped %s still carries %s\n' "$target/release/vox" "$marker" >&2
   exit 1
 fi
+# Nor a test-only knob (V210-105): those are compiled in only by `test-knobs`.
+if grep -aq 'VOX_TEST_' "$target/release/vox"; then
+  printf 'build-mutant-sender: the shipped %s carries a test-only knob (VOX_TEST_)\n' "$target/release/vox" >&2
+  exit 1
+fi
 (cd "$out" && printf '%s/vox\n' "$(pwd -P)")

@@ -23,7 +23,8 @@
 //! **Asserted.** Every attack is a circuit to charlie, whom a real member reaches:
 //! 1. *Controls:* bravo asks the victim, and then the anchor, for a circuit to charlie, and each
 //!    is carried — so a circuit through each node does open, and the zeros below measure
-//!    something. Either failing is `CANNOT MEASURE`.
+//!    something. Either failing is `PRODUCT (staging)`: the node would not carry a circuit
+//!    between two real members.
 //! 2. A stranger publishes a room it minted to the victim, with a second identity of its own
 //!    witnessed into it, and asks the victim for a circuit to that second identity, and to
 //!    charlie. **Neither is carried**, and nobody is offered one.
@@ -37,6 +38,11 @@
 //!    is what an anchor is for — and asks the anchor for a circuit to charlie. **Not carried.**
 //!
 //! What each escalation step got is printed; with each defect, its steps are all accepted.
+//!
+//! **Every red names its side.** An attack the node carried is `PRODUCT:`. A staging step the
+//! product performs (a join, a control circuit, the anchor taking a room) is `PRODUCT (staging):`.
+//! A record the attacker could not build, or a temp file it could not write, is
+//! `CANNOT MEASURE (harness error):`.
 //!
 //! **Mutations that must turn it red**, one assertion each:
 //! - (2) `nat::service`'s `put`: take a peer's genesis on any board (drop the `serve_any_room`
@@ -104,7 +110,7 @@ fn control(
     );
     assert!(
         answer == CircuitAnswer::Opened && got >= 1,
-        "CANNOT MEASURE: the {via} would not carry a circuit between two real members \
+        "PRODUCT (staging): the {via} would not carry a circuit between two real members \
          ({answer:?}, {got} offered), so a refusal below would measure nothing"
     );
 }
@@ -128,7 +134,7 @@ fn attack(
 #[ignore = "real vox processes with production Argon2id and two real joins; run in release"]
 fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("CANNOT MEASURE (harness error): a temp dir");
     let (anchor_dir, victim_dir, bravo_dir, charlie_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "victim"),
@@ -136,16 +142,19 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         profile_dir(tmp.path(), "charlie"),
     );
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n"))
+        .expect("CANNOT MEASURE (harness error): the identity passphrase file");
 
     // ---- the real room ------------------------------------------------------------------
     let anchor_port = free_port();
     let (_anchor, spec) = hostile::anchor(&anchor_dir, &format!("127.0.0.1:{anchor_port}"));
     let anchor_id = vox_core::node::link::b32_decode(
-        spec.split('@').next().expect("an anchor spec"),
+        spec.split('@')
+            .next()
+            .expect("PRODUCT (staging): the anchor printed an empty spec"),
         "anchor fingerprint",
     )
-    .expect("the anchor's fingerprint");
+    .expect("PRODUCT (staging): the anchor's spec carries no fingerprint");
     let victim_id = fingerprint(&victim_dir);
     let charlie_id = fingerprint(&charlie_dir);
     let bravo_id = fingerprint(&bravo_dir);
@@ -155,15 +164,22 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     for (name, dir) in [("bravo", &bravo_dir), ("charlie", &charlie_dir)] {
         let d = daemon(name, dir, free_port(), &spec, &pass_file);
         let (ok, out, err) = vox_in(dir, &["room", "join", &link, "--name", "team"], ROOM_PASS);
-        assert!(ok, "CANNOT MEASURE: {name} joins the room: {out}{err}");
+        assert!(
+            ok,
+            "PRODUCT (staging): {name} could not join the room: {out}{err}"
+        );
         // Let the victim file the new member, and mirror it to the anchor, before it goes.
         std::thread::sleep(Duration::from_secs(3));
         drop(d);
     }
     let bravo = member_signer(&bravo_dir);
     let charlie = member_signer(&charlie_dir);
-    let victim_addr = format!("127.0.0.1:{victim_port}").parse().unwrap();
-    let anchor_addr = format!("127.0.0.1:{anchor_port}").parse().unwrap();
+    let victim_addr = format!("127.0.0.1:{victim_port}")
+        .parse()
+        .expect("CANNOT MEASURE (harness error): the victim's address");
+    let anchor_addr = format!("127.0.0.1:{anchor_port}")
+        .parse()
+        .expect("CANNOT MEASURE (harness error): the anchor's address");
 
     let rt = Rt::new();
     let (_b1, bravo_v) = rt.block_on(connect(&*bravo, victim_addr, victim_id));
@@ -202,34 +218,40 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         ttl: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     };
-    let genesis = Genesis::create(&s, hostile::now(), policy).unwrap();
+    let genesis = Genesis::create(&s, hostile::now(), policy)
+        .expect("CANNOT MEASURE (harness error): the stranger's genesis");
     let fake = genesis.channel_id();
     let minted = genesis.to_wire();
     let t = hostile::now();
-    let ring2 = PrekeyRing::generate(&s2, &[0x3D; 32], t).unwrap();
-    let witness = JoinWitness::build(&s, &fake, 0, &s2.fingerprint(), t).unwrap();
+    let ring2 = PrekeyRing::generate(&s2, &[0x3D; 32], t)
+        .expect("CANNOT MEASURE (harness error): a prekey ring");
+    let witness = JoinWitness::build(&s, &fake, 0, &s2.fingerprint(), t)
+        .expect("CANNOT MEASURE (harness error): a join witness");
     let s2_bundle = MemberBundleRecord::build(
         &s2,
         &fake,
         0,
-        ring2.bundle(&s2.public_key()).unwrap(),
+        ring2
+            .bundle(&s2.public_key())
+            .expect("CANNOT MEASURE (harness error): a prekey bundle"),
         1,
         t,
         3600,
         Admission::Witnessed(Box::new(witness)),
     )
-    .unwrap()
+    .expect("CANNOT MEASURE (harness error): the second identity's bundle")
     .to_wire();
     let s2_address = RendezvousRecord::build(
         &s2,
         &fake,
         0,
-        EndpointList::new(Vec::new()).unwrap(),
+        EndpointList::new(Vec::new())
+            .expect("CANNOT MEASURE (harness error): an empty endpoint list"),
         1,
         t,
         3600,
     )
-    .unwrap()
+    .expect("CANNOT MEASURE (harness error): the second identity's address record")
     .to_wire();
     let (_s1, s_v) = rt.block_on(connect(&s, victim_addr, victim_id));
     let (_s3, s2_v) = rt.block_on(connect(&s2, victim_addr, victim_id));
@@ -247,35 +269,39 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     );
     assert!(
         asked != CircuitAnswer::Opened && got == 0,
-        "the victim relayed between two identities of a stranger that published a room it minted: \
-         a genesis made its creator a member of a node that holds no such room ({asked:?}, {got} \
-         offered; genesis {published:?}, bundle {joined:?}, address {addressed2:?})"
+        "PRODUCT: the victim relayed between two identities of a stranger that published a room it \
+         minted: a genesis made its creator a member of a node that holds no such room ({asked:?}, \
+         {got} offered; genesis {published:?}, bundle {joined:?}, address {addressed2:?})"
     );
     let (asked, got) = attack(&rt, &s_v, charlie_id, &offered_v);
     println!("[proof] stranger → charlie through the victim: {asked:?}, charlie offered {got}");
     assert!(
         asked != CircuitAnswer::Opened && got == 0,
-        "a stranger that published a genesis it minted had the victim carry its circuit to a real \
-         member ({asked:?}, {got} offered; the genesis: {published:?})"
+        "PRODUCT: a stranger that published a genesis it minted had the victim carry its circuit \
+         to a real member ({asked:?}, {got} offered; the genesis: {published:?})"
     );
 
     // ---- 3. a key nobody witnessed, vouched for by a real member ---------------------------
     let x = stranger(0x77);
     let t = hostile::now();
-    let ring = PrekeyRing::generate(&x, &[0x3C; 32], t).unwrap();
-    let bundle = ring.bundle(&x.public_key()).unwrap();
-    let x_bundle =
-        MemberBundleRecord::build(&x, &room, 0, bundle, 1, t, 3600, Admission::Creator).unwrap();
+    let ring = PrekeyRing::generate(&x, &[0x3C; 32], t)
+        .expect("CANNOT MEASURE (harness error): a prekey ring");
+    let bundle = ring
+        .bundle(&x.public_key())
+        .expect("CANNOT MEASURE (harness error): a prekey bundle");
+    let x_bundle = MemberBundleRecord::build(&x, &room, 0, bundle, 1, t, 3600, Admission::Creator)
+        .expect("CANNOT MEASURE (harness error): X's bundle");
     let x_address = RendezvousRecord::build(
         &x,
         &room,
         0,
-        EndpointList::new(Vec::new()).unwrap(),
+        EndpointList::new(Vec::new())
+            .expect("CANNOT MEASURE (harness error): an empty endpoint list"),
         1,
         t,
         3600,
     )
-    .unwrap();
+    .expect("CANNOT MEASURE (harness error): X's address record");
     let vouched = rt.block_on(put(&bravo_v, &x_bundle.to_wire()));
     println!("[proof] step: bravo publishes X's bundle with no witness → {vouched:?}");
     let (_x1, x_v) = rt.block_on(connect(&x, victim_addr, victim_id));
@@ -285,8 +311,8 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     println!("[proof] X → charlie through the victim: {asked:?}, charlie offered {got}");
     assert!(
         asked != CircuitAnswer::Opened && got == 0,
-        "a key no member witnessed was treated as a member of the victim's board: the victim \
-         carried its circuit to a real member ({asked:?}, {got} offered) after a member \
+        "PRODUCT: a key no member witnessed was treated as a member of the victim's board: the \
+         victim carried its circuit to a real member ({asked:?}, {got} offered) after a member \
          published its bundle with no join witness (bundle {vouched:?}, address {addressed:?})"
     );
 
@@ -296,31 +322,35 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let x2 = stranger(0x78);
     let forger = stranger(0x79);
     let t = hostile::now();
-    let ring = PrekeyRing::generate(&x2, &[0x3E; 32], t).unwrap();
-    let mut forged = JoinWitness::build(&forger, &room, 0, &x2.fingerprint(), t).unwrap();
+    let ring = PrekeyRing::generate(&x2, &[0x3E; 32], t)
+        .expect("CANNOT MEASURE (harness error): a prekey ring");
+    let mut forged = JoinWitness::build(&forger, &room, 0, &x2.fingerprint(), t)
+        .expect("CANNOT MEASURE (harness error): the forged witness");
     forged.witness_id = bravo_id;
     let x2_bundle = MemberBundleRecord::build(
         &x2,
         &room,
         0,
-        ring.bundle(&x2.public_key()).unwrap(),
+        ring.bundle(&x2.public_key())
+            .expect("CANNOT MEASURE (harness error): a prekey bundle"),
         1,
         t,
         3600,
         Admission::Witnessed(Box::new(forged)),
     )
-    .unwrap()
+    .expect("CANNOT MEASURE (harness error): X2's bundle")
     .to_wire();
     let x2_address = RendezvousRecord::build(
         &x2,
         &room,
         0,
-        EndpointList::new(Vec::new()).unwrap(),
+        EndpointList::new(Vec::new())
+            .expect("CANNOT MEASURE (harness error): an empty endpoint list"),
         1,
         t,
         3600,
     )
-    .unwrap()
+    .expect("CANNOT MEASURE (harness error): X2's address record")
     .to_wire();
     let (_x2, x2_v) = rt.block_on(connect(&x2, victim_addr, victim_id));
     let forged_bundle = rt.block_on(put(&x2_v, &x2_bundle));
@@ -333,24 +363,28 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     println!("[proof] X2 → charlie through the victim: {asked:?}, charlie offered {got}");
     assert!(
         forged_bundle.is_err() && asked != CircuitAnswer::Opened && got == 0,
-        "a bundle whose join witness is forged — naming bravo, signed by a stranger — was taken \
-         and its key treated as a member ({forged_bundle:?}, {asked:?}, {got} offered)"
+        "PRODUCT: a bundle whose join witness is forged — naming bravo, signed by a stranger — was \
+         taken and its key treated as a member ({forged_bundle:?}, {asked:?}, {got} offered)"
     );
 
     // ---- 3c. a pre-join put by one identity for another --------------------------------------
     let p = stranger(0x81);
     let q = stranger(0x82);
     let t = hostile::now();
-    let qring = PrekeyRing::generate(&q, &[0x3F; 32], t).unwrap();
+    let qring = PrekeyRing::generate(&q, &[0x3F; 32], t)
+        .expect("CANNOT MEASURE (harness error): a prekey ring");
     let q_prejoin = PreJoinRecord::build(
         &q,
         &room,
-        qring.bundle(&q.public_key()).unwrap(),
-        EndpointList::new(Vec::new()).unwrap(),
+        qring
+            .bundle(&q.public_key())
+            .expect("CANNOT MEASURE (harness error): a prekey bundle"),
+        EndpointList::new(Vec::new())
+            .expect("CANNOT MEASURE (harness error): an empty endpoint list"),
         1,
         t,
     )
-    .unwrap()
+    .expect("CANNOT MEASURE (harness error): Q's pre-join")
     .to_wire();
     let (_p1, p_v) = rt.block_on(connect(&p, victim_addr, victim_id));
     let (_p2, p_a) = rt.block_on(connect(&p, anchor_addr, anchor_id));
@@ -359,8 +393,8 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     println!("[proof] step: P puts Q's pre-join → victim {on_victim:?}, anchor {on_anchor:?}");
     assert!(
         on_victim.is_err() && on_anchor.is_err(),
-        "a pre-join was taken from an identity other than the one it names — one connection can \
-         fill a room's pre-join slots (victim {on_victim:?}, anchor {on_anchor:?})"
+        "PRODUCT: a pre-join was taken from an identity other than the one it names — one \
+         connection can fill a room's pre-join slots (victim {on_victim:?}, anchor {on_anchor:?})"
     );
 
     // ---- 4. the stranger's own room, on the anchor ----------------------------------------
@@ -369,8 +403,8 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     println!("[proof] step: the stranger publishes its genesis to the anchor → {anchored:?}");
     assert!(
         anchored.is_ok(),
-        "CANNOT MEASURE: the anchor refused the stranger's room ({anchored:?}); an anchor keeps a \
-         board for any room brought to it, so this is the case that has to be safe"
+        "PRODUCT (staging): the anchor refused the stranger's room ({anchored:?}); an anchor keeps \
+         a board for any room brought to it, so this is the case that has to be safe"
     );
     // The anchor adopts a room on its tick; give it one.
     std::thread::sleep(Duration::from_secs(2));
@@ -378,7 +412,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     println!("[proof] stranger → charlie through the anchor: {asked:?}, charlie offered {got}");
     assert!(
         asked != CircuitAnswer::Opened && got == 0,
-        "the anchor carried a circuit from the creator of a room a stranger brought it to a member \
-         of a different room ({asked:?}, {got} offered)"
+        "PRODUCT: the anchor carried a circuit from the creator of a room a stranger brought it to \
+         a member of a different room ({asked:?}, {got} offered)"
     );
 }

@@ -81,9 +81,12 @@ impl std::fmt::Debug for SharedPolicy {
 /// **For proofs only.** When set, a comma-separated list of `ip:port`: this node advertises exactly
 /// those addresses instead of what the ADR-012 ladder found. The R41 throughput proof points a host at
 /// a link emulator this way, so the tunnel's packets cross the same emulated link as the raw
-/// transfer it is compared with. Nothing a person runs sets it; unset, nothing changes.
+/// transfer it is compared with. Nothing a person runs sets it; unset, nothing changes. Not compiled
+/// in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 
+#[cfg(feature = "test-knobs")]
 fn test_advertise() -> Option<EndpointList> {
     let value = std::env::var(TEST_ADVERTISE_ENV).ok()?;
     let addrs: Vec<crate::nat::multiaddr::Multiaddr> = value
@@ -490,6 +493,7 @@ impl NodeNet {
     /// node bound to a concrete address and merely useless for one bound to the
     /// wildcard.
     pub fn local_endpoints(&self) -> Result<EndpointList> {
+        #[cfg(feature = "test-knobs")]
         if let Some(list) = test_advertise() {
             return Ok(list);
         }
