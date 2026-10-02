@@ -301,11 +301,14 @@ envelope MUST carry only what the log does not know:**
   > **MUST** carry fingerprints: each entry is an addressee's full base32 fingerprint, optionally
   > followed by `/` and the agent name (`VOX_AGENT_NAME`) or session it answers to
   > (`[A-Za-z0-9._@:+-]{1,64}`). Without one, every session of that node is addressed. The
-  > sender resolves what it typed once (`vox room post --to` takes a room member's fingerprint
-  > or a unique prefix of one, as `handoff --to` does). A receiver matches on its own
-  > fingerprint, never on a name, and every reader shows each addressee by its own keyring's
-  > name for it, or by the fingerprint when it has none. An entry that is not a fingerprint
-  > addresses nobody.
+  > sender resolves what it typed once: `vox room post --to` takes the sending node's own keyring
+  > name for a room member, or its fingerprint or a unique prefix of one. A receiver matches on
+  > its own fingerprint, never on a name. **Each node has its own keyring and reads no other**
+  > (the decider, 2026-10-02): every surface of a node, an agent's drain and `room read` as much
+  > as the TUI, shows each addressee by that node's own keyring name, or by the fingerprint
+  > when it has none. So the control socket answers `Names`, read-only and without the identity
+  > passphrase; editing the keyring still needs it. An entry that is not a fingerprint addresses
+  > nobody.
 - `re` correlates a reply to one message; `thread` names the conversation root. They are distinct, as
   in FIPA (`in-reply-to` vs `conversation-id`) and A2A (`taskId` vs `contextId`).
 - **`not-understood`** is the one mandatory reply: a receiver that cannot act on a message addressed

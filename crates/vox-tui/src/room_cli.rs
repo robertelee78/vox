@@ -496,7 +496,8 @@ pub async fn post_cmd(
 
 /// `--to` as typed, resolved **once, by the sender**, to what the wire carries: each entry a
 /// room member's full fingerprint, optionally followed by `/` and an agent name or session
-/// (PRD-001 R15).
+/// (PRD-001 R15). The member is named by this node's own keyring name for it, or by its
+/// fingerprint (a unique prefix of one in `vox room roster`).
 ///
 /// A name the sender gave someone is local to the sender, so a message that carried it would
 /// address a different member, or nobody, on every other node. A fingerprint is the same
@@ -515,6 +516,7 @@ async fn resolve_addressees(
         Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
+    let names = crate::ident::own_names(client).await;
     let mut out: Vec<String> = Vec::with_capacity(typed.len());
     for t in typed {
         let (who, sub) = match t.split_once('/') {
@@ -528,12 +530,23 @@ async fn resolve_addressees(
                 vox_agentcomms::envelope::MAX_NAME
             )));
         }
-        let fp = resolve_prefix(who, &members).map_err(|e| {
-            AppError::Usage(format!(
-                "--to {t:?} names a room member by fingerprint (a unique prefix of one in \
-                 `vox room roster`), optionally followed by /<agent name or session>: {e}"
-            ))
-        })?;
+        // This node's own name first: it is what the person typed it as, and it is only ever
+        // this node's. A name that is not a member here addresses nobody, so it is refused.
+        let fp = match names.iter().find(|(_, n)| n == who) {
+            Some((fp, _)) if members.contains(fp) => *fp,
+            Some(_) => {
+                return Err(AppError::Usage(format!(
+                    "--to {t:?}: {who:?} is a name in your keyring, but not a member of this room"
+                )))
+            }
+            None => resolve_prefix(who, &members).map_err(|e| {
+                AppError::Usage(format!(
+                    "--to {t:?} names a room member by your name for it (`vox trust list`) or by \
+                     fingerprint (a unique prefix of one in `vox room roster`), optionally \
+                     followed by /<agent name or session>: {e}"
+                ))
+            })?,
+        };
         let wire = vox_agentcomms::envelope::Addressee {
             fp,
             sub: sub.map(str::to_owned),
@@ -631,6 +644,7 @@ fn row_json(
     r: &vox_core::node::api::MessageRow,
     ops: &vox_agentcomms::ops::OpIndex,
     status_override: Option<&str>,
+    names: &[(Digest32, String)],
 ) -> String {
     let parsed = Envelope::parse(&r.text);
     let (envelope, parse_error) = match &parsed {
@@ -655,14 +669,21 @@ fn row_json(
             "group": group.iter().map(claim::b32).collect::<Vec<_>>(),
         }))
     });
-    // **Who it is addressed to, as fingerprints** (PRD-001 R15): `envelope.to` read, with any
-    // entry that is not a fingerprint left out, since it addresses nobody.
+    // **Who it is addressed to** (PRD-001 R15): `envelope.to` read, with any entry that is not a
+    // fingerprint left out, since it addresses nobody. `name` is this node's own keyring name for
+    // the addressee, or null where it has none; never a name another node gave it.
     let addressed: Vec<serde_json::Value> = parsed
         .as_ref()
         .map(Envelope::addressees)
         .unwrap_or_default()
         .iter()
-        .map(|a| serde_json::json!({ "fp": claim::b32(&a.fp), "sub": a.sub }))
+        .map(|a| {
+            let name = names
+                .iter()
+                .find(|(id, n)| *id == a.fp && !n.trim().is_empty())
+                .map(|(_, n)| n.clone());
+            serde_json::json!({ "fp": claim::b32(&a.fp), "sub": a.sub, "name": name })
+        })
         .collect();
     serde_json::json!({
         "schema": "vox.room.row/1",
@@ -796,6 +817,7 @@ pub async fn read(
     // The operation index needs the whole room, not only what follows the cursor: an
     // entry after it may repeat, or conflict with, one before it.
     let all = coord::read_all(&mut client, channel_id, None).await?;
+    let names = crate::ident::own_names(&mut client).await;
     let wanted = after_cursor(&all, since)?;
     let mut ops = vox_agentcomms::ops::OpIndex::new();
     for p in coord::posted_of(&all) {
@@ -812,7 +834,7 @@ pub async fn read(
         .filter(|r| r.late || !only_late)
         .take(take)
     {
-        let _ = writeln!(out, "{}", row_json(&room_key, r, &ops, None));
+        let _ = writeln!(out, "{}", row_json(&room_key, r, &ops, None, &names));
     }
     Ok(())
 }
@@ -961,6 +983,7 @@ pub async fn tail(
             .collect(),
     };
 
+    let names = crate::ident::own_names(&mut lookup).await;
     let mut ops = vox_agentcomms::ops::OpIndex::new();
     let mut seen: std::collections::HashSet<Digest32> = std::collections::HashSet::new();
     let mut by_hash: std::collections::HashMap<Digest32, vox_core::node::api::MessageRow> =
@@ -990,7 +1013,7 @@ pub async fn tail(
     }
     backlog.sort_by_key(|r| r.arrival);
     for r in backlog {
-        emit_row(&mut out, &room_key, r, &ops, json, None);
+        emit_row(&mut out, &room_key, r, &ops, json, None, &names);
         last = Some(r.entry_hash);
     }
 
@@ -1007,7 +1030,7 @@ pub async fn tail(
             newly_conflicted = ops.insert(r.entry_hash, r.author, r.created_millis, e);
         }
         by_hash.insert(r.entry_hash, r.clone());
-        emit_row(out, &room_key, &r, ops, json, None);
+        emit_row(out, &room_key, &r, ops, json, None, &names);
         if newly_conflicted && json {
             if let Some(e) = &parsed {
                 for earlier in ops.group_of(r.author, e) {
@@ -1015,7 +1038,7 @@ pub async fn tail(
                         continue;
                     }
                     if let Some(row) = by_hash.get(&earlier) {
-                        emit_row(out, &room_key, row, ops, json, Some("conflict"));
+                        emit_row(out, &room_key, row, ops, json, Some("conflict"), &names);
                     }
                 }
             }
@@ -1103,9 +1126,10 @@ fn emit_row(
     ops: &vox_agentcomms::ops::OpIndex,
     json: bool,
     status: Option<&str>,
+    names: &[(Digest32, String)],
 ) {
     let line = if json {
-        row_json(room_key, r, ops, status)
+        row_json(room_key, r, ops, status, names)
     } else {
         plain_row(r)
     };

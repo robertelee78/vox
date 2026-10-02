@@ -7,11 +7,13 @@
 //!
 //! Where the keyring's petnames are at hand (the TUI holds the node's view), a trusted member is
 //! shown by the name the operator gave it, and anyone else by [`AUTHOR_CHARS`] of its fingerprint,
-//! marked as not in the keyring. Surfaces that speak to a node over its control socket cannot read
-//! the keyring (it is sealed under the identity passphrase, ADR-020 §3), so they show the
-//! fingerprint at [`AUTHOR_CHARS`] and make no claim about trust either way.
+//! marked as not in the keyring. Surfaces that speak to a node over its control socket show authors
+//! by the fingerprint at [`AUTHOR_CHARS`] and make no claim about trust either way. **Addressees**
+//! are shown by the node's own names on every surface (PRD-001 R15): the socket answers
+//! [`own_names`] read-only, since every node shows its own keyring's names and no other's.
 
 use vox_core::hash::Digest32;
+use vox_core::node::ipc::{Frame, IpcClient};
 use vox_core::node::link::b32_encode;
 
 /// Base32 characters of a fingerprint shown wherever a member is named without a keyring name:
@@ -60,6 +62,16 @@ pub fn keyring_name(trusted: &[(Digest32, String)], me: Option<&Digest32>, fp: &
     match trusted.iter().find(|(id, _)| id == fp) {
         Some((_, petname)) if !petname.trim().is_empty() => petname.clone(),
         _ => author_id(fp),
+    }
+}
+
+/// This node's own names for its trusted members, read over its control socket without a
+/// passphrase (PRD-001 R15). Empty when the node gives none — locked, or refusing — so a reader
+/// is shown fingerprints, never a name it does not hold.
+pub async fn own_names(client: &mut IpcClient) -> Vec<(Digest32, String)> {
+    match client.names().await {
+        Ok(Frame::Trusted { entries }) => entries,
+        _ => Vec::new(),
     }
 }
 

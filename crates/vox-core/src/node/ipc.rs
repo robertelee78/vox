@@ -283,6 +283,12 @@ const T_RENAME: u64 = 25;
 // request can tell a node at work from a suspended or stuck one. Not a protocol bump: a node that
 // does not know it answers with an error, and any answer is proof of life.
 const T_PING: u64 = 17;
+// **This node's own names, read-only** (PRD-001 R15). A node shows every member by the name its own
+// keyring gives it, or by its fingerprint where it has none, and an agent's surfaces (the drain,
+// `vox room read`) are that node's as much as the TUI is. Reading the names grants nothing and
+// changes nothing, so it needs no passphrase; adding, removing or renaming still does. No node
+// reads another node's keyring: this answers only for the node the socket belongs to.
+const T_NAMES: u64 = 30;
 
 /// What a client sends.
 ///
@@ -444,6 +450,13 @@ pub enum Request {
         /// The identity passphrase, proving this is the operator and not an agent.
         identity_passphrase: String,
     },
+    /// This node's names for its trusted members, `(fingerprint, petname)`, read-only and
+    /// without a passphrase (PRD-001 R15). Answered with [`Frame::Trusted`], paged as
+    /// [`Request::TrustList`] is.
+    Names {
+        /// The last fingerprint of the previous page, or `None` for the first.
+        after: Option<Digest32>,
+    },
     /// Read the trust keyring. Requires the identity passphrase.
     TrustList {
         /// The identity passphrase.
@@ -600,6 +613,11 @@ impl Request {
                     .bytes(target)
                     .text(identity_passphrase);
             }
+            Request::Names { after } => {
+                e.array(2)
+                    .uint(T_NAMES)
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]));
+            }
             Request::TrustList {
                 identity_passphrase,
                 after,
@@ -751,6 +769,12 @@ impl Request {
                     identity_passphrase: std::mem::take(&mut *identity_passphrase),
                     after: None,
                 })
+            }
+            (T_NAMES, 2) => {
+                let after = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Names { after })
             }
             (T_TRUST_LIST, 3) => {
                 let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
@@ -2256,6 +2280,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
+        Request::Names { after } => Frame::Trusted {
+            entries: page(handle.view().trusted, after, |(id, petname)| {
+                (*id, petname.len())
+            }),
+        },
         Request::TrustList {
             identity_passphrase,
             after,
@@ -2900,6 +2929,32 @@ impl IpcClient {
                     }
                     after = Some(last.0);
                     all.extend(rooms);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// This node's names for its trusted members, however many pages that takes — as one
+    /// [`Frame::Trusted`], `(fingerprint, petname)` in fingerprint order, or the first reply
+    /// that was not (an error) (PRD-001 R15). Read-only; needs no passphrase.
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn names(&mut self) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            match self.request(&Request::Names { after }).await? {
+                Frame::Trusted { entries } => {
+                    let Some(last) = entries.last() else {
+                        return Ok(Frame::Trusted { entries: all });
+                    };
+                    if after.is_some_and(|a| last.0 <= a) {
+                        return Err(Error::MalformedIpc("ipc names page did not advance"));
+                    }
+                    after = Some(last.0);
+                    all.extend(entries);
                 }
                 other => return Ok(other),
             }

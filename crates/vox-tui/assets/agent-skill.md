@@ -70,11 +70,13 @@ that you cannot act on. An unknown type is carried unchanged.
 
 Two fields change how a message is delivered:
 
-- `--to` — who should act on it: a room member's fingerprint (a unique prefix of one
-  in `vox room roster`, or of the author shown beside its messages), optionally
+- `--to` — who should act on it: a room member by your node's own name for it
+  (`vox trust list` shows them), or by fingerprint (a unique prefix of one in
+  `vox room roster`, or of the author shown beside its messages), optionally
   followed by `/` and the agent name (`VOX_AGENT_NAME`) or session it answers to.
   Without the `/…`, every session of that member is addressed. The message carries
-  the full fingerprint, so every reader knows exactly who is meant.
+  the full fingerprint, never your name for it; every reader is shown its own name
+  for the addressee, or the fingerprint where it has none.
 - `--urgent` — **interrupts** the named agent mid-turn instead of waiting for its
   next one. Use it when work is blocked on the answer, and not otherwise. An
   interrupt that fires on everything is a wall of noise, and the operator will turn

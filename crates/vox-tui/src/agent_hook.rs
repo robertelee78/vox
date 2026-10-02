@@ -263,6 +263,12 @@ fn lost_claims(
         .collect()
 }
 
+/// What a drain names members by: this node's own keyring, and its own fingerprint.
+struct Names<'a> {
+    trusted: &'a [(Digest32, String)],
+    me: Option<Digest32>,
+}
+
 /// Whether `row` is this very session's own message: the same author fingerprint
 /// **and** the same session.
 fn is_own(row: &vox_core::node::api::MessageRow, me: Option<Digest32>, session: &str) -> bool {
@@ -317,10 +323,12 @@ fn is_line_break(c: char) -> bool {
 ///
 /// Other control characters are replaced rather than passed through, for the same
 /// reason line breaks are: whatever displays this must not be steered by the text.
-fn render_row(out: &mut String, r: &vox_core::node::api::MessageRow) {
-    // **Addressees by fingerprint** (PRD-001 R15): what the wire carries, and the only name this
-    // surface has for anyone, since a socket client cannot read the keyring (`ident`).
-    let to = crate::ident::addressed(&r.text, crate::ident::author_id);
+fn render_row(out: &mut String, r: &vox_core::node::api::MessageRow, names: &Names<'_>) {
+    // **Addressees by this node's own names** (PRD-001 R15): the wire carries fingerprints, and
+    // each is shown by the name this node's keyring gives it, or by the fingerprint.
+    let to = crate::ident::addressed(&r.text, |fp| {
+        crate::ident::keyring_name(names.trusted, names.me.as_ref(), fp)
+    });
     let who = if to.is_empty() {
         crate::ident::author_id(&r.author)
     } else {
@@ -427,12 +435,13 @@ fn render(
     room_label: &str,
     rows: &[vox_core::node::api::MessageRow],
     notice: Option<&str>,
+    names: &Names<'_>,
 ) -> (String, usize) {
     let mut body = String::new();
     let mut shown = 0usize;
     for r in rows.iter().take(MAX_INJECTED_MESSAGES) {
         let mut one = String::new();
-        render_row(&mut one, r);
+        render_row(&mut one, r, names);
         if shown > 0 && body.len() + one.len() > MAX_INJECTED_BYTES {
             break;
         }
@@ -850,7 +859,12 @@ async fn drain(
     // it was.
     let mut upto = rows.iter().rev().find(|r| !r.owed);
     if !fresh.is_empty() {
-        let (text, shown) = render(&label, &fresh, notice.as_deref());
+        let trusted = crate::ident::own_names(&mut client).await;
+        let names = Names {
+            trusted: &trusted,
+            me,
+        };
+        let (text, shown) = render(&label, &fresh, notice.as_deref(), &names);
         context.push_str(&text);
         if shown < fresh.len() {
             upto = fresh.get(shown.saturating_sub(1));
