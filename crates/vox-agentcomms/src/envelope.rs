@@ -57,16 +57,10 @@ pub fn is_valid_work(s: &str) -> bool {
 
 /// The suggested work vocabulary, shipped as convention rather than enforced.
 ///
-/// Shaped to map onto A2A's `TaskState` so a bridge is mechanical later. Nothing
-/// in this crate requires an agent to use these — an unknown type is carried
-/// unchanged — but a room whose agents agree on them gets a board view for free.
+/// Each is a heads-up to the room, never a work record: who holds a task and how far it got
+/// is on the work item's GitHub issue (V030-26). Nothing in this crate requires an agent to
+/// use these — an unknown type is carried unchanged.
 pub mod work {
-    /// Offer a unit of work to someone.
-    pub const ASSIGN: &str = "assign";
-    /// Take it.
-    pub const ACCEPT: &str = "accept";
-    /// Refuse it.
-    pub const DECLINE: &str = "decline";
     /// In progress.
     pub const WORKING: &str = "working";
     /// Stuck, and why. A Health observation for a tracker — never a Work phase.

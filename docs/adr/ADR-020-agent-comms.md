@@ -6,7 +6,8 @@ milestone `DONE` with the commit that landed it, or leaves it unmarked. Nothing 
 that has not passed a gate.
 
 **Built**: §1 (the app tier — `crates/vox-agentcomms`), §3 (the trust keyring), §4 (the envelope),
-§5 (the claim model, now reachable from the product as `vox room claim|release|handoff|board`),
+§5 (the claim model — built, then **removed by V030-26, #348, 2026-10-02**: Vox holds no task
+state; see the amendment at §5),
 §6 (the drain hook, **proven against a live model in all three harnesses**), §7 (the event fan-out
 and the control socket), §8 (the `vox room` verbs), §12 (`vox daemon`).
 
@@ -77,6 +78,13 @@ The decider was explicit, and it bounds the whole design:
 A typical day is a 1:1 chat room with one agent (ctm-over-vox, a **separate** effort belonging to the
 chat app) **plus** that agent in an agent-comms room with three or four others, which the operator
 may also join. Agent comms is therefore not a mirror of agent activity and MUST NOT become one.
+
+> **Amended 2026-10-02 (the decider; V210-131, V030-26).** "github is the authority, vox is the
+> nagging reminder." The room is for asking for help, volunteering, asking for status, urgent
+> wakes and decisions. **Who holds a task, and how far it got, is the work item's GitHub issue**,
+> maintained by the agents through awa (agent-work-accountability). The volunteer takes work by
+> recording its attempt on the issue; nobody assigns or locks. A takeover after repeated
+> unanswered status asks is a written rule in the agent instructions, not code.
 
 ### Prior art surveyed
 
@@ -319,6 +327,14 @@ A2A's `TaskState` so a future bridge is mechanical.
 > the code as well as this list (ADR-021 F7, closed).
 
 ### 5. Work assignment is a claim, and the log resolves it
+
+> **Removed by V030-26 (#348, the decider 2026-10-02).** Everything in this section and its
+> ADR-021 corrections — `claim`, `release`, `handoff`, `renew`, `decline`, `board`, the fold, its
+> leases and the version gate that protected it — is gone from the product. It was a second
+> ownership clock beside the GitHub issue awa maintains ("a man with two watches never knows what
+> time it is"). Taking, asking about and handing over work are ordinary messages carrying
+> `--work <awa key>`; the issue's open attempt says who holds a task. The text below is kept as
+> the record of what was built and why it was removed, not as a description of the product.
 
 Borrowed from ruflo's agentbbs, which solved this problem in the same shape. "Assignment of work" is
 literally a claim, and a converging log resolves ownership with **no coordinator**:

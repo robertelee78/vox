@@ -79,7 +79,7 @@ just after the newest thing it saw. **A `seen` hash a node does not hold never b
 (entries arrive out of order); it contributes nothing until it arrives, and then the clocks of what
 named it, and their descendants, are raised to what the full set requires — the same result as if
 everything had arrived in causal order. `Dag::happened_before(a, b)` is the causal relation itself
-(ancestor through feeds and `seen`), the seam claims (ADR-020/021, R17) are to be built on.
+(ancestor through feeds and `seen`).
 
 **Canonical serialization (normative, series-wide — the one encoding every ADR signs over).** Every
 signed/authenticated structure in Vox — log entries (here), SKDMs (ADR-006), certificates and consent

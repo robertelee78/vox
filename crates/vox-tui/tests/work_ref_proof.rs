@@ -1,38 +1,15 @@
-//! ADR-021 §2 — **a work reference has one shape, and an attempt id is seeded from the
-//! log**, through the shipped `vox` binary.
+//! ADR-021 §2 — **a work reference has one shape**, through the shipped `vox` binary.
 //!
-//! A tracker keys its items however it keys them; the one it is built for keys them
-//! `OWNER/REPO:SOURCE:ITEM`. A reference is `<scheme>:<id>`, and the id may contain `:`,
-//! so such a key rides in `data.work` byte for byte. Anything else is refused before it
-//! is posted — by whichever flag carried it, because `--data '{"work":…}'` is the same
-//! message as `--work` and must not be a way around the check.
+//! A work item is named by awa's work key, `OWNER/REPO:SOURCE:ITEM`, under a scheme. A
+//! reference is `<scheme>:<id>`, and the id may contain `:`, so such a key rides in
+//! `data.work` byte for byte. Anything else is refused before it is posted — by whichever
+//! flag carried it, because `--data '{"work":…}'` is the same message as `--work` and must
+//! not be a way around the check.
 //!
-//! A tracker correlates the posts of one attempt by id, and an agent should not have to
-//! mint one. So a work-bound post from the session that holds the claim on that item
-//! carries a **seeded id** in `data.attempt` — the claim's acquisition, or the holder's
-//! latest `failed` since it. Seeding starts nothing: an attempt becomes active only on the
-//! holder's `working` (ADR-021 §3), which `tracker_rehearsal_proof` proves with a tracker.
-//! This proof covers the seeding:
-//!
-//! 1. a skill-shaped key is accepted and carried unchanged;
-//! 2. malformed references are refused (exit 1) and nothing is posted — by `--work`, by
-//!    `--data`, and by `claim --work`;
-//! 3. the holder's post carries the acquisition the board shows; a session that does not
-//!    hold the claim gets no id; an explicit `--attempt` wins;
-//! 4. a `failed` carries the id it ends, and seeds the next one: the holder's next post
-//!    carries that `failed` entry's hash, and so on for every failure — every retry's id
-//!    is derivable from the log;
-//! 5. release and claim again seeds a **new** id;
-//! 6. retrying an `--op` after the claim was re-taken is still the same message — it
-//!    keeps the attempt its first post carried, instead of turning into a conflict.
-//! 7. two `failed` entries never seed (ADR-021 F20): **a retried `failed` seeds from its
-//!    first entry**, not the retry, and **a `failed` whose operation is void seeds nothing**.
-//!    Both need a second entry under one `(author, op)` that the CLI's own lookup would have
-//!    prevented, which is what a writer racing the CLI produces. The first `failed` is
-//!    `vox room post`'s; the racing copy is written onto the control socket as the bytes that
-//!    writer writes, as `work_op_proof` does for the same staging. The proof checks each
-//!    row's `op.status` (`duplicate`, `conflict`) and says APPARATUS if the staging did not
-//!    take.
+//! 1. a skill-shaped key is accepted and carried unchanged, and nothing is added beside it:
+//!    a work-bound post carries no attempt id, because Vox holds no task state (V030-26);
+//! 2. malformed references are refused (exit 1) and nothing is posted — by `--work` and by
+//!    `--data`.
 
 #![cfg(unix)]
 
@@ -41,9 +18,9 @@ mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use support::{post_raw, resource, Out, Worker};
+use support::{Out, Worker};
 
-/// The key shape of the work-accountability tracker, under a scheme.
+/// awa's work-key shape, under its scheme.
 const KEY: &str = "gwa:robertelee78/vox:adr-021:m21.3";
 
 fn rows(w: &Worker, r: &str) -> Vec<serde_json::Value> {
@@ -73,19 +50,9 @@ fn data_of(w: &Worker, r: &str, posted: &Out) -> serde_json::Value {
         .clone()
 }
 
-fn acquisition(w: &Worker, r: &str, key: &str) -> String {
-    let b = w.vox(Some("holder"), &["room", "board", r, "--json"]);
-    assert!(b.ok, "{b:?}");
-    resource(&b.json(), key).unwrap_or_else(|| panic!("{key} not on the board: {b:?}"))
-        ["acquisition"]
-        .as_str()
-        .expect("a held resource names its acquisition")
-        .to_owned()
-}
-
 #[test]
 #[ignore = "two networked nodes with production Argon2id; CI runs it in release"]
-fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
+fn a_work_reference_has_one_shape() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -100,7 +67,16 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
     // ---- (1) the tracker's own key, colons and all, is carried unchanged ----
     let ok = post(alice, "other", r, &["--work", KEY], "reading the ADR");
     assert!(ok.ok, "a skill-shaped work key must be accepted: {ok:?}");
-    assert_eq!(data_of(alice, r, &ok)["work"], KEY, "carried byte for byte");
+    let data = data_of(alice, r, &ok);
+    assert_eq!(
+        data["work"], KEY,
+        "PRODUCT: the key must be carried byte for byte"
+    );
+    assert!(
+        data.get("attempt").is_none(),
+        "PRODUCT: a work-bound post carries an attempt id, which is task state Vox no longer \
+         keeps: {data}"
+    );
 
     // ---- (2) anything else is refused, whichever flag carried it ----
     let before = rows(alice, r).len();
@@ -117,12 +93,7 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         let via_flag = post(alice, "other", r, &["--work", bad], "x");
         let data = serde_json::json!({ "work": bad }).to_string();
         let via_data = post(alice, "other", r, &["--data", &data], "x");
-        let via_claim = alice.vox(Some("other"), &["room", "claim", r, "--work", bad]);
-        for (how, o) in [
-            ("--work", &via_flag),
-            ("--data", &via_data),
-            ("claim --work", &via_claim),
-        ] {
+        for (how, o) in [("--work", &via_flag), ("--data", &via_data)] {
             assert_eq!(
                 o.code,
                 Some(1),
@@ -140,252 +111,5 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         rows(alice, r).len(),
         before,
         "a refused reference must post nothing"
-    );
-
-    // ---- (3) the holder's post names the claim's acquisition ----
-    let claimed = alice.vox(Some("holder"), &["room", "claim", r, "--work", KEY]);
-    assert!(claimed.ok, "{claimed:?}");
-    let first = acquisition(alice, r, KEY);
-    let mine = post(
-        alice,
-        "holder",
-        r,
-        &["--work", KEY, "--op", "op-attempt-0001"],
-        "porting",
-    );
-    assert!(mine.ok, "{mine:?}");
-    assert_eq!(
-        data_of(alice, r, &mine)["attempt"],
-        first.as_str(),
-        "the holder's work-bound post must carry its claim's acquisition as the attempt"
-    );
-    let theirs = post(alice, "bystander", r, &["--work", KEY], "watching");
-    assert!(theirs.ok, "{theirs:?}");
-    assert!(
-        data_of(alice, r, &theirs).get("attempt").is_none(),
-        "a session that does not hold the claim has no attempt to name"
-    );
-    let named = post(
-        alice,
-        "holder",
-        r,
-        &["--work", KEY, "--attempt", "a-explicit"],
-        "named",
-    );
-    assert!(named.ok, "{named:?}");
-    assert_eq!(
-        data_of(alice, r, &named)["attempt"],
-        "a-explicit",
-        "an explicit --attempt wins"
-    );
-
-    // ---- (4) a `failed` carries the id it ends and seeds the retry's ----
-    let failed = post_as(
-        alice,
-        "holder",
-        r,
-        "failed",
-        &["--work", KEY, "--data", r#"{"reason":"tests red"}"#],
-        "first try failed",
-    );
-    assert!(failed.ok, "{failed:?}");
-    assert_eq!(
-        data_of(alice, r, &failed)["attempt"],
-        first.as_str(),
-        "a `failed` must name the attempt that failed"
-    );
-    let retry1 = post(alice, "holder", r, &["--work", KEY], "trying again");
-    assert!(retry1.ok, "{retry1:?}");
-    assert_eq!(
-        data_of(alice, r, &retry1)["attempt"],
-        failed.json()["entry_hash"],
-        "after a `failed`, the holder's next post must carry a NEW id, seeded by that failure"
-    );
-    let failed2 = post_as(
-        alice,
-        "holder",
-        r,
-        "failed",
-        &["--work", KEY, "--data", r#"{"reason":"still red"}"#],
-        "second try failed",
-    );
-    assert!(failed2.ok, "{failed2:?}");
-    assert_eq!(
-        data_of(alice, r, &failed2)["attempt"],
-        failed.json()["entry_hash"],
-        "the second `failed` names the second attempt"
-    );
-    let retry2 = post(alice, "holder", r, &["--work", KEY], "third try");
-    assert!(retry2.ok, "{retry2:?}");
-    assert_eq!(
-        data_of(alice, r, &retry2)["attempt"],
-        failed2.json()["entry_hash"],
-        "every failure seeds the next id, not only the first"
-    );
-
-    // ---- (5) release and claim again: a new id ----
-    let released = alice.vox(Some("holder"), &["room", "release", r, KEY]);
-    assert!(released.ok, "{released:?}");
-    let again = alice.vox(Some("holder"), &["room", "claim", r, "--work", KEY]);
-    assert!(again.ok, "{again:?}");
-    let second = acquisition(alice, r, KEY);
-    assert_ne!(first, second, "a new claim must be a new acquisition");
-    let next = post(alice, "holder", r, &["--work", KEY], "second go");
-    assert!(next.ok, "{next:?}");
-    assert_eq!(
-        data_of(alice, r, &next)["attempt"],
-        second.as_str(),
-        "a post after re-claiming must carry the NEW id"
-    );
-
-    // ---- (6) an --op retried after the re-claim is still the same message ----
-    let retry = post(
-        alice,
-        "holder",
-        r,
-        &["--work", KEY, "--op", "op-attempt-0001"],
-        "porting",
-    );
-    assert!(
-        retry.ok,
-        "a retry after the claim was re-taken must not become a conflict: {retry:?}"
-    );
-    assert_eq!(retry.json()["status"], "already-posted", "{retry:?}");
-    assert_eq!(retry.json()["entry_hash"], mine.json()["entry_hash"]);
-
-    // ---- (7) a retried `failed` seeds from its first entry; a void one seeds nothing ----
-    let rows_of_op = |op: &str| -> Vec<serde_json::Value> {
-        let mut v: Vec<serde_json::Value> = rows(alice, r)
-            .into_iter()
-            .filter(|x| x["envelope"]["data"]["op"] == op)
-            .collect();
-        v.sort_by_key(|x| {
-            (
-                x["created_millis"].as_u64().unwrap_or_else(|| {
-                    panic!("PRODUCT: a row of `room read --json` has no created_millis: {x}")
-                }),
-                x["entry_hash"]
-                    .as_str()
-                    .unwrap_or_else(|| {
-                        panic!("PRODUCT: a row of `room read --json` has no entry_hash: {x}")
-                    })
-                    .to_owned(),
-            )
-        });
-        v
-    };
-    let failed3 = post_as(
-        alice,
-        "holder",
-        r,
-        "failed",
-        &["--work", KEY, "--op", "op-f20-retried"],
-        "tests red",
-    );
-    assert!(
-        failed3.ok,
-        "PRODUCT: the holder's `failed` was refused: {failed3:?}"
-    );
-    let first_failed = failed3.json()["entry_hash"]
-        .as_str()
-        .unwrap_or_else(|| panic!("PRODUCT: `room post --json` named no entry_hash: {failed3:?}"))
-        .to_owned();
-    let row = rows(alice, r)
-        .into_iter()
-        .find(|x| x["entry_hash"] == first_failed.as_str())
-        .unwrap_or_else(|| {
-            panic!("PRODUCT: `room read` does not return the `failed` that `room post` accepted: {failed3:?}")
-        });
-    let text = row["text"]
-        .as_str()
-        .unwrap_or_else(|| panic!("PRODUCT: a row of `room read --json` has no text: {row}"))
-        .to_owned();
-    std::thread::sleep(std::time::Duration::from_millis(20)); // the copy lands later
-    rt.block_on(post_raw(alice, room.cid, &text));
-    let retried = rows_of_op("op-f20-retried");
-    assert!(
-        retried.len() == 2
-            && retried[0]["entry_hash"] == first_failed.as_str()
-            && retried[1]["op"]["status"] == "duplicate",
-        "APPARATUS (staging not achieved): not one `failed` and its later duplicate: {retried:?}"
-    );
-    let next = post(
-        alice,
-        "holder",
-        r,
-        &["--work", KEY],
-        "after the retried failure",
-    );
-    assert!(next.ok, "PRODUCT: {next:?}");
-    let seeded = data_of(alice, r, &next)["attempt"].clone();
-    eprintln!(
-        "[proof] retried failed: first {first_failed}, copy {}; next post seeded {seeded}",
-        retried[1]["entry_hash"]
-    );
-    assert!(
-        seeded == first_failed.as_str(),
-        "PRODUCT: a retried `failed` must seed from its FIRST entry {first_failed}, never the \
-         duplicate; the next post seeded {seeded}"
-    );
-
-    let void = post_as(
-        alice,
-        "holder",
-        r,
-        "failed",
-        &[
-            "--work",
-            KEY,
-            "--op",
-            "op-f20-void",
-            "--data",
-            r#"{"reason":"flaky network"}"#,
-        ],
-        "failed: flaky network",
-    );
-    assert!(
-        void.ok,
-        "PRODUCT: the holder's `failed` was refused: {void:?}"
-    );
-    let row = rows(alice, r)
-        .into_iter()
-        .find(|x| x["entry_hash"] == void.json()["entry_hash"])
-        .unwrap_or_else(|| {
-            panic!("PRODUCT: `room read` does not return the `failed` that `room post` accepted: {void:?}")
-        });
-    let text = row["text"]
-        .as_str()
-        .unwrap_or_else(|| panic!("PRODUCT: a row of `room read --json` has no text: {row}"));
-    let mut racing = vox_agentcomms::envelope::Envelope::parse(text).unwrap_or_else(|e| {
-        panic!(
-            "PRODUCT: `room post` wrote a `failed` its own envelope parser refuses ({e}): {text}"
-        )
-    });
-    racing.body = "failed: disk full".into();
-    racing.data["reason"] = "disk full".into();
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    rt.block_on(post_raw(alice, room.cid, &racing.to_text()));
-    let voided = rows_of_op("op-f20-void");
-    assert!(
-        voided.len() == 2 && voided.iter().all(|x| x["op"]["status"] == "conflict"),
-        "APPARATUS (staging not achieved): not two conflicting `failed` under one op: {voided:?}"
-    );
-    let after_void = post(
-        alice,
-        "holder",
-        r,
-        &["--work", KEY],
-        "after the void failure",
-    );
-    assert!(after_void.ok, "PRODUCT: {after_void:?}");
-    let seeded = data_of(alice, r, &after_void)["attempt"].clone();
-    eprintln!(
-        "[proof] void failed: {} and {}; next post seeded {seeded}",
-        voided[0]["entry_hash"], voided[1]["entry_hash"]
-    );
-    assert!(
-        seeded == first_failed.as_str(),
-        "PRODUCT: a `failed` whose operation is void must seed nothing: the id stays the last \
-         real failure's, {first_failed}; the next post seeded {seeded}"
     );
 }

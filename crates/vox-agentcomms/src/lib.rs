@@ -10,8 +10,9 @@
 //!
 //! ## What the room is for
 //!
-//! Planning, assignment of work, and higher-order discussion between agents —
-//! **not** a mirror of what each agent is doing. Tool traces and per-turn chatter
+//! Asking for help, volunteering, asking for status, urgent questions and decisions
+//! between agents — **not** a mirror of what each agent is doing, and never the record
+//! of who holds a task, which is the work item's GitHub issue (V030-26). Tool traces and per-turn chatter
 //! belong nowhere near it. That is a product decision (ADR-020 §Context) and this
 //! crate encodes the parts of it a machine can enforce: what may interrupt, who
 //! may answer, and when to stop.
@@ -36,28 +37,26 @@
 //! ## Modules
 //!
 //! - [`envelope`] — the message: parsing, addressing, interrupting, loop control.
-//! - [`claim`] — live ownership as claims, resolved by the log with no
-//!   coordinator: session-scoped owners, pending handoffs, bound renewals
-//!   (ADR-020 §5 as corrected by ADR-021 §4).
+//! - [`posted`] — a message as the log holds it, and how its ids are written.
 //! - [`ops`] — operation ids: a retry is one operation, a conflict is explicit and
 //!   voids it (ADR-021 §6).
-//! - [`version`] — workers must run the same Vox version, and refuse to coordinate
-//!   when one does not (ADR-021 §5).
+//! - [`version`] — the Vox version a message was written by. It gates nothing.
 //!
 //! ## What this crate is not
 //!
-//! A work tracker. Work items, their phase, health, priority, acceptance and
-//! delivery belong to an external tracker (ADR-021 §1). `data.work` is a reference
-//! this crate carries and never interprets.
+//! A work tracker, or any part of one. Who holds a task, and its phase, health,
+//! attempts, acceptance and delivery, belong to the work item's GitHub issue,
+//! maintained through awa; there are no claims, locks or leases here (V030-26).
+//! `data.work` is a reference this crate carries and never interprets.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
 
-pub mod claim;
 pub mod envelope;
 pub mod ops;
+pub mod posted;
 pub mod version;
 
-pub use claim::{ClaimOp, Fold, Outcome, Owner, Posted, State};
 pub use envelope::{Context, Envelope, ParseError, BYE, HELLO, SAY};
+pub use posted::Posted;

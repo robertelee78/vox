@@ -678,35 +678,6 @@ enum RoomCmd {
     Roster(RoomRefArgs),
     /// List the rooms this node holds.
     List(ProfileArgs),
-    /// Say in the room that you are taking a unit of work: room courtesy that records nothing.
-    ///
-    /// **The work item's GitHub issue decides who holds a task** (its open attempt, recorded
-    /// through awa); a room claim lets the room see who said they are on what, and nothing
-    /// more (V210-131). A claim is a **message, not a lock**: nothing is reserved in the node.
-    /// Ownership is whatever the room's log resolves to, so every member computes
-    /// the same answer with nobody coordinating. `--ttl` is what makes an agent
-    /// that dies holding work release it without anyone noticing it died.
-    ///
-    /// Ownership is per **session** (ADR-021 §4): the session comes from `--session`,
-    /// `VOX_SESSION`, or the harness (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`).
-    /// Every participant must run this exact vox version, or the claim is refused
-    /// with exit status 3. A claim also completes a handoff pending for this session.
-    Claim(ClaimArgs),
-    /// Say in the room that you stopped working on something: releases your room claim,
-    /// which records nothing (the issue does). Only the exact holding session's release
-    /// counts, and releasing means neither done nor failed.
-    Release(ResourceArgs),
-    /// Offer your room claim to another harness, named by fingerprint; it completes when an
-    /// eligible session of it claims it. The task itself moves only on its issue.
-    Handoff(HandoffArgs),
-    /// Refuse a room handoff pending for this session. The room claim is freed, not returned.
-    Decline(ResourceArgs),
-    /// Extend this session's current room claim by its original `--ttl`.
-    Renew(ResourceArgs),
-    /// Show the room's claims — who said they are on what, until when — and whether
-    /// coordination is refused because a participant runs another vox version. A hint:
-    /// the work item's GitHub issue decides who holds a task.
-    Board(RoomBoardArgs),
     /// Offer a file to the room and announce it (ADR-020 §11).
     ///
     /// The bytes never enter the log: they ride a room-bound service, and what
@@ -898,8 +869,8 @@ pub struct StatusArgs {
 /// (ADR-021 §4, §6).
 #[derive(Args, Debug, Clone, Default)]
 pub struct CoordArgs {
-    /// The session to act as. Defaults to `VOX_SESSION`, then the harness's own
-    /// session id. Ownership is per session.
+    /// The session to speak as. Defaults to `VOX_SESSION`, then the harness's own
+    /// session id.
     #[arg(long)]
     pub session: Option<String>,
     /// The operation id to post under: 8–64 of `[A-Za-z0-9._-]`. Choose it before
@@ -920,78 +891,6 @@ impl CoordArgs {
             json: self.json,
         }
     }
-}
-
-/// `vox room claim`
-#[derive(Args, Debug, Clone)]
-pub struct ClaimArgs {
-    #[command(flatten)]
-    pub profile: ProfileArgs,
-    /// The room's id, or a unique prefix of it.
-    pub room: String,
-    /// What is being claimed — a file, a milestone, a crate, whatever the room
-    /// has agreed to name. Optional with `--work`, which is then the resource.
-    pub resource: Option<String>,
-    /// The work item's awa key as `gwa:OWNER/REPO:SOURCE:ITEM` (any `<scheme>:<id>`; the id
-    /// may contain `:`), carried in `data.work` and used as the resource (ADR-021 §2).
-    #[arg(long)]
-    pub work: Option<String>,
-    /// Seconds after which the claim lapses on its own unless renewed.
-    #[arg(long)]
-    pub ttl: Option<u64>,
-    #[command(flatten)]
-    pub coord: CoordArgs,
-}
-
-/// `vox room release`, `decline` and `renew`
-#[derive(Args, Debug, Clone)]
-pub struct ResourceArgs {
-    #[command(flatten)]
-    pub profile: ProfileArgs,
-    /// The room's id, or a unique prefix of it.
-    pub room: String,
-    /// The resource.
-    pub resource: String,
-    #[command(flatten)]
-    pub coord: CoordArgs,
-}
-
-/// `vox room handoff`
-#[derive(Args, Debug, Clone)]
-pub struct HandoffArgs {
-    #[command(flatten)]
-    pub profile: ProfileArgs,
-    /// The room's id, or a unique prefix of it.
-    pub room: String,
-    /// What is being handed off.
-    pub resource: String,
-    /// The recipient: a room member's fingerprint, or a unique prefix of one as
-    /// `vox room roster` prints it. Resolved here, once, so every node agrees.
-    #[arg(long)]
-    pub to: String,
-    /// Reserve it for one exact session of the recipient, rather than any.
-    #[arg(long)]
-    pub to_session: Option<String>,
-    /// Seconds until the pending handoff lapses and the work is free. Default 3600.
-    #[arg(long)]
-    pub ttl: Option<u64>,
-    #[command(flatten)]
-    pub coord: CoordArgs,
-}
-
-/// `vox room board`
-#[derive(Args, Debug, Clone)]
-pub struct RoomBoardArgs {
-    #[command(flatten)]
-    pub profile: ProfileArgs,
-    /// The room's id, or a unique prefix of it.
-    pub room: String,
-    /// Print one `vox.room.board/1` JSON object.
-    #[arg(long)]
-    pub json: bool,
-    /// The session whose view to mark as "you". Defaults as for the other verbs.
-    #[arg(long)]
-    pub session: Option<String>,
 }
 
 /// `vox room tail`
@@ -1142,15 +1041,10 @@ pub struct RoomPostArgs {
     #[arg(long = "type")]
     pub kind: Option<String>,
     /// The work item's awa key as `gwa:OWNER/REPO:SOURCE:ITEM` (any `<scheme>:<id>`; the id
-    /// may contain `:`), carried in `data.work`. A post with `--work` takes part in work coordination
-    /// and passes the version gate.
+    /// may contain `:`), carried in `data.work` so the room can tell what a message is
+    /// about. Vox checks its shape and never interprets it.
     #[arg(long)]
     pub work: Option<String>,
-    /// A label carried in `data.attempt`. Defaults, with `--work`, to an id seeded from
-    /// this session's room claim (or its latest `failed`) on that item. It is the room's
-    /// label and starts nothing: the attempt is awa's attempt-started on the issue.
-    #[arg(long)]
-    pub attempt: Option<String>,
     /// Address a session by petname; repeat for several.
     #[arg(long)]
     pub to: Vec<String>,
@@ -1897,11 +1791,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Read(a) => &a.profile,
                 RoomCmd::Roster(a) => &a.profile,
                 RoomCmd::Tail(a) => &a.profile,
-                RoomCmd::Board(a) => &a.profile,
                 RoomCmd::List(p) => p,
-                RoomCmd::Claim(a) => &a.profile,
-                RoomCmd::Release(a) | RoomCmd::Decline(a) | RoomCmd::Renew(a) => &a.profile,
-                RoomCmd::Handoff(a) => &a.profile,
                 RoomCmd::Send(a) => &a.profile,
                 RoomCmd::Get(a) => &a.profile,
                 RoomCmd::Join(a) => &a.profile,
@@ -1937,7 +1827,6 @@ pub fn run() -> ExitCode {
                             let opts = crate::room_cli::PostOpts {
                                 kind: a.kind.clone(),
                                 work: a.work.clone(),
-                                attempt: a.attempt.clone(),
                                 to: a.to.clone(),
                                 urgent: a.urgent,
                                 re: a.re.clone(),
@@ -1967,60 +1856,6 @@ pub fn run() -> ExitCode {
                         }
                         RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
                         RoomCmd::List(_) => crate::room_cli::list(&paths).await,
-                        RoomCmd::Claim(a) => {
-                            crate::room_cli::claim_resource(
-                                &paths,
-                                &a.room,
-                                a.resource.as_deref(),
-                                a.work.as_deref(),
-                                a.ttl,
-                                &a.coord.opts(),
-                            )
-                            .await
-                        }
-                        RoomCmd::Release(a) => {
-                            crate::room_cli::release_resource(
-                                &paths,
-                                &a.room,
-                                &a.resource,
-                                &a.coord.opts(),
-                            )
-                            .await
-                        }
-                        RoomCmd::Decline(a) => {
-                            crate::room_cli::decline_resource(
-                                &paths,
-                                &a.room,
-                                &a.resource,
-                                &a.coord.opts(),
-                            )
-                            .await
-                        }
-                        RoomCmd::Renew(a) => {
-                            crate::room_cli::renew_resource(
-                                &paths,
-                                &a.room,
-                                &a.resource,
-                                &a.coord.opts(),
-                            )
-                            .await
-                        }
-                        RoomCmd::Handoff(a) => {
-                            crate::room_cli::handoff_resource(
-                                &paths,
-                                &a.room,
-                                &a.resource,
-                                &a.to,
-                                a.to_session.as_deref(),
-                                a.ttl,
-                                &a.coord.opts(),
-                            )
-                            .await
-                        }
-                        RoomCmd::Board(a) => {
-                            crate::room_cli::board(&paths, &a.room, a.json, a.session.as_deref())
-                                .await
-                        }
                         RoomCmd::Send(a) => {
                             crate::room_cli::send_file(&paths, &a.room, &a.path).await
                         }

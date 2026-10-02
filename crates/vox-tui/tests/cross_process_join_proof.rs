@@ -305,32 +305,10 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     )
     .expect("the message crosses");
 
-    // A claim, so the work board is exercised across processes too.
-    let (ok, out, err) = vox(
-        &bob_dir,
-        &[
-            "room".into(),
-            "claim".into(),
-            room.clone(),
-            "port-the-codec".into(),
-        ],
-        None,
-    );
-    assert!(ok, "bob claims: stdout={out:?} stderr={err:?}");
-    assert!(out.contains("you hold port-the-codec"), "{out:?}");
-    until(
-        &alice_dir,
-        "bob's claim to reach alice",
-        &["room".into(), "board".into(), room],
-        60,
-        |o| o.contains("port-the-codec"),
-    )
-    .expect("the claim crosses");
-
     // ---- the file leg: agent-comms file transfer, across processes ----
     //
-    // This is a **different subsystem** from everything above. Posting and claiming
-    // ride the log and its sync; `vox room send|get` rides a room-bound service and
+    // This is a **different subsystem** from everything above. Posting rides the log
+    // and its sync; `vox room send|get` rides a room-bound service and
     // a `Forward` — a QUIC tunnel over the overlay. ADR-012 currently records that
     // path failing at establishment and mid-stream, so this leg is expected to be
     // the flaky one, and it is named separately for exactly that reason: a single

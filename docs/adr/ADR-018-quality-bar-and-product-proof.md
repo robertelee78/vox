@@ -160,8 +160,9 @@ MUST be reproduced by the harness when its fix is reverted.
    *Status:* on integrate/v0.3.0 only `an_agent_wake_is_safe_and_bounded_proof` case 6 is behind
    `live-model-sandbox`. Planned on v0.3.0 (built on integrate/v0.2.10, #301, 5c521a3a): the sandbox
    (`tests/support/oc_sandbox.rs`, macOS `sandbox-exec`), and the same gate for
-   `agent_rehearsal_proof`, `drain_self_filter_proof`, `opencode_plugin_proof` and
-   `tracker_rehearsal_proof`; it reaches v0.3.0 with the v0.2.10 sync (#226).
+   `agent_rehearsal_proof`, `drain_self_filter_proof` and `opencode_plugin_proof`; it reaches
+   v0.3.0 with the v0.2.10 sync (#226). `tracker_rehearsal_proof` was deleted with Vox's claims
+   (V030-26).
 4. **A spike is valid.** It MUST be run, and its result reported in the post. It MUST NOT be committed
    to the gate. A fix with no user-facing proof MUST rest on review plus such a spike.
 5. **Everything else is deleted.** A unit test, an in-process library test, a test of an internal

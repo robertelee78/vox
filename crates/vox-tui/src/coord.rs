@@ -1,28 +1,28 @@
-//! ADR-021 — the plumbing every coordinating verb shares: who is speaking, where,
-//! with which operation id, under which version, and whether it may.
+//! ADR-021 — the plumbing every structured post shares: who is speaking, where, with
+//! which operation id and under which version.
 //!
-//! The verbs in [`crate::room_cli`] decide *what* to post. This module decides
-//! everything a post must carry to be a valid work-coordination message, and it is
-//! one code path so that no verb can forget a part of it:
+//! [`crate::room_cli`] decides *what* to post. This module decides everything a
+//! structured post carries, and it is one code path so that no post can forget a part
+//! of it:
 //!
-//! - **the session** (`from`) — ownership is `(author fingerprint, session)`, so a
-//!   claim with no session is refused rather than attributed to the whole harness;
+//! - **the session** (`from`) — which of a harness's sessions is speaking, so a reply
+//!   and a wake reach the right one;
 //! - **the context** (`at`) — the repository, worktree, branch and directory the
 //!   session is working in, read from Git rather than trusted to a caller;
 //! - **the operation id** (`data.op`) — supplied by the caller for a real retry, or
 //!   minted as a convenience;
 //! - **the version stamp** (`data.vox`) — always this binary's own, never the
-//!   caller's;
-//! - **the version gate** — a worker refuses to coordinate while any participant in
-//!   the room runs another version (ADR-021 §5).
+//!   caller's. It gates nothing.
 //!
-//! It holds no work state. `data.work` is carried and never interpreted: this is a
-//! transport for a tracker's observations, not a tracker (ADR-021 §1).
+//! **It holds no task state** (V030-26, the decider: "github is the authority, vox is the
+//! nagging reminder"). There are no claims, leases or locks: who holds a task is the work
+//! item's GitHub issue, maintained through awa. `data.work` is carried and never
+//! interpreted.
 
-use vox_agentcomms::claim::{self, Fold, Posted};
 use vox_agentcomms::envelope::{Context, Envelope, HELLO, WORK_KEY};
 use vox_agentcomms::ops::{self, OpIndex, Verdict};
-use vox_agentcomms::version::{self, Stamp, VersionTable, VOX_KEY};
+use vox_agentcomms::posted::Posted;
+use vox_agentcomms::version::{self, Stamp, VOX_KEY};
 use vox_core::hash::Digest32;
 use vox_core::node::api::MessageRow;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
@@ -30,11 +30,9 @@ use vox_core::node::link::b32_encode;
 
 use crate::app::AppError;
 
-/// This binary's version: the stamp it writes and the only one its fold applies.
+/// This binary's version: the stamp it writes.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Exit status of a verb refused because a participant runs another version.
-pub const EXIT_VERSION: u8 = 3;
 /// Exit status of a post whose operation id already names different content.
 pub const EXIT_CONFLICT: u8 = 4;
 
@@ -69,7 +67,7 @@ pub fn session(flag: Option<&str>) -> Option<String> {
 pub fn require_session(flag: Option<&str>) -> Result<String, AppError> {
     session(flag).ok_or_else(|| {
         AppError::Usage(
-            "no session: work coordination is owned per session (ADR-021 §4), and nothing \
+            "no session: a structured post says which session is speaking, and nothing \
              names this one. Run inside Claude Code or Codex, set VOX_SESSION, or pass \
              --session."
                 .into(),
@@ -132,16 +130,7 @@ pub fn new_op() -> Result<String, AppError> {
     Ok(format!("op-{}", &b32_encode(&b)[..26]))
 }
 
-/// Milliseconds since the Unix epoch, by this machine's clock — the clock the fold
-/// measures lapses against.
-#[must_use]
-pub fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
-/// Everything a coordinating verb needs to know about a room at one moment.
+/// Everything a structured post needs to know about a room at one moment.
 pub struct Snapshot {
     /// This node's identity.
     pub me: Digest32,
@@ -149,12 +138,6 @@ pub struct Snapshot {
     pub rows: Vec<MessageRow>,
     /// Every row that parsed as an envelope.
     pub posted: Vec<Posted>,
-    /// Folded claim state under this version.
-    pub fold: Fold,
-    /// The version table.
-    pub table: VersionTable,
-    /// When it was taken.
-    pub now_millis: u64,
 }
 
 impl Snapshot {
@@ -231,55 +214,11 @@ pub async fn snapshot(client: &mut IpcClient, channel_id: Digest32) -> Result<Sn
         AppError::Usage("the node did not say who it is; is its identity unlocked?".into())
     })?;
     let rows = read_all(client, channel_id, None).await?;
-    let roster = match ask(client, &Request::Roster { channel_id }).await? {
-        Frame::Members { members } => members,
-        other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-    };
     let posted = posted_of(&rows);
-    let now = now_millis();
-    let fold = claim::fold(&posted, VERSION, now);
-    let table = version::version_table(&posted, me, &roster, VERSION, now, &fold);
-    Ok(Snapshot {
-        me,
-        rows,
-        posted,
-        fold,
-        table,
-        now_millis: now,
-    })
+    Ok(Snapshot { me, rows, posted })
 }
 
-/// The refusal, naming every incompatible worker, its version and the required one.
-#[must_use]
-pub fn refusal(room: &str, table: &VersionTable) -> AppError {
-    let mut msg = format!(
-        "work coordination refused in room {}",
-        &room[..12.min(room.len())]
-    );
-    for p in table.mismatched() {
-        msg.push_str(&format!(
-            "\n  worker {} session {} runs vox {}; required {}",
-            crate::ident::author_id(&p.author),
-            if p.session.is_empty() {
-                "(none)"
-            } else {
-                &p.session
-            },
-            p.stamp.describe(&table.mine),
-            table.mine
-        ));
-    }
-    msg.push_str(
-        "\n  every worker in a coordinating room must run the same vox version — upgrade \
-         it, or remove it from the room",
-    );
-    AppError::Refused {
-        code: EXIT_VERSION,
-        message: msg,
-    }
-}
-
-/// One message to post, before the fields every coordinating post carries are added.
+/// One message to post, before the fields every structured post carries are added.
 #[derive(Debug, Clone, Default)]
 pub struct Draft {
     /// The envelope type.
@@ -457,21 +396,15 @@ fn conflict(op: &str, group: &[Digest32]) -> AppError {
     }
 }
 
-/// Take part in work coordination: announce this session if it has not, then refuse
-/// if any participant runs another version.
-///
-/// The announcement comes **first**. A worker that checked before announcing would,
-/// after an upgrade of every worker, see only the others' old-version messages and
-/// refuse — and so would every other worker, and nobody would ever announce. Posting
-/// the stamped `hello` first means the second worker to act sees the first one's new
-/// version.
+/// Announce this session with a stamped `hello` if it has not yet, so readers know which
+/// version it runs, and return the room as read after. Nothing is refused on a version:
+/// there is no claim protocol for two versions to disagree about (V030-26).
 ///
 /// # Errors
-/// [`EXIT_VERSION`] naming every incompatible worker, or a node error.
-pub async fn participate(
+/// A node error.
+pub async fn announce(
     client: &mut IpcClient,
     channel_id: Digest32,
-    room: &str,
     session: &str,
 ) -> Result<Snapshot, AppError> {
     let mut snap = snapshot(client, channel_id).await?;
@@ -486,19 +419,7 @@ pub async fn participate(
             .await?
             .after;
     }
-    if snap.table.refused() {
-        return Err(refusal(room, &snap.table));
-    }
     Ok(snap)
-}
-
-/// Whether a draft or raw text is a claim-protocol operation, which only the
-/// dedicated verbs may post.
-#[must_use]
-pub fn is_claim_type(kind: &str, data: &serde_json::Value) -> bool {
-    let mut env = Envelope::new(kind, "");
-    env.data = data.clone();
-    claim::is_claim_protocol(&env)
 }
 
 /// The work reference a row carries, if any.

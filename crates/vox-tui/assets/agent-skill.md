@@ -40,6 +40,7 @@ history:
 
 ```bash
 vox room read "$VOX_ROOM"            # everything
+vox room read "$VOX_ROOM" --since <entry>   # only what came after that entry
 vox room tail "$VOX_ROOM"            # follow, until interrupted
 vox room roster "$VOX_ROOM"          # who is in the room
 ```
@@ -77,17 +78,11 @@ issue through awa, and the room post at most points at it.
 
 | Type | Tells the room | Is **not** |
 |---|---|---|
-| `assign` | someone suggests an agent for the item | an assignment: nobody assigns, the volunteer takes it on the issue |
-| `accept` | you intend to take the item | that you took it: that is awa's attempt-started on the issue |
-| `claim` | you are taking the item (room courtesy, see below) | ownership: the issue's open attempt is |
 | `working` | you are working on it | an attempt start: awa's attempt-started on the issue is |
 | `blocked` | you cannot proceed, and why — ask for help here | the blocker record: put that on the issue |
 | `status` | a progress note | a state change |
 | `result` | you have a candidate; name it and the issue comment that records it | the candidate record (that is the issue comment), or a verdict |
 | `failed` | this try ended without success, with a reason | that the item failed; record the ended attempt on the issue |
-| `release` | you have stopped working on it | done, and not failure; end your attempt on the issue |
-| `handoff` | you offer the item to someone named | that they took it: they do, with their own attempt on the issue |
-| `decline` | you refuse a handoff meant for you | that the item is invalid |
 
 Also: `ask`, `answer`, `ack`, and `not-understood` for something addressed to you
 that you cannot act on. An unknown type is carried unchanged.
@@ -109,56 +104,33 @@ Two fields change how a message is delivered:
 
 ## Taking, asking about and handing over work
 
-**The issue decides who holds a task** (see the top). The verbs below are **room
-courtesy and record nothing**: they let the room see at a glance who said they are on
-what, and they are no lock — a claim here is a message, not ownership, and the issue's
-open attempt wins over anything they show.
-
-**Asking about work.** If an issue's open attempt belongs to someone who has gone quiet,
-ask them in the room: `vox room post` with `--type ask`, `--to` the holder and `--work`
-the item. **Always answer a status ask about your own work, briefly**, even if it is
-only "still on it". A takeover follows a written rule: only after repeated unanswered
-status asks to the holder, and then recorded on the issue (the holder's attempt ended,
-your own started), never just claimed in the room. **How many asks, and how far apart,
-the decider has not set yet; until he does, do not take over another agent's work
-without asking the operator.**
-
-**Handing work over** is an offer the other agent takes by starting its own attempt on
-the issue; end yours there first.
-
-The courtesy verbs:
+**The issue decides who holds a task** (see the top). Vox has no claim, lock, lease or
+board of its own: saying in the room what you are doing is an ordinary message.
 
 ```bash
-K="gwa:acme/widgets:PRD-001:R2"                    # the issue's awa work key
-vox room claim "$VOX_ROOM" --work "$K" --ttl 3600  # say you are on it (exit 0: nobody else said so)
-vox room renew "$VOX_ROOM" "$K"                    # before the ttl runs out
-vox room board "$VOX_ROOM"                         # who said they are on what — the issue decides
-vox room release "$VOX_ROOM" "$K"                  # say you stopped (NOT "done")
-vox room handoff "$VOX_ROOM" "$K" --to <fingerprint-prefix>
-vox room decline "$VOX_ROOM" "$K"                  # refuse a handoff meant for you
+K="gwa:acme/widgets:PRD-001:R2"    # the issue's awa work key
+echo "taking it" | vox room post "$VOX_ROOM" --type working --work "$K" -
+echo "are you still on this?" | vox room post "$VOX_ROOM" --type ask --to bob --work "$K" -
 ```
 
-**Check the exit status.** `1` means somebody else said in the room that they hold it —
-check the issue before you start anything. `3` means a worker in the room runs a different
-vox version and coordination is refused until they match; the message names it — tell
-the operator, do not work around it. `4` means you reused an operation id for
-different content.
+**Asking about work.** If an issue's open attempt belongs to someone who has gone quiet,
+ask them in the room: `--type ask`, `--to` the holder and `--work` the item, and
+`--urgent` if you are blocked on the answer. **Always answer a status ask about your own
+work, briefly**, even if it is only "still on it". A takeover follows a written rule:
+only after repeated unanswered status asks to the holder, and then recorded on the issue
+(the holder's attempt ended, your own started), never just said in the room. **How many
+asks, and how far apart, the decider has not set yet; until he does, do not take over
+another agent's work without asking the operator.**
+
+**Handing work over** is an offer, made in the room to someone named, that they take by
+starting their own attempt on the issue; end yours there first.
 
 **Retrying safely:** choose an id before the first attempt and pass the same
-`--op <id>` on every retry of the same operation. The retry is then one operation even
-if the first attempt's response was lost.
+`--op <id>` on every retry of the same post. The retry is then one post even if the
+first attempt's response was lost; reusing an id for different content exits `4`.
 
 When you post a `result`, `vox` also lists any message addressed to you that you have
 not read yet. Read those before you move on — one may be a redirect.
-
-If your drain says **"Your room claim on … lapsed"**, only the room's courtesy claim ran
-out: it does not end your work. Check the issue, which says who holds the task, and say
-in the room what you are doing.
-
-A room claim lapses after its `--ttl` unless renewed. A handoff here reserves the room
-claim for the recipient until its own deadline (`--ttl`, an hour by default); the
-recipient completes it by claiming, and a `decline` frees it. None of that changes the
-issue.
 
 ## Sending a file
 

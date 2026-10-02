@@ -7,17 +7,20 @@
 //!
 //! 1. **a retry with the same content** returns the first entry and posts nothing new;
 //! 2. **two entries that both got past the pre-post lookup** — concurrent retries — are
-//!    still **one** operation: the fold applies it once, the stream marks the second a
-//!    duplicate, and a later CLI retry reports it as already posted;
-//! 3. **the same op with different content** is a conflict. It voids the operation on
-//!    every node — neither entry has any effect — and a consumer that already recorded
-//!    the first entry is told, **in the stream**, that it is now void. The CLI refuses a
-//!    conflicting reuse with exit 4 and never reports success for it;
+//!    still **one** operation: the stream and every read mark the second a duplicate,
+//!    and a later CLI retry reports it as already posted;
+//! 3. **the same op with different content** is a conflict, marked so on every node, and
+//!    a consumer that already recorded the first entry is told, **in the stream**, that
+//!    it is now a conflict. The CLI refuses a conflicting reuse with exit 4 and never
+//!    reports success for it;
 //! 4. **two conflicting posts racing** never both report success.
 //!
 //! Cases 2 and 3 need two entries under one `(author, op)` that the CLI's own lookup
 //! would have prevented, which is precisely what a racing retry produces. They are
 //! written onto the control socket as the bytes such a retry writes.
+//!
+//! Ordinary structured posts throughout: Vox has no claims (V030-26), and an operation id
+//! is about one post, not about who holds anything.
 
 #![cfg(unix)]
 
@@ -31,7 +34,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use support::{post_raw, resource, until, Out, Worker, HARNESS_SESSION_VARS, VOX};
+use support::{post_raw, until, Out, Worker, HARNESS_SESSION_VARS, VOX};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -47,14 +50,25 @@ fn rows_with_op(w: &Worker, r: &str, op: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A claim exactly as `vox room claim` writes it (the fields that make up its
-/// semantic content), under `op`.
-fn claim_text(session: &str, res: &str, op: &str) -> String {
+/// A status exactly as `vox room post --type status --data '{"item":…}'` writes it (the
+/// fields that make up its semantic content), under `op`.
+fn status_text(session: &str, item: &str, op: &str) -> String {
     serde_json::json!({
-        "v": 1, "type": "claim", "from": session, "body": "a racing retry",
-        "data": { "resource": res, "op": op, "vox": VERSION }
+        "v": 1, "type": "status", "from": session, "body": "a racing retry",
+        "data": { "item": item, "op": op, "vox": VERSION }
     })
     .to_string()
+}
+
+/// `vox room post --type status --data '{"item":…}' --op …`, as `session`.
+fn post_status(w: &Worker, session: &str, r: &str, item: &str, op: &str) -> Out {
+    let data = format!("{{\"item\":\"{item}\"}}");
+    w.vox(
+        Some(session),
+        &[
+            "room", "post", r, "--type", "status", "--data", &data, "--op", op, "--json", "note",
+        ],
+    )
 }
 
 /// A live `vox room tail --since … --json` on `w`, its lines collected as they come.
@@ -181,24 +195,13 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
         rt.block_on(post_raw(
             alice,
             room.cid,
-            &claim_text("a1", "dup-res", "op-race-0002"),
+            &status_text("a1", "dup", "op-race-0002"),
         ));
     }
-    let o = alice.vox(
-        Some("a1"),
-        &[
-            "room",
-            "claim",
-            r,
-            "dup-res",
-            "--op",
-            "op-race-0002",
-            "--json",
-        ],
-    );
+    let o = post_status(alice, "a1", r, "dup", "op-race-0002");
     assert!(
         o.ok,
-        "a retry of a duplicated operation reports the holding: {o:?}"
+        "a retry of a duplicated operation reports it as already posted: {o:?}"
     );
     assert_eq!(o.json()["status"], "already-posted", "{o:?}");
     let dups = rows_with_op(alice, r, "op-race-0002");
@@ -226,12 +229,9 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
     });
 
     // ---- (3) the same op, different content: void everywhere, and said so ----
-    let o = alice.vox(
-        Some("a1"),
-        &["room", "claim", r, "c-one", "--op", "op-conflict-03"],
-    );
-    assert!(o.ok && o.stdout.contains("you hold c-one"), "{o:?}");
-    consumer.wait("the first claim, as an ordinary operation", |ls| {
+    let o = post_status(alice, "a1", r, "c-one", "op-conflict-03");
+    assert!(o.ok && o.json()["status"] == "posted", "{o:?}");
+    consumer.wait("the first post, as an ordinary operation", |ls| {
         ls.iter()
             .any(|x| x["op"]["id"] == "op-conflict-03" && x["op"]["status"] == "ok")
     });
@@ -239,7 +239,7 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
     rt.block_on(post_raw(
         alice,
         room.cid,
-        &claim_text("a1", "c-two", "op-conflict-03"),
+        &status_text("a1", "c-two", "op-conflict-03"),
     ));
     consumer.wait("the earlier entry re-emitted as a conflict", |ls| {
         let c: Vec<_> = ls
@@ -248,46 +248,43 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
             .collect();
         // Both entries, each reported as conflict — the first one AGAIN, after it had
         // already been delivered as ok.
-        c.iter()
-            .any(|x| x["envelope"]["data"]["resource"] == "c-one")
-            && c.iter()
-                .any(|x| x["envelope"]["data"]["resource"] == "c-two")
+        c.iter().any(|x| x["envelope"]["data"]["item"] == "c-one")
+            && c.iter().any(|x| x["envelope"]["data"]["item"] == "c-two")
     });
     for w in [alice, bob] {
-        let b = until(
+        let rows = until(
             w,
             None,
-            "the conflict to void the claim",
-            &["room", "board", r, "--json"],
-            |o: &Out| o.ok && resource(&o.json(), "c-one").is_none(),
+            "both conflicting entries, each marked a conflict",
+            &["room", "read", r, "--json"],
+            |o: &Out| {
+                o.ok && o
+                    .ndjson()
+                    .iter()
+                    .filter(|x| {
+                        x["op"]["id"] == "op-conflict-03" && x["op"]["status"] == "conflict"
+                    })
+                    .count()
+                    == 2
+            },
         )
-        .json();
-        assert!(
-            resource(&b, "c-two").is_none(),
-            "{}: a conflicted operation had an effect: {b}",
-            w.name
-        );
-        assert!(
-            resource(&b, "dup-res").is_some(),
-            "{}: the duplicated operation must still hold: {b}",
-            w.name
-        );
-        let conflicted = b["violations"]
-            .as_array()
-            .unwrap()
+        .ndjson();
+        let dup = rows
             .iter()
-            .filter(|v| v["outcome"]["conflict"].is_array())
-            .count();
+            .filter(|x| x["op"]["id"] == "op-race-0002")
+            .map(|x| x["op"]["status"].as_str().unwrap_or("").to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            conflicted, 2,
-            "{}: both conflicting entries are reported: {b}",
+            dup,
+            ["duplicate", "ok"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            "{}: the duplicated operation must still read as one: {rows:?}",
             w.name
         );
     }
-    let o = alice.vox(
-        Some("a1"),
-        &["room", "claim", r, "c-one", "--op", "op-conflict-03"],
-    );
+    let o = post_status(alice, "a1", r, "c-one", "op-conflict-03");
     assert_eq!(
         o.code,
         Some(4),

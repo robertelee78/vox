@@ -35,9 +35,7 @@
 //! What it asserts: the union of every row the consumer emitted, after the starting
 //! cursor, **equals** the room's log after that cursor — no gap — and every duplicate
 //! is explained by a restart, and while one consumer runs every row synced to it is emitted
-//! **once** (V210-113). Then, separately: `board --json` shows what a person expects
-//! of the claims made through the CLI — the contested resource held by alice's session, the
-//! handed-off one by bob's, the lapsed claim gone.
+//! **once** (V210-113).
 //!
 //! Every message is posted with `vox room post`, as a person or an agent posts.
 //!
@@ -48,7 +46,7 @@
 //!   keeps running and ends holding every one of the 1,800 messages, with no restart.
 //!
 //! And across the node's restart: `read --json` holds every row it held before **at the
-//! same position**, `board --json`'s `position` is unchanged, and `tail --since` the
+//! same position**, and `tail --since` the
 //! consumer's pre-restart cursor resumes with exactly the rows that followed it. The order
 //! is local and is rebuilt from the sealed cache on reopen; without this the cursor's
 //! meaning across a reboot was read from the code, not proved.
@@ -73,7 +71,7 @@ mod watchdog;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::{until, Out, Worker, HARNESS_SESSION_VARS, VOX};
 
@@ -275,106 +273,27 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let r = room.id.clone();
     mark!("room ready");
 
-    // ---- the fold half: a contested claim, a completed handoff, a lapse ----
-    let o = alice.vox(Some("a1"), &["room", "claim", &r, "contested"]);
-    assert!(
-        o.ok,
-        "PRODUCT: alice's claim of a free resource was refused: {o:?}"
-    );
-    until(
-        bob,
-        None,
-        "the claim to reach bob",
-        &["room", "board", &r, "--json"],
-        |o: &Out| o.ok && support::resource(&o.json(), "contested").is_some(),
-    );
-    let o = bob.vox(Some("b1"), &["room", "claim", &r, "contested"]);
-    assert_eq!(
-        o.code,
-        Some(1),
-        "PRODUCT: bob's claim of a resource alice holds did not exit 1: {o:?}"
-    );
-    let o = alice.vox(Some("a1"), &["room", "claim", &r, "passed"]);
-    assert!(
-        o.ok,
-        "PRODUCT: alice's claim of a free resource was refused: {o:?}"
-    );
-    let o = alice.vox(
-        Some("a1"),
-        &["room", "handoff", &r, "passed", "--to", &bob.b32()[..16]],
-    );
-    assert!(o.ok, "PRODUCT: alice's handoff to bob was refused: {o:?}");
-    until(
-        bob,
-        None,
-        "the handoff to reach bob",
-        &["room", "board", &r, "--json"],
-        |o: &Out| {
-            o.ok && support::resource(&o.json(), "passed").is_some_and(|x| x["state"] == "pending")
-        },
-    );
-    let o = bob.vox(Some("b1"), &["room", "claim", &r, "passed"]);
-    assert!(
-        o.ok,
-        "PRODUCT: bob could not take the resource handed to him: {o:?}"
-    );
-    let o = bob.vox(Some("b1"), &["room", "claim", &r, "lapsed", "--ttl", "1"]);
-    assert!(
-        o.ok,
-        "PRODUCT: bob's claim of a free resource was refused: {o:?}"
-    );
-    std::thread::sleep(Duration::from_secs(2));
-    until(
-        bob,
-        None,
-        "bob to hold everything alice posted",
-        &["room", "read", &r, "--json"],
-        |o: &Out| {
-            o.ok && o.ndjson().len()
-                == alice
-                    .vox(None, &["room", "read", &r, "--json"])
-                    .ndjson()
-                    .len()
-        },
-    );
+    // **The room settled before the stream half starts**: what the room's setup posts (the
+    // workers' greetings, their trust) must all be on bob's node before the starting cursor is
+    // taken, or a late one arrives after it and the consumers' first row is not the one the
+    // proof posted. Settled is the same count on both nodes, three reads a second apart.
+    let count = |w: &Worker| w.vox(None, &["room", "read", &r, "--json"]).ndjson().len();
+    let settled = Instant::now();
+    let mut same = 0;
+    let mut last = usize::MAX;
+    while same < 3 {
+        assert!(
+            settled.elapsed() < Duration::from_secs(120),
+            "CANNOT MEASURE: the room never settled before the stream half (bob {}, alice {})",
+            count(bob),
+            count(alice)
+        );
+        let (b, a) = (count(bob), count(alice));
+        same = if b == a && b == last { same + 1 } else { 0 };
+        last = b;
+        std::thread::sleep(Duration::from_secs(1));
+    }
     let rows = bob.vox(None, &["room", "read", &r, "--json"]).ndjson();
-    let board = bob.vox(None, &["room", "board", &r, "--json"]).json();
-    let from_board: BTreeMap<String, (String, String)> = board["resources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|x| {
-            (
-                x["resource"].as_str().unwrap().to_owned(),
-                (
-                    x["owner_fp"].as_str().unwrap_or("").to_owned(),
-                    x["owner_session"].as_str().unwrap_or("").to_owned(),
-                ),
-            )
-        })
-        .collect();
-    // What the board must show, as a person reads it: the contested resource held by alice's
-    // session `a1`, the handed-off one by bob's session `b1`, and the lapsed claim gone. (The
-    // comparison with `vox_agentcomms::claim::fold` is gone: the board is that fold, so it could
-    // not fail.)
-    assert_eq!(
-        from_board.get("contested"),
-        Some(&(alice.b32(), "a1".to_owned())),
-        "PRODUCT: board --json does not show alice's session a1 holding the contested resource: \
-         {board}"
-    );
-    assert_eq!(
-        from_board.get("passed"),
-        Some(&(bob.b32(), "b1".to_owned())),
-        "PRODUCT: board --json does not show bob's session b1 holding the handed-off resource: \
-         {board}"
-    );
-    assert!(
-        !from_board.contains_key("lapsed"),
-        "PRODUCT: board --json still shows a claim whose ttl lapsed: {board}"
-    );
-    eprintln!("[proof] board --json: {from_board:?}");
-    mark!("fold half done");
 
     // ---- the stream half ----
     let start_cursor = rows.last().unwrap()["entry_hash"]
@@ -686,14 +605,8 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             })
             .collect()
     };
-    let position = |w: &Worker| -> serde_json::Value {
-        let o = w.vox(None, &["room", "board", &r, "--json"]);
-        assert!(o.ok, "PRODUCT: `room board --json` failed: {o:?}");
-        o.json()["position"].clone()
-    };
     let held = order(bob);
     let before = hashes(&held);
-    let before_position = position(bob);
     let mut canonical = held.clone();
     canonical.sort_by_key(|x| {
         (
@@ -722,7 +635,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         .collect();
     eprintln!(
         "[proof] before bob's node restarts: {} rows, {off_canonical} of them off canonical \
-         order, position {before_position}; {} rows follow the consumer's cursor",
+         order; {} rows follow the consumer's cursor",
         before.len(),
         followed.len()
     );
@@ -759,12 +672,6 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         before.len(),
         moved.first()
     );
-    let after_position = position(bob);
-    assert!(
-        after_position == before_position,
-        "PRODUCT: board.position changed across a restart that posted nothing: \
-         {before_position} before, {after_position} after"
-    );
 
     // The consumer resumes from its pre-restart cursor and gets exactly what followed it.
     let mut run = start(bob, &r, &cursor, &stderr);
@@ -788,7 +695,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let _ = run.child.kill();
     let _ = run.child.wait();
     eprintln!(
-        "[proof] after the restart: same {} rows in the same order, position {after_position}, \
+        "[proof] after the restart: same {} rows in the same order, \
          tail --since the consumer's cursor resumed with {} of {} rows",
         before.len(),
         resumed.len(),
