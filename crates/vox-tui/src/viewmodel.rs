@@ -306,7 +306,7 @@ impl UiError {
                 "a member is busy answering other joins — try again shortly"
             }
             UiError::JoinProofMismatch => "join identity proof failed",
-            UiError::Unreachable => "no reachable peer — both must be online (or run your node)",
+            UiError::Unreachable => "no reachable peer — the host or a member must be online",
             UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
             UiError::KeyChanged => "a member's key changed — re-verify before trusting",
             UiError::MissingConsent => "you'll see this member once they consent to you",

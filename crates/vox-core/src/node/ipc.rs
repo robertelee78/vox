@@ -196,6 +196,11 @@ const T_PUBLISH_CURED: u64 = 2091;
 const T_CONNECTION_NOTE: u64 = 2092;
 /// `NodeEvent::HandshakesQueued` (V210-86). Additive, away from the tags beside it.
 const T_HANDSHAKES_QUEUED: u64 = 2186;
+/// `NodeEvent::AddressWithheld` (V210-96). Additive, away from the sequential range and the tags
+/// other lines use.
+const T_ADDRESS_WITHHELD: u64 = 2296;
+/// `NodeEvent::AddressNote` (V210-96). Additive, beside `T_ADDRESS_WITHHELD`.
+const T_ADDRESS_NOTE: u64 = 2297;
 /// [`NodeEvent::JoinSteps`]: where a join's time went.
 const T_JOIN_STEPS: u64 = 1718;
 /// [`NodeEvent::JoinStep`] (V210-85): the step a join is in now. Additive, away from the other
@@ -1007,6 +1012,9 @@ pub enum Frame {
     Link {
         /// The `vox://` address.
         url: String,
+        /// What it carries ([`NodeEvent::AddressNote`]); empty when none was said. Additive: a
+        /// two-element frame decodes with none.
+        note: String,
     },
     /// The trust keyring a [`Request::TrustList`] asked for.
     Trusted {
@@ -1073,8 +1081,11 @@ impl Frame {
             Frame::Bound { local } => {
                 e.array(2).uint(T_BOUND).text(local);
             }
-            Frame::Link { url } => {
+            Frame::Link { url, note } if note.is_empty() => {
                 e.array(2).uint(T_LINK).text(url);
+            }
+            Frame::Link { url, note } => {
+                e.array(3).uint(T_LINK).text(url).text(note);
             }
             Frame::Rooms { rooms } => {
                 e.array(2).uint(T_ROOMS).array(rooms.len());
@@ -1292,6 +1303,15 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::JoinFailed { reason } => {
             e.array(2).uint(T_JOIN_FAILED).text(reason);
         }
+        NodeEvent::AddressNote { channel_id, note } => {
+            e.array(3).uint(T_ADDRESS_NOTE).bytes(channel_id).text(note);
+        }
+        NodeEvent::AddressWithheld { channel_id, reason } => {
+            e.array(3)
+                .uint(T_ADDRESS_WITHHELD)
+                .bytes(channel_id)
+                .text(reason);
+        }
         NodeEvent::RoomNotRemembered { channel_id, why } => {
             e.array(3)
                 .uint(T_ROOM_NOT_REMEMBERED)
@@ -1478,6 +1498,13 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_LINK, 2) => {
             return Ok(Frame::Link {
                 url: text(d, "ipc link")?,
+                note: String::new(),
+            });
+        }
+        (T_LINK, 3) => {
+            return Ok(Frame::Link {
+                url: text(d, "ipc link")?,
+                note: text(d, "ipc link note")?,
             });
         }
         (T_ROOMS, 2) => {
@@ -1643,6 +1670,20 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc handshakes longest"))?,
             }
         }
+        (T_ADDRESS_NOTE, 3) => NodeEvent::AddressNote {
+            channel_id: digest(d)?,
+            note: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc address note"))?
+                .to_owned(),
+        },
+        (T_ADDRESS_WITHHELD, 3) => NodeEvent::AddressWithheld {
+            channel_id: digest(d)?,
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc address withheld"))?
+                .to_owned(),
+        },
         (T_CONNECTION_NOTE, 3) => NodeEvent::ConnectionNote {
             peer: digest(d)?,
             note: d
@@ -2438,9 +2479,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 (Some(cursor), None) => {
                     // A message not received yet has no arrival to read on from (V030-10): as a
                     // cursor its `0` would re-deliver the whole room.
+                    // Searched from the end: a tail's cursor is the last row it read, at or near
+                    // the end (V210-113).
                     let Some(mark) = detail
                         .timeline
                         .iter()
+                        .rev()
                         .find(|r| r.entry_hash == cursor && !r.owed)
                         .map(|r| r.arrival)
                     else {
@@ -2463,7 +2507,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                             reason: "page mark not in this room's timeline".into(),
                         };
                     };
-                    detail.timeline[i + 1..].iter().collect()
+                    detail.timeline.iter_from(i + 1).collect()
                 }
             };
             // **One reply is bounded by bytes, never the whole room.** A reply was every row
@@ -2799,9 +2843,26 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 crate::node::api::Outcome::Done => {}
                 other => {
-                    return Frame::Error {
-                        reason: other.to_string(),
+                    // **With why** (V210-96): an address withheld because it would lead nowhere
+                    // says so, naming each anchor and what kept the room off it, in place of the
+                    // fault's general advice — which speaks of an anchor even when none was named.
+                    let mut reason = other.to_string();
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while let Ok(Some(item)) =
+                        tokio::time::timeout_at(deadline, events.next()).await
+                    {
+                        if let EventStreamItem::Event(NodeEvent::AddressWithheld {
+                            channel_id: c,
+                            reason: why,
+                        }) = item
+                        {
+                            if c == channel_id {
+                                reason = format!("the address was not handed out: {why}");
+                                break;
+                            }
+                        }
                     }
+                    return Frame::Error { reason };
                 }
             }
             match tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -2818,7 +2879,26 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             })
             .await
             {
-                Ok(Some(url)) => Frame::Link { url },
+                Ok(Some(url)) => {
+                    // And what it carries, which the node says right after it (V210-96).
+                    let mut note = String::new();
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while let Ok(Some(item)) =
+                        tokio::time::timeout_at(deadline, events.next()).await
+                    {
+                        if let EventStreamItem::Event(NodeEvent::AddressNote {
+                            channel_id: c,
+                            note: said,
+                        }) = item
+                        {
+                            if c == channel_id {
+                                note = said;
+                                break;
+                            }
+                        }
+                    }
+                    Frame::Link { url, note }
+                }
                 Ok(None) => Frame::Error {
                     reason: "the node stopped before the link was minted".into(),
                 },

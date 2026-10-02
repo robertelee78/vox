@@ -191,7 +191,7 @@ What does not change: the relay is still ciphertext-only by construction.
 
 ### 7. The app API (R29–R30)
 
-- **New stream kind `App = 8`.**
+- **New stream kind `App = 9`** (8 at first; v0.2.10 took 8 for its stopping node's goodbye, V210-93).
   - The first frame after the kind is `[1, channel_id, [labels…≤8], flags]`.
   - The responder picks the first label it serves and answers `[1, label]`, or `[0, reason]`.
   - Labels are libp2p-style `name/vN`, at most 64 ASCII bytes, with no registry. An incompatible
@@ -290,7 +290,7 @@ media.
 **Neutral.**
 
 - The replay window code is deleted.
-- `StreamKind` gains `App = 8`.
+- `StreamKind` gains `App = 9`.
 
 ## Proofs (each drives the shipped binary, each mutation-checked, each prints counts)
 

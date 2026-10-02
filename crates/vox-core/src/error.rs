@@ -304,6 +304,14 @@ pub enum Error {
     #[error("tunnel reach withdrawn: {0}")]
     TunnelRevoked(&'static str),
 
+    /// A tunnel was refused because the connection to that member already carries
+    /// [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER) tunnels, each holding a
+    /// receive window this node agreed to buffer (V210-81). Said where the tunnel was asked
+    /// for; the host refuses one past it too, uniformly, as it refuses anything. Carries what
+    /// the person is told: how many are open, to which services, and how to free one.
+    #[error("{0}")]
+    TunnelLimit(String),
+
     /// A tunnel control message (service request, stream-setup handshake) or an
     /// SSH-CA certificate was structurally malformed on parse, exceeded a size
     /// bound, or carried an out-of-domain value (ADR-013). Carries a static reason.
@@ -354,17 +362,18 @@ pub enum Error {
     MalformedAnchor(&'static str),
 
     /// The anchors file names no anchor that can be used — every line of it was skipped — and
-    /// no `--anchor` was given (V210-75). A verb that needs an anchor refuses to start rather
-    /// than run with none: with every line skipped, the node would reach nobody it cannot dial
-    /// directly, and say nothing about why.
+    /// no `--anchor` was given (V210-75). **Said, never a refusal** (V210-107): the file is
+    /// named and skipped, and the verb runs anchorless, reaching whoever it can reach directly.
+    /// An anchor only bridges hosts that cannot otherwise reach each other (ADR-012), so a verb
+    /// that truly needs one fails where it needs it, not here.
     #[error(
-        "the anchors file {path} names no usable anchor ({skipped} line(s) skipped, said above); \
-         fix it, or give --anchor"
+        "the anchors file {path} names no usable anchor ({skipped} skipped, each said above); \
+         a peer this machine can reach directly needs none"
     )]
     AnchorsFileUnusable {
         /// The anchors file.
         path: String,
-        /// How many of its lines were skipped.
+        /// How many of its lines were skipped; 1 for a file that cannot be read at all.
         skipped: usize,
     },
 

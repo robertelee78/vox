@@ -175,6 +175,8 @@ fn render(v: &Value) -> String {
             short(s(t, "room"))
         );
     }
+    // Every live tunnel, with how long since it last moved a byte (V210-81).
+    tunnels(v, &mut o);
     let d = &v["datagrams"];
     let a = &v["app"];
     let n = |x: &Value, k: &str| x.get(k).and_then(Value::as_u64).unwrap_or(0);
@@ -261,4 +263,44 @@ fn render(v: &Value) -> String {
         o.push('\n');
     }
     o
+}
+
+/// One line per live tunnel (V210-81): who, which service, which way, how long it has been open
+/// and how long since it last moved a byte — so a stale one, holding a member's connection, is
+/// seen. Said before the sync rows.
+fn tunnels(v: &serde_json::Value, out: &mut String) {
+    use std::fmt::Write as _;
+    let now = vox_core::transport::quic::unix_now();
+    let ago = |t: u64| {
+        let s = now.saturating_sub(t);
+        if s < 120 {
+            format!("{s}s")
+        } else if s < 7200 {
+            format!("{}m", s / 60)
+        } else {
+            format!("{}h", s / 3600)
+        }
+    };
+    for t in v
+        .get("tunnels")
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let s = |k: &str| t.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_owned();
+        let n = |k: &str| t.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let peer: String = s("peer").chars().take(12).collect();
+        let way = if s("direction") == "out" {
+            format!("to {peer}")
+        } else {
+            format!("from {peer}")
+        };
+        let _ = writeln!(
+            out,
+            "tunnel {way} for {}: open {}, last moved {} ago",
+            s("service"),
+            ago(n("opened")),
+            ago(n("last_moved"))
+        );
+    }
 }
