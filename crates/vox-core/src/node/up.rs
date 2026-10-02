@@ -245,12 +245,13 @@ async fn reach_host_with_patience<D: HostDialer>(
 /// **So does the tunnel's credit** ([`VoxConnection::carry_tunnel`]), taken before the stream is
 /// opened and held by the caller for the same span: a receive window of the tunnel's own, and
 /// its place among the [`TUNNELS_PER_PEER`](crate::transport::quic::TUNNELS_PER_PEER) the
-/// connection may carry.
+/// member may have with this node, on any of its connections.
 ///
 /// # Errors
-/// [`Error::TunnelDenied`] when the host refused; [`Error::TunnelLimit`] when the connection
-/// to the host already carries all the tunnels it may (not retried: only a tunnel closing
-/// changes it); otherwise the last reason the host could not be reached.
+/// [`Error::TunnelDenied`] when the host refused; [`Error::TunnelLimit`] when the host already
+/// has all the tunnels it may with this member, by this node's count or the host's
+/// (`TunnelStatus::Full`) — not retried: only a tunnel closing changes it; otherwise the last
+/// reason the host could not be reached.
 pub async fn open_tunnel<D: HostDialer>(
     dialer: &D,
     host: &Digest32,
@@ -277,7 +278,12 @@ pub async fn open_tunnel<D: HostDialer>(
             {
                 // The host refused at the cap, in a race this side's own count lost: said as the
                 // cap, with this node's list of the member's tunnels (#272 c5).
-                Err(Error::TunnelLimit(_)) => return Err(conn.tunnel_limit()),
+                // This attempt's own place is given back first, so the list it gives counts
+                // only the tunnels that are open.
+                Err(Error::TunnelLimit(_)) => {
+                    drop(credit);
+                    return Err(conn.tunnel_limit());
+                }
                 other => other?,
             }
             Ok::<_, Error>((send, recv, conn, credit))
