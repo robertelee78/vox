@@ -22,7 +22,7 @@
 //! out on a clean stop.
 //!
 //! **Asserted.** In [`WATCH`] after the restart, the victim sends mallory **no key**: she took it,
-//! and the node remembers. `CANNOT MEASURE` if the first key never reached her before the restart,
+//! and the node remembers. `PRODUCT (staging)` if the first key never reached her before the restart,
 //! or if, after [`WATCH`], **a key the restarted victim does owe her** does not reach her: the
 //! victim stops trusting her and trusts her again (`vox trust remove`, `vox trust add`), which
 //! rotates its key and consents to her afresh, and that key must arrive on the same connection
@@ -32,7 +32,8 @@
 //! owes nothing opens no pairwise stream at all, so a pairwise-stream count cannot be required.)
 //!
 //! **Which side a red is on.** A key sent again, or a daemon that would not stop on SIGTERM, is
-//! `PRODUCT:`; staging not achieved is `CANNOT MEASURE:`; a fault of this proof's own (a runtime,
+//! `PRODUCT:`; a `vox` step of the setup that failed, or a key the node owed that never came, is
+//! `PRODUCT (staging):`; mallory's own connection not made is `CANNOT MEASURE:`; a fault of this proof's own (a runtime,
 //! a file, a signal it could not send) is `APPARATUS:`. Mallory joins **once**: a join turned away
 //! is the product's red, not something to retry past.
 //!
@@ -262,9 +263,10 @@ fn stop(mut p: VoxProc, halt: Halt) {
 
 fn fingerprint(data: &Path) -> [u8; 32] {
     let (ok, out, err) = vox_once(data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
-    vox_core::node::link::b32_decode(out.trim(), "fingerprint")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: vox id printed no fingerprint ({e:?}): {out}"))
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
+    vox_core::node::link::b32_decode(out.trim(), "fingerprint").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): vox id printed no fingerprint ({e:?}): {out}")
+    })
 }
 
 #[test]
@@ -319,15 +321,15 @@ fn taken_first_key_after(halt: Halt) {
         &["room", "create", "--name", "team"],
         ROOM_PASS,
     );
-    assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, list, _) = vox_once(&victim_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
         .next()
-        .expect("CANNOT MEASURE: the new room in `vox room list`")
+        .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
     let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "CANNOT MEASURE: room invite: {err}");
+    assert!(ok, "PRODUCT (staging): room invite: {err}");
     let link = link.trim().to_owned();
     let (joined, out, err) = vox_in(
         &mallory_dir,
@@ -389,7 +391,7 @@ fn taken_first_key_after(halt: Halt) {
     );
     assert!(
         ok,
-        "CANNOT MEASURE: the victim could not trust mallory: {out}\n{err}"
+        "PRODUCT (staging): the victim could not trust mallory: {out}\n{err}"
     );
     let deadline = Instant::now() + FIRST_KEY_WITHIN;
     while lock(&before).keys.is_empty() && Instant::now() < deadline {
@@ -398,7 +400,7 @@ fn taken_first_key_after(halt: Halt) {
     let taken = lock(&before).keys.len();
     assert!(
         taken >= 1,
-        "CANNOT MEASURE: no key reached mallory within {FIRST_KEY_WITHIN:?} of the victim \
+        "PRODUCT (staging): no key reached mallory within {FIRST_KEY_WITHIN:?} of the victim \
          trusting her"
     );
     // The victim records the key as delivered when her answer reaches it.
@@ -441,7 +443,7 @@ fn taken_first_key_after(halt: Halt) {
         let (ok, out, err) = vox_in(&victim_dir, &verb, "");
         assert!(
             ok,
-            "CANNOT MEASURE: the positive control's `vox {}` failed: {out}\n{err}",
+            "PRODUCT (staging): the positive control's `vox {}` failed: {out}\n{err}",
             verb.join(" ")
         );
     }
@@ -456,7 +458,7 @@ fn taken_first_key_after(halt: Halt) {
     );
     assert!(
         owed >= 1,
-        "CANNOT MEASURE: a key the restarted victim owed mallory (it re-trusted her) did not reach \
+        "PRODUCT (staging): a key the restarted victim owed mallory (it re-trusted her) did not reach \
          her within {FIRST_KEY_WITHIN:?}, so its key-delivery path never reached her and \"no key \
          sent again\" measures nothing"
     );

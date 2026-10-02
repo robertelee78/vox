@@ -199,15 +199,12 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
     let relay = CountingRelay::new(spec_addr(&decoy_spec));
 
     let (ok, guest_fp, err) = world::vox_once(&guest_dir, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id (guest, staging) failed: {err}");
+    assert!(ok, "PRODUCT (staging): vox id (guest) failed: {err}");
     let (ok, out, err) = world::vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
     );
-    assert!(
-        ok,
-        "CANNOT MEASURE: trust add (staging) failed: {out}\n{err}"
-    );
+    assert!(ok, "PRODUCT (staging): trust add failed: {out}\n{err}");
 
     // The host's own address second, the decoy's (through the relay) first. The port is probed
     // and released, then handed to `vox serve`: another process can take it in between. If one

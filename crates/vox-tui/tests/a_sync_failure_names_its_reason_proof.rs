@@ -16,7 +16,7 @@
 //! 3. every post of every round is taken (`vox room post` exits 0): a post refused while the other
 //!    member posts is a collision a person sees.
 //!
-//! Preconditions (else CANNOT MEASURE): both daemons opened at least three sessions to each other
+//! Preconditions (else PRODUCT (staging)): both daemons opened at least three sessions to each other
 //! over the rounds (`vox status --json`). Not one per round: posts made while a session runs are
 //! carried by it (measured on the change: 14 and 10 over 40 rounds). And **the reports can be
 //! seen at all**: the absence of a report proves nothing unless a sync that does fail is reported
@@ -24,8 +24,9 @@
 //! `ps`) and Alice posts: her sync with him cannot complete, and her daemon must say a sync "did
 //! not complete" — the positive control.
 //!
-//! Which side a red is on: `PRODUCT:` quotes what vox said; `CANNOT MEASURE:` names staging that
-//! was not achieved; `APPARATUS:` names a fault of this proof's own.
+//! Which side a red is on: `PRODUCT:` quotes what vox said; a `vox` step of the setup that failed,
+//! the preconditions above included, is `PRODUCT (staging):`; `APPARATUS:` names a fault of this
+//! proof's own.
 //!
 //! Mutations: restoring the busy refusal at the inbound check breaks (1); the old governance
 //! wrapper in `sync_failure` breaks (2) wherever a failure is reported.
@@ -158,13 +159,13 @@ fn a_sync_that_did_not_complete_says_why() {
 
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "CANNOT MEASURE: vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     };
     let (alice_fp, bob_fp) = (fp(&alice_dir), fp(&bob_dir));
     for (d, other, name) in [(&alice_dir, &bob_fp, "bob"), (&bob_dir, &alice_fp, "alice")] {
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", other, "--name", name]));
-        assert!(ok, "CANNOT MEASURE: vox trust add {name}: {out}{err}");
+        assert!(ok, "PRODUCT (staging): vox trust add {name}: {out}{err}");
     }
 
     let mut alice = daemon("alice", &alice_dir, &spec, &idpass);
@@ -175,9 +176,9 @@ fn a_sync_that_did_not_complete_says_why() {
         &["room", "create", "--name", "pair"],
         "room pass",
     );
-    assert!(ok, "CANNOT MEASURE: vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "CANNOT MEASURE: vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("pair"))
@@ -187,13 +188,13 @@ fn a_sync_that_did_not_complete_says_why() {
         })
         .to_owned();
     let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "CANNOT MEASURE: vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
         &["room", "join", link.trim(), "--name", "pair"],
         "room pass",
     );
-    assert!(ok, "CANNOT MEASURE: bob's `vox room join`: {out}{err}");
+    assert!(ok, "PRODUCT (staging): bob's `vox room join`: {out}{err}");
 
     // Both members read each other before the rounds, so every failure below is between two
     // members that can sync, not a join still settling.
@@ -202,7 +203,7 @@ fn a_sync_that_did_not_complete_says_why() {
         &alice_dir,
         &args(&["room", "post", &room, "hello from alice"]),
     );
-    assert!(ok, "CANNOT MEASURE: alice's first post: {err}");
+    assert!(ok, "PRODUCT (staging): alice's first post: {err}");
     loop {
         let (_, read, _) = vox_once(&bob_dir, &args(&["room", "read", &room]));
         if read.contains("hello from alice") {
@@ -210,7 +211,7 @@ fn a_sync_that_did_not_complete_says_why() {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: bob never read alice before the rounds"
+            "PRODUCT (staging): bob never read alice before the rounds"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -289,7 +290,7 @@ fn a_sync_that_did_not_complete_says_why() {
     }
     assert!(
         a_opened >= 3 && b_opened >= 3,
-        "CANNOT MEASURE: the members opened {a_opened} and {b_opened} sessions to each other over \
+        "PRODUCT (staging): the members opened {a_opened} and {b_opened} sessions to each other over \
          {ROUNDS} rounds"
     );
 
@@ -337,7 +338,7 @@ fn a_sync_that_did_not_complete_says_why() {
     );
     assert!(
         seen.is_some(),
-        "CANNOT MEASURE: with bob frozen, alice never reported a sync that {DID_NOT_COMPLETE:?} \
+        "PRODUCT (staging): with bob frozen, alice never reported a sync that {DID_NOT_COMPLETE:?} \
          within {CONTROL_WITHIN:?} (her post ok={ok}: {err}), so the silence during the rounds \
          proves nothing\n{}",
         alice.transcript()

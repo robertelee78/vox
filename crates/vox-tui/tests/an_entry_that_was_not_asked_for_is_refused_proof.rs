@@ -23,7 +23,7 @@
 //! first is advertised (it is now the second newest), the second never is, but is served.
 //!
 //! ## Asserted
-//! 1. Bob reads "p9 visible" (the pair syncs; precondition, else CANNOT MEASURE);
+//! 1. Bob reads "p9 visible" (the pair syncs; precondition, else PRODUCT (staging));
 //! 2. Bob **never** reads "p9 hidden", over [`WATCH`];
 //! 3. Bob's `vox status --json` names the violation as the last failure with Alice.
 //!
@@ -87,7 +87,7 @@ fn an_entry_that_was_not_asked_for_is_refused() {
         }
         assert!(
             start.elapsed() < Duration::from_secs(90),
-            "CANNOT MEASURE: bob never read alice's warm-up\nalice:\n{}\nbob:\n{}",
+            "PRODUCT (staging): bob never read alice's warm-up\nalice:\n{}\nbob:\n{}",
             alice_d.transcript(),
             bob_d.transcript()
         );
@@ -138,7 +138,7 @@ fn an_entry_that_was_not_asked_for_is_refused() {
     );
     assert!(
         visible_at.is_some(),
-        "CANNOT MEASURE: bob never read \"p9 visible\" within {WATCH:?}\nbob:\n{}",
+        "PRODUCT (staging): bob never read \"p9 visible\" within {WATCH:?}\nbob:\n{}",
         bob_d.transcript()
     );
     assert!(

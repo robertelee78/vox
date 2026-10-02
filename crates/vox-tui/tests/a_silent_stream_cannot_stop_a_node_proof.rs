@@ -30,8 +30,8 @@
 //!    not refused.
 //!
 //! **Which side a red is on.** A slow or failed post or read is `PRODUCT:` and quotes what vox
-//! said; staging not achieved (a join, the escalation, the attack not holding) is
-//! `CANNOT MEASURE:`; a fault of this proof's own (a file, a runtime, a signal) is `APPARATUS:`.
+//! said; a `vox` step of the setup that failed (an identity, a room, the first post) is
+//! `PRODUCT (staging):`; the escalation or the attack not holding is `CANNOT MEASURE:`; a fault of this proof's own (a file, a runtime, a signal) is `APPARATUS:`.
 //! Mallory joins **once**: a join turned away is the product's red, not something to retry past.
 //! The bound is read against an **apparatus clock**: a quiet baseline post on the victim before
 //! the attack starts, and the time to start a `vox --version` right after any slow post. A post
@@ -242,9 +242,10 @@ fn stop(mut p: VoxProc) {
 
 fn fingerprint(data: &Path) -> [u8; 32] {
     let (ok, out, err) = vox_once(data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
-    vox_core::node::link::b32_decode(out.trim(), "fingerprint")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: vox id printed no fingerprint ({e:?}): {out}"))
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
+    vox_core::node::link::b32_decode(out.trim(), "fingerprint").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): vox id printed no fingerprint ({e:?}): {out}")
+    })
 }
 
 #[test]
@@ -288,15 +289,15 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
         &["room", "create", "--name", "team"],
         ROOM_PASS,
     );
-    assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, list, _) = vox_once(&victim_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
         .next()
-        .expect("CANNOT MEASURE: the new room in `vox room list`")
+        .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
     let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "CANNOT MEASURE: room invite: {err}");
+    assert!(ok, "PRODUCT (staging): room invite: {err}");
     let link = link.trim().to_owned();
     let (joined, out, err) = vox_in(
         &mallory_dir,
@@ -310,7 +311,7 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
 
     // The room's full id, from a row the victim renders.
     let (ok, _, err) = vox_once(&victim_dir, &args(&["room", "post", &prefix, "hello"]));
-    assert!(ok, "CANNOT MEASURE: first post: {err}");
+    assert!(ok, "PRODUCT (staging): first post: {err}");
     let (_, rows, _) = vox_once(&victim_dir, &args(&["room", "read", &prefix, "--json"]));
     let room = rows
         .lines()
@@ -321,7 +322,7 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
                 .as_str()
                 .map(str::to_owned)
         })
-        .expect("CANNOT MEASURE: the victim's read names its room");
+        .expect("PRODUCT (staging): the victim's read names its room");
     let cid = vox_core::node::link::b32_decode(&room, "room id").unwrap_or_else(|e| {
         panic!("PRODUCT: `vox room read --json` named a room {room:?} that is not a room id: {e:?}")
     });

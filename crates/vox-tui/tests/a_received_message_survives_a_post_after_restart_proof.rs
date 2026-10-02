@@ -177,15 +177,12 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
     let mut fps = Vec::new();
     for dir in [&alice, &bob] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "CANNOT MEASURE: vox id (staging) failed: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         fps.push(out.trim().to_owned());
     }
     for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(
-            ok,
-            "CANNOT MEASURE: vox trust add {name} (staging) failed: {err}"
-        );
+        assert!(ok, "PRODUCT (staging): vox trust add {name} failed: {err}");
     }
 
     let _a = daemon(&alice, "alice");
@@ -194,30 +191,24 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
         &["room", "create", "--name", "kept"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(
-        ok,
-        "CANNOT MEASURE: vox room create (staging) failed: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
     let (_, listed, _) = vox(&alice, &["room", "list"], None);
     let room: String = listed
         .split_whitespace()
         .next()
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: no room id in `vox room list`: {listed:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in `vox room list`: {listed:?}"))
         .chars()
         .take(12)
         .collect();
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(
-        ok,
-        "CANNOT MEASURE: vox room invite (staging) failed: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
     let b = daemon(&bob, "bob-start");
     let (ok, _, err) = vox(
         &bob,
         &["room", "join", link.trim(), "--name", "kept"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: vox room join (staging) failed: {err}");
+    assert!(ok, "PRODUCT (staging): vox room join failed: {err}");
 
     // ---- alice posts; bob receives all three ------------------------------------------------
     let hers = [
@@ -227,7 +218,7 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
     ];
     for p in hers {
         let (ok, _, err) = vox(&alice, &["room", "post", &room, p], None);
-        assert!(ok, "CANNOT MEASURE: alice's post (staging) failed: {err}");
+        assert!(ok, "PRODUCT (staging): alice's post failed: {err}");
     }
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -237,7 +228,7 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: bob received only {got:?} of alice's posts within 60s"
+            "PRODUCT (staging): bob received only {got:?} of alice's posts within 60s"
         );
         std::thread::sleep(Duration::from_millis(250));
     }

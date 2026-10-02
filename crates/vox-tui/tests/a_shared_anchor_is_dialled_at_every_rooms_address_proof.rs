@@ -24,8 +24,9 @@
 //! anchor's restart bob says `connected to this anchor` again.
 //!
 //! **Which side a red is on.** `PRODUCT:` quotes what vox said or did (a join refused, an anchor
-//! that would not stop, bob not back in time); `CANNOT MEASURE:` names staging that was not
-//! achieved; `APPARATUS:` names a fault of this proof's own (a process it could not start, a file
+//! that would not stop, bob not back in time); a `vox` step of the setup that failed is
+//! `PRODUCT (staging):`, quoting it; `CANNOT MEASURE:` names a precondition that was not met;
+//! `APPARATUS:` names a fault of this proof's own (a process it could not start, a file
 //! it could not write, a signal it could not send). Each join is tried **once**: a join turned
 //! away is the product's red, not something to retry past. The bound is read against an
 //! **apparatus clock** on the same timeline — how long this machine takes to start a `vox
@@ -298,9 +299,9 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
             .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", d.display()));
     }
     let (ok, alice_fp, err) = vox(&alice_dir, &["id"], None);
-    assert!(ok, "CANNOT MEASURE: alice's vox id: {err}");
+    assert!(ok, "PRODUCT (staging): alice's vox id: {err}");
     let (ok, bob_fp, err) = vox(&bob_dir, &["id"], None);
-    assert!(ok, "CANNOT MEASURE: bob's vox id: {err}");
+    assert!(ok, "PRODUCT (staging): bob's vox id: {err}");
     let (alice_fp, bob_fp) = (alice_fp.trim().to_owned(), bob_fp.trim().to_owned());
     let (_alice, alice_err) = daemon(&alice_dir, &["--anchor", &spec]);
     let mut rooms = Vec::new();
@@ -310,7 +311,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
             &["room", "create", "--name", name],
             Some(ROOM_PASS),
         );
-        assert!(ok, "CANNOT MEASURE: alice's room create: {err}");
+        assert!(ok, "PRODUCT (staging): alice's room create: {err}");
         let id = room_ids(&alice_dir)
             .into_iter()
             .find(|id| !rooms.contains(id))
@@ -332,7 +333,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: alice's invite for {room} never named the anchor at {real_addr}: \
+                "PRODUCT (staging): alice's invite for {room} never named the anchor at {real_addr}: \
                  {out:?}\n{}",
                 std::fs::read_to_string(&alice_err).unwrap_or_default()
             );
@@ -371,13 +372,13 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
         &["trust", "add", &bob_fp, "--name", "bob"],
         None,
     );
-    assert!(ok, "CANNOT MEASURE: alice trusts bob: {err}");
+    assert!(ok, "PRODUCT (staging): alice trusts bob: {err}");
     let (ok, _, err) = vox(
         &bob_dir,
         &["trust", "add", &alice_fp, "--name", "alice"],
         None,
     );
-    assert!(ok, "CANNOT MEASURE: bob trusts alice: {err}");
+    assert!(ok, "PRODUCT (staging): bob trusts alice: {err}");
     for (link, name) in [(&stale_link, "one"), (&good_link, "two")] {
         let (joined, said) = join(&bob_dir, link, name);
         println!("[proof] bob joined {name}: {joined}");

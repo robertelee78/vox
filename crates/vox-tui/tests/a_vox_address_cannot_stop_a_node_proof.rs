@@ -216,14 +216,15 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 fn fingerprint(data: &Path) -> [u8; 32] {
     let (ok, out, err) = vox_once(data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
-    vox_core::node::link::b32_decode(out.trim(), "fingerprint")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: vox id printed no fingerprint ({e:?}): {out}"))
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
+    vox_core::node::link::b32_decode(out.trim(), "fingerprint").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): vox id printed no fingerprint ({e:?}): {out}")
+    })
 }
 
 #[test]
@@ -251,7 +252,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .expect("CANNOT MEASURE: the anchor's spec line names no address")
+        .expect("PRODUCT (staging): the anchor's spec line names no address")
         .to_owned();
     let victim_id = fingerprint(&victim_dir);
     let victim_listen = format!("127.0.0.1:{}", free_udp_port());
@@ -261,15 +262,15 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
         &["room", "create", "--name", "team"],
         ROOM_PASS,
     );
-    assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, list, _) = vox_once(&victim_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
         .next()
-        .expect("CANNOT MEASURE: the new room in `vox room list`")
+        .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
     let (ok, _, err) = vox_once(&victim_dir, &args(&["room", "post", &prefix, "hello"]));
-    assert!(ok, "CANNOT MEASURE: first post: {err}");
+    assert!(ok, "PRODUCT (staging): first post: {err}");
     let (_, rows, _) = vox_once(&victim_dir, &args(&["room", "read", &prefix, "--json"]));
     // The room's id in full: the `.vox` name, and all the stranger is given.
     let room = rows
@@ -281,9 +282,9 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
                 .as_str()
                 .map(str::to_owned)
         })
-        .expect("CANNOT MEASURE: the victim's read names its room");
+        .expect("PRODUCT (staging): the victim's read names its room");
     let cid = vox_core::node::link::b32_decode(&room, "room id").unwrap_or_else(|e| {
-        panic!("CANNOT MEASURE: the victim's read named room {room:?} ({e:?})")
+        panic!("PRODUCT (staging): the victim's read named room {room:?} ({e:?})")
     });
 
     // ---- the stranger: a fresh identity and the room's name, nothing else ---------------

@@ -19,8 +19,8 @@
 //! SIGINT, SIGTERM, SIGHUP and SIGQUIT in turn. Each must exit within [`STOP_WITHIN`] with status 0,
 //! not by the signal, and say which signal stopped it and that it is shutting down.
 //!
-//! **A red names its side.** An anchor that never wrote its anchors file, or a `kill` that failed,
-//! is CANNOT MEASURE (the scene was not staged). Anything after the signal is the product's: it
+//! **A red names its side.** An anchor that never wrote its anchors file is PRODUCT (staging); a
+//! `kill` that failed is CANNOT MEASURE (the scene was not staged). Anything after the signal is the product's: it
 //! did not exit, died by the signal, or exited without saying why. The wait for each exit is
 //! polled every 50 ms, and the proof measures its own clock on the same timeline: how far the
 //! deschedule's sleep overshot, and the longest gap between two polls. An anchor still running
@@ -120,7 +120,7 @@ fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
         if let Err(why) = anchor.try_expect_within(LINE_PATIENCE, "the anchors file written", |l| {
             l.starts_with("vox node: wrote ")
         }) {
-            panic!("CANNOT MEASURE: anchor {trial} never settled: {why}");
+            panic!("PRODUCT (staging): anchor {trial} never settled: {why}");
         }
         let pid = anchor.child.id();
         signal(pid, "-STOP");

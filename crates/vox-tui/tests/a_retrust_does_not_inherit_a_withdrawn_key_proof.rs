@@ -174,7 +174,7 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
     let mut fps = Vec::new();
     for d in &dirs {
         let (ok, out, err) = vox(d, &["id"], None);
-        assert!(ok, "CANNOT MEASURE: vox id (staging) failed: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         fps.push(out.trim().to_owned());
     }
     let _alice = daemon(alice_dir, "127.0.0.1:0", &anchor.v4_spec);
@@ -185,41 +185,35 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
 
     for (i, name) in [(1usize, "bob"), (2, "carol")] {
         let (ok, _, err) = vox(alice_dir, &["trust", "add", &fps[i], "--name", name], None);
-        assert!(
-            ok,
-            "CANNOT MEASURE: alice trusts {name} (staging) failed: {err}"
-        );
+        assert!(ok, "PRODUCT (staging): alice trusts {name} failed: {err}");
         let (ok, _, err) = vox(
             &dirs[i],
             &["trust", "add", &fps[0], "--name", "alice"],
             None,
         );
-        assert!(
-            ok,
-            "CANNOT MEASURE: {name} trusts alice (staging) failed: {err}"
-        );
+        assert!(ok, "PRODUCT (staging): {name} trusts alice failed: {err}");
     }
     let (ok, _, err) = vox(
         alice_dir,
         &["room", "create", "--name", "late"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: room create (staging) failed: {err}");
+    assert!(ok, "PRODUCT (staging): room create failed: {err}");
     let listed = vox(alice_dir, &["room", "list"], None).1;
     let room = listed
         .split_whitespace()
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: no room id in `vox room list`: {listed:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in `vox room list`: {listed:?}"))
         .to_owned();
     let (ok, link, err) = vox(alice_dir, &["room", "invite", &room], None);
-    assert!(ok, "CANNOT MEASURE: room invite (staging) failed: {err}");
+    assert!(ok, "PRODUCT (staging): room invite failed: {err}");
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,
             &["room", "join", link.trim(), "--name", "late"],
             Some(&format!("{ROOMPASS}\n")),
         );
-        assert!(ok, "CANNOT MEASURE: a join failed: {err}");
+        assert!(ok, "PRODUCT (staging): a join failed: {err}");
     }
     // Both hold the room and each other's admission before carol decides anything.
     let (ok, _, err) = vox(
@@ -227,10 +221,7 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
         &["room", "post", &room, "CAROL-BEFORE-TRUST"],
         None,
     );
-    assert!(
-        ok,
-        "CANNOT MEASURE: carol's first post (staging) failed: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): carol's first post failed: {err}");
     assert!(
         until("bob holds carol's entry (unreadable yet)", 60, || {
             vox(bob_dir, &["room", "read", &room, "--json"], None)
@@ -238,7 +229,7 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
                 .contains(&fps[2][..20])
                 || reads(alice_dir, &room, "CAROL-BEFORE-TRUST")
         }),
-        "CANNOT MEASURE: carol's first post never reached the room"
+        "PRODUCT (staging): carol's first post never reached the room"
     );
     std::thread::sleep(Duration::from_secs(3));
     assert!(

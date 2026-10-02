@@ -247,13 +247,13 @@ fn an_identity_made_over_a_leftover_store_unlocks() {
     let first = p.vox(&["id"]);
     assert!(
         first.ok,
-        "CANNOT MEASURE: the first vox id: {}{}",
+        "PRODUCT (staging): the first vox id: {}{}",
         first.stdout, first.stderr
     );
     let (answers, what) = p.daemon_answers();
     assert!(
         answers,
-        "CANNOT MEASURE: the first identity's daemon never answered: {what}"
+        "PRODUCT (staging): the first identity's daemon never answered: {what}"
     );
     std::fs::remove_file(p.dir().join("vault.cbor"))
         .expect("APPARATUS: cannot remove the vault to stage a leftover store");
@@ -350,7 +350,7 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
     let first = q.vox(&["id"]);
     assert!(
         first.ok,
-        "CANNOT MEASURE: the first vox id: {}",
+        "PRODUCT (staging): the first vox id: {}",
         first.stderr
     );
     std::fs::remove_file(q.dir().join("vault.cbor"))
@@ -486,7 +486,7 @@ fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
     let first = q.vox(&["id"]);
     assert!(
         first.ok,
-        "CANNOT MEASURE: the first vox id: {}",
+        "PRODUCT (staging): the first vox id: {}",
         first.stderr
     );
     std::fs::remove_file(q.dir().join("vault.cbor"))

@@ -130,7 +130,7 @@ impl Proc {
             .map(|g| g.clone())
             .unwrap_or_else(|e| e.into_inner().clone());
         panic!(
-            "CANNOT MEASURE: {} (staging) never printed {what}; saw: {seen:#?}\nits stderr:\n{err}",
+            "PRODUCT (staging): {} never printed {what}; saw: {seen:#?}\nits stderr:\n{err}",
             self.name
         );
     }
@@ -232,7 +232,7 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
     // ---- identities, headless ----
     let fp = |d: &std::path::Path| {
         let (ok, out, err) = vox(d, &s(&["id"]), None);
-        assert!(ok, "CANNOT MEASURE: vox id (staging) failed: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         out.trim().to_owned()
     };
     let (alice_fp, bob_fp, carol_fp) = (fp(&alice), fp(&bob), fp(&carol));
@@ -247,10 +247,7 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
         (&carol, &alice_fp, "alice"),
     ] {
         let (ok, _, err) = vox(d, &s(&["trust", "add", who, "--name", name]), None);
-        assert!(
-            ok,
-            "CANNOT MEASURE: vox trust add {name} (staging) failed: {err}"
-        );
+        assert!(ok, "PRODUCT (staging): vox trust add {name} failed: {err}");
     }
 
     let mut daemons = Vec::new();
@@ -271,18 +268,18 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
         &s(&["room", "create", "--name", "mission"]),
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: room create (staging) failed: {err}");
+    assert!(ok, "PRODUCT (staging): room create failed: {err}");
     let listed = until(&alice, "the room", &s(&["room", "list"]), 30, |o| {
         o.contains("mission")
     })
-    .unwrap_or_else(|e| panic!("CANNOT MEASURE: alice's room never listed (staging): {e}"));
+    .unwrap_or_else(|e| panic!("PRODUCT (staging): alice's room never listed: {e}"));
     let room = listed
         .split_whitespace()
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: no room id in `vox room list`: {listed:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in `vox room list`: {listed:?}"))
         .to_owned();
     let (ok, link, err) = vox(&alice, &s(&["room", "invite", &room]), None);
-    assert!(ok, "CANNOT MEASURE: room invite (staging) failed: {err}");
+    assert!(ok, "PRODUCT (staging): room invite failed: {err}");
     let link = link.trim().to_owned();
 
     // ---- claim 1: a wrong passphrase is refused, and the refusal names the passphrase ----

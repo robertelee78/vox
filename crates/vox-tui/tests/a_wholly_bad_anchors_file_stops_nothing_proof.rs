@@ -223,7 +223,7 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
         let fp = fp.trim().to_owned();
         assert!(
             ok && fp.len() == 52,
-            "CANNOT MEASURE: the first `vox id` (no anchors file yet) printed {fp:?}: {err}"
+            "PRODUCT (staging): the first `vox id` (no anchors file yet) printed {fp:?}: {err}"
         );
         fps.push(fp);
     }
@@ -334,7 +334,7 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned);
     let Some(room) = room.filter(|_| ok) else {
-        panic!("CANNOT MEASURE: no room id in alice's `vox room list`: {listed}{err}");
+        panic!("PRODUCT (staging): no room id in alice's `vox room list`: {listed}{err}");
     };
     let (ok, _, err) = vox_once(&alice, &args(&["room", "post", &room, POST]));
     assert!(ok, "PRODUCT: alice's post in her own room: {err}");
@@ -493,7 +493,7 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     let carol = tmp.path().join("carol");
     std::fs::create_dir_all(carol.join("cfg")).expect("APPARATUS: cannot make a directory");
     let (ok, _, err) = vox_once(&carol, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: carol's `vox id`: {err}");
+    assert!(ok, "PRODUCT (staging): carol's `vox id`: {err}");
     let t0 = Instant::now();
     let mut connect = Proc::spawn(
         &carol,

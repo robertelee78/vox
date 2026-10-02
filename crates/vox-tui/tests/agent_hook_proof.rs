@@ -122,7 +122,7 @@ impl Daemon {
             ],
             "",
         );
-        assert!(ok, "CANNOT MEASURE: vox id failed: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         let fingerprint = out.trim().to_owned();
         let err_file = root.join("daemon.err");
         let child = vox(&data, &cfg)
@@ -140,7 +140,7 @@ impl Daemon {
         while !hook(&data, &cfg, &["room", "list"], "").0 {
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: the daemon never answered `vox room list` in 60 s; it said:\n{}",
+                "PRODUCT (staging): the daemon never answered `vox room list` in 60 s; it said:\n{}",
                 std::fs::read_to_string(&err_file).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(250));
@@ -151,21 +151,21 @@ impl Daemon {
             &["room", "create", "--name", "agents"],
             "channel passphrase",
         );
-        assert!(ok, "CANNOT MEASURE: vox room create failed: {err}");
+        assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
         let (_, list, _) = hook(&data, &cfg, &["room", "list"], "");
         let label = list
             .split_whitespace()
             .next()
-            .unwrap_or_else(|| panic!("CANNOT MEASURE: `vox room list` named no room: {list:?}"))
+            .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` named no room: {list:?}"))
             .to_owned();
         let (ok, link, err) = hook(&data, &cfg, &["room", "invite", &label], "");
-        assert!(ok, "CANNOT MEASURE: vox room invite failed: {err}");
+        assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
         let room_key = link
             .trim()
             .strip_prefix("vox://")
             .and_then(|l| l.split('?').next())
             .unwrap_or_else(|| {
-                panic!("CANNOT MEASURE: `vox room invite` printed no link: {link:?}")
+                panic!("PRODUCT (staging): `vox room invite` printed no link: {link:?}")
             })
             .to_owned();
         Self {
@@ -181,7 +181,7 @@ impl Daemon {
     fn post(&self, text: &str) {
         let label: String = self.room_key.chars().take(12).collect();
         let (ok, _, err) = hook(&self.data, &self.cfg, &["room", "post", &label, "-"], text);
-        assert!(ok, "CANNOT MEASURE: vox room post failed: {err}");
+        assert!(ok, "PRODUCT (staging): vox room post failed: {err}");
     }
 }
 

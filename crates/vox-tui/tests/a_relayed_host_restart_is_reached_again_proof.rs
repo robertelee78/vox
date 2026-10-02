@@ -104,7 +104,7 @@ fn trial(n: usize) -> (Duration, Duration) {
         let host = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
         let anchor = w.anchor.proc.transcript();
         panic!(
-            "CANNOT MEASURE (trial {n}): the guest could not join over the relay ({took:?}).\n{out}\n\
+            "PRODUCT (staging, trial {n}): the guest could not join over the relay ({took:?}).\n{out}\n\
              {err}\n--- host:\n{host}\n--- anchor:\n{anchor}"
         );
     }
@@ -112,7 +112,7 @@ fn trial(n: usize) -> (Duration, Duration) {
     let before =
         round_trip(at, b"before the crash", Duration::from_secs(120)).unwrap_or_else(|e| {
             panic!(
-                "CANNOT MEASURE (trial {n}): no echo before the crash ({e}).\n{}",
+                "PRODUCT (staging, trial {n}): no echo before the crash ({e}).\n{}",
                 w.fwd.as_mut().unwrap().transcript()
             )
         });

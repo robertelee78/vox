@@ -73,7 +73,7 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
 
     for dir in [&host_dir, &guest_dir] {
         let (ok, _, err) = vox_once(dir, &args(&["id"]));
-        assert!(ok, "CANNOT MEASURE: vox id (staging) failed: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
     }
 
     // The room exists, and anchor A holds it: `vox serve` publishes before it prints the address.

@@ -150,7 +150,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         std::thread::sleep(Duration::from_millis(250));
     }
     panic!(
-        "CANNOT MEASURE: {name}'s daemon never answered `vox room list` within {SETUP:?}, so the \
+        "PRODUCT (staging): {name}'s daemon never answered `vox room list` within {SETUP:?}, so the \
          scene was not staged:\n{}",
         p.transcript()
     );
@@ -256,7 +256,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
 
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "CANNOT MEASURE: vox id (staging) failed: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         out.trim().to_owned()
     };
     let members = [
@@ -274,7 +274,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
                 let (ok, out, err) = vox_once(d, &args(&["trust", "add", &fps[j], "--name", name]));
                 assert!(
                     ok,
-                    "CANNOT MEASURE: vox trust add {name} (staging) failed: {out}{err}"
+                    "PRODUCT (staging): vox trust add {name} failed: {out}{err}"
                 );
             }
         }
@@ -286,33 +286,24 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     let frank = daemon("frank", &frank_dir, &spec, &idpass);
 
     let (ok, out, err) = vox_in(&alice_dir, &["room", "create", "--name", "eq"], "room pass");
-    assert!(
-        ok,
-        "CANNOT MEASURE: vox room create (staging) failed: {out}{err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox room create failed: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "CANNOT MEASURE: vox room list (staging) failed: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list failed: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("eq"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: the new room is not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the new room is not listed: {list}"))
         .to_owned();
     let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(
-        ok,
-        "CANNOT MEASURE: vox room invite (staging) failed: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
     for (name, d) in &members[1..] {
         let (ok, out, err) = vox_in(
             d,
             &["room", "join", link.trim(), "--name", "eq"],
             "room pass",
         );
-        assert!(
-            ok,
-            "CANNOT MEASURE: {name}'s join (staging) failed: {out}{err}"
-        );
+        assert!(ok, "PRODUCT (staging): {name}'s join failed: {out}{err}");
     }
     // The room's full id, as `vox status --json` names it: the invite link carries it.
     let room_id = link
@@ -356,7 +347,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: after {SETUP:?} ({round} rounds) the members still do not all read \
+            "PRODUCT (staging): after {SETUP:?} ({round} rounds) the members still do not all read \
              each other: {missing:?}"
         );
     }
@@ -378,7 +369,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     for text in ["EQ-EVE-A-3", "EQ-FRANK-A-1"] {
         assert!(
             wait_reads(&bob_dir, &room, text, REACH),
-            "CANNOT MEASURE: bob never read {text}, so the first side of the fork is not in place"
+            "PRODUCT (staging): bob never read {text}, so the first side of the fork is not in place"
         );
     }
     stop(eve);
@@ -483,7 +474,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     post(&bob_dir, &room, "bob", "EQ-CONTROL");
     assert!(
         wait_reads(&carol_dir, &room, "EQ-CONTROL", REACH),
-        "CANNOT MEASURE: carol never read bob's control message, so nothing shows the room moves"
+        "PRODUCT (staging): carol never read bob's control message, so nothing shows the room moves"
     );
     std::thread::sleep(HELD);
     for (who, d) in [("bob", &bob_dir), ("carol", &carol_dir)] {
@@ -505,7 +496,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     for (name, f) in [("eve", &eve_fp), ("frank", &frank_fp)] {
         assert!(
             anchor_holds(&before, f),
-            "CANNOT MEASURE: the anchor never said it holds {name} back, so its restart proves \
+            "PRODUCT (staging): the anchor never said it holds {name} back, so its restart proves \
              nothing:\n{before}"
         );
     }
@@ -518,7 +509,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     // yet reopened.
     assert!(
         wait_reads(&carol_dir, &room, "EQ-CONTROL", REACH),
-        "CANNOT MEASURE: carol's restarted daemon never reopened the room"
+        "PRODUCT (staging): carol's restarted daemon never reopened the room"
     );
     let after = listed(&carol_dir, &room_id);
     eprintln!("[proof] carol, restarted alone, lists {after:?}");

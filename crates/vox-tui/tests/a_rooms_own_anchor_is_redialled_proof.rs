@@ -30,13 +30,14 @@
 //!
 //! **Asserted:** the forward process has no configured anchor (else CANNOT MEASURE); the path is
 //! relayed (the guest's `still relayed`); before the restart the anchor held both members'
-//! records (else CANNOT MEASURE); after the restart the echo carries again within
+//! records (else PRODUCT (staging)); after the restart the echo carries again within
 //! [`BACK_WITHIN`]; the forward said the connection to its anchor was gone; and the restarted
 //! anchor, with the host paused, holds the host's record again within [`REPUBLISHED_WITHIN`].
 //!
 //! **Which side a red is on.** A red that names the product begins `PRODUCT:` and quotes what
-//! vox said; one that names the staging (a join, an echo before the restart, a record the anchor
-//! never held) begins `CANNOT MEASURE:`; a fault of this proof's own (a signal that did not take,
+//! vox said; a step of the setup the product did not do (a join, an echo before the restart, a
+//! record the anchor never held) begins `PRODUCT (staging):`; a precondition that was not met (an
+//! anchors file, the store's place) begins `CANNOT MEASURE:`; a fault of this proof's own (a signal that did not take,
 //! a `vox` that cannot be started) begins `APPARATUS:`. The host's pause is confirmed, not
 //! assumed: `ps` must show it stopped after SIGSTOP and running after SIGCONT, or a host that was
 //! never paused could restore its own record and pass the republish claim for it. The two bounds
@@ -94,7 +95,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
 
     // ---- the forward: no --anchor, no anchors file; its only anchor is the room's -------------
@@ -135,7 +136,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     let first = round_trip(at, b"before", Duration::from_secs(30));
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
-        "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
+        "PRODUCT (staging): no echo through the forward before the anchor went: {first:?}\n{}",
         w.fwd.as_mut().unwrap().transcript()
     );
     w.expect_still_relayed();
@@ -150,7 +151,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
         .cloned()
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: before the restart the anchor held no record for the host \
+                "PRODUCT (staging): before the restart the anchor held no record for the host \
                  ({host_author}…): {held_before:?}\n{}",
                 w.anchor.proc.transcript()
             )

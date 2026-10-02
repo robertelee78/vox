@@ -88,14 +88,14 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
     let started = Instant::now();
     let at = w.forward();
     let first = round_trip(at, b"before", Duration::from_secs(30));
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
-        "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
+        "PRODUCT (staging): no echo through the forward before the anchor went: {first:?}\n{}",
         forward(&mut w.fwd).transcript()
     );
     w.expect_still_relayed();
@@ -350,15 +350,18 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
     let anchor12: String = anchor_id(&w).chars().take(12).collect();
     let host12: String = w.host_fp.chars().take(12).collect();
     let started = Instant::now();
     let at = if host_too {
-        let host = w
-            .host_spec()
-            .unwrap_or_else(|| panic!("CANNOT MEASURE: no address for the host in {}", w.address));
+        let host = w.host_spec().unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): no address for the host in {}",
+                w.address
+            )
+        });
         w.forward_with_anchors(&[&host])
     } else {
         w.forward()
@@ -366,7 +369,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     let first = round_trip(at, b"before", Duration::from_secs(30));
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
-        "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
+        "PRODUCT (staging): no echo through the forward before the anchor went: {first:?}\n{}",
         forward(&mut w.fwd).transcript()
     );
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
@@ -416,7 +419,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: the forward never held its host as an anchor over the relay \
+                "PRODUCT (staging): the forward never held its host as an anchor over the relay \
                  (reached: {reached}, still relayed: {relayed}, redialling it: {})\n{}",
                 !settled,
                 fwd.transcript()
@@ -432,7 +435,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     assert_eq!(
         before,
         0,
-        "CANNOT MEASURE: the forward said its anchor went before it was stopped\n{}",
+        "PRODUCT (staging): the forward said its anchor went before it was stopped\n{}",
         fwd.transcript()
     );
 
@@ -446,7 +449,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
         );
         assert!(
             flowing,
-            "CANNOT MEASURE: the transfer through the forward never echoed {TRANSFER_FLOWING} bytes \
+            "PRODUCT (staging): the transfer through the forward never echoed {TRANSFER_FLOWING} bytes \
              ({} did)\n{}",
             t.echoed(),
             forward(&mut w.fwd).transcript()
@@ -592,8 +595,8 @@ impl Transfer {
         let echoed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut out =
-            std::net::TcpStream::connect(at).expect("CANNOT MEASURE: connect to the forward");
-        let mut back = out.try_clone().expect("CANNOT MEASURE: clone the stream");
+            std::net::TcpStream::connect(at).expect("PRODUCT (staging): connect to the forward");
+        let mut back = out.try_clone().expect("APPARATUS: clone the stream");
         let _ = out.set_write_timeout(Some(Duration::from_millis(200)));
         let _ = back.set_read_timeout(Some(Duration::from_millis(200)));
         let idle = |e: &std::io::Error| {
@@ -680,7 +683,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
     let _ = w.forward();
     let anchor_dir = w.tmp.path().join("anchor");
@@ -696,7 +699,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
         };
         assert!(
             reached.is_some(),
-            "CANNOT MEASURE: round {round}: the forward never said it reached its anchor\n{}",
+            "PRODUCT (staging): round {round}: the forward never said it reached its anchor\n{}",
             forward(&mut w.fwd).transcript()
         );
         kill(["-INT", &w.anchor.proc.child.id().to_string()]);
