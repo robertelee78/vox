@@ -15,11 +15,12 @@
 //!   capability model (PRD-001 R44) is still in those bytes, and must still decode and
 //!   re-encode exactly.
 //!
-//! Each room's full id is read from `vox room invite` (its address is `vox://<room id>…`), with
-//! v0.2.9 and then with this build on the same profile. Asserted, as PRODUCT:
-//! 1. this build lists both rooms;
+//! Each room's full id is read from v0.2.9 (`vox room invite` and `vox serve`'s address,
+//! `vox://<room id>…`). Then this build's daemon starts on the same profile, given each room's
+//! passphrase as a person gives them. Asserted, as PRODUCT:
+//! 1. this build lists and opens both rooms;
 //! 2. it prints the same full id for each, in its invite;
-//! 3. it opens each (`vox room read` exits 0).
+//! 3. it reads each (`vox room read` exits 0).
 //!
 //! Mutation that must turn it red: this build's genesis encoder writes the retired slot as the
 //! deniable value (`1`). Every v0.2.9 room then hashes to another id, and this build refuses to
@@ -84,10 +85,13 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
 }
 
 /// A `vox daemon` of `exe` on `data`, once it answers `vox room list`. v0.2.9's daemon takes the
-/// identity passphrase only from a file or stdin, so it is given a file.
-fn daemon(exe: &Path, name: &str, data: &Path) -> VoxProc {
+/// identity passphrase only from a file or stdin, so it is given a file: the identity passphrase,
+/// then one room passphrase per line, which is how a person opens their rooms at start.
+fn daemon(exe: &Path, name: &str, data: &Path, rooms: &[&str]) -> VoxProc {
     let pass = data.join("identity-passphrase");
-    std::fs::write(&pass, IDENTITY)
+    let mut lines = vec![IDENTITY];
+    lines.extend_from_slice(rooms);
+    std::fs::write(&pass, lines.join("\n") + "\n")
         .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass.display()));
     let mut p = VoxProc::spawn_exe(
         exe,
@@ -159,7 +163,7 @@ fn a_room_made_by_the_last_release_keeps_its_name() {
         "CANNOT MEASURE: {PREVIOUS}'s `vox id` failed: {out}{err}"
     );
 
-    let old_daemon = daemon(&old, &format!("{PREVIOUS}'s daemon"), &host);
+    let old_daemon = daemon(&old, &format!("{PREVIOUS}'s daemon"), &host, &[]);
     let (ok, out, err) = vox_with(
         &old,
         &host,
@@ -217,24 +221,52 @@ fn a_room_made_by_the_last_release_keeps_its_name() {
     let svc_id = room_of(&address).unwrap_or_else(|| {
         panic!("CANNOT MEASURE: {PREVIOUS}'s `vox serve` printed no room address: {address}")
     });
+    let svc_pass = after_label(
+        &staged(&mut serve, "its room passphrase", |l| {
+            l.starts_with("passphrase ")
+        }),
+        "passphrase",
+    );
+    // `serving` comes after the room is stored and its service offered.
+    staged(&mut serve, "that it is serving", |l| {
+        l.starts_with("serving ")
+    });
     drop(serve);
     drop(anchor);
     eprintln!("[proof] {PREVIOUS} made chat {chat_id} and svc {svc_id}");
 
-    // ---- this build, on the same profile ----
-    let _daemon = daemon(Path::new(VOX), "this build's daemon", &host);
-    let (ok, list, err) = vox_with(Path::new(VOX), &host, &["room", "list"], None);
-    assert!(
-        ok,
-        "PRODUCT: this build's `vox room list` failed on {PREVIOUS}'s profile: {list}{err}"
+    // ---- this build, on the same profile, given both rooms' passphrases ----
+    let _daemon = daemon(
+        Path::new(VOX),
+        "this build's daemon",
+        &host,
+        &[ROOM_PASS, &svc_pass],
     );
     for (name, id) in [("chat", &chat_id), ("svc", &svc_id)] {
-        let prefix = listed(&list, name).unwrap_or_else(|| {
-            panic!(
-                "PRODUCT: this build does not list the room {PREVIOUS} made as {name} ({id}): \
-                 {list}{err}"
-            )
-        });
+        let prefix: String = id.chars().take(12).collect();
+        // The daemon opens the rooms it was given passphrases for as it starts; wait for that.
+        let deadline = Instant::now() + TIMEOUT;
+        let mut list: String;
+        let open = loop {
+            let (ok, out, err) = vox_with(Path::new(VOX), &host, &["room", "list"], None);
+            list = format!("{out}{err}");
+            let line = out
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .map(str::to_owned);
+            if ok && line.as_deref().is_some_and(|l| !l.contains("[closed]")) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        assert!(
+            open,
+            "PRODUCT: this build must list and open the room {PREVIOUS} made as {name} ({id}), \
+             given its passphrase; after {TIMEOUT:?} `vox room list` says: {list}"
+        );
         let (ok, invite, err) = vox_with(Path::new(VOX), &host, &["room", "invite", &prefix], None);
         assert!(
             ok && room_of(&invite).as_ref() == Some(id),
@@ -244,8 +276,8 @@ fn a_room_made_by_the_last_release_keeps_its_name() {
         let (ok, out, err) = vox_with(Path::new(VOX), &host, &["room", "read", &prefix], None);
         assert!(
             ok,
-            "PRODUCT: this build must open the room {PREVIOUS} made as {name} ({id}): {out}{err}"
+            "PRODUCT: this build must read the room {PREVIOUS} made as {name} ({id}): {out}{err}"
         );
-        eprintln!("[proof] this build lists, names and opens {name} as {id}");
+        eprintln!("[proof] this build lists, opens, names and reads {name} as {id}");
     }
 }
