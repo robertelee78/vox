@@ -277,9 +277,19 @@ fn scrape(addr: &str) -> String {
     let mut s = std::net::TcpStream::connect(addr)
         .unwrap_or_else(|e| panic!("PRODUCT: nothing answers at the metrics address {addr}: {e}"));
     s.set_read_timeout(Some(TIMEOUT)).ok();
-    // One write, as a scraper sends it: `write!` would send it in pieces.
-    s.write_all(format!("GET /metrics HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
-        .unwrap_or_else(|e| panic!("PRODUCT: the metrics endpoint at {addr} took no request: {e}"));
+    // In pieces, as a slow or proxied scraper's request arrives: the endpoint must read to the
+    // end of the headers before it answers, or its close resets the connection (V030-23, #337).
+    for piece in [
+        "GET /metrics HTTP/1.0\r\n",
+        &format!("Host: {addr}\r\n"),
+        "\r\n",
+    ] {
+        s.write_all(piece.as_bytes()).unwrap_or_else(|e| {
+            panic!("PRODUCT: the metrics endpoint at {addr} took no request: {e}")
+        });
+        s.flush().ok();
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let mut got = String::new();
     s.read_to_string(&mut got)
         .unwrap_or_else(|e| panic!("PRODUCT: the metrics endpoint at {addr} did not answer: {e}"));
