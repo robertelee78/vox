@@ -101,6 +101,9 @@
 //! and `VOX_TEST_WATCHDOG_SECS=0` disables it — for attaching a debugger, which is the one
 //! case where an unbounded hang is what you want.
 
+#[path = "proof_home.rs"]
+pub mod proof_home;
+
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -256,6 +259,8 @@ pub fn arm() {
 /// largest any of its tests asked for, whichever armed first. `VOX_TEST_WATCHDOG_SECS` still
 /// overrides it.
 pub fn arm_for(default_budget: Duration) {
+    // **First, the proof's children get a temporary HOME, never the operator's** (V210-157).
+    proof_home::isolate();
     BUDGET_SECS.fetch_max(default_budget.as_secs(), Ordering::Relaxed);
     let name = std::thread::current()
         .name()

@@ -275,7 +275,12 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
                 .args(args)
                 .env_clear()
                 .env("PATH", path)
-                .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+                // The proof's temporary HOME, never the operator's (V210-157).
+                .env(
+                    "HOME",
+                    watchdog::proof_home::proof_home()
+                        .unwrap_or(std::path::Path::new("/nonexistent")),
+                )
                 .env("SHELL", &shell)
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())

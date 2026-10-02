@@ -81,10 +81,14 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
     use std::io::Write as _;
     let mut cmd = std::process::Command::new(support::VOX);
     cmd.env_clear();
-    for key in ["PATH", "HOME", "TMPDIR"] {
+    for key in ["PATH", "TMPDIR"] {
         if let Some(v) = std::env::var_os(key) {
             cmd.env(key, v);
         }
+    }
+    // The proof's temporary HOME, never the operator's (V210-157).
+    if let Some(home) = watchdog::proof_home::proof_home() {
+        cmd.env("HOME", home);
     }
     cmd.args(args)
         .env("VOX_DATA_DIR", &bob.data)

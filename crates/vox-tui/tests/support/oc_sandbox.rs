@@ -55,9 +55,8 @@ fn which(bin: &str) -> Option<PathBuf> {
 /// is isolated from the operator's configuration **and** leaves nothing behind in
 /// it — a proof that pollutes the machine it runs on is a bad neighbour.
 pub fn auth_json() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share")))?;
+    // The operator's real one: the proof's own children have a temporary HOME (V210-157).
+    let base = crate::watchdog::proof_home::real_data_home()?;
     let p = base.join("opencode/auth.json");
     p.is_file().then_some(p)
 }
@@ -225,7 +224,9 @@ pub struct Canary {
 
 impl Canary {
     pub fn plant() -> Self {
-        let home = std::env::var_os("HOME")
+        // In the operator's **real** HOME: that is what the sandbox must keep a model out of. The
+        // proof's own children have a temporary one (V210-157).
+        let home = crate::watchdog::proof_home::real_home()
             .unwrap_or_else(|| panic!("APPARATUS: HOME is unset, so no canary can be planted"));
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -437,7 +438,9 @@ impl OcSandbox {
                 "cat {p:?} /System/Volumes/Data{p:?}; find / -name {n:?} 2>/dev/null; ls -a {h:?}",
                 p = self.canary.path.display().to_string(),
                 n = self.canary.name(),
-                h = std::env::var("HOME").unwrap_or_default(),
+                h = crate::watchdog::proof_home::real_home()
+                    .map(|h| h.display().to_string())
+                    .unwrap_or_default(),
             ))
             .output()
             .unwrap_or_else(|e| panic!("APPARATUS: cannot run the sandbox probe: {e}"));
