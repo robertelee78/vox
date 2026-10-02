@@ -46,7 +46,8 @@
 //! the long room and in the fresh one: the long room's median may be at most one and a half times
 //! the fresh room's plus a quarter second. Mutations: the drain's coordination snapshot reads the
 //! whole room again (`coord::snapshot`); the `--json` read reads the whole room again for its
-//! operation index. Each is red on its own assertion.
+//! operation index. Each is red on its own assertion. `vox room board --json` is timed the same
+//! way, and its position must count the whole room; mutation: it reads every row for that.
 //!
 //! **Mutation that must turn it red.** Copy every room's timeline again on each clone of the view
 //! (and rebuild every room's timeline on each publish), as before V210-71: the read takes many
@@ -291,6 +292,27 @@ fn json_reads(data: &Path, room: &str, after: &str) -> Vec<Duration> {
             took
         })
         .collect()
+}
+
+/// [`TURNS`] calls of `vox room board <room> --json`, each timed until it exits; returns the
+/// times and the row count the last one gave as the room's position.
+fn board_reads(data: &Path, room: &str) -> (Vec<Duration>, u64) {
+    let mut entries = 0;
+    let took = (0..TURNS)
+        .map(|_| {
+            let (ok, took, out, err) = vox(data, &["room", "board", room, "--json"], "");
+            assert!(
+                ok,
+                "PRODUCT: `vox room board --json` failed in room {room}: {err}"
+            );
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
+                panic!("PRODUCT: `vox room board --json` is not JSON ({e}): {out}")
+            });
+            entries = v["position"]["entries"].as_u64().unwrap_or(0);
+            took
+        })
+        .collect();
+    (took, entries)
 }
 
 /// The 50th and 95th percentiles and the maximum of `took`.
@@ -592,6 +614,25 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         h50 < turn_allowed,
         "PRODUCT: an agent's turn in a room of {POSTS} messages took p50 {h50:?}, and {hs50:?} in a \
          fresh room on the same node (allowed {turn_allowed:?}): each turn costs the room's history"
+    );
+    let (long_board, long_entries) = board_reads(&data, &room);
+    let (short_board, _) = board_reads(&data, &short_room);
+    let ((b50, _, _), (bs50, _, _)) = (spread(&long_board), spread(&short_board));
+    println!(
+        "[proof] {TURNS} `vox room board --json`: the {POSTS}-message room p50 {b50:?} (position: \
+         {long_entries} rows); a fresh room p50 {bs50:?}"
+    );
+    assert!(
+        long_entries >= POSTS as u64,
+        "PRODUCT: `vox room board --json` gave the room of {POSTS} messages a position of \
+         {long_entries} rows"
+    );
+    let board_allowed = bs50 * 3 / 2 + Duration::from_millis(250);
+    assert!(
+        b50 < board_allowed,
+        "PRODUCT: `vox room board --json` in a room of {POSTS} messages took p50 {b50:?}, and \
+         {bs50:?} in a fresh room on the same node (allowed {board_allowed:?}): each call costs the \
+         room's history"
     );
     let json_allowed = js50 * 3 / 2 + Duration::from_millis(250);
     assert!(

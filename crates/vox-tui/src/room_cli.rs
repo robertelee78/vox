@@ -1671,12 +1671,23 @@ pub async fn board(
 ) -> Result<(), AppError> {
     let (mut client, cid, room_key) = open_room(paths, room).await?;
     let snap = coord::snapshot(&mut client, cid).await?;
-    // The board's position is the whole room's: its row count and newest row. A one-off read,
-    // not part of the snapshot every turn takes (V210-120).
-    let all = if json {
-        coord::read_all(&mut client, cid, None).await?
+    // The board's position is the whole room's: its row count and newest row, which the node
+    // counts rather than this reading every row (V210-120).
+    let (entries, last) = if json {
+        match client
+            .request(&vox_core::node::ipc::Request::Count {
+                channel_id: cid,
+                since: None,
+            })
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
+        {
+            vox_core::node::ipc::Frame::Count { n, last } => (n, last),
+            vox_core::node::ipc::Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        }
     } else {
-        Vec::new()
+        (0, None)
     };
     let session = coord::session(session).unwrap_or_default();
     let me = Owner {
@@ -1736,8 +1747,8 @@ pub async fn board(
                 "resources": resources,
                 "violations": violations,
                 "position": {
-                    "entries": all.len(),
-                    "last": all.last().map(|r| claim::b32(&r.entry_hash)),
+                    "entries": entries,
+                    "last": last.map(|h| claim::b32(&h)),
                 },
                 "now_millis": snap.now_millis,
             })

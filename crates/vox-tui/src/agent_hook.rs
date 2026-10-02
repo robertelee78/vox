@@ -763,7 +763,7 @@ async fn drain(
             })
             .await
         {
-            Ok(Frame::Count { n }) => usize::try_from(n).unwrap_or(usize::MAX),
+            Ok(Frame::Count { n, .. }) => usize::try_from(n).unwrap_or(usize::MAX),
             _ => 0,
         },
         _ => 0,

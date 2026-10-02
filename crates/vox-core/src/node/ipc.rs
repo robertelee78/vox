@@ -873,10 +873,12 @@ pub enum Frame {
         /// Why it failed.
         reason: String,
     },
-    /// How many rows a [`Request::Count`] found.
+    /// How many rows a [`Request::Count`] found, and the room's newest row.
     Count {
         /// The count.
         n: u64,
+        /// The entry hash of the room's newest row, if it has any.
+        last: Option<Digest32>,
     },
     /// The rows a [`Request::Read`] asked for, oldest first.
     Rows {
@@ -940,8 +942,11 @@ impl Frame {
             Frame::Error { reason } => {
                 e.array(2).uint(T_ERROR).text(reason);
             }
-            Frame::Count { n } => {
-                e.array(2).uint(T_COUNT).uint(*n);
+            Frame::Count { n, last } => {
+                e.array(3)
+                    .uint(T_COUNT)
+                    .uint(*n)
+                    .bytes(last.as_ref().map_or(&[][..], |d| &d[..]));
             }
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
@@ -1286,10 +1291,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .to_owned(),
             })
         }
-        (T_COUNT, 2) => {
-            return Ok(Frame::Count {
-                n: d.uint().map_err(|_| Error::MalformedIpc("ipc count"))?,
-            });
+        (T_COUNT, 3) => {
+            let n = d.uint().map_err(|_| Error::MalformedIpc("ipc count"))?;
+            let last = optional_digest(d)?;
+            return Ok(Frame::Count { n, last });
         }
         (T_ROWS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc rows"))?;
@@ -2285,8 +2290,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 };
             };
             let len = detail.timeline.len();
+            let last = detail.timeline.last().map(|r| r.entry_hash);
             match since {
-                None => Frame::Count { n: len as u64 },
+                None => Frame::Count {
+                    n: len as u64,
+                    last,
+                },
                 // From the newest row back: a reader's cursor is usually near the end.
                 Some(cursor) => match detail
                     .timeline
@@ -2294,7 +2303,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     .rev()
                     .position(|r| r.entry_hash == cursor)
                 {
-                    Some(k) => Frame::Count { n: k as u64 },
+                    Some(k) => Frame::Count { n: k as u64, last },
                     None => Frame::Error {
                         reason: "cursor not in this room's timeline".into(),
                     },
