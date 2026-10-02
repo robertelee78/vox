@@ -106,6 +106,11 @@ pub const DIRECT_HEAD_START: std::time::Duration = std::time::Duration::from_mil
 /// post-quantum handshake took 150–575 ms on a machine at load 45–97.
 pub const DIAL_BACK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(3000);
 
+/// How long a reach that knows no address for a member waits on one connected board's read of the
+/// room before it moves on (V030-22, [`NodeNet::member_endpoints`]): a live board answers a read in
+/// milliseconds.
+pub const BOARD_LOOKUP_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1000);
+
 #[cfg(feature = "test-knobs")]
 fn test_advertise() -> Option<EndpointList> {
     let value = std::env::var(TEST_ADVERTISE_ENV).ok()?;
@@ -1516,6 +1521,39 @@ impl NodeNet {
             .find(|r| r.author_id == *member)
             .map(|r| r.endpoints.clone())
             .unwrap_or_default()
+    }
+
+    /// Where to dial `member` of `channel_id`: this node's board record for it, or — when this
+    /// node's board holds none yet — the record a connected board holds (V030-22).
+    ///
+    /// **Read the board before bridging.** A node that has just come online has not read its
+    /// room's board yet, so a reach it makes at once knows no address for the member and could only
+    /// relay: measured, a guest's `vox up` asked its anchor for a circuit to a host it could dial
+    /// directly, the host's address record sitting on that same anchor's board. One read of a
+    /// connected board, bounded by [`BOARD_LOOKUP_PATIENCE`] each, comes first. The identity is
+    /// pinned, so a stale or wrong address only fails.
+    pub async fn member_endpoints(&self, channel_id: &Digest32, member: Digest32) -> EndpointList {
+        let local = self.board_endpoints(channel_id, &member);
+        if !local.is_empty() {
+            return local;
+        }
+        for board in self.helpers(member) {
+            let read = tokio::time::timeout(
+                BOARD_LOOKUP_PATIENCE,
+                self.fetch_channel(&board, channel_id, 0),
+            )
+            .await;
+            if let Ok(Ok(set)) = read {
+                if let Some(record) = set
+                    .members
+                    .iter()
+                    .find(|r| r.author_id == member && !r.endpoints.is_empty())
+                {
+                    return record.endpoints.clone();
+                }
+            }
+        }
+        local
     }
 
     /// Whether this node's board holds a live member address or bundle record for

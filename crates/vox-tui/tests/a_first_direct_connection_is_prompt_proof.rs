@@ -46,15 +46,16 @@
 //!
 //! - **the anchor carries nothing for the pair** (V030-22): its own `circuit(s) carried` report
 //!   never goes above 0 for the whole run, the host's reaches for a guest it cannot dial included;
-//! - **the host asks a guest to dial back** (V030-22): an **optional** second test,
+//! - **the host asks a guest to dial back** (V030-22): a second test,
 //!   `the_host_asks_a_guest_to_dial_back`, stages it — carol joins from an anchor-only address and
-//!   comes online; the host must reach her. It is a known open question on the candidate (#335)
-//!   and blocks nothing until settled; without `optional-proofs` it says it did not run.
+//!   comes online, so the host must reach a guest it cannot dial; she must be reached with no
+//!   circuit at all, the anchor carrying none (see `dial_back_is_asked_for`).
 //!
-//! For V030-22 the whole-run "anchor carried 0" assertion is red only in a run where the host
-//! happens to reach for a guest that is online but not connected to it, so a mutant that removes the
-//! dial-back is not reliably red here; the deterministic arm is the optional
-//! `the_host_asks_a_guest_to_dial_back` (an open question, #335).
+//! For V030-22 the whole-run "anchor carried 0" assertion is supporting evidence only: it is red
+//! only in a run where the host happens to reach for a guest that is online but not connected to
+//! it. The discriminating arm is `the_host_asks_a_guest_to_dial_back`; its mutants are the
+//! dial-back rung removed from `NodeNet::reach_ladder`, and `NodeNet::member_endpoints` reading
+//! only this node's own board — each makes the anchor bridge the pair: red, as PRODUCT.
 //!
 //! And for V210-122: `DIRECT_HEAD_START` set to 0, the old race. The guest's `vox forward` asks for
 //! a circuit through the anchor beside its direct dial over the 30 ms path, and the guest's status
@@ -64,12 +65,6 @@
 //! process on a NAT simulator.
 
 #![cfg(unix)]
-// Without the feature the staged dial-back arm is only its stand-in; its code still compiles.
-#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
-
-#[path = "support/optional_proof.rs"]
-mod optional_proof;
-optional_proof::not_run!(the_host_asks_a_guest_to_dial_back);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -106,13 +101,10 @@ const GIVE_UP: Duration = Duration::from_secs(10);
 /// count, small enough to be one flight.
 const PAYLOAD: usize = 16 * 1024;
 
-/// **Optional, and a known open question** (V030-22, #335): run with `--features
-/// optional-proofs`. On the candidate it is red: carol's own `vox up` reaches for the host before
-/// it has read the host's board record, asks the host to dial back (the host cannot), and bridges;
-/// her later dial-back then lands direct in 5–6 ms. Not blocking until that case is settled.
-#[cfg(feature = "optional-proofs")]
+/// **The host asks a guest to dial back, and nothing bridges them** (V030-22, #335) — the claim's
+/// own arm. See [`dial_back_is_asked_for`] for the staging and what is asserted.
 #[test]
-#[ignore = "production Argon2id + a real PoW, a third member staged; run by hand, not in CI"]
+#[ignore = "production Argon2id + a real PoW, a third member staged; run in release"]
 fn the_host_asks_a_guest_to_dial_back() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
@@ -131,17 +123,56 @@ fn the_host_asks_a_guest_to_dial_back() {
 /// handshake at a time, and the dial-back's own connection came 1–3 s late — the staging, not the
 /// product (measured: every send `Ok`, the host's handshakes 150–575 ms each at load 45–97).
 ///
-/// Asserted: the host asked carol to dial back and she answered (`reach.dial_backs_answered`, or the
-/// case was never staged: `CANNOT MEASURE`), the host asked for no circuit to her, and the anchor
-/// carried none from the post on.
+/// **Re-staged, up to [`STAGINGS`] times, when it did not stage.** Carol may reach the host herself
+/// first — her node reads the host's address off the anchor's board and dials it directly, which is
+/// right — and then the host never needs to reach her. That run measures nothing about a dial-back
+/// and is said as such; a fresh guest is staged again. Any run that did stage decides: a PRODUCT
+/// red stops at once.
+///
+/// Asserted, on the first run that stages (the host asked her to dial back and she answered, or the
+/// anchor carried something for them): she answered, and the anchor carried **no** circuit for the
+/// pair from the moment she came online. Circuits the host asked for and the anchor refused (to a
+/// process of hers that had already exited: "relay cannot reach the peer") carry nothing and are
+/// printed, not asserted. Every run unstaged: `CANNOT MEASURE`.
 fn dial_back_is_asked_for(w: &mut ForwardedWorld) {
+    let mut unstaged = Vec::new();
+    for n in 1..=STAGINGS {
+        match stage_dial_back(w, n) {
+            Staging::Staged => return,
+            Staging::NotStaged(why) => {
+                eprintln!("[proof] staging {n}: not staged — {why}");
+                unstaged.push(why);
+            }
+        }
+    }
+    panic!(
+        "CANNOT MEASURE: in {STAGINGS} stagings the host never had to reach a guest that was \
+         online and not connected to it:\n{}",
+        unstaged.join("\n")
+    );
+}
+
+/// How many fresh guests [`dial_back_is_asked_for`] stages before it says it could not measure.
+const STAGINGS: usize = 5;
+/// The forward's one-way latency, guest to host, while a dial-back is staged: a real path's.
+const STAGING_DELAY: Duration = Duration::from_millis(200);
+
+enum Staging {
+    /// Measured and asserted.
+    Staged,
+    /// Nothing to measure, and why.
+    NotStaged(String),
+}
+
+/// One staging, with a fresh guest `carol-<n>`: see [`dial_back_is_asked_for`].
+fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
     use world::{args, room_pass_file, vox_once, VoxProc};
-    let carol = w.tmp.path().join("carol");
+    let carol = w.tmp.path().join(format!("carol-{n}"));
     world::mkdir(&carol.join("cfg"));
     let carol_fp = world::fingerprint(&carol, "carol");
     let (ok, out, err) = vox_once(
         &w.host_dir,
-        &args(&["trust", "add", &carol_fp, "--name", "carol"]),
+        &args(&["trust", "add", &carol_fp, "--name", &format!("carol-{n}")]),
     );
     assert!(
         ok,
@@ -175,8 +206,12 @@ fn dial_back_is_asked_for(w: &mut ForwardedWorld) {
         reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs_answered"),
     );
     let mark = w.anchor.mark();
+    // A direct path with latency, as a real one has: carol's own dial of the host then takes a few
+    // hundred milliseconds, so the host's reach for her starts while she is not yet connected to
+    // it — the case. Her dial back crosses the same path.
+    w.forward.set_delay(STAGING_DELAY);
     let mut up = VoxProc::spawn(
-        "carol-up",
+        &format!("carol-{n}-up"),
         &carol,
         &args(&[
             "up",
@@ -218,25 +253,28 @@ fn dial_back_is_asked_for(w: &mut ForwardedWorld) {
     let answered =
         reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs_answered") - before.1;
     eprintln!(
-        "[proof] staged dial-back: the host's dial-backs answered {answered}, circuits asked \
+        "[proof] staging {n}: the host's dial-backs answered {answered}, circuits asked \
          {circuits}; the anchor carried up to {carried} since carol came online"
     );
+    w.forward.set_delay(Duration::ZERO);
     let host = w.host.transcript();
     let said = up.transcript();
     interrupt(&mut up, Duration::from_secs(15));
+    if answered == 0 && carried == 0 {
+        return Staging::NotStaged(format!(
+            "no dial-back answered and nothing carried (circuits asked: {circuits}); carol \
+             reached the host herself, or the host did not need her"
+        ));
+    }
     assert!(
-        answered > 0 || circuits > 0,
-        "CANNOT MEASURE: once carol came online the host neither asked carol to dial back nor asked \
-         for a circuit to her, so the case was not staged.\nhost:\n{host}\ncarol:\n{said}"
-    );
-    assert!(
-        answered > 0 && circuits == 0 && carried == 0,
+        answered > 0 && carried == 0,
         "PRODUCT: the host, which cannot dial carol, had to reach her while she could dial the \
-         host; it must ask her to dial back and ask for no circuit. Dial-backs answered: \
-         {answered}; circuits asked: {circuits}; the anchor carried up to {carried}.\nhost:\n\
-         {host}\ncarol:\n{said}\nanchor:\n{}",
+         host; it must ask her to dial back, and the anchor must carry nothing for them. \
+         Dial-backs answered: {answered}; circuits asked: {circuits}; the anchor carried up to \
+         {carried}.\nhost:\n{host}\ncarol:\n{said}\nanchor:\n{}",
         w.anchor.proc.transcript()
     );
+    Staging::Staged
 }
 
 /// `address` with `who`'s entry (its `a=` and the `b=` addresses after it) taken out.
