@@ -175,8 +175,7 @@ Two spike trees were measured, both never committed to the product:
   start ends, and every tree-A figure is a mean over seconds judged long after loss had ended slow
   start; the rows are still labelled, not mixed with tree B's.
 
-Every derived figure was computed by one script (`docs/adr/ADR-024-reviews/m241-analyze.py`), over
-the run logs and per-loss traces committed in `docs/adr/ADR-024-reviews/runs/`; it prints its method
+Every derived figure was computed by one script over the run logs and per-loss traces; it printed its method
 with its output: the RESULT line of each run (means over the last two thirds of the run's timeline);
 loss share = lost bytes over lost plus acknowledged bytes, and queue rise = the last finished round's
 minimum round trip minus the windowed base, both over trace lines at least 17 s into the sending
