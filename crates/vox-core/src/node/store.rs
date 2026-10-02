@@ -45,6 +45,10 @@ type SegmentKey = (Digest32, u8, u64);
 const SEGMENTS: TableDefinition<SegmentKey, &[u8]> = TableDefinition::new("segments");
 const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wraps");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// Per at-rest key: `(slot, class) → generation(8 BE) ‖ seals(8 BE)` (V210-136). See
+/// [`SealState`]. Created by the first sealed write; a store without it has every key at
+/// generation 0 with no seals counted.
+const SEAL_STATE: TableDefinition<(Digest32, u8), &[u8]> = TableDefinition::new("seal_state");
 const META_SCHEMA: &str = "schema_version";
 
 /// Stable on-disk code for a [`SegmentKind`] (part of the key; never reordered).
@@ -61,6 +65,97 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         // because it belongs to no channel), but a kind must map to a stable code
         // or this match stops being exhaustive.
         SegmentKind::Trust => 8,
+    }
+}
+
+/// Which at-rest key a sealed write is under (V210-136): a room's store key seals its log,
+/// caches, indexes and key material; an anchor's key its anchor pages; the prekey ring and each
+/// node-wide meta blob have keys of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyClass {
+    /// A room's store key (its SEK): log pages, caches, indexes, key material.
+    Room,
+    /// An anchor's per-room key: anchor log and metadata pages.
+    Anchor,
+    /// The identity's prekey-ring key.
+    PrekeyRing,
+    /// The key of one node-wide meta blob (the trust keyring, pending consents, …), named by
+    /// its meta key.
+    Meta,
+}
+
+impl KeyClass {
+    const fn code(self) -> u8 {
+        match self {
+            KeyClass::Room => 1,
+            KeyClass::Anchor => 2,
+            KeyClass::PrekeyRing => 3,
+            KeyClass::Meta => 4,
+        }
+    }
+
+    /// The class a segment of `kind` is sealed under.
+    #[must_use]
+    pub const fn of(kind: SegmentKind) -> Self {
+        match kind {
+            SegmentKind::AnchorLog | SegmentKind::AnchorMeta => KeyClass::Anchor,
+            SegmentKind::PrekeyRing => KeyClass::PrekeyRing,
+            SegmentKind::Trust => KeyClass::Meta,
+            _ => KeyClass::Room,
+        }
+    }
+
+    /// The segment kinds sealed under this class.
+    #[must_use]
+    pub const fn kinds(self) -> &'static [SegmentKind] {
+        match self {
+            KeyClass::Room => &[
+                SegmentKind::LogDb,
+                SegmentKind::PlaintextCache,
+                SegmentKind::Index,
+                SegmentKind::KeyMaterial,
+            ],
+            KeyClass::Anchor => &[SegmentKind::AnchorLog, SegmentKind::AnchorMeta],
+            KeyClass::PrekeyRing => &[SegmentKind::PrekeyRing],
+            KeyClass::Meta => &[],
+        }
+    }
+}
+
+/// The slot a meta blob's key is counted under: the SHA-256 of its meta name.
+#[must_use]
+pub fn meta_slot(name: &str) -> Digest32 {
+    crate::hash::sha256(name.as_bytes())
+}
+
+/// One at-rest key's state (V210-136): the data-key generation it seals under, and how many
+/// sealed writes have been stored under that generation. Counted in the same transaction as
+/// each write, so a crash can neither lose a count nor count a write that never landed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SealState {
+    /// The data-key generation ([`crate::atrest::sek::Sek::data_key`]).
+    pub generation: u64,
+    /// Sealed writes stored under `generation`.
+    pub seals: u64,
+}
+
+impl SealState {
+    fn to_bytes(self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&self.generation.to_be_bytes());
+        b[8..].copy_from_slice(&self.seals.to_be_bytes());
+        b
+    }
+
+    fn from_slice(v: &[u8]) -> Result<Self> {
+        let b: [u8; 16] = v
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("seal state length"))?;
+        let (g, n) = b.split_at(8);
+        Ok(Self {
+            generation: u64::from_be_bytes(g.try_into().unwrap_or_default()),
+            seals: u64::from_be_bytes(n.try_into().unwrap_or_default()),
+        })
     }
 }
 
@@ -244,6 +339,16 @@ impl Store {
                         let (k, v) = item.map_err(storage("iterate sek_wraps"))?;
                         to.insert(k.value(), v.value())
                             .map_err(storage("write sek wrap"))?;
+                    }
+                }
+                if let Some(from) = source_table(&r, SEAL_STATE, "open seal_state")? {
+                    let mut to = w
+                        .open_table(SEAL_STATE)
+                        .map_err(storage("open seal_state"))?;
+                    for item in from.iter().map_err(storage("iterate seal_state"))? {
+                        let (k, v) = item.map_err(storage("iterate seal_state"))?;
+                        to.insert(k.value(), v.value())
+                            .map_err(storage("write seal state"))?;
                     }
                 }
                 if let Some(from) = source_table(&r, META, "open meta")? {
@@ -501,6 +606,23 @@ impl Store {
         Ok(out)
     }
 
+    /// The at-rest state of the key `class` at `slot` (a room's or anchor's channel id, the
+    /// prekey ring's pseudo-channel, or [`meta_slot`]) — generation 0 with nothing counted when
+    /// nothing has been sealed since this was introduced (V210-136).
+    pub fn seal_state(&self, slot: &Digest32, class: KeyClass) -> Result<SealState> {
+        let txn = self.begin_read()?;
+        let Some(t) = source_table(&txn, SEAL_STATE, "open seal_state")? else {
+            return Ok(SealState::default());
+        };
+        match t
+            .get((*slot, class.code()))
+            .map_err(storage("read seal state"))?
+        {
+            None => Ok(SealState::default()),
+            Some(v) => SealState::from_slice(v.value()),
+        }
+    }
+
     /// Write a public metadata entry (its own durable transaction). Meta holds
     /// only public facts (schema version, identity fingerprint, creation time).
     pub fn put_meta(&self, name: &str, value: &[u8]) -> Result<()> {
@@ -540,6 +662,51 @@ impl Store {
             let (next, out) = f(current.as_deref())?;
             meta.insert(name, next.as_slice())
                 .map_err(storage("write meta"))?;
+            out
+        };
+        txn.commit().map_err(storage("commit"))?;
+        Ok(out)
+    }
+
+    /// [`Store::update_meta`] for a **sealed** node-wide blob (V210-136): in one write
+    /// transaction, `f` is given the current value and the key's [`SealState`], and returns the
+    /// new value, the state to set when it sealed under a new generation (`None` otherwise), and
+    /// whatever it hands back. The write is counted as one seal under [`meta_slot`]`(name)`.
+    pub fn update_sealed_meta<T>(
+        &self,
+        name: &str,
+        f: impl FnOnce(Option<&[u8]>, SealState) -> Result<(Vec<u8>, Option<SealState>, T)>,
+    ) -> Result<T> {
+        let slot = meta_slot(name);
+        let key = (slot, KeyClass::Meta.code());
+        let txn = self.begin_write()?;
+        let out = {
+            let mut meta = txn.open_table(META).map_err(storage("open meta"))?;
+            let mut states = txn
+                .open_table(SEAL_STATE)
+                .map_err(storage("open seal_state"))?;
+            let current = meta
+                .get(name)
+                .map_err(storage("read meta"))?
+                .map(|v| v.value().to_vec());
+            let st = match states.get(key).map_err(storage("read seal state"))? {
+                None => SealState::default(),
+                Some(v) => SealState::from_slice(v.value())?,
+            };
+            let (next, set, out) = f(current.as_deref(), st)?;
+            meta.insert(name, next.as_slice())
+                .map_err(storage("write meta"))?;
+            let after = set.unwrap_or(SealState {
+                generation: st.generation,
+                seals: st.seals.saturating_add(1),
+            });
+            states
+                .insert(key, after.to_bytes().as_slice())
+                .map_err(storage("write seal state"))?;
+            if set.is_some() {
+                meta.insert(crate::node::at_rest::REWRITE_PENDING_META, [1u8].as_slice())
+                    .map_err(storage("write meta"))?;
+            }
             out
         };
         txn.commit().map_err(storage("commit"))?;
@@ -605,7 +772,50 @@ impl Batch<'_> {
         let key: SegmentKey = (*channel, kind_code(kind), id);
         t.insert(key, sealed_segment_to_vec(seg).as_slice())
             .map_err(storage("write segment"))?;
+        drop(t);
+        self.count_seal(channel, KeyClass::of(kind))
+    }
+
+    /// Count one sealed write under the key `class` at `slot`, in this transaction (V210-136).
+    fn count_seal(&mut self, slot: &Digest32, class: KeyClass) -> Result<()> {
+        let mut t = self
+            .txn
+            .open_table(SEAL_STATE)
+            .map_err(storage("open seal_state"))?;
+        let mut st = match t
+            .get((*slot, class.code()))
+            .map_err(storage("read seal state"))?
+        {
+            None => SealState::default(),
+            Some(v) => SealState::from_slice(v.value())?,
+        };
+        st.seals = st.seals.saturating_add(1);
+        t.insert((*slot, class.code()), st.to_bytes().as_slice())
+            .map_err(storage("write seal state"))?;
         Ok(())
+    }
+
+    /// Set the at-rest state of the key `class` at `slot` (a rotation, V210-136).
+    pub fn set_seal_state(
+        &mut self,
+        slot: &Digest32,
+        class: KeyClass,
+        st: SealState,
+    ) -> Result<()> {
+        let mut t = self
+            .txn
+            .open_table(SEAL_STATE)
+            .map_err(storage("open seal_state"))?;
+        t.insert((*slot, class.code()), st.to_bytes().as_slice())
+            .map_err(storage("write seal state"))?;
+        Ok(())
+    }
+
+    /// Queue a **sealed** meta blob write — a node-wide blob sealed under its own key — counted
+    /// as one seal under [`meta_slot`]`(name)` (V210-136).
+    pub fn put_sealed_meta(&mut self, name: &str, value: &[u8]) -> Result<()> {
+        self.put_meta(name, value)?;
+        self.count_seal(&meta_slot(name), KeyClass::Meta)
     }
 
     /// Queue a sealed segment delete; returns whether it existed.

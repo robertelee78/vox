@@ -286,6 +286,9 @@ pub struct SyncBook {
     prekeys: Option<PrekeyCounts>,
     /// Each open room's stored entries set aside when it opened (V210-74), as `author#seq: why`.
     set_aside: BTreeMap<Digest32, Vec<String>>,
+    /// Each open room's at-rest data-key generation (V210-136): 0 until its store key first
+    /// reaches the rotation threshold.
+    at_rest: BTreeMap<Digest32, u64>,
 }
 
 /// What the prekey ring holds, and what keeping it up has done since the node started.
@@ -382,6 +385,18 @@ impl SyncBook {
         c.rotated += u64::from(rotated);
         c.refilled += u64::try_from(added).unwrap_or(u64::MAX);
         c.previous_used = previous_used;
+    }
+
+    /// Record `room`'s at-rest data-key generation (V210-136).
+    pub fn note_at_rest(book: &SharedSyncBook, room: Digest32, generation: u64) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        b.at_rest.insert(room, generation);
+    }
+
+    /// Forget `room` (no longer open).
+    pub fn forget_at_rest(book: &SharedSyncBook, room: &Digest32) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        b.at_rest.remove(room);
     }
 
     /// Count one reachability ladder run to `peer`.
@@ -518,6 +533,18 @@ impl SyncBook {
                 "{{\"room\":\"{}\",\"entries\":[{}]}}",
                 b32_encode(room),
                 list.join(",")
+            );
+        }
+        // **Each open room's at-rest key generation** (V210-136): a rotation moves it on.
+        s.push_str("],\"at_rest\":[");
+        for (i, (room, generation)) in b.at_rest.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(
+                s,
+                "{{\"room\":\"{}\",\"at_rest_generation\":{generation}}}",
+                b32_encode(room)
             );
         }
         // **Every live tunnel** (V210-81): the member, the service, which way it was opened, and

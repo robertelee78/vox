@@ -51,8 +51,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::atrest::sek::{Sek, NONCE_LEN};
-use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
+use crate::atrest::sek::Sek;
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::{sha256, Digest32};
@@ -243,32 +242,26 @@ impl Keyring {
 
     /// Seal and write the keyring. Requires an unlocked identity.
     pub fn save(&self, store: &Store, signer: &dyn RootSigner) -> Result<()> {
-        let sek = trust_sek(signer)?;
-        let sealed = seal_segment(&sek, SegmentKind::Trust, TRUST_SEGMENT_ID, &self.to_bytes())?;
-        let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
-        blob.extend_from_slice(&sealed.nonce);
-        blob.extend_from_slice(&sealed.ciphertext);
-        store.put_meta(TRUST_META_KEY, &blob)
+        crate::node::at_rest::save_meta_blob(
+            store,
+            TRUST_META_KEY,
+            TRUST_SEGMENT_ID,
+            &trust_sek(signer)?,
+            &self.to_bytes(),
+        )
     }
 
     /// Read and open the keyring, or an empty one if this node has never trusted
     /// anybody. Requires an unlocked identity.
     pub fn load(store: &Store, signer: &dyn RootSigner) -> Result<Self> {
-        let Some(blob) = store.get_meta(TRUST_META_KEY)? else {
-            return Ok(Self::new());
-        };
-        if blob.len() < NONCE_LEN {
-            return Err(Error::MalformedAtRest("keyring blob too short"));
+        match crate::node::at_rest::load_meta_blob(
+            store,
+            TRUST_META_KEY,
+            TRUST_SEGMENT_ID,
+            &trust_sek(signer)?,
+        )? {
+            None => Ok(Self::new()),
+            Some(plain) => Self::from_bytes(&plain),
         }
-        let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
-        let nonce = <[u8; NONCE_LEN]>::try_from(nonce_bytes)
-            .map_err(|_| Error::MalformedAtRest("keyring nonce"))?;
-        let sealed = SealedSegment {
-            nonce,
-            ciphertext: ciphertext.to_vec(),
-        };
-        let sek = trust_sek(signer)?;
-        let plain = open_segment(&sek, SegmentKind::Trust, TRUST_SEGMENT_ID, &sealed)?;
-        Self::from_bytes(&plain)
     }
 }

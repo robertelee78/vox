@@ -106,6 +106,13 @@ const EVENT_QUEUE: usize = 256;
 /// milliseconds instead, which is the behaviour a client expects.
 type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 
+/// What [`Node::rotate_at_rest_if_due`] re-seals: a room this node is a member of, or an
+/// anchored copy (V210-136).
+enum RotateTarget {
+    Room(SharedChannel),
+    Anchor(Arc<tokio::sync::Mutex<crate::node::anchor::AnchorState>>),
+}
+
 /// How often the actor's timers run. Sync is not paced by it: a port is evaluated at the end of
 /// every event that can change what it needs (ADR-025 D6a); the tick retires attempts whose
 /// connection died and raises the periodic request (D7).
@@ -413,6 +420,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Reopened { .. } => "holding a room that reopened",
         NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
+        NetEvent::AtRestRotated { .. } => "noting a store re-sealed under a new key",
         NetEvent::LockSettled => "answering a lock that has settled",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
         NetEvent::HandshakesQueued { .. } => "saying how a burst of connection attempts went",
@@ -1059,6 +1067,17 @@ enum NetEvent {
     /// The reopening has tried every room (#208). A room still marked as reopening would not
     /// open: it stays remembered, and closed. The unlock is answered now.
     ReopenFinished,
+    /// A room's or anchored copy's store finished re-sealing under its next at-rest generation,
+    /// off the actor (V210-136).
+    AtRestRotated {
+        /// The room.
+        channel_id: Digest32,
+        /// Whether it was a room this node is a member of (else an anchored copy).
+        member: bool,
+        /// The generation it seals under now, or why the re-seal failed (it then still seals
+        /// under the old one, and the next tick tries again).
+        result: std::result::Result<u64, String>,
+    },
     /// A lock has settled: nothing it stopped holds a secret any more (V210-94).
     LockSettled,
     /// A forward's first dial finished (#215): bind the forward, or say why not, and answer the
@@ -3086,6 +3105,9 @@ pub struct Node {
     /// The anchored channels' logs, by channelID (ADR-016 M15.2b). A channel is never
     /// both here and in `channels`: a member holds the real thing.
     anchored: BTreeMap<Digest32, Arc<tokio::sync::Mutex<crate::node::anchor::AnchorState>>>,
+    /// Rooms and anchored copies whose store is being re-sealed under a new at-rest generation
+    /// right now, off the actor (V210-136).
+    at_rest_rotating: BTreeSet<Digest32>,
     /// Live forwards by their bound local address (ADR-013 Dial, M16.1). Dropping one
     /// stops its listener.
     forwards: BTreeMap<std::net::SocketAddr, crate::node::tunnel::Forward>,
@@ -3505,6 +3527,7 @@ impl Node {
             serve_only,
             anchor_store: None,
             anchored: BTreeMap::new(),
+            at_rest_rotating: BTreeSet::new(),
             forwards: BTreeMap::new(),
             pow_params,
             stream_loops: std::collections::BTreeMap::new(),
@@ -3808,6 +3831,7 @@ impl Node {
                     }
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
+                    self.rotate_at_rest_if_due();
                     self.renew_mappings_if_due();
                     self.renew_records_if_due().await;
                     self.adopt_anchored_from_board().await;
@@ -4627,6 +4651,119 @@ impl Node {
         *entry
     }
 
+    /// **Rotate each at-rest key that has reached its threshold** (V210-136), off the actor.
+    ///
+    /// A room's or anchored copy's re-seal rewrites its whole store in one transaction, which
+    /// for a long room is real work, so it runs on a blocking thread holding that room's own
+    /// lock: other rooms, reads of the published view, and the network go on meanwhile. On every
+    /// tick it also records each open room's generation for `vox status --json`, and rewrites the
+    /// store file once a finished rotation left the old ciphertext in its freed pages.
+    fn rotate_at_rest_if_due(&mut self) {
+        use crate::node::store::KeyClass;
+        let Some(store) = self.log_store() else {
+            return;
+        };
+        let members = self
+            .channels
+            .iter()
+            .map(|(c, ch)| (*c, true, RotateTarget::Room(Arc::clone(ch))));
+        let anchors = self
+            .anchored
+            .iter()
+            .map(|(c, a)| (*c, false, RotateTarget::Anchor(Arc::clone(a))));
+        let targets: Vec<_> = members.chain(anchors).collect();
+        for (channel_id, member, target) in targets {
+            if self.at_rest_rotating.contains(&channel_id) {
+                continue;
+            }
+            let class = if member {
+                KeyClass::Room
+            } else {
+                KeyClass::Anchor
+            };
+            if member {
+                if let RotateTarget::Room(ch) = &target {
+                    if let Ok(ch) = ch.try_lock() {
+                        crate::node::status::SyncBook::note_at_rest(
+                            &self.sync_book,
+                            channel_id,
+                            ch.at_rest_generation(),
+                        );
+                    }
+                }
+            }
+            if !crate::node::at_rest::due(&store, &channel_id, class).unwrap_or(false) {
+                continue;
+            }
+            self.at_rest_rotating.insert(channel_id);
+            let store = Arc::clone(&store);
+            let tx = self.net_tx.clone();
+            tokio::spawn(async move {
+                let result = match target {
+                    RotateTarget::Room(ch) => {
+                        let mut guard = ch.lock_owned().await;
+                        tokio::task::spawn_blocking(move || {
+                            guard
+                                .rotate_at_rest_if_due(&store)
+                                .map(|_| guard.at_rest_generation())
+                        })
+                        .await
+                    }
+                    RotateTarget::Anchor(a) => {
+                        let mut guard = a.lock_owned().await;
+                        tokio::task::spawn_blocking(move || {
+                            guard
+                                .rotate_at_rest_if_due(&store)
+                                .map(|_| guard.at_rest_generation())
+                        })
+                        .await
+                    }
+                };
+                let result = match result {
+                    Ok(Ok(g)) => Ok(g),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(e) => Err(format!("the re-seal task failed: {e}")),
+                };
+                let _ = tx
+                    .send(NetEvent::AtRestRotated {
+                        channel_id,
+                        member,
+                        result,
+                    })
+                    .await;
+            });
+        }
+        if self.at_rest_rotating.is_empty() {
+            self.rewrite_store_if_pending();
+        }
+    }
+
+    /// Once a rotation has committed, the store file still holds the old generation's
+    /// ciphertext in pages redb freed. Rewrite the file fresh from its live rows
+    /// ([`crate::node::store::Store::rewrite_fresh`]) — but only while nothing else holds the
+    /// store, since a write in flight elsewhere would land in the file being replaced. It is
+    /// tried again on every tick until it can run (V210-136).
+    fn rewrite_store_if_pending(&mut self) {
+        if !self.at_rest_rotating.is_empty() {
+            return;
+        }
+        let Some(profile) = self.profile.as_mut() else {
+            return;
+        };
+        if !profile.rewrite_pending() {
+            return;
+        }
+        match profile.rewrite_store_if_exclusive() {
+            Ok(true) => {
+                eprintln!("vox: the store file was rewritten without the old at-rest key's pages")
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("vox: rewriting the store after a re-key failed ({e}); tried again")
+            }
+        }
+    }
+
     /// The store anchored logs and channels live in: the profile's, or the headless
     /// node's own.
     fn log_store(&self) -> Option<Arc<crate::node::store::Store>> {
@@ -5244,6 +5381,35 @@ impl Node {
                 let _ = self.forget_open(&channel_id);
             }
             NetEvent::LockSettled => self.settle_lock().await,
+            NetEvent::AtRestRotated {
+                channel_id,
+                member,
+                result,
+            } => {
+                self.at_rest_rotating.remove(&channel_id);
+                match result {
+                    Ok(generation) => {
+                        if member {
+                            crate::node::status::SyncBook::note_at_rest(
+                                &self.sync_book,
+                                channel_id,
+                                generation,
+                            );
+                        }
+                        eprintln!(
+                            "vox: room {}'s store is sealed under at-rest key generation \
+                             {generation}",
+                            &crate::node::link::b32_encode(&channel_id)[..12]
+                        );
+                    }
+                    Err(e) => eprintln!(
+                        "vox: re-sealing room {}'s store under a new key failed ({e}); it \
+                         stays sealed under the old one, and is tried again",
+                        &crate::node::link::b32_encode(&channel_id)[..12]
+                    ),
+                }
+                self.rewrite_store_if_pending();
+            }
             NetEvent::ReopenFinished => {
                 self.reopening.clear();
                 self.reopen_task = None;

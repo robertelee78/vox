@@ -262,8 +262,24 @@ impl Profile {
             self.migrate_vault(&backup, &signer, passphrase)?;
         }
         drop(backup);
+        // A rotation that committed while another handle held the store left the old key's
+        // pages in it; nothing else holds it yet at an unlock (V210-136). Best effort: the flag
+        // stays set and the running node tries again.
+        if self.rewrite_pending() {
+            let _ = self.rewrite_store_if_exclusive();
+        }
         self.unlocked = Some(Arc::new(signer));
         Ok(())
+    }
+
+    /// Whether a rotation left the store file to be rewritten (V210-136).
+    #[must_use]
+    pub fn rewrite_pending(&self) -> bool {
+        self.store
+            .get_meta(crate::node::at_rest::REWRITE_PENDING_META)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.as_slice() == [1])
     }
 
     /// Bring a version-1 vault's profile up to version 2 (V210-40, #214): re-seal the node-wide
@@ -400,6 +416,23 @@ impl Profile {
             Some(store) => store.compact(),
             None => Ok(false),
         }
+    }
+
+    /// Rewrite the store file fresh from its live rows ([`Store::rewrite_fresh`]) and clear the
+    /// pending flag a rotation set, **only** if no other handle to the store is outstanding: a
+    /// write in flight on another handle would land in the file being replaced. Returns whether
+    /// it ran (V210-136).
+    ///
+    /// # Errors
+    /// The rewrite or the flag's write fails.
+    pub fn rewrite_store_if_exclusive(&mut self) -> Result<bool> {
+        if std::sync::Arc::strong_count(&self.store) != 1 {
+            return Ok(false);
+        }
+        self.store.rewrite_fresh()?;
+        self.store
+            .put_meta(crate::node::at_rest::REWRITE_PENDING_META, &[0])?;
+        Ok(true)
     }
 
     /// The profile's paths.

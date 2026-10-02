@@ -26,6 +26,7 @@
 pub mod actor;
 pub mod anchor;
 pub mod api;
+pub mod at_rest;
 pub mod channel;
 pub mod circuitstream;
 pub mod consent_order;

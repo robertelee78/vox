@@ -459,7 +459,12 @@ pub struct ChannelState {
     local_name: String,
     created: u64,
     epoch: u64,
+    /// The **data key** every segment of this room is sealed under: the room's SEK at its
+    /// current at-rest generation ([`Sek::data_key`], V210-136).
     sek: Sek,
+    /// The room's SEK itself, which the data keys derive from and which a daemon keeps sealed to
+    /// reopen the room ([`Self::sek_bytes`]).
+    base_sek: Sek,
     /// Author fingerprint → composite root key (M13: the creator only).
     authors: BTreeMap<Digest32, CompositePublicKey>,
     admission: AdmissionPolicy,
@@ -1136,7 +1141,8 @@ impl ChannelState {
             passphrase: Zeroizing::new(channel_passphrase.to_vec()),
             created: now_secs,
             epoch,
-            sek,
+            sek: sek.data_key(0)?,
+            base_sek: sek,
             authors,
             admission,
             dag: Dag::new(),
@@ -1199,6 +1205,14 @@ impl ChannelState {
         channel_passphrase: &[u8],
         now_secs: u64,
     ) -> Result<Self> {
+        // Every segment is sealed under the room's current at-rest generation (V210-136).
+        let base_sek = sek;
+        let sek = crate::node::at_rest::data_key(
+            store,
+            channel_id,
+            crate::node::store::KeyClass::Room,
+            &base_sek,
+        )?;
         let manifest_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_MANIFEST)?
             .ok_or(Error::MalformedAtRest("channel manifest missing"))?;
@@ -1508,6 +1522,7 @@ impl ChannelState {
             created,
             epoch,
             sek,
+            base_sek,
             authors,
             admission,
             dag,
@@ -1781,7 +1796,8 @@ impl ChannelState {
             passphrase: Zeroizing::new(channel_passphrase.to_vec()),
             created: now_secs,
             epoch,
-            sek,
+            sek: sek.data_key(0)?,
+            base_sek: sek,
             authors,
             admission,
             dag: Dag::new(),
@@ -4071,7 +4087,37 @@ impl ChannelState {
     /// This channel's SEK, so a daemon can keep it sealed under its identity and reopen the room
     /// after a restart without the room passphrase (#208).
     pub fn sek_bytes(&self) -> Result<&[u8]> {
-        self.sek.key_bytes()
+        self.base_sek.key_bytes()
+    }
+
+    /// The at-rest data-key generation this room's store is sealed under (V210-136).
+    #[must_use]
+    pub fn at_rest_generation(&self) -> u64 {
+        self.sek.generation()
+    }
+
+    /// Re-seal this room's whole store under its next at-rest generation if its key has reached
+    /// the rotation threshold ([`crate::node::at_rest`], V210-136), in one store transaction, and
+    /// wipe the old data key. Returns whether it rotated.
+    ///
+    /// # Errors
+    /// The store cannot be read or written, or the room is locked. Nothing changes then: the
+    /// room still seals under its old generation, and the next attempt tries again.
+    pub fn rotate_at_rest_if_due(&mut self, store: &Store) -> Result<bool> {
+        use crate::node::store::KeyClass;
+        if !crate::node::at_rest::due(store, &self.channel_id, KeyClass::Room)? {
+            return Ok(false);
+        }
+        let new = crate::node::at_rest::rotate_segments(
+            store,
+            &self.channel_id,
+            KeyClass::Room,
+            &self.sek,
+            &self.base_sek,
+        )?;
+        let mut old = std::mem::replace(&mut self.sek, new);
+        old.lock_now();
+        Ok(true)
     }
 
     /// the UI as the memory-protection honesty flag).
@@ -4084,6 +4130,7 @@ impl ChannelState {
     /// afterwards; any further seal/open fails with [`Error::AtRestLocked`].
     pub fn lock_now(&mut self) {
         self.sek.lock_now();
+        self.base_sek.lock_now();
         // Wipe the retained passphrase with the SEK: after an app-lock this channel
         // can neither unseal nor answer a join until it is reopened (ADR-010/015).
         self.passphrase.zeroize();

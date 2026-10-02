@@ -19,8 +19,6 @@ use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 use crate::atrest::sek::Sek;
-use crate::atrest::sek::NONCE_LEN;
-use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
@@ -152,31 +150,25 @@ impl PendingConsents {
 
     /// Seal and write. Requires an unlocked identity.
     pub fn save(&self, store: &Store, signer: &dyn RootSigner) -> Result<()> {
-        let sek = pending_consent_sek(signer)?;
-        let sealed = seal_segment(&sek, SegmentKind::Trust, SEGMENT_ID, &self.to_bytes())?;
-        let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
-        blob.extend_from_slice(&sealed.nonce);
-        blob.extend_from_slice(&sealed.ciphertext);
-        store.put_meta(META_KEY, &blob)
+        crate::node::at_rest::save_meta_blob(
+            store,
+            META_KEY,
+            SEGMENT_ID,
+            &pending_consent_sek(signer)?,
+            &self.to_bytes(),
+        )
     }
 
     /// Read and open, or an empty map if nothing was ever pending. Requires an unlocked identity.
     pub fn load(store: &Store, signer: &dyn RootSigner) -> Result<Self> {
-        let Some(blob) = store.get_meta(META_KEY)? else {
-            return Ok(Self::default());
-        };
-        if blob.len() < NONCE_LEN {
-            return Err(Error::MalformedAtRest("pending consents blob too short"));
+        match crate::node::at_rest::load_meta_blob(
+            store,
+            META_KEY,
+            SEGMENT_ID,
+            &pending_consent_sek(signer)?,
+        )? {
+            None => Ok(Self::default()),
+            Some(plain) => Self::from_bytes(&plain),
         }
-        let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
-        let nonce = <[u8; NONCE_LEN]>::try_from(nonce_bytes)
-            .map_err(|_| Error::MalformedAtRest("pending consents nonce"))?;
-        let sealed = SealedSegment {
-            nonce,
-            ciphertext: ciphertext.to_vec(),
-        };
-        let sek = pending_consent_sek(signer)?;
-        let plain = open_segment(&sek, SegmentKind::Trust, SEGMENT_ID, &sealed)?;
-        Self::from_bytes(&plain)
     }
 }

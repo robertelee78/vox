@@ -69,6 +69,11 @@ pub const FACTOR_PASS_LEN: usize = 32;
 /// `KEK = HKDF-SHA-256(factor_id ‖ factor_pass, info = "vox/sek-wrap/v1")`.
 pub const KEK_HKDF_INFO: &[u8] = b"vox/sek-wrap/v1";
 
+/// HKDF `info` prefix for an at-rest **data key** of generation `g ≥ 1` (V210-136):
+/// `DK_g = HKDF-SHA-256(SEK, info = "vox/at-rest/data/v1" ‖ g (8 BE))`. Generation 0 is the SEK
+/// itself, so every store written before generations existed opens unchanged.
+pub const DATA_KEY_HKDF_INFO: &[u8] = b"vox/at-rest/data/v1";
+
 /// AEAD associated data for a SEK wrap, separating it from store segments and any
 /// other ciphertext that might ever share a derived key.
 const WRAP_AAD: &[u8] = b"vox/sek-wrap-aead/v1";
@@ -243,6 +248,10 @@ pub struct Sek {
     key: SecretBuf,
     /// Whether the SEK has been invalidated by an app-lock.
     locked: bool,
+    /// The at-rest data-key generation this key seals under (V210-136): 0 for a SEK as
+    /// generated or unwrapped, `g` for [`Sek::data_key`]`(g)`. A segment sealed under a
+    /// generation `g ≥ 1` binds `g` into its AAD (see [`crate::atrest::store`]).
+    generation: u64,
 }
 
 impl Sek {
@@ -267,6 +276,7 @@ impl Sek {
         Self {
             key: SecretBuf::from_array(key),
             locked: false,
+            generation: 0,
         }
     }
 
@@ -278,6 +288,38 @@ impl Sek {
             return Err(Error::AtRestLocked);
         }
         Ok(self.key.as_slice())
+    }
+
+    /// The at-rest data-key generation this key seals under (0 for a SEK itself).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The at-rest **data key** of `generation` (V210-136): what store segments are sealed
+    /// under. Generation 0 is this key's own bytes, so a store sealed before generations existed
+    /// opens unchanged; generation `g ≥ 1` is
+    /// `HKDF-SHA-256(self, info = DATA_KEY_HKDF_INFO ‖ g)`. Rotating to a new generation gives a
+    /// fresh AES key, so no one key ever reaches AES-GCM's random-nonce bound.
+    ///
+    /// # Errors
+    /// [`Error::AtRestLocked`] after an app-lock.
+    pub fn data_key(&self, generation: u64) -> Result<Self> {
+        let base = self.key_bytes()?;
+        let mut key = Zeroizing::new([0u8; SEK_LEN]);
+        if generation == 0 {
+            key.copy_from_slice(base);
+        } else {
+            let mut info = Vec::with_capacity(DATA_KEY_HKDF_INFO.len() + 8);
+            info.extend_from_slice(DATA_KEY_HKDF_INFO);
+            info.extend_from_slice(&generation.to_be_bytes());
+            Hkdf::<Sha256>::new(None, base)
+                .expand(&info, key.as_mut())
+                .map_err(|_| Error::AtRestUnlockFailed)?;
+        }
+        let mut k = Self::from_bytes(key);
+        k.generation = generation;
+        Ok(k)
     }
 
     /// Whether this SEK has been invalidated by an app-lock.

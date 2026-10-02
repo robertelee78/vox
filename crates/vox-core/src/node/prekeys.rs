@@ -78,7 +78,7 @@
 use zeroize::Zeroizing;
 
 use crate::atrest::sek::Sek;
-use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
+use crate::atrest::store::SegmentKind;
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::{sha256, Digest32, COMPOSITE_SIG_LEN};
@@ -615,18 +615,13 @@ fn take64(d: &mut Decoder<'_>) -> Result<Zeroizing<[u8; 64]>> {
 
 /// Seal and store the ring (latest-wins in its one segment).
 pub fn save(store: &Store, signer: &dyn RootSigner, ring: &PrekeyRing) -> Result<()> {
-    let sek = ring_sek(signer)?;
-    let sealed = seal_segment(
-        &sek,
-        SegmentKind::PrekeyRing,
-        SEG_PREKEY_RING,
-        ring.encode().as_ref(),
-    )?;
-    store.put_segment(
+    crate::node::at_rest::save_segment(
+        store,
         &ring_channel(),
         SegmentKind::PrekeyRing,
         SEG_PREKEY_RING,
-        &sealed,
+        &ring_sek(signer)?,
+        ring.encode().as_ref(),
     )
 }
 
@@ -635,13 +630,16 @@ pub fn save(store: &Store, signer: &dyn RootSigner, ring: &PrekeyRing) -> Result
 /// [`Error::AtRestUnlockFailed`] — never a silently regenerated ring, which would
 /// invalidate every published bundle.
 pub fn load(store: &Store, signer: &dyn RootSigner) -> Result<Option<PrekeyRing>> {
-    let Some(sealed) =
-        store.get_segment(&ring_channel(), SegmentKind::PrekeyRing, SEG_PREKEY_RING)?
+    let Some(plain) = crate::node::at_rest::load_segment(
+        store,
+        &ring_channel(),
+        SegmentKind::PrekeyRing,
+        SEG_PREKEY_RING,
+        &ring_sek(signer)?,
+    )?
     else {
         return Ok(None);
     };
-    let sek = ring_sek(signer)?;
-    let plain = open_segment(&sek, SegmentKind::PrekeyRing, SEG_PREKEY_RING, &sealed)?;
     PrekeyRing::decode(&signer.public_key(), &plain).map(Some)
 }
 

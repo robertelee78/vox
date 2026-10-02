@@ -56,7 +56,7 @@ use crate::atrest::vault::VaultRootSigner;
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
-use crate::node::store::Store;
+use crate::node::store::{meta_slot, KeyClass, SealState, Store};
 use crate::node::trust::MAX_TRUSTED;
 
 /// The metadata key the sealed blob is stored under.
@@ -212,7 +212,7 @@ impl ConsentOrder {
         Ok(Self { id, last, trusted })
     }
 
-    fn open(blob: Option<&[u8]>, signer: &VaultRootSigner) -> Result<Self> {
+    fn open(blob: Option<&[u8]>, signer: &VaultRootSigner, generation: u64) -> Result<Self> {
         // A missing blob is a new counter under a new id, never the old one restarted: every
         // stamp the old one handed out is then unordered against every stamp of this one.
         let Some(blob) = blob else {
@@ -228,13 +228,14 @@ impl ConsentOrder {
             nonce,
             ciphertext: ciphertext.to_vec(),
         };
-        let plain = open_segment(&order_sek(signer)?, SegmentKind::Trust, SEGMENT_ID, &sealed)?;
+        let key = order_sek(signer)?.data_key(generation)?;
+        let plain = open_segment(&key, SegmentKind::Trust, SEGMENT_ID, &sealed)?;
         Self::from_bytes(&plain)
     }
 
-    fn seal(&self, signer: &VaultRootSigner) -> Result<Vec<u8>> {
+    fn seal(&self, signer: &VaultRootSigner, generation: u64) -> Result<Vec<u8>> {
         let sealed = seal_segment(
-            &order_sek(signer)?,
+            &order_sek(signer)?.data_key(generation)?,
             SegmentKind::Trust,
             SEGMENT_ID,
             &self.to_bytes(),
@@ -249,7 +250,8 @@ impl ConsentOrder {
     /// the blob was deleted). Requires an unlocked identity.
     pub fn load(store: &Store, signer: &VaultRootSigner) -> Result<Self> {
         let blob = store.get_meta(CONSENT_ORDER_META_KEY)?;
-        Self::open(blob.as_deref(), signer)
+        let st = store.seal_state(&meta_slot(CONSENT_ORDER_META_KEY), KeyClass::Meta)?;
+        Self::open(blob.as_deref(), signer, st.generation)
     }
 
     /// Apply `f` to the persisted order in one store transaction and persist the result before
@@ -259,10 +261,20 @@ impl ConsentOrder {
         signer: &VaultRootSigner,
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        store.update_meta(CONSENT_ORDER_META_KEY, |blob| {
-            let mut order = Self::open(blob, signer)?;
+        // Counted, and rotated to a new data-key generation at the threshold (V210-136).
+        store.update_sealed_meta(CONSENT_ORDER_META_KEY, |blob, st| {
+            let mut order = Self::open(blob, signer, st.generation)?;
             let out = f(&mut order)?;
-            Ok((order.seal(signer)?, out))
+            if st.seals >= crate::node::at_rest::rotate_at() {
+                let next = st.generation.saturating_add(1);
+                let set = SealState {
+                    generation: next,
+                    seals: 1,
+                };
+                Ok((order.seal(signer, next)?, Some(set), out))
+            } else {
+                Ok((order.seal(signer, st.generation)?, None, out))
+            }
         })
     }
 }

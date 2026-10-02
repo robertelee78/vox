@@ -115,14 +115,21 @@ pub struct SealedSegment {
     pub ciphertext: Vec<u8>,
 }
 
-/// Build the AEAD AAD for a segment: `kind_tag ‖ segment_id(8 BE)`. Binding the id
-/// pins a sealed segment to its slot (it cannot be relocated/replayed into another
-/// id), and binding the kind keeps kinds non-interchangeable.
-fn segment_aad(kind: SegmentKind, segment_id: u64) -> Vec<u8> {
+/// Build the AEAD AAD for a segment: `kind_tag ‖ segment_id(8 BE)`, and, under a data-key
+/// generation `g ≥ 1` (V210-136), `‖ "/g" ‖ g(8 BE)`. Binding the id pins a sealed segment to its
+/// slot (it cannot be relocated/replayed into another id), binding the kind keeps kinds
+/// non-interchangeable, and binding the generation keeps a segment from opening as another
+/// generation's. Generation 0 adds nothing, so a store sealed before generations existed opens
+/// byte for byte as it did.
+fn segment_aad(kind: SegmentKind, segment_id: u64, generation: u64) -> Vec<u8> {
     let tag = kind.aad_tag();
-    let mut aad = Vec::with_capacity(tag.len() + 8);
+    let mut aad = Vec::with_capacity(tag.len() + 18);
     aad.extend_from_slice(tag);
     aad.extend_from_slice(&segment_id.to_be_bytes());
+    if generation != 0 {
+        aad.extend_from_slice(b"/g");
+        aad.extend_from_slice(&generation.to_be_bytes());
+    }
     aad
 }
 
@@ -143,7 +150,7 @@ pub fn seal_segment(
     let cipher =
         Aes256Gcm::new_from_slice(sek.key_bytes()?).map_err(|_| Error::AtRestUnlockFailed)?;
     let nonce = random_array::<NONCE_LEN>()?;
-    let aad = segment_aad(kind, segment_id);
+    let aad = segment_aad(kind, segment_id, sek.generation());
     let ct = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -178,7 +185,7 @@ pub fn open_segment(
     // Post-lock open fails with `AtRestLocked` until re-auth (ADR-010).
     let cipher =
         Aes256Gcm::new_from_slice(sek.key_bytes()?).map_err(|_| Error::AtRestUnlockFailed)?;
-    let aad = segment_aad(kind, segment_id);
+    let aad = segment_aad(kind, segment_id, sek.generation());
     cipher
         .decrypt(
             Nonce::from_slice(&sealed.nonce),

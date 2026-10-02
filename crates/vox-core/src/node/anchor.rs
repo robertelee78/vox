@@ -82,7 +82,11 @@ pub struct AnchorState {
     admission: AdmissionPolicy,
     dag: Dag,
     next_log_id: u64,
+    /// The data key the copy's pages are sealed under: the anchor key at its current at-rest
+    /// generation (V210-136).
     sek: Sek,
+    /// The anchor key itself, which the data keys derive from.
+    base_sek: Sek,
     poisoned: bool,
     /// The copy's generation (ADR-025 D1): bumped by every entry persisted.
     gen: Arc<std::sync::atomic::AtomicU64>,
@@ -101,6 +105,35 @@ impl std::fmt::Debug for AnchorState {
 }
 
 impl AnchorState {
+    /// The at-rest data-key generation this copy's pages are sealed under (V210-136).
+    #[must_use]
+    pub fn at_rest_generation(&self) -> u64 {
+        self.sek.generation()
+    }
+
+    /// Re-seal this copy's pages under the next at-rest generation if its key has reached the
+    /// rotation threshold, in one store transaction, and wipe the old data key (V210-136).
+    /// Returns whether it rotated.
+    ///
+    /// # Errors
+    /// The store cannot be read or written. Nothing changes then.
+    pub fn rotate_at_rest_if_due(&mut self, store: &Store) -> Result<bool> {
+        use crate::node::store::KeyClass;
+        if !crate::node::at_rest::due(store, &self.channel_id, KeyClass::Anchor)? {
+            return Ok(false);
+        }
+        let new = crate::node::at_rest::rotate_segments(
+            store,
+            &self.channel_id,
+            KeyClass::Anchor,
+            &self.sek,
+            &self.base_sek,
+        )?;
+        let mut old = std::mem::replace(&mut self.sek, new);
+        old.lock_now();
+        Ok(true)
+    }
+
     /// Start anchoring `genesis`'s channel: file the genesis and the creator, sealed
     /// under `sek`. Fails if the channel is already anchored in `store`.
     pub fn create(store: &Store, sek: Sek, genesis: &Genesis, now_secs: u64) -> Result<Self> {
@@ -125,7 +158,8 @@ impl AnchorState {
             authors,
             dag: Dag::new(),
             next_log_id: 1,
-            sek,
+            sek: sek.data_key(0)?,
+            base_sek: sek,
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             forks_kept: 0,
@@ -139,6 +173,14 @@ impl AnchorState {
     /// Reopen an anchored channel from `store`: the metadata, then every stored
     /// entry re-passes the acceptance predicate under the authors on file.
     pub fn open(store: &Store, sek: Sek, channel_id: &Digest32) -> Result<Self> {
+        // The pages are sealed under the copy's current at-rest generation (V210-136).
+        let base_sek = sek;
+        let sek = crate::node::at_rest::data_key(
+            store,
+            channel_id,
+            crate::node::store::KeyClass::Anchor,
+            &base_sek,
+        )?;
         let meta_seg = store
             .get_segment(channel_id, SegmentKind::AnchorMeta, SEG_META)?
             .ok_or(Error::Profile("channel is not anchored here"))?;
@@ -157,6 +199,7 @@ impl AnchorState {
             dag: Dag::new(),
             next_log_id: 1,
             sek,
+            base_sek,
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             forks_kept: 0,
