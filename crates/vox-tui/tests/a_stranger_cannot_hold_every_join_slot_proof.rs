@@ -841,9 +841,19 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
              carol: {out}{err}\n  alice's stderr:\n{text}",
             took.as_secs_f64()
         );
+        // Her own word on where the time went, so a red past the bound is diagnosable from its
+        // message alone: the `join got in` line carries each step's time and the path it rode.
+        let carol_said = std::fs::read_to_string(s.dir.join("carol.daemon.err"))
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .find(|l| l.contains("join got in"))
+            .unwrap_or("(carol's daemon said no `join got in` line)")
+            .to_owned();
         assert!(
             took < JOIN_BOUND,
-            "PRODUCT: {case}: carol got in, but only after {:.1}s, past {}s\n  alice's stderr:\n{text}",
+            "PRODUCT: {case}: carol got in, but only after {:.1}s, past {}s\n  carol's daemon: \
+             {carol_said}\n  alice's stderr:\n{text}",
             took.as_secs_f64(),
             JOIN_BOUND.as_secs()
         );
