@@ -15,7 +15,7 @@
 //! ```text
 //! vox id; vox trust add …          # two identities that consent to each other
 //! vox daemon                       # alice's node, no terminal
-//! vox room create; vox room post   # POSTS posts from one author, every one must succeed
+//! vox room create; vox room post   # posts from one author, every one must succeed
 //! (kill the daemon) vox daemon     # restart: the room must open, and read back every row
 //! vox room invite / vox room join  # bob, cold
 //! vox room post (alice, after)      # bob must render it: his log holds her whole feed
@@ -30,14 +30,23 @@
 //! **How bob's catch-up is seen from outside.** Alice posts once more after bob has joined, and
 //! bob must render that post. A member's log accepts an author's entry at `seq` only after that
 //! author's entries `1..seq-1` (the feed append checks the sequence is contiguous and the
-//! `prev_hash` and `lipmaa_backlink` chain), so a rendered post 1,501 means bob's log holds
-//! every one of alice's 1,500 posts before it. That is the claim: the newcomer's **log** catches
+//! `prev_hash` and `lipmaa_backlink` chain), so a rendered post `n + 1` means bob's log holds
+//! every one of alice's `n` posts before it. That is the claim: the newcomer's **log** catches
 //! up with the whole history, of any size.
 //!
-//! **Not asserted, printed:** how many of the 1,500 pre-join posts bob can *read*. Bob was
-//! trusted before any post, so he is entitled to all of them; on `integrate/v0.2.10` before
-//! #220's fix he reads only 500 (posts 1,001–1,500), and #220 (`fix/220-whole-history`) makes it
-//! 1,500. That is #220's own proof to assert; here it is printed so a regression shows.
+//! **Sizes.** "Any size" cannot be run, so two are: [`MID`] (5,000) blocks, which is five times the
+//! old 1,000-per-author cap and more than three times the 1,500 this proof used to stage; and
+//! [`LARGE`] (100,000), past 65,536 where a 16-bit count or index would wrap, is an **optional**
+//! proof (`--features optional-proofs`), because its staging takes most of an hour. The posts come
+//! from several shells at once to stage them faster; every shell is the same profile, so it is
+//! still one author's feed.
+//!
+//! **Not asserted, printed:** how many of the pre-join posts bob can *read*. Bob was trusted
+//! before any post, so he is entitled to all of them; that is #220's own proof to assert, and here
+//! it is printed so a regression shows.
+//!
+//! **Mutation that must turn it red:** a lifetime cap on one author's entries anywhere between
+//! 1,500 and [`MID`] in `Dag::accept`: the blocking arm goes red on its post assertion.
 
 #![cfg(unix)]
 
@@ -51,8 +60,6 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
-/// Half again past the old 1,000-per-hour cap, from one author, inside a minute or two.
-const POSTS: usize = 1_500;
 
 /// A `vox daemon`, killed by its own PID when dropped.
 struct Daemon(Child);
@@ -79,17 +86,17 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: write stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -99,8 +106,10 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
 
 /// Start `vox daemon` with `stdin_lines` piped in, its output to files next to the profile.
 fn daemon(dir: &std::path::Path, tag: &str, stdin_lines: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: daemon log");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: daemon log");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -110,10 +119,11 @@ fn daemon(dir: &std::path::Path, tag: &str, stdin_lines: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: spawn vox daemon");
     // Write, then close: the daemon reads stdin to EOF before it binds its socket.
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(stdin_lines.as_bytes()).unwrap();
+    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(stdin_lines.as_bytes())
+        .expect("APPARATUS: write the daemon's stdin");
     drop(pipe);
     Daemon(child)
 }
@@ -131,7 +141,7 @@ fn attached(dir: &std::path::Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "{tag}'s daemon never answered: {last}\nits stderr: {}",
+        "PRODUCT: {tag}'s daemon never answered: {last}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
     );
 }
@@ -163,7 +173,10 @@ fn read_posts(
         let page: Vec<serde_json::Value> = out
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad row ({e}): {l}")))
+            .map(|l| {
+                serde_json::from_str(l)
+                    .unwrap_or_else(|e| panic!("PRODUCT: `vox room read --json` row ({e}): {l}"))
+            })
             .collect();
         for row in &page {
             if let Some(n) = row["text"]
@@ -180,7 +193,7 @@ fn read_posts(
                 since = Some(
                     last["entry_hash"]
                         .as_str()
-                        .expect("every row carries its entry hash")
+                        .expect("PRODUCT: every row carries its entry hash")
                         .to_owned(),
                 );
             }
@@ -189,30 +202,86 @@ fn read_posts(
     }
 }
 
+/// Post `"post 1"` … `"post {posts}"` to `room` as this profile, from `writers` shells at once
+/// (one author: every shell is this profile's daemon). Returns the first refusal, if any.
+fn post_all(dir: &std::path::Path, room: &str, posts: usize, writers: usize) -> Option<String> {
+    let refused = std::sync::Mutex::new(None::<String>);
+    let posted = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for w in 0..writers {
+            let (refused, posted) = (&refused, &posted);
+            s.spawn(move || {
+                for i in (1 + w..=posts).step_by(writers) {
+                    if refused.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let (ok, _, err) =
+                        vox(dir, &["room", "post", room, &format!("post {i}")], None);
+                    if !ok {
+                        let done = posted.load(std::sync::atomic::Ordering::Relaxed);
+                        refused.lock().unwrap().get_or_insert(format!(
+                            "post {i} of {posts} was refused after {done} succeeded: {err}"
+                        ));
+                        return;
+                    }
+                    posted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    refused.into_inner().unwrap()
+}
+
+/// **Blocking** (PRD-001 R1): past 1,000 posts from one author (D1) and past what a room held
+/// before, the room reopens after a restart and a newcomer catches up cold.
+const MID: usize = 5_000;
+
+/// **Optional** (`--features optional-proofs`): a room of this many posts from one author, past
+/// 65,536, where any 16-bit count or index would wrap. Staging alone takes most of an hour.
+const LARGE: usize = 100_000;
+
 #[test]
-#[ignore = "real vox daemons, 1,500 CLI posts and production Argon2id; CI runs it in release"]
-fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_them_all() {
-    watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+#[ignore = "real vox daemons, 5,000 CLI posts and production Argon2id; CI runs it in release"]
+fn a_room_of_five_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_them_all() {
+    watchdog::arm_for(Duration::from_secs(1_200));
+    a_room_of(MID, 4, Duration::from_secs(300));
+}
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_room_of_a_hundred_thousand_posts_reopens_and_a_newcomer_holds_them_all);
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "optional: 100,000 CLI posts, most of an hour; run in release"]
+fn a_room_of_a_hundred_thousand_posts_reopens_and_a_newcomer_holds_them_all() {
+    watchdog::arm_for(Duration::from_secs(4 * 3_600));
+    a_room_of(LARGE, 8, Duration::from_secs(1_800));
+}
+
+/// One author posts `posts` times (from `writers` shells); the room must reopen after a restart
+/// with every post, and a newcomer who joins cold must catch up within `catch_up`.
+fn a_room_of(posts: usize, writers: usize, catch_up: Duration) {
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     for d in [&alice, &bob] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a profile dir");
     }
 
     // ---- two identities that consent to each other, decided before any daemon runs ----
     let mut fps = Vec::new();
     for dir in [&alice, &bob] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT: vox id: {err}");
         fps.push(out.trim().to_owned());
     }
     for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(ok, "vox trust add {name}: {err}");
+        assert!(ok, "PRODUCT: vox trust add {name}: {err}");
     }
 
-    // ---- alice: a room, and POSTS posts from one author --------------------------------
+    // ---- alice: a room, and `posts` posts from one author --------------------------------
     let first = daemon(&alice, "first", &format!("{IDENTITY}\n"));
     attached(&alice, "alice");
     let (ok, _, err) = vox(
@@ -220,35 +289,29 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
         &["room", "create", "--name", "long"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "PRODUCT: vox room create: {err}");
     let listed = attached(&alice, "alice");
     let room = listed
         .split_whitespace()
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .expect("a room id in `room list`")
+        .unwrap_or_else(|| panic!("PRODUCT: no room id in `room list`: {listed:?}"))
         .to_owned();
 
     let started = Instant::now();
-    for i in 1..=POSTS {
-        let (ok, _, err) = vox(&alice, &["room", "post", &room, &format!("post {i}")], None);
-        assert!(
-            ok,
-            "post {i} of {POSTS} was refused after {} succeeded: {err} — one author may post \
-             without limit (PRD-001 R1/R3)",
-            i - 1
-        );
+    if let Some(why) = post_all(&alice, &room, posts, writers) {
+        panic!("PRODUCT: {why} — one author may post without limit (PRD-001 R1/R3)");
     }
     let (before, before_rows, pages, why) = read_posts(&alice, &room);
     println!(
-        "[proof] alice posted {POSTS} through `vox room post` in {:?}; `vox room read --json` \
-         shows {} distinct posts in {before_rows} rows over {pages} pages {why}",
+        "[proof] alice posted {posts} through `vox room post` ({writers} shells) in {:?}; `vox \
+         room read --json` shows {} distinct posts in {before_rows} rows over {pages} pages {why}",
         started.elapsed(),
         before.len()
     );
     assert_eq!(
         (before.len(), before_rows),
-        (1_500, 1_500),
-        "every post reads back once before the restart"
+        (posts, posts),
+        "PRODUCT: every post reads back once before the restart {why}"
     );
 
     // ---- restart: the room must open, with every row --------------------------------------
@@ -263,19 +326,19 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     );
     assert!(
         listed.contains("long") && !listed.contains("[closed]"),
-        "the room with {POSTS} posts from one author did not reopen after a restart: \
+        "PRODUCT: the room with {posts} posts from one author did not reopen after a restart: \
          {listed:?} — PRD-001 D1\nalice's daemon said: {}",
         std::fs::read_to_string(alice.join("daemon-second.err")).unwrap_or_default()
     );
     assert_eq!(
         (after.len(), after_rows),
-        (1_500, 1_500),
-        "every post reads back once after the restart"
+        (posts, posts),
+        "PRODUCT: every post reads back once after the restart {why}"
     );
 
     // ---- bob joins cold and must read every row ------------------------------------------
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT: vox room invite: {err}");
     let link = link.trim().to_owned();
     let bob_daemon = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
     attached(&bob, "bob");
@@ -284,13 +347,13 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
         &["room", "join", &link, "--name", "long"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room join: {err}");
+    assert!(ok, "PRODUCT: vox room join: {err}");
     // ---- bob's log catches up: he renders the post alice makes after his join ----------
     let joined = Instant::now();
-    let after_join = format!("post {}", POSTS + 1);
+    let after_join = format!("post {}", posts + 1);
     let (ok, _, err) = vox(&alice, &["room", "post", &room, &after_join], None);
-    assert!(ok, "alice's post after bob joined: {err}");
-    let deadline = joined + Duration::from_secs(300);
+    assert!(ok, "PRODUCT: alice's post after bob joined: {err}");
+    let deadline = joined + catch_up;
     let caught_up = loop {
         let (ok, out, _) = vox(&bob, &["room", "read", &room, "--json"], None);
         let seen = ok
@@ -305,11 +368,11 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     };
     let took = joined.elapsed();
     let (bob_posts, bob_rows, pages, why) = read_posts(&bob, &room);
-    let history: Vec<usize> = bob_posts.iter().copied().filter(|n| *n <= POSTS).collect();
+    let history: Vec<usize> = bob_posts.iter().copied().filter(|n| *n <= posts).collect();
     println!(
         "[proof] bob rendered alice's {after_join:?} (made after his join): {caught_up} after \
          {took:?}; his `vox room read --json` shows {} distinct posts in {bob_rows} rows over \
-         {pages} pages {why}; of the {POSTS} pre-join posts he reads {} (first {:?}, last {:?}) \
+         {pages} pages {why}; of the {posts} pre-join posts he reads {} (first {:?}, last {:?}) \
          — printed, not asserted",
         bob_posts.len(),
         history.len(),
@@ -318,9 +381,9 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     );
     assert!(
         caught_up,
-        "a newcomer's log must catch up with the whole history, of any size (PRD-001 R1): bob \
-         never rendered {after_join:?}, which his log can accept only after all {POSTS} of \
-         alice's earlier posts, within {took:?}\nbob's daemon said: {}",
+        "PRODUCT: a newcomer's log must catch up with the whole history, of any size (PRD-001 \
+         R1): bob never rendered {after_join:?}, which his log can accept only after all {posts} \
+         of alice's earlier posts, within {took:?}\nbob's daemon said: {}",
         std::fs::read_to_string(bob.join("daemon-bob.err")).unwrap_or_default()
     );
     drop(bob_daemon);
