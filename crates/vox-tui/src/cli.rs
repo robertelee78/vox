@@ -609,6 +609,10 @@ pub struct LanUpArgs {
     /// sends still come back. ICMP echo always passes.
     #[arg(long, value_delimiter = ',')]
     pub allow: Vec<u16>,
+    /// Serve Prometheus metrics at this address, as `vox daemon --metrics` does (PRD-001 R38).
+    /// Loopback only: the counters name every peer and room this node talks to.
+    #[arg(long)]
+    pub metrics: Option<SocketAddr>,
 }
 
 /// `vox app` — app streams from a shell, over a running node.
@@ -2664,7 +2668,21 @@ pub fn run() -> ExitCode {
             }
             let (socket, stats) = (a.helper_socket.clone(), a.stats_file.clone());
             let allow = a.allow.iter().copied().collect();
+            let metrics = a.metrics;
             run_tunnel_verb(a.room.clone(), move |node, cid| async move {
+                // A running LAN answers as a `vox daemon` does (V030-04, #236): its control
+                // socket is served by the tunnel verbs' path, and its metrics here.
+                if let Some(addr) = metrics {
+                    let listener = vox_core::node::status::bind_metrics(addr)
+                        .await
+                        .map_err(|e| crate::app::AppError::Usage(e.to_string()))?;
+                    let bound = listener.local_addr()?;
+                    tokio::spawn(vox_core::node::status::serve_metrics(
+                        listener,
+                        node.clone(),
+                    ));
+                    println!("vox lan: metrics http://{bound}/metrics");
+                }
                 crate::lan_cli::up(&node, cid, socket, stats, allow).await
             })
         }
