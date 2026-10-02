@@ -579,9 +579,11 @@ mod optional_proof;
 optional_proof::not_run!(a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again);
 
 /// **A room that has not synced** (PRD-001 R37), optional because the condition takes
-/// `STALE_SYNC_SECS` (ten minutes) to start. bob, alice's only other member, is killed: once the
-/// room has gone ten minutes with no completed sync, exactly one notification names the room;
-/// bob back, exactly one "recovered" for it.
+/// `STALE_SYNC_SECS` (ten minutes) to start. bob, alice's only other member, is killed, and so is
+/// the anchor: an anchor holds the room's log for whoever is away and syncs it, so with the anchor
+/// up the room is not stale, which is right. Once the room has gone ten minutes with no completed
+/// sync, exactly one notification names the room; the anchor back on its port, the room syncs
+/// again and exactly one "recovered" names it.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "optional: an anchor and two daemons, one killed for over ten minutes; run in release"]
@@ -591,7 +593,7 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
     let file = tmp.path().join("notifications.log");
     let script = notify_script(&tmp, &file);
     let Scene {
-        _anchor,
+        _anchor: mut the_anchor,
         anchor,
         alice: _alice,
         alice_dir,
@@ -601,6 +603,7 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
         pass_file,
         ..
     } = scene(&tmp, &script, |_| {});
+    let anchor_port = anchor.rsplit('/').next().unwrap_or_default().to_owned();
     let room: String = status(&alice_dir)["rooms"][0]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("PRODUCT: alice's status lists no room"))
@@ -610,16 +613,22 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
     let stale = |lines: &[String]| count(lines, "no completed sync", &room);
 
     let killed = Instant::now();
-    let _ = bob.child.kill();
-    let _ = bob.child.wait();
+    for p in [&mut bob, &mut the_anchor] {
+        let _ = p.child.kill();
+        let _ = p.child.wait();
+    }
     let until = killed + Duration::from_secs(10 * 60 + 120);
     while stale(&notes(&file)) == 0 {
+        let s = status(&alice_dir);
         assert!(
             Instant::now() < until,
-            "PRODUCT: no notification for room {room} {:?} after its only other member was \
-             killed; alice's status says {}; notifications: {:?}",
+            "PRODUCT: no notification for room {room} {:?} after its only other member and the \
+             anchor were killed; alice's room last synced at {} (now {}); her status says {}; \
+             notifications: {:?}",
             killed.elapsed(),
-            status(&alice_dir)["unhealthy"],
+            s["rooms"][0]["last_sync"],
+            s["now"],
+            s["unhealthy"],
             notes(&file)
         );
         std::thread::sleep(Duration::from_secs(1));
@@ -627,13 +636,26 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
     let raised_after = killed.elapsed();
     std::thread::sleep(Duration::from_secs(30));
     let held = notes(&file);
-    eprintln!("[proof] room {room} raised {raised_after:?} after bob was killed: {held:?}");
+    eprintln!(
+        "[proof] room {room} raised {raised_after:?} after bob and the anchor were killed: {held:?}"
+    );
     assert_eq!(
         stale(&held),
         1,
         "PRODUCT: one condition is one notification: {held:?}"
     );
 
+    // The anchor back on its port, with its profile; then bob.
+    drop(the_anchor);
+    let anchor_port: u16 = anchor_port
+        .parse()
+        .unwrap_or_else(|_| panic!("APPARATUS: no port in the anchor spec {anchor}"));
+    port_free(anchor_port);
+    let _anchor_again = VoxProc::spawn(
+        "anchor",
+        &tmp.path().join("anchor"),
+        &args(&["node", "--listen", &format!("127.0.0.1:{anchor_port}")]),
+    );
     drop(bob);
     port_free(bob_port);
     let mut bob_again = daemon("bob", &bob_dir, bob_port, &anchor, &pass_file, &[]);
@@ -653,8 +675,8 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
     while cleared(&notes(&file)) == 0 {
         assert!(
             Instant::now() < until,
-            "PRODUCT: no \"recovered\" for room {room} {:?} after bob was back; notifications: \
-             {:?}",
+            "PRODUCT: no \"recovered\" for room {room} {:?} after the anchor and bob were back; \
+             notifications: {:?}",
             back.elapsed(),
             notes(&file)
         );
@@ -663,7 +685,7 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
     std::thread::sleep(Duration::from_secs(11));
     let end = notes(&file);
     eprintln!(
-        "[proof] room {room} recovered {:?} after bob was back: {end:?}",
+        "[proof] room {room} recovered {:?} after the anchor and bob were back: {end:?}",
         back.elapsed()
     );
     assert_eq!(
