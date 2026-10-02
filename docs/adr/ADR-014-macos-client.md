@@ -127,7 +127,7 @@ the client presents it.
 7.1. The app MUST embed the node and run it while the app runs. *Planned; the embedding is built
      (11.x).*
 7.2. The app MUST be able to point at any user-run node as its anchor (ADR-012). Vox MUST NOT mandate
-     a topology: every option MUST be configurable, and none MUST be made compulsory.
+     a topology: every option MUST be configurable, and Vox MUST NOT make any of them compulsory.
 7.3. Vox MUST also ship a headless node binary (the same Rust core, no UI) for an always-on box with a
      port forward, for reachability while the Mac sleeps (ADR-012). *Built as `vox node` and
      `vox daemon`.*
