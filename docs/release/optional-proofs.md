@@ -32,6 +32,11 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
 
 ### Live model (needs `opencode` on PATH, logged in: `~/.local/share/opencode/auth.json`)
 
+**Ad hoc, on demand only** (decider, 2026-10-02): nobody runs one of these unless the decider asks, and none is ever part of CI or the release gate. When one is run:
+
+- **Models:** only `claude -p`, `codex exec`, or OpenCode with `opencode/kimi-k3`. Never the free model. Set `VOX_PROOF_OPENCODE_MODEL=opencode/kimi-k3`; the proofs' built-in default, `opencode/claude-haiku-4-5`, is not on that list.
+- **Sandbox:** a live model gets a shell, and on 2026-10-02 an unsandboxed one read other agents' private files and sent them to the provider. These proofs run only inside the sandbox: no shell, or one confined to a throwaway `HOME` and working directory with no real-profile path visible. That sandbox is fix-handoff-b's, landing with the OpenCode labels candidate. Until it has landed, do not run them.
+
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
 | `agent_rehearsal_proof::two_agent_sessions_and_an_operator_share_one_room` | Two AI sessions and a person in one room don't see each other's messages, or a session sees its own posts echoed. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test agent_rehearsal_proof -- --ignored --exact two_agent_sessions_and_an_operator_share_one_room` | opencode + login; a model account (default `opencode/claude-haiku-4-5`, `VOX_PROOF_OPENCODE_MODEL` overrides it) | not timed; minutes of model turns |
