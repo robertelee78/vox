@@ -163,6 +163,11 @@ pub trait TerminalIo {
     fn draw(&mut self, render: &mut dyn FnMut(&mut Frame)) -> io::Result<()>;
     /// Wait up to `timeout` for a key press (release events are filtered).
     fn poll_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>>;
+    /// [`TerminalIo::poll_key`] for a key going into a secret field (a passphrase), read so that
+    /// nothing outlives it but the field itself (see [`CrosstermIo`]'s). Defaults to `poll_key`.
+    fn poll_secret_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
+        self.poll_key(timeout)
+    }
     /// Leave the alternate screen (clearing it), purge scrollback, restore the
     /// terminal. Idempotent; also performed on drop by real backends.
     fn leave(&mut self) -> io::Result<()>;
@@ -235,6 +240,18 @@ impl TerminalIo for CrosstermIo {
         }
     }
 
+    /// **A passphrase is read past crossterm** (V210-94). crossterm reads the terminal into a
+    /// 1024-byte buffer of its own, which it keeps for the life of the process and never clears:
+    /// a passphrase typed at the unlock prompt stayed there, whole, after the node locked — and after
+    /// a typed `:lock`, all of it but the six bytes `:lock\r` overwrote. Measured through the shipped
+    /// binary. While a secret field is being typed this reads the terminal itself, one byte into one
+    /// byte of stack, wiped before it returns; crossterm reads nothing meanwhile, so its buffer never
+    /// sees a passphrase.
+    #[cfg(unix)]
+    fn poll_secret_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
+        secret_input::poll_key(timeout)
+    }
+
     fn leave(&mut self) -> io::Result<()> {
         if self.entered {
             self.entered = false;
@@ -249,6 +266,123 @@ impl Drop for CrosstermIo {
     fn drop(&mut self) {
         // Runs on every exit path, including panic unwind.
         let _ = self.leave();
+    }
+}
+
+/// Reading a key for a secret field straight from the terminal, past crossterm; see
+/// [`CrosstermIo::poll_secret_key`].
+#[cfg(unix)]
+mod secret_input {
+    use std::io::{self, IsTerminal as _, Read as _};
+    use std::time::{Duration, Instant};
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use zeroize::Zeroize as _;
+
+    /// How long the rest of a multi-byte key (an escape sequence, a UTF-8 character) may take to
+    /// arrive once its first byte has: they come in one write.
+    const REST_OF_KEY: Duration = Duration::from_millis(30);
+
+    /// The terminal crossterm reads: standard input when it is one, else `/dev/tty`.
+    fn tty() -> io::Result<std::fs::File> {
+        use std::os::fd::AsFd as _;
+        let stdin = io::stdin();
+        if stdin.is_terminal() {
+            return Ok(std::fs::File::from(stdin.as_fd().try_clone_to_owned()?));
+        }
+        std::fs::File::options().read(true).open("/dev/tty")
+    }
+
+    /// One byte within `wait`, into `b`; `false` if none came.
+    fn byte(tty: &mut std::fs::File, b: &mut [u8; 1], wait: Duration) -> io::Result<bool> {
+        use std::os::fd::AsFd as _;
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let fd = tty.as_fd();
+            let mut fds = [rustix::event::PollFd::new(
+                &fd,
+                rustix::event::PollFlags::IN,
+            )];
+            let ts = rustix::event::Timespec::try_from(left).ok();
+            match rustix::event::poll(&mut fds, ts.as_ref()) {
+                Ok(0) => return Ok(false),
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+            return match tty.read(b) {
+                Ok(1) => Ok(true),
+                Ok(_) => Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => Err(e),
+            };
+        }
+    }
+
+    /// Wait up to `timeout` for one key, decoded the way crossterm decodes the keys a prompt uses.
+    /// An escape sequence (an arrow, a function key) is read whole and ignored.
+    pub(super) fn poll_key(timeout: Duration) -> io::Result<Option<KeyEvent>> {
+        let mut tty = tty()?;
+        let mut b = [0u8; 1];
+        let key = (|| -> io::Result<Option<KeyEvent>> {
+            if !byte(&mut tty, &mut b, timeout)? {
+                return Ok(None);
+            }
+            let plain = |code| Some(KeyEvent::new(code, KeyModifiers::NONE));
+            Ok(match b[0] {
+                b'\r' | b'\n' => plain(KeyCode::Enter),
+                0x7f | 0x08 => plain(KeyCode::Backspace),
+                b'\t' => plain(KeyCode::Tab),
+                0x1b => {
+                    if !byte(&mut tty, &mut b, REST_OF_KEY)? {
+                        return Ok(plain(KeyCode::Esc));
+                    }
+                    // `ESC [ … final` or `ESC O x`: read to its final byte and drop it.
+                    if b[0] == b'[' || b[0] == b'O' {
+                        let ss3 = b[0] == b'O';
+                        while byte(&mut tty, &mut b, REST_OF_KEY)? {
+                            if ss3 || (0x40..=0x7e).contains(&b[0]) {
+                                break;
+                            }
+                        }
+                    }
+                    None
+                }
+                c @ 0x00..=0x1f => Some(KeyEvent::new(
+                    KeyCode::Char(char::from(c | 0x60)),
+                    KeyModifiers::CONTROL,
+                )),
+                lead => {
+                    // UTF-8: the lead byte says how many follow. Assembled in a stack array wiped
+                    // below, like `b`.
+                    let len = match lead {
+                        0x00..=0x7f => 1,
+                        0xc0..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        0xf0..=0xf7 => 4,
+                        _ => return Ok(None),
+                    };
+                    let mut buf = [0u8; 4];
+                    buf[0] = lead;
+                    let mut ok = true;
+                    for slot in buf.iter_mut().take(len).skip(1) {
+                        if !byte(&mut tty, &mut b, REST_OF_KEY)? {
+                            ok = false;
+                            break;
+                        }
+                        *slot = b[0];
+                    }
+                    let c = ok
+                        .then(|| std::str::from_utf8(&buf[..len]).ok()?.chars().next())
+                        .flatten();
+                    buf.zeroize();
+                    c.and_then(|c| plain(KeyCode::Char(c)))
+                }
+            })
+        })();
+        b.zeroize();
+        key
     }
 }
 
@@ -296,10 +430,101 @@ fn dialable(listening: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// A signal that asks this process to stop, as `stop_requested` resolves to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopSignal {
+    /// Ctrl-C.
+    Interrupt,
+    /// A service manager's, or `kill`'s.
+    Terminate,
+    /// The terminal went away: a closed window, a dropped ssh session.
+    Hangup,
+    /// `Ctrl-\`.
+    Quit,
+}
+
+impl StopSignal {
+    /// Its name, as a person reads it: `SIGTERM`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            StopSignal::Interrupt => "SIGINT",
+            StopSignal::Terminate => "SIGTERM",
+            StopSignal::Hangup => "SIGHUP",
+            StopSignal::Quit => "SIGQUIT",
+        }
+    }
+
+    /// 128 + the signal's number, as a shell reports a process the signal killed.
+    #[must_use]
+    pub fn exit_code(self) -> u8 {
+        match self {
+            StopSignal::Interrupt => 130,
+            StopSignal::Terminate => 143,
+            StopSignal::Hangup => 129,
+            StopSignal::Quit => 131,
+        }
+    }
+}
+
+/// Resolves when this process is asked to stop: Ctrl-C (SIGINT), SIGTERM (a service manager's stop,
+/// `kill`), SIGHUP (its terminal went away) or SIGQUIT (`Ctrl-\`) (V210-85, V210-93), to which one
+/// it was. Each is registered when this is called, not when the future is first polled, so a signal
+/// that arrives before the caller first waits is not lost; call it once, before the work it races,
+/// and keep it.
+///
+/// **Registering one replaces its default action for the rest of the process**, so only a verb
+/// that races this for its whole run may call it: anywhere else, Ctrl-C would stop doing anything.
+/// Left to their defaults these ended the process on the spot, saying nothing — for `vox connect`
+/// a non-zero exit with an empty stderr (V210-85).
+pub(crate) fn stop_requested(verb: &'static str) -> impl std::future::Future<Output = StopSignal> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, Signal, SignalKind};
+        let listen = |kind: SignalKind, name: &str| match signal(kind) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("{verb}: no {name} handler ({e})");
+                None
+            }
+        };
+        let mut int = listen(SignalKind::interrupt(), "SIGINT");
+        let mut term = listen(SignalKind::terminate(), "SIGTERM");
+        let mut hup = listen(SignalKind::hangup(), "SIGHUP");
+        let mut quit = listen(SignalKind::quit(), "SIGQUIT");
+        async fn recv(s: &mut Option<Signal>) {
+            match s {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        async move {
+            tokio::select! {
+                () = recv(&mut int) => StopSignal::Interrupt,
+                () = recv(&mut term) => StopSignal::Terminate,
+                () = recv(&mut hup) => StopSignal::Hangup,
+                () = recv(&mut quit) => StopSignal::Quit,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = verb;
+        let interrupted = tokio::signal::ctrl_c();
+        async move {
+            let _ = interrupted.await;
+            StopSignal::Interrupt
+        }
+    }
+}
+
 pub fn run_node(
     paths: Paths,
     listen: std::net::SocketAddr,
     anchors: vox_core::nat::bootstrap::BootstrapSet,
+    serve_only: Option<std::collections::BTreeSet<vox_core::hash::Digest32>>,
 ) -> Result<(), AppError> {
     use vox_core::identity::composite::RootSigner;
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -313,6 +538,17 @@ pub fn run_node(
         .anchors(anchors)
         .headless(signer)
         .anchor_logs(true);
+    let cfg = match serve_only {
+        Some(creators) => {
+            println!(
+                "vox node: serving only rooms made by the {} identit{} this profile trusts",
+                creators.len(),
+                if creators.len() == 1 { "y" } else { "ies" }
+            );
+            cfg.serve_only(creators)
+        }
+        None => cfg,
+    };
     // Kept for the anchors file the loop below writes (M17.4); the node takes its own clone.
     let anchors_paths = paths.clone();
     let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
@@ -335,7 +571,12 @@ pub fn run_node(
         // anchor descheduled past a tick on a loaded box, then signalled — went to a listener
         // that was then dropped, and the anchor served on, deaf to Ctrl-C: 13 of 20 anchors
         // stopped for 1.2 s and signalled never exited.
-        let interrupted = tokio::signal::ctrl_c();
+        //
+        // **And not only on Ctrl-C** (V210-93, V210-85): SIGTERM, which a service manager and
+        // `kill` send, SIGHUP and SIGQUIT stop it the same way. Left to their defaults they killed
+        // it on the spot, closes unsent — SIGQUIT with a core dump — and every peer counted the
+        // anchor as connected until it stopped answering.
+        let interrupted = stop_requested("vox node");
         tokio::pin!(interrupted);
         loop {
             tokio::select! {
@@ -523,6 +764,20 @@ pub fn run_node(
                                         crate::ident::author_id(&peer)
                                     );
                                 }
+                                vox_core::node::api::NodeEvent::HandshakesQueued {
+                                    waited,
+                                    most_waiting,
+                                    most_running,
+                                    refused,
+                                    longest_ms,
+                                } => {
+                                    eprintln!(
+                                        "vox node: {waited} connection attempt(s) waited for a \
+                                         handshake slot (at most {most_waiting} at once, the \
+                                         longest {longest_ms}ms) while at most {most_running} \
+                                         handshake(s) ran; {refused} refused"
+                                    );
+                                }
                                 vox_core::node::api::NodeEvent::ConnectionNote { peer, note } => {
                                     eprintln!(
                                         "vox node: connection to {} — {note}",
@@ -553,7 +808,8 @@ pub fn run_node(
                         }
                     }
                 }
-                _ = &mut interrupted => {
+                signal = &mut interrupted => {
+                    println!("vox node: stopped by {}", signal.name());
                     println!("vox node: shutting down");
                     let _ = node.apply(NodeCommand::Shutdown).await;
                     break;
@@ -610,7 +866,7 @@ async fn judge(
         .open_channels
         .iter()
         .find(|d| d.channel_id == *channel_id)
-        .map_or(&[][..], |d| d.timeline.as_slice());
+        .map_or(&[][..], |d| &d.timeline[..]);
     if crate::wake::hops_left(&envelope, timeline) == 0 {
         eprintln!(
             "vox daemon: not interrupting anyone for {}: its hop budget is spent; it waits for \
@@ -671,6 +927,26 @@ async fn judge(
             }
         });
     }
+}
+
+impl AppError {
+    /// How a long-running **client** verb (`vox up`, `vox forward`, `vox room tail`) ends when
+    /// `signal` stops it (V210-108): `stopped by SIGHUP`, exiting 128 + the signal's number, as a
+    /// shell reports a process the signal killed. A server's stop is its normal end, and exits 0.
+    #[must_use]
+    pub fn stopped_by(signal: StopSignal) -> Self {
+        AppError::Refused {
+            code: signal.exit_code(),
+            message: format!("stopped by {}", signal.name()),
+        }
+    }
+}
+
+/// Print a line on stdout, ignoring a stdout that is gone. After a hangup it can be a terminal that
+/// closed, and `println!` panics on a failed write: the stop would end in a panic, not in what the
+/// verb says when it stops (V210-108).
+pub(crate) fn say(line: std::fmt::Arguments<'_>) {
+    let _ = writeln!(io::stdout(), "{line}");
 }
 
 /// Run this profile's node **without a terminal**, so agent sessions can attach
@@ -788,6 +1064,15 @@ pub fn run_daemon(
         .worker_threads(2)
         .enable_all()
         .build()?;
+    // **Every stop signal is a clean stop, taken from the start** (V210-108): SIGINT, SIGTERM,
+    // SIGHUP and SIGQUIT. Taken here, before the profile is opened and unlocked, so a stop sent
+    // while the daemon is still starting is not the default action's silent death either; it is
+    // acted on once the start-up step under way has finished.
+    let stop = {
+        // Registering needs the runtime's signal driver, not a task.
+        let _in_runtime = rt.enter();
+        stop_requested("vox daemon")
+    };
     // **Wait briefly for a profile that is being closed.** redb allows one process per
     // store, and a daemon started the moment another vox finished with the profile could
     // still find the file open: it failed at once with "another vox already has this
@@ -1138,7 +1423,7 @@ pub fn run_daemon(
                     // someone is copied out to be judged.
                     let mut fresh = Vec::new();
                     for d in &view.open_channels {
-                        for r in &d.timeline {
+                        for r in d.timeline.iter() {
                             if seen.insert(r.entry_hash) && may_wake(&r.text) {
                                 fresh.push((d.channel_id, r.clone()));
                             }
@@ -1153,48 +1438,16 @@ pub fn run_daemon(
     }
 
     rt.block_on(async {
-        // **SIGHUP must be explicitly ignored, not merely left unhandled.** Its
-        // default disposition is to terminate the process, so "we do not handle it"
-        // means "it kills us" — which the proof caught on its first run. The TUI
-        // locks on SIGHUP because a terminal going away means the operator walked
-        // off. A daemon has no terminal to lose, and SIGHUP is what a service
-        // manager sends to ask for a reload, so dying on it would make this
-        // unusable. Registering a stream for it replaces the default action; the
-        // task then drains it forever and does nothing.
-        #[cfg(unix)]
-        {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-                Ok(mut hup) => {
-                    tokio::spawn(async move {
-                        while hup.recv().await.is_some() {
-                            // Deliberately nothing. See above.
-                        }
-                    });
-                }
-                // Worth saying out loud rather than panicking: the daemon still
-                // works, but it will now die if anything sends it a SIGHUP.
-                Err(e) => eprintln!(
-                    "vox daemon: could not take over SIGHUP ({e}); a hangup will stop this daemon"
-                ),
-            }
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut term) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = term.recv() => {}
-                    }
-                }
-                Err(e) => {
-                    eprintln!("vox daemon: no SIGTERM handler ({e}); stop it with Ctrl-C");
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        println!("vox daemon: shutting down");
+        // **SIGHUP stops it too** (V210-108). It used to be ignored, on the reading that a daemon
+        // has no terminal to lose and a service manager sends SIGHUP to ask for a reload. But this
+        // daemon has nothing to reload, and people start it from tmux and ssh sessions, whose
+        // closing sends SIGHUP: an ignored hangup left a daemon nobody could see still holding the
+        // profile. Each of the four stops it the same way.
+        // A server's stop is its normal end: it says which signal and exits 0, as a service manager
+        // expects of a service it stopped.
+        let signal = stop.await;
+        say(format_args!("vox daemon: stopped by {}", signal.name()));
+        say(format_args!("vox daemon: shutting down"));
         // **Bounded.** The node handles one thing at a time, so `Shutdown` waits behind whatever
         // it is doing — and it can be doing a network round trip to a peer that has vanished.
         // Measured: a daemon that had joined a room through an anchor, with the anchor gone,
@@ -1206,7 +1459,8 @@ pub fn run_daemon(
             .await
             .is_err()
         {
-            eprintln!(
+            let _ = writeln!(
+                io::stderr(),
                 "vox daemon: the node did not stop within {}s — it was mid-way through a network \
                  exchange with a peer that is not answering; stopping anyway",
                 SHUTDOWN_PATIENCE.as_secs()
@@ -1319,6 +1573,16 @@ pub fn run_loop(
     result
 }
 
+/// Say a lock is under way before asking for it. A lock waits for work still holding a secret —
+/// an Argon2id seal, a passphrase check, a room being reopened — to finish and wipe it (V210-94),
+/// which can take a derivation's time, and the TUI waits on the answer: without this it looked
+/// frozen.
+fn say_locking(io: &mut impl TerminalIo, vm: &ViewModel, ui: &mut UiState) -> Result<(), AppError> {
+    ui.status_message = Some("locking… waiting for work that holds a secret to finish".to_owned());
+    io.draw(&mut |f| render(f, vm, ui))?;
+    Ok(())
+}
+
 fn event_loop(
     io: &mut impl TerminalIo,
     core: &mut impl CoreHandle,
@@ -1348,7 +1612,8 @@ fn event_loop(
 
         // Idle lock (ADR-015): lock the node after IDLE_LOCK_SECS without input.
         let now = clock();
-        if !vm.locked && vm.has_identity && idle_lock_due(last_input, now) {
+        if !vm.locked && !vm.locking && vm.has_identity && idle_lock_due(last_input, now) {
+            say_locking(io, &vm, &mut ui)?;
             ui.status_message = Some(core.apply(Command::Lock).message());
             last_input = now;
             continue;
@@ -1356,7 +1621,13 @@ fn event_loop(
 
         // Poll so the render loop never blocks indefinitely (core-pushed updates
         // and the idle timer are folded in each tick).
-        let Some(key) = io.poll_key(Duration::from_millis(250))? else {
+        // A passphrase is read past the terminal library (V210-94): see `poll_secret_key`.
+        let key = if ui.typing_a_secret() {
+            io.poll_secret_key(Duration::from_millis(250))?
+        } else {
+            io.poll_key(Duration::from_millis(250))?
+        };
+        let Some(key) = key else {
             continue;
         };
         last_input = clock();
@@ -1364,6 +1635,9 @@ fn event_loop(
             Action::Quit => return Ok(()),
             Action::Redraw => {}
             Action::Dispatch(cmd) => {
+                if matches!(cmd, Command::Lock) {
+                    say_locking(io, &vm, &mut ui)?;
+                }
                 // **Waiting is said in the status line** (V210-100), never on stderr: stderr is
                 // this terminal, and a line written there lands inside the screen.
                 let status = core.apply_noting(cmd, &mut || {

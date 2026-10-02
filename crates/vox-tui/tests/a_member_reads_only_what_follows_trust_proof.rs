@@ -264,7 +264,8 @@ fn ranges(seen: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
 #[test]
 #[ignore = "real vox daemons, 3,160 CLI posts and production Argon2id; CI runs it in release"]
 fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
-    watchdog::arm();
+    // Two joins; 8 unlocks: two `vox id`s, two `trust add`s, two daemons and two rooms created.
+    watchdog::arm_for_setup(2, 8);
     let tmp = tempfile::tempdir().unwrap();
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");

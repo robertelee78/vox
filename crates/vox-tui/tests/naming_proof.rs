@@ -251,6 +251,9 @@ impl Member {
     /// daemon, which offers the service at once. The room passphrase is passed as a person who
     /// scripted the one-shot form would have; the daemon already holds the room open.
     fn serve(&self, room: &str, pass: &str, at: SocketAddr) {
+        // From a file, never argv (V210-72: a room passphrase on the command line is refused).
+        let pass_file = self.dir.join("room.pass");
+        std::fs::write(&pass_file, pass).unwrap();
         let (ok, out, err) = vox(
             &self.dir,
             &[
@@ -259,8 +262,8 @@ impl Member {
                 room,
                 "22",
                 &at.to_string(),
-                "--passphrase",
-                pass,
+                "--passphrase-file",
+                pass_file.to_str().unwrap(),
                 "--listen",
                 "127.0.0.1:0",
             ],
@@ -287,7 +290,7 @@ impl Member {
             &args(&["forward", name, "22", "0"]),
         );
         let bound = p
-            .wait_for(Duration::from_secs(20), |l| l.contains("forwarding"))
+            .line_within(Duration::from_secs(20), |l| l.contains("forwarding"))
             .is_some();
         // Whatever it printed as it went (a refusal ends the process, which ends the wait).
         std::thread::sleep(Duration::from_millis(100));

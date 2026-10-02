@@ -16,7 +16,7 @@ use vox_core::hash::Digest32;
 use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::nat::multiaddr::Multiaddr;
 use vox_core::nat::reachability::is_routable;
-use vox_core::node::actor::{Bind, Node, NodeConfig, NodeHandle};
+use vox_core::node::actor::{Bind, EventStreamItem, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome, Secret};
 use vox_core::node::link::{b32_decode, b32_encode, vox_hostname};
 use vox_core::node::paths::Paths;
@@ -76,8 +76,12 @@ pub fn identity_passphrase_for(
         ));
     }
     if let Some(path) = file {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+        // The whole file is the passphrase and whatever follows it, so it is wiped on drop like
+        // the copy returned: only that copy should outlive this read.
+        let text = zeroize::Zeroizing::new(
+            std::fs::read_to_string(&path)
+                .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?,
+        );
         let first = text.lines().next().unwrap_or_default();
         if first.is_empty() {
             return Err(AppError::Usage(format!(
@@ -520,19 +524,10 @@ pub async fn forward(
     println!("     Ctrl-C to stop");
     // Keep reading events while forwarding, so a connection the host refused or cut says
     // why here (PRD-001 R23). The application only ever sees its socket reset; waiting on
-    // Ctrl-C alone left the reason in a queue nobody read.
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
-    tokio::pin!(interrupted);
-    loop {
-        tokio::select! {
-            _ = &mut interrupted => break,
-            ev = node.next_event() => match ev {
-                Some(ref ev) => say_if_it_explains_a_failure(ev),
-                None => break,
-            },
-        }
+    // Ctrl-C alone left the reason in a queue nobody read. A stop signal ends the run in
+    // `with_room` (V210-108).
+    while let Some(ev) = node.next_event().await {
+        say_if_it_explains_a_failure(&ev);
     }
     println!("vox: stopping the forward");
     let _ = node.apply(NodeCommand::StopForward { local: bound }).await;
@@ -677,30 +672,28 @@ pub async fn serve(
     println!("  `vox trust list` shows who you have decided about");
     println!("Ctrl-C to stop");
 
-    // Until interrupted: report who reaches the service. The service itself cannot say
-    // — every Vox client arrives at it from loopback (ADR-017 decision 6).
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
-    tokio::pin!(interrupted);
+    // Until stopped: report who reaches the service. The service itself cannot say
+    // — every Vox client arrives at it from loopback (ADR-017 decision 6). A stop signal ends the
+    // run in the verb's runner, which raced it from before the identity was unlocked (V210-108).
     loop {
-        tokio::select! {
-            _ = &mut interrupted => break,
-            event = node.next_event() => match event {
-                Some(NodeEvent::TunnelServed { client, service_tag, .. }) => {
-                    println!("vox: {} reached {service_tag:?}", crate::ident::author_id(&client));
-                }
-                Some(NodeEvent::PeerJoined { peer, .. }) => {
-                    println!("vox: {} joined", crate::ident::author_id(&peer));
-                }
-                Some(ref other) => say_if_it_explains_a_failure(other),
-                None => return Err(AppError::Usage("the node stopped".into())),
-            },
+        match node.next_event().await {
+            Some(NodeEvent::TunnelServed {
+                client,
+                service_tag,
+                ..
+            }) => {
+                println!(
+                    "vox: {} reached {service_tag:?}",
+                    crate::ident::author_id(&client)
+                );
+            }
+            Some(NodeEvent::PeerJoined { peer, .. }) => {
+                println!("vox: {} joined", crate::ident::author_id(&peer));
+            }
+            Some(ref other) => say_if_it_explains_a_failure(other),
+            None => return Err(AppError::Usage("the node stopped".into())),
         }
     }
-    println!("vox: stopping");
-    let _ = node.apply(NodeCommand::Shutdown).await;
-    Ok(())
 }
 
 /// `vox connect <address>` — join the room an address names, and print the name its
@@ -708,36 +701,135 @@ pub async fn serve(
 ///
 /// One-shot: joining is a durable act recorded in the profile, so there is nothing to
 /// keep running. What makes the printed name resolve is `vox up` (decision 5).
+///
+/// `waiting` is kept on the step the join is in, so a `vox connect` stopped part-way says
+/// where it was (V210-85).
 pub async fn connect(
     node: &NodeHandle,
     url: &str,
     name: &str,
     room_passphrase: &str,
+    waiting: &Waiting,
 ) -> Result<(), AppError> {
-    let out = node
-        .apply(NodeCommand::JoinChannel {
-            link: url.to_owned(),
-            local_name: name.to_owned(),
-            // Canonicalization is the node's, at its one boundary — see
-            // `actor::room_passphrase`. Doing it here as well would be a second place
-            // for the two sides to disagree.
-            passphrase: Secret::new(room_passphrase.as_bytes().to_vec()),
-        })
-        .await;
+    // Taken before the command, so the join's first step is not raised before anyone listens.
+    let mut steps = node.subscribe();
+    waiting.on("the node to take the join");
+    let join = node.apply(NodeCommand::JoinChannel {
+        link: url.to_owned(),
+        local_name: name.to_owned(),
+        // Canonicalization is the node's, at its one boundary — see
+        // `actor::room_passphrase`. Doing it here as well would be a second place
+        // for the two sides to disagree.
+        passphrase: Secret::new(room_passphrase.as_bytes().to_vec()),
+    });
+    tokio::pin!(join);
+    let out = loop {
+        tokio::select! {
+            out = &mut join => break out,
+            item = steps.next() => match item {
+                Some(EventStreamItem::Event(NodeEvent::JoinStep { step })) => waiting.on(step),
+                Some(_) => {}
+                None => break (&mut join).await,
+            },
+        }
+    };
     if !out.is_done() {
         return Err(AppError::Usage(why_a_join_failed(node, out).await));
     }
-    let channel_id = loop {
-        match node.next_event().await {
-            Some(NodeEvent::Joined { channel_id, .. }) => break channel_id,
-            Some(ref other) => say_if_it_explains_a_failure(other),
-            None => return Err(AppError::Usage("the node stopped".into())),
-        }
-    };
+    // **`Done` is the join.** This waited on the event stream for `Joined`, with no bound — and
+    // that stream drops its oldest events under a burst, so a `Joined` lost there left `vox
+    // connect` waiting for good, saying nothing. The node raises `Joined` and the join's steps
+    // before it answers, so what they explain is already queued: say it, and take the room from
+    // the address the node just joined by.
+    while let Some(ev) = node.try_next_event() {
+        say_if_it_explains_a_failure(&ev);
+    }
+    let channel_id = vox_core::node::link::InviteLink::parse(url)
+        .map_err(|e| AppError::Usage(format!("joined, but the address no longer reads: {e}")))?
+        .channel_id;
     println!("joined. reachable as {}", vox_hostname(&channel_id));
     println!("        run `vox up` on this machine to make that name resolve");
     let _ = node.apply(NodeCommand::Shutdown).await;
     Ok(())
+}
+
+/// What a one-shot verb is waiting for, and since when: what it says when it is stopped before it
+/// finishes (V210-85).
+///
+/// A `vox connect` stopped by Ctrl-C, a SIGTERM or a hangup died on the signal's default action and
+/// printed nothing, so a person — or a proof reading its stderr — got a non-zero exit with no reason
+/// at all, after however long it had been joining. A SIGKILL cannot be answered; these can.
+pub struct Waiting {
+    started: Instant,
+    /// What the verb could not finish without.
+    outcome: &'static str,
+    now: std::sync::Mutex<(String, Instant)>,
+    /// A server's verb (`vox serve`): being stopped is how it ends, so a stop is a clean exit, not
+    /// an error (V210-108).
+    serves: bool,
+}
+
+impl Waiting {
+    /// Start the clock. `outcome` is what did not happen if the verb is stopped: `the room was not
+    /// joined`.
+    #[must_use]
+    pub fn new(outcome: &'static str) -> std::sync::Arc<Self> {
+        let now = Instant::now();
+        std::sync::Arc::new(Self {
+            started: now,
+            outcome,
+            now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+            serves: false,
+        })
+    }
+
+    /// [`Waiting::new`] for a server's verb, which runs until it is stopped: a stop is its normal
+    /// end and exits 0, as a service manager expects of a service it stopped (V210-108).
+    #[must_use]
+    pub fn server() -> std::sync::Arc<Self> {
+        let now = Instant::now();
+        std::sync::Arc::new(Self {
+            started: now,
+            outcome: "it was serving",
+            now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+            serves: true,
+        })
+    }
+
+    /// Whether a stop is this verb's normal end (see [`Waiting::server`]).
+    #[must_use]
+    pub fn serves(&self) -> bool {
+        self.serves
+    }
+
+    /// The verb now waits for `what`.
+    pub fn on(&self, what: impl Into<String>) {
+        if let Ok(mut now) = self.now.lock() {
+            *now = (what.into(), Instant::now());
+        }
+    }
+
+    /// The error a verb stopped by `signal` ends with: how long it ran, what did not happen, and
+    /// what it had been waiting for, for how long. Exits 128 + the signal's number, as a shell
+    /// reports a process the signal killed.
+    #[must_use]
+    pub fn stopped_by(&self, signal: crate::app::StopSignal) -> AppError {
+        let (what, since) = self
+            .now
+            .lock()
+            .map(|n| (n.0.clone(), n.1))
+            .unwrap_or_else(|_| (String::from("something it cannot name"), self.started));
+        AppError::Refused {
+            code: signal.exit_code(),
+            message: format!(
+                "stopped by {} after {:.1}s — {}\n       it had waited {:.1}s for {what}",
+                signal.name(),
+                self.started.elapsed().as_secs_f64(),
+                self.outcome,
+                since.elapsed().as_secs_f64(),
+            ),
+        }
+    }
 }
 
 /// `vox up` — the local entry point: a SOCKS5 proxy carrying one room's services
@@ -770,25 +862,17 @@ pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Re
     println!("then:  ssh user@{hostname}");
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     println!("Ctrl-C to stop");
-    // Wait on Ctrl-C, but keep reading events so a session cut by the host withdrawing our
-    // reach says so (ADR-017 M17.11). Without this the proxy stays up and silent and the
-    // person sees only `ssh` dying, which reads as a network fault and invites a retry that
-    // cannot succeed.
-    // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    let interrupted = tokio::signal::ctrl_c();
-    tokio::pin!(interrupted);
-    loop {
-        tokio::select! {
-            _ = &mut interrupted => break,
-            ev = node.next_event() => match ev {
-                Some(NodeEvent::ReachWithdrawn { port, .. }) => {
-                    println!("vox: the host withdrew access to port {port} — that session was cut");
-                    println!("     nothing to retry: ask them to trust this identity again");
-                }
-                Some(ref other) => say_if_it_explains_a_failure(other),
-                None => break,
-            },
+    // Until stopped — a stop signal ends the run in `with_room` (V210-108) — keep reading events
+    // so a session cut by the host withdrawing our reach says so (ADR-017 M17.11). Without this
+    // the proxy stays up and silent and the person sees only `ssh` dying, which reads as a network
+    // fault and invites a retry that cannot succeed.
+    while let Some(ev) = node.next_event().await {
+        match ev {
+            NodeEvent::ReachWithdrawn { port, .. } => {
+                println!("vox: the host withdrew access to port {port} — that session was cut");
+                println!("     nothing to retry: ask them to trust this identity again");
+            }
+            ref other => say_if_it_explains_a_failure(other),
         }
     }
     println!("vox: stopping the proxy");
@@ -928,15 +1012,33 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
     // what to actually do. A paragraph is not a better error message than a sentence —
     // the first version of this fix was four lines of prose and read like documentation
     // at exactly the moment somebody is stuck.
-    let advice = join_advice(match out {
+    let fault = match out {
         Outcome::Failed(fault) => Some(fault),
         Outcome::Done | Outcome::Bound(_) => None,
-    });
+    };
+    let advice = join_advice_after(fault, &said.join("; "));
 
     if said.is_empty() {
         format!("cannot join: {advice}")
     } else {
         format!("cannot join: {} — {advice}", said.join("; "))
+    }
+}
+
+/// [`join_advice`], told what the join said about itself: `said` is its reason and its steps.
+///
+/// **A member reached and then silent is not a member never reached** (V210-85). A join exchange
+/// that ran out of time ends as `Unreachable`, the fault of a member nobody could reach, and its
+/// advice — "no member it knows could be reached … ask a member to come online" — sent a person to
+/// bring online a member that had been online and reached, and then stopped answering. A join that
+/// got as far as the exchange says so in its steps (`<member>: exchange …`).
+pub(crate) fn join_advice_after(fault: Option<Fault>, said: &str) -> &'static str {
+    let reached = said.contains(": exchange: ") || said.contains(": exchange (incl. solve) ");
+    match fault {
+        Some(Fault::Unreachable) if reached => {
+            "a member was reached, but did not answer the join exchange in time\n       your passphrase was never checked — this is not a verdict on it\n       the member may have gone offline part-way, or be too busy to answer; try again while it is online"
+        }
+        other => join_advice(other),
     }
 }
 
@@ -980,6 +1082,7 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
             "the anchor answered, but no member it knows could be reached\n       your passphrase was never checked — this is not a verdict on it\n       ask a member to come online, or check `vox node` on the anchor shows more than `1m` for this room"
         }
         Some(Fault::SolveTooSlow) => Fault::SolveTooSlow.explain(),
+        Some(Fault::MembersBusy) => Fault::MembersBusy.explain(),
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
         // responder, so it is the responder that says no. Leading with "the refusal is
@@ -992,8 +1095,14 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::NotNetworked) => {
             "this node is not networked, or its identity is locked\n       nothing about the room is in question"
         }
-        Some(Fault::Locked | Fault::NoIdentity) => {
-            "this profile has no unlocked identity, so there is nobody to join as\n       run `vox id` to make one"
+        // **Locked is not "no identity"** (V210-94). A join a lock cut short, or one asked of a
+        // locked node, has an identity to join as; it was told to run `vox id`, which would make
+        // a second one.
+        Some(Fault::Locked) => {
+            "this profile's identity is locked: a lock stopped the join, or it was locked already\n       unlock it (open `vox tui`, or start `vox daemon`), then run the join again"
+        }
+        Some(Fault::NoIdentity) => {
+            "this profile has no identity yet, so there is nobody to join as\n       run `vox id` to make one"
         }
         // Joining a room this node already holds used to say `Failed(IdentityExists)`.
         Some(Fault::AlreadyMember) => Fault::AlreadyMember.explain(),
@@ -1011,41 +1120,14 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
 /// **Every fault, not the ones a join was expected to meet** (V210-83). It knew ten, and a join
 /// that failed for any other — the store, the node shutting down, a bug — printed the enum's name
 /// to the person: `cannot join: Failed(Storage)`.
+///
+/// **And every fault added since** (V210-114): its own table here knew the 28 of V210-83, and
+/// `ProfileBusy`, `IdentityFileUnwritable` and `NotAdmitted`, added after it, fell out of it. The
+/// names now come from [`Fault::from_name`], made from the one list that `Fault::name` must cover.
 pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
     let first = reason.lines().next().unwrap_or_default();
     let name = first.trim().strip_prefix("Failed(")?.strip_suffix(')')?;
-    Some(match name {
-        "NoIdentity" => Fault::NoIdentity,
-        "IdentityExists" => Fault::IdentityExists,
-        "Locked" => Fault::Locked,
-        "WrongPassphrase" => Fault::WrongPassphrase,
-        "UnknownChannel" => Fault::UnknownChannel,
-        "ChannelNotOpen" => Fault::ChannelNotOpen,
-        "TooLong" => Fault::TooLong,
-        "KeyringFull" => Fault::KeyringFull,
-        "Storage" => Fault::Storage,
-        "SealedUnreadable" => Fault::SealedUnreadable,
-        "ShuttingDown" => Fault::ShuttingDown,
-        "NotNetworked" => Fault::NotNetworked,
-        "BadLink" => Fault::BadLink,
-        "RoomNotOnBoard" => Fault::RoomNotOnBoard,
-        "BoardUnreachable" => Fault::BoardUnreachable,
-        "Unreachable" => Fault::Unreachable,
-        "SolveTooSlow" => Fault::SolveTooSlow,
-        "Refused" => Fault::Refused,
-        "NotConsented" => Fault::NotConsented,
-        "StillTrusted" => Fault::StillTrusted,
-        "NotLoopback" => Fault::NotLoopback,
-        "AddressInUse" => Fault::AddressInUse,
-        "AlreadyMember" => Fault::AlreadyMember,
-        "NotAServiceRoom" => Fault::NotAServiceRoom,
-        "NotOffered" => Fault::NotOffered,
-        "NoSuchForward" => Fault::NoSuchForward,
-        "NotAdmin" => Fault::NotAdmin,
-        "RoomFromBeforeV030" => Fault::RoomFromBeforeV030,
-        "Internal" => Fault::Internal,
-        _ => return None,
-    })
+    Fault::from_name(name)
 }
 
 /// What a daemon's reply to a failed join says after the fault's name: its `steps: …` and
@@ -1087,29 +1169,58 @@ pub struct RoomTarget {
 }
 
 /// Shared entry: open the room, run `body`, shut down.
-pub async fn with_room<F, Fut>(target: RoomTarget, body: F) -> Result<(), AppError>
+///
+/// **The whole run races every stop signal** (V210-108): SIGINT, SIGTERM, SIGHUP and SIGQUIT, from
+/// before the room is opened. `vox up` and `vox forward` run until stopped, and they listened for
+/// Ctrl-C alone: SIGTERM and SIGHUP — a service manager's stop, a closed tmux pane or ssh session —
+/// took the default action and ended them on the spot, saying nothing. A stop now ends the verb
+/// with [`AppError::stopped_by`], after the node is shut down so its peers are told it went.
+///
+/// `stop` is the caller's `stop_requested`, taken before its passphrase prompts, so
+/// one listener covers the whole run.
+pub async fn with_room<F, Fut>(
+    target: RoomTarget,
+    mut stop: std::pin::Pin<&mut impl std::future::Future<Output = crate::app::StopSignal>>,
+    body: F,
+) -> Result<(), AppError>
 where
     F: FnOnce(NodeHandle, Digest32) -> Fut,
     Fut: std::future::Future<Output = Result<(), AppError>>,
 {
     let socket = target.paths.socket_file();
-    let (node, channel_id) = open_room(
+    let opening = open_room(
         target.paths,
         target.listen,
         target.anchors,
         &target.identity_passphrase,
         &target.room,
         &target.room_passphrase,
-    )
-    .await?;
+    );
+    let (node, channel_id) = tokio::select! {
+        opened = opening => opened?,
+        signal = &mut stop => return Err(AppError::stopped_by(signal)),
+    };
     let _control = serve_control_socket(&node, socket);
     let handle = node.clone();
-    let result = body(node, channel_id).await;
-    // The verbs are one-shot; `forward` shuts the node down itself when the person
-    // interrupts it, and a second shutdown is harmless.
+    let result = tokio::select! {
+        done = body(node, channel_id) => done,
+        signal = &mut stop => {
+            crate::app::say(format_args!("vox: stopping"));
+            // Bounded: the node handles one thing at a time, and what it was doing can be a
+            // round trip to a peer that has gone (see `app::run_daemon`). A stop has to mean stop.
+            let _ = tokio::time::timeout(STOP_PATIENCE, handle.apply(NodeCommand::Shutdown)).await;
+            return Err(AppError::stopped_by(signal));
+        }
+    };
+    // The verbs are one-shot; `forward` shuts the node down itself when it ends, and a second
+    // shutdown is harmless.
     let _ = handle.apply(NodeCommand::Shutdown).await;
     result
 }
+
+/// How long a stopped verb waits for its node to shut down before it exits anyway. A clean
+/// shutdown takes milliseconds; this is for a node stuck on a peer that vanished.
+const STOP_PATIENCE: Duration = Duration::from_secs(5);
 
 /// Read a passphrase from the terminal without echoing it (ADR-015: a passphrase is
 /// never shown, never in a flag, never in the shell's history). Falls back to a plain

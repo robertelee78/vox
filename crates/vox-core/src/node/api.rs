@@ -86,8 +86,9 @@ pub struct ChannelDetail {
     pub epoch: u64,
     /// Members, in fingerprint order.
     pub members: Vec<Digest32>,
-    /// The render-gated timeline, oldest first.
-    pub timeline: Vec<MessageRow>,
+    /// The render-gated timeline, oldest first. Shared, not copied: every clone of the view — each
+    /// IPC read page takes one — used to copy every room's whole timeline (V210-71).
+    pub timeline: std::sync::Arc<[MessageRow]>,
     /// Every entry this node holds for the channel, readable or not, in the room's one
     /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
     /// sequence restricted to rendered rows.
@@ -113,6 +114,10 @@ pub struct NodeView {
     pub identity: Option<IdentityInfo>,
     /// Whether the identity is locked (no signer in memory).
     pub locked: bool,
+    /// Whether a lock is under way: the identity is locked and refuses new work, and the node is
+    /// waiting for work that still held a secret to finish and wipe it (V210-94). `locked` turns
+    /// true when it has.
+    pub locking: bool,
     /// Whether every open channel's SEK is `mlock`ed (`true` when none are open).
     /// `false` surfaces the documented zeroize-only degradation (ADR-010/015).
     pub mlock_active: bool,
@@ -517,6 +522,10 @@ pub enum Fault {
     /// solve it than the member waits (V210-87). **Not [`Fault::Unreachable`]**, which is how it
     /// was reported: the member had been reached, and had waited.
     SolveTooSlow,
+    /// Every member that answered was already answering as many joins as it takes at once
+    /// (V210-92). **Not [`Fault::Refused`]**, which a joiner reads as a wrong passphrase: this one
+    /// was never checked.
+    MembersBusy,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
     /// A consent named a member this node has not admitted to the room (yet): it holds no
@@ -632,6 +641,9 @@ impl Fault {
             Fault::SolveTooSlow => {
                 "a member answered, but this device took longer to solve the join's proof of work than the member waits\n       your passphrase was never checked — this is not a verdict on it\n       run the join again when this device is less busy"
             }
+            Fault::MembersBusy => {
+                "a member answered, but it is busy answering other joins\n       your passphrase was never checked — this is not a verdict on it\n       try the join again shortly"
+            }
             Fault::Refused => "the other side refused",
             Fault::NotAdmitted => {
                 "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
@@ -676,6 +688,73 @@ impl std::fmt::Display for Fault {
         f.write_str(self.explain())
     }
 }
+
+/// A fault's name and its way back from one, made from **one list** (V210-114).
+///
+/// A daemon names the fault of a failed join over its control socket (`Failed(ProfileBusy)`),
+/// and `vox room join` turns the name back into the fault to say what it means. That was a table
+/// of its own in the CLI, and every fault added after it was written fell out of it unseen:
+/// `ProfileBusy`, `IdentityFileUnwritable` and `NotAdmitted` reached the person as a bare
+/// `Failed(…)`, not as their cause. Here [`Fault::name`]'s match is exhaustive, so a fault that is
+/// not on the list does not build, and [`Fault::from_name`] is made from the same list.
+macro_rules! fault_names {
+    ($($fault:ident),* $(,)?) => {
+        impl Fault {
+            /// This fault's name, as its `Debug` writes it: what crosses the control socket.
+            #[must_use]
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Fault::$fault => stringify!($fault),)*
+                }
+            }
+
+            /// The fault named `name` (as [`Fault::name`] gives it), if there is one.
+            #[must_use]
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $(stringify!($fault) => Some(Fault::$fault),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+fault_names!(
+    NoIdentity,
+    IdentityExists,
+    Locked,
+    WrongPassphrase,
+    UnknownChannel,
+    ChannelNotOpen,
+    TooLong,
+    KeyringFull,
+    Storage,
+    ProfileBusy,
+    IdentityFileUnwritable,
+    SealedUnreadable,
+    ShuttingDown,
+    NotNetworked,
+    BadLink,
+    RoomNotOnBoard,
+    BoardUnreachable,
+    Unreachable,
+    SolveTooSlow,
+    MembersBusy,
+    Refused,
+    NotAdmitted,
+    NotConsented,
+    StillTrusted,
+    NotLoopback,
+    AddressInUse,
+    AlreadyMember,
+    NotAServiceRoom,
+    NotOffered,
+    NoSuchForward,
+    NotAdmin,
+    RoomFromBeforeV030,
+    Internal,
+);
 
 /// The result of a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -859,6 +938,21 @@ pub enum NodeEvent {
         /// What happened, for the operator.
         note: String,
     },
+    /// More peers dialled this node at once than it runs handshakes for, and the ones past the
+    /// cap waited for a slot or were refused (V210-86): said once per burst, when none is left
+    /// waiting, so an operator can see a burst was absorbed, or how many were turned away.
+    HandshakesQueued {
+        /// How many attempts waited for a slot.
+        waited: usize,
+        /// The most that waited at once.
+        most_waiting: usize,
+        /// The most handshakes that ran at once meanwhile: never more than the cap.
+        most_running: usize,
+        /// How many were refused: no place left to wait, or no slot in time.
+        refused: usize,
+        /// The longest any waited, in milliseconds.
+        longest_ms: u64,
+    },
     /// A join failed, with what each responder that was tried reported.
     ///
     /// `Outcome::Failed(Fault)` is a single token with no room for a reason, so this carries the
@@ -876,6 +970,15 @@ pub enum NodeEvent {
         joined: bool,
         /// Each step and how long it took, in order.
         steps: String,
+    },
+    /// A join this node is running has begun a step: what it now waits for (V210-85).
+    ///
+    /// [`NodeEvent::JoinSteps`] arrives only once the join has ended, so a join that is stopped
+    /// before then — Ctrl-C, a service manager's SIGTERM — had nothing to say about where it was.
+    /// `vox connect` keeps the latest of these, and names it when it is stopped.
+    JoinStep {
+        /// The step, for the person: `dialling member 7r7pa7jfcfdo`.
+        step: String,
     },
     /// An upgrade off a relayed path was tried and nothing better landed, with what each rung
     /// reported.

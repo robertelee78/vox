@@ -38,6 +38,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/world.rs"]
 mod world;
 
@@ -76,6 +79,7 @@ fn profile() -> &'static str {
 #[test]
 #[ignore = "a grind floored at 300s, a relayed then direct path, real processes; CI runs it in release"]
 fn a_join_outlives_its_displaced_path() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_SOLVE_AT_LEAST_MS"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let (anchor_dir, host_dir, guest_dir) = (

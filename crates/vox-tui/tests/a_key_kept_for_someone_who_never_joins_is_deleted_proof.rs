@@ -31,6 +31,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -116,6 +118,7 @@ fn daemon(dir: &Path, tag: &str, step_ms: i64) -> Daemon {
     if step_ms == 0 {
         cmd.env_remove("VOX_TEST_CLOCK_STEP_MS");
     } else {
+        test_knobs::require(&["VOX_TEST_CLOCK_STEP_MS"]);
         cmd.env("VOX_TEST_CLOCK_STEP_MS", step_ms.to_string());
     }
     let mut child = cmd.spawn().expect("spawn vox daemon");

@@ -493,6 +493,9 @@ impl Host {
                 }
             })
         };
+        // From a file, never argv (V210-72: a room passphrase on the command line is refused).
+        let pass_file = self.dir.join("room.pass");
+        std::fs::write(&pass_file, ROOM_PASS).unwrap();
         let mut p = VoxProc::spawn(
             &format!("lan {}", self.name),
             &self.dir,
@@ -500,8 +503,8 @@ impl Host {
                 "lan",
                 "up",
                 room,
-                "--passphrase",
-                ROOM_PASS,
+                "--passphrase-file",
+                pass_file.to_str().unwrap(),
                 "--anchor",
                 anchor,
                 "--listen",

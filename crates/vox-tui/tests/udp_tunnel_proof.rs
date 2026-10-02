@@ -435,7 +435,7 @@ fn denied(path: PathKind) {
     );
     // A missing refusal has two sides; the forward's alone cannot say which one went quiet,
     // so a failure prints what the host and the anchor said too.
-    let Some(why) = fwd.wait_for(Duration::from_secs(10), |l| {
+    let Some(why) = fwd.line_within(Duration::from_secs(10), |l| {
         l.starts_with("! ") && l.contains("the host refused")
     }) else {
         let host = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();

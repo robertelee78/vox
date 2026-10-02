@@ -9,7 +9,7 @@
 //! |---|---|---|---|
 //! | 0 | joiner → responder | `WANT` — which `(channelID, epoch)` this join is for | — |
 //! | 1 | responder → joiner | `CHALLENGE` — signed [`ResponderNonce`], the `sid`, the responder's composite key and its prekey bundle | — |
-//! | 2 | joiner → responder | `SOLVE` — [`PowToken`] + CPace share | [`join_initiate`] |
+//! | 2 | joiner → responder | `SOLVE` — [`PowToken`] + CPace share | [`join_check_challenge`], [`join_start`] |
 //! | 3 | responder → joiner | `SHARE` — CPace share | [`join_accept`] (PoW verified **before** any CPace work) |
 //! | 4 | joiner → responder | `PROOF` — sealed identity PoP | [`JoinInitiator::complete_cpace`](crate::join::session::JoinInitiator::complete_cpace) |
 //! | 5 | responder → joiner | `PROOF` — sealed identity PoP | [`JoinResponder::complete_cpace`](crate::join::session::JoinResponder::complete_cpace), [`JoinProofPending::verify_peer_sealed`](crate::join::session::JoinProofPending::verify_peer_sealed) |
@@ -67,8 +67,9 @@ use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSig
 use crate::identity::keyagreement::{PrekeyBundlePublic, X25519IdentityKey};
 use crate::join::cpace::{fresh_sid, CPACE_SHARE_LEN};
 use crate::join::pop::JoinPeerIdentity;
+use crate::join::pow::solve_token_until;
 use crate::join::pow::{Difficulty, PowToken, ResponderNonce};
-use crate::join::session::{join_accept, join_initiate, JoinContext};
+use crate::join::session::{join_accept, join_check_challenge, join_start, JoinContext};
 use crate::nat::record::JoinWitness;
 use crate::node::prekeys::{self, OneTimeUse, PrekeyRing};
 use crate::node::store::Store;
@@ -110,6 +111,10 @@ pub enum JoinReject {
     /// Refused after the work gate: wrong passphrase, identity mismatch, an
     /// unresolvable prekey, or a policy refusal. One value, so it is no oracle.
     Refused = 3,
+    /// Every one of the responder's join slots was held, so it did not start the exchange
+    /// (V210-92). Sent before the challenge, so before anything about the passphrase is known: it
+    /// says only that this member is busy, and nothing about the joiner.
+    Busy = 4,
 }
 
 impl JoinReject {
@@ -118,6 +123,7 @@ impl JoinReject {
             1 => Some(Self::PowInvalid),
             2 => Some(Self::Malformed),
             3 => Some(Self::Refused),
+            4 => Some(Self::Busy),
             _ => None,
         }
     }
@@ -129,6 +135,7 @@ impl JoinReject {
             Self::PowInvalid => "responder refused: proof-of-work invalid",
             Self::Malformed => "responder refused: malformed frame",
             Self::Refused => "responder refused",
+            Self::Busy => "responder refused: busy answering other joins",
         }
     }
 }
@@ -361,12 +368,35 @@ async fn send_frame(send: &mut SendStream, frame: &JoinFrame) -> Result<()> {
     write_frame(send, &frame.to_frame()).await
 }
 
+/// What a joiner reports for a member's refusal: [`JoinReject::Busy`] — every slot held, or this
+/// join ended for one from elsewhere (V210-92) — is the member being busy and says nothing about
+/// the joiner; every other reason is the coarse refusal.
+fn rejected(r: JoinReject) -> Error {
+    match r {
+        JoinReject::Busy => Error::JoinResponderBusy,
+        r => Error::JoinRefused(r.as_str()),
+    }
+}
+
 async fn recv_frame(recv: &mut RecvStream) -> Result<JoinFrame> {
     let bytes = read_frame(recv, MAX_JOIN_FRAME)
         .await?
         .ok_or(Error::MalformedJoin("join stream closed early"))?;
     JoinFrame::from_frame(&bytes)
 }
+
+/// **How long the rest of a join may take once the joiner's proof of work has verified**
+/// (V210-92): the remaining frames are a few signatures, key agreements and round trips each way,
+/// well under 2s even on a Raspberry-Pi-class device, so 20s is ten times that and all margin. It
+/// is tight on purpose: a hold that has done its work cannot be ended for a newcomer, so this is
+/// the only thing that frees its slot, and at the per-frame bound's 30s each it would never fire.
+///
+/// A hold that has done its work is never the one ended for a newcomer (`node::joinslots`), so
+/// how long it may last is what this sets. Each frame is already bounded by
+/// [`FRAME_PATIENCE`](crate::transport::framing::FRAME_PATIENCE); this bounds the rest of the
+/// exchange **as a whole**, so a stranger that paid sixteen solves cannot then keep every slot by
+/// sending each remaining frame just inside the per-frame bound.
+pub const ADMISSION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long one expected Equihash solve may take on a slow joiner.
 ///
@@ -388,8 +418,52 @@ const SOLVE_BUDGET_PER_EXPECTED_SOLVE: std::time::Duration = std::time::Duration
 /// Test-only: make this joiner's grind last at least this many milliseconds, as it does on a
 /// slower device. **For proofs; nothing in a real deployment sets it.** A proof cannot otherwise
 /// stage a joiner slower than the responder's patience with the release build, whose solve takes a
-/// second or two. Unset, empty or unparsable is no floor.
+/// second or two. Unset, empty or unparsable is no floor. Not compiled in without the `test-knobs`
+/// feature (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_SOLVE_AT_LEAST_ENV: &str = "VOX_TEST_SOLVE_AT_LEAST_MS";
+
+/// Test-only: once this joiner has sent its solution, wait this many milliseconds before reading
+/// the member's answer — a join that has done its work and then goes quiet, which the member's
+/// [`ADMISSION_PATIENCE`] exists for (V210-92). It says so on stderr when it starts waiting, so a
+/// proof can tell the work was done. **For proofs; nothing in a real deployment sets it.** Unset,
+/// empty or unparsable is no wait. Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_STALL_AFTER_SOLVE_ENV: &str = "VOX_TEST_STALL_AFTER_SOLVE_MS";
+
+/// Test-only: once this joiner's proof of work is in, wait this many milliseconds before **each**
+/// frame it still owes the member (its proof, then its init) — a join that has done its work and
+/// then sends every remaining frame just inside the per-frame bound, which only the member's
+/// [`ADMISSION_PATIENCE`] limits as a whole (V210-92). It says so on stderr when it starts. **For
+/// proofs; nothing in a real deployment sets it.** Unset, empty or unparsable is no wait. Not
+/// compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_DRIP_AFTER_SOLVE_ENV: &str = "VOX_TEST_DRIP_AFTER_SOLVE_MS";
+
+/// The test-only wait of `TEST_DRIP_AFTER_SOLVE_ENV`, before one frame the joiner owes.
+#[cfg(feature = "test-knobs")]
+fn test_drip() -> Option<std::time::Duration> {
+    std::env::var(TEST_DRIP_AFTER_SOLVE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+}
+
+/// Without the `test-knobs` feature there is no wait, and nothing reads the environment.
+#[cfg(not(feature = "test-knobs"))]
+const fn test_drip() -> Option<std::time::Duration> {
+    None
+}
+
+/// Tells a joiner's grind to give up when the join that started it is dropped — finished, failed,
+/// or aborted by a lock (V210-94). See the `SOLVE` step of [`run_initiator`].
+struct StopGrind(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopGrind {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// How close to the responder's patience a grind may finish and still count as in time. The
 /// responder started its clock when it sent the challenge, a one-way trip before this side started
@@ -485,7 +559,12 @@ pub async fn run_initiator(
         nonce,
         sid,
         bundle,
-    } = recv_frame(&mut recv).await?
+    } = (match recv_frame(&mut recv).await? {
+        // A member whose every join slot was held (V210-92): not a verdict on this joiner, and
+        // said as such, not as the refusal a wrong passphrase gets.
+        JoinFrame::Rejected(JoinReject::Busy) => return Err(Error::JoinResponderBusy),
+        frame => frame,
+    })
     else {
         return Err(Error::MalformedJoin("expected challenge"));
     };
@@ -514,44 +593,53 @@ pub async fn run_initiator(
     };
     let challenge_sig = CompositeSignature::from_bytes(&challenge_sig)?;
 
-    // 2. SOLVE — `join_initiate` verifies the signature, the binding and the
-    //    difficulty cap before grinding, then solves and starts CPace.
+    // 2. SOLVE — the challenge is checked first: the responder's signature, the binding to this
+    //    channel and epoch, and the cap, before any work.
     //
-    //    **Ground off the runtime's worker.** The solve is Equihash — seconds of CPU — and this is
-    //    an async function, so it ran on one of the daemon's two runtime workers and took it away
-    //    from everything else scheduled there: measured through the real binary, a `vox room list`
-    //    issued during a join waited 0.8–17.5s, tracking the join's own length, although it needs
-    //    nothing but the published view. `block_in_place` moves this worker's other tasks elsewhere
-    //    for the duration. It panics on a current-thread runtime, which grinds inline as before.
-    let grind = || {
-        join_initiate(
-            ctx,
-            passphrase,
-            &sid,
-            &challenge,
-            &responder_pub,
-            &challenge_sig,
-            root,
-            ik,
-        )
-    };
+    //    **Ground on a thread that holds nothing secret** (V210-94). The solve is Equihash —
+    //    seconds of CPU, far more in a debug build — and only the challenge goes into it. It used
+    //    to run under `block_in_place` inside this task, with the room passphrase and the identity
+    //    signer held across it; no abort reaches a thread busy in `block_in_place`, so a lock
+    //    aborting this join waited out the whole grind before it could say it was done, and the
+    //    secrets lived that long. Now this task only *awaits* the grind: an abort drops it — and
+    //    everything it holds — at once, and the dropped `StopGrind` tells the thread to give up at
+    //    its next nonce. The CPace start that needs the passphrase runs after, here, briefly.
+    //    (On a current-thread runtime there is no other thread: it grinds inline, as before.)
+    join_check_challenge(&ctx, &challenge, &responder_pub, &challenge_sig)?;
     let grinding = std::time::Instant::now();
-    let grind = || {
-        let ground = grind()?;
-        let floor = std::env::var(TEST_SOLVE_AT_LEAST_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
-        std::thread::sleep(floor.saturating_sub(grinding.elapsed()));
-        Ok::<_, Error>(ground)
+    #[cfg(feature = "test-knobs")]
+    let floor = std::env::var(TEST_SOLVE_AT_LEAST_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _stop_on_drop = StopGrind(std::sync::Arc::clone(&stop));
+    let grind = {
+        let (params, challenge, stop) = (
+            ctx.pow_params,
+            challenge.clone(),
+            std::sync::Arc::clone(&stop),
+        );
+        move || {
+            let token = solve_token_until(params, &challenge, 1 << 24, &stop)?;
+            // The test-only floor on a joiner's grind (V210-87), stopped like the grind.
+            #[cfg(feature = "test-knobs")]
+            while grinding.elapsed() < floor && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(50).min(floor));
+            }
+            Ok::<_, Error>(token)
+        }
     };
-    let (initiator, token, share) = if tokio::runtime::Handle::current().runtime_flavor()
+    let token = if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
     {
-        tokio::task::block_in_place(grind)?
+        tokio::task::spawn_blocking(grind)
+            .await
+            .map_err(|_| Error::JoinPowInvalid)??
     } else {
         grind()?
     };
+    let (initiator, share) = join_start(ctx, passphrase, &sid, root, ik)?;
     let solved_in = grinding.elapsed();
     // **A grind past the responder's patience is this device's, and said so (V210-87).** The
     // responder has stopped waiting by then and its refusal arrived here as a stream that failed,
@@ -564,7 +652,7 @@ pub async fn run_initiator(
         patience_secs: patience.as_secs(),
     };
     let late = solved_in + SOLVE_PATIENCE_SLACK >= patience;
-    send_frame(
+    if let Err(e) = send_frame(
         &mut send,
         &JoinFrame::Solve {
             equihash_nonce: token.equihash_nonce.clone(),
@@ -573,19 +661,51 @@ pub async fn run_initiator(
         },
     )
     .await
-    .map_err(|e| if late { too_slow() } else { e })?;
+    {
+        // A member that ended this join while it solved (V210-92) said why before it stopped
+        // reading, so the write can fail with the reason already waiting: read it, briefly. Only
+        // `Busy` is told apart here. Any other refusal, from a member that stopped waiting for a
+        // grind past its patience, is that grind's, and is said as such (V210-87).
+        let said =
+            tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(&mut recv)).await;
+        return Err(match said {
+            Ok(Ok(JoinFrame::Rejected(JoinReject::Busy))) => Error::JoinResponderBusy,
+            _ if late => too_slow(),
+            Ok(Ok(JoinFrame::Rejected(r))) => rejected(r),
+            _ => e,
+        });
+    }
+    #[cfg(feature = "test-knobs")]
+    if let Some(stall) = std::env::var(TEST_STALL_AFTER_SOLVE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        eprintln!("vox: test: solved, now silent for {stall}ms ({TEST_STALL_AFTER_SOLVE_ENV})");
+        tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+    }
+    #[cfg(feature = "test-knobs")]
+    if let Some(drip) = test_drip() {
+        eprintln!(
+            "vox: test: solved, now {drip:?} before each frame ({TEST_DRIP_AFTER_SOLVE_ENV})"
+        );
+    }
 
     // 3. SHARE.
     let peer_share = match recv_frame(&mut recv).await {
         Ok(JoinFrame::Share { share }) => share,
+        // Busy is the member's slots, never this joiner's pace (V210-92).
+        Ok(JoinFrame::Rejected(JoinReject::Busy)) => return Err(Error::JoinResponderBusy),
         Ok(JoinFrame::Rejected(_)) | Err(_) if late => return Err(too_slow()),
-        Ok(JoinFrame::Rejected(r)) => return Err(Error::JoinRefused(r.as_str())),
+        Ok(JoinFrame::Rejected(r)) => return Err(rejected(r)),
         Err(e) => return Err(e),
         Ok(_) => return Err(Error::MalformedJoin("expected share")),
     };
     let (pending, bootstrap) = initiator.complete_cpace(&peer_share)?;
 
     // 4/5. PROOF both ways. A wrong passphrase fails here, locally.
+    if let Some(drip) = test_drip() {
+        tokio::time::sleep(drip).await;
+    }
     send_frame(
         &mut send,
         &JoinFrame::Proof {
@@ -595,12 +715,15 @@ pub async fn run_initiator(
     .await?;
     let sealed_peer = match recv_frame(&mut recv).await? {
         JoinFrame::Proof { sealed } => sealed,
-        JoinFrame::Rejected(r) => return Err(Error::JoinRefused(r.as_str())),
+        JoinFrame::Rejected(r) => return Err(rejected(r)),
         _ => return Err(Error::MalformedJoin("expected proof")),
     };
     let peer = pending.verify_peer_sealed(&sealed_peer, &responder_fp)?;
 
     // 6. INIT — PQXDH against the responder's verified bundle.
+    if let Some(drip) = test_drip() {
+        tokio::time::sleep(drip).await;
+    }
     let (session, init_msg) = bootstrap.bootstrap(&bundle)?;
     send_frame(
         &mut send,
@@ -613,7 +736,7 @@ pub async fn run_initiator(
     // 7. ACCEPTED, carrying the responder's witness to this join (M17.6).
     let witness = match recv_frame(&mut recv).await? {
         JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
-        JoinFrame::Rejected(r) => return Err(Error::JoinRefused(r.as_str())),
+        JoinFrame::Rejected(r) => return Err(rejected(r)),
         _ => return Err(Error::MalformedJoin("expected accepted")),
     };
     // Checked here, against the identity the handshake pinned, so a responder cannot
@@ -656,6 +779,9 @@ pub struct ResponderConfig<'a> {
     pub pending_joins: u32,
     /// Wall clock (for the prekey-ring consume record).
     pub now_secs: u64,
+    /// Set once the joiner's proof of work verifies, so its join slot is never the one ended for
+    /// a newcomer (V210-92, `node::joinslots`).
+    pub worked: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Read the joiner's opening `WANT` frame, so the caller can select the channel
@@ -671,8 +797,14 @@ pub async fn read_join_request(recv: &mut RecvStream) -> Result<(Digest32, u64)>
 /// Refuse a join on a stream whose `WANT` named a channel this node cannot answer
 /// for (it does not hold it, or it is app-locked so the passphrase is gone). The
 /// reason is the same opaque `Refused` every post-work refusal uses.
-pub async fn refuse_join(mut send: SendStream) {
-    let _ = send_frame(&mut send, &JoinFrame::Rejected(JoinReject::Refused)).await;
+pub async fn refuse_join(send: SendStream) {
+    refuse_join_as(send, JoinReject::Refused).await;
+}
+
+/// Refuse a join with `reason`, as [`refuse_join`] does. Only [`JoinReject::Busy`] is said apart,
+/// and only before the exchange starts, where it depends on nothing the joiner sent.
+pub async fn refuse_join_as(mut send: SendStream, reason: JoinReject) {
+    let _ = send_frame(&mut send, &JoinFrame::Rejected(reason)).await;
     let _ = send.finish();
 }
 
@@ -708,6 +840,7 @@ pub async fn refuse_join(mut send: SendStream) {
 /// So the caller uses this to apply the admission on the actor and wait for it. The wait happens
 /// here, on the slot's task, which is what keeps the actor free — the property the slot was
 /// introduced for.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct required input
 pub async fn run_responder<F, Fut>(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -715,13 +848,25 @@ pub async fn run_responder<F, Fut>(
     cfg: &ResponderConfig<'_>,
     store: &Store,
     ring: &tokio::sync::Mutex<PrekeyRing>,
+    ended: Option<tokio::sync::oneshot::Receiver<()>>,
     admit_before_accepting: F,
 ) -> Result<JoinOutcome>
 where
     F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let mut result = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring).await;
+    let exchange = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring);
+    // **Ended for a newcomer, and told so** (V210-92). The slot this exchange holds can be given
+    // to a joiner from a lighter source; the exchange stops where it is and the joiner hears the
+    // member is busy, not the refusal a wrong passphrase gets. A sender dropped without a word is
+    // not an ending: that branch is then off and the exchange runs on.
+    let mut result = match ended {
+        Some(ended) => tokio::select! {
+            r = exchange => r,
+            Ok(()) = ended => Err(Error::JoinEndedForNewcomer),
+        },
+        None => exchange.await,
+    };
     match &mut result {
         Ok(outcome) => {
             // **Admitted before it is told it is in.** See `admit_before_accepting`.
@@ -745,7 +890,9 @@ where
             // already complete and already witnessed, so anything else is tolerated:
             // the session still receives, and a later `Hello`/`Open` on a pairwise
             // stream can open the sending direction.
-            if let Ok(JoinFrame::Open { sealed }) = recv_frame(&mut recv).await {
+            if let Ok(Ok(JoinFrame::Open { sealed })) =
+                tokio::time::timeout(ADMISSION_PATIENCE, recv_frame(&mut recv)).await
+            {
                 let message = crate::pairwise::message::Message::from_wire(&sealed)?;
                 // An empty plaintext is the whole payload; what matters is that
                 // decrypting it steps the ratchet and yields a sending chain.
@@ -758,6 +905,7 @@ where
             let reason = match e {
                 Error::JoinPowInvalid => JoinReject::PowInvalid,
                 Error::MalformedJoin(_) | Error::Cbor(_) => JoinReject::Malformed,
+                Error::JoinEndedForNewcomer => JoinReject::Busy,
                 _ => JoinReject::Refused,
             };
             let _ = send_frame(&mut send, &JoinFrame::Rejected(reason)).await;
@@ -822,7 +970,42 @@ async fn responder_exchange(
     };
     let (responder, own_share) =
         join_accept(cfg.ctx, cfg.passphrase, &sid, &challenge, &token, cfg.root)?;
+    // The work is done and verified: from here this join's slot is not given to a newcomer, and
+    // the rest of the exchange must finish within `ADMISSION_PATIENCE`.
+    if let Some(worked) = &cfg.worked {
+        worked.store(true, std::sync::atomic::Ordering::Release);
+    }
+    tokio::time::timeout(
+        ADMISSION_PATIENCE,
+        responder_after_work(
+            send,
+            recv,
+            peer_fp,
+            cfg,
+            store,
+            ring,
+            responder,
+            own_share,
+            joiner_share,
+        ),
+    )
+    .await
+    .map_err(|_| Error::MalformedJoin("the joiner went quiet after its proof of work"))?
+}
 
+/// The exchange after the joiner's proof of work has verified: steps 3–7, bounded by the caller.
+#[allow(clippy::too_many_arguments)] // the state of one exchange, handed on whole
+async fn responder_after_work(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    peer_fp: Digest32,
+    cfg: &ResponderConfig<'_>,
+    store: &Store,
+    ring: &tokio::sync::Mutex<PrekeyRing>,
+    responder: crate::join::session::JoinResponder<'_>,
+    own_share: [u8; CPACE_SHARE_LEN],
+    joiner_share: [u8; CPACE_SHARE_LEN],
+) -> Result<JoinOutcome> {
     // 3. SHARE, then CPace completes and this side's proof is built.
     send_frame(send, &JoinFrame::Share { share: own_share }).await?;
     let (pending, bootstrap) = responder.complete_cpace(&joiner_share)?;

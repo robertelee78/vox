@@ -34,6 +34,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/world.rs"]
 mod world;
 
@@ -166,6 +169,7 @@ fn cpu_secs(pid: u32) -> f64 {
 #[test]
 #[ignore = "four real vox processes and production Argon2id; CI runs it in release"]
 fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let dir = |n: &str| {

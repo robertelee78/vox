@@ -54,6 +54,9 @@ mod world;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/previous_release.rs"]
 mod previous_release;
 
@@ -403,6 +406,7 @@ impl Tally {
 #[test]
 #[ignore = "real vox processes with production Argon2id, and the v0.2.9 release; CI runs it in release"]
 fn two_unlocks_of_one_v1_profile_lose_no_rows() {
+    test_knobs::require(&["VOX_TEST_REPLACE_PAUSE_MS", "VOX_TEST_REWRITE_DELAY_MS"]);
     watchdog::arm_for(Duration::from_secs(if cfg!(debug_assertions) {
         2400
     } else {

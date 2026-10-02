@@ -39,6 +39,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -251,6 +254,7 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
 #[test]
 #[ignore = "a grind floored at 150s, production Argon2id and a real anchor; CI runs it in release"]
 fn a_joiner_slower_than_the_old_patience_gets_in() {
+    test_knobs::require(&["VOX_TEST_SOLVE_AT_LEAST_MS"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let s = stage(tmp.path(), SLOW_GRIND_MS);
@@ -298,6 +302,7 @@ fn a_joiner_slower_than_the_old_patience_gets_in() {
 #[test]
 #[ignore = "a grind floored at 485s, production Argon2id and a real anchor; CI runs it in release"]
 fn a_joiner_slower_than_the_patience_is_told_why() {
+    test_knobs::require(&["VOX_TEST_SOLVE_AT_LEAST_MS"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
     let s = stage(tmp.path(), TOO_SLOW_GRIND_MS);

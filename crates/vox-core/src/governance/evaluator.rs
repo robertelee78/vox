@@ -185,6 +185,10 @@ pub struct Evaluator {
     /// Members whose genesis-conferred capabilities have been withdrawn by an
     /// authorized [`ServiceGrantExclusion`](crate::governance::servicegrant::ServiceGrantExclusion).
     excluded: BTreeSet<Digest32>,
+    /// The entries that passed pass 1 (bound to this channel, signature verified under
+    /// their author's root), by entry hash: what [`Evaluator::build_reusing`] need not
+    /// verify again.
+    verified: BTreeSet<Digest32>,
 }
 
 impl Evaluator {
@@ -235,9 +239,38 @@ impl Evaluator {
     where
         F: Fn(&Digest32) -> Option<CompositePublicKey>,
     {
+        Self::build_reusing(genesis, entries, now_secs, author_key, members, None)
+    }
+
+    /// [`Evaluator::build_with_members`], taking from `prior` — an evaluator built earlier for
+    /// the same channel — which entries have already passed pass 1, so their signatures are
+    /// not verified again (V210-71).
+    ///
+    /// Sound because an entry's hash covers its signed body, and an author's root key is
+    /// fixed by its fingerprint: an entry that verified under its author's key once verifies
+    /// under it for good. The author's key must still be known now, exactly as for an entry
+    /// verified afresh. Every other pass runs over the whole set as before, so the result is
+    /// the one [`Evaluator::build_with_members`] gives.
+    ///
+    /// A room re-verified every governance signature on every rebuild, under its lock: a
+    /// joiner's first sync of a room with a few hundred consents spent minutes doing so.
+    pub fn build_reusing<F>(
+        genesis: &Genesis,
+        entries: &[GovEntry],
+        now_secs: u64,
+        author_key: F,
+        members: BTreeSet<Digest32>,
+        prior: Option<&Evaluator>,
+    ) -> Result<Self>
+    where
+        F: Fn(&Digest32) -> Option<CompositePublicKey>,
+    {
         genesis.verify()?;
         let channel_id = genesis.channel_id();
         let root_admin = genesis.creator_pubkey().fingerprint();
+        let known = prior
+            .filter(|p| p.channel_id == channel_id)
+            .map(|p| &p.verified);
 
         // ---- Pass 1: keep only entries that bind to THIS channel and whose
         // composite signature verifies under their author's root. ----
@@ -250,10 +283,13 @@ impl Evaluator {
             let Some(key) = author_key(&e.author_id) else {
                 continue; // author key unknown: cannot verify, cannot trust
             };
-            if Self::verify_body(&e.body, &key).is_ok() {
+            if known.is_some_and(|k| k.contains(&e.entry_hash))
+                || Self::verify_body(&e.body, &key).is_ok()
+            {
                 verified.push(e);
             }
         }
+        let verified_hashes: BTreeSet<Digest32> = verified.iter().map(|e| e.entry_hash).collect();
 
         // ---- Pass 2: the single causal relation + canonical order. ----
         let causality = Causality::build(&verified)?;
@@ -282,6 +318,7 @@ impl Evaluator {
             service_grant: genesis.body.service_grant.clone(),
             members,
             excluded,
+            verified: verified_hashes,
         })
     }
 
@@ -872,18 +909,30 @@ impl<'a> Causality<'a> {
     /// input — and rejecting it here keeps the strict-past recursion in [`Resolver`]
     /// well-founded (no unbounded recursion / stack overflow).
     fn build(entries: &[&'a GovEntry]) -> Result<Self> {
+        // **Near-linear in the edges, not cubic** (V210-71). A node names every governance
+        // entry it holds as a causal predecessor (`gov_heads`), so the edges are dense, and the
+        // three steps below were O(N^2), O(N^3) and O(N^3) as written first. The relation, the
+        // order and the closure they produce are unchanged.
         let present: BTreeSet<Digest32> = entries.iter().map(|e| e.entry_hash).collect();
         let by_hash: BTreeMap<Digest32, &GovEntry> =
             entries.iter().map(|e| (e.entry_hash, *e)).collect();
 
         // Same-author seq-1 predecessor: the greatest-seq entry below this one's seq
-        // for the same author. This is the within-author causal edge.
+        // for the same author. This is the within-author causal edge. Among entries tied on
+        // that seq, the last in input order, as `Iterator::max_by_key` chose it.
+        let mut by_author: BTreeMap<Digest32, Vec<(u64, usize)>> = BTreeMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            by_author.entry(e.author_id).or_default().push((e.seq, i));
+        }
+        for seqs in by_author.values_mut() {
+            seqs.sort_unstable();
+        }
         let prev_same_author = |e: &GovEntry| -> Option<Digest32> {
-            entries
-                .iter()
-                .filter(|o| o.author_id == e.author_id && o.seq < e.seq)
-                .max_by_key(|o| o.seq)
-                .map(|o| o.entry_hash)
+            let seqs = by_author.get(&e.author_id)?;
+            let below = seqs.partition_point(|(s, _)| *s < e.seq);
+            below
+                .checked_sub(1)
+                .map(|at| entries[seqs[at].1].entry_hash)
         };
 
         // Direct predecessors (in-set only).
@@ -901,29 +950,40 @@ impl<'a> Causality<'a> {
             preds.insert(e.entry_hash, p);
         }
 
-        // Canonical order: Kahn, smallest-hash-ready-first (over the SAME `preds`).
-        let mut remaining: BTreeMap<Digest32, BTreeSet<Digest32>> = preds.clone();
-        let mut emitted: BTreeSet<Digest32> = BTreeSet::new();
+        // Canonical order: Kahn, smallest-hash-ready-first (over the SAME `preds`), with a
+        // ready set and a count of unemitted predecessors per entry rather than a rescan.
+        let mut waiting: BTreeMap<Digest32, usize> = BTreeMap::new();
+        let mut successors: BTreeMap<Digest32, Vec<Digest32>> = BTreeMap::new();
+        let mut ready: BTreeSet<Digest32> = BTreeSet::new();
+        for (h, p) in &preds {
+            waiting.insert(*h, p.len());
+            if p.is_empty() {
+                ready.insert(*h);
+            }
+            for d in p {
+                successors.entry(*d).or_default().push(*h);
+            }
+        }
         let mut order: Vec<&GovEntry> = Vec::with_capacity(entries.len());
+        let mut position: BTreeMap<Digest32, usize> = BTreeMap::new();
         while order.len() < entries.len() {
-            let next = remaining
-                .iter()
-                .find(|(_, p)| p.iter().all(|d| emitted.contains(d)))
-                .map(|(h, _)| *h);
-            match next {
-                Some(h) => {
-                    emitted.insert(h);
-                    remaining.remove(&h);
-                    if let Some(e) = by_hash.get(&h) {
-                        order.push(e);
+            let Some(h) = ready.pop_first() else {
+                // No ready node while entries remain ⇒ a cycle in the supplied
+                // causal edges. Reject rather than producing a bogus order or
+                // risking unbounded strict-past recursion (defense-in-depth: the
+                // `Resolver` also guards re-entrancy).
+                return Err(Error::GovernanceCycle);
+            };
+            position.insert(h, order.len());
+            if let Some(e) = by_hash.get(&h) {
+                order.push(e);
+            }
+            for s in successors.get(&h).into_iter().flatten() {
+                if let Some(n) = waiting.get_mut(s) {
+                    *n -= 1;
+                    if *n == 0 {
+                        ready.insert(*s);
                     }
-                }
-                None => {
-                    // No ready node while entries remain ⇒ a cycle in the supplied
-                    // causal edges. Reject rather than producing a bogus order or
-                    // risking unbounded strict-past recursion (defense-in-depth: the
-                    // `Resolver` also guards re-entrancy).
-                    return Err(Error::GovernanceCycle);
                 }
             }
         }
@@ -931,12 +991,20 @@ impl<'a> Causality<'a> {
         // Transitive ancestor closure over the SAME predecessor relation, computed
         // in canonical order so each node's ancestors are already final (the order
         // is a valid topological sort, guaranteed acyclic by the check above).
+        //
+        // Direct predecessors are taken latest first, and one already in the set is skipped:
+        // it got there as an ancestor of a predecessor taken before it, so its own ancestors
+        // are in the set already (the closure is transitive).
         let mut ancestors: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
         for e in &order {
             let mut anc: BTreeSet<Digest32> = BTreeSet::new();
             if let Some(direct) = preds.get(&e.entry_hash) {
-                for d in direct {
-                    anc.insert(*d);
+                let mut latest_first: Vec<&Digest32> = direct.iter().collect();
+                latest_first.sort_unstable_by_key(|d| std::cmp::Reverse(position.get(*d)));
+                for d in latest_first {
+                    if !anc.insert(*d) {
+                        continue;
+                    }
                     if let Some(da) = ancestors.get(d) {
                         anc.extend(da.iter().copied());
                     }

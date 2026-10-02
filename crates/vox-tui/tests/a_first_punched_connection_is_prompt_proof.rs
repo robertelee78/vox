@@ -53,6 +53,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/world.rs"]
 mod world;
 
@@ -281,6 +284,7 @@ fn stats(label: &str, samples: &[Duration]) -> Duration {
 #[test]
 #[ignore = "production Argon2id + a real PoW, two NAT worlds and a dozen cold `vox up`; run in release"]
 fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
 

@@ -54,8 +54,12 @@ const TICK: Duration = Duration::from_secs(30);
 /// whole-second clock, and the counters are read by polling.
 const MARGIN: Duration = Duration::from_secs(3);
 /// The most that step 3 (alice's posts, and bob reading them) may take before the window no
-/// longer fits between two ticks.
-const STAGING: Duration = Duration::from_secs(6);
+/// longer fits between two ticks. Measured 0.1 s (release) to 0.8 s (debug, load 30-90). It is 3 s,
+/// not more, so that a window always fits (V210-110, #306): the window and its margins come to
+/// 3 + 5 + 2 × 3 = 14 s, and two ticks on a 30 s period always leave a gap of at least 15 s. At 6 s
+/// they came to 17 s, and every run whose two tick phases were 13–17 s apart (about one in eight)
+/// was a CANNOT MEASURE.
+const STAGING: Duration = Duration::from_secs(3);
 const SETUP: Duration = Duration::from_secs(90);
 
 fn texts_of(m: &Member, room: &str) -> Vec<String> {
@@ -245,11 +249,17 @@ fn a_member_relays_what_it_learned() {
         ended == 0,
         "CANNOT MEASURE: carol ended {ended} session(s) with alice, so bob was not her only source"
     );
+    // The staging held (bob holds all of them, carol ended nothing with alice, no tick in the
+    // window), so a short count is the product's: bob did not relay what he learned. Both sides'
+    // sessions and connections are printed, so the red says which event was lost.
     assert!(
         have == POSTS,
-        "carol reads {have}/{POSTS} of alice's entries {BOUND:?} after she was continued: bob holds \
-         all {POSTS} and did not hand them on\nbob:\n{}\ncarol:\n{}",
+        "PRODUCT: carol reads {have}/{POSTS} of alice's entries {BOUND:?} after she was continued: \
+         bob holds all {POSTS} and did not hand them on\nbob's status:\n{}\ncarol's status:\n{}\n\
+         bob:\n{}\ncarol:\n{}",
         bob.status(),
+        carol.status(),
+        bob_d.transcript(),
         carol_d.transcript()
     );
 }

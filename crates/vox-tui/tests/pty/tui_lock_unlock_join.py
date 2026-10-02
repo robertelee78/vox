@@ -24,11 +24,13 @@ import os, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import DEBUG_EXTRA, Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, LINK, HOLD, DELAY, TAG = sys.argv[1:10]
 HOLD = float(HOLD)
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "240"))
+# The join's own wait: 180 s, and a debug build's measured join cost on top (vox_pty.DEBUG_EXTRA).
+JOIN_WITHIN = 180 + DEBUG_EXTRA
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
     sys.exit(2)
@@ -81,7 +83,7 @@ try:
         env=jenv,
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=JOIN_WITHIN,
     )
     tui.pump(0.5)
     if j.returncode == 0:
@@ -95,7 +97,7 @@ except Hung as h:
     print(f"{TAG} HUNG at {h}")
     code = 1
 except subprocess.TimeoutExpired:
-    print(f"{TAG} join failed: vox room join did not answer within 180s")
+    print(f"{TAG} join failed: vox room join did not answer within {JOIN_WITHIN}s")
     code = 0
 finally:
     disarm()

@@ -1,0 +1,1070 @@
+commit 9a63e0ab7cbb383e204bc23482850e8a0554d282
+Author: Robert E. Lee <robert@loveathome.us>
+Date:   Thu Oct 1 14:12:07 2026 -0700
+
+    SPIKE (never pushed): ADR-024 M24.1 spike harness on integrate 76e5c2c4, tier 1 = VoxCubic as shipped (no f5fc7c7f)
+
+diff --git a/crates/vox-core/src/transport/congestion.rs b/crates/vox-core/src/transport/congestion.rs
+index 5e5bf01a..4d17b231 100644
+--- a/crates/vox-core/src/transport/congestion.rs
++++ b/crates/vox-core/src/transport/congestion.rs
+@@ -55,8 +55,11 @@ pub struct IdleRestartConfig;
+ 
+ impl ControllerFactory for IdleRestartConfig {
+     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
++        if let Some(c) = spike::bbr(now, current_mtu) {
++            return c;
++        }
+         Box::new(IdleRestart {
+-            inner: Box::new(VoxCubic::new(now, current_mtu)),
++            inner: spike::inner(now, current_mtu),
+             mtu: current_mtu,
+             last_sent: None,
+             srtt: Duration::ZERO,
+@@ -79,7 +82,7 @@ impl Controller for IdleRestart {
+             .last_sent
+             .is_some_and(|t| now.saturating_duration_since(t) > idle)
+         {
+-            self.inner = Box::new(VoxCubic::new(now, self.mtu));
++            self.inner = spike::inner(now, self.mtu);
+         }
+         self.last_sent = Some(now);
+         self.inner.on_sent(now, bytes, last_packet_number);
+@@ -200,6 +203,10 @@ impl CubicState {
+         let w_max = self.w_max / mtu as f64;
+         (w_max * (1.0 - BETA_CUBIC) / C).cbrt()
+     }
++    fn cubic_k_beta(&self, mtu: u64, beta: f64) -> f64 {
++        let w_max = self.w_max / mtu as f64;
++        (w_max * (1.0 - beta) / C).cbrt()
++    }
+     // W_cubic(t) = C * (t - K)^3 + w_max  (Eq. 1)
+     fn w_cubic(&self, t: Duration, mtu: u64) -> f64 {
+         let w_max = self.w_max / mtu as f64;
+@@ -391,32 +398,7 @@ impl Controller for VoxCubic {
+         is_persistent_congestion: bool,
+         _lost_bytes: u64,
+     ) {
+-        if self
+-            .recovery_start_time
+-            .is_some_and(|recovery_start_time| sent <= recovery_start_time)
+-        {
+-            return;
+-        }
+-        // Loss ends HyStart++ whatever its phase: from here it is Cubic's.
+-        self.phase = Phase::Done;
+-        self.recovery_start_time = Some(now);
+-        let window = self.window as f64;
+-        self.state.w_max = if window < self.state.w_max {
+-            window * (1.0 + BETA_CUBIC) / 2.0
+-        } else {
+-            window
+-        };
+-        self.ssthresh = ((window * BETA_CUBIC) as u64).max(self.minimum_window());
+-        self.window = self.ssthresh;
+-        self.state.k = self.state.cubic_k(self.mtu);
+-        self.state.cwnd_inc = (self.state.cwnd_inc as f64 * BETA_CUBIC) as u64;
+-        if is_persistent_congestion {
+-            self.recovery_start_time = None;
+-            self.state.w_max = self.window as f64;
+-            self.ssthresh = ((self.window as f64 * BETA_CUBIC) as u64).max(self.minimum_window());
+-            self.state.cwnd_inc = 0;
+-            self.window = self.minimum_window();
+-        }
++        self.reduce(now, sent, is_persistent_congestion, BETA_CUBIC);
+     }
+ 
+     fn on_mtu_update(&mut self, new_mtu: u16) {
+@@ -447,3 +429,45 @@ impl Controller for VoxCubic {
+         self
+     }
+ }
++
++impl VoxCubic {
++    /// SPIKE: Cubic's reduction with a chosen beta. Returns whether it acted (a new recovery).
++    pub(crate) fn reduce(
++        &mut self,
++        now: Instant,
++        sent: Instant,
++        is_persistent_congestion: bool,
++        beta: f64,
++    ) -> bool {
++        if self
++            .recovery_start_time
++            .is_some_and(|recovery_start_time| sent <= recovery_start_time)
++        {
++            return false;
++        }
++        // Loss ends HyStart++ whatever its phase: from here it is Cubic's.
++        self.phase = Phase::Done;
++        self.recovery_start_time = Some(now);
++        let window = self.window as f64;
++        self.state.w_max = if window < self.state.w_max {
++            window * (1.0 + beta) / 2.0
++        } else {
++            window
++        };
++        self.ssthresh = ((window * beta) as u64).max(self.minimum_window());
++        self.window = self.ssthresh;
++        self.state.k = self.state.cubic_k_beta(self.mtu, beta);
++        self.state.cwnd_inc = (self.state.cwnd_inc as f64 * beta) as u64;
++        if is_persistent_congestion {
++            self.recovery_start_time = None;
++            self.state.w_max = self.window as f64;
++            self.ssthresh = ((self.window as f64 * BETA_CUBIC) as u64).max(self.minimum_window());
++            self.state.cwnd_inc = 0;
++            self.window = self.minimum_window();
++        }
++        true
++    }
++}
++
++#[path = "congestion_spike.rs"]
++pub(crate) mod spike;
+diff --git a/crates/vox-core/src/transport/congestion_spike.rs b/crates/vox-core/src/transport/congestion_spike.rs
+new file mode 100644
+index 00000000..8cfb065f
+--- /dev/null
++++ b/crates/vox-core/src/transport/congestion_spike.rs
+@@ -0,0 +1,329 @@
++//! SPIKE (ADR-024 M24.1, never committed): env-selected controller with a per-event trace.
++
++use std::any::Any;
++use std::io::Write as _;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++use std::time::{Duration, Instant};
++
++use quinn::congestion::{BbrConfig, Controller, ControllerFactory, ControllerMetrics};
++use quinn_proto::RttEstimator;
++
++use super::VoxCubic;
++
++struct Params {
++    mode: String,
++    beta_rand: f64,
++    signal: String,
++    veno_pkts: f64,
++    veno_frac: f64,
++    delay_ms: f64,
++    delay_frac: f64,
++    cap: f64,
++    entry: f64,
++    rise_abs: f64,
++    trend_bytes: f64,
++    trace: Option<Mutex<std::fs::File>>,
++    epoch: Instant,
++}
++
++fn env_f(k: &str, d: f64) -> f64 {
++    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
++}
++
++fn p() -> &'static Params {
++    static P: OnceLock<Params> = OnceLock::new();
++    P.get_or_init(|| Params {
++        mode: std::env::var("VOX_SPIKE_CC").unwrap_or_else(|_| "cubic".into()),
++        beta_rand: env_f("VOX_SPIKE_BETA_RAND", 0.85),
++        signal: std::env::var("VOX_SPIKE_SIGNAL").unwrap_or_else(|_| "either".into()),
++        veno_pkts: env_f("VOX_SPIKE_VENO_PKTS", 3.0),
++        veno_frac: env_f("VOX_SPIKE_VENO_FRAC", 0.1),
++        delay_ms: env_f("VOX_SPIKE_DELAY_MS", 2.0),
++        delay_frac: env_f("VOX_SPIKE_DELAY_FRAC", 0.25),
++        cap: env_f("VOX_SPIKE_CAP", 1.0),
++        entry: env_f("VOX_SPIKE_ENTRY", -1.0),
++        rise_abs: env_f("VOX_SPIKE_RISE_ABS", 0.005),
++        trend_bytes: env_f("VOX_SPIKE_TREND_BYTES", 33554432.0),
++        trace: std::env::var("VOX_SPIKE_TRACE").ok().map(|f| {
++            Mutex::new(
++                std::fs::OpenOptions::new()
++                    .create(true)
++                    .append(true)
++                    .open(f)
++                    .expect("spike trace"),
++            )
++        }),
++        epoch: Instant::now(),
++    })
++}
++
++fn trace(line: std::fmt::Arguments<'_>) {
++    if let Some(f) = &p().trace {
++        let _ = writeln!(f.lock().unwrap(), "{line}");
++    }
++}
++
++pub(crate) fn bbr(_now: Instant, _mtu: u16) -> Option<Box<dyn Controller>> {
++    None
++}
++
++pub(crate) fn inner(now: Instant, mtu: u16) -> Box<dyn Controller> {
++    static ID: AtomicU64 = AtomicU64::new(1);
++    let inner = match p().mode.as_str() {
++        "bbr" => Inner::Other(std::sync::Arc::new(BbrConfig::default()).build(now, mtu)),
++        _ => Inner::Cubic(VoxCubic::new(now, mtu)),
++    };
++    Box::new(Spike {
++        inner,
++        id: ID.fetch_add(1, Ordering::Relaxed),
++        mtu: u64::from(mtu),
++        srtt: Duration::ZERO,
++        min: Duration::ZERO,
++        last_pn: 0,
++        round_end: None,
++        round_min: None,
++        last_round_min: None,
++        tick: None,
++        acked: 0,
++        rand: 0,
++        cong: 0,
++        lost: 0,
++        mins: std::collections::VecDeque::new(),
++        rsent: 0,
++        rlost: 0,
++        ring: std::collections::VecDeque::new(),
++    })
++}
++
++enum Inner {
++    Cubic(VoxCubic),
++    Other(Box<dyn Controller>),
++}
++
++impl Inner {
++    fn c(&self) -> &dyn Controller {
++        match self {
++            Inner::Cubic(c) => c,
++            Inner::Other(o) => o.as_ref(),
++        }
++    }
++    fn m(&mut self) -> &mut dyn Controller {
++        match self {
++            Inner::Cubic(c) => c,
++            Inner::Other(o) => o.as_mut(),
++        }
++    }
++}
++
++struct Spike {
++    inner: Inner,
++    id: u64,
++    mtu: u64,
++    srtt: Duration,
++    min: Duration,
++    last_pn: u64,
++    round_end: Option<u64>,
++    round_min: Option<Duration>,
++    last_round_min: Option<Duration>,
++    tick: Option<Instant>,
++    acked: u64,
++    rand: u64,
++    cong: u64,
++    lost: u64,
++    mins: std::collections::VecDeque<(Instant, Duration)>,
++    rsent: u64,
++    rlost: u64,
++    ring: std::collections::VecDeque<(u64, u64)>,
++}
++
++fn us(d: Option<Duration>) -> i64 {
++    d.map_or(-1, |d| d.as_micros() as i64)
++}
++
++impl Spike {
++    fn t(&self, now: Instant) -> u128 {
++        now.saturating_duration_since(p().epoch).as_millis()
++    }
++    fn veno(&self) -> f64 {
++        if self.srtt.is_zero() || self.min >= self.srtt {
++            return 0.0;
++        }
++        self.inner.c().window() as f64 * (1.0 - self.min.as_secs_f64() / self.srtt.as_secs_f64())
++    }
++    fn queue_delay(&self) -> Option<Duration> {
++        self.last_round_min.map(|m| m.saturating_sub(self.min))
++    }
++}
++
++impl Clone for Spike {
++    fn clone(&self) -> Self {
++        Self {
++            inner: match &self.inner {
++                Inner::Cubic(c) => Inner::Cubic(c.clone()),
++                Inner::Other(o) => Inner::Other(o.clone_box()),
++            },
++            mins: self.mins.clone(),
++            ring: self.ring.clone(),
++            ..*self
++        }
++    }
++}
++
++impl Controller for Spike {
++    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
++        self.last_pn = last_packet_number;
++        self.rsent += bytes;
++        if self.round_end.is_none() {
++            self.round_end = Some(last_packet_number);
++        }
++        self.inner.m().on_sent(now, bytes, last_packet_number);
++    }
++
++    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, app_limited: bool, rtt: &RttEstimator) {
++        self.srtt = rtt.get();
++        let s = now.saturating_duration_since(sent);
++        // Windowed path minimum over the last 10 s of samples (quinn's min is lifetime and read 0).
++        while self.mins.back().is_some_and(|(_, m)| *m >= s) {
++            self.mins.pop_back();
++        }
++        self.mins.push_back((now, s));
++        while self.mins.front().is_some_and(|(t, _)| now.saturating_duration_since(*t) > Duration::from_secs(10)) {
++            self.mins.pop_front();
++        }
++        self.min = self.mins.front().map_or(s, |(_, m)| *m);
++        let _ = rtt.min();
++        self.round_min = Some(self.round_min.map_or(s, |m| m.min(s)));
++        self.acked += bytes;
++        let tick = *self.tick.get_or_insert(now);
++        if now.saturating_duration_since(tick) >= Duration::from_millis(100) {
++            trace(format_args!(
++                "S {} {} cwnd {} srtt {} min {} lrm {} acked {} rand {} cong {} lost {} applim {}",
++                self.t(now),
++                self.id,
++                self.inner.c().window(),
++                self.srtt.as_micros(),
++                self.min.as_micros(),
++                us(self.last_round_min),
++                self.acked,
++                self.rand,
++                self.cong,
++                self.lost,
++                app_limited as u8
++            ));
++            self.tick = Some(now);
++            self.acked = 0;
++            self.rand = 0;
++            self.cong = 0;
++            self.lost = 0;
++        }
++        self.inner.m().on_ack(now, sent, bytes, app_limited, rtt);
++    }
++
++    fn on_end_acks(&mut self, now: Instant, in_flight: u64, app_limited: bool, largest: Option<u64>) {
++        if let (Some(a), Some(e)) = (largest, self.round_end) {
++            if a >= e {
++                self.last_round_min = self.round_min.or(self.last_round_min);
++                self.round_min = None;
++                self.round_end = Some(self.last_pn);
++                self.ring.push_back((self.rsent, self.rlost));
++                while self.ring.len() > 4096 {
++                    self.ring.pop_front();
++                }
++                self.rsent = 0;
++                self.rlost = 0;
++            }
++        }
++        self.inner.m().on_end_acks(now, in_flight, app_limited, largest);
++    }
++
++    fn on_congestion_event(&mut self, now: Instant, sent: Instant, persistent: bool, lost_bytes: u64) {
++        let pr = p();
++        self.lost += 1;
++        self.rlost += lost_bytes;
++        let (ts, tl) = self.ring.iter().rev().take(8).fold((self.rsent, self.rlost), |(a, b), &(s, l)| (a + s, b + l));
++        let share = if ts == 0 { 0.0 } else { tl as f64 / ts as f64 };
++        let (mut ls, mut ll) = (self.rsent, self.rlost);
++        for &(s, l) in self.ring.iter().rev() {
++            if ls as f64 >= pr.trend_bytes {
++                break;
++            }
++            ls += s;
++            ll += l;
++        }
++        let long_share = if ls as f64 >= pr.trend_bytes { ll as f64 / ls as f64 } else { 0.0 };
++        let veno = self.veno();
++        let cwnd = self.inner.c().window() as f64;
++        let veno_q = veno >= (pr.veno_pkts * self.mtu as f64).max(pr.veno_frac * cwnd);
++        let qd = self.queue_delay();
++        let delay_thr = Duration::from_secs_f64((pr.delay_ms / 1000.0).max(pr.delay_frac * self.min.as_secs_f64()));
++        let delay_q = qd.is_some_and(|d| d >= delay_thr);
++        let queued = match pr.signal.as_str() {
++            "veno" => veno_q,
++            "round" => delay_q,
++            "both" => veno_q && delay_q,
++            _ => veno_q || delay_q,
++        };
++        let risen = pr.entry >= 0.0 && long_share > (1.5 * pr.entry).max(pr.entry + pr.rise_abs);
++        let congestion = persistent || lost_bytes == 0 || queued || share > pr.cap || risen;
++        let (decision, acted) = match &mut self.inner {
++            Inner::Cubic(c) if pr.mode == "tier2" && !congestion => {
++                let acted = if pr.beta_rand >= 1.0 { false } else { c.reduce(now, sent, false, pr.beta_rand) };
++                ("rand", acted)
++            }
++            Inner::Cubic(c) => ("cong", c.reduce(now, sent, persistent, 0.7)),
++            Inner::Other(o) => {
++                o.on_congestion_event(now, sent, persistent, lost_bytes);
++                (if queued { "cong" } else { "rand" }, true)
++            }
++        };
++        if decision == "rand" {
++            self.rand += 1;
++        } else {
++            self.cong += 1;
++        }
++        trace(format_args!(
++            "L {} {} share {:.4} cwnd {} srtt {} min {} lrm {} rm {} veno {:.0} venoq {} qd {} delayq {} {} acted {} lost {}",
++            self.t(now),
++            self.id,
++            share,
++            cwnd as u64,
++            self.srtt.as_micros(),
++            self.min.as_micros(),
++            us(self.last_round_min),
++            us(self.round_min),
++            veno,
++            veno_q as u8,
++            us(qd),
++            delay_q as u8,
++            decision,
++            acted as u8,
++            lost_bytes
++        ));
++    }
++
++    fn on_mtu_update(&mut self, new_mtu: u16) {
++        self.mtu = u64::from(new_mtu);
++        self.inner.m().on_mtu_update(new_mtu);
++    }
++
++    fn window(&self) -> u64 {
++        self.inner.c().window()
++    }
++
++    fn metrics(&self) -> ControllerMetrics {
++        self.inner.c().metrics()
++    }
++
++    fn clone_box(&self) -> Box<dyn Controller> {
++        Box::new(self.clone())
++    }
++
++    fn initial_window(&self) -> u64 {
++        self.inner.c().initial_window()
++    }
++
++    fn into_any(self: Box<Self>) -> Box<dyn Any> {
++        self
++    }
++}
+diff --git a/crates/vox-tui/Cargo.toml b/crates/vox-tui/Cargo.toml
+index 16047252..e9d60467 100644
+--- a/crates/vox-tui/Cargo.toml
++++ b/crates/vox-tui/Cargo.toml
+@@ -79,6 +79,7 @@ redb.workspace = true
+ # V210-62's proof plays a peer that opens a handshake with the host and never finishes it: no vox
+ # command stops mid-handshake on purpose, so the test drives a QUIC client of its own.
+ quinn.workspace = true
++rcgen.workspace = true
+ rustls.workspace = true
+ # V210-85's proof stops `vox connect` at its passphrase prompts, which it shows only on a terminal:
+ # the test opens a pty of its own and reads the terminal's modes back after the stop.
+diff --git a/crates/vox-tui/tests/spike_adr024.rs b/crates/vox-tui/tests/spike_adr024.rs
+new file mode 100644
+index 00000000..0c73dc5d
+--- /dev/null
++++ b/crates/vox-tui/tests/spike_adr024.rs
+@@ -0,0 +1,594 @@
++//! SPIKE (ADR-024 M24.1/M24.2, never committed). Arms selected by SPIKE_ARM:
++//! lossy | congested | changing. Controller selected in the vox processes by VOX_SPIKE_CC etc.
++//! A competing stock-quinn-Cubic flow shares the emulator's forward bottleneck.
++
++#![cfg(unix)]
++
++#[path = "../../vox-core/tests/support/watchdog.rs"]
++mod watchdog;
++
++use std::io::{BufRead, BufReader, Read, Write};
++use std::net::{SocketAddr, TcpListener, TcpStream};
++use std::process::{Child, Command, Stdio};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{mpsc, Arc, Mutex};
++use std::time::{Duration, Instant};
++
++const VOX: &str = env!("CARGO_BIN_EXE_vox");
++
++#[derive(Clone, Copy, Debug)]
++struct Link {
++    bits_per_sec: f64,
++    one_way: Duration,
++    loss: f64,
++    /// Forward queue limit in bytes.
++    queue: f64,
++}
++
++type Shared = Arc<Mutex<Option<Link>>>;
++
++static TAIL_DROPS: AtomicU64 = AtomicU64::new(0);
++static LOSS_DROPS: AtomicU64 = AtomicU64::new(0);
++static LATENESS_US: AtomicU64 = AtomicU64::new(0);
++static SINK_BYTES: AtomicU64 = AtomicU64::new(0);
++static COMP_BYTES: AtomicU64 = AtomicU64::new(0);
++
++struct Pacer {
++    next_free: Instant,
++}
++
++impl Pacer {
++    fn new() -> Self {
++        Self { next_free: Instant::now() }
++    }
++    fn release(&mut self, link: &Link, now: Instant, len: usize) -> Instant {
++        let serialise = Duration::from_secs_f64(len as f64 * 8.0 / link.bits_per_sec);
++        let start = self.next_free.max(now);
++        self.next_free = start + serialise;
++        self.next_free + link.one_way
++    }
++}
++
++fn sleep_until(t: Instant) {
++    let now = Instant::now();
++    if t > now {
++        std::thread::sleep(t - now);
++    }
++}
++
++fn next_rand(state: &mut u64) -> f64 {
++    *state ^= *state << 13;
++    *state ^= *state >> 7;
++    *state ^= *state << 17;
++    (*state >> 11) as f64 / (1u64 << 53) as f64
++}
++
++fn big_buffers(sock: &std::net::UdpSocket) {
++    let s = socket2::SockRef::from(sock);
++    let mut n = 64 << 20;
++    while n >= 1 << 20 && s.set_recv_buffer_size(n).is_err() {
++        n /= 2;
++    }
++    let mut n = 64 << 20;
++    while n >= 1 << 20 && s.set_send_buffer_size(n).is_err() {
++        n /= 2;
++    }
++}
++
++/// One direction: packets from `rx` (via `recv`) are paced by `pacer` (shared for the forward
++/// bottleneck) and delivered by `send`.
++fn direction(
++    recv: impl FnMut(&mut [u8]) -> Option<usize> + Send + 'static,
++    send: impl Fn(&[u8]) + Send + 'static,
++    link: Shared,
++    pacer: Arc<Mutex<Pacer>>,
++    limit_queue: bool,
++    seed: u64,
++) {
++    let (tx, queue) = mpsc::channel::<(Instant, Vec<u8>, bool)>();
++    let mut recv = recv;
++    std::thread::spawn(move || {
++        let mut buf = vec![0u8; 65536];
++        let mut rng = seed | 1;
++        while let Some(n) = recv(&mut buf) {
++            let now = Instant::now();
++            let l = *link.lock().unwrap();
++            let due = match l {
++                None => now,
++                Some(l) => {
++                    if l.loss > 0.0 && next_rand(&mut rng) < l.loss {
++                        LOSS_DROPS.fetch_add(1, Ordering::Relaxed);
++                        continue;
++                    }
++                    let mut p = pacer.lock().unwrap();
++                    let backlog = p.next_free.saturating_duration_since(now).as_secs_f64()
++                        * l.bits_per_sec
++                        / 8.0;
++                    if limit_queue && backlog > l.queue {
++                        TAIL_DROPS.fetch_add(1, Ordering::Relaxed);
++                        continue;
++                    }
++                    p.release(&l, now, n + 28)
++                }
++            };
++            if tx.send((due, buf[..n].to_vec(), l.is_some())).is_err() {
++                return;
++            }
++        }
++    });
++    std::thread::spawn(move || {
++        for (due, pkt, shaped) in queue {
++            sleep_until(due);
++            if shaped {
++                let late = Instant::now().saturating_duration_since(due).as_micros() as u64;
++                LATENESS_US.fetch_max(late, Ordering::Relaxed);
++            }
++            send(&pkt);
++        }
++    });
++}
++
++/// A UDP shaper in front of `upstream`; client->upstream goes through the shared `bottleneck`.
++fn udp_shaper(upstream: SocketAddr, link: Shared, bottleneck: Arc<Mutex<Pacer>>, seed: u64) -> SocketAddr {
++    let front = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
++    let back = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
++    big_buffers(&front);
++    big_buffers(&back);
++    back.connect(upstream).unwrap();
++    let addr = front.local_addr().unwrap();
++    let client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
++    let (front_rx, back_tx) = (front.try_clone().unwrap(), back.try_clone().unwrap());
++    let learn = Arc::clone(&client);
++    direction(
++        move |buf| {
++            front_rx.recv_from(buf).ok().map(|(n, from)| {
++                *learn.lock().unwrap() = Some(from);
++                n
++            })
++        },
++        move |pkt| {
++            let _ = back_tx.send(pkt);
++        },
++        Arc::clone(&link),
++        bottleneck,
++        true,
++        seed,
++    );
++    let who = Arc::clone(&client);
++    direction(
++        move |buf| back.recv(buf).ok(),
++        move |pkt| {
++            if let Some(to) = *who.lock().unwrap() {
++                let _ = front.send_to(pkt, to);
++            }
++        },
++        link,
++        Arc::new(Mutex::new(Pacer::new())),
++        false,
++        seed ^ 0x2545_f491_4f6c_dd1d,
++    );
++    addr
++}
++
++struct Proc {
++    name: &'static str,
++    child: Child,
++    lines: Arc<Mutex<Vec<String>>>,
++}
++
++impl Drop for Proc {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++impl Proc {
++    fn spawn(name: &'static str, dir: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Self {
++        let mut child = Command::new(VOX)
++            .args(args)
++            .envs(env.iter().copied())
++            .env("VOX_DATA_DIR", dir)
++            .env("VOX_CONFIG_DIR", dir.join("cfg"))
++            .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
++            .stdin(Stdio::null())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            .spawn()
++            .unwrap();
++        let lines = Arc::new(Mutex::new(Vec::new()));
++        for stream in [
++            child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
++            child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
++        ]
++        .into_iter()
++        .flatten()
++        {
++            let sink = Arc::clone(&lines);
++            std::thread::spawn(move || {
++                for line in BufReader::new(stream).lines().map_while(Result::ok) {
++                    sink.lock().unwrap().push(line);
++                }
++            });
++        }
++        Self { name, child, lines }
++    }
++    fn said(&self) -> Vec<String> {
++        self.lines.lock().unwrap().clone()
++    }
++    fn expect_line(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
++        let deadline = Instant::now() + Duration::from_secs(120);
++        while Instant::now() < deadline {
++            if let Some(l) = self.said().into_iter().find(|l| pred(l)) {
++                return l;
++            }
++            std::thread::sleep(Duration::from_millis(50));
++        }
++        panic!("{}: never printed {what}:\n{}", self.name, self.said().join("\n"));
++    }
++}
++
++fn vox_once_env(dir: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
++    let out = Command::new(VOX)
++        .args(args)
++        .envs(env.iter().copied())
++        .env("VOX_DATA_DIR", dir)
++        .env("VOX_CONFIG_DIR", dir.join("cfg"))
++        .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
++        .stdin(Stdio::null())
++        .output()
++        .unwrap();
++    (
++        out.status.success(),
++        String::from_utf8_lossy(&out.stdout).into_owned(),
++        String::from_utf8_lossy(&out.stderr).into_owned(),
++    )
++}
++
++fn after_label(line: &str, label: &str) -> String {
++    line.strip_prefix(label).unwrap().trim().to_owned()
++}
++
++fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
++    let at = dir.join("room-passphrase");
++    std::fs::write(&at, pass).unwrap();
++    at.to_str().unwrap().to_owned()
++}
++
++/// Sink: counts every byte into SINK_BYTES.
++fn sink() -> u16 {
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    let port = listener.local_addr().unwrap().port();
++    std::thread::spawn(move || {
++        for s in listener.incoming() {
++            let Ok(mut s) = s else { continue };
++            std::thread::spawn(move || {
++                let mut buf = vec![0u8; 256 * 1024];
++                while let Ok(n) = s.read(&mut buf) {
++                    if n == 0 {
++                        return;
++                    }
++                    SINK_BYTES.fetch_add(n as u64, Ordering::Relaxed);
++                }
++            });
++        }
++    });
++    port
++}
++
++/// Write to `to` until `stop`.
++fn pump(to: SocketAddr, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
++    std::thread::spawn(move || {
++        let chunk = vec![0x5au8; 256 * 1024];
++        let mut s = TcpStream::connect(to).unwrap();
++        while !stop.load(Ordering::Relaxed) {
++            if s.write_all(&chunk).is_err() {
++                return;
++            }
++        }
++    })
++}
++
++// ---- the competing flow: stock quinn Cubic --------------------------------------------------
++
++#[derive(Debug)]
++struct AnyCert(Arc<rustls::crypto::CryptoProvider>);
++impl rustls::client::danger::ServerCertVerifier for AnyCert {
++    fn verify_server_cert(
++        &self,
++        _: &rustls::pki_types::CertificateDer<'_>,
++        _: &[rustls::pki_types::CertificateDer<'_>],
++        _: &rustls::pki_types::ServerName<'_>,
++        _: &[u8],
++        _: rustls::pki_types::UnixTime,
++    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
++        Ok(rustls::client::danger::ServerCertVerified::assertion())
++    }
++    fn verify_tls12_signature(
++        &self,
++        m: &[u8],
++        c: &rustls::pki_types::CertificateDer<'_>,
++        d: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
++    }
++    fn verify_tls13_signature(
++        &self,
++        m: &[u8],
++        c: &rustls::pki_types::CertificateDer<'_>,
++        d: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
++    }
++    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
++        self.0.signature_verification_algorithms.supported_schemes()
++    }
++}
++
++fn comp_transport() -> Arc<quinn::TransportConfig> {
++    let mut cfg = quinn::TransportConfig::default();
++    let mut mtu = quinn::MtuDiscoveryConfig::default();
++    mtu.upper_bound(8192);
++    cfg.mtu_discovery_config(Some(mtu));
++    cfg.stream_receive_window(quinn::VarInt::from_u32(16 << 20));
++    cfg.send_window(32 << 20);
++    cfg.receive_window(quinn::VarInt::from_u32(32 << 20));
++    cfg.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
++    Arc::new(cfg)
++}
++
++fn comp_endpoint(addr: SocketAddr) -> quinn::Endpoint {
++    let sock = std::net::UdpSocket::bind(addr).unwrap();
++    big_buffers(&sock);
++    let mut ecfg = quinn::EndpointConfig::default();
++    let _ = ecfg.max_udp_payload_size(8192);
++    quinn::Endpoint::new(ecfg, None, sock, Arc::new(quinn::TokioRuntime)).unwrap()
++}
++
++/// Server bound now; returns its address. Counts into COMP_BYTES.
++fn comp_server(rt: &tokio::runtime::Runtime) -> SocketAddr {
++    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
++    let ck = rcgen::generate_simple_self_signed(vec!["comp".into()]).unwrap();
++    let cert = ck.cert.der().clone();
++    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
++    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
++        .with_protocol_versions(&[&rustls::version::TLS13])
++        .unwrap()
++        .with_no_client_auth()
++        .with_single_cert(vec![cert], key)
++        .unwrap();
++    tls.alpn_protocols = vec![b"comp".to_vec()];
++    let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(
++        quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
++    ));
++    scfg.transport_config(comp_transport());
++    let _g = rt.enter();
++    let mut ep = comp_endpoint("127.0.0.1:0".parse().unwrap());
++    ep.set_server_config(Some(scfg));
++    let addr = ep.local_addr().unwrap();
++    rt.spawn(async move {
++        while let Some(inc) = ep.accept().await {
++            tokio::spawn(async move {
++                let Ok(conn) = inc.await else { return };
++                while let Ok(mut rx) = conn.accept_uni().await {
++                    tokio::spawn(async move {
++                        let mut buf = vec![0u8; 256 * 1024];
++                        while let Ok(Some(n)) = rx.read(&mut buf).await {
++                            COMP_BYTES.fetch_add(n as u64, Ordering::Relaxed);
++                        }
++                    });
++                }
++            });
++        }
++    });
++    addr
++}
++
++fn comp_client(rt: &tokio::runtime::Runtime, to: SocketAddr, stop: Arc<AtomicBool>) {
++    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
++    let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
++        .with_protocol_versions(&[&rustls::version::TLS13])
++        .unwrap()
++        .dangerous()
++        .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
++        .with_no_client_auth();
++    tls.alpn_protocols = vec![b"comp".to_vec()];
++    let mut ccfg = quinn::ClientConfig::new(Arc::new(
++        quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
++    ));
++    ccfg.transport_config(comp_transport());
++    let _g = rt.enter();
++    let ep = comp_endpoint("127.0.0.1:0".parse().unwrap());
++    rt.spawn(async move {
++        let conn = ep.connect_with(ccfg, to, "comp").unwrap().await.expect("competitor connects");
++        let mut tx = conn.open_uni().await.unwrap();
++        let chunk = vec![0x5au8; 256 * 1024];
++        while !stop.load(Ordering::Relaxed) {
++            if tx.write_all(&chunk).await.is_err() {
++                return;
++            }
++        }
++        let _ = tx.finish();
++        conn.close(0u32.into(), b"done");
++        ep.wait_idle().await;
++    });
++}
++
++// ---- timeline -------------------------------------------------------------------------------
++
++/// Sample (vox, competitor) byte counters every `step` for `dur`, print per-step Mbit/s.
++fn timeline(label: &str, dur: Duration, step: Duration, mut at: impl FnMut(Duration)) -> Vec<(f64, f64)> {
++    let start = Instant::now();
++    let mut out = Vec::new();
++    let (mut v0, mut c0) = (SINK_BYTES.load(Ordering::Relaxed), COMP_BYTES.load(Ordering::Relaxed));
++    let mut k = 1u32;
++    while start.elapsed() < dur {
++        at(start.elapsed());
++        sleep_until(start + step * k);
++        let (v, c) = (SINK_BYTES.load(Ordering::Relaxed), COMP_BYTES.load(Ordering::Relaxed));
++        let s = step.as_secs_f64();
++        let row = ((v - v0) as f64 * 8.0 / s / 1e6, (c - c0) as f64 * 8.0 / s / 1e6);
++        eprintln!(
++            "TL {label} t={:.1} vox {:.1} comp {:.1} Mbit/s late {} ms",
++            (step * k).as_secs_f64(),
++            row.0,
++            row.1,
++            LATENESS_US.swap(0, Ordering::Relaxed) / 1000
++        );
++        out.push(row);
++        (v0, c0) = (v, c);
++        k += 1;
++    }
++    out
++}
++
++fn mean(v: &[f64]) -> f64 {
++    v.iter().sum::<f64>() / v.len().max(1) as f64
++}
++
++#[test]
++#[ignore = "spike"]
++fn spike_adr024() {
++    watchdog::arm();
++    let arm = std::env::var("SPIKE_ARM").unwrap_or_else(|_| "lossy".into());
++    let rate: f64 = std::env::var("SPIKE_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(2e8);
++    let ow_ms: f64 = std::env::var("SPIKE_OW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0);
++    let loss: f64 = std::env::var("SPIKE_LOSS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.01);
++    let qbdp: f64 = std::env::var("SPIKE_QUEUE_BDP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
++    let secs: u64 = std::env::var("SPIKE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
++    let one_way = Duration::from_secs_f64(ow_ms / 1000.0);
++    let bdp = rate / 8.0 * one_way.as_secs_f64() * 2.0;
++    let deep = bdp + 4e6;
++    eprintln!("SPIKE arm {arm} rate {rate} ow {ow_ms} ms loss {loss} qbdp {qbdp} cc {:?}", std::env::var("VOX_SPIKE_CC"));
++
++    let tmp = tempfile::tempdir().unwrap();
++    let (anchor_dir, host_dir, guest_dir) = (tmp.path().join("a"), tmp.path().join("h"), tmp.path().join("g"));
++    for d in [&anchor_dir, &host_dir, &guest_dir] {
++        std::fs::create_dir_all(d.join("cfg")).unwrap();
++    }
++    let port = sink();
++    let link: Shared = Arc::new(Mutex::new(None));
++    let bottleneck = Arc::new(Mutex::new(Pacer::new()));
++
++    let anchor = Proc::spawn("anchor", &anchor_dir, &["node", "--listen", "127.0.0.1:0"], &[]);
++    let spec = anchor
++        .expect_line("spec", |l| l.trim_start().contains('@') && l.trim_start().starts_with(|c: char| c.is_alphanumeric()))
++        .trim()
++        .to_owned();
++    let (ok, host_fp, e) = vox_once_env(&host_dir, &["id"], &[]);
++    assert!(ok, "{e}");
++    let (ok, guest_fp, e) = vox_once_env(&guest_dir, &["id"], &[]);
++    assert!(ok, "{e}");
++    let (ok, _, e) = vox_once_env(&host_dir, &["trust", "add", guest_fp.trim(), "--name", "guest"], &[]);
++    assert!(ok, "{e}");
++    let host_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
++    let host_listen = format!("127.0.0.1:{host_port}");
++    let shaped = udp_shaper(host_listen.parse().unwrap(), Arc::clone(&link), Arc::clone(&bottleneck), 0x9e37_79b9_7f4a_7c15);
++    let adv = shaped.to_string();
++    let port_s = port.to_string();
++    let host = Proc::spawn(
++        "host",
++        &host_dir,
++        &["serve", &port_s, "--anchor", &spec, "--listen", &host_listen],
++        &[("VOX_TEST_ADVERTISE", adv.as_str())],
++    );
++    let room = after_label(&host.expect_line("room", |l| l.starts_with("room ")), "room");
++    let address = after_label(&host.expect_line("address", |l| l.starts_with("address ")), "address");
++    let pass = after_label(&host.expect_line("pass", |l| l.starts_with("passphrase ")), "passphrase");
++    let nowhere = ("VOX_TEST_ADVERTISE", "127.0.0.1:9");
++    let pf = room_pass_file(&guest_dir, &pass);
++    let (ok, o, e) = vox_once_env(
++        &guest_dir,
++        &["connect", &address, "--passphrase-file", &pf, "--anchor", &spec, "--listen", "127.0.0.1:0"],
++        &[nowhere],
++    );
++    assert!(ok, "connect: {o}\n{e}");
++    let trace = std::env::var("SPIKE_TRACE").unwrap_or_default();
++    let forward = Proc::spawn(
++        "forward",
++        &guest_dir,
++        &["forward", &room, host_fp.trim(), &port_s, "127.0.0.1:0", "--passphrase-file", &pf, "--anchor", &spec, "--listen", "127.0.0.1:0"],
++        &[nowhere, ("VOX_SPIKE_TRACE", trace.as_str())],
++    );
++    let line = forward.expect_line("bound", |l| l.starts_with("vox: ") && l.contains(" → "));
++    let tunnel: SocketAddr = line.split_whitespace().nth(1).unwrap().parse().unwrap();
++
++    // Warm the tunnel up unshaped, so the path is direct.
++    {
++        let stop = Arc::new(AtomicBool::new(false));
++        let h = pump(tunnel, Arc::clone(&stop));
++        std::thread::sleep(Duration::from_secs(3));
++        stop.store(true, Ordering::Relaxed);
++        let _ = h.join();
++        std::thread::sleep(Duration::from_secs(2));
++    }
++
++    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
++    let comp_srv = comp_server(&rt);
++    let comp_front = udp_shaper(comp_srv, Arc::clone(&link), Arc::clone(&bottleneck), 0x1234_5678_9abc_def1);
++    let step = Duration::from_millis(500);
++    let dur = Duration::from_secs(secs);
++
++    match arm.as_str() {
++        "lossy" => {
++            *link.lock().unwrap() = Some(Link { bits_per_sec: rate, one_way, loss, queue: deep });
++            std::thread::sleep(Duration::from_millis(500));
++            let stop = Arc::new(AtomicBool::new(false));
++            let h = pump(tunnel, Arc::clone(&stop));
++            let tl = timeline("vox-alone", dur, step, |_| {});
++            stop.store(true, Ordering::Relaxed);
++            let _ = h.join();
++            std::thread::sleep(Duration::from_secs(2));
++            let stop2 = Arc::new(AtomicBool::new(false));
++            comp_client(&rt, comp_front, Arc::clone(&stop2));
++            let tc = timeline("cubic-alone", dur, step, |_| {});
++            stop2.store(true, Ordering::Relaxed);
++            let skip = tl.len() / 3;
++            let v = mean(&tl[skip..].iter().map(|r| r.0).collect::<Vec<_>>());
++            let c = mean(&tc[skip..].iter().map(|r| r.1).collect::<Vec<_>>());
++            eprintln!("RESULT lossy vox {v:.1} Mbit/s, cubic {c:.1} Mbit/s, ratio {:.2}; loss drops {} tail drops {}", v / c, LOSS_DROPS.load(Ordering::Relaxed), TAIL_DROPS.load(Ordering::Relaxed));
++        }
++        "congested" => {
++            *link.lock().unwrap() = Some(Link { bits_per_sec: rate, one_way, loss: 0.0, queue: (qbdp * bdp).max(64e3) });
++            std::thread::sleep(Duration::from_millis(500));
++            let stop = Arc::new(AtomicBool::new(false));
++            comp_client(&rt, comp_front, Arc::clone(&stop));
++            std::thread::sleep(Duration::from_secs(1));
++            let h = pump(tunnel, Arc::clone(&stop));
++            let tl = timeline("shared", dur, step, |_| {});
++            stop.store(true, Ordering::Relaxed);
++            let _ = h.join();
++            let skip = tl.len() / 3;
++            let v = mean(&tl[skip..].iter().map(|r| r.0).collect::<Vec<_>>());
++            let c = mean(&tl[skip..].iter().map(|r| r.1).collect::<Vec<_>>());
++            eprintln!("RESULT congested vox {v:.1} Mbit/s, cubic {c:.1} Mbit/s, share ratio vox/cubic {:.2}; tail drops {}", v / c, TAIL_DROPS.load(Ordering::Relaxed));
++        }
++        "changing" => {
++            let clean = Link { bits_per_sec: rate, one_way, loss: 0.0, queue: deep };
++            let lossy = Link { loss, ..clean };
++            *link.lock().unwrap() = Some(clean);
++            std::thread::sleep(Duration::from_millis(500));
++            let stop = Arc::new(AtomicBool::new(false));
++            let h = pump(tunnel, Arc::clone(&stop));
++            let phase = dur / 3;
++            let l2 = Arc::clone(&link);
++            let tl = timeline("changing", dur, step, move |t| {
++                let want = if t >= phase && t < phase * 2 { lossy } else { clean };
++                *l2.lock().unwrap() = Some(want);
++            });
++            stop.store(true, Ordering::Relaxed);
++            let _ = h.join();
++            let n = tl.len() / 3;
++            for (i, name) in ["clean1", "lossy", "clean2"].iter().enumerate() {
++                let v = mean(&tl[i * n..(i + 1) * n].iter().map(|r| r.0).collect::<Vec<_>>());
++                eprintln!("RESULT changing {name} vox {v:.1} Mbit/s");
++            }
++        }
++        _ => panic!("arm"),
++    }
++    *link.lock().unwrap() = None;
++    drop(forward);
++    drop(host);
++    drop(anchor);
++    drop(rt);
++}
