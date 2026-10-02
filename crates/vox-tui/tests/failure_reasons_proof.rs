@@ -171,7 +171,6 @@ impl Proc {
     }
 
     /// A line the scene needs `vox` to print; one that never comes is the product's (staging).
-
     fn expect_out(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + Duration::from_secs(120);
         while Instant::now() < deadline {
@@ -457,11 +456,14 @@ fn every_common_failure_names_its_cause() {
         "PRODUCT: trust add, keyring full: with the keyring capped at {SMALL_CAP}, all \
          {SMALL_TRIES} identities were trusted — the cap was not enforced"
     );
+    // The cap in force, not the shipped one: a message that names a wrong number is how a gate
+    // ends up asserting the wrong thing (#85).
+    let cap_said = format!("keyring is full ({SMALL_CAP} identities)");
     for said in &refusals {
         assert_says(
             "trust add, keyring full",
             said,
-            &["keyring is full", "vox trust remove"],
+            &[&cap_said, "vox trust remove"],
         );
     }
 
@@ -762,7 +764,7 @@ fn a_full_keyring_names_its_cause() {
         assert_says(
             "trust add, keyring full",
             said,
-            &["keyring is full", "vox trust remove"],
+            &["keyring is full (1,024 identities)", "vox trust remove"],
         );
     }
     drop(daemon);

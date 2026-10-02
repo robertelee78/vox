@@ -321,7 +321,16 @@ impl UiError {
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",
-            UiError::KeyringFull => "your trust keyring is full (1,024) — remove one first",
+            // The cap in force (#85), as `Fault::KeyringFull` names it.
+            UiError::KeyringFull => {
+                static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                TEXT.get_or_init(|| {
+                    format!(
+                        "your trust keyring is full ({}) — remove one first",
+                        vox_core::node::trust::trust_cap_words()
+                    )
+                })
+            }
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
