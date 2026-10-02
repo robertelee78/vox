@@ -13,6 +13,12 @@
 //!    **reserved** for someone by a handoff, is reported with the lapse and who has it;
 //! 4. a claim the session **released itself** is not news, and is not reported — in the
 //!    same drain that does report a lapse, so the silence is a decision, not a dead drain.
+//!
+//! **Every notice is information, never an order** (V210-131, the decider: "github is the
+//! authority, vox is the nagging reminder"). A room claim records nothing; the work item's
+//! GitHub issue, maintained through awa, is the only record of who holds a task. So each
+//! notice names the issue as the authority and never tells the agent to stop work: the
+//! notice this replaced said "Stop work on it", and putting that text back turns this red.
 
 #![cfg(unix)]
 
@@ -24,6 +30,22 @@ mod watchdog;
 use std::time::Duration;
 
 use support::{until, Out, Worker};
+
+/// What a lapse notice must say instead of an order: the issue decides.
+const AUTHORITY: &str = "the work item's GitHub issue says who holds the task";
+
+/// A lapse notice is information that points at the issue, never an order to stop.
+fn points_at_the_issue(told: &str, what: &str) {
+    assert!(
+        told.contains(AUTHORITY),
+        "PRODUCT: the {what} notice does not name the GitHub issue as the authority: {told:?}"
+    );
+    assert!(
+        !told.contains("Stop work") && !told.contains("or stop"),
+        "PRODUCT: the {what} notice orders the agent to stop work, though a room claim \
+         records nothing: {told:?}"
+    );
+}
 
 /// One turn's drain for `session`, as a harness hook runs it.
 fn drain(w: &Worker, r: &str, session: &str) -> String {
@@ -69,25 +91,26 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let _ = drain(alice, r, "s1"); // records what s1 holds
     let quiet = drain(alice, r, "s1");
     assert!(
-        !quiet.contains("no longer hold"),
-        "a session whose claims did not change must be told nothing: {quiet:?}"
+        !quiet.contains("room claim on"),
+        "PRODUCT: a session whose claims did not change must be told nothing: {quiet:?}"
     );
 
     // ---- (2) a lapse is reported, once ----
     std::thread::sleep(Duration::from_secs(4));
     let told = drain(alice, r, "s1");
     assert!(
-        told.contains("You no longer hold `lapses`") && told.contains("lapsed"),
-        "a lapsed claim must be reported with its reason: {told:?}"
+        told.contains("Your room claim on `lapses` lapsed"),
+        "PRODUCT: a lapsed claim must be reported with its reason: {told:?}"
     );
+    points_at_the_issue(&told, "lapse");
     assert!(
         !told.contains("`kept`"),
-        "a claim still held must not be reported: {told:?}"
+        "PRODUCT: a claim still held must not be reported: {told:?}"
     );
     let again = drain(alice, r, "s1");
     assert!(
-        !again.contains("no longer hold"),
-        "the loss must be reported once, not every turn: {again:?}"
+        !again.contains("room claim on"),
+        "PRODUCT: the loss must be reported once, not every turn: {again:?}"
     );
 
     // ---- (3) someone else now holds it ----
@@ -114,10 +137,12 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     );
     let told = drain(alice, r, "s1");
     assert!(
-        told.contains("You no longer hold `taken`: your claim lapsed, and it is now held by")
+        told.contains("Your room claim on `taken` lapsed, and ")
+            && told.contains("has since claimed it in the room")
             && told.contains(&format!("{}/b1", &bob_fp[..26])),
-        "a claim someone else now holds must name the holder: {told:?}"
+        "PRODUCT: a claim someone else now holds must name the holder: {told:?}"
     );
+    points_at_the_issue(&told, "taken-over");
 
     // ---- (3b) lapsed, then reserved for someone by a handoff ----
     claim(alice, "s1", r, "reserved", "2");
@@ -158,10 +183,11 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let told = drain(alice, r, "s1");
     assert!(
         told.contains(
-            "You no longer hold `reserved`: your claim lapsed, and it is now reserved for"
+            "Your room claim on `reserved` lapsed, and it is now reserved in the room for"
         ) && told.contains(&format!("{}/s9", &alice_fp[..26])),
-        "a lapsed claim now reserved by a handoff must say so and name the recipient: {told:?}"
+        "PRODUCT: a lapsed claim now reserved by a handoff must say so and name the recipient: {told:?}"
     );
+    points_at_the_issue(&told, "reserved");
 
     // ---- (4) a session's own release is not news — with a positive control ----
     claim(alice, "s1", r, "mine", "600");
@@ -172,11 +198,11 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     std::thread::sleep(Duration::from_secs(4));
     let told = drain(alice, r, "s1");
     assert!(
-        told.contains("You no longer hold `gone`"),
-        "the positive control: the same drain must report the lapse of `gone`: {told:?}"
+        told.contains("Your room claim on `gone` lapsed"),
+        "PRODUCT: the positive control: the same drain must report the lapse of `gone`: {told:?}"
     );
     assert!(
         !told.contains("`mine`"),
-        "a session's own release must not be reported back to it: {told:?}"
+        "PRODUCT: a session's own release must not be reported back to it: {told:?}"
     );
 }
