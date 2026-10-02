@@ -1,174 +1,67 @@
 name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
+# V210-145 (#364) SPIKE, on a throwaway branch whose draft PR is closed unmerged: this replaces the
+# whole CI for this branch only. It runs one deliberately hung proof on ubuntu, so the hung-proof
+# watchdog's Linux dump can be read: as it is, with the dump removed, and with the processes
+# declaring PR_SET_PTRACER_ANY (no privilege).
 
-# A newer run on an integrate/* branch covers the one before it, so it cancels it: three runs at
-# once on integrate/v0.2.10 for successive merges had to be cancelled by hand (#301). Those runs
-# are its pull request's, so the branch is `head_ref`. Every other run (main, tags, release, any
-# other PR) gets a group of its own, `run_id`: a shared group would still cancel a *pending* run.
-concurrency:
-  group: ${{ startsWith(github.head_ref || github.ref_name, 'integrate/') && format('ci-{0}', github.head_ref || github.ref_name) || format('ci-run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ startsWith(github.head_ref || github.ref_name, 'integrate/') }}
+on:
+  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # No gap is accepted here (no VOX_PROOF_ALLOW_UNPROVEN). The live-model proofs, and every other
-  # proof too heavy or too timing-bound to block, are optional (decider, 2026-10-01): they run only
-  # with vox-tui's `optional-proofs` feature, so CI compiles them and never runs them. Without it,
-  # a stand-in in each one's place prints `OPTIONAL PROOF NOT RUN` and passes.
 
 jobs:
-  # **Every commit must build, not merely the tip.** `git bisect` compiles the commit it
-  # lands on, so one commit that does not build makes bisect useless for the whole range
-  # around it — and a range is exactly when you reach for bisect. This caught a real case
-  # the day it was proposed: a change moved a function to five arguments in one crate while
-  # its call site sat in the next commit, so the branch built and its first commit did not.
-  #
-  # `cargo check`, not a full build: this is about whether the tree is coherent at each
-  # step, and check catches that. Bounded to the last 20 commits of the range so a long
-  # branch cannot turn one push into an hour.
-  every-commit-builds:
-    name: every commit builds
+  hung-proof-dump:
+    name: hung proof dump (${{ matrix.variant }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # Needs history: the range is what is being checked, not the tip.
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Check each commit in this push or pull request
-        run: |
-          set -eu
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
-          elif [ -n "${{ github.event.before }}" ] \
-               && git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null \
-               && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            range="${{ github.event.before }}..${{ github.sha }}"
-          else
-            # A first push, or a force-push whose predecessor is gone: check the tip alone
-            # rather than guessing at a range, and say so.
-            echo "no usable predecessor; checking ${{ github.sha }} only"
-            range="${{ github.sha }}~1..${{ github.sha }}"
-          fi
-          commits=$(git rev-list --reverse "$range" | tail -20)
-          if [ -z "$commits" ]; then
-            echo "no commits in $range"
-            exit 0
-          fi
-          n=$(echo "$commits" | wc -l | tr -d ' ')
-          echo "checking $n commit(s)"
-          for c in $commits; do
-            echo "::group::$c $(git log -1 --format=%s "$c")"
-            git checkout --quiet --detach "$c"
-            # RUSTFLAGS is not set here: a commit that builds with warnings still builds,
-            # and clippy/fmt are the tip's business. This asks one question only.
-            cargo check --workspace --all-targets
-            echo "::endgroup::"
-          done
-
-  build-test:
-    name: build · clippy · fmt · test
-    # ADR-015 scopes clients to macOS + Linux; the core is checked on both.
+    timeout-minutes: 45
     strategy:
-      # Both platforms report. Without this, one failure cancels the other and the second
-      # platform's state is never learned — which is how a red ubuntu hid macOS for ten runs.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    # 120, not 45: both platforms were cancelled at 45 minutes on v0.2.9's merge with nothing red.
-    timeout-minutes: 120
+        variant: [as-is, no-dump-mutant, ptracer-any]
     steps:
       - uses: actions/checkout@v4
-      # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
-      # proofs run: on a fresh runner it took R41's emulator to 74-90% of the link, and to a clean
-      # 98% with indexing off (diag run 36228035025). The runner is a throwaway VM.
-      - name: Stop Spotlight indexing (macOS)
-        if: runner.os == 'macOS'
-        run: sudo mdutil -a -i off
-      # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
-      # `shell_setup_proof` measures real shells. A shell that is absent is reported unproven and
-      # FAILS (ADR-018 §3), so the runners install the ones it proves against rather than the
-      # proof being excused. ubuntu-latest ships neither zsh nor fish; macOS ships zsh only.
-      - name: Install the shells the proofs measure
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: The environment the dump depends on
         run: |
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update && sudo apt-get install -y zsh fish
-          else
-            brew install fish
-          fi
-          zsh --version && fish --version && bash --version | head -1
-      # `codex_trust_proof` asks Codex itself whether Vox's hook is trusted and refuses to pass
-      # without `codex` on PATH (an absent Codex is not a pass). Pinned to the version it was
-      # measured on: the app-server's `hooks/list` statuses are Codex's, not Vox's, to change.
-      - name: Install the Codex the trust proof measures
-        run: npm install -g @openai/codex@0.157.0 && codex --version
-      # `tui_member_names_proof` reads the real `vox tui`'s screen through the `pyte` terminal
-      # emulator, and fails as CANNOT MEASURE without it (#198). Pinned to the version it was
-      # measured on, in a venv of its own: the runners' Python is externally managed (PEP 668).
-      - name: Install the terminal emulator the TUI proof reads the screen with
+          set -u
+          echo "gdb: $(command -v gdb || echo 'not installed')"
+          gdb --version 2>/dev/null | head -1 || true
+          echo "kernel.yama.ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 'absent')"
+          uname -a
+      - name: The no-dump mutant (the dump calls removed)
+        if: matrix.variant == 'no-dump-mutant'
         run: |
-          python3 -m venv "$RUNNER_TEMP/pyte"
-          "$RUNNER_TEMP/pyte/bin/pip" install --quiet pyte==0.8.2
-          echo "VOX_PYTE_PATH=$("$RUNNER_TEMP/pyte/bin/python" -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
-      - name: Show toolchain
-        run: rustc --version && cargo --version
-      - name: Format check
-        run: cargo fmt --all --check
-      # Vox is pure Rust (ADR-001 principle 10): there are no optional native
-      # backends to feature-gate; the default build IS the whole build.
-      - name: Clippy (default, pure-Rust)
-        run: cargo clippy --all-targets -- -D warnings
-      # The mutant sender (vox-core's `mutant-sender` feature, ADR-025 P9/P10) is never in a
-      # default build, so it is linted and documented on its own here.
-      - name: Clippy (mutant sender)
-        run: cargo clippy -p vox-core --features mutant-sender -- -D warnings
-      # The test-only knobs (`test-knobs`, V210-105) are in no shipped build either; the proofs
-      # build with them, and refuse a `vox` without them as CANNOT MEASURE.
-      - name: Clippy (test knobs)
-        run: cargo clippy --all-targets --features vox-tui/test-knobs -- -D warnings
-      - name: Test (default, pure-Rust)
-        run: cargo test --workspace --no-fail-fast --features vox-tui/test-knobs
+          set -eu
+          f=crates/vox-core/tests/support/watchdog.rs
+          grep -c 'dump_threads(std::process::id());' "$f"
+          grep -c 'dump_descendants(&children);' "$f"
+          sed -i 's|    dump_threads(std::process::id());|    // MUTANT-V210-145: no dump|' "$f"
+          sed -i 's|    dump_descendants(&children);|    let _ = \&children; // MUTANT-V210-145: no dump|' "$f"
+          git diff --stat
+      - name: Build the spike
+        run: cargo test --release -p vox-tui --features test-knobs --test v210_145_hung_spike --no-run
+      - name: Run the spike (it hangs; the watchdog fires at 40 s)
+        continue-on-error: true
         env:
-          # `update_proof` asks GitHub which releases exist, to find one to update *from*.
-          GH_TOKEN: ${{ github.token }}
-      - name: Docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-      - name: Docs (mutant sender)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc -p vox-core --no-deps --features mutant-sender
-      - name: Docs (test knobs)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features vox-tui/test-knobs
-      # The proofs that drive the shipped `vox` with production parameters (Argon2id, real
-      # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
-      # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
-      # product is a test", 2026-09-26). Run here in release.
-      # No proof is excluded by name any more (V210-19, #192): `cross_process_join_proof`, excused
-      # as a flake since v0.2.2, passed 20 of 20 on integrate/v0.2.10 and is back in this gate.
-      # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
-      # ADR-025's P9 and P10 proofs run a deliberately misbehaving sync sender as the faulty peer
-      # (no `vox` command makes a correct node misbehave). It is built here from this commit, into
-      # its own path, and named to them by VOX_MUTANT_SENDER; the script rebuilds the shipped
-      # binary with the default features afterwards and checks that it does not carry the mutant.
-      # Without this both proofs fail as CANNOT MEASURE (run 36389831839).
-      - name: Build the mutant sender (ADR-025 P9, P10)
+          VOX_TEST_WATCHDOG_SECS: "40"
+          VOX_SPIKE_PTRACER: ${{ matrix.variant == 'ptracer-any' && '1' || '0' }}
         run: |
-          path=$(scripts/build-mutant-sender.sh)
-          echo "VOX_MUTANT_SENDER=$path" >> "$GITHUB_ENV"
-      - name: Real-parameter gates (release)
+          set -u
+          cargo test --release -p vox-tui --features test-knobs --test v210_145_hung_spike \
+            -- --ignored --nocapture 2>&1 | tee spike.log
+          echo "exit: ${PIPESTATUS[0]}"
+      - name: What the log holds
+        if: always()
         run: |
-          cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored
-      # The optional proofs (docs/release/optional-proofs.md) block nothing and are never run here
-      # (decider, 2026-10-01). They are kept ready for troubleshooting, so this only builds them,
-      # with RUSTFLAGS' -D warnings: a change that breaks one is caught now, not on the day it is
-      # needed. It is not a test. It builds even when a gate above went red, so a red run still
-      # says whether the kit compiles.
-      - name: Compile optional proofs (not run; troubleshooting kit)
-        if: ${{ !cancelled() }}
-        run: cargo test --release -p vox-tui --features optional-proofs --no-run
+          set -u
+          echo "watchdog banner: $(grep -c 'vox test watchdog' spike.log || true)"
+          echo "descendant headers: $(grep -c 'vox test watchdog: descendant' spike.log || true)"
+          echo "thread census lines: $(grep -c 'threads (tid, state' spike.log || true)"
+          echo "gdb thread headers: $(grep -cE '^Thread [0-9]+ ' spike.log || true)"
+          echo "gdb frames: $(grep -cE '^#[0-9]+ ' spike.log || true)"
+          echo "ptrace refusals: $(grep -ciE 'ptrace: Operation not permitted|could not attach' spike.log || true)"
+          echo "descendants left: $(grep 'remain' spike.log || true)"
