@@ -333,9 +333,9 @@ pub enum Request {
         /// The last room of the previous page, or `None` for the first.
         after: Option<Digest32>,
     },
-    /// Offer a local TCP endpoint as a room-bound service (ADR-013), for as long as this
-    /// connection stays open: it is withdrawn when the connection closes, however the client
-    /// ends, and never persisted (V210-72). A [`Request::Forward`] likewise.
+    /// Offer a local TCP endpoint as a room-bound service (ADR-013). Unless `persist`, only for
+    /// as long as this connection stays open: it is withdrawn when the connection closes, however
+    /// the client ends, and never persisted (V210-72). A [`Request::Forward`] likewise.
     AddService {
         /// The room.
         channel_id: Digest32,
@@ -343,6 +343,9 @@ pub enum Request {
         service_tag: String,
         /// The local endpoint to carry connections to.
         local: String,
+        /// Kept: offered until removed, across this node's restarts, as `vox service add` offers
+        /// it without a daemon (V030-06). Not withdrawn when the connection closes.
+        persist: bool,
     },
     /// Stop offering a service.
     RemoveService {
@@ -495,12 +498,14 @@ impl Request {
                 channel_id,
                 service_tag,
                 local,
+                persist,
             } => {
-                e.array(4)
+                e.array(5)
                     .uint(T_ADD_SERVICE)
                     .bytes(channel_id)
                     .text(service_tag)
-                    .text(local);
+                    .text(local)
+                    .uint(u64::from(*persist));
             }
             Request::RemoveService {
                 channel_id,
@@ -755,16 +760,18 @@ impl Request {
                     after,
                 })
             }
-            (T_ADD_SERVICE, 4) => {
+            (T_ADD_SERVICE, 5) => {
                 let channel_id = digest(&mut d)?;
                 let service_tag = text(&mut d, "ipc service tag")?;
                 let local = text(&mut d, "ipc local address")?;
+                let persist = flag(&mut d, "ipc service persist")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::AddService {
                     channel_id,
                     service_tag,
                     local,
+                    persist,
                 })
             }
             (T_REMOVE_SERVICE, 3) => {
@@ -1908,6 +1915,8 @@ impl Held {
     /// cloned for this: some carry passphrases).
     fn intent(request: &Request) -> Intent {
         match request {
+            // A kept offer outlives the connection that made it, as `vox service add` means it to.
+            Request::AddService { persist: true, .. } => Intent::Nothing,
             Request::AddService {
                 channel_id,
                 service_tag,
@@ -2380,6 +2389,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             channel_id,
             service_tag,
             local,
+            persist,
         } => {
             let Ok(local) = local.parse() else {
                 return Frame::Error {
@@ -2392,8 +2402,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     service_tag,
                     local,
                     // Offered over this socket, it lasts as long as the client's connection
-                    // (`Held`), and so never outlives this node's run either.
-                    persist: false,
+                    // (`Held`), and so never outlives this node's run either — unless the client
+                    // asked for it kept, as `vox service add` does (V030-06).
+                    persist,
                 })
                 .await
             {

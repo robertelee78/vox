@@ -2283,6 +2283,41 @@ pub fn run() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Ask the running node when there is one, as `vox service remove` does (V030-06): the
+        // profile is not ours to open while a daemon holds it, and stopping the daemon to add a
+        // service, then starting it again with every room's passphrase, is not something a person
+        // should have to do. The daemon holds the room open already, so no passphrase is asked.
+        Cmd::Service(ServiceCmd::Add(a)) if node_answers(&a.room.profile) => {
+            let paths = match a.room.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(crate::room_cli::service_add(
+                &paths,
+                &a.room.room,
+                &label_of(&a.tag),
+                a.local,
+            )) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // Ask the running node when there is one, like `vox trust`: the profile is not ours to
         // open while it runs, and a running host is the case R22 is about.
         Cmd::Service(ServiceCmd::Remove(r)) if node_answers(&r.room.profile) => {

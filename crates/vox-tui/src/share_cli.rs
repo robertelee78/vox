@@ -194,6 +194,7 @@ pub async fn share(
             channel_id,
             service_tag: tag.clone(),
             local: local.to_string(),
+            persist: false,
         })
         .await
     {
