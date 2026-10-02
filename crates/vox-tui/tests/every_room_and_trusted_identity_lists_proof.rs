@@ -36,6 +36,9 @@ mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::collections::BTreeSet;
 
 /// Trusted identities: past one [`FRAME`] and four pages.
@@ -56,10 +59,11 @@ const PARALLEL: usize = 8;
 #[test]
 #[ignore = "networked nodes, 200 rooms and 200 trusted identities with production Argon2id; CI runs it in release"]
 fn every_room_and_trusted_identity_is_listed_past_one_page() {
+    test_knobs::require(&["VOX_TEST_MAX_FRAME"]);
     watchdog::arm();
     // Every process this proof starts inherits it: the daemons page their replies to it, and
     // each `vox` command refuses a frame over it.
-    std::env::set_var(vox_core::node::ipc::TEST_MAX_FRAME_ENV, FRAME.to_string());
+    std::env::set_var("VOX_TEST_MAX_FRAME", FRAME.to_string());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

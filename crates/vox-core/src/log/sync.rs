@@ -996,6 +996,9 @@ pub enum SessionError {
     /// The peer served an entry this side did not ask for, or served one twice (ADR-025 D3). Local
     /// only: no wire code says it, and the stream is reset with the uninformative one.
     ProtocolViolation,
+    /// The peer's entries did not all arrive within the drain budget, this many seconds (V210-71).
+    /// What arrived was applied first. Local only: the stream is closed with `TransportFailed`.
+    DrainBudget(u64),
 }
 
 impl SessionError {
@@ -1005,6 +1008,7 @@ impl SessionError {
         match self {
             Self::Local(c) | Self::Peer(c) => c,
             Self::ProtocolViolation => WireError::AuthenticatorInvalid,
+            Self::DrainBudget(_) => WireError::TransportFailed,
         }
     }
 }
@@ -1256,7 +1260,19 @@ where
     };
     while let Some(frame) = recv(t)? {
         if std::time::Instant::now() >= deadline {
-            return Err(local(WireError::SyncModeUnsupported));
+            // **What arrived is kept, and the stop says why** (V210-71). This used to return at
+            // once, dropping every staged entry — up to `MAX_STAGED` verified entries thrown away
+            // and fetched again — and reported "sync mode unsupported", which names a protocol
+            // mismatch that did not happen.
+            if !staged.is_empty() {
+                apply(
+                    std::mem::take(&mut staged),
+                    std::mem::take(&mut positions),
+                    &mut coverage,
+                    out,
+                )?;
+            }
+            return Err(SessionError::DrainBudget(DRAIN_BUDGET.as_secs()));
         }
         match decode_frame(&frame) {
             Ok(SyncFrame::Entry(wire)) => {
@@ -1304,7 +1320,8 @@ where
 ///
 /// - `serve-nothing` (P10): its `HAVE` is true, and it serves nothing for any `WANT`;
 /// - `serve-unasked` (P9): its `HAVE` hides the newest entry of every feed (it advertises
-///   `max_seq - 1` and that entry's hash), and it serves the hidden entries on every session anyway.
+///   `max_seq - 1` and that entry's hash), and it serves the hidden entries on every session anyway;
+/// - `serve-slowly` (V210-71): it serves what was asked, one frame a second, past its serve budget.
 ///
 /// - `strip-payload` (V210-74): it serves every entry with its payload stripped, the skeleton and
 ///   its signature intact;
@@ -1329,6 +1346,7 @@ pub mod mutant {
         Correct,
         ServeNothing,
         ServeUnasked,
+        ServeSlowly,
         StripPayload,
         AuthorUnclassifiable,
         OldRowIds,
@@ -1342,6 +1360,7 @@ pub mod mutant {
             let mode = match named.as_str() {
                 "serve-nothing" => Mode::ServeNothing,
                 "serve-unasked" => Mode::ServeUnasked,
+                "serve-slowly" => Mode::ServeSlowly,
                 "strip-payload" => Mode::StripPayload,
                 "author-unclassifiable" => Mode::AuthorUnclassifiable,
                 "old-row-ids" => Mode::OldRowIds,
@@ -1389,12 +1408,21 @@ pub mod mutant {
         Ok((shown, hidden))
     }
 
+    /// `serve-slowly` (V210-71): the gap before each served frame, with the serve budget ignored,
+    /// so the peer's drain runs past its own budget.
+    #[must_use]
+    pub fn pace() -> Option<std::time::Duration> {
+        (mode() == Mode::ServeSlowly).then(|| std::time::Duration::from_secs(1))
+    }
+
     /// The entries to serve, given what the peer asked for and what is served unasked.
     pub(super) fn serve(asked: Vec<Vec<u8>>, unasked: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         match mode() {
-            Mode::Correct | Mode::AuthorUnclassifiable | Mode::OldRowIds | Mode::AuthorMisbound => {
-                asked
-            }
+            Mode::Correct
+            | Mode::ServeSlowly
+            | Mode::AuthorUnclassifiable
+            | Mode::OldRowIds
+            | Mode::AuthorMisbound => asked,
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
             Mode::StripPayload => asked

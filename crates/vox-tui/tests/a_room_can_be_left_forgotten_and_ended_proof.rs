@@ -24,7 +24,8 @@
 //! - **End.** Bob, who did not create the room, is refused `vox room admin add`. Alice, its
 //!   creator, makes bob and carol admins (`vox room admin add`) and takes carol's back (`remove`);
 //!   every member's `vox room admin list` says so. Carol is then refused `vox room end`, and bob, an
-//!   admin, ends the room. Within [`WITHIN`] every member's `vox room list` says it ended, every member's post
+//!   admin, ends the room. Afterwards carol forgets it and joins again with its address and
+//!   passphrase: she is told the room has ended, not that her passphrase is probably wrong. Within [`WITHIN`] every member's `vox room list` says it ended, every member's post
 //!   is refused, and what was said before stays readable.
 //! - **Idle end.** Alice makes a room with `vox room create --idle-end` [`IDLE`]. A message said
 //!   before the idle time runs out keeps it going past [`IDLE`] from its creation; once nothing is
@@ -37,13 +38,15 @@
 //!   reaches bob's `vox room list`; alice's `:forget` leaves her store without the room's id.
 //!
 //! **Every red names which it is.** `PRODUCT:` — `vox` did the wrong thing, and what it said is
-//! quoted. `APPARATUS:` — the staging was not achieved or a precondition is unmet (a setup verb
-//! failed, posting drove no session at all), so nothing about the claim was measured. The watchdog
-//! (`support/watchdog.rs`) names itself when it fires.
+//! quoted; `PRODUCT (staging):` — a `vox` step of the staging failed (a create, join, post or list
+//! a person would run). `APPARATUS:` — the apparatus's own fault or a precondition it could not
+//! stage (a temporary directory, a timing window, the TUI driver), so nothing about the claim was
+//! measured. The watchdog (`support/watchdog.rs`) names itself when it fires.
 //!
 //! **Mutations that must turn it red:** a member that left still synced with (leave); a member
 //! that joined again not saying it is back (rejoin); the room's rows not deleted (forget); a post
-//! taken after the end, or an admin's end ignored (end); the idle end ignored (idle end).
+//! taken after the end, an admin's end ignored, or a join to an ended room refused as a wrong
+//! passphrase (end); the idle end ignored (idle end).
 
 #![cfg(unix)]
 
@@ -64,7 +67,7 @@ const WITHIN: Duration = Duration::from_secs(30);
 /// The idle end the idle arm chooses.
 const IDLE: Duration = Duration::from_secs(40);
 
-/// The room `support::room` makes, or an `APPARATUS` red naming why it could not.
+/// The room `support::room` makes, or a `PRODUCT (staging)` red naming why it could not.
 fn room_of(rt: &tokio::runtime::Runtime, tmp: &std::path::Path, names: &[&str]) -> Room {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(support::room(tmp, names))
@@ -75,7 +78,7 @@ fn room_of(rt: &tokio::runtime::Runtime, tmp: &std::path::Path, names: &[&str]) 
             .cloned()
             .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
             .unwrap_or_default();
-        panic!("APPARATUS: the room could not be set up, so nothing was measured: {why}")
+        panic!("PRODUCT (staging): the room could not be set up: {why}")
     })
 }
 
@@ -86,12 +89,13 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("a tokio runtime")
 }
 
-/// `w` runs `args`; an `APPARATUS` red if a setup verb fails.
+/// `w` runs `args`, a step of the staging that the product itself performs: a failure is the
+/// product failing a person, `PRODUCT (staging)`.
 fn setup(w: &Worker, args: &[&str]) -> Out {
     let o = w.vox(None, args);
     assert!(
         o.ok,
-        "APPARATUS: setup verb `vox {}` on {} failed, so nothing was measured: {o:?}",
+        "PRODUCT (staging): `vox {}` on {} failed: {o:?}",
         args.join(" "),
         w.name
     );
@@ -190,7 +194,7 @@ fn a_member_that_left_is_synced_with_and_delivered_to_no_more() {
     );
     assert!(
         between_after > between,
-        "APPARATUS: ten posts between bob and carol drove no sync session between them \
+        "PRODUCT (staging): ten posts between bob and carol drove no sync session between them \
          ({between} -> {between_after}), so a session with alice could not have shown either"
     );
     assert_eq!(
@@ -321,7 +325,7 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
             }
             assert!(
                 Instant::now() < deadline,
-                "APPARATUS: bob's `vox status --json` never said whom it froze in the room within \
+                "PRODUCT (staging): bob's `vox status --json` never said whom it froze in the room within \
                  {WITHIN:?}, so a restarted feed could not be seen: {row:?}"
             );
             std::thread::sleep(Duration::from_millis(500));
@@ -368,7 +372,7 @@ fn a_forgotten_room_leaves_nothing_on_the_node() {
     // Checked the moment it answers: a forget that says it is done is done.
     assert!(
         !holds(&store),
-        "PRODUCT: `vox room forget` answered, and alice's store.redb still holds the room's id,          which keys every one of its rows: {}",
+        "PRODUCT: `vox room forget` answered, and alice's store.redb still holds the room's id, which keys every one of its rows: {}",
         store.display()
     );
     let (gone, o2) = poll(bob, &["room", "roster", &id], WITHIN, |o| {
@@ -416,6 +420,10 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
     };
     let id = room.id.as_str();
     setup(bob, &["room", "post", id, "said before the end"]);
+    let link = setup(alice, &["room", "invite", id])
+        .stdout
+        .trim()
+        .to_owned();
 
     // Only the creator names admins.
     let o = bob.vox(None, &["room", "admin", "add", id, &carol.b32()]);
@@ -499,6 +507,20 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
         "PRODUCT: carol shows a message said after the end: {}",
         o.stdout
     );
+
+    // Joining an ended room is refused as that, not as a wrong passphrase: carol forgets it and
+    // joins again with its address and passphrase.
+    setup(carol, &["room", "forget", id]);
+    let o = carol.vox_in(
+        None,
+        &["room", "join", &link, "--name", "mission"],
+        Some("channel passphrase"),
+    );
+    assert!(
+        !o.ok && o.stderr.contains("has ended") && !o.stderr.contains("passphrase is wrong"),
+        "PRODUCT: a join to the ended room was not refused as the room having ended: {o:?}"
+    );
+    eprintln!("[proof] end: a join to the ended room was told it ended");
 }
 
 #[test]
@@ -533,7 +555,9 @@ fn a_chosen_idle_end_ends_a_quiet_room_and_only_that_room() {
         .lines()
         .find(|l| !before.contains(&l.to_string()))
         .map(str::to_owned)
-        .unwrap_or_else(|| panic!("APPARATUS: the new room is not in alice's `vox room list`"));
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): the new room is not in alice's `vox room list`")
+        });
     let short = line.split_whitespace().next().unwrap().to_owned();
     let link = setup(alice, &["room", "invite", &short])
         .stdout
@@ -544,12 +568,15 @@ fn a_chosen_idle_end_ends_a_quiet_room_and_only_that_room() {
         &["room", "join", &link, "--name", "quiet"],
         Some("idle room passphrase"),
     );
-    assert!(o.ok, "APPARATUS: bob could not join the idle room: {o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT (staging): bob could not join the idle room: {o:?}"
+    );
 
     // Said before the idle time runs out: the room goes on past IDLE from its creation.
     assert!(
         made.elapsed() < IDLE / 2,
-        "APPARATUS: bob's join took {:?}, past half the {IDLE:?} idle end, so a message said          inside it could not be staged",
+        "APPARATUS: bob's join took {:?}, past half the {IDLE:?} idle end, so a message said inside it could not be staged",
         made.elapsed()
     );
     std::thread::sleep((made + IDLE / 2).saturating_duration_since(Instant::now()));
@@ -637,22 +664,25 @@ fn tui_verb(w: &Worker, verb: &str, hold: Duration) {
         driven.took.as_secs_f64(),
         driven.stdout.trim()
     );
+    // Stopped from outside before it said anything: the driver never got to measure.
     assert!(
         driven.has_verdict(&tag),
-        "APPARATUS: the TUI driver for :{verb} on {} was stopped before it could say anything \
-         (stage {:?}), so nothing was measured",
+        "APPARATUS: the TUI driver for :{verb} on {} was stopped from outside before it gave a \
+         verdict (stage {:?}), so nothing was measured",
         w.name,
         driven.stage
     );
+    // A crashed driver is caught by `pty_driver::checked` as APPARATUS; its own staging fault is
+    // exit 2. Every other non-pass — a refusal, no answer, a TUI that exited or stopped reading
+    // (`HUNG`) — is the TUI not doing what the person typed (V210-107).
     match driven.code {
         Some(0) => {}
-        Some(3) => panic!(
-            "PRODUCT: `vox tui` refused :{verb} on {}: {}",
+        Some(2) => panic!(
+            "APPARATUS: the TUI driver for :{verb} on {} could not stage its run: {}",
             w.name, driven.stdout
         ),
         _ => panic!(
-            "APPARATUS: the TUI driver did not get to an answer to :{verb} on {} (exit {:?}, \
-             stage {:?}), so nothing was measured: {}",
+            "PRODUCT: `vox tui` did not do :{verb} on {} (exit {:?}, stage {:?}): {}",
             w.name, driven.code, driven.stage, driven.stdout
         ),
     }

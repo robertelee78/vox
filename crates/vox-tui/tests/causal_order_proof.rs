@@ -41,6 +41,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -186,6 +188,7 @@ fn daemon(dir: &Path, tag: &str, listen: &str, stdin_lines: &str, skew_ms: Optio
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
     if let Some(skew) = skew_ms {
+        test_knobs::require(&[vox_core::time::TEST_CLOCK_SKEW_ENV]);
         cmd.env(vox_core::time::TEST_CLOCK_SKEW_ENV, skew.to_string());
     }
     let mut child = cmd.spawn().expect("spawn vox daemon");

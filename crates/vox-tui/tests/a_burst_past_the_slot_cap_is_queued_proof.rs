@@ -36,6 +36,9 @@
 //!    post in room 39, 24 s). The push is asserted, not only the read, because Bob's own 30 s tick
 //!    can carry the post and would hide a port still backing off.
 //!
+//! A warm-up post that never reaches Bob once both joins succeeded is a product red (`PRODUCT:`),
+//! not a precondition: delivery is the product.
+//!
 //! ## Preconditions (else CANNOT MEASURE)
 //! - The burst reached the slot cap: on Alice's `vox status --json`, `skipped_at_cap` rose (the
 //!   base) or `queued` rose (ADR-025). A burst that never met the cap proves nothing.
@@ -64,11 +67,22 @@ use sync_pair::{counter, failures, pct, Member};
 
 /// More rooms than the 16 outbound slots, and ten times the 4 a peer may hold.
 const ROOMS: usize = 40;
-/// Each post readable by Bob within this of its `vox room post` returning.
-const BOUND: Duration = Duration::from_secs(2);
+/// Each post readable by Bob within this of its `vox room post` returning: 2 s in a release build,
+/// where timing bounds count. A debug build seals and opens every post unoptimized, about ten times
+/// as slowly (#295: three debug runs' burst crossings, most 4.89 s, 4.58 s and 6.13 s, against p50
+/// 0.21 s in release), so it gets 13 s, about twice its most measured — still far below the 30 s
+/// interval a skipped port waits.
+const BOUND: Duration = Duration::from_secs(if cfg!(debug_assertions) { 13 } else { 2 });
 /// The post in the late-joined room readable by Bob within this, once he has synced with Alice
-/// there: well under the 30 s `Policy` backoff the refused push used to wait out (24 s on CI).
-const LATE_BOUND: Duration = Duration::from_secs(5);
+/// there: well under the 30 s `Policy` backoff the refused push used to wait out (24 s on CI). 5 s
+/// in a release build; 15 s in a debug build (see [`BOUND`]), still half that backoff.
+const LATE_BOUND: Duration = Duration::from_secs(if cfg!(debug_assertions) { 15 } else { 5 });
+/// Which build's bounds apply, said in the log.
+const PROFILE: &str = if cfg!(debug_assertions) {
+    "debug"
+} else {
+    "release"
+};
 /// Longest Bob stays paused while the burst is posted: well inside the 5 s an outbound session's
 /// setup may take, so no session fails for the pause.
 const PAUSE_MAX: Duration = Duration::from_secs(3);
@@ -81,6 +95,12 @@ const STAGE_TRIES: usize = 5;
 /// How long Alice's row for the late-joined room must stay unchanged and idle before the timed post.
 const SETTLE: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
+/// How many of the [`ROOMS`] Bob joins at once. One in a release build, as the staging always ran.
+/// Three in a debug build, where a join's proof of work costs up to `watchdog::DEBUG_JOIN` and forty
+/// in turn were about 55 minutes of setup (V210-99): three, because a node answering fewer than
+/// four joins at once asks no more work of each (`Difficulty::ADAPT_THRESHOLD`), so no join is made
+/// harder by the others.
+const JOINS_AT_ONCE: usize = if cfg!(debug_assertions) { 3 } else { 1 };
 
 /// Print a line that reaches the log **when the test passes too**: straight to stderr, past
 /// libtest's capture, which swallows `println!` of a passing test. CI shows a green run's burst
@@ -115,7 +135,13 @@ fn backoffs(status: &serde_json::Value, peer: &str) -> Vec<String> {
 #[test]
 #[ignore = "two real daemons with production Argon2id and 40 rooms; CI runs it in release"]
 fn a_burst_past_the_slot_cap_is_queued() {
-    watchdog::arm();
+    // Sized on the whole debug run (#295): its 19 joins and 51 unlocks, each at twice its most
+    // measured, would ask for 7,434 s, past what any run is given. Three debug runs of this proof
+    // took 1,317.9 s, 1,696.9 s and 2,001.2 s.
+    watchdog::arm_for_debug_total(Duration::from_millis(2_001_200), 3);
+    shown(&format!(
+        "[proof] {PROFILE} build: bounds {BOUND:?} for the burst, {LATE_BOUND:?} for the late join"
+    ));
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let alice = Member::new(root, "alice");
@@ -128,8 +154,14 @@ fn a_burst_past_the_slot_cap_is_queued() {
     let rooms: Vec<String> = (0..ROOMS)
         .map(|i| alice.create(&format!("burst{i:02}")))
         .collect();
-    for (i, room) in rooms.iter().enumerate() {
-        bob.join(&alice.invite(room), &format!("burst{i:02}"));
+    let links: Vec<String> = rooms.iter().map(|r| alice.invite(r)).collect();
+    for chunk in (0..ROOMS).collect::<Vec<_>>().chunks(JOINS_AT_ONCE) {
+        std::thread::scope(|s| {
+            for &i in chunk {
+                let (bob, link) = (&bob, &links[i]);
+                s.spawn(move || bob.join(link, &format!("burst{i:02}")));
+            }
+        });
     }
     let mut rb = bob.reader();
     let ids: Vec<_> = rooms.iter().map(|r| rb.room(r)).collect();
@@ -149,7 +181,8 @@ fn a_burst_past_the_slot_cap_is_queued() {
         }
         assert!(
             start.elapsed() < Duration::from_secs(240),
-            "CANNOT MEASURE: bob never read the warm-up in rooms {unread:?}\nalice:\n{}\nbob:\n{}",
+            "PRODUCT: after both joins succeeded, bob read no warm-up post in rooms {unread:?} \
+             within 240 s of alice posting there\nalice:\n{}\nbob:\n{}",
             alice_d.transcript(),
             bob_d.transcript()
         );

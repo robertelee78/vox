@@ -74,7 +74,9 @@ fn storage<E: std::fmt::Display>(op: &'static str) -> impl FnOnce(E) -> Error {
 /// **For proofs only.** When set, [`Store::rewrite_fresh`] waits this many milliseconds between
 /// releasing the old file and renaming the new one over it — the moment no redb lock covers the
 /// profile. The concurrent-migration proof uses it to let a second vox reach that moment. Nothing
-/// a person runs sets it; unset, nothing changes.
+/// a person runs sets it; unset, nothing changes. Not compiled in without the `test-knobs` feature
+/// (V210-105).
+#[cfg(feature = "test-knobs")]
 pub const TEST_REPLACE_PAUSE_ENV: &str = "VOX_TEST_REPLACE_PAUSE_MS";
 
 /// The profile store.
@@ -261,6 +263,7 @@ impl Store {
         }
         // Release the old file, then replace it.
         drop(std::mem::replace(&mut *backing, Backing::Closed));
+        #[cfg(feature = "test-knobs")]
         super::profile::test_pause(
             TEST_REPLACE_PAUSE_ENV,
             "the store is released, not yet replaced",

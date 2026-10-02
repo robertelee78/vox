@@ -73,16 +73,22 @@ impl PendingConsents {
 
     /// Hold `skdm` (wire form) as the key to release to `target` in `channel_id`, unless that
     /// would break what [`PendingConsents::load`] accepts: a key over `MAX_SKDM` bytes, or a new
-    /// entry past `MAX_PENDING`. Whether it is held.
+    /// entry past `MAX_PENDING`. Whether it is held. Taken zeroizing, so a key refused here is
+    /// wiped as it is dropped too.
     #[must_use]
-    pub fn insert(&mut self, channel_id: Digest32, target: Digest32, skdm: Vec<u8>) -> bool {
+    pub fn insert(
+        &mut self,
+        channel_id: Digest32,
+        target: Digest32,
+        skdm: Zeroizing<Vec<u8>>,
+    ) -> bool {
         let key = (channel_id, target);
         if skdm.len() > MAX_SKDM
             || (self.entries.len() >= MAX_PENDING && !self.entries.contains_key(&key))
         {
             return false;
         }
-        self.entries.insert(key, Zeroizing::new(skdm));
+        self.entries.insert(key, skdm);
         true
     }
 
@@ -109,7 +115,7 @@ impl PendingConsents {
     /// is zeroized when dropped.
     #[must_use]
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
-        let mut e = Encoder::new();
+        let mut e = Encoder::for_secrets();
         e.array(2).uint(VERSION).array(self.entries.len());
         for ((room, member), skdm) in &self.entries {
             e.array(3).bytes(room).bytes(member).bytes(skdm);

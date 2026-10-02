@@ -26,6 +26,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -294,6 +296,7 @@ fn r6_a_room_with_no_retention_keeps_every_message_however_old() {
     let t = tempfile::tempdir().unwrap();
     let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
+    test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
     let skew = vec![("VOX_TEST_CLOCK_SKEW_MS", format!("-{TEN_YEARS_MS}"))];
     let _a = daemon(
         &alice,

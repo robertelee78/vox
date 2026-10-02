@@ -101,7 +101,7 @@ impl SenderChain {
     #[must_use]
     pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
         let (ed, ml) = self.signing_key.component_seeds();
-        let mut e = Encoder::new();
+        let mut e = Encoder::for_secrets();
         e.array(10)
             .uint(SENDER_STATE_VERSION)
             .bytes(&self.channel_id)
@@ -364,7 +364,7 @@ impl ReceiverChain {
     /// Contains key material, so the buffer zeroizes on drop.
     #[must_use]
     pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
-        let mut e = Encoder::new();
+        let mut e = Encoder::for_secrets();
         e.array(9)
             .uint(RECEIVER_STATE_VERSION)
             .bytes(&self.channel_id)
