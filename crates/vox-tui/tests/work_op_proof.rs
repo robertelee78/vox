@@ -102,7 +102,7 @@ impl Consumer {
                 };
                 eprintln!("[tail] {l}");
                 match serde_json::from_str(&l) {
-                    Ok(v) => sink.lock().unwrap().push(v),
+                    Ok(v) => sink.lock().expect("APPARATUS: a poisoned lock").push(v),
                     Err(e) => {
                         reason = format!(
                             "PRODUCT: `vox room tail --json` printed a line that is not JSON ({e}): {l:?}"
@@ -111,7 +111,7 @@ impl Consumer {
                     }
                 }
             }
-            *why.lock().unwrap() = Some(reason);
+            *why.lock().expect("APPARATUS: a poisoned lock") = Some(reason);
         });
         Self {
             child,
@@ -123,14 +123,19 @@ impl Consumer {
     fn wait(&mut self, what: &str, pred: impl Fn(&[serde_json::Value]) -> bool) {
         let deadline = Instant::now() + support::TIMEOUT;
         while Instant::now() < deadline {
-            if pred(&self.lines.lock().unwrap()) {
+            if pred(&self.lines.lock().expect("APPARATUS: a poisoned lock")) {
                 return;
             }
-            if let Some(why) = self.stopped.lock().unwrap().clone() {
+            if let Some(why) = self
+                .stopped
+                .lock()
+                .expect("APPARATUS: a poisoned lock")
+                .clone()
+            {
                 let status = self.child.try_wait().ok().flatten();
                 panic!(
                     "{why} (exit {status:?}) before the consumer saw {what}: {:?}",
-                    self.lines.lock().unwrap()
+                    self.lines.lock().expect("APPARATUS: a poisoned lock")
                 );
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -138,7 +143,7 @@ impl Consumer {
         panic!(
             "PRODUCT: the consumer never saw {what} within {:?}: {:?}",
             support::TIMEOUT,
-            self.lines.lock().unwrap()
+            self.lines.lock().expect("APPARATUS: a poisoned lock")
         );
     }
 }

@@ -171,7 +171,7 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
                 "--name",
                 name,
                 "--identity-passphrase-file",
-                w.pass.to_str().unwrap(),
+                w.pass.to_str().expect("APPARATUS: a non-UTF-8 temp path"),
             ],
         );
         assert!(
@@ -185,7 +185,7 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
                 "trust",
                 "list",
                 "--identity-passphrase-file",
-                w.pass.to_str().unwrap(),
+                w.pass.to_str().expect("APPARATUS: a non-UTF-8 temp path"),
             ],
         );
         assert!(
@@ -387,8 +387,12 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     }
 
     // ---- (6) the same claims, logged in opposite orders, fold to one board ----
-    let alice_d = alice.daemon_pid().expect("alice's daemon runs");
-    let bob_d = bob.daemon_pid().expect("bob's daemon runs");
+    let alice_d = alice
+        .daemon_pid()
+        .expect("APPARATUS: the harness has no pid for alice's daemon");
+    let bob_d = bob
+        .daemon_pid()
+        .expect("APPARATUS: the harness has no pid for bob's daemon");
     let anchor_d = room.anchor_pid();
     signal(bob_d, "-STOP", "bob's daemon");
     let first = alice.vox(Some("a1"), &["room", "claim", r, "h-order"]);
@@ -401,7 +405,7 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     signal(anchor_d, "-CONT", "the anchor");
     assert!(
         first.ok && first.stdout.contains("you hold h-order"),
-        "alice/a1 claimed h-order first, with nobody else claiming it: {first:?}"
+        "PRODUCT: alice/a1 claimed h-order first, with nobody else claiming it: {first:?}"
     );
     let orders: Vec<Vec<(String, String, u64)>> = [alice, bob]
         .iter()

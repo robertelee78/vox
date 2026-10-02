@@ -100,25 +100,27 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
     let (ok, said) = vox(&dir, IDPASS, &["id"], "");
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — `vox id` did not make the profile: {said}"
+        "PRODUCT (staging): `vox id` did not make the profile: {said}"
     );
     let fp = said.trim().lines().next().unwrap_or_default().to_owned();
     assert_eq!(
         fp.len(),
         52,
-        "CANNOT MEASURE: staging not achieved — `vox id`'s first line is not a fingerprint: {said}"
+        "PRODUCT (staging): `vox id`'s first line is not a fingerprint: {said}"
     );
     let store = dir.join("default").join("store.redb");
     assert!(
         store.is_file(),
-        "CANNOT MEASURE: staging not achieved — `vox id` left no {} to watch: {said}",
+        "PRODUCT (staging): `vox id` left no {} to watch: {said}",
         store.display()
     );
 
     // The room passphrase from a file: argv and the environment are refused (V210-72).
     let room_pass_at = tmp.path().join("room.pass");
     std::fs::write(&room_pass_at, "x").expect("APPARATUS: write the room passphrase file");
-    let room_pass = room_pass_at.to_str().unwrap();
+    let room_pass = room_pass_at
+        .to_str()
+        .expect("APPARATUS: a non-UTF-8 temp path");
     // A syntactically whole address, so `connect` gets as far as opening the profile.
     let link = format!("vox://{fp}?a={fp}&b=/ip4/127.0.0.1/udp/1");
     let verbs: [(&str, Vec<&str>); 5] = [
@@ -280,7 +282,7 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
                 let _ = daemon.kill();
                 let _ = daemon.wait();
                 panic!(
-                    "CANNOT MEASURE: staging not achieved — the holding `vox daemon` {} \
+                    "PRODUCT (staging): the holding `vox daemon` {} \
                      before naming its control socket.\nstdout:\n{}\nstderr:\n{}",
                     if matches!(why, mpsc::RecvTimeoutError::Timeout) {
                         format!("was not up within {up_within:?}")

@@ -45,7 +45,7 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
     match out.code {
         Some(0) => assert!(
             said.contains("cargo PASS"),
-            "exit 0 without a PASS line: {said}"
+            "APPARATUS: the driver exited 0 without a PASS line: {said}"
         ),
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
         _ if !out.has_verdict("cargo") => panic!(

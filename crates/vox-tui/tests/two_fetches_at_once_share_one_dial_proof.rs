@@ -236,7 +236,7 @@ impl Agent {
         while !self.vox(&["room", "list"]).0 {
             assert!(
                 started.elapsed() < Duration::from_secs(60),
-                "CANNOT MEASURE: staging not achieved — {}'s daemon never answered `vox room list` \
+                "PRODUCT (staging): {}'s daemon never answered `vox room list` \
                  in {:?}; it said:\n{}",
                 self.name,
                 started.elapsed(),
@@ -270,10 +270,7 @@ fn agent(tmp: &tempfile::TempDir, name: &str, listen: &str, spec: &str) -> Agent
         "--identity-passphrase-file",
         &a.pass.to_string_lossy(),
     ]);
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — {name}'s `vox id` failed: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): {name}'s `vox id` failed: {err}");
     a.start_daemon();
     a
 }
@@ -304,13 +301,13 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: staging not achieved — the anchor never printed its spec in 60 s:\n\
+            "PRODUCT (staging): the anchor never printed its spec in 60 s:\n\
              {said}"
         );
         std::thread::sleep(Duration::from_millis(100));
     };
     let Some((fp, addr)) = spec.split_once('@') else {
-        panic!("CANNOT MEASURE: the anchor's spec is not `fingerprint@address`: {spec}");
+        panic!("PRODUCT (staging): the anchor's spec is not `fingerprint@address`: {spec}");
     };
     let port = addr.rsplit('/').next().unwrap_or_default();
     (
@@ -339,7 +336,7 @@ fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) {
         }
         assert!(
             started.elapsed() < Duration::from_secs(90),
-            "CANNOT MEASURE: staging not achieved — no {what} in {:?}; `vox {}` last said:\n\
+            "PRODUCT (staging): no {what} in {:?}; `vox {}` last said:\n\
              {out}{err}",
             started.elapsed(),
             args.join(" ")
@@ -390,10 +387,7 @@ fn two_fetches_at_once_share_one_dial() {
     let mut bob = agent(&tmp, "bob", "[::1]:0", &v6);
     let fp = |a: &Agent| {
         let (ok, out, err) = a.vox(&["id"]);
-        assert!(
-            ok,
-            "CANNOT MEASURE: staging not achieved — `vox id` failed: {err}"
-        );
+        assert!(ok, "PRODUCT (staging): `vox id` failed: {err}");
         out.trim().to_owned()
     };
     let (alice_fp, bob_fp) = (fp(&alice), fp(&bob));
@@ -407,39 +401,30 @@ fn two_fetches_at_once_share_one_dial() {
             "--identity-passphrase-file",
             &who.pass.to_string_lossy(),
         ]);
-        assert!(
-            ok,
-            "CANNOT MEASURE: staging not achieved — trusting {name} failed: {err}"
-        );
+        assert!(ok, "PRODUCT (staging): trusting {name} failed: {err}");
     }
     let (ok, _, err) = alice.vox_with(&["room", "create", "--name", "mission"], ROOM_PASS);
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — `vox room create` failed: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): `vox room create` failed: {err}");
     let (_, list, err) = alice.vox(&["room", "list"]);
     let Some(label) = list.split_whitespace().next().map(str::to_owned) else {
-        panic!("CANNOT MEASURE: staging not achieved — `vox room list` names no room: {list}{err}");
+        panic!("PRODUCT (staging): `vox room list` names no room: {list}{err}");
     };
     let (ok, link, err) = alice.vox(&["room", "invite", &label]);
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — `vox room invite` failed: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): `vox room invite` failed: {err}");
     let link = link.trim().to_owned();
     let Some(room) = link
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
         .map(str::to_owned)
     else {
-        panic!("CANNOT MEASURE: `vox room invite` printed no `vox://` link: {link}");
+        panic!("PRODUCT (staging): `vox room invite` printed no `vox://` link: {link}");
     };
     // One join, no retry: a join that fails is a defect in joining, which is not what this proves,
     // and retrying would hide it.
     let (ok, out, err) = bob.vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS);
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — bob's `vox room join` over the relay failed: \
+        "PRODUCT (staging): bob's `vox room join` over the relay failed: \
          {out}{err}"
     );
 
@@ -526,7 +511,7 @@ fn two_fetches_at_once_share_one_dial() {
         let count = |field: &str| {
             row.and_then(|r| r[field].as_u64()).unwrap_or_else(|| {
                 panic!(
-                    "CANNOT MEASURE: cycle {cycle}: bob's `vox status --json` has no `reach` \
+                    "PRODUCT (staging): cycle {cycle}: bob's `vox status --json` has no `reach` \
                      `{field}` for alice, so nothing dialled her or the field is gone: {json}"
                 )
             })
@@ -549,7 +534,7 @@ fn two_fetches_at_once_share_one_dial() {
     }
     let Some(carried) = circuits(&anchor) else {
         panic!(
-            "CANNOT MEASURE: the anchor printed no status line to read its circuits from:\n{}",
+            "PRODUCT (staging): the anchor printed no status line to read its circuits from:\n{}",
             anchor.said()
         );
     };

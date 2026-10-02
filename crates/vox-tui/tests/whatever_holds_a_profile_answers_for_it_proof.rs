@@ -130,7 +130,7 @@ fn whatever_holds_a_profile_answers_for_it() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — the guest could not join ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join ({took:?}).\n{out}\n{err}"
     );
     w.forward();
     let room: String = w.room.chars().take(12).collect();
@@ -141,7 +141,7 @@ fn whatever_holds_a_profile_answers_for_it() {
     let (ok, stranger, err) = vox_once(&third, &args(&["id"]));
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — `vox id` for a third profile failed: {err}"
+        "PRODUCT (staging): `vox id` for a third profile failed: {err}"
     );
     let stranger = stranger.trim().to_owned();
 

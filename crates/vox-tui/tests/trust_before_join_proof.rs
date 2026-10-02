@@ -14,7 +14,8 @@
 //! Every trust edge is added before either daemon starts, and alice posts the moment
 //! bob's `vox room join` returns — the shape that failed. Bob joins once, as a person would:
 //! a refused join is a PRODUCT red quoting the join and both daemons, never retried past.
-//! Staging that did not happen (an identity, trust, the anchor, a room) reads CANNOT MEASURE.
+//! A staging step `vox` itself performs that fails (an identity, trust, the anchor, a room) reads
+//! `PRODUCT (staging):`, quoting what `vox` said.
 
 #![cfg(unix)]
 
@@ -117,13 +118,15 @@ impl Member {
             &[
                 "id",
                 "--identity-passphrase-file",
-                self.pass.to_str().unwrap(),
+                self.pass
+                    .to_str()
+                    .expect("APPARATUS: a non-UTF-8 temp path"),
             ],
             None,
         );
         assert!(
             ok,
-            "CANNOT MEASURE: staging not achieved — {}'s `vox id` failed: {err}",
+            "PRODUCT (staging): {}'s `vox id` failed: {err}",
             self.name
         );
         out.trim().to_owned()
@@ -158,7 +161,7 @@ impl Member {
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: staging not achieved — {}'s daemon never answered `vox room \
+                "PRODUCT (staging): {}'s daemon never answered `vox room \
                  list` in 60 s; the last answer: {said}\nthe daemon's stderr:\n{}",
                 self.name,
                 std::fs::read_to_string(err).unwrap_or_default()
@@ -216,7 +219,7 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: staging not achieved — the anchor printed no spec in 60 s.\n\
+            "PRODUCT (staging): the anchor printed no spec in 60 s.\n\
              stdout:\n{text}\nstderr:\n{}",
             std::fs::read_to_string(&anchor_err).unwrap_or_default()
         );
@@ -235,13 +238,13 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
                 "--name",
                 members[j].name,
                 "--identity-passphrase-file",
-                m.pass.to_str().unwrap(),
+                m.pass.to_str().expect("APPARATUS: a non-UTF-8 temp path"),
             ],
             None,
         );
         assert!(
             ok,
-            "CANNOT MEASURE: staging not achieved — {} could not trust {}: {err}",
+            "PRODUCT (staging): {} could not trust {}: {err}",
             m.name, members[j].name
         );
     }
@@ -265,20 +268,20 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
     let (ok, _, err) = alice.vox(&["room", "create", "--name", "mission"], Some(ROOM_PASS));
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — alice's `vox room create` failed: {err}"
+        "PRODUCT (staging): alice's `vox room create` failed: {err}"
     );
     let (_, listed, _) = alice.vox(&["room", "list"], None);
     let room = listed
         .split_whitespace()
         .next()
         .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: staging not achieved — alice's `vox room list` shows no room: {listed:?}")
+            panic!("PRODUCT (staging): alice's `vox room list` shows no room: {listed:?}")
         })
         .to_owned();
     let (ok, link, err) = alice.vox(&["room", "invite", &room], None);
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — alice's `vox room invite` failed: {err}"
+        "PRODUCT (staging): alice's `vox room invite` failed: {err}"
     );
     let link = link.trim().to_owned();
     // One join, as a person makes it: no retry past a refusal, so a join turned away is a red

@@ -39,9 +39,10 @@
 //!   defaults, stays green while the other two hold.
 //!
 //! Every red names its side: `PRODUCT:` quotes what the tunnel's application saw and what
-//! `vox` said; `CANNOT MEASURE:` is staging that did not happen (a forward that never carried
-//! a byte before the event under test), or a runner that stalled through a timed window,
-//! which [`StallClock`] measures on the same timeline as the bound.
+//! `vox` said; `PRODUCT (staging):` is a step `vox` performs that failed before the event under
+//! test (a forward that never carried a byte, a session never live); `CANNOT MEASURE:` is only a
+//! runner that stalled through a timed window, which [`StallClock`] measures on the same
+//! timeline as the bound.
 //!
 //! ## Why it is `#[ignore]`d
 //!
@@ -128,7 +129,7 @@ fn a_forward_carries_a_new_connection_after_its_host_restarts() {
         round_trip(at, b"before the restart", Duration::from_secs(120)).unwrap_or_else(|e| {
             let host_said = w.host.as_mut().map(|h| h.transcript()).unwrap_or_default();
             panic!(
-                "CANNOT MEASURE: staging not achieved — the forward carried no connection before \
+                "PRODUCT (staging): the forward carried no connection before \
                  the restart ({e}), so a restart proves nothing. The forward said:\n{}\nThe host \
                  said:\n{host_said}",
                 fwd.transcript()
@@ -261,7 +262,7 @@ fn removing_a_service_cuts_its_live_sessions_within_a_second() {
     // for the removal to cut.
     let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
         panic!(
-            "CANNOT MEASURE: staging not achieved — the forward's listener {at} refused a \
+            "PRODUCT (staging): the forward's listener {at} refused a \
              connection: {e}. It said:\n{}",
             fwd.transcript()
         )
@@ -276,7 +277,7 @@ fn removing_a_service_cuts_its_live_sessions_within_a_second() {
         .and_then(|()| s.read_exact(&mut back))
     {
         panic!(
-            "CANNOT MEASURE: staging not achieved — the session was never live before the \
+            "PRODUCT (staging): the session was never live before the \
              removal ({e}). The forward said:\n{}",
             fwd.transcript()
         );
@@ -356,14 +357,14 @@ fn a_backend_reset_reaches_the_far_client_as_a_reset() {
 
     let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
         panic!(
-            "CANNOT MEASURE: staging not achieved — the forward's listener {at} refused a \
+            "PRODUCT (staging): the forward's listener {at} refused a \
              connection: {e}. It said:\n{}",
             fwd.transcript()
         )
     });
     s.write_all(b"GET /").unwrap_or_else(|e| {
         panic!(
-            "CANNOT MEASURE: staging not achieved — the request could not be written to the \
+            "PRODUCT (staging): the request could not be written to the \
              forward: {e}. It said:\n{}",
             fwd.transcript()
         )
@@ -385,7 +386,7 @@ fn a_backend_reset_reaches_the_far_client_as_a_reset() {
     let transcript = fwd.transcript();
     assert!(
         !got.is_empty(),
-        "CANNOT MEASURE: staging not achieved — not one byte of the backend's reply crossed \
+        "PRODUCT (staging): not one byte of the backend's reply crossed \
          (the read ended {ending:?}), so no reset was ever relayed. The forward said:\n\
          {transcript}"
     );
@@ -424,7 +425,7 @@ fn a_refused_forward_resets_the_application_and_says_why() {
     let t0 = Instant::now();
     let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
         panic!(
-            "CANNOT MEASURE: staging not achieved — the forward's listener {at} refused a \
+            "PRODUCT (staging): the forward's listener {at} refused a \
              connection: {e}. It said:\n{}",
             fwd.transcript()
         )

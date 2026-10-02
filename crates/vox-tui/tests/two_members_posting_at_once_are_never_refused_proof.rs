@@ -20,7 +20,7 @@
 //! MEASURE**, never a pass and never a product verdict.
 //!
 //! The warm-up (everyone reads everyone) can meet #200's pairwise-session race, which fails as
-//! CANNOT MEASURE, never as a pass.
+//! `PRODUCT (staging)`, never as a pass: it is `vox` that did not deliver.
 //!
 //! ## ADR-025 P6
 //! vox-0e's gate (3bb6ca1, on `test/two-member-collisions`), adapted as ADR-025's P6: besides
@@ -141,7 +141,7 @@ impl Member {
         });
         let Some(rows) = v["sync"].as_array() else {
             panic!(
-                "CANNOT MEASURE: {}'s `vox status --json` has no `sync` rows: {out}",
+                "PRODUCT (staging): {}'s `vox status --json` has no `sync` rows: {out}",
                 self.name
             );
         };
@@ -149,7 +149,7 @@ impl Member {
             .map(|r| {
                 r["busy_refused"].as_u64().unwrap_or_else(|| {
                     panic!(
-                        "CANNOT MEASURE: a sync row in {}'s `vox status --json` has no \
+                        "PRODUCT (staging): a sync row in {}'s `vox status --json` has no \
                          `busy_refused`: {r}",
                         self.name
                     )
@@ -163,13 +163,15 @@ impl Member {
             &[
                 "id",
                 "--identity-passphrase-file",
-                self.pass.to_str().unwrap(),
+                self.pass
+                    .to_str()
+                    .expect("APPARATUS: a non-UTF-8 temp path"),
             ],
             None,
         );
         assert!(
             ok,
-            "CANNOT MEASURE: staging not achieved — {}'s `vox id` failed: {err}",
+            "PRODUCT (staging): {}'s `vox id` failed: {err}",
             self.name
         );
         out.trim().to_owned()
@@ -199,7 +201,7 @@ impl Member {
         while !self.vox(&["room", "list"], None).0 {
             assert!(
                 started.elapsed() < Duration::from_secs(60),
-                "CANNOT MEASURE: staging not achieved — {}'s daemon never answered `vox room list` \
+                "PRODUCT (staging): {}'s daemon never answered `vox room list` \
                  in {:?}; its stderr:\n{}",
                 self.name,
                 started.elapsed(),
@@ -242,7 +244,7 @@ fn spawn_anchor(root: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: staging not achieved — the anchor never printed its spec in 60 s; \
+            "PRODUCT (staging): the anchor never printed its spec in 60 s; \
              it said:\n{text}\n{}",
             std::fs::read_to_string(&anchor_err).unwrap_or_default()
         );
@@ -329,13 +331,13 @@ fn two_members_posting_at_once_are_never_refused() {
                         "--name",
                         other.name,
                         "--identity-passphrase-file",
-                        m.pass.to_str().unwrap(),
+                        m.pass.to_str().expect("APPARATUS: a non-UTF-8 temp path"),
                     ],
                     None,
                 );
                 assert!(
                     ok,
-                    "CANNOT MEASURE: staging not achieved — {} could not trust {}: {err}",
+                    "PRODUCT (staging): {} could not trust {}: {err}",
                     m.name, other.name
                 );
             }
@@ -349,16 +351,16 @@ fn two_members_posting_at_once_are_never_refused() {
     let (ok, _, err) = alice.vox(&["room", "create", "--name", "mission"], Some(ROOM_PASS));
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — alice's `vox room create` failed: {err}"
+        "PRODUCT (staging): alice's `vox room create` failed: {err}"
     );
     let (_, list, err) = alice.vox(&["room", "list"], None);
     let Some(room) = list.split_whitespace().next().map(str::to_owned) else {
-        panic!("CANNOT MEASURE: staging not achieved — alice's `vox room list` names no room: {list}{err}");
+        panic!("PRODUCT (staging): alice's `vox room list` names no room: {list}{err}");
     };
     let (ok, link, err) = alice.vox(&["room", "invite", &room], None);
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — alice's `vox room invite` failed: {err}"
+        "PRODUCT (staging): alice's `vox room invite` failed: {err}"
     );
     let link = link.trim().to_owned();
     // One join, no retry: a join that fails is a defect in joining, which is not what this proves,
@@ -369,7 +371,7 @@ fn two_members_posting_at_once_are_never_refused() {
     );
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — bob's `vox room join` failed: {out}{err}"
+        "PRODUCT (staging): bob's `vox room join` failed: {out}{err}"
     );
     // Everyone reads everyone before the anchor stops: keys have flowed and every pair has a session.
     let mut pending: Vec<(&str, &str)> = Vec::new();
@@ -385,7 +387,7 @@ fn two_members_posting_at_once_are_never_refused() {
     while !pending.is_empty() {
         assert!(
             start.elapsed() < Duration::from_secs(90),
-            "CANNOT MEASURE: {pending:?} still unread after 90 s, before anyone died"
+            "PRODUCT (staging): {pending:?} still unread after 90 s, before anyone died"
         );
         round += 1;
         for w in &members {
@@ -396,7 +398,7 @@ fn two_members_posting_at_once_are_never_refused() {
                 );
                 assert!(
                     ok,
-                    "CANNOT MEASURE: staging not achieved — {}'s warm-up post failed: {err}",
+                    "PRODUCT (staging): {}'s warm-up post failed: {err}",
                     w.name
                 );
             }
@@ -451,9 +453,12 @@ fn two_members_posting_at_once_are_never_refused() {
         }
         // Per crossing: when it was seen (the end of the read that showed it), and when the last
         // read that did not show it started — the crossing lies between the two.
-        let mut seen_at: Vec<(String, Duration, Duration)> = Vec::new();
+        let mut seen_at: Vec<(String, &str, Duration, Duration)> = Vec::new();
         let mut missed_at: std::collections::HashMap<(&str, &str), Duration> =
             std::collections::HashMap::new();
+        // Every `vox room read` this round, per reader: when it started and when it returned. A
+        // read that itself took past the bound is a person waiting that long, whatever the poll.
+        let mut reads: Vec<(&str, Duration, Duration)> = Vec::new();
         while !unseen.is_empty() && posted.elapsed() < Duration::from_secs(45) {
             for rd in &members {
                 if !unseen.iter().any(|(x, _)| *x == rd.name) {
@@ -467,13 +472,14 @@ fn two_members_posting_at_once_are_never_refused() {
                     rd.name
                 );
                 let at = posted.elapsed();
+                reads.push((rd.name, asked, at));
                 unseen.retain(|(x, w)| {
                     if *x != rd.name {
                         return true;
                     }
                     if out.contains(&format!("round-{r}-{w}")) {
                         let missed = missed_at.get(&(*x, *w)).copied().unwrap_or_default();
-                        seen_at.push((format!("{w}->{x}"), at, missed));
+                        seen_at.push((format!("{w}->{x}"), x, at, missed));
                         false
                     } else {
                         missed_at.insert((*x, *w), asked);
@@ -485,7 +491,7 @@ fn two_members_posting_at_once_are_never_refused() {
         }
         let slowest = seen_at
             .iter()
-            .map(|(_, d, _)| *d)
+            .map(|(_, _, d, _)| *d)
             .max()
             .unwrap_or(Duration::MAX);
         eprintln!(
@@ -497,19 +503,33 @@ fn two_members_posting_at_once_are_never_refused() {
             }
         );
         worst = worst.max(slowest);
-        // A crossing past the bound is the product's only if a read that started past the bound,
-        // plus what the runner stalled meanwhile, still missed it; otherwise the poll gap or the
-        // runner may have made it look late.
-        let mut judge = |who: String, missed: Duration, seen: Option<Duration>| {
+        // A crossing past the bound is the product's if a read that started past the bound, plus
+        // what the runner stalled meanwhile, still missed it; or if one of the reader's own `vox
+        // room read`s took past the bound, less what the runner stalled during it, since a person
+        // waits on that read. Otherwise the poll gap or the runner may have made it look late.
+        let mut judge = |who: String, reader: &str, missed: Duration, seen: Option<Duration>| {
             let stalled = stalls.within(posted, posted + missed);
             let shown = match seen {
                 Some(d) => format!("seen at {d:?}"),
                 None => "never seen within 45 s".to_owned(),
             };
+            let slow_read = reads
+                .iter()
+                .filter(|(n, asked, _)| *n == reader && seen.is_none_or(|d| *asked < d))
+                .map(|(_, asked, at)| {
+                    let stall = stalls.within(posted + *asked, posted + *at);
+                    ((*at - *asked).saturating_sub(stall), *at - *asked, stall)
+                })
+                .max();
             if missed > BOUND + stalled {
                 late.push(format!(
                     "round {r} {who}: still unread by a read started at {missed:?}, {shown} \
                      (runner stalled {stalled:?})"
+                ));
+            } else if let Some((net, took, stall)) = slow_read.filter(|(net, _, _)| *net > BOUND) {
+                late.push(format!(
+                    "round {r} {who}: {shown}; one of {reader}'s `vox room read`s itself took \
+                     {took:?} (runner stalled {stall:?} during it, so {net:?} was vox's)"
                 ));
             } else {
                 unmeasured.push(format!(
@@ -519,14 +539,14 @@ fn two_members_posting_at_once_are_never_refused() {
                 ));
             }
         };
-        for (who, d, missed) in &seen_at {
+        for (who, reader, d, missed) in &seen_at {
             if *d > BOUND {
-                judge(who.clone(), *missed, Some(*d));
+                judge(who.clone(), reader, *missed, Some(*d));
             }
         }
         for (x, w) in &unseen {
             let missed = missed_at.get(&(*x, *w)).copied().unwrap_or_default();
-            judge(format!("{w}->{x}"), missed, None);
+            judge(format!("{w}->{x}"), x, missed, None);
         }
     }
     std::thread::sleep(Duration::from_secs(1));
@@ -568,7 +588,8 @@ fn two_members_posting_at_once_are_never_refused() {
     assert!(
         late.is_empty(),
         "PRODUCT: with every member posting at once, a post crossed later than {BOUND:?}: \
-         {late:?} — a push that kept colliding was left to the 30 s interval"
+         {late:?} (a push that kept colliding was left to the 30 s interval, or `vox room read` \
+         itself kept the reader waiting)"
     );
     assert!(
         unmeasured.is_empty(),
