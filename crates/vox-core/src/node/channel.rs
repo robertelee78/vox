@@ -4489,6 +4489,58 @@ impl ChannelState {
         self.receivers.keys().any(|(a, _)| a == author)
     }
 
+    /// Whether this node holds generation `chain_id` of `author`'s sender key.
+    #[must_use]
+    pub fn holds_generation(&self, author: &Digest32, chain_id: u64) -> bool {
+        self.receivers.contains_key(&(*author, chain_id))
+    }
+
+    /// Drop every sender key held from an author not in `trusted` (V210-118): a node reads only
+    /// the members its owner trusts. Messages already rendered stay rendered; nothing that
+    /// arrives from such an author afterwards opens. Returns how many generations were dropped.
+    pub fn forget_keys_except(
+        &mut self,
+        store: &Store,
+        trusted: &BTreeSet<Digest32>,
+    ) -> Result<usize> {
+        let before = self.receivers.len();
+        self.receivers.retain(|(a, _), _| trusted.contains(a));
+        let dropped = before - self.receivers.len();
+        if dropped > 0 {
+            self.persist_receivers(store)?;
+        }
+        Ok(dropped)
+    }
+
+    /// Offer `target` again **every** generation it is entitled to, if it is consented to here
+    /// (V210-118): the live one, and each retired one from where its entitlement began, as
+    /// history. `target` may have refused them while its owner did not trust this identity, or
+    /// dropped them when its owner stopped trusting it; a key it has just handed over says it may
+    /// take ours now. Only the live generation was offered again, so the posts sealed under a
+    /// generation retired in between stayed unreadable to it for good, although it was entitled
+    /// to them. Sending a generation it already holds is harmless: [`Self::accept_skdm`] keeps the
+    /// one it has.
+    pub fn reoffer(&mut self, store: &Store, target: &Digest32) -> Result<()> {
+        if !self.has_consented(target) {
+            return Ok(());
+        }
+        self.owe_entitled_history(store, target)?;
+        if self.delivered.remove(target).is_some() {
+            self.persist_delivered(store)?;
+        }
+        Ok(())
+    }
+
+    /// Owe `target`, as history, every retired generation from the one its entitlement begins
+    /// in (V210-118). Nothing when it is entitled only to the live one, which the ordinary re-key
+    /// covers.
+    pub fn owe_entitled_history(&mut self, store: &Store, target: &Digest32) -> Result<()> {
+        match self.entitled_from(target) {
+            Some((from, _)) => self.owe_history(store, *target, from),
+            None => Ok(()),
+        }
+    }
+
     /// Persist the receiver chains, poisoning the channel if the write fails.
     fn persist_receivers(&mut self, store: &Store) -> Result<()> {
         let seg = seal_segment(

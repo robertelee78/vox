@@ -18,7 +18,18 @@
 //! IPv4 host from an IPv6-only guest needs a relay circuit (#173), so the join as a whole is
 //! reported but not asserted.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    an_ipv6_only_joiner_reaches_its_board_within_two_seconds,
+    a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seconds
+);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -33,8 +44,9 @@ use world::{after_label, args, echo_service, vox_once, VoxProc};
 /// PRD-001 R42's bound for a first connection.
 const BOARD_WITHIN: Duration = Duration::from_secs(2);
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "production Argon2id and a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id and a real PoW, driving the real binary; optional, run it in release"]
 fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
@@ -137,8 +149,9 @@ fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
 /// a short grace and then not waited for, reaches the live board without first timing out on each
 /// dead one. This is the staging that isolates `reach_a_board`'s concurrency; the first one is
 /// carried by the family filter and the endpoint merge on their own.
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "production Argon2id and a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id and a real PoW, driving the real binary; optional, run it in release"]
 fn a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seconds() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();

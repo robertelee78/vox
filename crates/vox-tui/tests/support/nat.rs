@@ -36,7 +36,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +123,8 @@ pub struct TwoNats {
     stop: Arc<AtomicBool>,
     /// When each inside address first sent a peer datagram (towards the other process).
     first_p2p: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
+    /// The first emulator thread's panic, if one panicked: see [`locked`].
+    panicked: Arc<OnceLock<String>>,
 }
 
 impl TwoNats {
@@ -141,21 +143,21 @@ impl TwoNats {
         let counters = Arc::new(Counters::default());
         let stop = Arc::new(AtomicBool::new(false));
         let first_p2p = Arc::new(Mutex::new(HashMap::new()));
+        let panicked = Arc::new(OnceLock::new());
         let ctx = Ctx {
             inner: Arc::clone(&inner),
             counters: Arc::clone(&counters),
             stop: Arc::clone(&stop),
             first_p2p: Arc::clone(&first_p2p),
+            panicked: Arc::clone(&panicked),
             anchor_v6,
             anchor_v4,
         };
         let (anchor_for_host, anchor_for_guest) = {
-            let mut locked = inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut held = locked(&inner, &panicked);
             (
-                bind_socket(&mut locked, "127.0.0.1:0", Role::AnchorForHost, &ctx),
-                bind_socket(&mut locked, "[::1]:0", Role::AnchorForGuest, &ctx),
+                bind_socket(&mut held, "127.0.0.1:0", Role::AnchorForHost, &ctx),
+                bind_socket(&mut held, "[::1]:0", Role::AnchorForGuest, &ctx),
             )
         };
         Self {
@@ -168,52 +170,61 @@ impl TwoNats {
             counters,
             stop,
             first_p2p,
+            panicked,
         }
     }
 
     /// Peer payload bytes delivered guest → host.
     pub fn p2p_to_host(&self) -> u64 {
+        self.sound();
         self.counters.p2p_to_host.load(Ordering::SeqCst)
     }
 
     /// Peer payload bytes delivered host → guest.
     pub fn p2p_to_guest(&self) -> u64 {
+        self.sound();
         self.counters.p2p_to_guest.load(Ordering::SeqCst)
     }
 
     /// Unsolicited peer datagrams a NAT dropped.
     pub fn p2p_filtered(&self) -> u64 {
+        self.sound();
         self.counters.p2p_filtered.load(Ordering::SeqCst)
     }
 
     /// Anchor datagrams a NAT dropped (should stay 0: each process dialled its anchor).
     pub fn anchor_filtered(&self) -> u64 {
+        self.sound();
         self.counters.anchor_filtered.load(Ordering::SeqCst)
+    }
+
+    /// `CANNOT MEASURE` if an emulator thread panicked: it stopped carrying datagrams, so a count
+    /// read now would blame vox for what the emulator dropped.
+    fn sound(&self) {
+        if let Some(why) = self.panicked.get() {
+            panic!(
+                "CANNOT MEASURE: a NAT emulator thread panicked, so it stopped carrying datagrams \
+                 and nothing measured through it can be judged: {why}"
+            );
+        }
     }
 
     /// When each inside address first sent the other process a datagram.
     pub fn first_p2p(&self) -> HashMap<SocketAddr, Instant> {
-        self.first_p2p
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.sound();
+        locked(&self.first_p2p, &self.panicked).clone()
     }
 
     /// The peer datagrams seen so far (the first few hundred).
     pub fn events(&self) -> Vec<P2pEvent> {
-        self.counters
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.sound();
+        locked(&self.counters.events, &self.panicked).clone()
     }
 
     /// The public mappings each NAT holds, as `(inside, public)` — for a report.
     pub fn mappings(&self) -> (usize, usize) {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sound();
+        let inner = locked(&self.inner, &self.panicked);
         (inner.host_nat.mapping.len(), inner.guest_nat.mapping.len())
     }
 }
@@ -230,6 +241,7 @@ struct Ctx {
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
     first_p2p: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
+    panicked: Arc<OnceLock<String>>,
     anchor_v6: SocketAddr,
     anchor_v4: SocketAddr,
 }
@@ -247,14 +259,27 @@ fn bind_socket(inner: &mut Inner, bind: &str, role: Role, ctx: &Ctx) -> SocketAd
     inner.roles.insert(addr, role);
     let ctx = ctx.clone();
     std::thread::spawn(move || {
-        let mut buf = vec![0u8; 65536];
-        while !ctx.stop.load(Ordering::SeqCst) {
-            let Ok((n, src)) = sock.recv_from(&mut buf) else {
-                continue;
-            };
-            if let Some((via, to)) = route(&ctx, addr, role, src, n) {
-                let _ = via.send_to(&buf[..n], to);
+        let carried = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut buf = vec![0u8; 65536];
+            while !ctx.stop.load(Ordering::SeqCst) {
+                let Ok((n, src)) = sock.recv_from(&mut buf) else {
+                    continue;
+                };
+                if let Some((via, to)) = route(&ctx, addr, role, src, n) {
+                    let _ = via.send_to(&buf[..n], to);
+                }
             }
+        }));
+        // Recorded, so the red that follows quotes it rather than a symptom of it.
+        if let Err(p) = carried {
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_else(|| "a panic with no message".to_owned());
+            let _ = ctx
+                .panicked
+                .set(format!("the thread for {addr} ({role:?}) panicked: {msg}"));
         }
     });
     addr
@@ -329,10 +354,7 @@ fn route(
     src: SocketAddr,
     n: usize,
 ) -> Option<(Arc<UdpSocket>, SocketAddr)> {
-    let mut inner = ctx
-        .inner
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut inner = locked(&ctx.inner, &ctx.panicked);
     match role {
         // A process dials its anchor: out through its NAT, to the anchor's real address.
         Role::AnchorForHost => {
@@ -368,19 +390,13 @@ fn route(
                 Side::Host => Side::Guest,
                 Side::Guest => Side::Host,
             };
-            ctx.first_p2p
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            locked(&ctx.first_p2p, &ctx.panicked)
                 .entry(src)
                 .or_insert_with(Instant::now);
             let from_public = egress(&mut inner, ctx, other, src, at);
             let verdict = ingress(&inner, side, at, from_public);
             {
-                let mut ev = ctx
-                    .counters
-                    .events
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut ev = locked(&ctx.counters.events, &ctx.panicked);
                 if ev.len() < EVENT_LOG {
                     ev.push(P2pEvent {
                         at: Instant::now(),
@@ -409,4 +425,25 @@ fn route(
             Some((Arc::clone(&inner.sockets[&from_public]), inside))
         }
     }
+}
+
+/// Lock emulator state, or end the run `CANNOT MEASURE`, quoting the emulator thread's panic that
+/// poisoned it: going on past it would read state a panic left half-written, and the red that
+/// followed would not mention the panic.
+fn locked<'a, T>(m: &'a Mutex<T>, panicked: &OnceLock<String>) -> MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|_| {
+        // The panicking thread records its panic as it unwinds, a moment after the lock poisons.
+        let wait = Instant::now() + Duration::from_secs(1);
+        while panicked.get().is_none() && Instant::now() < wait {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "CANNOT MEASURE: the NAT emulator's state is poisoned, so nothing measured through it \
+             can be judged: {}",
+            panicked.get().map_or(
+                "a thread panicked holding it (its panic was not recorded)",
+                String::as_str
+            )
+        )
+    })
 }

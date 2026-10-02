@@ -239,6 +239,10 @@ fn retrust(freeze: Duration, through_log: bool) {
         );
         assert!(ok, "CANNOT MEASURE: a join failed: {err}");
     }
+    // Bob trusts carol from the start: a node reads only whom its owner trusts (V210-118), so
+    // what this measures is carol's decision alone.
+    let (ok, _, err) = vox(bob_dir, &["trust", "add", &fps[2], "--name", "carol"], None);
+    assert!(ok, "bob trusts carol: {err}");
     // Both hold the room and each other's admission before carol decides anything.
     let (ok, _, _) = vox(
         carol_dir,

@@ -24,7 +24,15 @@
 //! count a board's refresh of what it already holds as news, or start a publish round after
 //! every sync that applied entries, and it goes red on the counts.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_post_answers_promptly_while_a_peer_posts);
 
 #[path = "support/world.rs"]
 mod world;
@@ -125,8 +133,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
     panic!("{name}'s daemon never answered `vox room list`");
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real vox processes with production Argon2id; CI runs it in release"]
+#[ignore = "real vox processes with production Argon2id; optional, run it in release"]
 fn a_post_answers_promptly_while_a_peer_posts() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
