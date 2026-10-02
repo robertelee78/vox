@@ -16,8 +16,8 @@
 //! who this identity consents to on the room's log, a room is online when the node holds a
 //! connection to another of its members, and sync says how many peers it is connected to.
 //! Verification is shown as unverified for every other member: the node exposes no safety code to
-//! compare, so there is nothing a mark could rest on, and `:verify` says it is not available. The
-//! ADR-015 visibility and block verbs report `NotAvailableYet` too.
+//! compare, so there is nothing a mark could rest on, and the TUI offers no `:verify` (V210-155):
+//! it offers only commands vox supports.
 
 use std::collections::BTreeMap;
 
@@ -28,8 +28,8 @@ use vox_core::node::api::{Fault, NodeCommand, NodeEvent, NodeView, Outcome, Secr
 
 use crate::app::CoreHandle;
 use crate::viewmodel::{
-    ChannelSummary, ChannelView, Command, CommandStatus, InboundVisibility, MemberView,
-    MessageView, OutboundConsent, Reachability, SyncStatus, UiError, Verification, ViewModel,
+    ChannelSummary, ChannelView, Command, CommandStatus, MemberView, MessageView, OutboundConsent,
+    Reachability, SyncStatus, UiError, Verification, ViewModel,
 };
 
 /// The TUI's binding to a running node.
@@ -341,8 +341,6 @@ impl LiveCore {
                                 } else {
                                     OutboundConsent::Revoked
                                 },
-                                inbound: InboundVisibility::Visible,
-                                blocked: false,
                                 // Safety codes need both parties' public keys; the
                                 // node exposes them with the member bundle work (M14).
                                 safety_code: String::new(),
@@ -466,17 +464,10 @@ impl CoreHandle for LiveCore {
             Command::CreateChannel {
                 local_name,
                 passphrase,
-                deniable,
-            } => {
-                if deniable {
-                    // ADR-009 is implemented but not enabled for shipping.
-                    return CommandStatus::Failed(UiError::NotAvailableYet);
-                }
-                self.send(NodeCommand::CreateChannel {
-                    local_name,
-                    passphrase: Self::secret(&passphrase),
-                })
-            }
+            } => self.send(NodeCommand::CreateChannel {
+                local_name,
+                passphrase: Self::secret(&passphrase),
+            }),
             Command::OpenChannel {
                 channel_id,
                 passphrase,
@@ -500,9 +491,6 @@ impl CoreHandle for LiveCore {
             Command::SendText { channel_id, text } => {
                 self.send(NodeCommand::SendText { channel_id, text })
             }
-            // A mark needs a comparison behind it, and the node exposes no safety code to
-            // compare yet: marking a member verified on the word alone was a false claim (V210-82).
-            Command::MarkVerified { .. } => CommandStatus::Failed(UiError::NotAvailableYet),
             Command::Join {
                 local_name,
                 link,
@@ -513,9 +501,6 @@ impl CoreHandle for LiveCore {
                 passphrase: Self::secret(&passphrase),
             }),
             Command::Invite { channel_id } => self.send(NodeCommand::Invite { channel_id }),
-            Command::SetVisibility { .. } | Command::Block { .. } | Command::Unblock { .. } => {
-                CommandStatus::Failed(UiError::NotAvailableYet)
-            }
         }
     }
 
