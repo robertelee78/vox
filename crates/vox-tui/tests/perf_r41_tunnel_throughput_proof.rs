@@ -1564,13 +1564,6 @@ struct Rig<'a> {
     done: &'a mpsc::Receiver<(Instant, Instant)>,
 }
 
-/// How many 2 s windows of `w` (each pair of neighbouring seconds) average under `bar`.
-///
-/// A clean link is judged in 2 s windows, not single seconds: the sink's counters are read once a
-/// second, and bytes that land just past a boundary move from one second to the next. On a clean
-/// 200 Mbit/s phase, fix-adr024-bbr found every second under the bar beside one above the link's
-/// own rate (166/230, 173/224, 169/229, 174/222: each pair about 2 x 199), which is when the bytes
-/// landed, not how fast vox sent them.
 /// How many seconds into `w` its first 2 s window at `bar` or above ends, if one does.
 fn reached_after(w: &[Window], bar: f64) -> Option<usize> {
     w.windows(2)
@@ -1578,6 +1571,13 @@ fn reached_after(w: &[Window], bar: f64) -> Option<usize> {
         .map(|i| i + 2)
 }
 
+/// How many 2 s windows of `w` (each pair of neighbouring seconds) average under `bar`.
+///
+/// A clean link is judged in 2 s windows, not single seconds: the sink's counters are read once a
+/// second, and bytes that land just past a boundary move from one second to the next. On a clean
+/// 200 Mbit/s phase, fix-adr024-bbr found every second under the bar beside one above the link's
+/// own rate (166/230, 173/224, 169/229, 174/222: each pair about 2 x 199), which is when the bytes
+/// landed, not how fast vox sent them.
 fn windows_below(w: &[Window], bar: f64) -> usize {
     w.windows(2)
         .filter(|p| (p[0].vox + p[1].vox) / 2.0 < bar)
@@ -1762,7 +1762,8 @@ fn taper_arms(
         let ratio = vm / cm;
         let stalls = windows_below(from_start, cm * STALL_FLOOR);
         let heavy = lossy.name == WIFI_HEAVY.name;
-        let reached = reached_after(from_start, cm * LOSSY_WIN);
+        // `from_start` begins at second 1: count from the link's first lossy second, 0.
+        let reached = reached_after(from_start, cm * LOSSY_WIN).map(|r| r + 1);
         let late = heavy && reached.is_none_or(|r| r as u64 > TIER3_WITHIN.as_secs());
         let verdict = if stalls > 0 {
             failed.push(format!(
@@ -1791,6 +1792,7 @@ fn taper_arms(
                 TIER3_WITHIN.as_secs(),
                 mbit(from_start, |x| x.vox)
             ));
+            // A late climb is named here even when the mean also misses the bar: one red per arm.
             format!(
                 "LATE (not at {LOSSY_WIN:.1}x within {} s)",
                 TIER3_WITHIN.as_secs()
@@ -2007,7 +2009,8 @@ fn taper_arms(
         }
         let m = mean_of(judged_after, |x| x.vox);
         // From the first second after the resume, in which the stream restarts.
-        let reached = reached_after(&after[1..], lossy_bar);
+        // From second 1 after the resume (the stream restarts in second 0), counted from 0.
+        let reached = reached_after(&after[1..], lossy_bar).map(|r| r + 1);
         let mut verdicts = Vec::new();
         if reached.is_none_or(|r| r as u64 > within.as_secs()) {
             verdicts.push(format!(
