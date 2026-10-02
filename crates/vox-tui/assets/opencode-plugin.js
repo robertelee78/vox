@@ -69,6 +69,7 @@ import { appendFileSync, lstatSync, mkdtempSync, readdirSync, rmdirSync, unlinkS
 import { spawn } from "node:child_process"
 import { connect, createServer } from "node:net"
 import { randomBytes, timingSafeEqual } from "node:crypto"
+import { StringDecoder } from "node:string_decoder"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -192,6 +193,9 @@ function wakeChannel(client) {
     const expected = Buffer.from(token)
     const server = createServer((conn) => {
       let buf = ""
+      // One decoder for the connection: a character whose bytes span two reads is held back
+      // until its last byte arrives, rather than each read decoding to U+FFFD at the seam.
+      const utf8 = new StringDecoder("utf8")
       let done = false
       const answer = (reply) => {
         done = true
@@ -211,7 +215,7 @@ function wakeChannel(client) {
       conn.on("close", () => clearTimeout(deadline))
       conn.on("data", async (chunk) => {
         if (done) return
-        buf += chunk.toString()
+        buf += utf8.write(chunk)
         if (buf.length > MAX_FRAMES_BYTES) {
           done = true
           return conn.destroy()
