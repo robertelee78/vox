@@ -174,6 +174,18 @@ A genesis "open room" flag was designed and **rejected**. Instead:
   whether they let me read them is their decision, made in their ring. This is ADR-007's per-direction
   rule unchanged. The asymmetry MUST be visible — a lopsided relationship is a thing the operator needs to
   see, not a thing the system silently fixes or silently enforces.
+  > **And my ring decides whom I read (decider, 2026-10-01, V210-118).** *"if agent-1 has not trusted
+  > agent-2, then agent-1 shouldn't see messages from agent-2"*; *"same for humans"*; *"we have no typed
+  > entity of agent or human -- they're both just nodes"*. Trust still runs one way per decision, and each
+  > direction is decided by its own node, but reading needs both: the author's ring releases its key, and
+  > the reader's node takes that key only if the reader's ring names the author. A key from an author not
+  > in the ring is refused on the pairwise stream (`KeyRefusal::NotTrusted`), so nothing of that author's
+  > opens on the node: not in the TUI, the CLI, or an agent's wake and drain. The member is still listed,
+  > as present and "(not in keyring)". The author's re-key round offers the key again, and a member that
+  > hands over a generation new to us is offered ours at once, so trusting the author makes its messages
+  > readable, earlier ones included, from where its consent began. Removing a key from the ring drops
+  > that author's keys in every room (a closed room drops them when it opens), so nothing it posts
+  > afterwards opens; what was already read stays read.
 - **Removing a key from the ring MUST change the lock.** Read access is a sender key already handed over,
   so removal cannot take it back — it can only stop the removed party reading what comes *next*. Removal
   therefore rotates this identity's sender key and re-keys everyone still in the ring, in **every** room
@@ -540,6 +552,14 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
   **MUST NOT** auto-reply to `status`, `hello`, `bye` or `ack` at all.
 - `hops` **MUST** be decremented on relay and the message dropped at zero. The default **MUST** be 8
   (ruflo ADR-097's value, whose default "alone closes the recursion-loop class").
+- **A reply that names no parent still spends a hop** (V210-121). A budget counted along `re` was
+  bypassed by leaving `re` out, an ordinary omission, and two agents answering each other urgently
+  that way woke each other for ever. So a session's post right after a wake **MUST** answer the
+  message that woke it when exactly one such wake is unanswered (an explicit `re` still wins), and
+  an urgent one with two or more unanswered **MUST** be refused until it names one; a raw
+  urgent envelope with no `re` from a session with an unanswered wake **MUST** be refused; and the
+  daemon **MUST NOT** wake a session that already spoke in the `re` chain the message answers. That
+  message still queues for the session's next turn.
 - Identical repeats from the same `(author, session)` within a short window **MAY** be dropped. There is
   **no rate cap**: the decider's product principle is no rate limits (2026-09-24), and loop prevention
   rests on `hops`, on addressing, and on the rules above and below. (This said a sender "SHOULD be
@@ -851,7 +871,9 @@ Both unknowns are already spiked; neither remains open.
   alternative is a clock nobody has. Claims schedule cooperating agents; they are not a defence
   against one that lies.
 - **M19.4 — CLI and skill. DONE 2026-09-22.** `vox room post|read|tail|roster|list`, and
-  `vox agent skill` prints the skill for an operator to install where their harness looks.
+  `vox agent skill` prints the skill for an operator to install where their harness looks: at user
+  scope (`~/.claude/skills/vox-agent-comms/SKILL.md`), beside the hook in `~/.claude/settings.json`,
+  so a session opened in any repository has both (V210-121).
 
   > **Named defect, found 2026-09-24 and fixed in PR #14 (ADR-021 F13) — `tail` never showed another member's
   > message.** The node emits `NewEntry` only for its own appends; an entry synced from a peer is

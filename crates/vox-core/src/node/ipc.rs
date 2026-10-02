@@ -283,6 +283,14 @@ const T_RENAME: u64 = 25;
 // request can tell a node at work from a suspended or stuck one. Not a protocol bump: a node that
 // does not know it answers with an error, and any answer is proof of life.
 const T_PING: u64 = 17;
+// V210-120: a room's structured posts by `type`, and rows by entry hash, so a client that needs a
+// room's coordination posts, or one row, does not read the whole room for them. Numbered far from
+// the others so a concurrently-developed branch taking 18 does not collide.
+const T_STRUCTURED: u64 = 120;
+const T_FIND: u64 = 121;
+const T_COUNT_REQ: u64 = 122;
+/// [`Frame::Count`] (V210-120), in the frame and event tag space, far from the others.
+const T_COUNT: u64 = 1200;
 
 /// What a client sends.
 ///
@@ -453,7 +461,40 @@ pub enum Request {
     },
     /// Answered `Ok` by the node's actor, changing nothing: proof it is taking commands.
     Ping,
+    /// A room's **structured posts** (V210-120): every row whose body is a JSON object with a
+    /// `type` in `types`, or whose operation id is in `ops`, oldest first, answered as
+    /// [`Frame::Rows`] and paged like [`Request::Read`]. The node knows no `type`'s meaning; see
+    /// [`crate::node::api::StructuredIndex`]. A row matched by an id's hash alone may carry
+    /// another id: the client checks.
+    Structured {
+        /// The room.
+        channel_id: Digest32,
+        /// The `type` values wanted.
+        types: Vec<String>,
+        /// The operation ids wanted; at most [`MAX_FIND`] with `types`.
+        ops: Vec<String>,
+        /// Return only matching rows **after** this one. Absent reads from the first.
+        since: Option<Digest32>,
+    },
+    /// How many rows of a room follow `since` (all of them when absent), as [`Frame::Count`]
+    /// (V210-120): what a reader that reads a page at a time says is still waiting.
+    Count {
+        /// The room.
+        channel_id: Digest32,
+        /// Count only rows **after** this one.
+        since: Option<Digest32>,
+    },
+    /// The rows of a room with these entry hashes, those it holds, as [`Frame::Rows`] (V210-120).
+    Find {
+        /// The room.
+        channel_id: Digest32,
+        /// The entry hashes wanted; at most [`MAX_FIND`].
+        entries: Vec<Digest32>,
+    },
 }
+
+/// The most entries one [`Request::Find`] may name.
+pub const MAX_FIND: usize = 64;
 
 impl Request {
     /// Canonical CBOR body (unframed).
@@ -466,6 +507,43 @@ impl Request {
             }
             Request::Ping => {
                 e.array(1).uint(T_PING);
+            }
+            Request::Structured {
+                channel_id,
+                types,
+                ops,
+                since,
+            } => {
+                e.array(5)
+                    .uint(T_STRUCTURED)
+                    .bytes(channel_id)
+                    .array(types.len());
+                for t in types {
+                    e.text(t);
+                }
+                e.array(ops.len());
+                for o in ops {
+                    e.text(o);
+                }
+                e.bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Request::Count { channel_id, since } => {
+                e.array(3)
+                    .uint(T_COUNT_REQ)
+                    .bytes(channel_id)
+                    .bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Request::Find {
+                channel_id,
+                entries,
+            } => {
+                e.array(3)
+                    .uint(T_FIND)
+                    .bytes(channel_id)
+                    .array(entries.len());
+                for h in entries {
+                    e.bytes(h);
+                }
             }
             Request::Post { channel_id, text } => {
                 e.array(3).uint(T_POST).bytes(channel_id).text(text);
@@ -691,6 +769,58 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Rooms { after })
             }
+            (T_STRUCTURED, 5) => {
+                let channel_id = digest(&mut d)?;
+                let n = d.array().map_err(|_| Error::MalformedIpc("ipc types"))?;
+                if n > MAX_FIND {
+                    return Err(Error::MalformedIpc("ipc too many types"));
+                }
+                let mut types = Vec::with_capacity(n);
+                for _ in 0..n {
+                    types.push(text(&mut d, "ipc type")?);
+                }
+                let m = d.array().map_err(|_| Error::MalformedIpc("ipc ops"))?;
+                if n + m > MAX_FIND {
+                    return Err(Error::MalformedIpc("ipc too many operation ids"));
+                }
+                let mut ops = Vec::with_capacity(m);
+                for _ in 0..m {
+                    ops.push(text(&mut d, "ipc op")?);
+                }
+                let since = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Structured {
+                    channel_id,
+                    types,
+                    ops,
+                    since,
+                })
+            }
+            (T_COUNT_REQ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let since = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Count { channel_id, since })
+            }
+            (T_FIND, 3) => {
+                let channel_id = digest(&mut d)?;
+                let n = d.array().map_err(|_| Error::MalformedIpc("ipc entries"))?;
+                if n > MAX_FIND {
+                    return Err(Error::MalformedIpc("ipc too many entries"));
+                }
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    entries.push(digest(&mut d)?);
+                }
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Find {
+                    channel_id,
+                    entries,
+                })
+            }
             (T_TRUST, n @ (4 | 5)) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
@@ -877,6 +1007,13 @@ pub enum Frame {
         /// Why it failed.
         reason: String,
     },
+    /// How many rows a [`Request::Count`] found, and the room's newest row.
+    Count {
+        /// The count.
+        n: u64,
+        /// The entry hash of the room's newest row, if it has any.
+        last: Option<Digest32>,
+    },
     /// The rows a [`Request::Read`] asked for, oldest first.
     Rows {
         /// The rendered entries.
@@ -943,6 +1080,12 @@ impl Frame {
             }
             Frame::Error { reason } => {
                 e.array(2).uint(T_ERROR).text(reason);
+            }
+            Frame::Count { n, last } => {
+                e.array(3)
+                    .uint(T_COUNT)
+                    .uint(*n)
+                    .bytes(last.as_ref().map_or(&[][..], |d| &d[..]));
             }
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
@@ -1309,6 +1452,11 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc error reason"))?
                     .to_owned(),
             })
+        }
+        (T_COUNT, 3) => {
+            let n = d.uint().map_err(|_| Error::MalformedIpc("ipc count"))?;
+            let last = optional_digest(d)?;
+            return Ok(Frame::Count { n, last });
         }
         (T_ROWS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc rows"))?;
@@ -2387,6 +2535,131 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         // (PRD-001's family scale); a member is a 32-byte key, so a roster is ~17 KiB of a
         // 256 KiB frame. A frame would hold ~7,700; paging this is owed only if that scale
         // ever rises past a few thousand (V210-16).
+        // V210-120: only the rows asked for, found through the room's index of structured posts,
+        // so a client after a room's coordination posts no longer reads every row of the room.
+        Request::Structured {
+            channel_id,
+            types,
+            ops,
+            since,
+        } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            let at = detail.structured.positions(&types, &ops);
+            let posts = at.iter().filter_map(|i| detail.timeline.get(*i as usize));
+            // **From a cursor, what arrived after it** (ADR-023 decision 1), as `Read` does: the
+            // timeline is in the room's order, where a late arrival lands above rows already
+            // read, so "the posts below the cursor" would skip it for good.
+            let wanted: Vec<&MessageRow> = match since {
+                None => posts.collect(),
+                Some(cursor) => {
+                    let Some(mark) = posts
+                        .clone()
+                        .rev()
+                        .find(|r| r.entry_hash == cursor && !r.owed)
+                        .map(|r| r.arrival)
+                    else {
+                        return Frame::Error {
+                            reason: "cursor not among this room's structured posts".into(),
+                        };
+                    };
+                    let mut newer: Vec<&MessageRow> = posts.filter(|r| r.arrival > mark).collect();
+                    newer.sort_by_key(|r| r.arrival);
+                    newer
+                }
+            };
+            let mut rows: Vec<MessageRow> = Vec::new();
+            let mut bytes = 0usize;
+            for r in wanted {
+                let cost = r.text.len() + ROW_OVERHEAD;
+                if !rows.is_empty() && bytes + cost > rows_budget() {
+                    break;
+                }
+                bytes += cost;
+                rows.push(r.clone());
+            }
+            Frame::Rows { rows }
+        }
+        Request::Count { channel_id, since } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            let len = detail.timeline.len();
+            // A cursor, so never a message not received yet (V030-10): it has no arrival.
+            let last = detail
+                .timeline
+                .iter()
+                .rev()
+                .find(|r| !r.owed)
+                .map(|r| r.entry_hash);
+            match since {
+                None => Frame::Count {
+                    n: len as u64,
+                    last,
+                },
+                // What arrived after the cursor (ADR-023 decision 1), as `Read` counts it; the
+                // cursor is looked for from the newest row back, as it is usually near the end.
+                Some(cursor) => match detail
+                    .timeline
+                    .iter()
+                    .rev()
+                    .find(|r| r.entry_hash == cursor && !r.owed)
+                    .map(|r| r.arrival)
+                {
+                    Some(mark) => Frame::Count {
+                        n: detail.timeline.iter().filter(|r| r.arrival > mark).count() as u64,
+                        last,
+                    },
+                    None => Frame::Error {
+                        reason: "cursor not in this room's timeline".into(),
+                    },
+                },
+            }
+        }
+        // Searched from the newest row back: what a client looks up (a reply's parent) is
+        // usually recent.
+        Request::Find {
+            channel_id,
+            entries,
+        } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            let mut want: std::collections::BTreeSet<Digest32> = entries.into_iter().collect();
+            let mut rows: Vec<MessageRow> = Vec::new();
+            for r in detail.timeline.iter().rev() {
+                if want.is_empty() {
+                    break;
+                }
+                if want.remove(&r.entry_hash) {
+                    rows.push(r.clone());
+                }
+            }
+            rows.reverse();
+            Frame::Rows { rows }
+        }
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view
@@ -2874,6 +3147,45 @@ impl IpcClient {
                         return Err(Error::MalformedIpc("ipc rows page did not advance"));
                     }
                     *marker = Some(last.entry_hash);
+                    all.extend(rows);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// A room's structured posts of `types`, and those whose operation id is in `ops`, however
+    /// many replies that takes ([`Request::Structured`], V210-120). Rows matched by an id's hash
+    /// alone are included: filter on the id.
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn read_structured(
+        &mut self,
+        channel_id: Digest32,
+        types: &[&str],
+        ops: &[String],
+    ) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            match self
+                .request(&Request::Structured {
+                    channel_id,
+                    types: types.iter().map(|t| (*t).to_owned()).collect(),
+                    ops: ops.to_vec(),
+                    since: cursor,
+                })
+                .await?
+            {
+                Frame::Rows { rows } => {
+                    let Some(last) = rows.last() else {
+                        return Ok(Frame::Rows { rows: all });
+                    };
+                    if cursor == Some(last.entry_hash) {
+                        return Err(Error::MalformedIpc("ipc rows page did not advance"));
+                    }
+                    cursor = Some(last.entry_hash);
                     all.extend(rows);
                 }
                 other => return Ok(other),

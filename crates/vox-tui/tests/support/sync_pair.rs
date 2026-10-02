@@ -300,6 +300,11 @@ impl Member {
         self.daemon_env(bin, anchor, &[])
     }
 
+    /// [`Member::daemon`] with `env` set too (a proof's test-only knobs).
+    pub fn daemon_with(&self, env: &[(&str, &str)]) -> Proc {
+        self.daemon_env(VOX, None, env)
+    }
+
     /// [`Member::daemon`] from the mutant sender build `bin` (see [`mutant_sender`]), misbehaving
     /// as `mode` (`serve-nothing`, `serve-unasked`). Check [`announced`] once it has synced.
     pub fn daemon_mutant(&self, bin: &str, mode: &str, anchor: Option<&str>) -> Proc {

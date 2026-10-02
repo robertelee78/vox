@@ -35,7 +35,15 @@
 //! arms). Dropping the live generation's post-trust part (the first fix's behaviour) leaves arm B
 //! at 50 of 950.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -261,8 +269,9 @@ fn ranges(seen: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
     out
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real vox daemons, 3,160 CLI posts and production Argon2id; CI runs it in release"]
+#[ignore = "real vox daemons, 3,160 CLI posts and production Argon2id; optional, run it in release"]
 fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
     // Two joins; 8 unlocks: two `vox id`s, two `trust add`s, two daemons and two rooms created.
     watchdog::arm_for_setup(2, 8);

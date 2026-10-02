@@ -90,6 +90,9 @@ quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc
 # The congestion controller's interface names quinn-proto's `RttEstimator`, which quinn does not
 # re-export (transport::congestion). No features: quinn selects them.
 quinn-proto = { version = "0.11", default-features = false }
+# Diagnostics for the tapered congestion controller's tier switches (ADR-024): debug events under
+# `vox::congestion`, printed only where a subscriber is installed. Already in the tree through quinn.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Socket options quinn does not set: the UDP buffer sizes (R41). Already in the tree through
 # tokio and quinn-udp; named here so the node can ask for buffers a burst fits in.
 socket2 = "0.6"

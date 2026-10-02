@@ -9,9 +9,9 @@
 //! datagram to the other, so the anchor's circuit is the only path.
 //!
 //! **Relayed is asserted, before and after the samples**, from the anchor's own count of circuits
-//! carried, so a direct path cannot pass this silently. **The control** runs the same room, verbs
-//! and samples with both daemons on `127.0.0.1`, and asserts the anchor carries nothing — which is
-//! what shows the split, and nothing else, is what makes the first arm relayed.
+//! carried, so a direct path cannot pass this silently. **The split is checked first**, as a
+//! CANNOT MEASURE precondition (`support/family_split.rs`): a datagram on `127.0.0.1` and one on
+//! `[::1]` must not reach each other, which is what makes the circuit the only path.
 //!
 //! [`SAMPLES`] times: alice runs `vox room post`, and the clock stops when the text is readable on
 //! bob's node over bob's own control socket, polled every [`POLL`]. Printed as min / median / p95
@@ -24,7 +24,15 @@
 //!   this red;
 //! - `VOX_PERF_INJECT_MS` sleeps inside the timed window before the post.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(r40_a_message_between_two_online_nodes_arrives_in_under_a_second_relayed);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -34,6 +42,9 @@ mod world;
 
 #[path = "support/relay.rs"]
 mod relay;
+
+#[path = "support/family_split.rs"]
+mod family_split;
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -308,10 +319,12 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     (end_to_end, network)
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an anchor, two real daemons and production Argon2id; run in release"]
 fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_relayed() {
     watchdog::arm();
+    family_split::assert_the_families_are_split();
     let target = env_ms("VOX_PERF_THRESHOLD_MS").unwrap_or(TARGET);
     let (end_to_end, network) = run(Split::Families, |a, when| a.assert_relayed(when));
     stats("R40 relayed, network (post returned -> readable)", &network);
@@ -325,15 +338,4 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_relayed() {
         "R40 (relayed): {over} of {SAMPLES} messages took {target:?} or longer end to end; the \
          slowest took {max:?}"
     );
-}
-
-/// **The control**: the same room and samples with both daemons on `127.0.0.1`. The anchor must
-/// carry no circuit, before or after — the split is what makes the other arm relayed.
-#[test]
-#[ignore = "an anchor, two real daemons and production Argon2id; run in release"]
-fn r40_control_without_the_split_the_same_pair_is_direct() {
-    watchdog::arm();
-    let (end_to_end, network) = run(Split::None, |a, when| a.assert_direct(when));
-    stats("R40 control (direct), network", &network);
-    stats("R40 control (direct), end to end", &end_to_end);
 }

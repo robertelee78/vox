@@ -1389,6 +1389,7 @@ pub async fn trust_add(
         println!("     with full history: it may also read what you wrote before now");
     }
     println!("     it may now read what you write in every room you share — now and later");
+    println!("     and you read what it writes, once it trusts you too");
     println!("     and reach every service you bind to a room you are both in");
     println!("     `vox trust remove` undoes it and changes the lock everywhere");
     Ok(())

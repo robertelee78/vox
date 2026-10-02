@@ -145,9 +145,7 @@ pub fn now_millis() -> u64 {
 pub struct Snapshot {
     /// This node's identity.
     pub me: Digest32,
-    /// Every row, in the node's local order.
-    pub rows: Vec<MessageRow>,
-    /// Every row that parsed as an envelope.
+    /// The room's coordination posts ([`COORDINATION`]), and any operation's group read with them.
     pub posted: Vec<Posted>,
     /// Folded claim state under this version.
     pub fold: Fold,
@@ -158,7 +156,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// The operation index over every row.
+    /// The operation index over the posts read.
     #[must_use]
     pub fn ops(&self) -> OpIndex {
         let mut idx = OpIndex::new();
@@ -207,6 +205,242 @@ pub async fn read_all(
     }
 }
 
+/// The `type`s a coordinating verb reads (V210-120): the claim protocol, the version handshake,
+/// and work failures, which seed an attempt id. Read from the node's index of structured posts, so
+/// a snapshot costs the room's coordination, not its history.
+pub const COORDINATION: &[&str] = &[
+    claim::CLAIM,
+    claim::RELEASE,
+    claim::HANDOFF,
+    claim::RENEW,
+    vox_agentcomms::envelope::work::DECLINE,
+    HELLO,
+    vox_agentcomms::envelope::BYE,
+    vox_agentcomms::envelope::work::FAILED,
+];
+
+/// A room's structured posts of `types`, and those under any operation id in `ops` (exactly:
+/// rows matched by a colliding hash are dropped), oldest first.
+///
+/// # Errors
+/// If the node cannot answer.
+pub async fn structured(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    types: &[&str],
+    ops: &[String],
+) -> Result<Vec<MessageRow>, AppError> {
+    let mut rows: Vec<MessageRow> = Vec::new();
+    // At most `MAX_FIND` names to a request, types and ids together.
+    let room = vox_core::node::ipc::MAX_FIND
+        .saturating_sub(types.len())
+        .max(1);
+    let mut chunks: Vec<&[String]> = ops.chunks(room).collect();
+    if chunks.is_empty() || !types.is_empty() {
+        chunks.insert(0, &[]);
+    }
+    for (k, ids) in chunks.into_iter().enumerate() {
+        let t: &[&str] = if k == 0 { types } else { &[] };
+        if t.is_empty() && ids.is_empty() {
+            continue;
+        }
+        match client
+            .read_structured(channel_id, t, ids)
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
+        {
+            Frame::Rows { rows: got } => rows.extend(got),
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        }
+    }
+    let wanted: std::collections::BTreeSet<&str> = ops.iter().map(String::as_str).collect();
+    rows.retain(|r| {
+        let Ok(env) = Envelope::parse(&r.text) else {
+            return false;
+        };
+        types.contains(&env.kind.as_str()) || ops::op_of(&env).is_some_and(|o| wanted.contains(o))
+    });
+    // Each request answers oldest first; a row two of them matched is kept once, where it first came.
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|r| seen.insert(r.entry_hash));
+    Ok(rows)
+}
+
+/// The posts of operation `op`, of any author.
+///
+/// # Errors
+/// If the node cannot answer.
+pub async fn op_group(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    op: &str,
+) -> Result<Vec<Posted>, AppError> {
+    Ok(posted_of(
+        &structured(client, channel_id, &[], &[op.to_owned()]).await?,
+    ))
+}
+
+/// The chain of messages `re` replies through, parent first, as far as the room holds it and no
+/// further than a hop budget can reach: what [`crate::wake::reply_hops`] walks. Fetched a row at a
+/// time by entry hash (V210-120), not by reading the room.
+///
+/// # Errors
+/// If the node cannot answer.
+pub async fn reply_chain(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    re: &str,
+) -> Result<Vec<MessageRow>, AppError> {
+    let mut chain: Vec<MessageRow> = Vec::new();
+    let mut next = vox_core::node::link::b32_decode(re.trim(), "re").ok();
+    while let Some(hash) = next.take() {
+        if chain.len()
+            > usize::try_from(vox_agentcomms::envelope::DEFAULT_HOPS).unwrap_or(usize::MAX)
+        {
+            break;
+        }
+        let rows = match ask(
+            client,
+            &Request::Find {
+                channel_id,
+                entries: vec![hash],
+            },
+        )
+        .await?
+        {
+            Frame::Rows { rows } => rows,
+            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        };
+        let Some(row) = rows.into_iter().find(|r| r.entry_hash == hash) else {
+            break;
+        };
+        next = Envelope::parse(&row.text)
+            .ok()
+            .and_then(|e| e.re)
+            .and_then(|r| vox_core::node::link::b32_decode(r.trim(), "re").ok())
+            .filter(|h| chain.iter().all(|c| c.entry_hash != *h));
+        chain.push(row);
+    }
+    Ok(chain)
+}
+
+/// What [`crate::wake::open_wakes`] needs of a room for `session` (V210-120): the entries recorded
+/// as having woken it, fetched by hash, and every row after the oldest of them, where a reply to
+/// any of them can be. Not the room's whole history.
+///
+/// # Errors
+/// If the node cannot answer.
+pub async fn wake_context(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    paths: &vox_core::node::paths::Paths,
+    session: &str,
+    room: &str,
+) -> Result<Vec<MessageRow>, AppError> {
+    let entries: Vec<Digest32> = crate::wake::recorded_wakes(paths, session, room)
+        .iter()
+        .filter_map(|e| vox_core::node::link::b32_decode(e.trim(), "wake").ok())
+        .collect();
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut found: Vec<MessageRow> = Vec::new();
+    for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
+        match ask(
+            client,
+            &Request::Find {
+                channel_id,
+                entries: chunk.to_vec(),
+            },
+        )
+        .await?
+        {
+            Frame::Rows { rows } => found.extend(rows),
+            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        }
+    }
+    let Some(oldest) = found.first().map(|r| r.entry_hash) else {
+        return Ok(Vec::new());
+    };
+    let mut seen: std::collections::HashSet<Digest32> =
+        found.iter().map(|r| r.entry_hash).collect();
+    let mut rows = found;
+    let after = read_all(client, channel_id, Some(oldest)).await?;
+    rows.extend(after.into_iter().filter(|r| seen.insert(r.entry_hash)));
+    Ok(rows)
+}
+
+/// The operation index over `posted`.
+#[must_use]
+pub fn index_of(posted: &[Posted]) -> OpIndex {
+    let mut idx = OpIndex::new();
+    for p in posted {
+        idx.insert(p.entry_hash, p.author, p.created_millis, &p.envelope);
+    }
+    idx
+}
+
+/// Up to `limit` rows after `since` (all of them when `limit` is 0), paged from the node and no
+/// further than asked (V210-120). `Ok(None)` when the node does not hold the cursor.
+///
+/// # Errors
+/// If the node cannot answer.
+pub async fn read_upto(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    since: Option<Digest32>,
+    limit: usize,
+) -> Result<Option<Vec<MessageRow>>, AppError> {
+    let mut rows: Vec<MessageRow> = Vec::new();
+    // A read from a cursor is a feed by arrival, so its next page follows the last row as a
+    // cursor; a read of the whole room is in the room's order, so its next page follows the last
+    // row as a page mark (ADR-023 decision 1), as `IpcClient::read_rows` pages.
+    let (mut cursor, mut mark) = (since, None);
+    loop {
+        let want = if limit == 0 {
+            0
+        } else {
+            u64::try_from(limit - rows.len()).unwrap_or(u64::MAX)
+        };
+        match client
+            .request(&Request::Read {
+                channel_id,
+                since: cursor,
+                after: mark,
+                limit: want,
+            })
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
+        {
+            Frame::Rows { rows: page } => {
+                let Some(last) = page.last() else {
+                    return Ok(Some(rows));
+                };
+                let marker = if since.is_some() {
+                    &mut cursor
+                } else {
+                    &mut mark
+                };
+                if *marker == Some(last.entry_hash) {
+                    return Err(AppError::Usage("ipc rows page did not advance".into()));
+                }
+                *marker = Some(last.entry_hash);
+                rows.extend(page);
+                if limit > 0 && rows.len() >= limit {
+                    rows.truncate(limit);
+                    return Ok(Some(rows));
+                }
+            }
+            Frame::Error { .. } if since.is_some() && rows.is_empty() && cursor == since => {
+                return Ok(None)
+            }
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        }
+    }
+}
+
 /// Parse rows into envelopes, keeping only those that are envelopes.
 #[must_use]
 pub fn posted_of(rows: &[MessageRow]) -> Vec<Posted> {
@@ -230,7 +464,7 @@ pub async fn snapshot(client: &mut IpcClient, channel_id: Digest32) -> Result<Sn
     let me = client.me().ok_or_else(|| {
         AppError::Usage("the node did not say who it is; is its identity unlocked?".into())
     })?;
-    let rows = read_all(client, channel_id, None).await?;
+    let rows = structured(client, channel_id, COORDINATION, &[]).await?;
     let roster = match ask(client, &Request::Roster { channel_id }).await? {
         Frame::Members { members } => members,
         other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
@@ -241,7 +475,6 @@ pub async fn snapshot(client: &mut IpcClient, channel_id: Digest32) -> Result<Sn
     let table = version::version_table(&posted, me, &roster, VERSION, now, &fold);
     Ok(Snapshot {
         me,
-        rows,
         posted,
         fold,
         table,
@@ -361,14 +594,15 @@ pub async fn post_once(
 ) -> Result<Posting, AppError> {
     let env = envelope(draft, session, op);
     let mine = ops::semantic(&env);
-    let prior: Vec<&Posted> = before
-        .posted
+    // This operation's group, read by its id (V210-120): not every row of the room.
+    let group = op_group(client, channel_id, op).await?;
+    let prior: Vec<&Posted> = group
         .iter()
         .filter(|p| p.author == before.me && ops::op_of(&p.envelope) == Some(op))
         .collect();
     if let Some(p) = prior.first() {
         if prior.iter().all(|q| ops::semantic(&q.envelope) == mine) {
-            let idx = before.ops();
+            let idx = index_of(&group);
             let first = match idx.verdict(p.author, &p.envelope, p.entry_hash) {
                 Some(Verdict::Duplicate { of }) => of,
                 _ => p.entry_hash,
@@ -412,10 +646,10 @@ pub async fn post_once(
     let is_mine = |me, p: &Posted| {
         p.author == me && ops::op_of(&p.envelope) == Some(op) && ops::semantic(&p.envelope) == mine
     };
-    let (after, entry) = loop {
-        let after = snapshot(client, channel_id).await?;
-        if let Some(entry) = after.posted.iter().find(|p| is_mine(after.me, p)).cloned() {
-            break (after, entry);
+    let (group, entry) = loop {
+        let group = op_group(client, channel_id, op).await?;
+        if let Some(entry) = group.iter().find(|p| is_mine(before.me, p)).cloned() {
+            break (group, entry);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(AppError::Usage(format!(
@@ -426,7 +660,8 @@ pub async fn post_once(
         }
         tokio::time::sleep(READBACK_POLL).await;
     };
-    let idx = after.ops();
+    let after = snapshot(client, channel_id).await?;
+    let idx = index_of(&group);
     match idx.verdict(entry.author, &entry.envelope, entry.entry_hash) {
         Some(Verdict::Conflict { group }) => Err(conflict(op, &group)),
         Some(Verdict::Duplicate { of }) => Ok(Posting {

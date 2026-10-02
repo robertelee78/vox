@@ -41,6 +41,14 @@
 //! Paths are as the call named them (for `open` and `rename`) or as the kernel reports them (for a
 //! descriptor), so a reader compares them after canonicalising the directory.
 //!
+//! ## One injected receive-buffer cap
+//! With `VOX_INTERPOSE_RCVBUF_CAP` set to a number of bytes, every
+//! `setsockopt(SOL_SOCKET, SO_RCVBUF, v)` asking for more is made with that number instead, so the
+//! kernel really grants the smaller buffer and `getsockopt(SO_RCVBUF)` honestly reads it back. It
+//! stages, without root, a host whose `kern.ipc.maxsockbuf` is small (#174): the binary is
+//! unchanged and no sysctl is touched. Each call is recorded as `rcvbuf asked set ret errno`.
+//! Unset, nothing is injected or recorded.
+//!
 //! ## Kill points
 //! With `VOX_INTERPOSE_KILL_ARM` naming a file, the process kills itself with `SIGKILL` right
 //! after the `N`th flush of a `store.redb` that returns while that file holds `N`: at a boundary
@@ -79,12 +87,21 @@ const F_BARRIERFSYNC: c_int = 85;
 const AT_FDCWD: c_int = -2;
 const MAXPATHLEN: usize = 1024;
 const EIO: c_int = 5;
+const SOL_SOCKET: c_int = 0xffff;
+const SO_RCVBUF: c_int = 0x1002;
 
 extern "C" {
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn openat(fd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn fsync(fd: c_int) -> c_int;
+    fn setsockopt(
+        fd: c_int,
+        level: c_int,
+        name: c_int,
+        value: *const std::ffi::c_void,
+        len: c_uint,
+    ) -> c_int;
     fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
     fn close(fd: c_int) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
@@ -296,6 +313,16 @@ fn fail_flush_of(path: &str) -> bool {
     !target.is_null() && text(target) == path
 }
 
+/// The receive-buffer cap to inject (`VOX_INTERPOSE_RCVBUF_CAP`), if any.
+fn rcvbuf_cap() -> Option<c_int> {
+    // SAFETY: getenv is called with a NUL-terminated name; the value it returns is read once.
+    let cap = unsafe { getenv(c"VOX_INTERPOSE_RCVBUF_CAP".as_ptr()) };
+    if cap.is_null() {
+        return None;
+    }
+    text(cap).trim().parse().ok()
+}
+
 /// Fail as the call would have with `EIO`.
 fn injected_eio() -> c_int {
     // SAFETY: __error returns this thread's errno slot.
@@ -360,6 +387,29 @@ pub unsafe extern "C" fn vti_fcntl_hook(fd: c_int, cmd: c_int, arg: c_ulong) -> 
         record(&["sync", &path, how, &ret, &errno]);
         after_sync(&path, r);
     }
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vti_setsockopt(
+    fd: c_int,
+    level: c_int,
+    name: c_int,
+    value: *const std::ffi::c_void,
+    len: c_uint,
+) -> c_int {
+    let int_len = std::mem::size_of::<c_int>() as c_uint;
+    if level != SOL_SOCKET || name != SO_RCVBUF || len != int_len || value.is_null() {
+        return setsockopt(fd, level, name, value, len);
+    }
+    let Some(cap) = rcvbuf_cap() else {
+        return setsockopt(fd, level, name, value, len);
+    };
+    let asked = *value.cast::<c_int>();
+    let set = asked.min(cap);
+    let r = setsockopt(fd, level, name, (&set as *const c_int).cast(), len);
+    let (ret, errno) = outcome(r);
+    record(&["rcvbuf", &asked.to_string(), &set.to_string(), &ret, &errno]);
     r
 }
 
@@ -634,6 +684,7 @@ interpose! {
     I_OPENAT: vti_openat => openat;
     I_FCNTL: vti_fcntl => fcntl;
     I_FSYNC: vti_fsync => fsync;
+    I_SETSOCKOPT: vti_setsockopt => setsockopt;
     I_RENAME: vti_rename => rename;
     I_RENAMEAT: vti_renameat => renameat;
     I_RENAMEX_NP: vti_renamex_np => renamex_np;

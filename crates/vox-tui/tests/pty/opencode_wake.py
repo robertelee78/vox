@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""opencode_wake.py <vox> <data_dir> <config_dir> <room> <project> <xdg_config> <plugin_log> <tmpdir> <tag>
+"""opencode_wake.py <vox> <data_dir> <config_dir> <room> <project> <xdg_config> <plugin_log> <tmpdir> <sandbox_profile> <sandbox_home> <tag>
 
 A plain `opencode`, opened by hand with no flags, interrupted by an urgent message addressed to it
 (ADR-020 §6, ADR-021 F17). The caller runs the `vox daemon` holding `<room>` and has installed
@@ -28,7 +28,8 @@ The screen is read through pyte, as the person sees it. Prints, each on its own 
   a user message is stored as the plugin left it): how many times the message addressed to bobby
   appears in it (the wake's own text is one), how many times the one addressed to carol does
   (only a `<vox-room>` read carries it), and whether any of it is a message's envelope JSON
-  rather than its words; `<tag> RECEIVED: never` if that turn never answered;
+  rather than its words; `<tag> RECEIVED: never` if that turn never answered, or `skipped (no wake arrived)` when there
+  was no wake and so no woken turn to wait for;
 - `<tag> SCREEN:` and the screen, whenever anything above is not clean.
 
 Then the person quits, and the plugin's wake directory (`vox-oc-*` in `<tmpdir>`, this run's own
@@ -53,7 +54,7 @@ sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import Hung, Tui, arm, disarm, pyte, reap, stage  # noqa: E402
 
-VOX, DATA, CFG, ROOM, PROJECT, XDG, PLUGIN_LOG, TMP, TAG = sys.argv[1:10]
+VOX, DATA, CFG, ROOM, PROJECT, XDG, PLUGIN_LOG, TMP, SANDBOX, SB_HOME, TAG = sys.argv[1:12]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
 GONE_SECS = 5  # the helper removes it the moment the pipe closes; this is slack, not a wait
 SLEEP = 45  # long enough that the wake is posted and relayed while the tool still runs
@@ -68,14 +69,27 @@ if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
     sys.exit(2)
 opencode = shutil.which("opencode")
-if opencode is None:
-    print(f"{TAG} APPARATUS: opencode is not on PATH")
+opencode = os.path.realpath(opencode) if opencode else None
+if opencode is None or not os.path.isfile(SANDBOX):
+    print(f"{TAG} APPARATUS: opencode is not on PATH, or there is no sandbox profile at {SANDBOX}")
     sys.exit(2)
 arm(BUDGET, TAG)
 
 # A cleared environment: an inherited one (cargo test's) silently disables plugin hooks, and a
 # real Claude Code session's variables must never reach anything here.
-env = {k: os.environ[k] for k in ("PATH", "HOME", "SHELL", "LANG", "USER") if k in os.environ}
+# A fixed, minimal environment: the operator's PATH names their home and other agents' scratch
+# directories, and USER names them; a model that ran `env` would send both to its provider.
+# OpenCode is started by its absolute path, so nothing here needs the real PATH.
+env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "SHELL": "/bin/zsh"}
+if "LANG" in os.environ:
+    env["LANG"] = os.environ["LANG"]
+# **Every OpenCode here is confined** (the caller's `sandbox-exec` profile): a turn runs a
+# shell, and an unconfined one could read the operator's files and send them to the model's
+# provider. Its HOME is the sandbox's own, so nothing it keeps is the operator's.
+env.update(HOME=SB_HOME, XDG_DATA_HOME=os.path.join(SB_HOME, ".local/share"),
+           XDG_CACHE_HOME=os.path.join(SB_HOME, ".cache"),
+           XDG_STATE_HOME=os.path.join(SB_HOME, ".local/state"))
+OPENCODE = ["/usr/bin/sandbox-exec", "-f", SANDBOX, opencode]
 env.update(TERM="xterm-256color", XDG_CONFIG_HOME=XDG, VOX_DATA_DIR=DATA, VOX_CONFIG_DIR=CFG,
            TMPDIR=TMP,  # this run's own, so its wake directories are exactly the ones counted
            VOX_BIN=VOX, VOX_PLUGIN_LOG=PLUGIN_LOG,
@@ -118,7 +132,7 @@ def received(session):
     """What the model was given in `session`, once the turn the wake started has answered: the
     text of every user message, as OpenCode stored it — after the plugin rewrote it — or `None`
     while that turn has not answered yet. `--pure`: reading the session needs no plugin."""
-    out = subprocess.run([opencode, "export", "--pure", session], env=env, cwd=PROJECT,
+    out = subprocess.run([*OPENCODE, "export", "--pure", session], env=env, cwd=PROJECT,
                          capture_output=True, text=True, timeout=60)
     try:
         messages = json.loads(out.stdout[out.stdout.index("{"):])["messages"]
@@ -141,7 +155,7 @@ def open_plain(known):
     """A plain `opencode` opened by hand in the project, and the wake directory its plugin made
     (the one in `<tmpdir>` not in `known`, holding its socket); `None` for the directory if none
     appeared."""
-    t = Tui([opencode], env, rows=60, cols=200)
+    t = Tui(OPENCODE, env, rows=60, cols=200)
     ok = t.until(lambda: any(os.path.exists(os.path.join(d, "wake.sock"))
                              for d in wake_dirs() - known), 60)
     new = sorted(wake_dirs() - known)
@@ -244,12 +258,16 @@ try:
 
     stage("let the woken turn answer, and read what the model was given")
     users = None
-    end = time.time() + 120
+    # No wake, no woken turn to wait for: (3) is already the verdict, and waiting would spend
+    # the driver's whole budget before it reaches the wake directories.
+    end = time.time() + (120 if shown else 0)
     while users is None and time.time() < end and regs:
         users = received(regs[0][2])
         if users is None:
             tui.pump(2)
-    if users is None:
+    if not shown:
+        print(f"{TAG} RECEIVED: skipped (no wake arrived)")
+    elif users is None:
         print(f"{TAG} RECEIVED: never")
         print(f"{TAG} SCREEN:\n{tui.text()}")
     else:

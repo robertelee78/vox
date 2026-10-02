@@ -5,15 +5,21 @@ on:
     branches: [main]
   pull_request:
 
+# A newer run on an integrate/* branch covers the one before it, so it cancels it: three runs at
+# once on integrate/v0.2.10 for successive merges had to be cancelled by hand (#301). Those runs
+# are its pull request's, so the branch is `head_ref`. Every other run (main, tags, release, any
+# other PR) gets a group of its own, `run_id`: a shared group would still cancel a *pending* run.
+concurrency:
+  group: ${{ startsWith(github.head_ref || github.ref_name, 'integrate/') && format('ci-{0}', github.head_ref || github.ref_name) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ startsWith(github.head_ref || github.ref_name, 'integrate/') }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # The one gap ADR-018 §3 accepts, named so that accepting it is a visible decision. `opencode`:
-  # the five live-model proofs need an OpenCode install and a model account, which CI runners do
-  # not have. The decider (2026-09-26) chose that they run on the local macOS release gate, with
-  # the decider's account, and must be green there before every tag; CI keeps this one exception.
-  # Removing it MUST make those proofs fail on CI. `fish` is NOT here: the runners install it.
-  VOX_PROOF_ALLOW_UNPROVEN: "opencode"
+  # No gap is accepted here (no VOX_PROOF_ALLOW_UNPROVEN). The live-model proofs, and every other
+  # proof too heavy or too timing-bound to block, are optional (decider, 2026-10-01): they run only
+  # with vox-tui's `optional-proofs` feature, so CI compiles them and never runs them. Without it,
+  # a stand-in in each one's place prints `OPTIONAL PROOF NOT RUN` and passes.
 
 jobs:
   # **Every commit must build, not merely the tip.** `git bisect` compiles the commit it
@@ -82,8 +88,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # 120, not 45: both platforms were cancelled at 45 minutes on v0.2.9's merge with nothing red;
-    # the suite now includes the R41/R42 transport proofs.
+    # 120, not 45: both platforms were cancelled at 45 minutes on v0.2.9's merge with nothing red.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -154,8 +159,6 @@ jobs:
       # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
       # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
       # product is a test", 2026-09-26). Run here in release.
-      # Excluded here, and run in their own job below: the PRD-001 transport proofs (`r40_`, `r41_`),
-      # the slowest part of the suite, so they run in parallel with this job instead of after it.
       # No proof is excluded by name any more (V210-19, #192): `cross_process_join_proof`, excused
       # as a flake since v0.2.2, passed 20 of 20 on integrate/v0.2.10 and is back in this gate.
       # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
@@ -183,34 +186,12 @@ jobs:
         # it held (2 of 5 runs). The frozen-daemon variant, in the blocking set, carries the
         # late-arrival claim meanwhile.
         run: |
-          cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored \
-            --skip r40_ --skip r41_
-
-  # **The PRD-001 transport proofs, in parallel with the rest.** They are blocking — a release
-  # publishes only a commit whose whole CI run passed (release.yml `ci-passed`) — but they are
-  # the slowest part of the suite, so they get their own runner instead of a place in line.
-  transport-gates:
-    name: transport proofs (R40 · R41)
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
-      # proofs run: on a fresh runner it took R41's emulator to 74-90% of the link, and to a clean
-      # 98% with indexing off (diag run 36228035025). The runner is a throwaway VM.
-      - name: Stop Spotlight indexing (macOS)
-        if: runner.os == 'macOS'
-        run: sudo mdutil -a -i off
-      - name: Show toolchain
-        run: rustc --version && cargo --version
-      - name: Transport gates (release)
-        # R41's WAN link is reported, not gated, on the macOS runner only (decider, 2026-09-26): the
-        # 3-core VM stalls its processes and the same build measures 29-106% of raw there. WAN is
-        # gated here on ubuntu and on real Mac hardware by the local macOS gate before a tag.
-        env:
-          VOX_PERF_REPORT_ONLY: ${{ runner.os == 'macOS' && 'WAN' || '' }}
-        run: cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored r40_ r41_
+          cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored
+      # The optional proofs (docs/release/optional-proofs.md) block nothing and are never run here
+      # (decider, 2026-10-01). They are kept ready for troubleshooting, so this only builds them,
+      # with RUSTFLAGS' -D warnings: a change that breaks one is caught now, not on the day it is
+      # needed. It is not a test. It builds even when a gate above went red, so a red run still
+      # says whether the kit compiles.
+      - name: Compile optional proofs (not run; troubleshooting kit)
+        if: ${{ !cancelled() }}
+        run: cargo test --release -p vox-tui --features optional-proofs --no-run
