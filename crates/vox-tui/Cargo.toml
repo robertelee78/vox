@@ -29,10 +29,11 @@ path = "src/main.rs"
 [features]
 optional-proofs = []
 heavy-proofs = ["optional-proofs"]
-# **The live-model turn of an_agent_wake_is_safe_and_bounded_proof (case 6), stopped** (2026-10-02):
-# a live-model turn runs the harness's shell unsandboxed, and a free model sent the contents of
-# ~/.claude, ~/.codex and ~/.config to its provider. Turn this on only once that turn runs in a
-# sandbox; without it the case prints OPTIONAL PROOF NOT RUN.
+# **Live-model proofs** (2026-10-02): a model's turn may run a shell, and an unsandboxed one sent
+# the contents of ~/.claude, ~/.codex and ~/.config to its provider. Only a build with this
+# feature starts a model, and every such turn runs confined (tests/support/oc_sandbox.rs);
+# without it each prints OPTIONAL PROOF NOT RUN. Live-model runs are ad hoc, on the decider's
+# request, never in CI.
 live-model-sandbox = ["optional-proofs"]
 # **Test-only knobs, for proofs only** (V210-105): vox-core's `test-knobs`, which compiles the
 # `VOX_TEST_*` variables into `vox`. The proofs that set one build with it and refuse, as CANNOT

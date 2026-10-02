@@ -63,6 +63,8 @@ optional_proof::not_run!(
     workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict
 );
 
+#[path = "support/oc_sandbox.rs"]
+mod oc_sandbox;
 #[path = "support/room.rs"]
 mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -82,16 +84,8 @@ fn which(bin: &str) -> Option<PathBuf> {
         .map(|d| d.join(bin))
         .find(|p| p.is_file())
 }
-fn auth_present() -> bool {
-    std::env::var_os("HOME").is_some_and(|h| {
-        Path::new(&h)
-            .join(".local/share/opencode/auth.json")
-            .is_file()
-    })
-}
 fn model() -> String {
-    std::env::var("VOX_PROOF_OPENCODE_MODEL")
-        .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
+    oc_sandbox::model()
 }
 
 // ------------------------------------------------------------------ the stub tracker
@@ -337,6 +331,9 @@ impl Adapter {
 
 struct Agent<'a> {
     worker: &'a Worker,
+    /// The sandbox every turn of this agent runs in, and its profile (support/oc_sandbox.rs).
+    sb: &'a oc_sandbox::OcSandbox,
+    profile: PathBuf,
     name: &'static str,
     project: PathBuf,
     session: Option<String>,
@@ -352,13 +349,9 @@ impl Agent<'_> {
         prompt: &str,
         kill_after: Option<Duration>,
     ) -> String {
-        let mut cmd = Command::new("opencode");
-        cmd.env_clear();
-        for key in ["HOME", "SHELL", "LANG", "TMPDIR", "USER"] {
-            if let Some(v) = std::env::var_os(key) {
-                cmd.env(key, v);
-            }
-        }
+        // Confined, with a fixed environment (`OcSandbox::opencode`): the recording `vox` shim
+        // first on the model's PATH, then the system's.
+        let mut cmd = self.sb.opencode(&self.profile, &[bin_dir], &self.project);
         let mut args = vec!["run".to_owned(), "--auto".into(), "-m".into(), model()];
 
         if let Some(s) = &self.session {
@@ -366,16 +359,7 @@ impl Agent<'_> {
             args.push(s.clone());
         }
         args.push(prompt.to_owned());
-        cmd.current_dir(&self.project)
-            .args(&args)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
+        cmd.args(&args)
             .env("XDG_CONFIG_HOME", oc_cfg)
             .env("VOX_DATA_DIR", &self.worker.data)
             .env("VOX_CONFIG_DIR", &self.worker.cfg)
@@ -384,7 +368,9 @@ impl Agent<'_> {
             .env("VOX_BIN", VOX)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("opencode");
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot run opencode in its sandbox: {e}"));
         // Every turn has a deadline of its own, so a turn that never returns is reported
         // as exactly that — with its output — rather than surfacing as the whole-process
         // watchdog, which says only that something, somewhere, hung.
@@ -408,6 +394,7 @@ impl Agent<'_> {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        self.sb.check(&s, "an `opencode run` turn");
         eprintln!("[receipt] {} turn {prompt:?}\n{s}", self.name);
         s
     }
@@ -465,10 +452,14 @@ fn instructions(steps: &[&str]) -> String {
 #[ignore = "two nodes, production Argon2id, and live model turns; optional, run it in release"]
 fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict() {
     watchdog::arm();
+    if !oc_sandbox::live_model_allowed(
+        "tracker_rehearsal_proof::workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict",
+    ) {
+        return;
+    }
     assert!(
-        which("opencode").is_some() && auth_present(),
-        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH and a credential \
-         (~/.local/share/opencode/auth.json)"
+        which("opencode").is_some(),
+        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH"
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -480,15 +471,19 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
 
-    // **One fixture per `vox` under test, never one for the machine** (as the drain proof's):
-    // every run rewrites its `bin/vox`, so two trees sharing one path ran each other's `vox`.
-    // Keyed by the binary's path, a tree still reuses its own OpenCode install.
-    let fixture = std::env::temp_dir().join(format!("vox-tracker-rehearsal-{:016x}", {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        VOX.hash(&mut h);
-        h.finish()
-    }));
+    // **Every model turn runs confined** (support/oc_sandbox.rs): a throwaway HOME, a fixed
+    // environment, a whitelist of readable paths, a canary in the real HOME it must never see.
+    // The plugins' hooks and the models' `vox` need the two workers' vox profiles; nothing
+    // else outside the sandbox is readable. A missing credential is CANNOT MEASURE there.
+    let sb = oc_sandbox::OcSandbox::new(tmp.path());
+    let profile = sb.profile(
+        "tracker",
+        &[&alice.data, &alice.cfg, &bob.data, &bob.cfg],
+        &[Path::new(VOX)],
+    );
+    // **This run's own fixture, inside its sandbox**: two trees sharing one fixture ran each
+    // other's `vox` (as the drain proof's); OpenCode installs into it on the warm-up turn.
+    let fixture = sb.root.join("fixture");
     let oc_cfg = fixture.join("config");
     let bin_dir = fixture.join("bin");
     std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
@@ -512,6 +507,8 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         }
         agents.push(Agent {
             worker: w,
+            sb: &sb,
+            profile: profile.clone(),
             name,
             project,
             session: None,

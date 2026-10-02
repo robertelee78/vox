@@ -360,6 +360,12 @@ pub trait RootSigner {
 /// natively-generated identity (ADR-002 §GPG integration "Generate").
 pub struct SoftwareRootSigner {
     secret: CompositeSecret,
+    /// The public key and its fingerprint, worked out once when the signer is built (V210-127):
+    /// deriving them expands the ML-DSA key from its seed, which a record's build asked for on
+    /// every publish, on the node's actor. They are fields of the signer, which never changes
+    /// its key: a new identity is a new signer, so they cannot outlive the key they came from.
+    public: CompositePublicKey,
+    fingerprint: Digest32,
 }
 
 impl SoftwareRootSigner {
@@ -389,7 +395,13 @@ impl SoftwareRootSigner {
             ed,
             ml_dsa_seed: DsaSeed(*ml_dsa_seed),
         };
-        Ok(Self { secret })
+        let public = secret.public();
+        let fingerprint = public.fingerprint();
+        Ok(Self {
+            secret,
+            public,
+            fingerprint,
+        })
     }
 
     /// The Ed25519 component seed (for encrypted backup export, ADR-002 §Backup).
@@ -412,7 +424,11 @@ impl SoftwareRootSigner {
 
 impl RootSigner for SoftwareRootSigner {
     fn public_key(&self) -> CompositePublicKey {
-        self.secret.public()
+        self.public.clone()
+    }
+
+    fn fingerprint(&self) -> Digest32 {
+        self.fingerprint
     }
 
     fn sign(&self, msg: &[u8]) -> Result<CompositeSignature> {
