@@ -829,6 +829,8 @@ const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long `vox daemon` waits for its node to stop on SIGTERM or Ctrl-C before leaving anyway.
 /// A clean stop takes milliseconds; this is for a node stuck waiting on a peer that vanished.
+/// It must stay longer than the node's own wait for finished tunnels (`STOP_ACK_BOUND`, 3 s), so a
+/// stop that waits that out still closes its connections before the daemon leaves.
 const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long one wake may take before it is abandoned.
@@ -877,6 +879,12 @@ async fn judge(
         return;
     }
     let author = crate::ident::member_name(&view.trusted, &row.author);
+    let room_name = view
+        .channels
+        .iter()
+        .find(|c| c.channel_id == *channel_id)
+        .and_then(|c| c.local_name.clone())
+        .unwrap_or_default();
     for session in crate::wake::registered(paths) {
         if session.room != room || session.name.is_empty() {
             continue;
@@ -888,16 +896,19 @@ async fn judge(
         // harness's own user message, so the bare body read as the operator speaking.
         let text = crate::agent_hook::render_wake(
             &room[..12.min(room.len())],
+            &room_name,
             &row.entry_hash,
             &author,
             &envelope.body,
         );
+        let entry = vox_core::node::link::b32_encode(&row.entry_hash);
         let paths = paths.clone();
         // **One wedged session must not stall every other wake.** Each is its own task,
         // bounded by a deadline: a session endpoint that accepts and never reads would
         // otherwise hold this loop — and so every later interrupt — indefinitely.
         tokio::spawn(async move {
-            match tokio::time::timeout(WAKE_DEADLINE, crate::wake::wake(&session, &text)).await {
+            let woke = crate::wake::wake(&session, &entry, &text);
+            match tokio::time::timeout(WAKE_DEADLINE, woke).await {
                 Ok(Ok(())) => {}
                 // A session that has ended is forgotten, so its name's later messages are
                 // not tried against it for ever.

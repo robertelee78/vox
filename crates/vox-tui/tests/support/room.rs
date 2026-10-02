@@ -42,7 +42,7 @@ const ROOM_PASS: &str = "channel passphrase";
 /// silently name a session. **This test process may itself be running inside Claude
 /// Code or Codex**, and a leaked `CLAUDE_CODE_SESSION_ID` would make every worker the
 /// same session — the exact defect these proofs exist to catch.
-pub const HARNESS_SESSION_VARS: [&str; 10] = [
+pub const HARNESS_SESSION_VARS: [&str; 11] = [
     "VOX_SESSION",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
@@ -56,7 +56,8 @@ pub const HARNESS_SESSION_VARS: [&str; 10] = [
     // wants a wake endpoint sets its own.
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
-    "OPENCODE_SERVER_URL",
+    "VOX_OPENCODE_WAKE_SOCKET",
+    "VOX_OPENCODE_WAKE_TOKEN",
     "VOX_HARNESS",
 ];
 
@@ -265,6 +266,40 @@ pub struct Room {
     pub id: String,
     pub cid: [u8; 32],
     _anchor: Proc,
+    anchor: String,
+    tmp: std::path::PathBuf,
+}
+
+impl Room {
+    /// Restart worker `i`'s daemon as an operator does after a crash: killed (SIGKILL) and
+    /// reaped by its own PID, then `vox daemon` again with the identity passphrase alone, which
+    /// reopens every room it held (#208). Returns once this room reads on that node again.
+    pub fn restart(&mut self, i: usize) {
+        let w = &mut self.workers[i];
+        w.daemon = None;
+        let err = self.tmp.join(format!("{}.daemon.restart.err", w.name));
+        start_daemon(w, &self.anchor, &err);
+        let deadline = Instant::now() + TIMEOUT;
+        while !w.vox(None, &["room", "read", &self.id]).ok {
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: {}'s restarted daemon answers but never reopened the room in {}s; its \
+                 stderr:\n{}",
+                w.name,
+                TIMEOUT.as_secs(),
+                std::fs::read_to_string(&err).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+impl Room {
+    /// The anchor's pid, for a proof that must stop it: it holds the room's entries too, and
+    /// would otherwise serve a stopped member's posts to the others.
+    pub fn anchor_pid(&self) -> u32 {
+        self._anchor.0.id()
+    }
 }
 
 /// A file to send a child's output to, or an `APPARATUS:` red naming it.
@@ -608,12 +643,19 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         cid,
         workers,
         _anchor: anchor,
+        anchor: spec,
+        tmp: tmp.to_path_buf(),
     }
 }
 
 /// Poll a `vox` invocation until its output satisfies `ok`, or fail naming what it
 /// last said. Something posted on one node reaches another through the log, so "has
 /// it arrived yet" has no synchronous answer.
+///
+/// **One verdict names its side**: `vox` giving no answer at all (killed, no exit status) is
+/// APPARATUS; a deadline that passed after fewer than [`MIN_LOOKS`] looks is CANNOT MEASURE
+/// (the harness was too slow to ask); otherwise `vox` refusing (a non-zero exit) or answering
+/// without what was awaited is PRODUCT, quoting the last answer.
 pub fn until(
     w: &Worker,
     session: Option<&str>,
@@ -633,8 +675,31 @@ pub fn until(
         last = Some(o);
         std::thread::sleep(Duration::from_millis(250));
     }
+    let secs = TIMEOUT.as_secs();
     let (side, seen) = looks.side();
-    panic!("{side} {what} did not happen in {TIMEOUT:?} ({seen}); the last answer: {last:?}");
+    match last {
+        Some(o) if o.code.is_none() => panic!(
+            "APPARATUS (no answer): waiting {secs}s for {what}, `{}` never exited with a \
+             status ({seen}): {o:?}",
+            o.argv
+        ),
+        // Too few looks to have given the product its chances: the harness's clock, not vox.
+        Some(o) if side != "PRODUCT:" => {
+            panic!("{side}: waiting {secs}s for {what} ({seen}); the last answer: {o:?}")
+        }
+        Some(o) if !o.ok => panic!(
+            "PRODUCT: waiting {secs}s for {what}, vox refused `{}` (exit {}): {}\nlast saw \
+             {o:?} ({seen})",
+            o.argv,
+            o.code.unwrap_or_default(),
+            o.stderr.trim()
+        ),
+        Some(o) => panic!(
+            "PRODUCT: waiting {secs}s for {what}, vox answered `{}` without it ({seen}): {o:?}",
+            o.argv
+        ),
+        None => panic!("APPARATUS: waiting for {what}, the deadline passed before one try"),
+    }
 }
 
 /// A resource's entry in a `vox.room.board/1` object, if it has one.
@@ -670,4 +735,103 @@ pub async fn post_raw(w: &Worker, cid: [u8; 32], text: &str) {
             w.name
         ),
     }
+}
+
+/// Put a recording `vox` at `bin_dir/vox` for a model's shell: it runs the real binary and
+/// appends to `log` a `call` line before and an `exit` line (status and stderr) after every
+/// command. **It is what tells a product red from an apparatus red** in a live-model proof:
+/// a command the model never ran is the apparatus, a command `vox` refused is the product,
+/// and only a command `vox` accepted can be waited for. The plugin calls `VOX_BIN` directly,
+/// so only the model's own commands land here.
+pub fn model_shim(bin_dir: &std::path::Path, log: &std::path::Path) {
+    let shim = bin_dir.join("vox");
+    let _ = std::fs::remove_file(&shim);
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\n\
+             printf 'call\\t%s\\n' \"$*\" >> '{log}'\n\
+             err=$(mktemp \"${{TMPDIR:-/tmp}}/vox-shim.XXXXXX\")\n\
+             '{vox}' \"$@\" 2>\"$err\"\n\
+             rc=$?\n\
+             cat \"$err\" >&2\n\
+             printf 'exit\\t%s\\t%s\\t%s\\n' \"$rc\" \"$*\" \"$(tr '\\n\\t' '  ' < \"$err\")\" >> '{log}'\n\
+             rm -f \"$err\"\n\
+             exit $rc\n",
+            log = log.display(),
+            vox = VOX
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+/// One command a model's shell ran through [`model_shim`].
+#[derive(Debug, Clone)]
+pub struct ModelCall {
+    pub args: String,
+    /// `vox`'s exit status and stderr; `None` when it never returned.
+    pub exit: Option<(i32, String)>,
+}
+
+/// Every command in a [`model_shim`] log, each paired with its own exit.
+pub fn model_calls(log: &std::path::Path) -> Vec<ModelCall> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let mut calls: Vec<ModelCall> = Vec::new();
+    for l in text.lines() {
+        let f: Vec<&str> = l.splitn(4, '\t').collect();
+        match f.as_slice() {
+            ["call", args] => calls.push(ModelCall {
+                args: (*args).to_owned(),
+                exit: None,
+            }),
+            ["exit", rc, args, err] => {
+                if let Some(c) = calls
+                    .iter_mut()
+                    .find(|c| c.exit.is_none() && c.args == *args)
+                {
+                    c.exit = Some((rc.parse().unwrap_or(-1), err.trim().to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+    calls
+}
+
+/// Judge a model's run of one `vox` command, found in `log` by `matches`: **vox refusing it
+/// is a PRODUCT red quoting the refusal**, and vox never returning is one too. Returns
+/// `false` when the model never ran it — the apparatus, which the caller names.
+pub fn vox_accepted(
+    log: &std::path::Path,
+    who: &str,
+    what: &str,
+    matches: impl Fn(&str) -> bool,
+) -> bool {
+    let calls = model_calls(log);
+    let Some(c) = calls.iter().find(|c| matches(&c.args)) else {
+        return false;
+    };
+    match &c.exit {
+        Some((0, _)) => true,
+        Some((rc, err)) => panic!(
+            "PRODUCT: vox refused {who}'s {what} (`vox {}`), exit {rc}: {err}",
+            c.args
+        ),
+        None => panic!(
+            "PRODUCT: {who}'s {what} (`vox {}`) never returned before the model's turn ended",
+            c.args
+        ),
+    }
+}
+
+/// [`until`] for something `vox` already accepted with exit 0, which the red says.
+pub fn arrives(w: &Worker, what: &str, args: &[&str], ok: impl Fn(&Out) -> bool) -> Out {
+    until(
+        w,
+        None,
+        &format!("{what}, which vox accepted with exit 0"),
+        args,
+        ok,
+    )
 }

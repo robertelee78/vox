@@ -192,15 +192,40 @@ const UDP_SOCKET_BUFFER: usize = 4 << 20;
 /// bandwidth-delay product of a 1 Gbit/s path at ~130 ms, or 10 Gbit/s at ~13 ms.
 pub const STREAM_WINDOW: u32 = 16 << 20;
 
-/// Flow-control credit a peer gets for the whole connection, across all its streams: what this
-/// node will buffer for one peer that sends and is not read.
+/// Flow-control credit a peer gets for the whole connection, across all its streams, **before
+/// any tunnel runs on it**: what this node will buffer for one peer that sends and is not read.
 ///
 /// quinn's default is unlimited, which is safe only while the per-stream window is small. At
 /// [`STREAM_WINDOW`] a peer may open quinn's default 100 concurrent bidirectional streams, so an
 /// unlimited connection window let one peer park 100 × 16 MiB = 1.6 GiB in this node's memory
-/// by writing into streams nobody reads. Two full stream windows keeps a single tunnel at full
-/// speed, and lets a second one run beside it.
+/// by writing into streams nobody reads.
+///
+/// **Each running tunnel adds its own [`STREAM_WINDOW`] on top** ([`VoxConnection::carry_tunnel`]),
+/// up to [`TUNNELS_PER_PEER`] tunnels on one connection.
+/// A tunnel whose local reader stops reading keeps a full stream window unread, and the
+/// connection's credit is shared: at a fixed two stream windows, two such tunnels held all of it,
+/// and the room's sync, pairwise keys and board records to that peer got none — a post waited out
+/// a 20 s frame timeout and failed (V210-81). With each tunnel bringing its own window, what the
+/// tunnels hold can never reach this base, so everything else keeps it. Only tunnels this node
+/// authorized, or opened for its own local application, are credited, so an unauthorized peer
+/// still gets exactly this.
 pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
+
+/// How many tunnels one member and this node carry between them at once, in both directions
+/// together and **across every connection to that member**. A tunnel past it is refused at once,
+/// saying so (decider, 2026-10-01).
+///
+/// Without it, every tunnel a trusted member opened added a [`STREAM_WINDOW`] to what this node
+/// agreed to buffer for them, with no end: a member could hold 16 MiB of this node's memory per
+/// tunnel whose far end had stopped reading. With it, a member's tunnels hold at most this many
+/// stream windows (256 MiB), each credited on the connection it runs on, so the room's sync never
+/// waits on them. Generous by design: past any real use, it is a bound on memory, not a quota.
+///
+/// Per member, not per connection: a member has two connections at once whenever a better path
+/// replaces a relayed one (the old one stays open while its tunnels run), and a count per
+/// connection let that member open 16 more on the new one, and told a person to close a tunnel
+/// that freed nothing on the count that refused them (#272 c5).
+pub const TUNNELS_PER_PEER: u32 = 16;
 
 /// quinn's own path-MTU ceiling (`MtuDiscoveryConfig::default().upper_bound`): 1500-byte Ethernet
 /// less IPv6 and UDP headers. What an endpoint falls back to when its socket cannot take the
@@ -611,11 +636,16 @@ impl VoxEndpoint {
         // beginning a handshake and never finishing it.
         let connecting = incoming
             .accept_with(Arc::new(server_cfg))
-            .map_err(|_| Error::SignatureInvalid)?;
+            .map_err(handshake_failed)?;
         let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
             .await
-            .map_err(|_| Error::SignatureInvalid)?
-            .map_err(|_| Error::SignatureInvalid)?;
+            .map_err(|_| {
+                Error::Handshake(format!(
+                    "the peer did not finish its handshake within {}s",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(handshake_failed)?;
         let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
 
@@ -707,6 +737,7 @@ fn finish_connection(
         datagram_tx: Mutex::new(DatagramSender::new()),
         datagram_rx: Mutex::new(ReplayWindow::default()),
         datagrams_dropped: AtomicU64::new(0),
+        tunnels: Arc::new(Mutex::new(0)),
     })
 }
 
@@ -783,12 +814,208 @@ pub struct VoxConnection {
     /// for observability ([`VoxConnection::datagrams_dropped`]); a rising count
     /// on a live connection is a replay signal worth surfacing.
     datagrams_dropped: AtomicU64,
+    /// Tunnels running on this connection, each credited a stream window of its own
+    /// ([`VoxConnection::carry_tunnel`]). Shared with each [`TunnelCredit`], so a credit needs no
+    /// borrow of the connection.
+    tunnels: Arc<Mutex<u32>>,
+}
+
+/// A tunnel's share of its connection's receive window, held for as long as the tunnel runs
+/// (see [`CONNECTION_WINDOW`]). Dropping it gives the share back, and takes the tunnel off
+/// [`live_tunnels`].
+#[must_use = "the credit lasts only as long as the guard is held"]
+pub struct TunnelCredit {
+    tunnels: Arc<Mutex<u32>>,
+    connection: Connection,
+    id: u64,
+    moved: Arc<AtomicU64>,
+}
+
+impl TunnelCredit {
+    /// Where the tunnel's splice marks the time it last moved a byte, in Unix seconds (see
+    /// [`LiveTunnel::last_moved`]).
+    #[must_use]
+    pub fn moved(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.moved)
+    }
+}
+
+impl Drop for TunnelCredit {
+    fn drop(&mut self) {
+        // One lock at a time, as `carry_tunnel` takes them.
+        lock(&LIVE).remove(&self.id);
+        let mut n = lock(&self.tunnels);
+        *n = n.saturating_sub(1);
+        set_tunnel_window(&self.connection, *n);
+    }
+}
+
+/// One live tunnel, as `vox status` lists it (V210-81): so a person can see which tunnels hold a
+/// member's connection, and which of them is stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTunnel {
+    /// The member at the other end.
+    pub peer: Digest32,
+    /// The service it reaches: a port, or a `vox room send` offer's tag.
+    pub service: String,
+    /// Whether this node opened it (to reach the member's service), rather than serving it.
+    pub outbound: bool,
+    /// When it was opened, in Unix seconds.
+    pub opened: u64,
+    /// When it last moved a byte either way, in Unix seconds; `opened` until it has.
+    pub last_moved: u64,
+}
+
+/// A live tunnel's entry in [`LIVE`].
+struct Live {
+    peer: Digest32,
+    service: String,
+    outbound: bool,
+    opened: u64,
+    moved: Arc<AtomicU64>,
+}
+
+/// Every tunnel this process carries now, by a number of its own. A process runs one node, so
+/// this is the node's list.
+static LIVE: Mutex<std::collections::BTreeMap<u64, Live>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The next key in [`LIVE`].
+static NEXT_TUNNEL: AtomicU64 = AtomicU64::new(0);
+
+/// The time now in Unix seconds, as [`LiveTunnel`] states times.
+#[must_use]
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Every tunnel this node carries now, oldest first.
+#[must_use]
+pub fn live_tunnels() -> Vec<LiveTunnel> {
+    lock(&LIVE)
+        .values()
+        .map(|t| LiveTunnel {
+            peer: t.peer,
+            service: t.service.clone(),
+            outbound: t.outbound,
+            opened: t.opened,
+            last_moved: t.moved.load(Ordering::Relaxed).max(t.opened),
+        })
+        .collect()
+}
+
+/// What a person is told when a tunnel is refused at the cap: how many are open to this member,
+/// to which services, and how to free one (decider, 2026-10-01).
+fn limit_said(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> String {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for t in live.values().filter(|t| t.peer == *peer) {
+        *counts.entry(t.service.clone()).or_default() += 1;
+    }
+    let services: Vec<String> = counts
+        .iter()
+        .map(|(s, n)| {
+            if *n == 1 {
+                s.clone()
+            } else {
+                format!("{s} ×{n}")
+            }
+        })
+        .collect();
+    format!(
+        "{TUNNELS_PER_PEER} tunnels are already open to this member (to {})\n       \
+         to free one: close the program using it, or restart the `vox up` or `vox forward` \
+         carrying it; on the host, `vox service remove` the service, or `vox trust remove` the \
+         member\n       `vox status` lists every tunnel, and when each last moved",
+        services.join(", ")
+    )
+}
+
+/// Set `connection`'s receive window for `tunnels` running tunnels.
+fn set_tunnel_window(connection: &Connection, tunnels: u32) {
+    let window = u64::from(CONNECTION_WINDOW) + u64::from(tunnels) * u64::from(STREAM_WINDOW);
+    connection.set_receive_window(quinn::VarInt::from_u64(window).unwrap_or(quinn::VarInt::MAX));
+}
+
+/// Whether a connection already carrying `open` tunnels must refuse one more.
+/// Whether `peer` already has as many live tunnels with this node as it may, on whatever
+/// connections they run.
+fn at_tunnel_cap(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> bool {
+    live.values().filter(|t| t.peer == *peer).count() >= TUNNELS_PER_PEER as usize
 }
 
 /// The next [`VoxConnection::serial`].
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 impl VoxConnection {
+    /// Credit one more running tunnel with a stream window of its own on top of
+    /// [`CONNECTION_WINDOW`], for as long as the returned guard is held — so a tunnel whose
+    /// local reader has stopped cannot take the credit the room's other streams need.
+    ///
+    /// [`Error::TunnelLimit`] when the member already has [`TUNNELS_PER_PEER`] tunnels with this
+    /// node, on this connection or any other: the tunnel is to be refused, not carried on memory
+    /// past the member's bound.
+    ///
+    /// Take it only for a tunnel this node authorized or opened for its own application: the
+    /// credit is memory this node agrees to hold for that peer. `service` and `outbound` are what
+    /// [`live_tunnels`] lists it as.
+    pub fn carry_tunnel(&self, service: &str, outbound: bool) -> Result<TunnelCredit> {
+        let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
+        let opened = unix_now();
+        let moved = Arc::new(AtomicU64::new(opened));
+        {
+            // Counted and taken under one lock, so two tunnels asked for at once cannot both
+            // take the last place.
+            let mut live = lock(&LIVE);
+            if at_tunnel_cap(&live, &self.peer_id) {
+                return Err(Error::TunnelLimit(limit_said(&live, &self.peer_id)));
+            }
+            live.insert(
+                id,
+                Live {
+                    peer: self.peer_id,
+                    service: service.to_owned(),
+                    outbound,
+                    opened,
+                    moved: Arc::clone(&moved),
+                },
+            );
+        }
+        // This connection's own count only sizes its receive window: each tunnel's stream
+        // window is credited where it runs.
+        let mut n = lock(&self.tunnels);
+        *n += 1;
+        set_tunnel_window(&self.connection, *n);
+        drop(n);
+        Ok(TunnelCredit {
+            tunnels: Arc::clone(&self.tunnels),
+            connection: self.connection.clone(),
+            id,
+            moved,
+        })
+    }
+
+    /// [`Error::TunnelLimit`] if this connection's member already has as many tunnels with this
+    /// node as it may ([`TUNNELS_PER_PEER`]), so another would be refused.
+    ///
+    /// # Errors
+    /// [`Error::TunnelLimit`], saying what it holds and how to free one.
+    pub fn room_for_a_tunnel(&self) -> Result<()> {
+        let live = lock(&LIVE);
+        if at_tunnel_cap(&live, &self.peer_id) {
+            return Err(Error::TunnelLimit(limit_said(&live, &self.peer_id)));
+        }
+        Ok(())
+    }
+
+    /// [`Error::TunnelLimit`] as this node words it, for a refusal the **host** made at the cap
+    /// (`TunnelStatus::Full`): the member's live tunnels here are the same ones it counted.
+    #[must_use]
+    pub fn tunnel_limit(&self) -> Error {
+        Error::TunnelLimit(limit_said(&lock(&LIVE), &self.peer_id))
+    }
+
     /// **A name for this connection that no other connection in this process is ever given.**
     ///
     /// quinn's `stable_id` is not one: it is the address of the connection's state, and a

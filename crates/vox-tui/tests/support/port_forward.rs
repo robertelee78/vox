@@ -202,10 +202,14 @@ pub struct ForwardedWorld {
 }
 
 impl ForwardedWorld {
+    /// Refuses as CANNOT MEASURE, naming the `test-knobs` feature, a `vox` that does not read
+    /// `VOX_TEST_ADVERTISE`: without it the host advertises its real address, the forward is never
+    /// used, and the world is not the one its proofs measure (V210-105).
     pub fn new(forward_open: bool) -> Self {
         use crate::world::{
             after_label, args, echo_service, fingerprint, mkdir, vox_once, VoxProc,
         };
+        crate::test_knobs::require(&["VOX_TEST_ADVERTISE"]);
         let tmp = crate::world::tempdir();
         let (anchor_dir, host_dir, guest_dir) = (
             tmp.path().join("anchor"),
@@ -275,8 +279,9 @@ impl ForwardedWorld {
         let joined_in = t0.elapsed();
         assert!(
             ok,
-            "PRODUCT (staging): the guest on [::1] could not join the host's room: `vox connect` \
-             failed after {joined_in:?}.\nstdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
+            "PRODUCT (staging): the guest on [::1] could not join the host's room the moment \
+             `vox serve` printed its address (after {joined_in:?}), which leads to the room when it \
+             is printed (V210-96). `vox connect` said:\nstdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
             host.transcript()
         );
         Self {
