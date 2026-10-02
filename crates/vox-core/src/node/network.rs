@@ -639,6 +639,16 @@ impl NodeNet {
         })
     }
 
+    /// Drop the pre-join record `peer` holds on this node's board for `channel_id`: it has just
+    /// been admitted, so it is no longer waiting to join (V210-102).
+    pub fn forget_prejoin(&self, channel_id: &Digest32, peer: &Digest32) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .forget_prejoin(channel_id, peer);
+    }
+
     /// Whether the board knows `peer` as a member of some channel it anchors: the
     /// creator named by a genesis it holds, or the author of a live member record
     /// (which the board only admitted from an authenticated member).

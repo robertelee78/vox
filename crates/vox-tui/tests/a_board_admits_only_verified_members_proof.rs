@@ -771,8 +771,14 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
             c.finish();
             set
         })
-        .ok()
-        .and_then(|set| set.bundles.into_iter().find(|b| b.author_id == victim_id))
+        .unwrap_or_else(|e| {
+            panic!(
+                "CANNOT MEASURE (harness error): the test could not read the victim's board: {e:?}"
+            )
+        })
+        .bundles
+        .into_iter()
+        .find(|b| b.author_id == victim_id)
         .map(|b| b.prekey_bundle)
         .expect("PRODUCT (staging): the victim's board holds no bundle of its own");
     let mut bundle = victim_bundle;
