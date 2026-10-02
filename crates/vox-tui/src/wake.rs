@@ -669,8 +669,8 @@ pub enum Tended {
 ///   due, the session's next read carries it, and once the cursor moves or the hold passes it is
 ///   counted again. Counted **now**: one read first is not announced at all.
 /// - **A reply** gets a notice only while the session is idle: one, then one after each wait in
-///   [`Settings::reply_nudges`], then no more. A fresher reply starts the series again. Read, the
-///   series ends.
+///   [`Settings::reply_nudges`], then no more. A fresher reply starts the series again, at once,
+///   whatever is outstanding. Read, the series ends.
 pub fn tend(
     n: &mut Notices,
     cursor: Option<String>,
@@ -700,7 +700,9 @@ pub fn tend(
     let reply_now = n.reply.is_some()
         && idle
         && match n.reply_sent {
-            0 => !outstanding,
+            // A reply not yet announced is told at once, an outstanding notice or not: the
+            // notice is about this reply, which nothing sent yet has counted.
+            0 => true,
             k => s
                 .reply_nudges
                 .get(k as usize - 1)
