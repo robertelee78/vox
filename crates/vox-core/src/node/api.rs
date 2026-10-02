@@ -961,7 +961,7 @@ impl Fault {
                 "a member answered, but it is busy answering other joins\n       your passphrase was never checked — this is not a verdict on it\n       try the join again shortly"
             }
             Fault::RoomFull => {
-                "the room is full: it holds as many members as a room can\n       your passphrase was accepted; nobody else can join this room"
+                "the room is full\n       your passphrase was accepted; nobody else can join this room\n       (the cap is soft: joins answered at the same moment by different members can take a room a little past it)"
             }
             Fault::NotAdmittedAfterJoin => {
                 "a member accepted your passphrase, then could not admit you: it was locked or closing, or could not write its store\n       your passphrase was accepted — this is not a verdict on it\n       run the join again; another member, or this one once it is running, can admit you"

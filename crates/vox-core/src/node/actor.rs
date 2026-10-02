@@ -352,6 +352,9 @@ const SETUP_PATIENCE: Duration = Duration::from_secs(5);
 /// never finished and keep everyone else out for as long as a member waits on a proof of work.
 /// Past the cap the heaviest source gives up its newest slot; see [`crate::node::joinslots`].
 const JOINS_IN_FLIGHT: usize = 16;
+// A room's soft cap overshoots by at most the joins answered at once (V210-128).
+const _OVERSHOOT_IS_THE_JOIN_SLOTS: () =
+    assert!(JOINS_IN_FLIGHT == crate::node::channel::JOIN_OVERSHOOT);
 
 /// How many identity-passphrase checks may run at once.
 ///
@@ -6491,6 +6494,8 @@ impl Node {
                     // this task, so the actor is never the thing waiting — which is the whole point
                     // of the slot. See `NetEvent::JoinAdmit`.
                     |identity| async move {
+                        #[cfg(feature = "test-knobs")]
+                        test_admission_gate().await;
                         let (ack, wait) = tokio::sync::oneshot::channel();
                         if admit_tx
                             .send(NetEvent::JoinAdmit {
@@ -11621,6 +11626,30 @@ async fn admit_board_records(
 /// compiled in without the `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
 pub const TEST_ADMISSION_FAILS_ENV: &str = "VOX_TEST_ADMISSION_FAILS";
+
+/// **Test-only**: a path. While no file is there, every joiner this node answers waits at its
+/// admission, with `<path>.reached.<pid>` written to say so, so a proof can hold joins answered by
+/// two members until both are about to admit, then let them go at once (V210-128's race). Bounded
+/// at a minute. Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_ADMISSION_GATE_ENV: &str = "VOX_TEST_ADMISSION_GATE";
+
+#[cfg(feature = "test-knobs")]
+async fn test_admission_gate() {
+    let Some(gate) = std::env::var_os(TEST_ADMISSION_GATE_ENV).map(std::path::PathBuf::from) else {
+        return;
+    };
+    if gate.exists() {
+        return;
+    }
+    let mut reached = gate.clone().into_os_string();
+    reached.push(format!(".reached.{}", std::process::id()));
+    let _ = std::fs::write(&reached, b"");
+    let t0 = std::time::Instant::now();
+    while !gate.exists() && t0.elapsed() < std::time::Duration::from_secs(60) {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
 
 fn fault_of(e: &Error) -> Fault {
     match e {

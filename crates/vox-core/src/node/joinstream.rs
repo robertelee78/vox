@@ -219,6 +219,8 @@ pub enum JoinFrame {
     Full {
         /// How many members the room holds.
         members: u64,
+        /// The room's cap, as the refusing member enforces it.
+        cap: u64,
     },
     /// **Step 8, joiner → responder:** one ratchet message with an empty plaintext,
     /// whose only job is to open the responder's sending direction (M17.6).
@@ -301,8 +303,8 @@ impl JoinFrame {
             Self::Rejected(r) => {
                 e.array(2).uint(OP_REJECTED).uint(u64::from(*r as u8));
             }
-            Self::Full { members } => {
-                e.array(2).uint(OP_FULL).uint(*members);
+            Self::Full { members, cap } => {
+                e.array(3).uint(OP_FULL).uint(*members).uint(*cap);
             }
         }
         e.finish()
@@ -367,7 +369,10 @@ impl JoinFrame {
                     .map_err(|_| Error::MalformedJoin("reject reason range"))?;
                 Self::Rejected(JoinReject::from_u8(v).ok_or(Error::MalformedJoin("reject reason"))?)
             }
-            (OP_FULL, 2) => Self::Full { members: d.uint()? },
+            (OP_FULL, 3) => Self::Full {
+                members: d.uint()?,
+                cap: d.uint()?,
+            },
             _ => return Err(Error::MalformedJoin("join frame op")),
         };
         d.finish()?;
@@ -757,7 +762,7 @@ pub async fn run_initiator(
     let witness = match recv_frame(&mut recv).await? {
         JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
         JoinFrame::Rejected(r) => return Err(rejected(r)),
-        JoinFrame::Full { members } => return Err(Error::RoomFull { members }),
+        JoinFrame::Full { members, cap } => return Err(Error::RoomFull { members, cap }),
         _ => return Err(Error::MalformedJoin("expected accepted")),
     };
     // Checked here, against the identity the handshake pinned, so a responder cannot
@@ -899,7 +904,7 @@ where
             // nothing.
             if let Err(e) = admit_before_accepting(outcome.peer.identity.clone()).await {
                 let refusal = match e {
-                    Error::RoomFull { members } => JoinFrame::Full { members },
+                    Error::RoomFull { members, cap } => JoinFrame::Full { members, cap },
                     // The passphrase was accepted: never the refusal that reads as a wrong one.
                     _ => JoinFrame::Rejected(JoinReject::NotAdmitted),
                 };
