@@ -296,6 +296,13 @@ pub const IN_REPLY_TO: &str = "  ↳ in reply to ";
 /// The most characters of the answered message's words a reply's preview shows.
 pub const PREVIEW_CHARS: usize = 100;
 
+/// The bidirectional embeddings, overrides and isolates (U+202A–E, U+2066–9): not control
+/// characters, but each reorders what follows it on the line.
+const BIDI_CONTROLS: &[char] = &[
+    '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}',
+    '\u{2069}',
+];
+
 /// Whether `c` ends a line for *somebody* reading this output.
 ///
 /// Not just `\n`: a model, a terminal and a JSON viewer each have their own idea of
@@ -331,11 +338,7 @@ fn is_line_break(c: char) -> bool {
 /// by the entry hash. Nothing of the preview comes from the reply, so its author can point at a
 /// message but cannot make the preview say anything that message did not; and a `re` this room
 /// does not hold is said to be absent, never shown as the reply wrote it.
-fn render_row(
-    out: &mut String,
-    r: &vox_core::node::api::MessageRow,
-    room: &[vox_core::node::api::MessageRow],
-) {
+fn render_row(out: &mut String, r: &vox_core::node::api::MessageRow, room: Parents<'_>) {
     let mut row = String::new();
     render_attributed(
         &mut row,
@@ -357,22 +360,31 @@ fn render_row(
     out.push_str(rest);
 }
 
+/// Where a reply's answered message is looked up (V030-19).
+#[derive(Clone, Copy)]
+enum Parents<'a> {
+    /// The whole room: a message not in it is not held here.
+    Room(&'a [vox_core::node::api::MessageRow]),
+    /// Only what this drain read, because the whole room could not be: a message not in it may
+    /// still be held, so its absence is not said.
+    Read(&'a [vox_core::node::api::MessageRow]),
+}
+
 /// The one-line preview of the message `r` replies to, or `None` when it names none.
-fn reply_preview(
-    r: &vox_core::node::api::MessageRow,
-    room: &[vox_core::node::api::MessageRow],
-) -> Option<String> {
+fn reply_preview(r: &vox_core::node::api::MessageRow, room: Parents<'_>) -> Option<String> {
     let re = vox_agentcomms::envelope::Envelope::parse(&r.text)
         .ok()?
         .re?;
     let Ok(hash) = b32_decode(re.trim(), "re") else {
         return Some("a message this room does not hold".to_owned());
     };
-    let Some(parent) = room.iter().find(|p| p.entry_hash == hash) else {
-        return Some(format!(
-            "[{}], a message this room does not hold",
-            &b32_encode(&hash)[..8]
-        ));
+    let (Parents::Room(rows) | Parents::Read(rows)) = room;
+    let Some(parent) = rows.iter().find(|p| p.entry_hash == hash) else {
+        let entry = &b32_encode(&hash)[..8];
+        return Some(match room {
+            Parents::Room(_) => format!("[{entry}], a message this room does not hold"),
+            Parents::Read(_) => format!("[{entry}]: couldn't look up the message it answers"),
+        });
     };
     let said = if parent.owed {
         vox_core::node::api::NOT_RECEIVED_YET.to_owned()
@@ -392,7 +404,11 @@ fn reply_preview(
 
 /// `text` as one line for a preview: every [`LINE_BREAKS`] character (some are not control
 /// characters, so [`one_line`] would keep them) and run of whitespace is one space, and any other
-/// control character is replaced, so the answered message cannot start a line of its own.
+/// control character or bidirectional override is replaced, so the answered message can neither
+/// start a line of its own nor steer how the line is shown.
+///
+/// The same rule as #324's `envelope::shown` on v0.2.10, which v0.3.0 does not have yet; the
+/// v0.2.10 → v0.3.0 sync can make them one.
 fn preview_line(text: &str) -> String {
     let mut out = String::new();
     for c in text.trim().chars() {
@@ -400,7 +416,7 @@ fn preview_line(text: &str) -> String {
             if !out.ends_with(' ') {
                 out.push(' ');
             }
-        } else if c.is_control() {
+        } else if c.is_control() || BIDI_CONTROLS.contains(&c) {
             out.push('\u{fffd}');
         } else {
             out.push(c);
@@ -506,7 +522,7 @@ fn render_attributed(out: &mut String, entry: &Digest32, author: &str, text: &st
 fn render(
     room_label: &str,
     rows: &[vox_core::node::api::MessageRow],
-    room: &[vox_core::node::api::MessageRow],
+    room: Parents<'_>,
     notice: Option<&str>,
 ) -> (String, usize) {
     let mut body = String::new();
@@ -933,7 +949,9 @@ async fn drain(
     if !fresh.is_empty() {
         // A reply's preview may name a message older than the cursor: the whole room is read for
         // it when the coordination snapshot was, and what this read returned when not.
-        let room = snap.as_ref().map_or(&rows[..], |s| &s.rows[..]);
+        let room = snap
+            .as_ref()
+            .map_or(Parents::Read(&rows), |s| Parents::Room(&s.rows));
         let (text, shown) = render(&label, &fresh, room, notice.as_deref());
         context.push_str(&text);
         if shown < fresh.len() {
