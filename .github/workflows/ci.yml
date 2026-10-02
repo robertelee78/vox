@@ -83,8 +83,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # 120, not 45: both platforms were cancelled at 45 minutes on v0.2.9's merge with nothing red.
-    timeout-minutes: 120
+    # Without the release suite (now `release-proofs`, V210-116), this job is the checks, the debug
+    # suite and the optional proofs' build. `scripts/release-gate.sh` refuses a job over two-thirds
+    # of its limit, so the limit is what keeps creep visible.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
@@ -145,13 +147,61 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc -p vox-core --no-deps --features mutant-sender
       - name: Docs (test knobs)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features vox-tui/test-knobs
-      # The proofs that drive the shipped `vox` with production parameters (Argon2id, real
-      # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
-      # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
-      # product is a test", 2026-09-26). Run here in release.
-      # No proof is excluded by name any more (V210-19, #192): `cross_process_join_proof`, excused
-      # as a flake since v0.2.2, passed 20 of 20 on integrate/v0.2.10 and is back in this gate.
-      # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
+      # The release `--ignored` suite runs in the `release-proofs` job below, split across runners
+      # (V210-116).
+      # The optional proofs (docs/release/optional-proofs.md) block nothing and are never run here
+      # (decider, 2026-10-01). They are kept ready for troubleshooting, so this only builds them,
+      # with RUSTFLAGS' -D warnings: a change that breaks one is caught now, not on the day it is
+      # needed. It is not a test. It builds even when a gate above went red, so a red run still
+      # says whether the kit compiles.
+      - name: Compile optional proofs (not run; troubleshooting kit)
+        if: ${{ !cancelled() }}
+        run: cargo test --release -p vox-tui --features optional-proofs --no-run
+
+  # **The release suite, split across runners** (V210-116). Run as one `cargo test` of every binary
+  # in turn it took 90–104 minutes, which put build-test at 89–117 of its 120 and
+  # `scripts/release-gate.sh` (two-thirds of the limit, V210-14) could never pass. Each shard builds
+  # the same release suite, runs every fourth binary with `--ignored`, and records what it ran;
+  # `release-proofs-union` then requires the shards to have run the whole list, each binary once.
+  # The proofs that drive the shipped `vox` with production parameters (Argon2id, real sockets) are
+  # too slow unoptimized, so they are `#[ignore]`d in the debug suite and run here in release.
+  # No proof is excluded by name (V210-19, #192). One red does not hide the rest: every binary in a
+  # shard runs whatever the others did (v0.2.9 left ~120 binaries unrun behind one).
+  # Four, measured (draft #318, run 36938525058, three shards): each shard spends 22-28 minutes
+  # building (the mutant sender, then the suite) and the macOS suite runs 83 minutes in all, so three
+  # shards took 40-63 of 90 minutes, over two-thirds; four bring the slowest to about 55.
+  release-proofs:
+    name: release proofs
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        shard: [0, 1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # See build-test: Spotlight on a fresh macOS runner took R41's emulator to 74-90% of the link.
+      - name: Stop Spotlight indexing (macOS)
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+      # The tools the proofs measure, as in build-test: the shells `shell_setup_proof` runs, the
+      # Codex `codex_trust_proof` asks, and `pyte` for the proofs that read `vox tui`'s screen.
+      - name: Install the shells the proofs measure
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update && sudo apt-get install -y zsh fish
+          else
+            brew install fish
+          fi
+          zsh --version && fish --version && bash --version | head -1
+      - name: Install the Codex the trust proof measures
+        run: npm install -g @openai/codex@0.157.0 && codex --version
+      - name: Install the terminal emulator the TUI proof reads the screen with
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyte"
+          "$RUNNER_TEMP/pyte/bin/pip" install --quiet pyte==0.8.2
+          echo "VOX_PYTE_PATH=$("$RUNNER_TEMP/pyte/bin/python" -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
       # ADR-025's P9 and P10 proofs run a deliberately misbehaving sync sender as the faulty peer
       # (no `vox` command makes a correct node misbehave). It is built here from this commit, into
       # its own path, and named to them by VOX_MUTANT_SENDER; the script rebuilds the shipped
@@ -161,14 +211,46 @@ jobs:
         run: |
           path=$(scripts/build-mutant-sender.sh)
           echo "VOX_MUTANT_SENDER=$path" >> "$GITHUB_ENV"
-      - name: Real-parameter gates (release)
-        run: |
-          cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored
-      # The optional proofs (docs/release/optional-proofs.md) block nothing and are never run here
-      # (decider, 2026-10-01). They are kept ready for troubleshooting, so this only builds them,
-      # with RUSTFLAGS' -D warnings: a change that breaks one is caught now, not on the day it is
-      # needed. It is not a test. It builds even when a gate above went red, so a red run still
-      # says whether the kit compiles.
-      - name: Compile optional proofs (not run; troubleshooting kit)
+      # Built with the test knobs (V210-105), as every proof is: a proof refuses a `vox` without
+      # them as CANNOT MEASURE.
+      - name: Build and list the release suite
+        env:
+          CI_SHARD_CARGO_ARGS: --features vox-tui/test-knobs
+        run: scripts/ci_shard.py list "list-${{ matrix.shard }}.tsv"
+      - name: Real-parameter gates (release), shard ${{ matrix.shard }} of 4
+        env:
+          # `update_proof` asks GitHub which releases exist, to find one to update *from*.
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci_shard.py run "list-${{ matrix.shard }}.tsv" ${{ matrix.shard }} 4 "ran-${{ matrix.shard }}.tsv"
+      # Uploaded whatever happened, so a shard cut short shows as binaries that never ran.
+      - name: Record what this shard ran
         if: ${{ !cancelled() }}
-        run: cargo test --release -p vox-tui --features optional-proofs --no-run
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-proofs-${{ matrix.os }}-${{ matrix.shard }}
+          path: |
+            list-${{ matrix.shard }}.tsv
+            ran-${{ matrix.shard }}.tsv
+          if-no-files-found: warn
+
+  # **Nothing is skipped silently** (V210-116): every shard of an OS listed the same suite, and
+  # between them they ran each binary in it exactly once. A binary missing, run twice, or run but
+  # not listed is red, named.
+  release-proofs-union:
+    name: every shard's binaries add up to the suite
+    needs: [release-proofs]
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-proofs-${{ matrix.os }}-*
+          path: shards
+      - name: Every binary ran, in exactly one shard (${{ matrix.os }})
+        run: scripts/ci_shard.py union shards
