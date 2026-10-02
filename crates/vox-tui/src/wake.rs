@@ -485,9 +485,7 @@ pub fn unread<'a>(
         if me == Some(r.author) && !e.from.is_empty() && e.from == session.session {
             continue;
         }
-        if !session.name.is_empty()
-            && e.may_interrupt(&session.name)
-            && hops_left(&e, timeline) > 0
+        if !session.name.is_empty() && e.may_interrupt(&session.name) && hops_left(&e, timeline) > 0
         {
             urgent.push(r);
         } else if is_reply(&e, &asked) {
@@ -675,8 +673,7 @@ pub fn tend(
 ) -> Tended {
     let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let outstanding = n.sent_cursor == cursor
-        && n
-            .sent_at
+        && n.sent_at
             .is_some_and(|t| now.saturating_sub(t) < ms(s.wake_hold));
     if newest_reply != n.reply {
         n.reply = newest_reply;

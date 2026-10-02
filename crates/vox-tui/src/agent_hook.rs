@@ -826,8 +826,7 @@ async fn drain(
         }
         upto = Some(i);
     }
-    let still_ahead: std::collections::BTreeSet<Digest32> = rows
-        [upto.map_or(0, |i| i + 1)..]
+    let still_ahead: std::collections::BTreeSet<Digest32> = rows[upto.map_or(0, |i| i + 1)..]
         .iter()
         .map(|r| r.entry_hash)
         .filter(|h| shown_now.contains(h) || ahead.contains(h))

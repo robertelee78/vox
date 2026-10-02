@@ -18,15 +18,17 @@ The screen is read through pyte, as the person sees it. Prints, each on its own 
   the daemon (`<data_dir>/<profile>/sessions/*.json`, those not there before it opened);
 - `<tag> OTHER: shown|absent` — whether the message addressed to carol reached the screen before
   the one addressed to bobby was posted;
-- `<tag> WAKE: shown mid-turn|shown after the turn|absent` — whether the message addressed to
-  bobby reached the screen, and whether the running turn's reply had appeared yet;
+- `<tag> WAKE: shown mid-turn|shown after the turn|absent` — whether the wake for the message
+  addressed to bobby reached the screen (Vox's notice, which carries no message, or the message
+  itself in the read that follows it), and whether the running turn's reply had appeared yet;
 - `<tag> TURN: completed|never completed` — whether the tool that was running when the wake
   arrived still ran to its end (its output, `SLEPT-42`, reached the screen): an interrupt queues
   into the running turn, and must not abort it;
 - `<tag> RECEIVED: woken=<n> other=<n> envelope=yes|no` — once the turn the wake started has
   answered, what the model was given, from the session as OpenCode stored it (`opencode export`;
   a user message is stored as the plugin left it): how many times the message addressed to bobby
-  appears in it (the wake's own text is one), how many times the one addressed to carol does
+  appears in it (the wake carries none of it: only the `<vox-room>` read does), how many times
+  the one addressed to carol does
   (only a `<vox-room>` read carries it), and whether any of it is a message's envelope JSON
   rather than its words; `<tag> RECEIVED: never` if that turn never answered;
 - `<tag> SCREEN:` and the screen, whenever anything above is not clean.
@@ -55,6 +57,8 @@ from vox_pty import Hung, Tui, arm, disarm, pyte, reap, stage  # noqa: E402
 
 VOX, DATA, CFG, ROOM, PROJECT, XDG, PLUGIN_LOG, TMP, TAG = sys.argv[1:10]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
+# How Vox's wake notice reads (V030-15): a count and the senders, never the message.
+NOTICE = "urgent message addressed to you"
 GONE_SECS = 5  # the helper removes it the moment the pipe closes; this is slack, not a wait
 SLEEP = 45  # long enough that the wake is posted and relayed while the tool still runs
 # The tool's own output, computed by the shell so the command's text cannot match it: on screen
@@ -222,7 +226,7 @@ try:
 
     stage("post an urgent message addressed to bobby")
     post("bobby", f"bobby: {WAKE} please acknowledge.")
-    shown = tui.until(lambda: WAKE in flat(), SLEEP + 60, step=0.25)
+    shown = tui.until(lambda: WAKE in flat() or NOTICE in flat(), SLEEP + 60, step=0.25)
     turn_done = SLEPT in flat()
     took = time.time() - t_turn
     if not shown:

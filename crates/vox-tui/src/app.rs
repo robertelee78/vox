@@ -955,10 +955,8 @@ fn tend(
             continue;
         }
         let cursor = crate::agent_hook::load_cursor(paths, &session.room, &session.session);
-        let ahead =
-            crate::agent_hook::delivered_ahead(paths, &session.room, &session.session);
-        let (urgent, replies) =
-            crate::wake::unread(&detail.timeline, me, &session, cursor, &ahead);
+        let ahead = crate::agent_hook::delivered_ahead(paths, &session.room, &session.session);
+        let (urgent, replies) = crate::wake::unread(&detail.timeline, me, &session, cursor, &ahead);
         let before = n.clone();
         let outcome = crate::wake::tend(
             &mut n,
@@ -1024,11 +1022,7 @@ fn tend(
 /// **One wedged session must not stall every other wake.** Each is its own task, bounded by a
 /// deadline: a session endpoint that accepts and never reads would otherwise hold the wake
 /// loop — and so every later interrupt — indefinitely.
-fn deliver(
-    paths: vox_core::node::paths::Paths,
-    session: crate::wake::Session,
-    text: String,
-) {
+fn deliver(paths: vox_core::node::paths::Paths, session: crate::wake::Session, text: String) {
     tokio::spawn(async move {
         let woke = crate::wake::wake(&session, &text);
         match tokio::time::timeout(WAKE_DEADLINE, woke).await {

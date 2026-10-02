@@ -23,25 +23,57 @@
 //! profile directories and the harness variables each case sets, and each registration is
 //! read back and required to name the test's own endpoint before anything is posted.
 //!
-//! It asserts, **each for a message that arrived by sync**:
+//! **A wake announces; the message arrives once, through the room read** (V030-15). The wake
+//! is a notice — how many urgent messages, from whom, in which room — and no byte of any
+//! message. Claude Code runs its `UserPromptSubmit` hook for a message written to its messaging
+//! socket, with that message as the hook's `prompt`, idle, mid-generation or between tool calls
+//! (measured against a live Claude Code 2.1.287), so the drain runs in the turn the wake starts.
+//! Here bob's hook runs on the wake it received exactly as his harness would.
 //!
-//! 1. addressed to bob and urgent — bob's session is woken, exactly once;
+//! `an_urgent_message_from_another_node_interrupts_its_addressee` asserts, **each for a message
+//! that arrived by sync**:
+//!
+//! 1. addressed to bob and urgent — bob's session is woken, exactly once, by a notice naming
+//!    one urgent message from alice; **no byte of any message body** reaches the wake endpoint
+//!    (each body carries a canary);
 //! 2. urgent but addressed to someone else — nothing;
 //! 3. addressed to bob but not urgent — nothing;
+//! 5. the turn the wake starts reads the urgent message **once**, first, ahead of the two older
+//!    ones that woke nothing, which it also reads once each;
+//! 6. **one notice outstanding at a time**: a second urgent message, while the first one's notice
+//!    is unread, wakes nothing, and the daemon says it held it;
+//! 7. **recounted before it fires**: once the session's read has taken that message, nothing
+//!    is sent for it, and the daemon says it was already read;
 //! 4. a wedged session (an OpenCode plugin's wake socket, registered by `vox agent hook
 //!    --session` with `VOX_OPENCODE_WAKE_SOCKET`/`_TOKEN`, that accepts and never answers) does
-//!    not stall bob's wakes;
-//! 5. **the wake is not given to the model a second time** (V210-112). Claude Code runs its
-//!    `UserPromptSubmit` hook for a message written to its messaging socket, with that message
-//!    as the hook's `prompt` (measured against a live Claude Code 2.1.287). So bob's hook runs
-//!    again with the wake it received as `prompt`, exactly as his harness would, and its room
-//!    read must carry the two messages that woke nothing, and not the one the wake delivered.
+//!    not stall bob's wakes.
 //!
-//! **Mutation.** Put the pre-F15 loop back — the daemon judges only `NewEntry`, treating
-//! `Synced`/`SenderKeyReceived` and its two-second sweep as nothing to do — and this goes red
-//! at (1): the urgent message reaches bob's node and his session is never woken. Drop the
-//! drain's reading of its own prompt (`woken_by_prompt`) and it goes red at (5), the woken
-//! message in the room read too.
+//! `an_idle_agent_is_told_when_a_reply_to_it_is_waiting` (V030-20): bob's session `asker` asks
+//! alice something, and alice answers (`--re`), each answer carrying a canary. The schedule is
+//! the profile's real setting, shortened here (`agent_reply_nudges = 8s 8s 8s` in bob's settings
+//! file); its default is 5, 20 and 60 minutes.
+//!
+//! 1. while the session is **busy** (its turn started and has not ended) — no notice;
+//! 2. at its **end of turn** (Claude Code's `Stop` hook, run as `vox agent hook`, printing
+//!    nothing) — exactly one notice, naming one reply from alice, with no canary byte;
+//! 3. then one after each wait of the schedule, and no more: four in all;
+//! 4. **a daemon restart resumes the series**: restarted after the second notice, the third and
+//!    fourth still come, and no fifth;
+//! 5. **a fresh reply starts it again**: one more notice;
+//! 6. the turn that notice starts reads each answer **once**; and an answer the session read
+//!    before going idle again is **never announced**;
+//! 7. `SessionEnd` removes the registration: a later answer wakes nothing;
+//! 8. `vox agent plugin claude` prints the `UserPromptSubmit`, `Stop` and `SessionEnd` entries.
+//!
+//! Every red says PRODUCT, with what the product sent or said, or CANNOT MEASURE, naming the
+//! staging that was not achieved.
+//!
+//! **Mutation**, one per claim, each red at its own assertion: the message put back in the wake
+//! (V030-15 (1), V030-20 (2)); no recount — the daemon counting from the start of the room rather
+//! than the cursor (V030-15 (7), V030-20 (6)); no outstanding-notice rule (V030-15 (6)); no idle
+//! gate (V030-20 (1)); no generation, so a fresh reply is not announced (V030-20 (5)); the
+//! series held in memory (V030-20 (4)). The pre-F15 loop — the daemon judging only `NewEntry` —
+//! goes red at V030-15 (1).
 
 #![cfg(unix)]
 
@@ -152,6 +184,65 @@ fn collect(
     got
 }
 
+/// The user message each stand-in frame carries: what the harness would put before the model.
+fn contents(frames: &[String]) -> Vec<String> {
+    frames
+        .iter()
+        .flat_map(|f| f.lines())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["type"] == "user")
+        .filter_map(|v| v["message"]["content"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A Claude Code hook input for `event`, for `session`, carrying `prompt` when the event has one.
+fn hook_json(event: &str, session: &str, prompt: Option<&str>) -> String {
+    let mut v = serde_json::json!({
+        "session_id": session,
+        "hook_event_name": event,
+        "cwd": "/tmp",
+        "transcript_path": "/tmp/t.jsonl",
+    });
+    if let Some(p) = prompt {
+        v["prompt"] = p.into();
+        v["permission_mode"] = "default".into();
+        v["prompt_id"] = "p".into();
+    }
+    if event == "Stop" {
+        v["stop_reason"] = "end_turn".into();
+        v["last_assistant_message"] = "done".into();
+    }
+    v.to_string()
+}
+
+/// The `additionalContext` a Claude Code drain injected, or nothing.
+fn injected(stdout: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .and_then(|v| {
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// Record a failed claim and carry on, so one mutant shows every red.
+fn check(failures: &mut Vec<String>, ok: bool, what: String) {
+    if !ok {
+        eprintln!("[red] {what}");
+        failures.push(what);
+    }
+}
+
+fn daemon_err(tmp: &std::path::Path, name: &str) -> String {
+    ["daemon.err", "daemon.restart.err"]
+        .iter()
+        .map(|f| std::fs::read_to_string(tmp.join(format!("{name}.{f}"))).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 #[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
 fn an_urgent_message_from_another_node_interrupts_its_addressee() {
@@ -164,23 +255,28 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
     let room = r.id.clone();
-    let err_path = tmp.path().join("bob.daemon.err");
+    let bob_err = || daemon_err(tmp.path(), "bob");
+    let mut failures = Vec::new();
 
     // ---- bob's session registers with his daemon, as its harness hook does every turn ----
     let sock = tmp.path().join("session.sock");
     let inbox = listen(&sock);
-    let hook_input = r#"{"session_id":"session-bob","hook_event_name":"UserPromptSubmit","cwd":"/tmp","permission_mode":"default","prompt":"hi","prompt_id":"p-1","transcript_path":"/tmp/t.jsonl"}"#;
     let sock_s = sock.to_string_lossy().into_owned();
-    hook(
-        bob,
-        &[
-            ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
-            ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
-            ("VOX_AGENT_NAME", "bob"),
-        ],
-        &["agent", "hook", "--room", &room],
-        Some(hook_input),
-    );
+    let bob_env = [
+        ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
+        ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
+        ("VOX_AGENT_NAME", "bob"),
+    ];
+    // bob's harness, starting a turn on `prompt`: its drain's injection.
+    let turn = |prompt: &str| {
+        injected(&hook(
+            bob,
+            &bob_env,
+            &["agent", "hook", "--room", &room],
+            Some(&hook_json("UserPromptSubmit", "session-bob", Some(prompt))),
+        ))
+    };
+    let _ = turn("hi");
     let reg = registered_endpoint(bob, "session-bob");
     assert_eq!(
         reg,
@@ -189,7 +285,8 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
          real session's"
     );
 
-    // Bob's daemon must be in sync with alice before the cases mean anything.
+    // Bob's daemon must be in sync with alice, and his session must have read everything so far,
+    // before the cases mean anything.
     post(alice, &room, "SYNC-MARKER");
     until(
         bob,
@@ -198,117 +295,180 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         &["room", "read", &room],
         |o| o.stdout.contains("SYNC-MARKER"),
     );
+    let _ = turn("hi");
 
-    // ---- (2) urgent, addressed to someone else: nothing ----
+    // ---- (2) urgent, addressed to someone else; (3) addressed to bob, not urgent ----
     post(
         alice,
         &room,
         r#"{"v":1,"type":"ask","to":["carol"],"urgent":true,"body":"carol: OTHER-ADDRESSEE"}"#,
     );
-    // ---- (3) addressed to bob, not urgent: nothing ----
     post(
         alice,
         &room,
         r#"{"v":1,"type":"ask","to":["bob"],"body":"bob: NOT-URGENT"}"#,
     );
-    // ---- (1) addressed to bob and urgent: woken ----
+    // ---- (1) addressed to bob and urgent: woken, by a notice that carries none of it ----
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WAKE-UP-FROM-ALICE"}"#,
+        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-URGENT-1 wake up"}"#,
     );
     until(
         bob,
         None,
         "the urgent message to reach bob's node",
         &["room", "read", &room],
-        |o| o.stdout.contains("WAKE-UP-FROM-ALICE"),
+        |o| o.stdout.contains("CANARY-URGENT-1"),
     );
     // Twenty seconds after it landed: ten sweeps of the daemon's two-second tick, and long
     // enough for a wrongly-woken or twice-woken session to show.
-    let woken = collect(&inbox, Duration::from_secs(20), |_| false);
-    let all = woken.join("\n");
-    let wakes = woken
-        .iter()
-        .filter(|f| f.contains("WAKE-UP-FROM-ALICE"))
-        .count();
+    let frames = collect(&inbox, Duration::from_secs(20), |_| false);
+    let all = frames.join("\n");
+    let wakes = contents(&frames);
     println!(
-        "[proof] bob's session got {} frame(s) in 20s: {wakes} wake(s) for the urgent message, \
-         other-addressee {}, not-urgent {}",
-        woken.len(),
+        "[proof] (1)-(3) bob's session got {} frame(s) in 20s, {} notice(s): {wakes:?}; \
+         canary/other/not-urgent bytes at the endpoint: {} {} {}",
+        frames.len(),
+        wakes.len(),
+        all.contains("CANARY-URGENT"),
         all.contains("OTHER-ADDRESSEE"),
         all.contains("NOT-URGENT")
     );
-    assert!(
-        all.contains("WAKE-UP-FROM-ALICE"),
-        "an urgent message addressed to bob, from another node, must interrupt bob's session; \
-         received {woken:?}; bob's daemon stderr:\n{}",
-        std::fs::read_to_string(&err_path).unwrap_or_default()
+    check(
+        &mut failures,
+        wakes.len() == 1
+            && wakes[0].contains("1 urgent message addressed to you from alice")
+            && all.contains("a-token"),
+        format!(
+            "PRODUCT (1): one urgent message from alice must wake bob's session once, with a \
+             notice naming one urgent message from alice and the registered token; received \
+             {frames:?}; bob's daemon:\n{}",
+            bob_err()
+        ),
     );
-    assert!(
-        all.contains("a-token"),
-        "the wake must authenticate with the token the harness registered: {woken:?}"
+    check(
+        &mut failures,
+        !all.contains("CANARY-URGENT") && !all.contains("wake up"),
+        format!("PRODUCT (1): no byte of the message may reach the wake endpoint: {frames:?}"),
     );
-    assert!(
-        !all.contains("OTHER-ADDRESSEE"),
-        "a message addressed to another agent must not interrupt bob"
-    );
-    assert!(
-        !all.contains("NOT-URGENT"),
-        "an addressed message that is not urgent must wait for the next turn"
-    );
-    assert_eq!(
-        wakes, 1,
-        "one urgent message wakes the session once: {woken:?}"
+    check(
+        &mut failures,
+        !all.contains("OTHER-ADDRESSEE") && !all.contains("NOT-URGENT"),
+        format!("PRODUCT (2)/(3): only the urgent message to bob may wake him: {frames:?}"),
     );
 
-    // ---- (5) the wake's own turn: the drain does not give the model the wake again ----
-    let wake_text = woken
-        .iter()
-        .flat_map(|f| f.lines())
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find(|v| v["type"] == "user")
-        .and_then(|v| v["message"]["content"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE (5): no user message among the frames bob's session received: {woken:?}")
-        });
-    let wake_turn = serde_json::json!({
-        "session_id": "session-bob",
-        "hook_event_name": "UserPromptSubmit",
-        "cwd": "/tmp",
-        "permission_mode": "default",
-        "prompt": wake_text,
-        "prompt_id": "p-2",
-        "transcript_path": "/tmp/t.jsonl",
-    })
-    .to_string();
-    let read = hook(
-        bob,
-        &[
-            ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
-            ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
-            ("VOX_AGENT_NAME", "bob"),
-        ],
-        &["agent", "hook", "--room", &room],
-        Some(&wake_turn),
-    );
+    // ---- (5) the wake's own turn reads the message once, first ----
+    let Some(wake_text) = wakes.first().cloned() else {
+        panic!(
+            "CANNOT MEASURE (5)-(7): bob's session was never woken; {} claim(s) failed:\n- {}",
+            failures.len(),
+            failures.join("\n- ")
+        );
+    };
+    let read = turn(&wake_text);
+    let at = |m: &str| read.find(m).unwrap_or(usize::MAX);
     println!(
-        "[proof] the wake's own turn read: woken message {} time(s), other-addressee {}, \
-         not-urgent {}",
-        read.matches("WAKE-UP-FROM-ALICE").count(),
+        "[proof] (5) the wake's own turn read: the urgent message {} time(s), other-addressee \
+         {}, not-urgent {}; the urgent one first {}",
+        read.matches("CANARY-URGENT-1").count(),
         read.matches("OTHER-ADDRESSEE").count(),
-        read.matches("NOT-URGENT").count()
+        read.matches("NOT-URGENT").count(),
+        at("CANARY-URGENT-1") < at("OTHER-ADDRESSEE").min(at("NOT-URGENT"))
     );
     assert!(
         read.matches("OTHER-ADDRESSEE").count() == 1 && read.matches("NOT-URGENT").count() == 1,
         "CANNOT MEASURE (5): the wake's turn must read the two messages that woke nothing, once \
          each, or the read did not reach them: {read}"
     );
-    assert_eq!(
-        read.matches("WAKE-UP-FROM-ALICE").count(),
-        0,
-        "PRODUCT (5): the message a wake delivered must not be given to the model again in the \
-         room read of the turn that wake started: {read}"
+    check(
+        &mut failures,
+        read.matches("CANARY-URGENT-1").count() == 1,
+        format!(
+            "PRODUCT (5): the turn the wake started must give the model the urgent message \
+             exactly once: {read}"
+        ),
+    );
+    check(
+        &mut failures,
+        at("CANARY-URGENT-1") < at("OTHER-ADDRESSEE").min(at("NOT-URGENT")),
+        format!("PRODUCT (5): the urgent message must come first in the read: {read}"),
+    );
+
+    // ---- (6) one notice outstanding at a time ----
+    post(
+        alice,
+        &room,
+        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-URGENT-2"}"#,
+    );
+    let got = contents(&collect(&inbox, Duration::from_secs(30), |g| {
+        g.contains("\"user\"")
+    }));
+    assert!(
+        got.len() == 1,
+        "CANNOT MEASURE (6): a second urgent message, after the first was read, must wake bob \
+         for the outstanding-notice case to mean anything; got {got:?}; bob's daemon:\n{}",
+        bob_err()
+    );
+    let second = got[0].clone();
+    post(
+        alice,
+        &room,
+        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-URGENT-3"}"#,
+    );
+    until(
+        bob,
+        None,
+        "the third urgent message to reach bob's node",
+        &["room", "read", &room],
+        |o| o.stdout.contains("CANARY-URGENT-3"),
+    );
+    let held = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    let said_held = bob_err().contains("not waking session session-bob again yet");
+    println!(
+        "[proof] (6) with a notice outstanding, a further urgent message woke bob {} time(s); \
+         the daemon said it held it: {said_held}",
+        held.len()
+    );
+    check(
+        &mut failures,
+        held.is_empty(),
+        format!(
+            "PRODUCT (6): no further wake while the first notice is outstanding (unread, inside \
+             the hold); got {held:?}"
+        ),
+    );
+    check(
+        &mut failures,
+        said_held,
+        format!(
+            "PRODUCT (6): the daemon must say it held the notice for the third message; its \
+             stderr:\n{}",
+            bob_err()
+        ),
+    );
+
+    // ---- (7) recounted before it fires: read first, nothing sent ----
+    let read = turn(&second);
+    assert!(
+        read.contains("CANARY-URGENT-2") && read.contains("CANARY-URGENT-3"),
+        "CANNOT MEASURE (7): the session's read must take both held messages first: {read}"
+    );
+    let after = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    let said_read = bob_err().contains("it already read the urgent message(s)");
+    println!(
+        "[proof] (7) once the session had read them, the daemon woke it {} time(s); it said \
+         they were already read: {said_read}",
+        after.len()
+    );
+    check(
+        &mut failures,
+        after.is_empty() && said_read,
+        format!(
+            "PRODUCT (7): a held urgent message the session read first must wake nothing, and \
+             the daemon must say it was already read; got {after:?}; bob's daemon:\n{}",
+            bob_err()
+        ),
     );
 
     // ---- (4) a wedged session must not stall anybody else's wake ----
@@ -348,33 +508,296 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
          never a real session's"
     );
     let registered = std::fs::read_dir(bob.paths.session_dir())
-        .map(|d| d.count())
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        })
         .unwrap_or(0);
     assert_eq!(
         registered, 2,
         "CANNOT MEASURE: exactly two sessions registered"
     );
-    for n in 1..=2 {
-        post(
-            alice,
-            &room,
-            &format!(
-                r#"{{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WEDGE-TEST-{n}"}}"#
-            ),
-        );
+    post(
+        alice,
+        &room,
+        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WEDGE-TEST"}"#,
+    );
+    let got = contents(&collect(&inbox, Duration::from_secs(45), |g| {
+        g.contains("\"user\"")
+    }));
+    println!("[proof] (4) with a wedged session registered, bob's session got {got:?}");
+    check(
+        &mut failures,
+        got.iter()
+            .any(|c| c.contains("1 urgent message addressed to you from alice")),
+        format!(
+            "PRODUCT (4): a wedged session stalled another session's wake; received {got:?}; \
+             bob's daemon:\n{}",
+            bob_err()
+        ),
+    );
+
+    assert!(
+        failures.is_empty(),
+        "{} claim(s) failed:\n- {}",
+        failures.len(),
+        failures.join("\n- ")
+    );
+}
+
+#[test]
+#[ignore = "an anchor and two vox daemons with production Argon2id, and a daemon restart; CI runs it in release"]
+fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let room = r.id.clone();
+    let bob_err = || daemon_err(tmp.path(), "bob");
+    let mut failures = Vec::new();
+
+    // The schedule is the profile's own setting, shortened: 8 s between notices, not 5, 20, 60
+    // minutes.
+    {
+        use std::io::Write as _;
+        let cfg = r.workers[1].paths.config_file();
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&cfg)
+            .expect("APPARATUS: open bob's settings file");
+        writeln!(f, "\nagent_reply_nudges = 8s 8s 8s").unwrap();
     }
-    let got = collect(&inbox, Duration::from_secs(45), |g| {
-        g.contains("WEDGE-TEST-1") && g.contains("WEDGE-TEST-2")
-    })
-    .join("\n");
+
+    // ---- (8) the entries a person merges into Claude Code's settings ----
+    let printed = r.workers[1].vox(None, &["agent", "plugin", "claude"]);
+    let entries: serde_json::Value =
+        serde_json::from_str(&printed.stdout).unwrap_or(serde_json::Value::Null);
+    let runs_hook = |event: &str| {
+        entries["hooks"][event][0]["hooks"][0]["command"] == "vox agent hook"
+            && entries["hooks"][event][0]["hooks"][0]["type"] == "command"
+    };
     println!(
-        "[proof] with a wedged session registered, bob's session got WEDGE-TEST-1 {} and \
-         WEDGE-TEST-2 {}",
-        got.contains("WEDGE-TEST-1"),
-        got.contains("WEDGE-TEST-2")
+        "[proof] (8) `vox agent plugin claude`: UserPromptSubmit {}, Stop {}, SessionEnd {}",
+        runs_hook("UserPromptSubmit"),
+        runs_hook("Stop"),
+        runs_hook("SessionEnd")
+    );
+    check(
+        &mut failures,
+        printed.ok && runs_hook("UserPromptSubmit") && runs_hook("Stop") && runs_hook("SessionEnd"),
+        format!(
+            "PRODUCT (8): `vox agent plugin claude` must print UserPromptSubmit, Stop and \
+             SessionEnd entries running `vox agent hook`: {printed:?}"
+        ),
+    );
+
+    // ---- bob's session `asker` registers, as its harness hook does at the top of a turn ----
+    let sock = tmp.path().join("asker.sock");
+    let inbox = listen(&sock);
+    let sock_s = sock.to_string_lossy().into_owned();
+    let env = [
+        ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
+        ("CLAUDE_CODE_MESSAGING_TOKEN", "asker-token"),
+        ("VOX_AGENT_NAME", "asker"),
+    ];
+    let event = |bob: &Worker, name: &str, prompt: Option<&str>| {
+        hook(
+            bob,
+            &env,
+            &["agent", "hook", "--room", &room],
+            Some(&hook_json(name, "asker", prompt)),
+        )
+    };
+    let _ = event(&r.workers[1], "UserPromptSubmit", Some("ask alice"));
+    assert_eq!(
+        registered_endpoint(&r.workers[1], "asker"),
+        ("claude".to_owned(), sock_s.clone()),
+        "CANNOT MEASURE: asker must be registered at the test's own socket"
+    );
+    // It asks alice, as its model would with `vox room post`.
+    let o = r.workers[1].vox_in(
+        Some("asker"),
+        &[
+            "room", "post", &room, "--type", "ask", "--to", "alice", "--json", "-",
+        ],
+        Some("What is the build number?"),
     );
     assert!(
-        got.contains("WEDGE-TEST-1") && got.contains("WEDGE-TEST-2"),
-        "a wedged session stalled another session's wakes; received: {got}"
+        o.ok,
+        "CANNOT MEASURE: asker could not post its question: {o:?}"
+    );
+    let q = o.json()["entry_hash"]
+        .as_str()
+        .expect("`vox room post --json` names the entry")
+        .to_owned();
+    until(
+        &r.workers[0],
+        None,
+        "the question to reach alice",
+        &["room", "read", &room],
+        |o| o.stdout.contains("What is the build number?"),
+    );
+    let answer = |alice: &Worker, bob: &Worker, canary: &str| {
+        let o = alice.vox_in(
+            Some("alice-s"),
+            &["room", "post", &room, "--type", "answer", "--re", &q, "-"],
+            Some(&format!("{canary}: build 42")),
+        );
+        assert!(o.ok, "CANNOT MEASURE: alice could not answer: {o:?}");
+        until(
+            bob,
+            None,
+            "alice's answer to reach bob",
+            &["room", "read", &room],
+            |o| o.stdout.contains(canary),
+        );
+    };
+
+    // ---- (1) busy: an answer waits, and nothing is sent ----
+    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-1");
+    let busy = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    println!("[proof] (1) while busy, asker got {} notice(s)", busy.len());
+    check(
+        &mut failures,
+        busy.is_empty(),
+        format!("PRODUCT (1): a busy session must get no reply notice: {busy:?}"),
+    );
+
+    // ---- (2) its turn ends: exactly one notice, carrying no canary byte ----
+    let stop = event(&r.workers[1], "Stop", None);
+    check(
+        &mut failures,
+        stop.is_empty(),
+        format!("PRODUCT (2): the Stop hook must print nothing: {stop:?}"),
+    );
+    let first = collect(&inbox, Duration::from_secs(15), |g| g.contains("\"user\""));
+    // Six more seconds: inside the 8 s wait, so a second notice here is one too many.
+    let mut frames = first.clone();
+    frames.extend(collect(&inbox, Duration::from_secs(6), |_| false));
+    let told = contents(&frames);
+    println!("[proof] (2) at the end of its turn, asker got {told:?}");
+    check(
+        &mut failures,
+        told.len() == 1 && told[0].contains("1 reply to your messages from alice"),
+        format!(
+            "PRODUCT (2): an idle session with an unread reply must get exactly one notice \
+             naming one reply from alice; got {told:?}; bob's daemon:\n{}",
+            bob_err()
+        ),
+    );
+    check(
+        &mut failures,
+        !frames.join("\n").contains("CANARY-REPLY") && !frames.join("\n").contains("build 42"),
+        format!("PRODUCT (2): no byte of the reply may reach the wake endpoint: {frames:?}"),
+    );
+
+    // ---- (3)/(4) the series goes on by the schedule, and survives a daemon restart ----
+    let second = contents(&collect(&inbox, Duration::from_secs(20), |g| {
+        g.contains("\"user\"")
+    }));
+    assert!(
+        second.len() == 1,
+        "CANNOT MEASURE (4): the second notice of the series must come before the restart; got \
+         {second:?}; bob's daemon:\n{}",
+        bob_err()
+    );
+    r.restart(1);
+    // The third is due 8 s after the second, which the restart has likely passed; the fourth 8 s
+    // after the third. Then no more.
+    let rest = contents(&collect(&inbox, Duration::from_secs(40), |_| false));
+    println!(
+        "[proof] (3)/(4) after the restart, asker got {} more notice(s) (2 due, then none)",
+        rest.len()
+    );
+    check(
+        &mut failures,
+        rest.len() == 2,
+        format!(
+            "PRODUCT (3)/(4): a restarted daemon must resume the series — the third and fourth \
+             notices, then no more; got {rest:?}; bob's daemon:\n{}",
+            bob_err()
+        ),
+    );
+
+    // ---- (5) a fresh reply starts the series again ----
+    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-2");
+    let fresh = contents(&collect(&inbox, Duration::from_secs(15), |g| {
+        g.contains("\"user\"")
+    }));
+    println!("[proof] (5) after a fresh reply, asker got {fresh:?}");
+    check(
+        &mut failures,
+        fresh.len() == 1 && fresh[0].contains("2 replies to your messages from alice"),
+        format!(
+            "PRODUCT (5): a fresh reply must start the series again with a notice naming both \
+             replies; got {fresh:?}; bob's daemon:\n{}",
+            bob_err()
+        ),
+    );
+
+    // ---- (6) the notice's turn reads each answer once; one read before idling is never told ----
+    let prompt = fresh.first().cloned().unwrap_or_else(|| "a notice".into());
+    let read = injected(&event(&r.workers[1], "UserPromptSubmit", Some(&prompt)));
+    println!(
+        "[proof] (6) the notice's turn read reply 1 {} time(s), reply 2 {} time(s)",
+        read.matches("CANARY-REPLY-1").count(),
+        read.matches("CANARY-REPLY-2").count()
+    );
+    check(
+        &mut failures,
+        read.matches("CANARY-REPLY-1").count() == 1 && read.matches("CANARY-REPLY-2").count() == 1,
+        format!("PRODUCT (6): the turn a notice starts must read each answer once: {read}"),
+    );
+    // Busy now. Another answer lands, and the session reads it before its turn ends.
+    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-3");
+    let read = injected(&event(&r.workers[1], "UserPromptSubmit", Some("go on")));
+    assert!(
+        read.contains("CANARY-REPLY-3"),
+        "CANNOT MEASURE (6): the session's own read must take the third answer: {read}"
+    );
+    let _ = event(&r.workers[1], "Stop", None);
+    let after = contents(&collect(&inbox, Duration::from_secs(12), |_| false));
+    println!(
+        "[proof] (6) answers read, then idle: asker got {} notice(s)",
+        after.len()
+    );
+    check(
+        &mut failures,
+        after.is_empty(),
+        format!(
+            "PRODUCT (6): an idle session that has read every answer must get no notice; got \
+             {after:?}"
+        ),
+    );
+
+    // ---- (7) SessionEnd removes the registration ----
+    let end = event(&r.workers[1], "SessionEnd", None);
+    let gone = !r.workers[1].paths.session_file("asker").exists();
+    answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-4");
+    let ended = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    println!(
+        "[proof] (7) after SessionEnd: registration gone {gone}, notices {}",
+        ended.len()
+    );
+    check(
+        &mut failures,
+        end.is_empty() && gone && ended.is_empty(),
+        format!(
+            "PRODUCT (7): SessionEnd must print nothing and remove the registration, and a \
+             later answer must wake nothing; printed {end:?}, gone {gone}, got {ended:?}"
+        ),
+    );
+
+    assert!(
+        failures.is_empty(),
+        "{} claim(s) failed:\n- {}",
+        failures.len(),
+        failures.join("\n- ")
     );
 }
