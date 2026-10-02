@@ -69,6 +69,7 @@ if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
     sys.exit(2)
 opencode = shutil.which("opencode")
+opencode = os.path.realpath(opencode) if opencode else None
 if opencode is None or not os.path.isfile(SANDBOX):
     print(f"{TAG} APPARATUS: opencode is not on PATH, or there is no sandbox profile at {SANDBOX}")
     sys.exit(2)
@@ -76,14 +77,19 @@ arm(BUDGET, TAG)
 
 # A cleared environment: an inherited one (cargo test's) silently disables plugin hooks, and a
 # real Claude Code session's variables must never reach anything here.
-env = {k: os.environ[k] for k in ("PATH", "SHELL", "LANG", "USER") if k in os.environ}
+# A fixed, minimal environment: the operator's PATH names their home and other agents' scratch
+# directories, and USER names them; a model that ran `env` would send both to its provider.
+# OpenCode is started by its absolute path, so nothing here needs the real PATH.
+env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "SHELL": "/bin/zsh"}
+if "LANG" in os.environ:
+    env["LANG"] = os.environ["LANG"]
 # **Every OpenCode here is confined** (the caller's `sandbox-exec` profile): a turn runs a
 # shell, and an unconfined one could read the operator's files and send them to the model's
 # provider. Its HOME is the sandbox's own, so nothing it keeps is the operator's.
 env.update(HOME=SB_HOME, XDG_DATA_HOME=os.path.join(SB_HOME, ".local/share"),
            XDG_CACHE_HOME=os.path.join(SB_HOME, ".cache"),
            XDG_STATE_HOME=os.path.join(SB_HOME, ".local/state"))
-OPENCODE = ["sandbox-exec", "-f", SANDBOX, opencode]
+OPENCODE = ["/usr/bin/sandbox-exec", "-f", SANDBOX, opencode]
 env.update(TERM="xterm-256color", XDG_CONFIG_HOME=XDG, VOX_DATA_DIR=DATA, VOX_CONFIG_DIR=CFG,
            TMPDIR=TMP,  # this run's own, so its wake directories are exactly the ones counted
            VOX_BIN=VOX, VOX_PLUGIN_LOG=PLUGIN_LOG,

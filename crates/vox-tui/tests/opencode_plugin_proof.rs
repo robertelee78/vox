@@ -479,6 +479,9 @@ impl Drop for Canary {
     }
 }
 
+/// The PATH every sandboxed OpenCode runs with: the system's alone, never the operator's.
+const SANDBOX_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
 /// One OpenCode sandbox: its profile file and the throwaway HOME its turns run with.
 struct Sandbox<'a> {
     profile: std::path::PathBuf,
@@ -494,7 +497,7 @@ fn opencode_turn(
     prompt: &str,
     sb: &Sandbox<'_>,
 ) -> String {
-    let mut cmd = Command::new("sandbox-exec");
+    let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-f").arg(&sb.profile).arg(opencode_bin());
     // **A cleared environment, not an inherited one.** Run from a shell the plugin
     // works; run from `cargo test` with the same directory and arguments it loads
@@ -503,10 +506,12 @@ fn opencode_turn(
     // actually needs. This also makes the run reproducible: whatever the operator
     // happens to export cannot decide whether this passes.
     cmd.env_clear();
-    for key in ["PATH", "SHELL", "LANG", "USER"] {
-        if let Some(v) = std::env::var_os(key) {
-            cmd.env(key, v);
-        }
+    // **A fixed, minimal environment**: the operator's PATH names their home and other agents'
+    // scratch directories, and USER names them, and a model that ran `env` would send both to
+    // its provider. OpenCode is started by its absolute path, so nothing needs the real PATH.
+    cmd.env("PATH", SANDBOX_PATH).env("SHELL", "/bin/zsh");
+    if let Some(v) = std::env::var_os("LANG") {
+        cmd.env("LANG", v);
     }
     // The sandbox's own HOME, so nothing OpenCode keeps (sessions, caches, state) is the
     // operator's, and nothing a turn writes outlives the run.
@@ -759,7 +764,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     // **The sandbox holds before any model runs.** A shell in the most open of the two
     // profiles tries to read the canary in the real HOME, by both of its paths, and to find
     // it; then it lists the operator's HOME. Any of it succeeding stops the run here.
-    let probe = Command::new("sandbox-exec")
+    let probe = Command::new("/usr/bin/sandbox-exec")
         .arg("-f")
         .arg(&fed.profile)
         .args(["/bin/sh", "-c"])
