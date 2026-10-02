@@ -157,9 +157,11 @@ MUST be reproduced by the harness when its fix is reverted.
    run only at the decider's request, and only inside a sandbox that keeps the model away from the
    host's private files. It MUST NOT run in CI or the release gate. Without the sandbox feature it MUST
    print `OPTIONAL PROOF NOT RUN`.
-   *Status:* `an_agent_wake_is_safe_and_bounded_proof` case 6 is behind `live-model-sandbox`. Planned:
-   the same gate for `agent_rehearsal_proof`, `drain_self_filter_proof`, `opencode_plugin_proof` and
-   `tracker_rehearsal_proof`, and the sandbox itself.
+   *Status:* on integrate/v0.3.0 only `an_agent_wake_is_safe_and_bounded_proof` case 6 is behind
+   `live-model-sandbox`. Planned on v0.3.0 (built on integrate/v0.2.10, #301, 5c521a3a): the sandbox
+   (`tests/support/oc_sandbox.rs`, macOS `sandbox-exec`), and the same gate for
+   `agent_rehearsal_proof`, `drain_self_filter_proof`, `opencode_plugin_proof` and
+   `tracker_rehearsal_proof`; it reaches v0.3.0 with the v0.2.10 sync (#226).
 4. **A spike is valid.** It MUST be run, and its result reported in the post. It MUST NOT be committed
    to the gate. A fix with no user-facing proof MUST rest on review plus such a spike.
 5. **Everything else is deleted.** A unit test, an in-process library test, a test of an internal
@@ -175,7 +177,7 @@ MUST be reproduced by the harness when its fix is reverted.
 9. **Run once.** A proof SHOULD be run once, in the profile CI uses. It MUST be repeated only on smoke
    (a red, a flake someone has seen, a timing near its bound, or a claim that is itself a rate), and
    whoever repeats it MUST say why. Callers' proofs MUST be run only where the diff plausibly reaches
-   them. A verifier MUST NOT re-run the fixer's greens. After a clean re-merge, only what the conflict
+   them, in one profile. A verifier MUST NOT re-run the fixer's greens. After a clean re-merge, only what the conflict
    touched MUST be re-run. Nobody SHOULD run locally what CI already runs.
 10. **One mutant per claim.** Every proof MUST have, for each claim, a mutant: the product broken on
     purpose, under which the proof goes red on the assertion that makes that claim, labelled
@@ -229,13 +231,14 @@ MUST be reproduced by the harness when its fix is reverted.
 
 | Gap | State |
 |---|---|
-| The proof graph, receipts and anchorless journey of §1 (M18.3) | not built on integrate/v0.3.0 |
-| Golden wire-byte vectors for the ADR-008 struct tags | unmet (`docs/adr/README.md`) |
-| The live-model sandbox (§10.3) | not built; live-model proofs are stopped until it exists |
+| The proof graph, receipts and anchorless journey of §1 (M18.3) | not built on integrate/v0.3.0; decider question 27 |
+| Golden wire-byte vectors for the ADR-008 struct tags | unmet (`docs/adr/README.md`); decider question 19 |
+| CPace's CFRG test vectors (ADR-005), the RFC 8949 canonical-CBOR vectors (ADR-001, ADR-008) and ADR-007's governance verdict suite (which ADR-007 names as a release gate) have no proof: their in-source suites were deleted with the unit tests, and no real-binary proof replaces them | decider question 30 |
+| The live-model sandbox (§10.3) | built on integrate/v0.2.10 (5c521a3a, #301); not on integrate/v0.3.0 until the sync (#226). Live-model proofs run only on the decider's request, through it |
 | §10.2 and §10.6 on integrate/v0.3.0: R40/R41 block in `transport-gates`, R41's WAN arm is report-only on macOS, and `scripts/release-gate.sh` requires the live-model proofs | built on integrate/v0.2.10 (#301); reaches v0.3.0 with #226 |
 | CI still accepts the `opencode` gap (§3) | the live-model proofs need OpenCode and a model account CI lacks |
-| The watchdog's Linux stack dump (§6.3) has not been run | open |
-| `cross_process_join_proof` saw one fast red (`Unreachable` straight after an invite, 1 in 3 on 005b801) whose cause was never named; it has not recurred (12/12, 15/15) and the next red names its side (#192) | open |
+| The watchdog's Linux stack dump (§6.3) has not been run | open, V210-145 |
+| `cross_process_join_proof` saw one fast red (`Unreachable` straight after an invite, 1 in 3 on 005b801) whose cause was never named; it has not recurred (12/12, 15/15) and the next red names its side (#192) | open, V210-146 |
 | UPnP port mapping has no real-router validation (ADR-012) | open |
 | Claims left unmeasured by the 2026-09-26 test deletion | proved since: `no_consent_without_a_ring_entry_proof`, `revocation_rotates_the_key_proof`, `the_path_mtu_follows_the_socket_buffer_proof`; the rest are tracked by #204 |
 
