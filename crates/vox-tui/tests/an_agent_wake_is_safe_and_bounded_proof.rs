@@ -50,8 +50,9 @@
 //!    wake, and it drains that answer on its next turn. A raw urgent envelope with no `re`, from
 //!    a session with an unanswered wake, is refused with words that say to use `--re`; and once
 //!    two of its wakes are unanswered, so is a structured urgent post with no `--re`, naming both.
-//! 6. **Live — stopped until its `opencode serve` runs in the live-model sandbox** (safety stop,
-//!    2026-10-02; support/oc_sandbox.rs): every build prints `OPTIONAL PROOF NOT RUN`. A real
+//! 6. **Live, on demand, sandboxed** (safety stop, 2026-10-02): only a build with
+//!    `live-model-sandbox` runs it, its `opencode serve` confined by support/oc_sandbox.rs; any
+//!    other prints `OPTIONAL PROOF NOT RUN`. A real
 //!    OpenCode session, registered with bob's daemon by Vox's own plugin's
 //!    drain (the plugin `vox agent plugin opencode` prints, installed in the project), receives
 //!    the urgent message as a prompt through that plugin, and what its model was shown (read
@@ -72,6 +73,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/oc_sandbox.rs"]
+mod oc_sandbox;
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 #[path = "support/room.rs"]
@@ -836,12 +839,19 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
 #[ignore = "an anchor and two vox daemons with production Argon2id, and a live model turn; optional, run it in release"]
 fn a_live_model_is_shown_the_framed_attributed_wake() {
     watchdog::arm();
+    // Before any node starts: only a `live-model-sandbox` build runs this (see `live`).
+    if !oc_sandbox::live_model_allowed(
+        "an_agent_wake_is_safe_and_bounded_proof (6), the live model shown the framed wake",
+    ) {
+        return;
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot build the runtime: {e}"));
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let daemon_err =
@@ -878,8 +888,7 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
 
 #[cfg(feature = "optional-proofs")]
 fn model() -> String {
-    std::env::var("VOX_PROOF_OPENCODE_MODEL")
-        .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
+    oc_sandbox::model()
 }
 
 /// A blocking HTTP/1.1 request to OpenCode's server; the response body.
@@ -887,8 +896,10 @@ fn model() -> String {
 fn http(base: &str, method: &str, path: &str, body: Option<&str>) -> String {
     use std::io::Write as _;
     let addr = base.trim_start_matches("http://").trim_end_matches('/');
-    let mut s = std::net::TcpStream::connect(addr).expect("reach opencode serve");
-    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut s = std::net::TcpStream::connect(addr)
+        .unwrap_or_else(|e| panic!("CANNOT MEASURE: cannot reach `opencode serve` at {addr}: {e}"));
+    s.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot set a read timeout: {e}"));
     let body = body.unwrap_or("");
     write!(
         s,
@@ -896,7 +907,7 @@ fn http(base: &str, method: &str, path: &str, body: Option<&str>) -> String {
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
-    .unwrap();
+    .unwrap_or_else(|e| panic!("CANNOT MEASURE: cannot send `opencode serve` a request: {e}"));
     let mut raw = Vec::new();
     let _ = s.read_to_end(&mut raw);
     let raw = String::from_utf8_lossy(&raw).into_owned();
@@ -957,7 +968,7 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|a| a.port())
-        .expect("a free port")
+        .unwrap_or_else(|e| panic!("APPARATUS: no free port: {e}"))
 }
 
 /// Wait until session `ses` has settled — its latest assistant message completed and no new
@@ -991,43 +1002,37 @@ fn live(
     failures: &mut Vec<String>,
     daemon_err: &dyn Fn() -> String,
 ) {
-    // **Not run until it is sandboxed** (safety stop, 2026-10-02). A live-model turn runs the
-    // harness's own shell, and an unsandboxed free model sent the contents of ~/.claude, ~/.codex
-    // and ~/.config to its provider.
-    // **Stopped, whatever the features** (2026-10-02): `live-model-sandbox` now starts the
-    // live-model proofs whose turns run in support/oc_sandbox.rs; this case's `opencode serve`
-    // does not yet, so it must not run on that switch.
-    const CASE6_SANDBOXED: bool = false;
-    if !CASE6_SANDBOXED {
-        println!(
-            "OPTIONAL PROOF NOT RUN: (6) the live model turn is stopped until its `opencode \
-             serve` runs in the live-model sandbox (support/oc_sandbox.rs); it blocks nothing"
-        );
+    // **Only a `live-model-sandbox` build starts the model, and it runs confined** (safety stop,
+    // 2026-10-02: an unsandboxed free model sent the contents of ~/.claude, ~/.codex and
+    // ~/.config to its provider). `opencode serve` runs under support/oc_sandbox.rs: a throwaway
+    // HOME, a fixed environment, a whitelist of readable paths, a canary in the real HOME it
+    // must never see.
+    if !oc_sandbox::live_model_allowed(
+        "an_agent_wake_is_safe_and_bounded_proof (6), the live model shown the framed wake",
+    ) {
         let _ = (bob, alice, r, failures, daemon_err);
         return;
     }
-    let auth = std::env::var_os("HOME").is_some_and(|h| {
-        Path::new(&h)
-            .join(".local/share/opencode/auth.json")
-            .is_file()
-    });
     assert!(
-        which("opencode").is_some() && auth,
-        "CANNOT MEASURE: the live case needs `opencode` on PATH and a credential \
-         (~/.local/share/opencode/auth.json)"
+        which("opencode").is_some(),
+        "CANNOT MEASURE: the live case needs `opencode` on PATH"
     );
-    // One fixture per `vox` under test: OpenCode installs into its project and config
-    // directories on first use, and two trees proving at once must not share one.
-    let fixture = std::env::temp_dir().join(format!("vox-wake-framing-{:016x}", {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        VOX.hash(&mut h);
-        h.finish()
-    }));
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
+    // A missing credential is CANNOT MEASURE here. The server's plugin drains as bob, so the
+    // profile may also read and write bob's vox profile, and read the `vox` binary; nothing else
+    // outside the sandbox is readable.
+    let sb = oc_sandbox::OcSandbox::new(tmp.path());
+    let profile = sb.profile("serve", &[&bob.data, &bob.cfg], &[Path::new(VOX)]);
+    // **This run's own fixture, inside its sandbox**: OpenCode installs into its project and
+    // config directories on first use (the warm-up turns below).
+    let fixture = sb.root.join("fixture");
     let project = fixture.join("project");
     let oc_cfg = fixture.join("config");
-    std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
-    std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
+    for d in [project.join(".opencode/plugin"), oc_cfg.join("opencode")] {
+        std::fs::create_dir_all(&d)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make the fixture's {d:?}: {e}"));
+    }
     // Vox's plugin, installed as a person installs it: it is what registers the session with
     // bob's daemon, and what relays the wake into it.
     let plugin = bob.vox(None, &["agent", "plugin", "opencode"]);
@@ -1035,7 +1040,8 @@ fn live(
         plugin.ok && plugin.stdout.contains("vox agent hook"),
         "CANNOT MEASURE: vox agent plugin opencode: {plugin:?}"
     );
-    std::fs::write(project.join(".opencode/plugin/vox.js"), &plugin.stdout).unwrap();
+    std::fs::write(project.join(".opencode/plugin/vox.js"), &plugin.stdout)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot install the plugin: {e}"));
     // The model answers in text only: a tool call would wait on a permission nobody grants.
     std::fs::write(
         project.join("opencode.json"),
@@ -1050,19 +1056,13 @@ fn live(
         })
         .to_string(),
     )
-    .unwrap();
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot write the fixture's opencode.json: {e}"));
 
-    // `opencode serve`, in a cleared environment: nothing of this process's — a real Claude
-    // Code session's messaging socket above all — reaches it.
-    let mut cmd = std::process::Command::new("opencode");
-    cmd.env_clear();
-    for key in ["HOME", "SHELL", "LANG", "TMPDIR", "USER", "PATH"] {
-        if let Some(v) = std::env::var_os(key) {
-            cmd.env(key, v);
-        }
-    }
+    // `opencode serve`, confined, in a cleared, fixed environment (`OcSandbox::opencode`):
+    // nothing of this process's — a real Claude Code session's messaging socket above all —
+    // reaches it, and nothing of the operator's is readable from it.
+    let mut cmd = sb.opencode(&profile, &[], &project);
     let mut child = cmd
-        .current_dir(&project)
         // A port of its own: `--port 0` means OpenCode's default 4096, where a real server
         // may already be listening.
         .args([
@@ -1082,8 +1082,11 @@ fn live(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("start opencode serve");
-    let stdout = child.stdout.take().unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start `opencode serve` in its sandbox: {e}"));
+    let stdout = child
+        .stdout
+        .take()
+        .unwrap_or_else(|| panic!("APPARATUS: `opencode serve` has no stdout pipe"));
     let _server = Kill(child);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -1099,6 +1102,7 @@ fn live(
     let base = rx
         .recv_timeout(Duration::from_secs(60))
         .expect("CANNOT MEASURE: `opencode serve` never said where it listens");
+    println!("[proof] (6) `opencode serve`, sandboxed, listens at {base}");
     let created: serde_json::Value =
         serde_json::from_str(&http(&base, "POST", "/session", Some("{}"))).unwrap_or_default();
     let ses = created["id"]
@@ -1144,7 +1148,11 @@ fn live(
         &["--type", "ask", "--to", "bobby", "--urgent"],
         body,
     );
-    let (seen, _) = settled(&base, &ses, users + 1, Duration::from_secs(180));
+    let (seen, answers) = settled(&base, &ses, users + 1, Duration::from_secs(180));
+    sb.check(
+        &format!("{seen:?} {answers:?}"),
+        "the live session's messages",
+    );
     // The plugin's drain runs on the woken prompt as on any other, and puts the room's unread
     // messages — this one among them — in a `<vox-room>` block before it. What the wake itself
     // delivered is what follows the plugin's "The user's message:" line.
