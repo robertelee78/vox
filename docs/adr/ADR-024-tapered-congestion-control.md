@@ -407,8 +407,9 @@ shows the speed a person sees after the pause.
 ### Tier 1 ↔ 2 and dwell
 
 - **1 → 2:** once tier 1's dwell (below) is over, all of: at least 3 losses of either kind (with or
-  without a queue) in the last 8 rounds (`CLIMB_1_LOSSES`, `CLIMB_1_ROUNDS`); no queue held for 8
-  rounds in a row (`CLIMB_3_QUEUE_ROUNDS`) through at least the last 8 rounds; and the loss share
+  without a queue) in the last 8 rounds (`CLIMB_1_LOSSES`, `CLIMB_1_ROUNDS`); at least the last 8
+  rounds (`CLIMB_1_ROUNDS`) in each of which no queue had been held for 8 rounds in a row
+  (`CLIMB_3_QUEUE_ROUNDS`); and the loss share
   over the last 32 MiB at least 0.5% (`TIER2_ENTRY_SHARE`). Losses of either kind, because past the
   5% cap every loss is called congestion: counting only losses without a queue held Vox in tier 1
   for 18 s and more on the changing 6% arm, climbing only when the share happened to dip
