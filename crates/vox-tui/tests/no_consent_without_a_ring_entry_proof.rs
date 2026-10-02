@@ -43,9 +43,12 @@
 //! `vox room read` and his agent drain (`vox agent hook`) show **0** of alice's posts in either
 //! room, each read showing carol's control line or `CANNOT MEASURE`. Then, with alice's daemon
 //! **stopped**, bob trusts her, and still renders 0 of hers: his node holds no key of alice's,
-//! since a key taken and merely hidden would render the moment his ring names her. Alice's daemon
-//! starts again, and within 120 s bob renders **every** post she made after trusting him, the
-//! earlier ones included, in both rooms.
+//! since a key taken and merely hidden would render the moment his ring names her. Before that,
+//! alice's key changes: she removes carol from her ring and trusts her again, which rotates her
+//! sender key, so every post so far sits under a **retired** generation, and she posts once more
+//! under the new one (carol renders it, or `CANNOT MEASURE`). Alice's daemon starts again, and
+//! within 120 s bob renders **every** post she made after trusting him, those under the retired
+//! generation included, in both rooms.
 //!
 //! ## The mutations that must turn it red
 //! - M1: the join releases the joiner's key to its responder — `self.consent(&parsed.channel_id,
@@ -54,6 +57,9 @@
 //!   `ChannelState::owed_consents` in `crates/vox-core/src/node/channel.rs`.
 //! - M3 (V210-118): a node takes any member's key — the `NotTrusted` refusal removed from
 //!   `take_pairwise` in `crates/vox-core/src/node/actor.rs`. Bob renders alice's posts.
+//! - M4 (V210-118): only the live generation is offered again once trusted — the
+//!   `owe_entitled_history` calls removed from `ChannelState::reoffer` and from the `NotTrusted`
+//!   refusal. Bob never renders the posts under the retired generation.
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -474,6 +480,37 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
          her in his ring: his node took the key she released to him"
     );
 
+    // **Alice's key changes before bob trusts her.** She removes carol from her ring, which
+    // rotates her sender key in every room she consented in, and trusts carol again. Every post so
+    // far now sits under a retired generation; she posts once more under the new one, and carol
+    // renders it (the rotation's re-key reached a member who kept consent).
+    let (ok, o, e) = alice.vox(
+        &[
+            "trust",
+            "remove",
+            &carol.fp,
+            "--identity-passphrase-file",
+            alice.pass.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(ok, "alice removes carol: {o}{e}");
+    alice.trust(&carol);
+    for (name, room, _) in &alice_posted {
+        let line = format!("A118-AFTER-ROTATION-IN-{name}");
+        let (ok, _, e) = alice.vox(&["room", "post", room, &line], None);
+        assert!(ok, "alice posts: {e}");
+        assert!(
+            until(
+                &format!("carol renders {line}"),
+                Duration::from_secs(120),
+                || carol.reads(room, &line)
+            ),
+            "CANNOT MEASURE: carol never rendered alice's post after the rotation in room {name}, \
+             so alice's new generation is not provably out"
+        );
+    }
+
     // Bob holds no key of alice's: with her daemon stopped, so nothing can be delivered, bob
     // trusts her, and still none of her posts opens. A key taken earlier and merely not shown
     // would render the moment his ring names her.
@@ -505,6 +542,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
             .map(|k| format!("A118-IN-{name} {k}"))
             .collect();
         want.push(format!("A118-FINAL-IN-{name}"));
+        // Under the generation live when bob trusts her: the ones above are under a retired one.
+        want.push(format!("A118-AFTER-ROTATION-IN-{name}"));
         let all = until(
             &format!("bob renders all of alice's posts in room {name}"),
             Duration::from_secs(120).saturating_sub(back.elapsed()),
@@ -518,9 +557,13 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         assert!(
             all,
             "bob trusted alice, yet within 120 s of her return he renders {} of her {} posts in \
-             room {name}: a key refused while untrusted was never taken once trusted",
+             room {name} (missing: {:?}): a key refused while untrusted, or one retired since, was \
+             never taken once trusted",
             count(&seen, "A118-"),
-            want.len()
+            want.len(),
+            want.iter()
+                .filter(|w| !seen.lines().any(|l| l.ends_with(w.as_str())))
+                .collect::<Vec<_>>()
         );
         eprintln!(
             "[proof] room {name}: bob reads all {} of alice's posts {:?} after her return",

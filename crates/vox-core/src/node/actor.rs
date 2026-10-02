@@ -5102,6 +5102,14 @@ impl Node {
                     }) {
                         let _ = channel.owe_history(profile.store(), peer, chain_id);
                     }
+                    // **Refused because its owner does not trust us** (V210-118): the member holds
+                    // none of what it refused, and by the time it trusts us the generation refused
+                    // may be retired. Everything it is entitled to is owed again, so the re-key
+                    // round, which retries until taken, delivers the retired generations too.
+                    use crate::node::pairwise_stream::KeyRefusal;
+                    if why == KeyRefusal::describe(KeyRefusal::NotTrusted.code().into_inner()) {
+                        let _ = channel.owe_entitled_history(profile.store(), &peer);
+                    }
                 }
                 // **The member holds no session with us** (V210-78): it restarted or locked, and
                 // sessions live only in memory. Ours is dead at its end, and resending under it is

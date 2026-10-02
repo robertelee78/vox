@@ -3458,15 +3458,33 @@ impl ChannelState {
         Ok(dropped)
     }
 
-    /// Offer `target` this identity's current generation again, if it is consented to here
-    /// (V210-118). `target` may have refused it, or dropped it when its owner stopped trusting this
-    /// identity, so a key it has just handed over says it may take ours now. Sending a generation
-    /// it already holds is harmless: [`Self::accept_skdm`] keeps the one it has.
+    /// Offer `target` again **every** generation it is entitled to, if it is consented to here
+    /// (V210-118): the live one, and each retired one from where its entitlement began, as
+    /// history. `target` may have refused them while its owner did not trust this identity, or
+    /// dropped them when its owner stopped trusting it; a key it has just handed over says it may
+    /// take ours now. Only the live generation was offered again, so the posts sealed under a
+    /// generation retired in between stayed unreadable to it for good, although it was entitled
+    /// to them. Sending a generation it already holds is harmless: [`Self::accept_skdm`] keeps the
+    /// one it has.
     pub fn reoffer(&mut self, store: &Store, target: &Digest32) -> Result<()> {
-        if !self.has_consented(target) || self.delivered.remove(target).is_none() {
+        if !self.has_consented(target) {
             return Ok(());
         }
-        self.persist_delivered(store)
+        self.owe_entitled_history(store, target)?;
+        if self.delivered.remove(target).is_some() {
+            self.persist_delivered(store)?;
+        }
+        Ok(())
+    }
+
+    /// Owe `target`, as history, every retired generation from the one its entitlement begins
+    /// in (V210-118). Nothing when it is entitled only to the live one, which the ordinary re-key
+    /// covers.
+    pub fn owe_entitled_history(&mut self, store: &Store, target: &Digest32) -> Result<()> {
+        match self.entitled_from(target) {
+            Some((from, _)) => self.owe_history(store, *target, from),
+            None => Ok(()),
+        }
     }
 
     /// Persist the receiver chains, poisoning the channel if the write fails.
