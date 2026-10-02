@@ -2038,8 +2038,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             // re-deliver the whole room.
             let start = match since {
                 None => 0,
-                Some(cursor) => match detail.timeline.iter().position(|r| r.entry_hash == cursor) {
-                    Some(i) => i + 1,
+                // From the end: a tail's cursor is the last row it read, at or near the end, so
+                // finding it costs what came after it rather than the room's history (V210-113).
+                Some(cursor) => match detail
+                    .timeline
+                    .iter()
+                    .rev()
+                    .position(|r| r.entry_hash == cursor)
+                {
+                    Some(k) => detail.timeline.len() - k,
                     None => {
                         return Frame::Error {
                             reason: "cursor not in this room's timeline".into(),
