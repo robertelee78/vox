@@ -40,6 +40,14 @@
 //! - **The mutation that must turn it red:** the anchor refuses to carry any circuit
 //!   (`serve_circuit`'s open arm refuses). The guest cannot reach its host, and the join fails.
 //!
+//! **V210-143 — a guest that asks before the anchor holds the room still joins**
+//! (`a_guest_that_arrives_before_the_anchor_holds_the_room_still_joins_through_the_relay`): with
+//! the host's room kept off the anchor for its first seconds (the test-only
+//! `VOX_TEST_HOLD_ROOM_FROM_ANCHORS_MS`), the guest says it is waiting for the room and joins
+//! through the relay within the join's patience. **The mutation that must turn it red:** the join's
+//! repeated search removed (`run_steps` gives up on the first search that finds the room on no
+//! board).
+//!
 //! `#[ignore]`d: production Argon2id and a real PoW. Run it in release.
 
 #![cfg(unix)]
@@ -90,8 +98,8 @@ fn a_guest_on_an_ipv6_socket_reaches_its_host_through_a_relay_circuit() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "the guest on [::1] could not join its host through the relay (after {took:?}).\n\
-         stdout:\n{out}\nstderr:\n{err}"
+        "PRODUCT: the guest on [::1] could not join its host through the relay (after {took:?}); \
+         the joiner said:\n{err}\nstdout:\n{out}"
     );
     eprintln!(
         "[test] joined through the relay in {:.1}s",
@@ -109,6 +117,61 @@ fn a_guest_on_an_ipv6_socket_reaches_its_host_through_a_relay_circuit() {
     w.assert_relayed("after the echo");
     w.expect_still_relayed();
     eprintln!("[test] echo crossed the circuit, and the forward reports the path relayed");
+}
+
+// ---- a guest that arrives before the anchor holds the room (V210-143) ----------------------------
+
+/// How long the host keeps its room off the anchor: past the guest's arrival, and well inside the
+/// join's 30 s patience once the host's publish backoff (1, 2, 4 s) has run.
+const HOST_HOLD_MS: &str = "3000";
+
+/// **A guest that asks before the anchor holds the room still joins** (V210-143).
+///
+/// A host publishes its room to its anchor moments after it starts; one whose first dial to the
+/// anchor fails publishes a second or more later. A guest that arrived first found the anchor's
+/// board empty, and its circuit to the host refused — an anchor carries circuits for a room's
+/// pending joiners, which it knows only once it holds the room, and it refuses anyone else
+/// uninformatively (`0x05`, "authenticator invalid"), as it must. `vox connect` then said "cannot
+/// join" after half a second: red 1 of 2 on integrate e7194d02, where the host's first dial to the
+/// anchor had failed.
+///
+/// Staged with the test-only `VOX_TEST_HOLD_ROOM_FROM_ANCHORS_MS`: the host's publish rounds to the
+/// anchor fail for [`HOST_HOLD_MS`] and are retried on their backoff. The guest asks at once.
+/// - The guest must say it is waiting for the room (`vox: waiting: …`), or the staging was not
+///   achieved: CANNOT MEASURE.
+/// - It must then join through the relay, within the join's patience: PRODUCT, quoting it.
+///
+/// **The mutation that must turn it red:** the join's repeated search removed, so a search that
+/// finds the room on no board ends the join at once (the code before V210-143).
+#[test]
+#[ignore = "production Argon2id + a real PoW, three real `vox` processes; run in release"]
+fn a_guest_that_arrives_before_the_anchor_holds_the_room_still_joins_through_the_relay() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_ROOM_FROM_ANCHORS_MS"]);
+    family_split::assert_the_families_are_split();
+    let w = RelayWorld::new_with_host_env(
+        Split::Families,
+        &[("VOX_TEST_HOLD_ROOM_FROM_ANCHORS_MS", HOST_HOLD_MS)],
+    );
+    let (ok, took, out, err) = w.join_guest();
+    let waited = err.lines().any(|l| l.starts_with("vox: waiting:"));
+    eprintln!(
+        "[test] the guest {} after {:.1}s; it said it was waiting for the room: {waited}",
+        if ok { "joined" } else { "did not join" },
+        took.as_secs_f64()
+    );
+    assert!(
+        ok,
+        "PRODUCT: a guest that asked before the anchor held the room could not join its host through \
+         the relay (after {took:?}): the join must wait for the host to publish, within its \
+         patience; the joiner said:\n{err}\nstdout:\n{out}"
+    );
+    assert!(
+        waited,
+        "CANNOT MEASURE (precondition unmet): the guest joined without saying it waited for the \
+         room, so the anchor already held it and the moment V210-143 is about was not staged; the \
+         joiner said:\n{err}"
+    );
 }
 
 // ---- two members who dial each other through one relay at once (V210-80, #271) ----------------

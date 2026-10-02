@@ -272,6 +272,14 @@ pub enum Error {
     #[error("the connection could not be set up: {0}")]
     Handshake(String),
 
+    /// A QUIC handshake failed its **authentication** (a TLS alert), and which end refused, the
+    /// alert, and why this end refused when it did (V210-143). Every such failure used to be
+    /// [`Self::SignatureInvalid`], which threw the alert and the check away: a host whose dial to
+    /// its anchor reached another honest node, through a port that node shared, was told only
+    /// "signature verification failed".
+    #[error("the connection's authentication failed: {0}")]
+    HandshakeAuth(String),
+
     /// This node could not listen on a local address it was told to use.
     ///
     /// Carried whole rather than as a `&'static str`: "quic endpoint bind" was the only thing
