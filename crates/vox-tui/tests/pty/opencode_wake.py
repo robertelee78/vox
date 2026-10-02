@@ -28,7 +28,8 @@ The screen is read through pyte, as the person sees it. Prints, each on its own 
   a user message is stored as the plugin left it): how many times the message addressed to bobby
   appears in it (the wake's own text is one), how many times the one addressed to carol does
   (only a `<vox-room>` read carries it), and whether any of it is a message's envelope JSON
-  rather than its words; `<tag> RECEIVED: never` if that turn never answered;
+  rather than its words; `<tag> RECEIVED: never` if that turn never answered, or `skipped (no wake arrived)` when there
+  was no wake and so no woken turn to wait for;
 - `<tag> SCREEN:` and the screen, whenever anything above is not clean.
 
 Then the person quits, and the plugin's wake directory (`vox-oc-*` in `<tmpdir>`, this run's own
@@ -244,12 +245,16 @@ try:
 
     stage("let the woken turn answer, and read what the model was given")
     users = None
-    end = time.time() + 120
+    # No wake, no woken turn to wait for: (3) is already the verdict, and waiting would spend
+    # the driver's whole budget before it reaches the wake directories.
+    end = time.time() + (120 if shown else 0)
     while users is None and time.time() < end and regs:
         users = received(regs[0][2])
         if users is None:
             tui.pump(2)
-    if users is None:
+    if not shown:
+        print(f"{TAG} RECEIVED: skipped (no wake arrived)")
+    elif users is None:
         print(f"{TAG} RECEIVED: never")
         print(f"{TAG} SCREEN:\n{tui.text()}")
     else:
