@@ -140,7 +140,7 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   - **Patience at start.** `vox forward` MUST wait for its host with `HOST_PATIENCE`, as `vox up`
     does, printing each attempt's rung verdicts. Status: the first connection after a host restart can
     still wait for QUIC's idle timeout on the dialer's stale connection (about 60 s); bounding that is
-    not done.
+    not done, tracked as V210-141 (#360).
 
 ### Loopback
 

@@ -164,6 +164,7 @@ fine, sans anchor".
   - **Known limit:** liveness is the count of datagrams routed to a connection, taken before
     authentication, so an on-path attacker who knows a connection ID can keep a dead connection
     looking alive. That returns the node to QUIC's 60 s idle timeout, no worse than without the rule.
+    Tracked as V210-140 (#359).
 - **N-23.** Before a newcomer is filed, each live, not-yet-dead connection held for that peer to the
   newcomer's own process, primary or retired (`probe_held`), MUST be probed with one
   ack-eliciting datagram, with a patience of 3 × RTT clamped to 250 ms–2 s. A held connection that does
@@ -291,8 +292,10 @@ fine, sans anchor".
   CONNECT refused (up to 314 s, past `up::HOST_PATIENCE`), or a mid-stream read failing 55–84 s in.
   `NodeCommand::Forward` over the same overlay was reliable, so the defect was placed in the `vox up`
   path (name resolution, `reach_host_with_patience`, or how the proxy establishes and holds the
-  stream). Re-measured 2026-10-02 on integrate/v0.2.10 `f47aafb3`, release: 5 of 5 runs passed
-  (23.5–31.4 s). No fixing commit is identified, so it stays recorded here.
+  stream). Re-measured 2026-10-02 in release: 5 of 5 runs passed on integrate/v0.2.10 `f47aafb3`,
+  and 30 of 30 on `10ff9310` (first CONNECT 642 µs–253 ms), so it does not reproduce on the current
+  tree. No fixing commit is identified, so it stays recorded here, tracked as V210-142 (#361).
+  `service_rehearsal_proof` is the blocking proof that guards it.
 
 ## Consequences
 
