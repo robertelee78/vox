@@ -29,10 +29,17 @@
 //!    daemon, and alice reaches each service through the name in (1) and (2) with no daemon ever
 //!    restarted. (It used to open the profile itself, so the daemon had to be stopped first, and
 //!    started again with every room's passphrase.)
-//! 6. **`vox service list` shows it while the daemon runs** (V030-24): carol lists *work* with her
-//!    daemon running, and the service just added is there; after her daemon stops, the one-shot
-//!    `vox service list` still shows it. (`list` used to open the profile while `add` asked the
-//!    daemon, so it was refused for a profile the daemon held.)
+//! 6. **`vox service list` shows exactly what is offered, and says the same with or without the
+//!    daemon** (V030-24). carol lists *work* with her daemon running, and the service just added is
+//!    there. She adds 80 beside 22, then removes 22, restarts her daemon, and stops it: each stage
+//!    lists exactly the services then offered, and what the daemon prints after the restart is
+//!    what the one-shot form prints with no daemon, word for word. (`list` used to open the
+//!    profile while `add` asked the daemon, so it was refused for a profile the daemon held.)
+//! 7. **A room the daemon holds closed is a failure, said the same way** (V030-24 c2, V210-149).
+//!    dave's only room is closed on purpose in `vox tui` (`tests/pty/tui_close_room.py`; a daemon
+//!    reopens every room it held), then his daemon starts without its passphrase. `vox service
+//!    list` on it exits non-zero, saying exactly `vox: cannot list that room's services: room not
+//!    open` — the one-shot form's words for the same case.
 //!
 //! **A red names its side.** A `vox` command that fails while setting the scene — an identity, a
 //! trust, a daemon, a room, an invite, a join, bob holding carol as a member, the proxy — is the
@@ -48,6 +55,9 @@ mod world;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
@@ -248,6 +258,11 @@ impl Member {
     /// daemon, which offers the service at once. The room passphrase is passed as a person who
     /// scripted the one-shot form would have; the daemon already holds the room open.
     fn serve(&self, room: &str, pass: &str, at: SocketAddr) {
+        self.serve_tag(room, pass, "22", at);
+    }
+
+    /// `vox service add <room> <tag> <at>`, with this member's daemon running.
+    fn serve_tag(&self, room: &str, pass: &str, tag: &str, at: SocketAddr) {
         // From a file, never argv (V210-72: a room passphrase on the command line is refused).
         let pass_file = self.dir.join("room.pass");
         std::fs::write(&pass_file, pass).expect("APPARATUS: write the room passphrase file");
@@ -257,7 +272,7 @@ impl Member {
                 "service",
                 "add",
                 room,
-                "22",
+                tag,
                 &at.to_string(),
                 "--passphrase-file",
                 pass_file.to_str().unwrap(),
@@ -268,20 +283,45 @@ impl Member {
         );
         assert!(
             ok,
-            "PRODUCT: {} could not offer 22 in {room} with its daemon running — `vox service add` \
-             did not ask the daemon: {out}{err}",
+            "PRODUCT: {} could not offer {tag} in {room} with its daemon running — `vox service \
+             add` did not ask the daemon: {out}{err}",
             self.name
         );
         assert!(
-            out.contains("vox: offering \"22\""),
-            "PRODUCT: {}'s `vox service add` did not say it is offering 22: {out}{err}",
+            out.contains(&format!("vox: offering \"{tag}\"")),
+            "PRODUCT: {}'s `vox service add` did not say it is offering {tag}: {out}{err}",
+            self.name
+        );
+    }
+
+    /// `vox service remove <room> <tag>`, with this member's daemon running.
+    fn unserve(&self, room: &str, pass: &str, tag: &str) {
+        let pass_file = self.dir.join("room.pass");
+        std::fs::write(&pass_file, pass).expect("APPARATUS: write the room passphrase file");
+        let (ok, out, err) = vox(
+            &self.dir,
+            &[
+                "service",
+                "remove",
+                room,
+                tag,
+                "--passphrase-file",
+                pass_file.to_str().unwrap(),
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT: {} could not stop offering {tag} in {room}: {out}{err}",
             self.name
         );
     }
 
     /// `vox service list <room>`: whether it succeeded, and what it said. With the room
     /// passphrase from a file, as the one-shot form needs it once no daemon holds the room.
-    fn list(&self, room: &str, pass: &str) -> (bool, String) {
+    fn list(&self, room: &str, pass: &str) -> (bool, String, String) {
         let pass_file = self.dir.join("room.pass");
         std::fs::write(&pass_file, pass).expect("APPARATUS: write the room passphrase file");
         let (ok, out, err) = vox(
@@ -297,7 +337,7 @@ impl Member {
             ],
             None,
         );
-        (ok, format!("{out}{err}"))
+        (ok, out, err)
     }
 
     /// `vox forward <name> 22 0`: whether it bound, and what it said.
@@ -455,7 +495,8 @@ fn a_local_name_reaches_the_node_it_names() {
     carol.serve(&family, family_pass, laptop_echo);
     carol.serve(&work, work_pass, laptop_work_echo);
     // (6) Listed while the daemon runs: `vox service list` asks it.
-    let (ok, listed) = carol.list(&work, work_pass);
+    let (ok, listed, err) = carol.list(&work, work_pass);
+    let listed = format!("{listed}{err}");
     let offered = format!("22  →  {laptop_work_echo}");
     assert!(
         ok && listed.contains(&offered),
@@ -632,18 +673,146 @@ fn a_local_name_reaches_the_node_it_names() {
         pids,
         "PRODUCT: a daemon was restarted or exited after its service was added"
     );
-    // (6) The daemon stopped, the one-shot `vox service list` still shows carol's service: it
-    // was kept, not only offered for the daemon's run.
+    // (6) Every stage lists exactly the services offered, and the daemon's answer is the one-shot
+    // form's, word for word. carol adds 80 beside 22, removes 22, restarts her daemon, and stops it.
+    let web_echo = echo("carol web");
+    carol.serve_tag(&work, work_pass, "80", web_echo);
+    expect_exactly(
+        &carol,
+        &work,
+        work_pass,
+        "with 22 and 80 added, the daemon running",
+        &[("22", laptop_work_echo), ("80", web_echo)],
+    );
+    carol.unserve(&work, work_pass, "22");
+    expect_exactly(
+        &carol,
+        &work,
+        work_pass,
+        "after 22 was removed, the daemon running",
+        &[("80", web_echo)],
+    );
     drop(carol.daemon.take());
-    let (ok, listed) = carol.list(&work, work_pass);
+    carol.start(&spec, &[], &[work.as_str()]);
+    let by_daemon = expect_exactly(
+        &carol,
+        &work,
+        work_pass,
+        "after the daemon restarted",
+        &[("80", web_echo)],
+    );
+    drop(carol.daemon.take());
+    let one_shot = expect_exactly(
+        &carol,
+        &work,
+        work_pass,
+        "with no daemon (the one-shot form)",
+        &[("80", web_echo)],
+    );
+    assert_eq!(
+        by_daemon, one_shot,
+        "PRODUCT: `vox service list` says one thing through the daemon and another without it, for \
+         the same services"
+    );
+
+    // (7) A room the daemon holds closed: dave's only room, closed on purpose in `vox tui` (a
+    // daemon reopens every room it held open), then his daemon started without its passphrase.
+    let mut dave = member(tmp.path(), "dave");
+    dave.start(&spec, &[], &[]);
+    let solo_pass = "solo passphrase";
+    let solo = dave.create("solo", solo_pass);
+    drop(dave.daemon.take());
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_close_room.py");
+    let closed = pty_driver::run(
+        script,
+        &[
+            VOX,
+            &dave.dir.to_string_lossy(),
+            &dave.dir.join("cfg").to_string_lossy(),
+            IDENTITY,
+            solo_pass,
+            "dave",
+        ],
+    );
+    let said = closed.stdout.clone();
+    // The driver's own verdicts (pyte missing, its staging, its own error) and a driver stopped
+    // with no verdict are the apparatus; a TUI that does not close the room is the product.
     assert!(
-        ok && listed.contains(&offered),
-        "PRODUCT: after carol's daemon stopped, `vox service list` does not show the service she \
-         added while it ran ({offered}): {listed}"
+        closed.has_verdict("dave"),
+        "CANNOT MEASURE: the TUI driver was stopped from outside before it gave a verdict, at \
+         stage {:?} (exit {:?}): {said}",
+        closed
+            .stage
+            .as_deref()
+            .unwrap_or("(before its first stage)"),
+        closed.code
+    );
+    assert!(
+        !said.contains("dave APPARATUS"),
+        "CANNOT MEASURE: the TUI driver's own apparatus failed (exit {:?}): {said}",
+        closed.code
+    );
+    assert!(
+        closed.code == Some(0) && said.contains("dave the TUI said done to :close"),
+        "PRODUCT: dave's `vox tui` did not unlock, open his room and close it as a person does; \
+         the driver exited {:?} at stage {:?} and saw this screen:\n{said}",
+        closed.code,
+        closed
+            .stage
+            .as_deref()
+            .unwrap_or("(before its first stage)")
+    );
+    dave.start(&spec, &[], &[]);
+    let (ok, rooms, err) = vox(&dave.dir, &["room", "list"], None);
+    assert!(
+        ok && rooms
+            .lines()
+            .any(|l| l.starts_with(solo.as_str()) && l.contains("[closed]")),
+        "CANNOT MEASURE: dave's daemon does not hold his room closed after the TUI closed it, so \
+         there is no closed room to ask about: {rooms}{err}"
+    );
+    let (ok, out, err) = dave.list(&solo, solo_pass);
+    assert!(
+        !ok && out.is_empty()
+            && err.trim() == "vox: cannot list that room's services: room not open",
+        "PRODUCT: `vox service list` on a room the daemon holds closed must fail, saying exactly \
+         \"vox: cannot list that room's services: room not open\" (the one-shot form's words, \
+         V210-149); it exited {} with stdout {out:?} and stderr {err:?}",
+        if ok { "0" } else { "non-zero" }
     );
     eprintln!(
         "[proof] 3 services added to 2 running daemons, each reached by name, none restarted; \
-         listed with the daemon running and after it stopped"
+         listed exactly after add, remove, restart and with no daemon, the daemon's words the \
+         one-shot form's; a closed room's list fails, saying so"
     );
+    drop(dave);
     drop((up, alice, bob, carol, anchor));
+}
+
+/// `vox service list <room>` from `who`: it succeeds and shows exactly `want`, each as
+/// `<tag>  →  <address>`, and nothing else. Returns what it printed, for comparing the two paths.
+fn expect_exactly(
+    who: &Member,
+    room: &str,
+    pass: &str,
+    when: &str,
+    want: &[(&str, SocketAddr)],
+) -> String {
+    let (ok, out, err) = who.list(room, pass);
+    let shown: std::collections::BTreeSet<String> = out
+        .lines()
+        .filter(|l| l.contains('→'))
+        .map(|l| l.trim().to_owned())
+        .collect();
+    let wanted: std::collections::BTreeSet<String> = want
+        .iter()
+        .map(|(tag, at)| format!("{tag}  →  {at}"))
+        .collect();
+    assert!(
+        ok && shown == wanted,
+        "PRODUCT: {}'s `vox service list` {when} must show exactly {wanted:?}; it showed {shown:?} \
+         (exit ok: {ok}).\nstdout:\n{out}\nstderr:\n{err}",
+        who.name
+    );
+    out
 }

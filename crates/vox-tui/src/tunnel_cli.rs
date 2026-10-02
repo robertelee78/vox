@@ -371,19 +371,25 @@ pub async fn service_remove(
 }
 
 /// `vox service list`
-pub fn service_list(node: &NodeHandle, channel_id: Digest32) {
+///
+/// # Errors
+/// If the room is not open: a request this cannot answer fails, with the reason, rather than
+/// printing it and exiting 0 for a script to read as success (V210-149). The wording is the one a
+/// running daemon gives for the same request (V030-24), so the two paths say the same thing.
+pub fn service_list(node: &NodeHandle, channel_id: Digest32) -> Result<(), AppError> {
     let view = node.view();
     let Some(detail) = view
         .open_channels
         .iter()
         .find(|d| d.channel_id == channel_id)
     else {
-        println!("vox: that room is not open");
-        return;
+        return Err(AppError::Usage(
+            "cannot list that room's services: room not open".to_owned(),
+        ));
     };
     if detail.services.is_empty() {
         println!("vox: no services offered in {}", short(&channel_id));
-        return;
+        return Ok(());
     }
     println!(
         "vox: services offered in {} ({})",
@@ -393,6 +399,7 @@ pub fn service_list(node: &NodeHandle, channel_id: Digest32) {
     for (tag, addr) in &detail.services {
         println!("  {tag}  →  {addr}");
     }
+    Ok(())
 }
 
 /// `vox forward` — serves until interrupted.
