@@ -603,9 +603,12 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
     // ---- and lengthens it again: what is left stays --------------------------------------
     let (ok, said) = set_retention(&alice, &room, "forever");
     assert!(ok, "PRODUCT: the admin sets forever: {said}");
-    for (dir, who) in members {
+    for (dir, who) in [(&alice, "alice"), (&bob, "bob")] {
         until_retention(dir, "PRODUCT", who, 0, 30);
     }
+    // carol's file asks for 60 days. Above every value the room had, it was ignored; below
+    // forever, it is the shorter, and it governs her node (a node keeps less than its room).
+    until_retention(&carol, "PRODUCT", "carol", 5_184_000, 30);
     std::thread::sleep(Duration::from_secs(40));
     for (dir, who) in members {
         let t = read(dir, &room);
