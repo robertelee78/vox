@@ -19,6 +19,13 @@
 //! **Not proved here:** that a trusted hook then fires in a live Codex turn. That needs a
 //! model login inside the isolated `CODEX_HOME`, and this proof does not take the
 //! operator's credentials. Trust is Codex's own gate, reported by Codex's own API.
+//!
+//! **Codex gets none of this process's environment.** Every `codex` the proof starts runs in a
+//! cleared environment ([`isolated`]): `PATH` to find it, and a temporary `HOME`, `TMPDIR` and
+//! `CODEX_HOME`. Nothing else, so no API key or token of the shell that runs the gate reaches a
+//! third-party program. The proof checks this first: a sentinel variable it sets in its own
+//! process must not reach a program started the same way (checked by the variable's name alone;
+//! no environment is ever printed). Mutation: `isolated` without `env_clear()` → red there.
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -29,8 +36,27 @@ use std::process::{Command, Stdio};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 
-fn codex_present() -> bool {
-    Command::new("codex")
+/// A variable this proof sets in its own process, which must never reach a program it starts.
+const SENTINEL: &str = "VOX_PROOF_ENV_SENTINEL";
+
+/// `program` in a cleared environment: `PATH` to find it, and `home` as its `CODEX_HOME`, with a
+/// temporary `HOME` and `TMPDIR` under it. Nothing of this process's environment besides `PATH`.
+fn isolated(program: &str, home: &Path) -> Command {
+    let user_home = home.join("user-home");
+    std::fs::create_dir_all(&user_home).expect("APPARATUS: cannot make the temporary HOME");
+    let mut c = Command::new(program);
+    c.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        c.env("PATH", path);
+    }
+    c.env("HOME", &user_home)
+        .env("TMPDIR", &user_home)
+        .env("CODEX_HOME", home);
+    c
+}
+
+fn codex_present(home: &Path) -> bool {
+    isolated("codex", home)
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
@@ -62,9 +88,8 @@ const HOSTILE: &[&str] = &[
 
 /// `command -> trustStatus`, asked of Codex's own app-server, independently of vox.
 fn trust_status(home: &Path) -> Vec<(String, String)> {
-    let mut child = Command::new("codex")
+    let mut child = isolated("codex", home)
         .arg("app-server")
-        .env("CODEX_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -135,12 +160,31 @@ fn vox_trust(home: &Path) -> (bool, String) {
 #[ignore = "drives the installed Codex's app-server; run where Codex is installed"]
 fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     watchdog::arm();
-    assert!(
-        codex_present(),
-        "this proof needs `codex` on PATH — an absent Codex is not a pass"
-    );
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let home = tmp.path();
+
+    // ---- (0) the programs this proof starts get none of its environment ----
+    // Set here, so a leak cannot be missed for want of a variable to leak; checked by name only.
+    std::env::set_var(SENTINEL, "set-in-the-proof-process");
+    let seen = isolated("sh", home)
+        .args([
+            "-c",
+            &format!("if [ -n \"${{{SENTINEL}+x}}\" ]; then echo present; else echo absent; fi"),
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run sh for the environment check: {e}"));
+    let seen = String::from_utf8_lossy(&seen.stdout).trim().to_owned();
+    println!("[proof] (0) {SENTINEL} in a program started as codex is: {seen}");
+    assert_eq!(
+        seen, "absent",
+        "APPARATUS: a variable set in this proof's process reaches the programs it starts, so \
+         the gate shell's environment (API keys included) would reach Codex"
+    );
+
+    assert!(
+        codex_present(home),
+        "CANNOT MEASURE: this proof needs `codex` on PATH — an absent Codex is not a pass"
+    );
     const HOOK: &str = "vox agent hook";
 
     // ---- (1) before: both untrusted ----
