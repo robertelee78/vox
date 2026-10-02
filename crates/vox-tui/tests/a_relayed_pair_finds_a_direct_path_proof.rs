@@ -84,9 +84,9 @@ const FIRST_ATTEMPT_WITHIN: Duration = Duration::from_secs(90);
 const PAYLOAD: usize = 16 * 1024;
 
 /// How long a `vox forward` may take to reach the host when only the anchor's circuit can (V210-122):
-/// the direct dial's 250 ms head start, the circuit (measured: 255 ms and 268 ms in all on the
-/// candidate), and margin for a loaded box. A number, not the product constant: a longer head start
-/// goes red.
+/// the direct dial's 500 ms head start (#321 attempt 3; it was 250 ms, measured 255–268 ms in all),
+/// the circuit, and margin for a loaded box. A number, not the product constant: a head start past
+/// it goes red.
 const RELAYED_REACH_WITHIN: Duration = Duration::from_millis(1000);
 
 /// Start the guest's `vox forward` to the host's service through the closed forward, and read how

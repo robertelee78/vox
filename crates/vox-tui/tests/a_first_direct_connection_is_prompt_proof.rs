@@ -85,7 +85,7 @@ use world::socks5_connect;
 const TARGET: Duration = Duration::from_millis(2000);
 /// The one-way delay of the forward for the `vox forward` step (V210-122): a direct path with
 /// latency, slower than the anchor's next door, and a handshake's few flights well inside the
-/// direct dial's 250 ms head start.
+/// direct dial's 500 ms head start.
 const FORWARD_DELAY: Duration = Duration::from_millis(30);
 /// Cold first connections measured per run.
 const SAMPLES: usize = 12;
@@ -95,6 +95,71 @@ const GIVE_UP: Duration = Duration::from_secs(10);
 /// The echo payload: big enough that a request which rode the forward is unmistakable in its byte
 /// count, small enough to be one flight.
 const PAYLOAD: usize = 16 * 1024;
+
+/// The forward's one-way latency, guest to host, for [`a_side_that_can_reach_directly_asks_for_no_circuit`]:
+/// a direct handshake over it (one round trip, 300 ms, and the post-quantum crypto) takes longer
+/// than the old 250 ms head start and under the 500 ms one.
+const SLOW_DIRECT_DELAY: Duration = Duration::from_millis(150);
+/// The old 250 ms head start and a margin for the circuit's 10 ms poll, written as a number: a run
+/// whose direct dial finished inside it did not stage a direct handshake clearly slower than the
+/// old head start (a 256 ms handshake beat a 250 ms circuit by the poll's slack).
+const OLD_HEAD_START: Duration = Duration::from_millis(300);
+
+/// **A side that can reach its peer directly asks for no circuit** (V210-122, #321) — the blocking
+/// arm of the claim, with no time bound asserted.
+///
+/// The guest's `vox forward` reaches the host through the forward, which here holds every datagram
+/// to the host for [`SLOW_DIRECT_DELAY`]: a live direct path whose handshake takes longer than the
+/// old 250 ms head start — what a loaded CI runner showed over a 30 ms path (run 36968701360:
+/// "reached … in 271 ms", 1 circuit asked). The head start is now 500 ms, so the direct dial wins
+/// and no circuit is asked for.
+///
+/// Asserted: the forward reached the host, and the guest's own `vox status --json` counts **0**
+/// circuits asked to it. The anchor's count is printed (the host's circuits to a guest it cannot
+/// dial are legitimate bridges, decider 2026-10-02). A forward that reached the host inside the old
+/// head start did not stage a slow direct handshake: `CANNOT MEASURE`.
+///
+/// **The mutation that must turn it red:** the head start back at 250 ms — the circuit is asked
+/// while the direct handshake is still under way: red, as PRODUCT.
+#[test]
+#[ignore = "production Argon2id + a real PoW; run in release"]
+fn a_side_that_can_reach_directly_asks_for_no_circuit() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
+    watchdog::arm();
+    let mut w = ForwardedWorld::new(true);
+    w.forward.set_delay(SLOW_DIRECT_DELAY);
+    let (reached, asked) = forward_once(&w);
+    w.forward.set_delay(Duration::ZERO);
+    let ever = w.anchor.circuits_ever(Duration::from_secs(2));
+    eprintln!(
+        "[proof] `vox forward` over a {SLOW_DIRECT_DELAY:?} path: {reached}; it asked for {asked} \
+         circuit(s) to the host; the anchor ever carried up to {ever}"
+    );
+    let took_ms: u128 = reached
+        .split(" in ")
+        .nth(1)
+        .and_then(|r| r.split(" ms").next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: no duration in the forward's line {reached:?}"));
+    assert!(
+        asked == 0,
+        "PRODUCT: the guest reached the host directly (the forward's path is live and the host \
+         answered), yet it asked the anchor for {asked} circuit(s): a side that could reach \
+         directly asked for a circuit while its direct handshake was still under way. \
+         {reached}\nanchor:\n{}",
+        w.anchor.proc.transcript()
+    );
+    // Only now, with no circuit asked: a direct dial that finished inside the old head start
+    // never put the head start to the test. (When a circuit was asked, the forward's time is the
+    // circuit's, and the failure stands whatever it was.)
+    assert!(
+        took_ms >= OLD_HEAD_START.as_millis(),
+        "CANNOT MEASURE (staging not achieved): the forward reached the host in {took_ms} ms, \
+         inside {OLD_HEAD_START:?} (the old head start and the circuit's poll), so its direct \
+         handshake was never clearly slower than the old head start and this run says nothing \
+         about waiting for it: {reached}"
+    );
+}
 
 /// Start the guest's `vox forward` to the host's service, wait until it says it reached the host,
 /// read how many circuits it asked for to the host while it still runs, and stop it (by its PID).
@@ -121,6 +186,13 @@ fn forward_once(w: &ForwardedWorld) -> (String, u64) {
         l.contains("vox: reached ") && l.contains(" ms (")
     });
     let asked = circuits_asked(&w.guest_dir, &w.host_fp, "the guest's `vox forward`");
+    for note in fwd
+        .transcript()
+        .lines()
+        .filter(|l| l.contains("connection to "))
+    {
+        eprintln!("[proof] the guest's `vox forward` said: {note}");
+    }
     interrupt(&mut fwd, Duration::from_secs(15));
     (line, asked)
 }
