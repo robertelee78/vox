@@ -429,6 +429,17 @@ fn net_event_name(e: &NetEvent) -> &'static str {
 
 /// Bound on the internal network→actor queue. Inbound streams are back-pressured
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
+/// A step of the actor's whose future is large, **boxed where it is made**: only the
+/// box's pointer sits in the frame of the step that awaits it.
+///
+/// A debug build gives an async fn's poll a stack slot for every future it awaits, every arm
+/// alike, and the actor's dispatchers await dozens: `handle_net`'s poll frame came to about
+/// 790 KiB and `Node::run`'s to about 490 KiB, so `vox room create` in a debug `vox daemon`
+/// overflowed a 2 MiB worker stack once the record it signs re-derived the ML-DSA key on top
+/// ("thread 'tokio-rt-worker' has overflowed its stack"). Each step below is a plain fn that makes
+/// its body's future in its own frame and boxes it, so its callers hold a pointer instead.
+type Boxed<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 const NET_QUEUE: usize = 64;
 
 /// Put a pre-join record on the board at `conn`. A **refusal is fine**: it means our
@@ -4001,7 +4012,12 @@ impl Node {
         }
     }
 
-    async fn handle(&mut self, command: NodeCommand) -> Outcome {
+    fn handle(&mut self, command: NodeCommand) -> Boxed<'_, Outcome> {
+        Box::pin(self.handle_unboxed(command))
+    }
+
+    /// [`Self::handle`], unboxed: see [`Boxed`].
+    async fn handle_unboxed(&mut self, command: NodeCommand) -> Outcome {
         match command {
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
@@ -5339,7 +5355,12 @@ impl Node {
     }
 
     /// Handle one piece of network work.
-    async fn handle_net(&mut self, event: NetEvent) {
+    fn handle_net(&mut self, event: NetEvent) -> Boxed<'_, ()> {
+        Box::pin(self.handle_net_unboxed(event))
+    }
+
+    /// [`Self::handle_net`], unboxed: see [`Boxed`].
+    async fn handle_net_unboxed(&mut self, event: NetEvent) {
         match event {
             NetEvent::Reopened {
                 channel_id,
@@ -7679,7 +7700,22 @@ impl Node {
 
     /// Consent to `target` reading this identity's messages — ADR-007 step 3, the
     /// human decision, taken per sender.
-    async fn consent(&mut self, channel_id: &Digest32, target: Digest32, asked: bool) -> Outcome {
+    fn consent<'a>(
+        &'a mut self,
+        channel_id: &'a Digest32,
+        target: Digest32,
+        asked: bool,
+    ) -> Boxed<'a, Outcome> {
+        Box::pin(self.consent_unboxed(channel_id, target, asked))
+    }
+
+    /// [`Self::consent`], unboxed: see [`Boxed`].
+    async fn consent_unboxed(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        asked: bool,
+    ) -> Outcome {
         let history = self.trust.history(&target);
         let outcome = self
             .release_key_to(channel_id, target, asked, history)
@@ -7789,7 +7825,17 @@ impl Node {
 
     /// Trust `fingerprint` node-wide under `petname` (ADR-020 §3), then act on it
     /// at once so the operator does not wait a tick to see the effect.
-    async fn trust_identity(
+    fn trust_identity<'a>(
+        &'a mut self,
+        fingerprint: Digest32,
+        petname: &'a str,
+        history: crate::node::trust::HistoryGrant,
+    ) -> Boxed<'a, Outcome> {
+        Box::pin(self.trust_identity_unboxed(fingerprint, petname, history))
+    }
+
+    /// [`Self::trust_identity`], unboxed: see [`Boxed`].
+    async fn trust_identity_unboxed(
         &mut self,
         fingerprint: Digest32,
         petname: &str,
@@ -7835,7 +7881,12 @@ impl Node {
     /// Forward-looking by construction: it changes who *future* consent is issued
     /// to and recalls nothing already granted. Recalling that is `Revoke`, per
     /// room — ADR-007's enforcement honesty, which this must not paper over.
-    async fn untrust_identity(&mut self, fingerprint: &Digest32) -> Outcome {
+    fn untrust_identity<'a>(&'a mut self, fingerprint: &'a Digest32) -> Boxed<'a, Outcome> {
+        Box::pin(self.untrust_identity_unboxed(fingerprint))
+    }
+
+    /// [`Self::untrust_identity`], unboxed: see [`Boxed`].
+    async fn untrust_identity_unboxed(&mut self, fingerprint: &Digest32) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -7994,7 +8045,12 @@ impl Node {
     /// unconditionally; the re-keys follow on a best-effort basis and are retried by
     /// the tick for whoever was unreachable. A revocation that waited for the rest of
     /// the room to be online would be a revocation in name only.
-    async fn revoke(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
+    fn revoke<'a>(&'a mut self, channel_id: &'a Digest32, target: Digest32) -> Boxed<'a, Outcome> {
+        Box::pin(self.revoke_unboxed(channel_id, target))
+    }
+
+    /// [`Self::revoke`], unboxed: see [`Boxed`].
+    async fn revoke_unboxed(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
         let now = self.now();
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
@@ -8023,7 +8079,12 @@ impl Node {
 
     /// Deliver the current sender-key generation to every member of every open
     /// channel that keeps consent and does not hold it yet.
-    async fn deliver_owed_rekeys(&mut self) {
+    fn deliver_owed_rekeys(&mut self) -> Boxed<'_, ()> {
+        Box::pin(self.deliver_owed_rekeys_unboxed())
+    }
+
+    /// [`Self::deliver_owed_rekeys`], unboxed: see [`Boxed`].
+    async fn deliver_owed_rekeys_unboxed(&mut self) {
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         for channel_id in channels {
             let _ = self.deliver_rekeys_for(&channel_id, false).await;
@@ -9637,7 +9698,12 @@ impl Node {
     /// Install the key-packages the log has delivered to this identity in `channel_id`: open
     /// each with a one-shot PQXDH against this node's own prekeys and hand the sender key to
     /// the channel, which verifies it against its author and backfills what it opens.
-    async fn install_key_packages(&mut self, channel_id: &Digest32) {
+    fn install_key_packages<'a>(&'a mut self, channel_id: &'a Digest32) -> Boxed<'a, ()> {
+        Box::pin(self.install_key_packages_unboxed(channel_id))
+    }
+
+    /// [`Self::install_key_packages`], unboxed: see [`Boxed`].
+    async fn install_key_packages_unboxed(&mut self, channel_id: &Digest32) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
@@ -10256,7 +10322,12 @@ impl Node {
     }
 
     /// Act on a pairwise stream whose frames have been read.
-    async fn handle_pairwise(&mut self, stream: PairwiseIn) {
+    fn handle_pairwise(&mut self, stream: PairwiseIn) -> Boxed<'_, ()> {
+        Box::pin(self.handle_pairwise_unboxed(stream))
+    }
+
+    /// [`Self::handle_pairwise`], unboxed: see [`Boxed`].
+    async fn handle_pairwise_unboxed(&mut self, stream: PairwiseIn) {
         let PairwiseIn {
             peer,
             first,
@@ -10578,7 +10649,16 @@ impl Node {
         }
     }
 
-    async fn create_channel(&mut self, local_name: &str, passphrase: &Secret) -> Outcome {
+    fn create_channel<'a>(
+        &'a mut self,
+        local_name: &'a str,
+        passphrase: &'a Secret,
+    ) -> Boxed<'a, Outcome> {
+        Box::pin(self.create_channel_unboxed(local_name, passphrase))
+    }
+
+    /// [`Self::create_channel`], unboxed: see [`Boxed`].
+    async fn create_channel_unboxed(&mut self, local_name: &str, passphrase: &Secret) -> Outcome {
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -10590,7 +10670,12 @@ impl Node {
     }
 
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
-    async fn finish_create_channel(&mut self, mut ch: ChannelState) -> Outcome {
+    fn finish_create_channel(&mut self, ch: ChannelState) -> Boxed<'_, Outcome> {
+        Box::pin(self.finish_create_channel_unboxed(ch))
+    }
+
+    /// [`Self::finish_create_channel`], unboxed: see [`Boxed`].
+    async fn finish_create_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
         // The node's own retention before the room is visible to anything that can start a
         // session on it (the retention fix, e2a74b9): every creation path comes through here.
         let id = ch.channel_id();
@@ -10724,7 +10809,17 @@ impl Node {
     /// service grant and no service hands out an address for nothing, and a service in a
     /// room nobody can join is unreachable. If the service cannot be offered the room is
     /// not kept.
-    async fn finish_serve_room(
+    fn finish_serve_room<'a>(
+        &'a mut self,
+        channel: ChannelState,
+        tag: &'a str,
+        endpoint: SocketAddr,
+    ) -> Boxed<'a, Outcome> {
+        Box::pin(self.finish_serve_room_unboxed(channel, tag, endpoint))
+    }
+
+    /// [`Self::finish_serve_room`], unboxed: see [`Boxed`].
+    async fn finish_serve_room_unboxed(
         &mut self,
         mut channel: ChannelState,
         tag: &str,
@@ -10928,7 +11023,12 @@ impl Node {
     }
 
     /// Hold a room opened off the actor: everything [`Self::begin_open_channel`] leaves.
-    async fn finish_open_channel(&mut self, mut ch: ChannelState) -> Outcome {
+    fn finish_open_channel(&mut self, ch: ChannelState) -> Boxed<'_, Outcome> {
+        Box::pin(self.finish_open_channel_unboxed(ch))
+    }
+
+    /// [`Self::finish_open_channel`], unboxed: see [`Boxed`].
+    async fn finish_open_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
         let channel_id = ch.channel_id();
         // The node's own retention before the room is visible to anything that can start a
         // session on it (the retention fix, e2a74b9).
