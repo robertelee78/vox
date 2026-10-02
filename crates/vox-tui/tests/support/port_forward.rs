@@ -48,6 +48,19 @@ struct State {
     /// How long each datagram guest → host is held before it is sent on, in microseconds; 0 sends
     /// at once. A path with latency, as a real one has (V210-122).
     delay_us: AtomicU64,
+    /// The on-path attacker (V210-140). `attack` turns it on; the relay then also emits packets
+    /// to the guest carrying `guest_cid` (the connection ID the guest's QUIC routes its host
+    /// connection by, learned from host → guest packets) so the guest's quinn routes them to that
+    /// connection. They carry no valid crypto, so they raise `udp_rx` (counted before decryption)
+    /// but never `frame_rx`. `public` and `guest_src` are what the attacker sends from and to;
+    /// `spoofed` counts what it sent.
+    attack: AtomicBool,
+    /// The destination-connection-ID length, learned from a long header (short headers omit it).
+    cid_len: Mutex<Option<usize>>,
+    guest_cid: Mutex<Option<Vec<u8>>>,
+    guest_src: Mutex<Option<SocketAddr>>,
+    public: Mutex<Option<Arc<UdpSocket>>>,
+    spoofed: AtomicU64,
 }
 
 pub struct PortForward {
@@ -88,6 +101,10 @@ impl PortForward {
         });
         std::thread::spawn(move || {
             let public_sock = Arc::new(public_sock);
+            *st.public
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::clone(&public_sock));
             let mut inside: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
             let mut buf = vec![0u8; 65536];
             while !st.stop.load(Ordering::SeqCst) {
@@ -101,6 +118,9 @@ impl PortForward {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .entry(from)
                     .or_insert(at);
+                *st.guest_src
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(from);
                 if !st.open.load(Ordering::SeqCst) {
                     st.dropped.fetch_add(1, Ordering::SeqCst);
                     continue;
@@ -123,6 +143,10 @@ impl PortForward {
                         let mut buf = vec![0u8; 65536];
                         while !st.stop.load(Ordering::SeqCst) {
                             let Ok(n) = back.recv(&mut buf) else { continue };
+                            // Learn the guest's connection ID from what the host sends it: the
+                            // packet's destination connection ID is the one the guest's QUIC
+                            // routes this connection by (V210-140).
+                            learn_guest_cid(&st, &buf[..n]);
                             if !st.open.load(Ordering::SeqCst) {
                                 st.dropped.fetch_add(1, Ordering::SeqCst);
                                 continue;
@@ -147,6 +171,78 @@ impl PortForward {
             host,
             state,
         }
+    }
+
+    /// Whether a guest connection ID has been learned yet (a host → guest packet has crossed).
+    pub fn learned_guest_cid(&self) -> bool {
+        self.state
+            .guest_cid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Turn on the on-path attacker (V210-140): from now on the relay also sends the guest
+    /// packets that its QUIC routes to the held host connection (they carry the learned
+    /// connection ID) but that carry no valid crypto, one every `every`. This is the on-path
+    /// position ADR-012 describes, in userspace on loopback. Returns false (and does nothing) if
+    /// no connection ID has been learned or no guest source seen yet.
+    pub fn start_spoofing(&self, every: Duration) -> bool {
+        let (cid, src, public) = {
+            let cid = self
+                .state
+                .guest_cid
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let src = *self
+                .state
+                .guest_src
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let public = self
+                .state
+                .public
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            (cid, src, public)
+        };
+        let (Some(cid), Some(src), Some(public)) = (cid, src, public) else {
+            return false;
+        };
+        self.state.attack.store(true, Ordering::SeqCst);
+        let st = Arc::clone(&self.state);
+        std::thread::spawn(move || {
+            // A short-header packet: the fixed bit set, the learned connection ID, then bytes
+            // that are not a valid packet. The guest's quinn routes it by the connection ID and
+            // fails to authenticate it.
+            let mut pkt = Vec::with_capacity(1 + cid.len() + 64);
+            let mut tick: u64 = 0;
+            while st.attack.load(Ordering::SeqCst) && !st.stop.load(Ordering::SeqCst) {
+                pkt.clear();
+                pkt.push(0x40);
+                pkt.extend_from_slice(&cid);
+                pkt.extend_from_slice(&tick.to_be_bytes());
+                pkt.resize(1 + cid.len() + 64, 0xA5);
+                if public.send_to(&pkt, src).is_ok() {
+                    st.spoofed.fetch_add(1, Ordering::SeqCst);
+                }
+                tick = tick.wrapping_add(1);
+                std::thread::sleep(every);
+            }
+        });
+        true
+    }
+
+    /// Turn the attacker off.
+    pub fn stop_spoofing(&self) {
+        self.state.attack.store(false, Ordering::SeqCst);
+    }
+
+    /// How many spoofed packets the attacker has sent.
+    pub fn spoofed(&self) -> u64 {
+        self.state.spoofed.load(Ordering::SeqCst)
     }
 
     /// Hold every datagram guest → host for `delay` from now on (zero: none).
@@ -196,6 +292,48 @@ impl Drop for PortForward {
     }
 }
 
+/// Learn the guest's connection ID from a host → guest packet. A long header states the
+/// destination connection ID's length explicitly, so the length is taken from the first long
+/// header seen; a short header then carries the connection ID at that fixed length, and is the
+/// 1-RTT connection ID the guest routes by. Updated from the most recent short header so it is
+/// current when the attacker starts (V210-140).
+fn learn_guest_cid(st: &State, pkt: &[u8]) {
+    if pkt.is_empty() {
+        return;
+    }
+    let long = pkt[0] & 0x80 != 0;
+    if long {
+        // [byte0][version:4][dcid_len:1][dcid]…
+        if pkt.len() < 6 {
+            return;
+        }
+        let len = pkt[5] as usize;
+        if len == 0 || pkt.len() < 6 + len {
+            return;
+        }
+        let mut slot = st
+            .cid_len
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(len);
+        return;
+    }
+    // Short header: [byte0][dcid: the learned length]…
+    let Some(len) = *st
+        .cid_len
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    else {
+        return;
+    };
+    if len == 0 || pkt.len() < 1 + len {
+        return;
+    }
+    *st.guest_cid
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pkt[1..1 + len].to_vec());
+}
+
 /// A free UDP port on `127.0.0.1`, for a host whose address the forward must know before the host
 /// starts. Released before it is returned, so another process could take it first; the host then
 /// fails to bind and says so, which is a loud failure, never a wrong measurement.
@@ -216,6 +354,9 @@ pub struct ForwardedWorld {
     pub anchor: crate::relay::Anchor,
     pub forward: PortForward,
     pub host: crate::world::VoxProc,
+    /// The host's real `127.0.0.1` address, behind the forward — kept so the host can be
+    /// restarted into the same room on the same address (V210-140).
+    pub host_addr: SocketAddr,
     pub host_dir: std::path::PathBuf,
     pub guest_dir: std::path::PathBuf,
     pub host_fp: String,
@@ -316,6 +457,7 @@ impl ForwardedWorld {
             anchor,
             forward,
             host,
+            host_addr,
             host_dir,
             guest_dir,
             host_fp,
@@ -326,6 +468,46 @@ impl ForwardedWorld {
             joined_in,
             join_stderr: err,
         }
+    }
+
+    /// Kill the host's `vox serve` and bring the **same identity and room** back as a
+    /// `vox daemon`, on the same `127.0.0.1` address and advertising the same forward (V210-140,
+    /// modelled on `world.rs`'s). The guest's path to the host is unchanged: the forward's inside
+    /// socket is aimed at that address, so the restarted process is reached through it.
+    pub fn restart_host_as_daemon(&mut self) {
+        use crate::world::{args, utf8, VoxProc};
+        let old = self.host.child.id();
+        // Replace the handle, which kills and reaps the old process on drop (ADR-018 §6).
+        let pass_file = self.tmp.path().join("daemon-passphrases");
+        std::fs::write(
+            &pass_file,
+            format!("{}\n{}\n", crate::world::IDENTITY, self.passphrase),
+        )
+        .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
+        let advertise = self.forward.public.to_string();
+        let mut daemon = VoxProc::spawn_env(
+            "host-daemon",
+            &self.host_dir,
+            &args(&[
+                "daemon",
+                "--passphrase-file",
+                &utf8(&pass_file),
+                "--anchor",
+                &self.anchor.v4_spec,
+                "--listen",
+                &self.host_addr.to_string(),
+            ]),
+            &[("VOX_TEST_ADVERTISE", advertise.as_str())],
+        );
+        let room = self.room.clone();
+        daemon.expect_line("the daemon to hold the room open", |l| {
+            l.starts_with("vox daemon: holding room") && l.contains(&room)
+        });
+        self.host = daemon;
+        eprintln!(
+            "[harness] host `vox serve` pid {old} killed; restarted as `vox daemon` on {}",
+            self.host_addr
+        );
     }
 
     /// The name the host's service answers on through `vox up`.
