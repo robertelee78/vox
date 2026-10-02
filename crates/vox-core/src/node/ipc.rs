@@ -180,6 +180,8 @@ const T_REACH_WITHDRAWN: u64 = 1711;
 const T_PROXY_REFUSED: u64 = 1712;
 /// Additive, and deliberately away from the sequential range (see above).
 const T_STILL_RELAYED: u64 = 1713;
+/// `NodeEvent::TunnelClosed` (V030-11). Additive, numbered for the item.
+const T_TUNNEL_CLOSED: u64 = 3011;
 /// Additive, and deliberately away from the sequential range (see above).
 const T_JOIN_FAILED: u64 = 1714;
 /// Additive, and deliberately away from the sequential range (see above).
@@ -343,9 +345,9 @@ pub enum Request {
         /// The last room of the previous page, or `None` for the first.
         after: Option<Digest32>,
     },
-    /// Offer a local TCP endpoint as a room-bound service (ADR-013), for as long as this
-    /// connection stays open: it is withdrawn when the connection closes, however the client
-    /// ends, and never persisted (V210-72). A [`Request::Forward`] likewise.
+    /// Offer a local TCP endpoint as a room-bound service (ADR-013). Unless `persist`, only for
+    /// as long as this connection stays open: it is withdrawn when the connection closes, however
+    /// the client ends, and never persisted (V210-72). A [`Request::Forward`] likewise.
     AddService {
         /// The room.
         channel_id: Digest32,
@@ -353,6 +355,9 @@ pub enum Request {
         service_tag: String,
         /// The local endpoint to carry connections to.
         local: String,
+        /// Kept: offered until removed, across this node's restarts, as `vox service add` offers
+        /// it without a daemon (V030-06). Not withdrawn when the connection closes.
+        persist: bool,
     },
     /// Stop offering a service.
     RemoveService {
@@ -508,12 +513,14 @@ impl Request {
                 channel_id,
                 service_tag,
                 local,
+                persist,
             } => {
-                e.array(4)
+                e.array(5)
                     .uint(T_ADD_SERVICE)
                     .bytes(channel_id)
                     .text(service_tag)
-                    .text(local);
+                    .text(local)
+                    .uint(u64::from(*persist));
             }
             Request::RemoveService {
                 channel_id,
@@ -774,16 +781,18 @@ impl Request {
                     after,
                 })
             }
-            (T_ADD_SERVICE, 4) => {
+            (T_ADD_SERVICE, 5) => {
                 let channel_id = digest(&mut d)?;
                 let service_tag = text(&mut d, "ipc service tag")?;
                 let local = text(&mut d, "ipc local address")?;
+                let persist = flag(&mut d, "ipc service persist")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::AddService {
                     channel_id,
                     service_tag,
                     local,
+                    persist,
                 })
             }
             (T_REMOVE_SERVICE, 3) => {
@@ -1225,6 +1234,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::StillRelayed { peer, reason } => {
             e.array(3).uint(T_STILL_RELAYED).bytes(peer).text(reason);
         }
+        NodeEvent::TunnelClosed { reason } => {
+            e.array(2).uint(T_TUNNEL_CLOSED).text(reason);
+        }
         NodeEvent::ProxyRefused { reason } => {
             e.array(2).uint(T_PROXY_REFUSED).text(reason);
         }
@@ -1630,6 +1642,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedIpc("ipc proxy refusal reason"))?
                 .to_owned(),
         },
+        (T_TUNNEL_CLOSED, 2) => NodeEvent::TunnelClosed {
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc tunnel close reason"))?
+                .to_owned(),
+        },
         (T_PEER_UNREACHABLE, 3) => NodeEvent::PeerUnreachable {
             peer: digest(d)?,
             why: d
@@ -1957,6 +1975,8 @@ impl Held {
     /// cloned for this: some carry passphrases).
     fn intent(request: &Request) -> Intent {
         match request {
+            // A kept offer outlives the connection that made it, as `vox service add` means it to.
+            Request::AddService { persist: true, .. } => Intent::Nothing,
             Request::AddService {
                 channel_id,
                 service_tag,
@@ -2057,6 +2077,12 @@ async fn serve_requests(
         // PRD-001 R35: `vox status`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
             crate::node::status::serve(&mut stream, handle).await?;
+            continue;
+        }
+        // V030-11: `vox tunnel close`. The live tunnels are this process's, so it is answered
+        // here, and the connection serves on.
+        if let Some(which) = crate::node::status::close_request(&body) {
+            crate::node::status::serve_close(&mut stream, &which).await?;
             continue;
         }
         // Protocol 6: an app request turns the connection into an app connection for
@@ -2446,6 +2472,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             channel_id,
             service_tag,
             local,
+            persist,
         } => {
             let Ok(local) = local.parse() else {
                 return Frame::Error {
@@ -2458,8 +2485,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     service_tag,
                     local,
                     // Offered over this socket, it lasts as long as the client's connection
-                    // (`Held`), and so never outlives this node's run either.
-                    persist: false,
+                    // (`Held`), and so never outlives this node's run either — unless the client
+                    // asked for it kept, as `vox service add` does (V030-06).
+                    persist,
                 })
                 .await
             {

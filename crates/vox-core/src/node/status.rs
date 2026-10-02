@@ -59,19 +59,6 @@ use crate::transport::router::DatagramStats;
 /// A room with other members and no completed sync for this long is flagged.
 pub const STALE_SYNC_SECS: u64 = 10 * 60;
 
-/// One tunnel this node is serving right now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServedTunnel {
-    /// The member reaching it.
-    pub client: Digest32,
-    /// The room it is bound to.
-    pub channel_id: Digest32,
-    /// The service.
-    pub service_tag: String,
-    /// When it was authorized, seconds since the epoch.
-    pub since: u64,
-}
-
 /// The ledgers this module keeps beside the node's own state.
 #[derive(Debug, Default)]
 pub struct StatusBook {
@@ -81,61 +68,9 @@ pub struct StatusBook {
     pub member_synced: BTreeMap<Digest32, u64>,
     /// Peer → when this node last saw a live connection to it.
     pub last_seen: BTreeMap<Digest32, u64>,
-    /// Tunnels being served, by a local id; entries leave when the tunnel ends.
-    pub served: Arc<Mutex<BTreeMap<u64, ServedTunnel>>>,
     /// When the node started, seconds since the epoch: a room that has not synced *yet*
     /// is not stale until it has had [`STALE_SYNC_SECS`] to do so.
     pub started: u64,
-    next_tunnel: u64,
-}
-
-/// A place in [`StatusBook::served`], given back when the tunnel ends.
-#[derive(Debug)]
-pub struct ServedGuard {
-    id: u64,
-    served: Arc<Mutex<BTreeMap<u64, ServedTunnel>>>,
-}
-
-impl ServedGuard {
-    /// The tunnel was authorized: it is now being served.
-    pub fn serving(&self, tunnel: ServedTunnel) {
-        self.served
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(self.id, tunnel);
-    }
-}
-
-impl Drop for ServedGuard {
-    fn drop(&mut self) {
-        self.served
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.id);
-    }
-}
-
-impl StatusBook {
-    /// A guard for one inbound tunnel stream; it shows as served once
-    /// [`ServedGuard::serving`] says so, and stops when the guard drops.
-    pub fn tunnel(&mut self) -> ServedGuard {
-        self.next_tunnel += 1;
-        ServedGuard {
-            id: self.next_tunnel,
-            served: Arc::clone(&self.served),
-        }
-    }
-
-    /// The tunnels being served now.
-    #[must_use]
-    pub fn served_now(&self) -> Vec<ServedTunnel> {
-        self.served
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect()
-    }
 }
 
 /// One member of a room, as this node sees it.
@@ -199,9 +134,11 @@ pub struct PeerStatus {
     pub datagrams: DatagramStats,
 }
 
-/// A local port forwarded to a member's service (the dial side).
+/// A local port forwarded to a member's service (the dial side): a door, which carries a tunnel
+/// only while something is connected through it. The tunnels themselves are in the one list of
+/// live tunnels ([`crate::transport::quic::live_tunnels`], V210-81).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DialedTunnel {
+pub struct ForwardStatus {
     /// The room.
     pub channel_id: Digest32,
     /// The member hosting it.
@@ -231,10 +168,8 @@ pub struct StatusReport {
     pub peers: Vec<PeerStatus>,
     /// How many circuits it carries for others.
     pub relaying: usize,
-    /// Tunnels it serves now.
-    pub tunnels_served: Vec<ServedTunnel>,
     /// Ports it forwards to others' services.
-    pub tunnels_dialed: Vec<DialedTunnel>,
+    pub forwards: Vec<ForwardStatus>,
     /// Datagram counters, summed over every connection.
     pub datagrams: DatagramStats,
     /// The app layer's counters.
@@ -371,17 +306,7 @@ impl StatusReport {
         });
         let _ = write!(j, "\"peers\":[{}],", list(peers));
         let _ = write!(j, "\"relaying\":{},", self.relaying);
-        let served = self.tunnels_served.iter().map(|t| {
-            format!(
-                "{{\"client\":{},\"room\":{},\"service\":{},\"since\":{}}}",
-                q(&b32_encode(&t.client)),
-                q(&b32_encode(&t.channel_id)),
-                q(&t.service_tag),
-                t.since
-            )
-        });
-        let _ = write!(j, "\"tunnels_served\":[{}],", list(served));
-        let dialed = self.tunnels_dialed.iter().map(|t| {
+        let forwards = self.forwards.iter().map(|t| {
             format!(
                 "{{\"host\":{},\"room\":{},\"service\":{},\"local\":{}}}",
                 q(&b32_encode(&t.host)),
@@ -390,7 +315,7 @@ impl StatusReport {
                 q(&t.local.to_string())
             )
         });
-        let _ = write!(j, "\"tunnels_dialed\":[{}],", list(dialed));
+        let _ = write!(j, "\"forwards\":[{}],", list(forwards));
         let _ = write!(j, "\"datagrams\":{},", dgram_json(&self.datagrams));
         let a = &self.app;
         let _ = write!(
@@ -501,15 +426,27 @@ impl StatusReport {
             "Circuits carried for other peers.",
             vec![(String::new(), self.relaying as u64)],
         );
+        let live = crate::transport::quic::live_tunnels();
         gauge(
             "vox_tunnels_served",
             "Tunnels being served now.",
-            vec![(String::new(), self.tunnels_served.len() as u64)],
+            vec![(
+                String::new(),
+                live.iter().filter(|t| !t.outbound).count() as u64,
+            )],
         );
         gauge(
             "vox_tunnels_dialed",
+            "Tunnels this node opened to members' services, now.",
+            vec![(
+                String::new(),
+                live.iter().filter(|t| t.outbound).count() as u64,
+            )],
+        );
+        gauge(
+            "vox_forwards",
             "Local forwards to members' services.",
-            vec![(String::new(), self.tunnels_dialed.len() as u64)],
+            vec![(String::new(), self.forwards.len() as u64)],
         );
         gauge(
             "vox_unhealthy",
@@ -1052,16 +989,24 @@ impl SyncBook {
         s.push_str("],\"reach\":[");
         // Ladders from this book; circuits counted where every outbound circuit is asked for
         // (`circuitstream::connect_through`). Every peer either names, in one row.
+        // Dial-backs (V030-22) counted where each is asked for, in the ladder.
         let circuits = crate::node::circuitstream::outbound_circuits();
-        let peers: std::collections::BTreeSet<&Digest32> =
-            b.ladders.keys().chain(circuits.keys()).collect();
+        let dial_backs = crate::node::coordstream::dial_backs();
+        let peers: std::collections::BTreeSet<&Digest32> = b
+            .ladders
+            .keys()
+            .chain(circuits.keys())
+            .chain(dial_backs.keys())
+            .collect();
         for (i, peer) in peers.into_iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
+            let (asked, answered) = dial_backs.get(peer).copied().unwrap_or((0, 0));
             let _ = write!(
                 s,
-                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{}}}",
+                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{},\"dial_backs\":{asked},\
+                 \"dial_backs_answered\":{answered}}}",
                 b32_encode(peer),
                 b.ladders.get(peer).copied().unwrap_or(0),
                 circuits.get(peer).copied().unwrap_or(0)
@@ -1140,8 +1085,9 @@ impl SyncBook {
             }
             let _ = write!(
                 s,
-                "{{\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\"opened\":{},\
-                 \"last_moved\":{}}}",
+                "{{\"id\":{},\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\
+                 \"opened\":{},\"last_moved\":{}}}",
+                t.id,
                 b32_encode(&t.peer),
                 q(&t.service),
                 if t.outbound { "out" } else { "in" },
@@ -1149,7 +1095,31 @@ impl SyncBook {
                 t.last_moved
             );
         }
-        s.push(']');
+        // **Tunnels that ended for a reason a person should see** (V030-11): closed here, closed
+        // at the other end, or closed as stuck, with why; and how long a stuck tunnel is given.
+        s.push_str("],\"closed_tunnels\":[");
+        for (i, t) in crate::transport::quic::closed_tunnels().iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(
+                s,
+                "{{\"id\":{},\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\
+                 \"opened\":{},\"closed\":{},\"why\":{}}}",
+                t.id,
+                b32_encode(&t.peer),
+                q(&t.service),
+                if t.outbound { "out" } else { "in" },
+                t.opened,
+                t.closed,
+                q(&t.why)
+            );
+        }
+        let _ = write!(
+            s,
+            "],\"tunnel_stuck_after\":{}",
+            crate::tunnel::session::stuck_after().as_secs()
+        );
         s
     }
 }
@@ -1159,6 +1129,93 @@ impl SyncBook {
 
 const T_STATUS: u64 = 2301;
 const T_STATUS_REPORT: u64 = 2302;
+const T_TUNNEL_CLOSE: u64 = 2303;
+const T_TUNNEL_CLOSED: u64 = 2304;
+
+/// What `vox tunnel close` says it closed (V030-11): each tunnel as `vox status` lists it.
+#[must_use]
+pub fn closed_said(closed: &[crate::transport::quic::LiveTunnel]) -> String {
+    closed
+        .iter()
+        .map(|t| {
+            format!(
+                "tunnel {} {} {} for {}",
+                t.id,
+                if t.outbound { "to" } else { "from" },
+                b32_encode(&t.peer).chars().take(12).collect::<String>(),
+                t.service
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `body` is a tunnel-close request (V030-11), and if so what it names.
+#[must_use]
+pub fn close_request(body: &[u8]) -> Option<crate::transport::quic::TunnelSelector> {
+    let mut d = Decoder::new(body);
+    if !matches!((d.array(), d.uint()), (Ok(4), Ok(T_TUNNEL_CLOSE))) {
+        return None;
+    }
+    let mut field = || d.text().ok().filter(|t| !t.is_empty()).map(str::to_owned);
+    let (id, member, service) = (field(), field(), field());
+    Some(crate::transport::quic::TunnelSelector {
+        id: id.and_then(|i| i.parse().ok()),
+        member,
+        service,
+    })
+}
+
+/// Close what `which` names, here in the node, and answer with what was closed.
+///
+/// # Errors
+/// If the reply cannot be written.
+pub async fn serve_close(
+    stream: &mut UnixStream,
+    which: &crate::transport::quic::TunnelSelector,
+) -> Result<()> {
+    // Nothing closed and a reason: the selector named more than one member.
+    let (n, said) =
+        match crate::transport::quic::close_tunnels(which, "closed by a person on this side") {
+            Ok(closed) => (closed.len() as u64, closed_said(&closed)),
+            Err(refused) => (0, refused),
+        };
+    let mut e = Encoder::new();
+    e.array(3).uint(T_TUNNEL_CLOSED).uint(n).text(&said);
+    write_frame(stream, &e.finish()).await
+}
+
+/// Ask the node listening on `path` to close the tunnels `which` names: how many it closed,
+/// and each as `vox status` lists it — or none, and why not, when `which` named more than one
+/// member.
+///
+/// # Errors
+/// If the node cannot be reached, does not answer in time, or answers something else.
+pub async fn request_close(
+    path: &Path,
+    which: &crate::transport::quic::TunnelSelector,
+) -> Result<(u64, String)> {
+    let mut e = Encoder::new();
+    e.array(4)
+        .uint(T_TUNNEL_CLOSE)
+        .text(&which.id.map(|i| i.to_string()).unwrap_or_default())
+        .text(which.member.as_deref().unwrap_or_default())
+        .text(which.service.as_deref().unwrap_or_default());
+    let body = tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, exchange(path, e.finish()))
+        .await
+        .map_err(|_| crate::node::ipc::silent())??;
+    let mut d = Decoder::new(&body);
+    if let (Ok(3), Ok(T_TUNNEL_CLOSED)) = (d.array(), d.uint()) {
+        let n = d
+            .uint()
+            .map_err(|_| Error::MalformedIpc("ipc tunnel-close reply"))?;
+        let said = d
+            .text()
+            .map_err(|_| Error::MalformedIpc("ipc tunnel-close reply"))?;
+        return Ok((n, said.to_owned()));
+    }
+    Err(Error::MalformedIpc("ipc tunnel-close reply"))
+}
 
 /// Whether `body` is a status request.
 #[must_use]
@@ -1217,6 +1274,27 @@ pub async fn request(path: &Path) -> Result<String> {
 }
 
 async fn ask(path: &Path) -> Result<String> {
+    let mut e = Encoder::new();
+    e.array(1).uint(T_STATUS);
+    let body = exchange(path, e.finish()).await?;
+    let mut d = Decoder::new(&body);
+    if let (Ok(2), Ok(T_STATUS_REPORT)) = (d.array(), d.uint()) {
+        return d
+            .text()
+            .map(str::to_owned)
+            .map_err(|_| Error::MalformedIpc("ipc status reply"));
+    }
+    match Frame::from_bytes(&body)? {
+        Frame::Error { reason } => Err(Error::Path {
+            op: "vox status",
+            detail: reason,
+        }),
+        _ => Err(Error::MalformedIpc("ipc status reply")),
+    }
+}
+
+/// Greet the node listening on `path`, send it `request`, and return its one reply.
+async fn exchange(path: &Path, request: Vec<u8>) -> Result<Vec<u8>> {
     let mut stream = crate::node::ipc::connect_own(path).await?;
     // A connection that ends is named as such, never as a malformed message (V210-101); and none
     // of this is an identity bundle, which `MalformedBundle` said.
@@ -1233,28 +1311,13 @@ async fn ask(path: &Path) -> Result<String> {
         }
         _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
     }
-    let mut e = Encoder::new();
-    e.array(1).uint(T_STATUS);
-    if let Err(e) = write_frame(&mut stream, &e.finish()).await {
+    if let Err(e) = write_frame(&mut stream, &request).await {
         return Err(crate::node::ipc::named(path, e).await);
     }
     let Some(body) = read_frame(&mut stream).await? else {
         return Err(crate::node::ipc::hung_up(path).await);
     };
-    let mut d = Decoder::new(&body);
-    if let (Ok(2), Ok(T_STATUS_REPORT)) = (d.array(), d.uint()) {
-        return d
-            .text()
-            .map(str::to_owned)
-            .map_err(|_| Error::MalformedIpc("ipc status reply"));
-    }
-    match Frame::from_bytes(&body)? {
-        Frame::Error { reason } => Err(Error::Path {
-            op: "vox status",
-            detail: reason,
-        }),
-        _ => Err(Error::MalformedIpc("ipc status reply")),
-    }
+    Ok(body)
 }
 
 // ---- metrics endpoint ------------------------------------------------------
@@ -1280,16 +1343,59 @@ pub async fn bind_metrics(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
         })
 }
 
+/// The most of a request's head [`read_request_head`] reads: far more than a scraper's request
+/// line and headers, so a client cannot hold the reader on a head without end.
+const REQUEST_HEAD_MAX: usize = 16 * 1024;
+
+/// Read `sock` until the end of an HTTP request's head (`\r\n\r\n`), the peer's end of stream,
+/// [`REQUEST_HEAD_MAX`] bytes, or `within`, whichever comes first (V210-126).
+async fn read_request_head(sock: &mut tokio::net::TcpStream, within: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut head: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while head.len() < REQUEST_HEAD_MAX {
+        match tokio::time::timeout_at(deadline, sock.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => {
+                // Only the last three bytes of what came before can begin the terminator.
+                let from = head.len().saturating_sub(3);
+                head.extend_from_slice(&chunk[..n]);
+                if head[from..].windows(4).any(|w| w == b"\r\n\r\n") {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
+/// How long [`drain_after_answer`] goes on discarding what a client still sends.
+const DRAIN_AFTER_ANSWER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// After the answer and its FIN: read and discard what the client still sends, until it closes
+/// its end or `within` passes (V030-23). Closing with unread input makes the OS reset the
+/// connection, and on macOS that reset can overtake the answer, so a client whose head was cut
+/// off at [`REQUEST_HEAD_MAX`] or never ended lost a response it had already been sent.
+async fn drain_after_answer(sock: &mut tokio::net::TcpStream, within: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut chunk = [0u8; 2048];
+    while let Ok(Ok(n)) = tokio::time::timeout_at(deadline, sock.read(&mut chunk)).await {
+        if n == 0 {
+            return;
+        }
+    }
+}
+
 /// Serve Prometheus text on every connection to `listener`, until it is dropped.
 pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle) {
     while let Ok((mut sock, _)) = listener.accept().await {
         let handle = handle.clone();
         tokio::spawn(async move {
-            // The request itself is not interpreted: every path answers the metrics. A
-            // bounded read is enough to consume a scraper's request line and headers.
-            let mut buf = [0u8; 2048];
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(2), sock.read(&mut buf)).await;
+            // The request itself is not interpreted: every path answers the metrics. But it is
+            // **read to its end** first, the blank line after its headers, within the same 2 s
+            // (V210-126): one read took only the first segment of a request that arrived in
+            // pieces, and closing with the rest unread made the OS reset the connection, so the
+            // scraper lost the answer (`Connection reset by peer`).
+            read_request_head(&mut sock, std::time::Duration::from_secs(2)).await;
             let body = match handle.status().await {
                 Ok(r) => r.to_prometheus(),
                 Err(_) => "vox_up 0\n".to_owned(),
@@ -1300,7 +1406,10 @@ pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle
             );
             let _ = sock.write_all(head.as_bytes()).await;
             let _ = sock.write_all(body.as_bytes()).await;
+            // Half-closed, so the answer is followed by a FIN, then drained, so whatever of the
+            // request was never read cannot turn the close into a reset (V030-23).
             let _ = sock.shutdown().await;
+            drain_after_answer(&mut sock, DRAIN_AFTER_ANSWER).await;
         });
     }
 }

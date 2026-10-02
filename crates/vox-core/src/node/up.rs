@@ -136,7 +136,7 @@ where
     D: HostDialer + 'static,
     N: Names + 'static,
     R: Fn(&Digest32, u16) + Send + Sync + 'static,
-    F: Fn(&str) + Send + Sync + 'static,
+    F: Fn(crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
 {
     let withdrawn = Arc::new(withdrawn);
     let refused = Arc::new(refused);
@@ -369,8 +369,9 @@ where
     D: HostDialer + 'static,
     N: Names + 'static,
     R: Fn(&Digest32, u16),
-    F: Fn(&str) + Send + Sync + 'static,
+    F: Fn(crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
 {
+    use crate::node::tunnel::TunnelNote::{Closed, Refused};
     socks::negotiate(&mut stream).await?;
     let (command, target) =
         socks::read_request(&mut stream, &[Command::Connect, Command::UdpAssociate]).await?;
@@ -383,7 +384,9 @@ where
         Target::Ip(_) => {
             // Not a Vox name. Refusing is the point: a proxy on loopback that forwarded
             // arbitrary addresses would be an open relay for anything on this machine.
-            refused("a CONNECT to a bare address: vox up carries .vox names only");
+            refused(Refused(
+                "a CONNECT to a bare address: vox up carries .vox names only".to_owned(),
+            ));
             socks::write_reply(&mut stream, Reply::AddressNotSupported, UNSPECIFIED).await?;
             return Err(Error::MalformedTunnel(
                 "vox up carries .vox names only; configure socks5h so the name reaches it",
@@ -396,7 +399,7 @@ where
             // Said to this machine's operator only, and only about this machine's own
             // names: which part of the name matched nothing, or matched too much. The
             // SOCKS client gets the one code.
-            refused(&why);
+            refused(Refused(why.to_string()));
             socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
             return Err(Error::MalformedTunnel("no such .vox name on this machine"));
         }
@@ -421,7 +424,7 @@ where
             Err(why) => {
                 // The SOCKS reply is a code, and a coarse one; the sentence goes to this node's
                 // own operator. Neither says anything the host did not.
-                refused(&refusal(&why, &format!("{name}:{port}")));
+                refused(Refused(refusal(&why, &format!("{name}:{port}"))));
                 let reply = match why {
                     Error::TunnelDenied(_) => Reply::NotAllowed,
                     _ => Reply::GeneralFailure,
@@ -431,12 +434,17 @@ where
             }
         };
     socks::write_reply(&mut stream, Reply::Succeeded, UNSPECIFIED).await?;
-    match crate::tunnel::session::splice_moving(send, recv, stream, credit.moved()).await {
+    match crate::tunnel::session::splice_watched(send, recv, stream, credit.watch()).await {
         // The session was established and then cut by a decision. Report it; every other
         // ending is silent (M17.11).
         Err(Error::TunnelRevoked(why)) => {
             withdrawn(&room.channel_id, port);
             Err(Error::TunnelRevoked(why))
+        }
+        // Closed on purpose, here or at the host, or as stuck (V030-11): said as a close.
+        Err(e @ Error::TunnelClosed(_)) => {
+            refused(Closed(format!("a session to {name}:{port}: {e}")));
+            Err(e)
         }
         other => other,
     }
@@ -478,8 +486,9 @@ async fn associate<D, N, F>(
 where
     D: HostDialer + 'static,
     N: Names + 'static,
-    F: Fn(&str) + Send + Sync + 'static,
+    F: Fn(crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
 {
+    use crate::node::tunnel::TunnelNote::Refused;
     use crate::tunnel::udp;
     use std::collections::HashMap;
     use tokio::io::AsyncReadExt as _;
@@ -527,7 +536,10 @@ where
                     continue;
                 }
                 let Target::Domain(name, port) = datagram.target else {
-                    refused("a UDP datagram to a bare address: vox up carries .vox names only");
+                    refused(Refused(
+                        "a UDP datagram to a bare address: vox up carries .vox names only"
+                            .to_owned(),
+                    ));
                     continue;
                 };
                 let key = (name.to_ascii_lowercase(), port);
@@ -539,7 +551,7 @@ where
                     let room = match resolver.lookup(&name).await {
                         Ok(room) => room,
                         Err(why) => {
-                            refused(&why);
+                            refused(Refused(why.to_string()));
                             continue;
                         }
                     };
@@ -558,7 +570,7 @@ where
                                 };
                                 udp::client_pump(flow, rx, to_client, guard).await;
                             }
-                            Err(e) => refused(&refusal(&e, &format!("{name}:{port}/udp"))),
+                            Err(e) => refused(Refused(refusal(&e, &format!("{name}:{port}/udp")))),
                         }
                     });
                     dests.insert(key.clone(), tx);

@@ -195,10 +195,10 @@ pub async fn serve_reporting(
             })
         },
         |channel_id, tag| {
-            let mut moved = None;
+            let mut watch = None;
             if let Some(conn) = carried {
                 let taken = conn.carry_tunnel(tag, false)?;
-                moved = Some(taken.moved());
+                watch = Some(taken.watch());
                 *credit
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(taken);
@@ -210,13 +210,24 @@ pub async fn serve_reporting(
                     service_tag: tag.to_owned(),
                 });
             }
-            Ok(moved)
+            Ok(watch)
         },
         udp,
     )
     .await;
     drop(credit);
     served
+}
+
+/// What a tunnel this node was asked for came to, said to the person who asked (PRD-001 R23,
+/// V030-11): refused before it carried anything, or closed on purpose after it had — here, at the
+/// other end, or as stuck. Kept apart so a deliberate close is never read as a refusal or a fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunnelNote {
+    /// The tunnel was not opened, or was cut by a decision about reach: why, in words.
+    Refused(String),
+    /// The tunnel was closed on purpose: which session, by which end, and why.
+    Closed(String),
 }
 
 /// A live local port forwarded to a member's service over the overlay.
@@ -285,7 +296,7 @@ impl Forward {
     ) -> Result<Self>
     where
         D: up::HostDialer + 'static,
-        F: Fn(String) + Send + Sync + 'static,
+        F: Fn(TunnelNote) + Send + Sync + 'static,
     {
         use crate::tunnel::udp;
         use std::collections::HashMap;
@@ -356,10 +367,12 @@ impl Forward {
                                 {
                                     // The host ended it: withdrawn, removed, or gone. Said
                                     // once per flow, not per packet.
-                                    report(format!("the host ended the {tag} flow from {src}"));
+                                    report(TunnelNote::Refused(format!(
+                                        "the host ended the {tag} flow from {src}"
+                                    )));
                                 }
                             }
-                            Err(e) => report(up::refusal(&e, &tag)),
+                            Err(e) => report(TunnelNote::Refused(up::refusal(&e, &tag))),
                         }
                         // Only this flow's entry: a newer flow for the same client may
                         // already have replaced it.
@@ -399,7 +412,7 @@ impl Forward {
     /// while still bound. `vox up` already asked its dialer per request; the forward now
     /// does the same, through the same [`up::open_tunnel`].
     ///
-    /// `report` hears, in words, why a connection was refused or cut — the application only
+    /// `report` hears, in words, why a connection was refused, cut or closed — the application only
     /// sees its socket reset, and the host's refusal is uniform on purpose, but this node is
     /// the operator's own and knows what it was told (PRD-001 R23).
     ///
@@ -418,7 +431,7 @@ impl Forward {
     ) -> Result<Self>
     where
         D: up::HostDialer + 'static,
-        F: Fn(String) + Send + Sync + 'static,
+        F: Fn(TunnelNote) + Send + Sync + 'static,
     {
         if !local.ip().is_loopback() {
             return Err(Error::MalformedTunnel("a forward binds loopback only"));
@@ -453,12 +466,22 @@ impl Forward {
                         // `_carried` and `_credit` are held for the whole splice (see
                         // `up::open_tunnel`): the path, and the tunnel's receive window on it.
                         Ok((send, recv, _carried, credit)) => {
-                            if let Err(Error::TunnelRevoked(_)) =
-                                session::splice_moving(send, recv, app, credit.moved()).await
-                            {
-                                report(format!(
-                                    "the host withdrew access to {tag:?} — that session was cut"
-                                ));
+                            match session::splice_watched(send, recv, app, credit.watch()).await {
+                                Err(Error::TunnelRevoked(_)) => {
+                                    report(TunnelNote::Refused(format!(
+                                        "the host withdrew access to {tag:?} — that session was \
+                                         cut"
+                                    )))
+                                }
+                                // Closed on purpose, here or at the host, or as stuck: said as a
+                                // close, so the person whose session ended knows it was a
+                                // decision, whose, and why.
+                                Err(e @ Error::TunnelClosed(_)) => {
+                                    report(TunnelNote::Closed(format!(
+                                        "a session to {tag:?}: {e}"
+                                    )));
+                                }
+                                _ => {}
                             }
                         }
                         Err(e) => {
@@ -466,7 +489,7 @@ impl Forward {
                             // its connect succeeded reads it as the service hanging up, and
                             // retries a thing that will never work.
                             session::abort_local(&app);
-                            report(up::refusal(&e, &format!("{tag:?}")));
+                            report(TunnelNote::Refused(up::refusal(&e, &format!("{tag:?}"))));
                         }
                     }
                 });

@@ -609,6 +609,10 @@ pub struct LanUpArgs {
     /// sends still come back. ICMP echo always passes.
     #[arg(long, value_delimiter = ',')]
     pub allow: Vec<u16>,
+    /// Serve Prometheus metrics at this address, as `vox daemon --metrics` does (PRD-001 R38).
+    /// Loopback only: the counters name every peer and room this node talks to.
+    #[arg(long)]
+    pub metrics: Option<SocketAddr>,
 }
 
 /// `vox app` — app streams from a shell, over a running node.
@@ -832,6 +836,33 @@ pub struct DaemonArgs {
     pub metrics: Option<SocketAddr>,
 }
 
+/// `vox tunnel …` (V030-11).
+#[derive(Subcommand, Debug, Clone)]
+pub enum TunnelCmd {
+    /// Close live tunnels: one by its number, or a member's — all of them, or those to one
+    /// service. `vox status` lists them, with their numbers.
+    ///
+    /// On the host, this closes a member's sessions to your services; on a guest, a session your
+    /// `vox up` or `vox forward` carries. Nobody is untrusted and no service is removed: the
+    /// member can open a new tunnel at once. The far end is told the tunnel was closed.
+    Close(TunnelCloseArgs),
+}
+
+/// `vox tunnel close`
+#[derive(Args, Debug, Clone)]
+pub struct TunnelCloseArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The member whose tunnels to close: their id as `vox status` prints it, or the start of it.
+    #[arg(required_unless_present = "id")]
+    pub member: Option<String>,
+    /// Only the member's tunnels to this service (a port, or an offer's tag).
+    pub service: Option<String>,
+    /// One tunnel, by the number `vox status` shows for it.
+    #[arg(long, conflicts_with_all = ["member", "service"])]
+    pub id: Option<u64>,
+}
+
 /// `vox share`
 #[derive(Args, Debug, Clone)]
 pub struct ShareArgs {
@@ -987,7 +1018,10 @@ enum AgentCmd {
     ///
     /// Register it on a turn-start event — `UserPromptSubmit` in both Claude Code
     /// and Codex — and for Codex register it with `async: false`, or the output is
-    /// observed and discarded.
+    /// observed and discarded. In Claude Code, register it on `Stop` and `SessionEnd`
+    /// too: on `Stop` it records that the session is idle, so a reply waiting for it
+    /// can be announced, and prints nothing; on `SessionEnd` it removes the session's
+    /// registration.
     Hook(AgentHookArgs),
     /// Print the integration a harness needs to run `vox agent hook` every turn.
     ///
@@ -1078,14 +1112,6 @@ pub struct AgentHookArgs {
     /// stdin. So the id arrives as a flag instead.
     #[arg(long)]
     pub session: Option<String>,
-    /// An entry this session was already shown by a wake, so the drain does not show it again.
-    /// Repeatable.
-    ///
-    /// A wake arrives as the harness's own prompt, and the drain then runs on that prompt. The
-    /// OpenCode plugin relays wakes itself, so it knows which entries it delivered and passes
-    /// them here.
-    #[arg(long, value_name = "ENTRY")]
-    pub woken: Vec<String>,
 }
 
 /// Naming a room on a running node. No passphrase: the node is already unlocked.
@@ -1700,6 +1726,9 @@ enum Cmd {
     /// Decide which identities this node trusts (ADR-020 §3, ADR-017 decision 3).
     #[command(subcommand)]
     Trust(TrustCmd),
+    /// Close the live tunnels `vox status` lists (V030-11).
+    #[command(subcommand)]
+    Tunnel(TunnelCmd),
     /// Put `vox` on PATH and install tab completion for your shell.
     ///
     /// `install.sh` and `vox update` run this for you. It writes the completion script into
@@ -2059,6 +2088,54 @@ pub fn run() -> ExitCode {
                 crate::share_cli::share(&paths, &args.room, &args.path, args.count, for_).await
             })
         }
+        Cmd::Tunnel(TunnelCmd::Close(args)) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let which = vox_core::transport::quic::TunnelSelector {
+                id: args.id,
+                member: args.member.clone(),
+                service: args.service.clone(),
+            };
+            match rt.block_on(vox_core::node::status::request_close(
+                &paths.socket_file(),
+                &which,
+            )) {
+                Ok((0, refused)) if !refused.is_empty() => {
+                    eprintln!("vox: {refused}");
+                    ExitCode::FAILURE
+                }
+                Ok((0, _)) => {
+                    eprintln!(
+                        "vox: no live tunnel matches that — `vox status` lists them, with their \
+                         numbers"
+                    );
+                    ExitCode::FAILURE
+                }
+                Ok((n, said)) => {
+                    println!("vox: closed {n} tunnel(s)\n{said}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vox: no running node answered: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Cmd::Status(args) => {
             let paths = match args.profile.paths() {
                 Ok(p) => p,
@@ -2161,7 +2238,6 @@ pub fn run() -> ExitCode {
                 args.room.as_deref(),
                 format,
                 args.session.as_deref(),
-                &args.woken,
             ));
             // Always success: a hook that fails must not break the turn.
             ExitCode::SUCCESS
@@ -2251,11 +2327,10 @@ pub fn run() -> ExitCode {
             // redirected or piped to `jq`; where to put it goes to stderr so it does not
             // land in the file.
             "claude" | "claude-code" => {
-                println!(
-                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
-                     \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
-                     \"vox agent hook\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
-                );
+                // `UserPromptSubmit` drains the room; `Stop` records that a turn ended, so an
+                // unread reply can be announced to an idle session; `SessionEnd` removes the
+                // session's registration (V030-20).
+                print!("{}", crate::agent_hook::CLAUDE_HOOKS);
                 eprintln!(
                     "vox: merge that into ~/.claude/settings.json, or .claude/settings.json \
                      in a project.\n     Set VOX_ROOM in the session's environment, or pass \
@@ -2283,6 +2358,41 @@ pub fn run() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Ask the running node when there is one, as `vox service remove` does (V030-06): the
+        // profile is not ours to open while a daemon holds it, and stopping the daemon to add a
+        // service, then starting it again with every room's passphrase, is not something a person
+        // should have to do. The daemon holds the room open already, so no passphrase is asked.
+        Cmd::Service(ServiceCmd::Add(a)) if node_answers(&a.room.profile) => {
+            let paths = match a.room.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(crate::room_cli::service_add(
+                &paths,
+                &a.room.room,
+                &label_of(&a.tag),
+                a.local,
+            )) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // Ask the running node when there is one, like `vox trust`: the profile is not ours to
         // open while it runs, and a running host is the case R22 is about.
         Cmd::Service(ServiceCmd::Remove(r)) if node_answers(&r.room.profile) => {
@@ -2535,7 +2645,21 @@ pub fn run() -> ExitCode {
             }
             let (socket, stats) = (a.helper_socket.clone(), a.stats_file.clone());
             let allow = a.allow.iter().copied().collect();
+            let metrics = a.metrics;
             run_tunnel_verb(a.room.clone(), move |node, cid| async move {
+                // A running LAN answers as a `vox daemon` does (V030-04, #236): its control
+                // socket is served by the tunnel verbs' path, and its metrics here.
+                if let Some(addr) = metrics {
+                    let listener = vox_core::node::status::bind_metrics(addr)
+                        .await
+                        .map_err(|e| crate::app::AppError::Usage(e.to_string()))?;
+                    let bound = listener.local_addr()?;
+                    tokio::spawn(vox_core::node::status::serve_metrics(
+                        listener,
+                        node.clone(),
+                    ));
+                    println!("vox lan: metrics http://{bound}/metrics");
+                }
                 crate::lan_cli::up(&node, cid, socket, stats, allow).await
             })
         }

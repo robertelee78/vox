@@ -22,6 +22,12 @@
 //! 6. **Stalled app streams cannot starve the room.** 200 app streams held open waiting,
 //!    and a message still crosses in under a second.
 //!
+//! **A red names its side.** A claim's assertion is PRODUCT. A `vox` command that fails while
+//! the scene is set (an identity, a daemon, a room, a join, a trust, a listener, a status
+//! report) is the product failing: PRODUCT (staging). CANNOT MEASURE is kept for what the test
+//! itself could not arrange: the attacker's own profile, endpoint, connection and frames in
+//! case 4. The test's own processes, pipes, locks, runtime and clock are APPARATUS.
+//!
 //! **One participant is not the product, deliberately: the attacker in case 4.** mallory
 //! is a real member — her identity is made by `vox id`, and she joins with her own
 //! `vox daemon` and `vox room join` — but what probes alice is a raw QUIC endpoint holding
@@ -86,12 +92,15 @@ impl Proc {
             }
             assert!(
                 !matches!(self.child.try_wait(), Ok(Some(_))),
-                "`vox app listen` exited before listening: {}",
+                "PRODUCT (staging): `vox app listen` exited before listening: {}",
                 self.said()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("the listener never registered: {}", self.said());
+        panic!(
+            "PRODUCT (staging): the listener never registered: {}",
+            self.said()
+        );
     }
 }
 
@@ -131,14 +140,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: vox's stdin")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("APPARATUS: write to vox's stdin");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -169,7 +178,7 @@ impl Member {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         let said = Arc::new(Mutex::new(String::new()));
         drain_into(child.stderr.take(), &said);
         Proc { child, said }
@@ -178,7 +187,11 @@ impl Member {
     /// A one-shot verb that must succeed; its stdout.
     fn run(&self, argv: &[&str]) -> String {
         let (ok, out, err) = vox_once(&self.data, &args(argv));
-        assert!(ok, "{}: vox {argv:?} failed: {out}{err}", self.name);
+        assert!(
+            ok,
+            "PRODUCT (staging): {}: vox {argv:?} failed: {out}{err}",
+            self.name
+        );
         out
     }
 
@@ -190,13 +203,30 @@ impl Member {
     /// The node's own report, `vox status --json`.
     fn status(&self) -> Value {
         let out = self.run(&["status", "--json"]);
-        serde_json::from_str(&out)
-            .unwrap_or_else(|e| panic!("{}: status did not parse ({e}): {out}", self.name))
+        serde_json::from_str(&out).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: {}'s `vox status --json` did not parse ({e}): {out}",
+                self.name
+            )
+        })
     }
 
     /// The app layer's counters from `vox status --json`.
     fn app(&self) -> App {
         App(self.status()["app"].clone())
+    }
+
+    /// The same counters, or what `vox status --json` said when it gave none. For a case
+    /// whose claim is that the node keeps answering, so a node that stops answering is
+    /// that claim's red, not the scene's.
+    fn try_app(&self) -> Result<App, String> {
+        let (ok, out, err) = vox_once(&self.data, &args(&["status", "--json"]));
+        if !ok {
+            return Err(format!("`vox status --json` failed: {out}{err}"));
+        }
+        let v: Value = serde_json::from_str(&out)
+            .map_err(|e| format!("`vox status --json` did not parse ({e}): {out}"))?;
+        Ok(App(v["app"].clone()))
     }
 }
 
@@ -209,7 +239,7 @@ impl App {
         self.0
             .get(k)
             .and_then(Value::as_u64)
-            .unwrap_or_else(|| panic!("the status report has no app.{k}: {}", self.0))
+            .unwrap_or_else(|| panic!("PRODUCT: the status report has no app.{k}: {}", self.0))
     }
 
     /// App streams handed to a listening program. The report does not print this count;
@@ -233,11 +263,11 @@ impl std::fmt::Debug for App {
 /// `vox daemon` serving it that answers `vox room list`.
 fn member(tmp: &Path, name: &str) -> Member {
     let data = tmp.join(name);
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: a profile directory");
     let pass = tmp.join("identity-passphrase");
-    std::fs::write(&pass, IDENTITY).unwrap();
+    std::fs::write(&pass, IDENTITY).expect("APPARATUS: the passphrase file");
     let (ok, out, err) = vox_once(&data, &args(&["id"]));
-    assert!(ok, "{name}: vox id: {out}{err}");
+    assert!(ok, "PRODUCT (staging): {name}: vox id: {out}{err}");
     let fp = out.trim().to_owned();
     let mut daemon = VoxProc::spawn(
         name,
@@ -247,7 +277,7 @@ fn member(tmp: &Path, name: &str) -> Member {
             "--listen",
             "127.0.0.1:0",
             "--passphrase-file",
-            pass.to_str().unwrap(),
+            pass.to_str().expect("APPARATUS: a UTF-8 path"),
         ]),
     );
     let until = Instant::now() + SETUP;
@@ -263,7 +293,7 @@ fn member(tmp: &Path, name: &str) -> Member {
         std::thread::sleep(Duration::from_millis(250));
     }
     panic!(
-        "{name}'s daemon never answered `vox room list`:\n{}",
+        "PRODUCT (staging): {name}'s daemon never answered `vox room list`:\n{}",
         daemon.transcript()
     );
 }
@@ -275,7 +305,7 @@ fn join(who: &Member, link: &str) {
         &["room", "join", link, "--name", "calls"],
         ROOM_PASS,
     );
-    assert!(ok, "{} joins: {out}{err}", who.name);
+    assert!(ok, "PRODUCT (staging): {} joins: {out}{err}", who.name);
 }
 
 /// A room alice created and bob joined, each on its own daemon. Nobody trusts anybody
@@ -289,7 +319,7 @@ struct Scene {
 }
 
 fn scene() -> Scene {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let alice = member(tmp.path(), "alice");
     let bob = member(tmp.path(), "bob");
     let (ok, out, err) = vox_in(
@@ -297,13 +327,13 @@ fn scene() -> Scene {
         &["room", "create", "--name", "calls"],
         ROOM_PASS,
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let list = alice.run(&["room", "list"]);
     let room = list
         .lines()
         .find(|l| l.contains("calls"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("the room is not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the room is not listed: {list}"))
         .to_owned();
     let link = alice.run(&["room", "invite", &room]).trim().to_owned();
     join(&bob, &link);
@@ -336,7 +366,7 @@ fn mutual(s: &mut Scene) {
                 eprintln!("---- {}'s daemon ----\n{}", m.name, m.daemon.transcript());
             }
             panic!(
-                "CANNOT MEASURE: after {SETUP:?} alice and bob do not read each other.\nalice \
+                "PRODUCT (staging): after {SETUP:?} alice and bob do not read each other.\nalice \
                  reads:\n{a}\nbob reads:\n{b}"
             );
         }
@@ -361,8 +391,16 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     // The listener echoes: whatever comes out of it goes straight back in, and once the
     // whole mebibyte has, its input ends — which ends its half of the stream.
     {
-        let mut from = listen.child.stdout.take().unwrap();
-        let mut into = listen.child.stdin.take().unwrap();
+        let mut from = listen
+            .child
+            .stdout
+            .take()
+            .expect("APPARATUS: the listener's stdout pipe");
+        let mut into = listen
+            .child
+            .stdin
+            .take()
+            .expect("APPARATUS: the listener's stdin pipe");
         let total = payload.len();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
@@ -383,7 +421,11 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     let mut open = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
     let echoed = Arc::new(Mutex::new(Vec::new()));
     {
-        let mut from = open.child.stdout.take().unwrap();
+        let mut from = open
+            .child
+            .stdout
+            .take()
+            .expect("APPARATUS: the opener's stdout pipe");
         let sink = Arc::clone(&echoed);
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
@@ -391,10 +433,16 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
                 if n == 0 {
                     break;
                 }
-                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                sink.lock()
+                    .expect("APPARATUS: the echo buffer's lock")
+                    .extend_from_slice(&buf[..n]);
             }
         });
-        let mut into = open.child.stdin.take().unwrap();
+        let mut into = open
+            .child
+            .stdin
+            .take()
+            .expect("APPARATUS: the opener's stdin pipe");
         let data = payload.clone();
         std::thread::spawn(move || {
             let _ = into.write_all(&data);
@@ -402,7 +450,10 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     }
     let started = Instant::now();
     let status = open.exited_within(TIMEOUT);
-    let got = echoed.lock().unwrap().clone();
+    let got = echoed
+        .lock()
+        .expect("APPARATUS: the echo buffer's lock")
+        .clone();
     let (want, have) = (Sha256::digest(&payload), Sha256::digest(&got));
     eprintln!(
         "round trip: sent {} bytes, got back {} in {:?}; sha256 sent {:x} got {:x}; opener \
@@ -415,17 +466,21 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
         open.said(),
         listen.said()
     );
-    assert_eq!(got.len(), payload.len(), "every byte must come back");
-    assert_eq!(want, have, "the round trip must be byte-for-byte");
+    assert_eq!(
+        got.len(),
+        payload.len(),
+        "PRODUCT: every byte must come back"
+    );
+    assert_eq!(want, have, "PRODUCT: the round trip must be byte-for-byte");
     assert!(
         status.is_some_and(|s| s.success()),
-        "the opener must end cleanly"
+        "PRODUCT: the opener must end cleanly"
     );
     let (a, b) = (s.alice.app(), s.bob.app());
     assert_eq!(
         (a.n("accepted"), b.n("opened")),
         (1, 1),
-        "alice {a:?} bob {b:?}"
+        "PRODUCT: alice must count 1 accepted and bob 1 opened: alice {a:?} bob {b:?}"
     );
     drop((listen, open));
 
@@ -434,12 +489,18 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     listen.listening();
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     {
-        let from = listen.child.stdout.take().unwrap();
+        let from = listen
+            .child
+            .stdout
+            .take()
+            .expect("APPARATUS: the listener's stdout pipe");
         let sink = Arc::clone(&lines);
         std::thread::spawn(move || {
             for line in std::io::BufReader::new(from).lines() {
                 let Ok(line) = line else { return };
-                sink.lock().unwrap().push(line);
+                sink.lock()
+                    .expect("APPARATUS: the line buffer's lock")
+                    .push(line);
             }
         });
     }
@@ -450,23 +511,42 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     // receive buffer.
     std::thread::sleep(Duration::from_millis(500));
     {
-        let mut into = open.child.stdin.take().unwrap();
+        let mut into = open
+            .child
+            .stdin
+            .take()
+            .expect("APPARATUS: the opener's stdin pipe");
         for i in 0..1000 {
-            writeln!(into, "datagram {i:04}").unwrap();
+            writeln!(into, "datagram {i:04}").unwrap_or_else(|e| {
+                panic!("PRODUCT: `vox app open --datagrams` stopped taking its input: {e}")
+            });
             if i % 10 == 0 {
-                into.flush().unwrap();
+                into.flush().unwrap_or_else(|e| {
+                    panic!("PRODUCT: `vox app open --datagrams` stopped taking its input: {e}")
+                });
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        into.flush().unwrap();
+        into.flush().unwrap_or_else(|e| {
+            panic!("PRODUCT: `vox app open --datagrams` stopped taking its input: {e}")
+        });
         // Held open until the count is in: the end of input is the end of the stream.
         let until = Instant::now() + Duration::from_secs(20);
-        while lines.lock().unwrap().len() < 1000 && Instant::now() < until {
+        while lines
+            .lock()
+            .expect("APPARATUS: the line buffer's lock")
+            .len()
+            < 1000
+            && Instant::now() < until
+        {
             std::thread::sleep(Duration::from_millis(50));
         }
         drop(into);
     }
-    let got = lines.lock().unwrap().clone();
+    let got = lines
+        .lock()
+        .expect("APPARATUS: the line buffer's lock")
+        .clone();
     let distinct: std::collections::BTreeSet<&String> = got.iter().collect();
     let expected: std::collections::BTreeSet<String> =
         (0..1000).map(|i| format!("datagram {i:04}")).collect();
@@ -483,7 +563,7 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     assert_eq!(
         (distinct.len(), intact),
         (1000, 1000),
-        "all 1000 datagrams must arrive, each intact"
+        "PRODUCT: all 1000 datagrams must arrive, each intact"
     );
 }
 
@@ -512,27 +592,35 @@ fn an_opener_outside_the_responders_ring_reaches_no_listener() {
     assert_eq!(
         a.n("inbound"),
         1,
-        "bob's stream must have reached alice's gate: {a:?}"
+        "PRODUCT (staging): bob's stream must have reached alice's gate: {a:?}"
     );
     assert_eq!(
         a.announced(),
         0,
-        "the listener must see 0 incoming streams from an opener outside the ring: {a:?}"
+        "PRODUCT: the listener must see 0 incoming streams from an opener outside the ring: {a:?}"
     );
-    assert_eq!(a.n("refused_untrusted"), 1, "{a:?}");
-    assert_eq!(a.n("accepted"), 0, "{a:?}");
+    assert_eq!(
+        a.n("refused_untrusted"),
+        1,
+        "PRODUCT: alice's gate must refuse bob as untrusted: {a:?}"
+    );
+    assert_eq!(
+        a.n("accepted"),
+        0,
+        "PRODUCT: nothing may be accepted from an opener outside the ring: {a:?}"
+    );
     assert!(
         status.is_some_and(|s| !s.success()),
-        "the opener must fail, not hang"
+        "PRODUCT: the opener must fail, not hang"
     );
     assert!(
         open.said().contains("refused by the peer"),
-        "and say only that it was refused: {}",
+        "PRODUCT: the opener must say only that it was refused: {}",
         open.said()
     );
     assert!(
         listener_running && !listen.said().contains(" from "),
-        "the listener must never have accepted anything, and still be waiting: {}",
+        "PRODUCT: the listener must never have accepted anything, and still be waiting: {}",
         listen.said()
     );
 }
@@ -558,17 +646,20 @@ fn a_target_outside_the_openers_ring_is_refused_locally() {
     assert_eq!(
         b.n("refused_locally"),
         1,
-        "bob's node must refuse the open itself: {b:?}"
+        "PRODUCT: bob's node must refuse the open itself: {b:?}"
     );
     assert_eq!(
         a.n("inbound"),
         0,
-        "nothing may reach the target when the opener's node refuses: {a:?}"
+        "PRODUCT: nothing may reach the target when the opener's node refuses: {a:?}"
     );
-    assert!(status.is_some_and(|s| !s.success()), "the opener must fail");
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "PRODUCT: the opener must fail"
+    );
     assert!(
         open.said().contains("not in this node's keyring"),
-        "and say why, since it is this node's own decision: {}",
+        "PRODUCT: the opener must say why, since it is its own node's decision: {}",
         open.said()
     );
 }
@@ -580,19 +671,22 @@ async fn probe(
     first: &[u8],
     then: &[u8],
 ) -> (String, String) {
-    let (mut send, mut recv) = conn.open_stream().await.unwrap();
+    let (mut send, mut recv) = conn
+        .open_stream()
+        .await
+        .expect("CANNOT MEASURE: the attacker could not open a stream");
     vox_core::transport::framing::write_frame(&mut send, first)
         .await
-        .unwrap();
+        .expect("CANNOT MEASURE: the attacker could not write its first frame");
     vox_core::transport::framing::write_frame(&mut send, then)
         .await
-        .unwrap();
+        .expect("CANNOT MEASURE: the attacker could not write its second frame");
     let read = tokio::time::timeout(Duration::from_secs(20), recv.read_to_end(4096))
         .await
-        .expect("the node must answer, not leave the stream hanging");
+        .expect("PRODUCT: the node must answer, not leave the stream hanging");
     let stopped = tokio::time::timeout(Duration::from_secs(20), send.stopped())
         .await
-        .expect("the node must stop the write, not leave it hanging");
+        .expect("PRODUCT: the node must stop the write, not leave it hanging");
     (format!("{read:?}"), format!("{stopped:?}"))
 }
 
@@ -602,7 +696,7 @@ fn stop(mut p: VoxProc) {
         .args(["-TERM", &p.child.id().to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill -TERM {}", p.name);
+    assert!(ok, "APPARATUS: kill -TERM {}", p.name);
     let until = Instant::now() + Duration::from_secs(20);
     while Instant::now() < until {
         if matches!(p.child.try_wait(), Ok(Some(_))) {
@@ -610,7 +704,10 @@ fn stop(mut p: VoxProc) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("{}'s daemon did not stop on SIGTERM", p.name);
+    panic!(
+        "PRODUCT (staging): {}'s daemon did not stop on SIGTERM",
+        p.name
+    );
 }
 
 /// **(4) The untrusted tier says nothing.** mallory joined the room — it is a member, and
@@ -642,47 +739,65 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
     let report = s.alice.status();
     let alice_addr = report["listening"]
         .as_array()
-        .expect("alice's report lists where she listens")
+        .expect("PRODUCT (staging): alice's report lists where she listens")
         .iter()
         .filter_map(Value::as_str)
         .filter_map(|m| vox_core::nat::multiaddr::Multiaddr::parse(m).ok())
         .filter_map(|m| m.socket_addr())
         .find(|a| a.ip().is_loopback())
-        .expect("alice listens on loopback");
+        .expect("PRODUCT (staging): alice listens on loopback");
     let room_id = report["rooms"]
         .as_array()
         .and_then(|rs| rs.iter().find(|r| r["name"] == "calls"))
         .and_then(|r| r["id"].as_str())
-        .map(|id| vox_core::node::link::b32_decode(id, "room id").unwrap())
-        .unwrap_or_else(|| panic!("alice's report lists the room: {report}"));
+        .map(|id| {
+            vox_core::node::link::b32_decode(id, "room id")
+                .expect("PRODUCT (staging): the room id in alice's report")
+        })
+        .unwrap_or_else(|| panic!("PRODUCT (staging): alice's report lists the room: {report}"));
     let alice_id = vox_core::node::link::b32_decode(&s.alice.fp, "fingerprint")
-        .expect("`vox id` prints the whole fingerprint");
+        .expect("PRODUCT (staging): `vox id` prints the whole fingerprint");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
+        .expect("APPARATUS: a tokio runtime");
     let (app, unknown, before, after) = rt.block_on(async {
         let paths = vox_core::node::paths::Paths::resolve(
             "default",
             Some(&mallory_data),
             Some(&mallory_data.join("cfg")),
         )
-        .unwrap();
+        .expect("CANNOT MEASURE: mallory's profile paths");
         let mut profile = vox_core::node::profile::Profile::open(paths)
-            .expect("mallory's profile opens once her daemon is gone");
-        profile.unlock(IDENTITY.as_bytes()).unwrap();
-        let signer = profile.signer_arc().unwrap();
-        let ep =
-            vox_core::transport::quic::VoxEndpoint::bind(&*signer, "127.0.0.1:0".parse().unwrap())
-                .unwrap();
+            .expect("CANNOT MEASURE: mallory's profile opens once her daemon is gone");
+        profile
+            .unlock(IDENTITY.as_bytes())
+            .expect("CANNOT MEASURE: mallory's identity unlocks");
+        let signer = profile
+            .signer_arc()
+            .expect("CANNOT MEASURE: mallory's signer");
+        let ep = vox_core::transport::quic::VoxEndpoint::bind(
+            &*signer,
+            "127.0.0.1:0".parse().expect("APPARATUS: an address"),
+        )
+        .expect("CANNOT MEASURE: the attacker's endpoint binds");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("APPARATUS: the clock")
             .as_secs();
-        let conn = ep.connect(alice_addr, alice_id, now).await.unwrap();
-        assert_eq!(conn.peer_id(), alice_id);
+        let conn = ep
+            .connect(alice_addr, alice_id, now)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("CANNOT MEASURE: the attacker could not connect to alice: {e}")
+            });
+        assert_eq!(
+            conn.peer_id(),
+            alice_id,
+            "CANNOT MEASURE: the attacker reached a node that is not alice"
+        );
         let open = vox_core::node::app::AppOpen {
             channel_id: room_id,
             labels: vec![LABEL.to_owned()],
@@ -718,22 +833,22 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
     assert_eq!(
         after.n("inbound"),
         before.n("inbound") + 1,
-        "mallory's app stream must have reached the app gate — otherwise it was refused as \
-         a stream kind and this compares nothing"
+        "PRODUCT (staging): mallory's app stream must have reached the app \
+         gate; otherwise it was refused as a stream kind and this compares nothing"
     );
     assert_eq!(
         after.n("refused_untrusted"),
         before.n("refused_untrusted") + 1,
-        "alice's gate must refuse mallory's app stream as untrusted: {after:?}"
+        "PRODUCT: alice's gate must refuse mallory's app stream as untrusted: {after:?}"
     );
     assert_eq!(
         app, unknown,
-        "an untrusted peer's app refusal must be indistinguishable from an unknown stream \
-         kind"
+        "PRODUCT: an untrusted peer's app refusal must be indistinguishable from an unknown \
+         stream kind"
     );
     assert!(
         told_exit.is_some_and(|s| !s.success()) && told.said().contains("no-listener"),
-        "a trusted member is told why: {}",
+        "PRODUCT: a trusted member is told why: {}",
         told.said()
     );
 }
@@ -750,22 +865,40 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
     let mut open = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
     // Live in both directions first: a line each way.
     let heard = |p: &mut Proc| {
-        let mut out = std::io::BufReader::new(p.child.stdout.take().unwrap());
+        let mut out =
+            std::io::BufReader::new(p.child.stdout.take().expect("APPARATUS: a stdout pipe"));
         let mut line = String::new();
-        out.read_line(&mut line).unwrap();
+        out.read_line(&mut line)
+            .expect("APPARATUS: read a line from a vox app pipe");
         (line, out)
     };
-    let mut to_listen = listen.child.stdin.take().unwrap();
-    let mut to_open = open.child.stdin.take().unwrap();
-    writeln!(to_open, "hello from bob").unwrap();
-    to_open.flush().unwrap();
+    let mut to_listen = listen
+        .child
+        .stdin
+        .take()
+        .expect("APPARATUS: the listener's stdin pipe");
+    let mut to_open = open
+        .child
+        .stdin
+        .take()
+        .expect("APPARATUS: the opener's stdin pipe");
+    writeln!(to_open, "hello from bob")
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox app open` stopped taking its input: {e}"));
+    to_open
+        .flush()
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox app open` stopped taking its input: {e}"));
     let (at_alice, _a_out) = heard(&mut listen);
-    writeln!(to_listen, "hello from alice").unwrap();
-    to_listen.flush().unwrap();
+    writeln!(to_listen, "hello from alice")
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox app listen` stopped taking its input: {e}"));
+    to_listen
+        .flush()
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox app listen` stopped taking its input: {e}"));
     let (at_bob, _b_out) = heard(&mut open);
     assert_eq!(
         (at_alice.trim(), at_bob.trim()),
-        ("hello from bob", "hello from alice")
+        ("hello from bob", "hello from alice"),
+        "PRODUCT (staging): the stream must be live both ways before trust \
+         is withdrawn"
     );
     // Both stdins stay open: nothing but the withdrawal can end this stream. alice
     // withdraws with `vox trust remove`, and the clock starts as she runs it.
@@ -788,19 +921,19 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
     );
     assert!(
         a.n("withdrawn") >= 1,
-        "alice's node must have torn the stream down: {a:?}"
+        "PRODUCT: alice's node must have torn the stream down: {a:?}"
     );
     assert!(
         alice_side.is_some() && bob_side.is_some(),
-        "both ends must be torn down within 5 s of the untrust"
+        "PRODUCT: both ends must be torn down within 5 s of the untrust"
     );
     assert!(
         alice_side.is_some_and(|s| !s.success()) && bob_side.is_some_and(|s| !s.success()),
-        "and each must say it was cut, not that it ended"
+        "PRODUCT: each end must say it was cut, not that it ended"
     );
     assert!(
         open.said().contains("closed before it ended"),
-        "bob's end must say why: {}",
+        "PRODUCT: bob's end must say why: {}",
         open.said()
     );
     drop((to_listen, to_open));
@@ -813,6 +946,18 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
 /// The listener that never accepts is a real `vox app listen`, suspended (`SIGSTOP`, a
 /// person's Ctrl-Z) once it is listening: its node announces every stream to it and none
 /// is ever taken. The 200 are 200 `vox app open` processes, started together.
+///
+/// **Reds.** A `vox` command failing while the scene is set (the room, the trust, the listener,
+/// alice's `vox room tail`) is PRODUCT (staging); the suspension is APPARATUS. Everything after
+/// the 200 opens start is PRODUCT: the
+/// message arriving late or not at all, alice's node no longer answering `vox status`, the
+/// 200 not reaching alice's gate, and the per-peer limit's counts. The message is asserted
+/// first, so a node starved by app streams reds on the claim itself, with the counts of the
+/// app streams it was starved by.
+///
+/// Mutation-checked (V030-07): serving each inbound app stream on alice's actor, awaited, in
+/// place of a task of its own lets 16 stalled streams hold the actor for 5 s each, and this
+/// case goes red on the message.
 #[test]
 #[ignore = "real vox daemons and 200 app streams; CI runs it in release"]
 fn stalled_app_streams_do_not_hold_up_a_room_message() {
@@ -825,7 +970,7 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
         .args(["-STOP", &never.child.id().to_string()])
         .status()
         .is_ok_and(|st| st.success());
-    assert!(ok, "kill -STOP the listener");
+    assert!(ok, "APPARATUS: kill -STOP the listener");
     // What alice sees arrive, as a person watching the room would.
     let mut tail = VoxProc::spawn(
         "alice-tail",
@@ -833,6 +978,12 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
         &args(&["room", "tail", &s.room]),
     );
     std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        matches!(tail.child.try_wait(), Ok(None)),
+        "PRODUCT (staging): alice's `vox room tail` ended before the \
+         opens: {}",
+        tail.transcript()
+    );
 
     let open_count: usize = 200;
     let started = Instant::now();
@@ -842,12 +993,17 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
     let spawned = started.elapsed();
     // Once all 200 have reached alice's gate. If the app streams were holding the
     // connection's stream slots, they would also hold up their own arrival, and this
-    // would not come.
+    // would not come. A `vox status` that fails here is recorded, not a red yet: the
+    // message is the claim, and it is asserted first.
     let until = Instant::now() + Duration::from_secs(10);
-    let mut at_post = s.alice.app();
-    while at_post.n("inbound") < open_count as u64 && Instant::now() < until {
+    let mut at_post = s.alice.try_app();
+    while at_post
+        .as_ref()
+        .map_or(true, |a| a.n("inbound") < open_count as u64)
+        && Instant::now() < until
+    {
         std::thread::sleep(Duration::from_millis(20));
-        at_post = s.alice.app();
+        at_post = s.alice.try_app();
     }
     let arrived_after = started.elapsed();
     let sent = Instant::now();
@@ -855,7 +1011,7 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
     let arrived = tail
         .line_within(Duration::from_secs(10), |l| l.contains("still here"))
         .map(|_| sent.elapsed());
-    let still_waiting = s.alice.app();
+    let still_waiting = s.alice.try_app();
     // Every opener ends: refused busy, or refused once nobody accepted in time.
     let mut outcomes = std::collections::BTreeMap::<String, usize>::new();
     for o in &mut opens {
@@ -870,16 +1026,19 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
         };
         *outcomes.entry(key).or_default() += 1;
     }
-    let end = s.alice.app();
+    let end = s.alice.try_app();
+    let counts = |a: &Result<App, String>| match a {
+        Ok(a) => format!("{a:?} (announced {})", a.announced()),
+        Err(e) => format!("no answer: {e}"),
+    };
     eprintln!(
-        "200 opens spawned in {spawned:?}, all at alice's gate after {arrived_after:?}; the \
-         message crossed in {arrived:?}; alice at the post {at_post:?} (announced {}); while \
-         waiting {still_waiting:?}; at the end {end:?} (announced {}); the 200 opens ended \
-         as {outcomes:?}",
-        at_post.announced(),
-        end.announced()
+        "{open_count} opens spawned in {spawned:?}; the gate wait ended after \
+         {arrived_after:?}; the message crossed in {arrived:?}\nalice at the post: {}\nwhile \
+         waiting: {}\nat the end: {}\nthe {open_count} opens ended as {outcomes:?}",
+        counts(&at_post),
+        counts(&still_waiting),
+        counts(&end),
     );
-    let took = arrived.expect("the room message must arrive at all");
     // One actor tick plus half a second. A local append is pushed within one tick
     // (`TICK`, 1 s) by design, so even with no app streams at all a message takes
     // anywhere from ~30 ms to ~1.03 s here (measured, three runs). ADR-022's "under
@@ -889,22 +1048,42 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
     // **Temporary.** The tick is itself a defect against PRD-001 R40 (a chat message
     // arrives in under 1 s). When R40's fix to the sync scheduling lands, this bound
     // returns to 1 s.
+    let took = arrived.unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: a room message from bob never reached alice's `vox room tail` within 10 s \
+             while {open_count} app streams were opened to her stalled listener; alice at the \
+             post: {}; at the end: {}\nalice's tail said:\n{}",
+            counts(&at_post),
+            counts(&end),
+            tail.transcript()
+        )
+    });
     assert!(
         took < Duration::from_millis(1500),
-        "a room message took {took:?} behind 200 stalled app streams"
+        "PRODUCT: a room message took {took:?} behind {open_count} stalled app streams; alice \
+         at the post: {}",
+        counts(&at_post)
     );
+    let answered = |a: Result<App, String>, when: &str| {
+        a.unwrap_or_else(|e| {
+            panic!("PRODUCT: alice's node did not answer `vox status` {when}: {e}")
+        })
+    };
+    let at_post = answered(at_post, "while the app streams waited");
+    let end = answered(end, "once the opens had ended");
     assert_eq!(
         at_post.n("inbound"),
         200,
-        "all 200 app streams must have reached alice's gate before the message: {at_post:?}"
+        "PRODUCT: all 200 app streams must have reached alice's gate before the message: \
+         {at_post:?}"
     );
     assert!(
         at_post.announced() > at_post.n("refused_unaccepted") + at_post.n("accepted"),
-        "some app streams must still be waiting when the message is sent: {at_post:?}"
+        "PRODUCT: some app streams must still be waiting when the message is sent: {at_post:?}"
     );
     assert!(
         end.announced() <= 16 && end.n("refused_busy") >= 184,
-        "at most 16 may wait on one peer's behalf, the rest refused busy: {end:?}"
+        "PRODUCT: at most 16 may wait on one peer's behalf, the rest refused busy: {end:?}"
     );
     assert_eq!(
         (
@@ -913,16 +1092,17 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
             end.n("accepted")
         ),
         (0, 0, 0),
-        "every stream was trusted, found the listener, and none was accepted: {end:?}"
+        "PRODUCT: every stream was trusted, found the listener, and none was accepted: {end:?}"
     );
     assert_eq!(
         end.announced() + end.n("refused_busy"),
         200,
-        "every one of the 200 accounted for: {end:?}"
+        "PRODUCT: every one of the 200 accounted for: {end:?}"
     );
+    // Every opener is to end, refused busy or refused unaccepted: none may hang.
     assert_eq!(
-        outcomes.values().sum::<usize>(),
-        200,
-        "every opener accounted for: {outcomes:?}"
+        outcomes.get("still running"),
+        None,
+        "PRODUCT: every `vox app open` must end within 30 s of the message: {outcomes:?}"
     );
 }

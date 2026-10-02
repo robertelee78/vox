@@ -33,7 +33,6 @@ use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
 use crate::governance::capability::{Capability, CapabilitySet};
 use crate::hash::Digest32;
-use crate::identity::composite::CompositePublicKey;
 use crate::nat::bootstrap::{BootstrapNode, BootstrapSet};
 use crate::nat::record::{MemberBundleRecord, RendezvousRecord};
 use crate::node::api::{
@@ -3552,6 +3551,12 @@ impl Node {
         } else {
             None
         };
+        // How long a stuck tunnel is given (V030-11), from the profile's config.
+        crate::tunnel::session::set_stuck_after(
+            paths
+                .tunnel_stuck_after()
+                .unwrap_or(crate::tunnel::session::STUCK_AFTER),
+        );
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
         let (event_tx, event_rx) = broadcast::channel(EVENT_QUEUE);
         // The handle keeps the sender so any number of clients may subscribe
@@ -5295,11 +5300,7 @@ impl Node {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             };
-            let members: BTreeMap<Digest32, CompositePublicKey> = ch
-                .author_keys()
-                .into_iter()
-                .map(|k| (k.fingerprint(), k))
-                .collect();
+            let members = ch.author_map();
             policy.add_members(members.keys().copied());
             net.membership().set_channel(*cid, ch.epoch(), members);
         }
@@ -5313,11 +5314,7 @@ impl Node {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             };
-            let members: BTreeMap<Digest32, CompositePublicKey> = st
-                .author_keys()
-                .into_iter()
-                .map(|k| (k.fingerprint(), k))
-                .collect();
+            let members = st.author_map();
             policy.add_members(members.keys().copied());
             net.membership().set_channel(*cid, st.epoch(), members);
         }
@@ -6328,65 +6325,42 @@ impl Node {
                         // is what tells `retire_expired` the path is still carrying, so a
                         // better path appearing does not close it under a live session.
                         let carried = Arc::clone(&connection);
-                        // `vox status` lists the tunnel while it is served: the report
-                        // arrives on a private channel, is filed, and is passed on.
-                        let guard = self.status.tunnel();
-                        let (served_tx, mut served_rx) = broadcast::channel(4);
-                        let clock = Arc::clone(&self.clock);
+                        // `vox status` lists the tunnel while it runs from the one list of live
+                        // tunnels the credit keeps (V210-81): not a second list of its own.
                         tokio::spawn(async move {
-                            let serving = crate::node::tunnel::serve_reporting(
+                            let served = crate::node::tunnel::serve_reporting(
                                 peer,
                                 send,
                                 recv,
                                 snapshot,
-                                Some(served_tx),
+                                Some(events.clone()),
                                 Some(crate::tunnel::session::UdpHost { conn: &conn, flows }),
                                 Some(&*carried),
-                            );
-                            tokio::pin!(serving);
-                            loop {
-                                tokio::select! {
-                                    // The result used to be dropped here, so a host refusing a
-                                    // member — untrusted, no such service, its own service down
-                                    // — said nothing anywhere (PRD-001 R36).
-                                    served = &mut serving => {
-                                        // Refusals only: a session that ends in an error
-                                        // after it was accepted is a disconnect, not a no.
-                                        if let Err(e @ crate::error::Error::TunnelDenied(_)) = served {
-                                            let who: String = crate::node::link::b32_encode(&peer)
-                                                .chars()
-                                                .take(12)
-                                                .collect();
-                                            let _ = events.send(NodeEvent::ProxyRefused {
-                                                reason: format!("refused {who} a tunnel: {e}"),
-                                            });
-                                        }
-                                        break;
-                                    }
-                                    ev = served_rx.recv() => {
-                                        let Ok(ev) = ev else { continue };
-                                        if let NodeEvent::TunnelServed {
-                                            channel_id,
-                                            client,
-                                            service_tag,
-                                        } = &ev
-                                        {
-                                            guard.serving(crate::node::status::ServedTunnel {
-                                                client: *client,
-                                                channel_id: *channel_id,
-                                                service_tag: service_tag.clone(),
-                                                since: clock(),
-                                            });
-                                        }
-                                        let _ = events.send(ev);
-                                    }
+                            )
+                            .await;
+                            let who: String = crate::node::link::b32_encode(&peer)
+                                .chars()
+                                .take(12)
+                                .collect();
+                            // The result used to be dropped here, so a host refusing a member —
+                            // untrusted, no such service, its own service down — said nothing
+                            // anywhere (PRD-001 R36).
+                            match served {
+                                // Refusals only: a session that ends in an error after it was
+                                // accepted is a disconnect, not a no.
+                                Err(e @ crate::error::Error::TunnelDenied(_)) => {
+                                    let _ = events.send(NodeEvent::ProxyRefused {
+                                        reason: format!("refused {who} a tunnel: {e}"),
+                                    });
                                 }
+                                // Closed on purpose (V030-11): the host is told too, as a close.
+                                Err(e @ crate::error::Error::TunnelClosed(_)) => {
+                                    let _ = events.send(NodeEvent::TunnelClosed {
+                                        reason: format!("a session from {who}: {e}"),
+                                    });
+                                }
+                                _ => {}
                             }
-                            // A report that raced the end is still passed on.
-                            while let Ok(ev) = served_rx.try_recv() {
-                                let _ = events.send(ev);
-                            }
-                            drop(guard);
                         });
                     }
                     Inbound::App { peer, send, recv } => {
@@ -10110,7 +10084,14 @@ impl Node {
         if asked || !recent {
             self.member_dialed_at.insert(target, now);
             let tx = self.net_tx.clone();
+            let room = *channel_id;
             tokio::spawn(async move {
+                // Nothing known for it here: read a connected board before bridging (V030-22).
+                let endpoints = if endpoints.is_empty() {
+                    net.member_endpoints(&room, target).await
+                } else {
+                    endpoints
+                };
                 match net.reach(target, &endpoints).await {
                     Ok(conn) => {
                         let _ = tx
@@ -10155,9 +10136,11 @@ impl Node {
         if net.manager().existing(&peer).is_some() || !self.sync_dials.insert(peer) {
             return;
         }
-        let endpoints = net.board_endpoints(channel_id, &peer);
+        let room = *channel_id;
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
+            // This node's board record, or a connected board's when it holds none yet (V030-22).
+            let endpoints = net.member_endpoints(&room, peer).await;
             match net.reach(peer, &endpoints).await {
                 Ok(conn) => {
                     let _ = tx
@@ -11144,10 +11127,8 @@ impl Node {
                     });
                 }
             },
-            move |reason: &str| {
-                let _ = events.send(NodeEvent::ProxyRefused {
-                    reason: reason.to_owned(),
-                });
+            move |note: crate::node::tunnel::TunnelNote| {
+                let _ = events.send(note_event(note));
             },
         ));
         let _ = self.event_tx.send(NodeEvent::ProxyUp {
@@ -11224,8 +11205,14 @@ impl Node {
                     crate::node::link::b32_encode(room)
                 ));
             },
-            move |reason: &str| {
-                let _ = report.send(reason.to_owned());
+            // A deliberate close is said as one, never as a refusal (V030-11).
+            move |note: crate::node::tunnel::TunnelNote| {
+                let _ = report.send(match note {
+                    crate::node::tunnel::TunnelNote::Refused(reason) => reason,
+                    crate::node::tunnel::TunnelNote::Closed(reason) => {
+                        format!("tunnel closed — {reason}")
+                    }
+                });
             },
         ));
         Ok((bound, task.abort_handle()))
@@ -11286,6 +11273,12 @@ impl Node {
         // `ForwardDialed` binds the forward. One sender, so the two arrive in that order.
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
+            // Nothing known for the host here: read a connected board before bridging (V030-22).
+            let endpoints = if endpoints.is_empty() {
+                net.member_endpoints(&channel_id, host).await
+            } else {
+                endpoints
+            };
             let result = match net.reach(host, &endpoints).await {
                 Ok(conn) => {
                     // A forward whose every connection would be refused is refused now, in
@@ -11353,8 +11346,8 @@ impl Node {
             channel_id: Some(*channel_id),
         });
         let events = self.event_tx.clone();
-        let report = move |reason: String| {
-            let _ = events.send(NodeEvent::ProxyRefused { reason });
+        let report = move |note: crate::node::tunnel::TunnelNote| {
+            let _ = events.send(note_event(note));
         };
         let bound = if crate::tunnel::udp::is_udp(service_tag) {
             crate::node::tunnel::Forward::bind_udp(
@@ -11439,7 +11432,7 @@ impl Node {
     /// [`StatusBook`]: crate::node::status::StatusBook
     fn status_report(&mut self) -> crate::node::status::StatusReport {
         use crate::node::status::{
-            add_stats, DialedTunnel, MemberStatus, PeerStatus, RoomStatus, StatusReport,
+            add_stats, ForwardStatus, MemberStatus, PeerStatus, RoomStatus, StatusReport,
         };
         self.note_peers_seen();
         let now = self.now();
@@ -11520,11 +11513,10 @@ impl Node {
                 });
             }
         }
-        report.tunnels_served = self.status.served_now();
-        report.tunnels_dialed = view
+        report.forwards = view
             .forwards
             .iter()
-            .map(|f| DialedTunnel {
+            .map(|f| ForwardStatus {
                 channel_id: f.channel_id,
                 host: f.host,
                 service_tag: f.service_tag.clone(),
@@ -12040,7 +12032,8 @@ impl crate::node::up::HostDialer for NodeDialer {
         // endpoint hints come from the board, which is also why this must happen per
         // request: a node that has only just joined has not read the board yet.
         let endpoints = match &self.channel_id {
-            Some(cid) => self.net.board_endpoints(cid, host),
+            // A connected board's record when this node's board holds none yet (V030-22).
+            Some(cid) => self.net.member_endpoints(cid, *host).await,
             None => self.net.board_endpoints_any(host),
         };
         self.net.reach(*host, &endpoints).await
@@ -12156,6 +12149,14 @@ async fn admit_board_records(
         }
     }
     admitted
+}
+
+/// The event a [`crate::node::tunnel::TunnelNote`] is said as.
+fn note_event(note: crate::node::tunnel::TunnelNote) -> NodeEvent {
+    match note {
+        crate::node::tunnel::TunnelNote::Refused(reason) => NodeEvent::ProxyRefused { reason },
+        crate::node::tunnel::TunnelNote::Closed(reason) => NodeEvent::TunnelClosed { reason },
+    }
 }
 
 fn fault_of(e: &Error) -> Fault {

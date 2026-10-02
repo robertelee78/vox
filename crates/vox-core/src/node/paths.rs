@@ -46,6 +46,11 @@ pub const RETENTION_FILE: &str = "retention";
 /// given. A leading `~/` means the home directory. Absent, it is `~/Downloads`.
 pub const DOWNLOADS_FILE: &str = "downloads";
 
+/// The config file saying how long a tunnel's bytes may wait to be taken before it is closed as
+/// stuck (V030-11): one line, `600`, `600s`, `10m` or `1h`. Absent or unreadable, it is 10
+/// minutes ([`STUCK_AFTER`](crate::tunnel::session::STUCK_AFTER)).
+pub const TUNNEL_STUCK_FILE: &str = "tunnel-stuck-after";
+
 /// The config file saying which rooms `vox node` serves: `anyone` or `trusted` (its
 /// `--serve` flag overrides it).
 pub const SERVE_FILE: &str = "serve";
@@ -183,6 +188,34 @@ impl Paths {
     #[must_use]
     pub fn serve_file(&self) -> PathBuf {
         self.config_dir.join(SERVE_FILE)
+    }
+
+    /// How long a stuck tunnel is given, for this profile ([`TUNNEL_STUCK_FILE`]).
+    #[must_use]
+    pub fn tunnel_stuck_file(&self) -> PathBuf {
+        self.config_dir.join(TUNNEL_STUCK_FILE)
+    }
+
+    /// The time the profile's [`TUNNEL_STUCK_FILE`] names, if it names one.
+    #[must_use]
+    pub fn tunnel_stuck_after(&self) -> Option<std::time::Duration> {
+        let text = std::fs::read_to_string(self.tunnel_stuck_file()).ok()?;
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+        let (digits, unit) = line.split_at(
+            line.find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(line.len()),
+        );
+        let n: u64 = digits.parse().ok()?;
+        let secs = match unit.trim() {
+            "" | "s" => n,
+            "m" => n.checked_mul(60)?,
+            "h" => n.checked_mul(3600)?,
+            _ => return None,
+        };
+        (secs > 0).then(|| std::time::Duration::from_secs(secs))
     }
 
     /// The download-directory file for this profile ([`DOWNLOADS_FILE`]).
@@ -435,8 +468,29 @@ pub fn check_socket_owner(socket: &Path) -> Result<()> {
 /// A failure at any step leaves `path` as it was: the old file is replaced only by the rename,
 /// and only once the new bytes are on the device.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_private_via(path, bytes, &path.with_extension("tmp"))
+}
+
+/// [`write_private_file`] for a file **two processes may write at once**: an agent session's
+/// record, cursor and notice record, written by its harness's hook and by the daemon. Each write
+/// stages through a temporary file of its own (`<name>.<pid>.<n>.tmp`), so two writers never
+/// share one and one cannot publish the other's half-written bytes under its own name; whichever
+/// rename is last wins whole. The identity vault keeps the fixed name: its writers hold the
+/// profile, so there is only ever one.
+///
+/// # Errors
+/// As [`write_private_file`].
+pub fn write_private_file_unique(path: &Path, bytes: &[u8]) -> Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    write_private_via(path, bytes, &path.with_file_name(name))
+}
+
+fn write_private_via(path: &Path, bytes: &[u8], tmp: &Path) -> Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp.to_path_buf();
     let fail = |op: &'static str, at: &Path, e: std::io::Error| Error::Path {
         op,
         detail: format!("{}: {e}", at.display()),

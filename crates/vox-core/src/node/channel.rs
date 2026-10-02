@@ -2459,6 +2459,13 @@ impl ChannelState {
         self.authors.values().cloned().collect()
     }
 
+    /// Every admitted author's key by its fingerprint, as held: the fingerprints are not worked
+    /// out again (V030-09).
+    #[must_use]
+    pub fn author_map(&self) -> BTreeMap<Digest32, CompositePublicKey> {
+        self.authors.clone()
+    }
+
     /// Every admitted author's fingerprint, in deterministic order.
     #[must_use]
     pub fn author_fingerprints(&self) -> Vec<Digest32> {
