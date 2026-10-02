@@ -253,7 +253,7 @@ impl Member {
     fn serve(&self, room: &str, pass: &str, at: SocketAddr) {
         // From a file, never argv (V210-72: a room passphrase on the command line is refused).
         let pass_file = self.dir.join("room.pass");
-        std::fs::write(&pass_file, pass).unwrap();
+        std::fs::write(&pass_file, pass).expect("CANNOT MEASURE: write the room passphrase file");
         let (ok, out, err) = vox(
             &self.dir,
             &[
