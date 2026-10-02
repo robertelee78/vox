@@ -83,23 +83,40 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
     )
 }
 
-/// A `vox daemon` of `exe` on `data`, once it answers `vox room list`.
+/// A `vox daemon` of `exe` on `data`, once it answers `vox room list`. v0.2.9's daemon takes the
+/// identity passphrase only from a file or stdin, so it is given a file.
 fn daemon(exe: &Path, name: &str, data: &Path) -> VoxProc {
-    let p = VoxProc::spawn_exe(
+    let pass = data.join("identity-passphrase");
+    std::fs::write(&pass, IDENTITY)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass.display()));
+    let mut p = VoxProc::spawn_exe(
         exe,
         name,
         data,
-        &args(&["daemon", "--listen", "127.0.0.1:0"]),
+        &args(&[
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ]),
         &[],
     );
     let deadline = Instant::now() + TIMEOUT;
+    let mut last = String::new();
     while Instant::now() < deadline {
-        if vox_with(exe, data, &["room", "list"], None).0 {
+        let (ok, out, err) = vox_with(exe, data, &["room", "list"], None);
+        if ok {
             return p;
         }
+        last = format!("{out}{err}");
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: {name} never answered `vox room list` in {TIMEOUT:?}");
+    panic!(
+        "CANNOT MEASURE: {name} never answered `vox room list` in {TIMEOUT:?}; it said:\n{}\n\
+         `vox room list` said: {last}",
+        p.transcript()
+    );
 }
 
 /// The room's 12-character prefix as `vox room list` prints it, for the room named `name`.
