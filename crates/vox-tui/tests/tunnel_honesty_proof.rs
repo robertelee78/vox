@@ -37,6 +37,28 @@
 //!   it is. It goes red only when all three are gone, so it guards against losing every one of
 //!   them, not against losing any single one; removing the keep-alive alone, or using quinn's
 //!   defaults, stays green while the other two hold.
+//! - **Withdrawing trust cuts a live session and refuses the next request** (ADR-017 M17.11,
+//!   RP-10). An `ssh` session opened while the guest was trusted is reset the moment the host's
+//!   operator runs `vox trust remove`, and `vox up` says the host withdrew access. A new CONNECT
+//!   through the **same** proxy — whose connection to the host was made while trusted — is
+//!   refused in the SOCKS reply, and the service behind it never accepts a connection.
+//!
+//!   *A stream parked open across the withdrawal* (opened while trusted, its request sent only
+//!   after) cannot be produced by the shipped binary: no honest `vox` delays its request. It is
+//!   judged by the same gate this proof reaches — the request is read first and the reacher set
+//!   consulted after it, live (`tunnel::session::accept_reporting`) — so the refusal here and a
+//!   parked refusal are one line of code; that the set is a live handle rather than a copy rests
+//!   on review (ADR-017 M17.11).
+//! - **A `.vox` name for a room this machine never joined is refused at the proxy, and nothing
+//!   is dialled** (ADR-017, RP-44). The room is real: its host runs on the same anchor, trusts
+//!   this guest and offers a service that counts connections. The guest only never joined it.
+//!   The CONNECT is refused in the reply with the proxy's own reason ("no room on this machine
+//!   answers to …", not a host's refusal), and neither room's service is ever dialled.
+//!
+//! Every red in those two proofs says which kind it is: **PRODUCT** (what the product did, as a
+//! person sees it), **PRODUCT (staging)** (a step vox itself performs before the claim failed),
+//! or **APPARATUS** / **CANNOT MEASURE** (the proof's own fault, or a case the shared harness never
+//! staged, so the run says nothing).
 //!
 //! ## Why it is `#[ignore]`d
 //!
@@ -57,8 +79,8 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use world::{
-    args, echo_service, read_to_end_within, resetting_service, round_trip, socks5_connect,
-    vox_once, Ending, World, PARTIAL,
+    args, counting_echo_service, echo_service, read_to_end_within, resetting_service, round_trip,
+    socks5_connect, vox_once, Ending, VoxProc, World, PARTIAL,
 };
 
 /// How long the idle session says nothing: past quinn's 30 s default idle timeout and past
@@ -135,12 +157,12 @@ fn a_quiet_session_still_carries_bytes() {
     ))
     .expect("APPARATUS: set a read timeout");
     s.write_all(b"before the quiet")
-        .expect("CANNOT MEASURE: the session never took a first write");
+        .expect("PRODUCT (staging): the forward's session never took a first write");
     let mut back = [0u8; 16];
     if let Err(e) = s.read_exact(&mut back) {
         panic!(
-            "CANNOT MEASURE: the session never carried bytes ({e}), so whether it survives a \
-             quiet cannot be measured. The forward said:\n{}",
+            "PRODUCT (staging): the forward's session never carried bytes ({e}), before any quiet: \
+             vox failed to carry a fresh session. The forward said:\n{}",
             fwd.transcript()
         );
     }
@@ -343,4 +365,241 @@ fn a_refused_socks_connect_is_refused_in_the_reply_and_says_why() {
         l.starts_with("! ") && l.contains("the host refused")
     });
     eprintln!("[test] vox up said: {why}");
+}
+
+/// A trusted session through `vox up`, carrying bytes: the staging both trust proofs start
+/// from. Every failure here is vox's own, so it is `PRODUCT (staging)`; a proxy that breaks the
+/// SOCKS exchange is `socks5_connect`'s PRODUCT red.
+fn live_session(up: &mut VoxProc, at: std::net::SocketAddr, name: &str, port: u16) -> TcpStream {
+    let (code, mut s) = socks5_connect(at, name, port);
+    assert_eq!(
+        code,
+        0,
+        "PRODUCT (staging): vox up refused a trusted member's CONNECT to {name}:{port} \
+         (reply {code}); vox up said:\n{}",
+        up.transcript()
+    );
+    s.set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("APPARATUS: setting a read timeout on the proof's own socket");
+    let echoed = s
+        .write_all(b"are you there")
+        .and_then(|()| {
+            let mut back = [0u8; 13];
+            s.read_exact(&mut back).map(|()| back)
+        })
+        .unwrap_or_else(|e| {
+            panic!("PRODUCT (staging): the trusted session through vox up carried no echo: {e}")
+        });
+    assert_eq!(
+        &echoed, b"are you there",
+        "PRODUCT (staging): the trusted session through vox up altered the echo"
+    );
+    s
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
+    watchdog::arm();
+    let (port, accepted) = counting_echo_service();
+    let mut w = World::new(port, true);
+    // `vox trust remove` asks the running node, which `vox serve` does not answer (it serves
+    // no control socket); a daemon holding the same room does.
+    w.restart_host_as_daemon();
+    let guest_dir = w.guest_dir.clone();
+    let (mut up, at) = w.up("guest-up", &guest_dir);
+    let name = format!("{}.vox", w.room);
+
+    // Step 1: a live session, as `ssh user@<room>.vox` holds one.
+    let mut s = live_session(&mut up, at, &name, port);
+    let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        dialled, 1,
+        "PRODUCT (staging): the service counted {dialled} connections for one session, so it cannot \
+         say whether a later one was dialled"
+    );
+    eprintln!("[test] step 1: a trusted session through vox up echoed; the service counted 1");
+
+    // Step 2: the host's operator withdraws trust, from the command line.
+    let (ok, out, err) = vox_once(&w.host_dir, &args(&["trust", "remove", &w.guest_fp]));
+    let removed_at = Instant::now();
+    assert!(
+        ok,
+        "PRODUCT: `vox trust remove` did not take effect on the running host.\nstdout:\n{out}\n\
+         stderr:\n{err}"
+    );
+    eprintln!("[test] step 2: {}", out.trim());
+
+    // Step 3: the live session is cut — a reset, not a quiet EOF — within a second.
+    let (tail, ending) = read_to_end_within(&mut s, Duration::from_secs(1));
+    let elapsed = removed_at.elapsed();
+    eprintln!(
+        "[test] step 3: the live session ended {ending:?} {elapsed:?} after the removal, {} \
+         stray bytes",
+        tail.len()
+    );
+    assert_eq!(
+        ending,
+        Ending::Reset,
+        "PRODUCT: withdrawing trust must cut the live session at once, with a reset (ADR-017 \
+         M17.11); it ended {ending:?} within {elapsed:?}"
+    );
+    assert!(
+        tail.is_empty(),
+        "PRODUCT: bytes arrived after trust was withdrawn: {tail:?}"
+    );
+    let said = up.try_expect_within(
+        Duration::from_secs(10),
+        "that the host withdrew access",
+        |l| l.contains("the host withdrew access") && l.contains(&port.to_string()),
+    );
+    assert!(
+        said.is_ok(),
+        "PRODUCT: vox up must tell its person the host withdrew access, so they do not retry a \
+         thing that cannot work; it said:\n{}",
+        up.transcript()
+    );
+
+    // Step 4: the next request, through the same proxy and the same connection to the host —
+    // made while the guest was trusted — is refused, and the service is never dialled.
+    let (code, mut s2) = socks5_connect(at, &name, port);
+    eprintln!("[test] step 4: the CONNECT after the withdrawal got SOCKS reply {code}");
+    assert_eq!(
+        code, 0x02,
+        "PRODUCT: a CONNECT after `vox trust remove` must be refused in the reply — code 2, not \
+         allowed; it got {code}"
+    );
+    let (got, _) = read_to_end_within(&mut s2, Duration::from_secs(2));
+    assert!(
+        got.is_empty(),
+        "PRODUCT: a refused CONNECT carried bytes: {got:?}"
+    );
+    let why = up.try_expect_within(Duration::from_secs(10), "that the host refused", |l| {
+        l.starts_with("! ") && l.contains("the host refused")
+    });
+    assert!(
+        why.is_ok(),
+        "PRODUCT: vox up must say the host refused the CONNECT; it said:\n{}",
+        up.transcript()
+    );
+    let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        dialled, 1,
+        "PRODUCT: the host dialled its service for a guest it no longer trusts — the service \
+         counted {dialled} connections, one more than the session before the withdrawal"
+    );
+    eprintln!("[test] step 4: refused, said why, and the service still counted 1");
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dialled() {
+    watchdog::arm();
+    let (port, accepted) = counting_echo_service();
+    let w = World::new(port, true);
+
+    // A second, real room on the same anchor, hosted by someone who trusts this guest and
+    // offers a service that counts connections. The guest never joins it: that is the only
+    // reason left for a refusal.
+    let (other_port, other_accepted) = counting_echo_service();
+    let other_dir = w.tmp.path().join("other-host");
+    std::fs::create_dir_all(other_dir.join("cfg"))
+        .expect("APPARATUS: creating the other host's profile directory");
+    let (ok, _, err) = vox_once(&other_dir, &args(&["id"]));
+    assert!(ok, "PRODUCT (staging): `vox id` (other host) failed: {err}");
+    let (ok, out, err) = vox_once(
+        &other_dir,
+        &args(&["trust", "add", &w.guest_fp, "--name", "the guest"]),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the other host's `vox trust add` failed: {out}\n{err}"
+    );
+    let mut other = VoxProc::spawn(
+        "other-host",
+        &other_dir,
+        &args(&[
+            "serve",
+            &other_port.to_string(),
+            "--anchor",
+            &w.anchor_spec,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+    );
+    let other_room = world::after_label(
+        &other.expect_staging("the other room", |l| l.starts_with("room ")),
+        "room",
+    );
+    assert_ne!(
+        other_room, w.room,
+        "PRODUCT (staging): the other host's `vox serve` printed this world's room"
+    );
+    let other_name = format!("{other_room}.vox");
+
+    let guest_dir = w.guest_dir.clone();
+    let (mut up, at) = w.up("guest-up", &guest_dir);
+
+    // Control: the proxy dials a room this machine did join — otherwise a refusal below could
+    // be a proxy that reaches nothing.
+    let s = live_session(&mut up, at, &format!("{}.vox", w.room), port);
+    let _ = s.shutdown(std::net::Shutdown::Both);
+    let joined = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        joined, 1,
+        "PRODUCT (staging): the joined room's service counted {joined} connections for one session"
+    );
+    eprintln!("[test] control: the joined room's name was carried; its service counted 1");
+
+    // The unjoined room's name, at its own service's port and at the joined room's: a proxy
+    // that resolved the name anywhere — the other room's host, or the room it does hold —
+    // would dial one of the two services.
+    for p in [other_port, port] {
+        let t0 = Instant::now();
+        let (code, mut s) = socks5_connect(at, &other_name, p);
+        eprintln!(
+            "[test] CONNECT {other_name}:{p} got SOCKS reply {code} after {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            code, 0x02,
+            "PRODUCT: a CONNECT to the .vox name of a room this machine never joined must be \
+             refused in the reply — code 2, not allowed; {other_name}:{p} got {code}"
+        );
+        let (got, _) = read_to_end_within(&mut s, Duration::from_secs(2));
+        assert!(
+            got.is_empty(),
+            "PRODUCT: a refused CONNECT carried bytes: {got:?}"
+        );
+    }
+    // Refused **at the proxy**: its own reason, not a host's refusal relayed back.
+    let why = up.try_expect_within(Duration::from_secs(10), "the proxy's own refusal", |l| {
+        l.starts_with("! ")
+            && l.contains("no room on this machine answers to")
+            && l.contains(&other_room)
+    });
+    assert!(
+        why.is_ok(),
+        "PRODUCT: vox up must refuse an unjoined room's name itself, saying no room on this \
+         machine answers to it; it said:\n{}",
+        up.transcript()
+    );
+    assert!(
+        !up.transcript().contains("the host refused"),
+        "PRODUCT: a host was asked about a room this machine never joined (the refusal came \
+         from a host, not the proxy); vox up said:\n{}",
+        up.transcript()
+    );
+    let (mine, theirs) = (
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        other_accepted.load(std::sync::atomic::Ordering::SeqCst),
+    );
+    assert_eq!(
+        (mine, theirs),
+        (1, 0),
+        "PRODUCT: an unjoined room's name was dialled — the joined room's service counted {mine} \
+         (1 is the control), the unjoined room's {theirs}"
+    );
+    eprintln!("[test] both refused at the proxy; the services counted 1 (the control) and 0");
+    drop(other);
 }

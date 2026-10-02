@@ -16,6 +16,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -346,6 +347,34 @@ pub fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// A real TCP echo service on loopback that **counts every connection it accepts**, so a
+/// proof can say the service was never dialled. Returns its port and the count.
+pub fn counting_echo_service() -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not bind the counting echo service: {e}"));
+    let port = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("APPARATUS: the counting echo service has no address: {e}"))
+        .port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            count.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 || s.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (port, accepted)
+}
+
 /// A real TCP echo service on loopback. Returns its port.
 pub fn echo_service() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -427,6 +456,7 @@ pub struct World {
     pub guest_dir: PathBuf,
     pub host: Option<VoxProc>,
     pub host_fp: String,
+    pub guest_fp: String,
     pub room: String,
     pub address: String,
     pub passphrase: String,
@@ -502,6 +532,7 @@ impl World {
             guest_dir,
             host: Some(host),
             host_fp,
+            guest_fp,
             room,
             address,
             passphrase,
