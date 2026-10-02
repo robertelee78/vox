@@ -111,10 +111,21 @@ pub async fn accept_typed(conn: &VoxConnection) -> Result<(StreamKind, SendStrea
 pub async fn accept_typed_on(
     conn: &quinn::Connection,
 ) -> Result<(StreamKind, SendStream, RecvStream)> {
-    let (send, mut recv) = conn
+    let (send, recv) = conn
         .accept_bi()
         .await
         .map_err(|_| Error::Unreachable("quic stream: the connection is closed"))?;
+    read_kind(send, recv).await
+}
+
+/// Read the kind frame of a bi-stream already accepted. Waits at most
+/// [`crate::transport::framing::FRAME_PATIENCE`] for it, so a caller that accepts in a loop must
+/// run this on a task of its own: a peer that opens a stream and withholds its kind would
+/// otherwise hold every stream it opens after it.
+pub async fn read_kind(
+    send: SendStream,
+    mut recv: RecvStream,
+) -> Result<(StreamKind, SendStream, RecvStream)> {
     let frame = read_frame(&mut recv, MAX_KIND_FRAME)
         .await?
         .ok_or(Error::MalformedBundle("stream closed before kind"))?;

@@ -288,16 +288,26 @@ impl KeyRefusal {
 /// within `patience`) counts as not taken. Sending a key twice is harmless; never sending it
 /// leaves a member unable to read. Awaited on its own task, never on the actor: the answer
 /// comes after the recipient's actor has handled the key.
-pub async fn refused(mut recv: quinn::RecvStream, patience: std::time::Duration) -> Option<String> {
+pub async fn refused(recv: quinn::RecvStream, patience: std::time::Duration) -> Option<String> {
+    refusal(recv, patience).await.map(|(why, _)| why)
+}
+
+/// [`refused`], and whether the recipient **answered**: `true` for a refusal it made (a reset with
+/// a code, or a wrong byte), `false` when the key never reached a decision (the connection lost,
+/// the stream ended unanswered, no answer in time).
+pub async fn refusal(
+    mut recv: quinn::RecvStream,
+    patience: std::time::Duration,
+) -> Option<(String, bool)> {
     let mut byte = [0u8; 1];
     match tokio::time::timeout(patience, recv.read_exact(&mut byte)).await {
         Ok(Ok(())) if byte[0] == KEY_TAKEN => None,
-        Ok(Ok(())) => Some(format!("answered {}", byte[0])),
+        Ok(Ok(())) => Some((format!("answered {}", byte[0]), true)),
         Ok(Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)))) => {
-            Some(KeyRefusal::describe(code.into_inner()))
+            Some((KeyRefusal::describe(code.into_inner()), true))
         }
-        Ok(Err(e)) => Some(e.to_string()),
-        Err(_) => Some(format!("no answer within {}s", patience.as_secs())),
+        Ok(Err(e)) => Some((e.to_string(), false)),
+        Err(_) => Some((format!("no answer within {}s", patience.as_secs()), false)),
     }
 }
 
