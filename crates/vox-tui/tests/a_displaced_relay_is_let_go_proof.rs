@@ -276,8 +276,8 @@ fn both_ends_keep_the_same_connection(
 /// **Observed, never assumed** (CANNOT MEASURE otherwise): the session's first echo rode the
 /// circuit (the forward was closed and carried none of it); after the forward opened a *new*
 /// request rode it (the pair went direct); the host or the guest reported its relayed connection
-/// displaced; and every later echo on the session still crossed the anchor, not the forward — it
-/// stayed on the displaced path.
+/// displaced; and the session rode the displaced path after the upgrade at least once (an echo
+/// that did not cross the forward) — otherwise displacement was never exercised under it.
 ///
 /// **Asserted:**
 /// - **V29-15 (#50): both ends keep the same one of the two live connections.** When the direct
@@ -290,8 +290,13 @@ fn both_ends_keep_the_same_connection(
 ///   at least one such pair is required (`CANNOT MEASURE` otherwise). A pair only one end has
 ///   filed yet is not compared: the pair keeps dialling, and a third connection can reach one end
 ///   before the other. Ends that disagree open streams on a connection the other has retired.
-/// - The session opened before the upgrade answers an echo, whole, every few seconds until the
-///   grace and 15 s for the tick have passed since the direct path took over.
+/// - The session opened before the upgrade answers **every** echo, whole, within its 10 s bound,
+///   every few seconds until the grace and 15 s for the tick have passed since the direct path
+///   took over (`PRODUCT` otherwise: a better path cut a live session). **Whichever path** the
+///   echo took: what a person needs is that the session never breaks, and its bytes may stay on
+///   the retired relayed connection or move onto the direct path partway through the grace (seen
+///   once in three runs on 2026-10-02, the session still answering every echo). Each echo's path
+///   is recorded and printed: how many crossed the forward, how many the circuit.
 ///
 /// **The mutations that must turn it red:**
 /// - `ConnectionManager::retire_expired` treating no retired connection as still carried
@@ -407,40 +412,42 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
         direct_at - opened
     );
 
-    // The hold: the session answers, on the displaced path, until well past its grace.
-    let mut echoes = 0usize;
+    // The hold: the session answers every echo until well past the grace, on whichever path.
+    // Each echo's path is recorded: the circuit (displaced) or the forward (direct).
+    let (mut displaced, mut moved) = (0usize, Vec::new());
     while direct_at.elapsed() < hold {
         std::thread::sleep(Duration::from_secs(3));
         let (ok, direct) = echo(&mut session, &w);
         assert!(
             ok,
             "PRODUCT: CUT — the session opened over the relayed path stopped answering {:?} after \
-             the direct path displaced it ({echoes} echoes answered before): a better path cut a \
-             live session it carried.\nup:\n{}\nhost:\n{}",
+             the direct path displaced it ({} echoes answered before, {} of them on the direct \
+             path): a better path cut a live session it carried.\nup:\n{}\nhost:\n{}",
             direct_at.elapsed(),
+            displaced + moved.len(),
+            moved.len(),
             up.transcript(),
             w.host.transcript()
         );
-        assert!(
-            !direct,
-            "CANNOT MEASURE: an echo on the session crossed the forward {:?} after the upgrade — it \
-             was not on the displaced path",
-            direct_at.elapsed()
-        );
-        echoes += 1;
+        if direct {
+            moved.push(direct_at.elapsed());
+        } else {
+            displaced += 1;
+        }
     }
-    let n = w.anchor.circuits(Duration::from_secs(2));
-    assert!(
-        n >= 1,
-        "CANNOT MEASURE: the session answered, but the anchor reports {n} circuits — it was not \
-         on the displaced path.\nanchor:\n{}",
-        w.anchor.proc.transcript()
-    );
     eprintln!(
-        "[proof] the session answered {echoes}/{echoes} echoes on the displaced path, the last {:?} \
-         after the direct path took over (grace {}s)",
+        "[proof] the session answered {0}/{0} echoes, the last {1:?} after the direct path took \
+         over (grace {2}s): {displaced} on the displaced path, {3} on the direct path (from {4:?})",
+        displaced + moved.len(),
         direct_at.elapsed(),
-        vox_core::node::net::RETIRE_GRACE_SECS
+        vox_core::node::net::RETIRE_GRACE_SECS,
+        moved.len(),
+        moved.first()
+    );
+    assert!(
+        displaced > 0,
+        "CANNOT MEASURE: every echo on the session after the upgrade crossed the forward, so the \
+         session never rode the displaced path and its displacement was not exercised"
     );
     drop(session);
     interrupt(&mut up, Duration::from_secs(15));
