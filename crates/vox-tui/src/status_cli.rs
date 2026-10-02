@@ -297,10 +297,35 @@ fn tunnels(v: &serde_json::Value, out: &mut String) {
         };
         let _ = writeln!(
             out,
-            "tunnel {way} for {}: open {}, last moved {} ago",
+            "tunnel {} {way} for {}: open {}, last moved {} ago",
+            n("id"),
             s("service"),
             ago(n("opened")),
             ago(n("last_moved"))
+        );
+    }
+    // Ended for a reason a person should see (V030-11): closed here, there, or as stuck.
+    for t in v
+        .get("closed_tunnels")
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let s = |k: &str| t.get(k).and_then(|x| x.as_str()).unwrap_or("?").to_owned();
+        let n = |k: &str| t.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let peer: String = s("peer").chars().take(12).collect();
+        let way = if s("direction") == "out" {
+            format!("to {peer}")
+        } else {
+            format!("from {peer}")
+        };
+        let _ = writeln!(
+            out,
+            "tunnel {} {way} for {} was {} {} ago",
+            n("id"),
+            s("service"),
+            s("why"),
+            ago(n("closed"))
         );
     }
 }
