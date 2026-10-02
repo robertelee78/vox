@@ -306,12 +306,34 @@ fn joins_answered_at_once_by_two_members_converge() {
     for (m, ok, said) in &joined {
         println!("[proof] {}'s join exited ok={ok}:\n{said}", m.name);
     }
+    // A newcomer that did not get in is the staging's only when **every** member that answered
+    // it refused it as full: then one member learned of the other's newcomer before deciding,
+    // and the joins did not race. Refused by any member for anything else, it is the product's,
+    // quoted (ac-fix93 on c3) — even when a later member then found the room full.
+    let only_full = |said: &str| {
+        said.contains("the room is full")
+            && said
+                .lines()
+                .filter_map(|l| l.trim_start().strip_prefix("said: "))
+                .flat_map(|l| l.split("; "))
+                .filter(|r| r.contains(": exchange"))
+                .all(|r| r.contains("the room is full"))
+    };
+    for (m, ok, said) in &joined {
+        if !ok && !only_full(said) {
+            panic!(
+                "PRODUCT: {}'s join failed, and a member refused it for something other than a full \
+                 room:\n{said}",
+                m.name
+            );
+        }
+    }
     let told_joined: Vec<&Member> = joined.iter().filter(|j| j.1).map(|j| j.0).collect();
     assert!(
         told_joined.len() == 2,
-        "CANNOT MEASURE: only {} of the 2 newcomers got in, so the joins did not race (one member \
-         learned of the other's newcomer before it answered its own): nothing measured whether \
-         raced joins converge",
+        "CANNOT MEASURE: only {} of the 2 newcomers got in, and every member refused the other \
+         as full, so the joins did not race (one member learned of the other's newcomer before it \
+         answered its own): nothing measured whether raced joins converge",
         told_joined.len()
     );
 
