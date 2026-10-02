@@ -99,6 +99,8 @@
 //! - Holds weighed by identity alone, the address dropped: case 3 red, carol ties with every hold
 //!   and is refused; cases 1 and 2 stay green, since they turn on the identity.
 //! - A relayed join's origin ignored, every circuit one source: case 4 red.
+//! - A join's line saying `direct` whatever path it rode: case 4 red as `PRODUCT:`, since no
+//!   direct join between IPv6-only alice and IPv4-only carol exists.
 //! - The identity ignored: cases 1 and 2 red.
 //! - An ended join stopped without a word, or told the bare refusal: case 5 red.
 //! - A hold that has done its work ended like any other: case 6 red, alice ends one for carol.
@@ -642,9 +644,14 @@ fn circuits_asked(who: &Who) -> u64 {
 /// direct in [`Layout::TwoAddresses`] (else the address dimension is not what was measured),
 /// relayed in [`Layout::Relayed`]. And in [`Layout::Relayed`], the anchor, the only relay here,
 /// must have carried a circuit for every stranger identity and carol at once, since every one of
-/// their joins is held open while carol joins. `Err` is CANNOT MEASURE, returned rather than raised
-/// so the caller can stop the stranger first.
-fn paths(s: &Staged, case: &str) -> Result<(), String> {
+/// their joins is held open while carol joins. `Err` is the red, `PRODUCT:` or CANNOT MEASURE,
+/// returned rather than raised so the caller can stop the stranger first.
+///
+/// **In [`Layout::Relayed`] a join that got in and does not say `relayed` is the product's red**
+/// (V210-124 c3): alice is IPv6-only and carol IPv4-only, so no direct join between them exists,
+/// and a line that says `direct`, or names no path, misreports the join. A join that did not get
+/// in is left to the caller's `PRODUCT:` assert.
+fn paths(s: &Staged, case: &str, got_in: bool) -> Result<(), String> {
     std::thread::sleep(Duration::from_secs(2));
     // Carol's daemon says how each join it ran went, `vox: join got in — …`, with its path.
     let carol_err = std::fs::read_to_string(s.dir.join("carol.daemon.err")).unwrap_or_default();
@@ -669,9 +676,11 @@ fn paths(s: &Staged, case: &str) -> Result<(), String> {
             "APPARATUS, CANNOT MEASURE: {case}: carol's join did not say it went direct, so it was \
              not her address that was measured: {carol_said:?}"
         )),
+        Layout::Relayed if !got_in => Ok(()),
         Layout::Relayed if !relayed => Err(format!(
-            "APPARATUS, CANNOT MEASURE: {case}: carol's join did not say it was relayed: \
-             {carol_said:?}"
+            "PRODUCT: {case}: carol's join got in but did not say it was relayed, though alice is \
+             IPv6-only and carol IPv4-only, so no direct join exists (the anchor carried at most \
+             {max} circuit(s) at once): {carol_said:?}"
         )),
         Layout::Relayed if max < want => Err(format!(
             "APPARATUS, CANNOT MEASURE: {case}: the anchor carried at most {max} circuit(s) at once, not one \
@@ -792,9 +801,9 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
             took.as_secs_f64(),
             format!("{out}{err}").replace('\n', " / ")
         );
-        if let Err(cannot) = paths(s, case) {
+        if let Err(red) = paths(s, case, ok) {
             done.store(true, Ordering::SeqCst);
-            panic!("{cannot}");
+            panic!("{red}");
         }
         // So the claim below does not rest on how often the stranger happened to arrive while
         // carol joined, it goes on until alice has turned it away `PROBES` more times.
