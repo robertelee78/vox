@@ -47,7 +47,9 @@ const SENTINEL: &str = ".vox-proof-sentinel";
 /// Move this test process, and so every child it starts, onto a fresh temporary HOME. Idempotent:
 /// the first call does it, and every later call returns at once.
 pub fn isolate() {
-    ISOLATED.call_once(|| {
+    // `call_once_force`: after an APPARATUS red here, the next test in the process runs the
+    // isolation again and gives the same labelled red, not an unlabelled "Once poisoned".
+    ISOLATED.call_once_force(|_| {
         let real = std::env::var_os("HOME").map(PathBuf::from);
         let _ = REAL_HOME.set(real.clone());
         let _ = REAL_DATA_HOME.set(std::env::var_os("XDG_DATA_HOME").map(PathBuf::from));
