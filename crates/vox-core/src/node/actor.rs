@@ -3801,6 +3801,20 @@ impl Node {
                 }
                 _ = ticker.tick() => {
                     if let Some(net) = self.net.as_ref() {
+                        if std::env::var_os("VOX_TEST_PATH_STATS").is_some() {
+                            for peer in net.manager().peers() {
+                                if let Some(c) = net.manager().existing(&peer) {
+                                    let s = c.quinn().stats();
+                                    let p = s.path;
+                                    eprintln!(
+                                        "vox: PATH {} mtu {} black_holes {} lost {} sent {} tx_bytes {}",
+                                        crate::node::network::short_id(peer), p.current_mtu,
+                                        p.black_holes_detected, p.lost_packets, p.sent_packets,
+                                        s.udp_tx.bytes
+                                    );
+                                }
+                            }
+                        }
                         // Connections a better path displaced are closed once their
                         // grace is up (M15.1b).
                         net.manager().retire_expired();
