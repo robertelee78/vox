@@ -27,32 +27,16 @@
 //!   queue of a round or two: one round in the trace read 39 ms on a 10.6 ms base with nothing
 //!   else on the path, and see [`CLIMB_3_QUEUE_ROUNDS`]. **The loss share is the clean-LAN guard:** a clean link loses only when its
 //!   queue overflows, well under 1% of what it sends, so it never reaches BBR.
-//! - **Tier 3 is on trial for its whole stay.** A shallow buffer under congestion shows the same
-//!   entry signal as random loss; they part once Vox sends harder, since random loss stays flat
-//!   with the rate and congestion loss climbs. So whenever the loss share rises past
-//!   `max(1.5 × entry, entry + TIER3_LOSS_RISE)` (`PathSignals::loss_risen`), tier 3 falls back to
-//!   tier 2 and is locked out for a back-off: [`BACKOFF_FIRST`], doubling with each failure up to
-//!   [`BACKOFF_MAX`], and back to the first only after a tier-3 stay of [`BACKOFF_RESET`] without
-//!   one. An ECN mark or persistent congestion is a failure too, at once.
-//! - **Descend 3 → 2 on a queue** held for [`TIER3_QUEUE_ROUNDS`] rounds, dwell or not (rule 3:
-//!   BBR must never hold a congested path). Tier 3 has its own queue test. quinn paces from the
-//!   window and the smoothed round trip, never from BBR's pacing rate, so BBR here is
-//!   window-bound: its target window (twice the bandwidth-delay product, plus the acknowledgement
-//!   aggregation it measured) can raise the round trip that far with no other flow on the path
-//!   ([`VoxBbr::standing_rtt`]). Measured on a 200 Mbit/s, 10.7 ms path with 1% loss and no other
-//!   flow: round minimums of 18–38 ms. So a round's minimum round trip past
-//!   [`TIER3_QUEUE_FACTOR`] × `standing_rtt(base)` + [`TIER3_QUEUE_MIN`] is another flow's queue.
-//!   Two inputs are fixed against what they would otherwise hide. The base is never above the base
-//!   at entry to tier 3: another flow's standing queue lifts every sample, and a base that followed
-//!   it would cancel the test (measured with a Cubic flow on a 4-BDP buffer: no round fired in 125
-//!   samples). And the bound is BBR's target window, not its current one, which moves the wrong way
-//!   both times it matters: in recovery or ProbeRtt it drops below the queue BBR has already built
-//!   (the test fired with no other flow), and while another flow takes share it lags BBR's falling
-//!   estimate, so `window / estimate` grows with that flow's queue (it never fired).
-//!   A share of the base, the other tiers' test, read BBR's own queue as congestion and took tier 3
-//!   out within a second, every time. **No delay test that stays quiet with Vox alone can see a
-//!   buffer of a bandwidth-delay product or less**: BBR's own window fills it. There the
-//!   whole-stay loss check is the guard.
+//! - **Leave tier 3 when it is slower than tier 2 was.** ADR-024 guarantees speed only (the
+//!   decider, 2026-10-02): tier 3 exists to be faster, and is kept only while it is. Vox's
+//!   delivered rate over the last [`RATE_WINDOW`] is recorded at 2 → 3; once tier 3 has dwelt, a
+//!   round whose rate over the same window is under [`TIER3_SLOWER`] of it takes the connection
+//!   back to tier 2 and locks tier 3 out for a back-off: [`BACKOFF_FIRST`], doubling with each
+//!   such exit up to [`BACKOFF_MAX`], and back to the first only after a tier-3 stay of
+//!   [`BACKOFF_RESET`] without one. Earlier candidates also left tier 3 on a queue another flow
+//!   built (rule 3), on a loss share that rose with Vox's rate (the trial), and on an ECN mark or
+//!   persistent congestion: those protected other flows, fairness is not ADR-024's to guarantee,
+//!   and they are gone.
 //! - **Descend 3 → 2 when the loss is gone:** the loss share under half [`GENTLE_LOSS_CAP`] for
 //!   [`QUIET_ROUNDS`] rounds and [`QUIET_TIME`].
 //! - **Descend 2 → 1** after a quiet stretch: [`QUIET_ROUNDS`] consecutive rounds and
@@ -61,7 +45,7 @@
 //!   an application that sent less, or from an earlier, faster path within the window.
 //! - **Hysteresis and dwell.** Each climb and its descent test different things, and a descent
 //!   needs a longer stretch than a climb. Every tier is left no sooner than [`DWELL_ROUNDS`]
-//!   rounds and [`DWELL_TIME`], except tier 3 by a queue or a failed trial.
+//!   rounds and [`DWELL_TIME`].
 //!
 //! An application-limited round is no evidence either way.
 //!
@@ -71,15 +55,16 @@
 //!   smoothed round trip), the base round trip and the current window, in ProbeBw, never Startup.
 //!   Not the best rate: a round closed on bunched acknowledgements once read 6.4 Gbit/s on a
 //!   200 Mbit/s link, and BBR seeded with it filled the buffer in its first round. BBR's own
-//!   delivery-rate samples raise a low seed within a few rounds. Never Startup: Startup's 2.885 gain on a congested path is what
-//!   the trial must not risk;
+//!   delivery-rate samples raise a low seed within a few rounds. Never Startup: its 2.885 gain
+//!   overshoots a path whose capacity tier 2 has already shown;
 //! - **out of BBR**: [`VoxCubic::seeded`] in congestion avoidance at BBR's delivery rate times the
 //!   windowed minimum round trip.
 //!
 //! # Idle restart
 //! `IdleRestart` (congestion.rs) rebuilds this controller after the connection has sent nothing
 //! for a while: the tier goes back to 1 and the base round trip is measured afresh, because the
-//! path may have changed. The tier-3 lockout is handed on ([`Tier3Backoff`]).
+//! path may have changed. The tier-3 lockout is handed on ([`Tier3Backoff`]): a tier 3 that was
+//! slower stays locked out across a pause.
 //!
 //! # Troubleshooting
 //! Each switch emits `tracing::debug!` under the target `vox::congestion`, with the tiers, the
@@ -115,21 +100,16 @@ pub(crate) const CLIMB_3_TIME: Duration = Duration::from_secs(2);
 /// 5% arm with nothing else on the path: rounds 4–7 ms over the base, two in a row about once a
 /// second, which broke every 2-second streak and kept tier 3 out (1.25x a Cubic flow).
 pub(crate) const CLIMB_3_QUEUE_ROUNDS: u32 = 8;
-/// Tier 3 fails when the loss share rises this much above its share at entry (or 1.5 times it).
-pub(crate) const TIER3_LOSS_RISE: f64 = 0.03;
-/// Tier 3 is locked out this long after a first failure…
+/// The window Vox's delivered rate is measured over, for tier 3's speed check.
+pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(2);
+/// Tier 3 is left when its delivered rate falls under this share of tier 2's at the switch.
+pub(crate) const TIER3_SLOWER: f64 = 0.9;
+/// Tier 3 is locked out this long after a first exit for being slower…
 pub(crate) const BACKOFF_FIRST: Duration = Duration::from_secs(30);
 /// …doubling with each further one, up to this…
 pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(480);
 /// …and back to the first after a tier-3 stay this long without one.
 pub(crate) const BACKOFF_RESET: Duration = Duration::from_secs(300);
-/// Consecutive rounds of a queue that take tier 3 to tier 2.
-pub(crate) const TIER3_QUEUE_ROUNDS: u32 = 2;
-/// In tier 3, a round's minimum round trip past this multiple of the round trip BBR can raise by
-/// itself…
-pub(crate) const TIER3_QUEUE_FACTOR: f64 = 1.25;
-/// …plus this, is a queue another flow is building (see the module docs).
-pub(crate) const TIER3_QUEUE_MIN: Duration = Duration::from_millis(4);
 /// Consecutive rounds of a stretch that descends a tier…
 pub(crate) const QUIET_ROUNDS: u32 = 40;
 /// …spanning at least this long.
@@ -206,11 +186,11 @@ impl Streak {
     }
 }
 
-/// Tier 3's lockout after failures. It outlives the controller: `IdleRestart` rebuilds the
+/// Tier 3's lockout after exits for being slower. It outlives the controller: `IdleRestart` rebuilds the
 /// connection's controller at tier 1 after an idle period, with a fresh base round trip, because the
 /// path may have changed; but it hands this on ([`Tapered::tier3_backoff`],
-/// [`Tapered::with_tier3_backoff`]), so a sender that pauses does not earn a retry of a trial that
-/// failed.
+/// [`Tapered::with_tier3_backoff`]), so a sender that pauses does not earn a retry of a tier 3 that
+/// was slower.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Tier3Backoff {
     /// The lockout the next failure imposes ([`BACKOFF_FIRST`] when `None`).
@@ -242,10 +222,11 @@ pub(crate) struct Tapered {
     mtu: u16,
     entered_at: Instant,
     rounds_in_tier: u32,
-    /// The loss share when tier 3 was entered.
-    entry_share: f64,
-    /// The base round trip when tier 3 was entered.
-    tier3_entry_base: Option<Duration>,
+    /// Vox's delivered rate at 2 -> 3, bytes per second.
+    tier3_entry_rate: f64,
+    /// (time, bytes acknowledged so far) over the last [`RATE_WINDOW`], oldest first.
+    acked: std::collections::VecDeque<(Instant, u64)>,
+    acked_total: u64,
     /// Tier 2's loss baseline while it settles: bytes sent since 1 -> 2, and the baseline marked.
     tier2_sent: u64,
     tier2_baseline: Option<f64>,
@@ -256,7 +237,6 @@ pub(crate) struct Tapered {
     queued: Streak,
     quiet: Streak,
     loss_gone: Streak,
-    queue: Streak,
 }
 
 impl Tapered {
@@ -269,8 +249,9 @@ impl Tapered {
             mtu: current_mtu,
             entered_at: now,
             rounds_in_tier: 0,
-            entry_share: 0.0,
-            tier3_entry_base: None,
+            tier3_entry_rate: 0.0,
+            acked: std::collections::VecDeque::new(),
+            acked_total: 0,
             tier2_sent: 0,
             tier2_baseline: None,
             backoff: Tier3Backoff::default(),
@@ -278,7 +259,6 @@ impl Tapered {
             queued: Streak::default(),
             quiet: Streak::default(),
             loss_gone: Streak::default(),
-            queue: Streak::default(),
         }
     }
 
@@ -299,13 +279,17 @@ impl Tapered {
         self.backoff
     }
 
-    /// The base round trip tier 3's queue test measures from: the path's, but never above what it
-    /// was when tier 3 was entered. Another flow's standing queue raises every sample, and a base
-    /// that followed it up would hide that very queue.
-    fn tier3_base(&self) -> Option<Duration> {
-        match (self.signals.min_rtt(), self.tier3_entry_base) {
-            (Some(now), Some(entry)) => Some(now.min(entry)),
-            (now, entry) => now.or(entry),
+    /// Vox's delivered rate over the last [`RATE_WINDOW`] (or what there is of it), bytes per
+    /// second: acknowledged bytes, which is what reached the peer.
+    fn delivered_rate(&self, now: Instant) -> f64 {
+        let Some(&(since, at)) = self.acked.front() else {
+            return 0.0;
+        };
+        let span = now.saturating_duration_since(since).as_secs_f64();
+        if span <= 0.0 {
+            0.0
+        } else {
+            (self.acked_total - at) as f64 / span
         }
     }
 
@@ -322,16 +306,9 @@ impl Tapered {
         self.settle_tier2_baseline();
         let share = self.signals.loss_share();
         let queued = self.signals.queue_building();
-        let tier3_queued = match (&self.tier, self.signals.round_min_rtt(), self.tier3_base()) {
-            (Tier::Bbr(bbr), Some(round_min), Some(base)) => {
-                round_min >= bbr.standing_rtt(base).mul_f64(TIER3_QUEUE_FACTOR) + TIER3_QUEUE_MIN
-            }
-            _ => false,
-        };
         let lossy =
             self.signals.losses_without_queue_in_last(1) > 0 || self.signals.loss_with_queue();
 
-        self.queue.update(now, tier3_queued);
         self.queued.update(now, queued);
         self.unqueued
             .update(now, self.queued.rounds < CLIMB_3_QUEUE_ROUNDS);
@@ -340,11 +317,10 @@ impl Tapered {
 
         let dwelt = self.rounds_in_tier >= DWELL_ROUNDS && in_tier >= DWELL_TIME;
         let decision = match self.tier_id {
-            TierId::Three if self.queue.rounds >= TIER3_QUEUE_ROUNDS => {
-                Some((TierId::Two, "a queue is building", false))
-            }
-            TierId::Three if self.signals.loss_risen(self.entry_share, TIER3_LOSS_RISE) => {
-                Some((TierId::Two, "the loss rose with the rate", true))
+            TierId::Three
+                if dwelt && self.delivered_rate(now) < TIER3_SLOWER * self.tier3_entry_rate =>
+            {
+                Some((TierId::Two, "tier 3 is slower than tier 2 was", true))
             }
             TierId::Three if dwelt && self.loss_gone.held(now, QUIET_ROUNDS, QUIET_TIME) => {
                 Some((TierId::Two, "the loss is gone", false))
@@ -453,10 +429,7 @@ impl Tapered {
                 self.tier2_baseline = Some(self.signals.trend_share());
             }
             (TierId::Two, TierId::One) => self.signals.clear_loss_baseline(),
-            (_, TierId::Three) => {
-                self.entry_share = self.signals.trend_share();
-                self.tier3_entry_base = self.signals.min_rtt();
-            }
+            (_, TierId::Three) => self.tier3_entry_rate = self.delivered_rate(now),
             _ => {}
         }
         tracing::debug!(
@@ -468,7 +441,8 @@ impl Tapered {
             window_after = self.tier.controller().window(),
             loss_share = self.signals.loss_share(),
             trend_share = self.signals.trend_share(),
-            entry_share = self.entry_share,
+            delivered_rate = self.delivered_rate(now),
+            tier3_entry_rate = self.tier3_entry_rate,
             min_rtt_us = min_rtt.as_micros() as u64,
             round_min_rtt_us = self.signals.round_min_rtt().map_or(0, |d| d.as_micros() as u64),
             srtt_us = self.signals.srtt().as_micros() as u64,
@@ -484,7 +458,6 @@ impl Tapered {
         self.queued.reset();
         self.quiet.reset();
         self.loss_gone.reset();
-        self.queue.reset();
     }
 }
 
@@ -506,6 +479,15 @@ impl Controller for Tapered {
         rtt: &RttEstimator,
     ) {
         self.signals.on_ack(now, sent, bytes, app_limited, rtt);
+        self.acked_total = self.acked_total.saturating_add(bytes);
+        self.acked.push_back((now, self.acked_total));
+        while self
+            .acked
+            .front()
+            .is_some_and(|&(t, _)| now.saturating_duration_since(t) > RATE_WINDOW)
+        {
+            self.acked.pop_front();
+        }
         self.tier
             .controller_mut()
             .on_ack(now, sent, bytes, app_limited, rtt);
@@ -543,12 +525,6 @@ impl Controller for Tapered {
         let congestion = self
             .signals
             .on_loss(now, lost_bytes, is_persistent_congestion);
-        // An ECN mark or persistent congestion takes tier 3 down at once, and the Cubic it hands
-        // to takes Cubic's cut for it below.
-        if self.tier_id == TierId::Three && (is_persistent_congestion || lost_bytes == 0) {
-            self.backoff.fail(now);
-            self.switch(now, TierId::Two, "ECN mark or persistent congestion");
-        }
         match &mut self.tier {
             Tier::Cubic(cubic) => {
                 cubic.on_loss(now, sent, is_persistent_congestion, lost_bytes, congestion)

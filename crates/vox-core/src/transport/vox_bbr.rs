@@ -29,8 +29,9 @@
 //! **quinn paces from the window, not from `pacing_rate`.** quinn-proto 0.11.18 reads a
 //! controller's pacing rate only for its metrics; its pacer runs from the window and the smoothed
 //! round trip. So BBR's gain cycle acts here only through the window (`cwnd_gain`), and BBR is
-//! window-bound: it can stand up to one bandwidth-delay product of queue by itself. The tapered
-//! controller's tier-3 queue test allows for that (`taper`).
+//! window-bound: it can stand up to one bandwidth-delay product of queue by itself. Vox keeps
+//! quinn's window gain (2, plus the acknowledgement aggregation measured): ADR-024 guarantees speed
+//! only, and a window of one bandwidth-delay product cost 7% of tier 3's speed on a lossy link.
 //!
 //! # What else is Vox's
 //! - [`VoxBbr::seeded`]: a BBR that starts from the rate, minimum round trip and window the
@@ -219,23 +220,6 @@ impl VoxBbr {
     /// The minimum round trip this BBR's model holds (zero before any sample).
     pub(crate) fn min_rtt(&self) -> Duration {
         self.min_rtt
-    }
-
-    /// The round trip this BBR can raise by itself on a path whose base round trip is `base`, with
-    /// no other flow: its target window (`cwnd_gain` bandwidth-delay products of `base`, plus the
-    /// acknowledgement aggregation it measured) drained at its bandwidth estimate. quinn paces from
-    /// the window, so this is the queue BBR alone can stand. It is computed from `base`, not from
-    /// this model's own minimum round trip, which another flow's standing queue raises; and from the
-    /// target, not the current window, which lags a falling estimate: with a Cubic flow taking share
-    /// on a 4-BDP buffer, `window / estimate` grew with the very queue it was meant to see.
-    pub(crate) fn standing_rtt(&self, base: Duration) -> Duration {
-        let bw = self.max_bandwidth.get_estimate();
-        if bw == 0 {
-            return base;
-        }
-        let target = K_DERIVED_HIGH_CWNDGAIN as f64 * bw as f64 * base.as_secs_f64()
-            + self.ack_aggregation.max_ack_height.get() as f64;
-        base.max(Duration::from_secs_f64(target / bw as f64))
     }
 
     fn enter_startup_mode(&mut self) {
