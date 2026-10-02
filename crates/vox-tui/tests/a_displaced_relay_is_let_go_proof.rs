@@ -31,7 +31,17 @@
 //! a live tunnel stays up past the grace — is RP-26's, held below by
 //! `a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace` on the same staging.
 
+// Three tests. The let-go test is optional (decider, 2026-10-01: a 60 s grace watched): it blocks
+// nothing and CI only compiles it; without `--features optional-proofs` a stand-in takes its place
+// and says it was not run (`support/optional_proof.rs`; docs/release/optional-proofs.md). RP-26's
+// `a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace` and #272's
+// `the_tunnel_cap_holds_across_a_path_upgrade` block.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -61,6 +71,7 @@ const LET_GO_WITHIN: Duration = Duration::from_secs(75);
 const UPGRADE_WITHIN: Duration = Duration::from_secs(100);
 const PAYLOAD: usize = 16 * 1024;
 
+#[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "production Argon2id + a real PoW, a relayed pair upgraded and a 60 s grace watched; run in release"]
 fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {

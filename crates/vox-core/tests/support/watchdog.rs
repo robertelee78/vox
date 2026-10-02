@@ -115,6 +115,12 @@ const DEFAULT_BUDGET: Duration = Duration::from_secs(600);
 /// for that long — the runner stalled it, or the machine slept.
 const STALL: Duration = Duration::from_secs(5);
 
+/// A process this test started that used at least this much CPU over the census's last 2 s is
+/// still working, so a budget that ran out on it is not a hang (V210-106): a debug `trust add`
+/// hashing a passphrase ran at 78%, and a release `vox serve` cut short mid-proof at 8-13%. An
+/// idle `vox` measures about 1%: only a process near 0 is stuck.
+const BUSY_PCT: f64 = 5.0;
+
 /// Twice the most one join cost a debug build: `vox room join` returning, its proof of work solved by the
 /// joining node, measured on the equivocation proof's staging (an anchor, five daemons, four
 /// joins in turn) on a machine doing its ordinary concurrent work, at load 10 to 77 (V210-99): 36
@@ -526,22 +532,33 @@ fn fire(
             "the wall clock agrees with the monotonic one (within {slept:?}): no machine sleep."
         )
     };
-    // The side, from what was measured: a machine that slept or a process that was not scheduled
-    // is the apparatus's; a process that ran throughout on an awake machine and still did not
-    // finish was held up by what it waits on — the product it drives.
-    let verdict = if asleep {
-        "NO RESULT: the machine slept during the run (below), so the budget measured nothing."
-    } else if stalled {
-        "APPARATUS STALL: this process was not scheduled for longer than the stall line (below)."
-    } else {
-        "PRODUCT HANG: this process was scheduled throughout and the machine did not sleep, so\n\
-         the time went to what it waits on — the `vox` processes it started (CPU below:\n\
-         one near 100% is spinning, one near 0 is stuck waiting)."
-    };
     // Found once, before any diagnostic runs: `ps` and `sample` are children of this process too,
     // and are waited for, so they are never in the list.
     let children = ours();
-    let cpu = cpu_census(&children);
+    let (cpu, busiest) = cpu_census(&children);
+    // The side, from what was measured: a machine that slept or a process that was not scheduled
+    // is the apparatus's. A process that ran throughout on an awake machine and still did not
+    // finish was held up by what it waits on — the product it drives — unless that product is
+    // still working: then the budget, not the product, is what ran out.
+    let working = busiest.filter(|(_, pct)| *pct >= BUSY_PCT);
+    let verdict = if asleep {
+        "NO RESULT: the machine slept during the run (below), so the budget measured nothing."
+            .to_owned()
+    } else if stalled {
+        "APPARATUS STALL: this process was not scheduled for longer than the stall line (below)."
+            .to_owned()
+    } else if let Some((pid, pct)) = working {
+        format!(
+            "CANNOT MEASURE: the budget ran out while the product was still working (CPU {pct:.0}%,\n\
+             pid {pid}, below). A budget too short for this machine and a product spinning look\n\
+             the same from here; the stacks below tell them apart."
+        )
+    } else {
+        "PRODUCT HANG: this process was scheduled throughout, the machine did not sleep, and no\n\
+         process it started was working (CPU below), so the time went to what it waits on — a\n\
+         `vox` process stuck waiting."
+            .to_owned()
+    };
     say(&format!(
         "\n\
          ==================== vox test watchdog ====================\n\
@@ -588,8 +605,9 @@ fn fire(
 }
 
 /// One line per process — this one, then `pids` — with its state, its CPU over the last 2 s, and
-/// its command line, from two `ps` samples 2 s apart.
-fn cpu_census(pids: &[u32]) -> String {
+/// its command line, from two `ps` samples 2 s apart; and the busiest of `pids` (not this one),
+/// with its CPU percentage, if any was measured.
+fn cpu_census(pids: &[u32]) -> (String, Option<(u32, f64)>) {
     let all: Vec<u32> = std::iter::once(std::process::id())
         .chain(pids.iter().copied())
         .collect();
@@ -616,21 +634,29 @@ fn cpu_census(pids: &[u32]) -> String {
     std::thread::sleep(Duration::from_secs(2));
     let after = sample();
     if after.is_empty() {
-        return "    (ps reported nothing: CPU unknown)".to_owned();
+        return ("    (ps reported nothing: CPU unknown)".to_owned(), None);
     }
-    after
+    let mut busiest: Option<(u32, f64)> = None;
+    let lines = after
         .iter()
         .map(|(pid, state, time, command)| {
             let was = before.iter().find(|(p, ..)| p == pid).and_then(|b| b.2);
             let used = match (was, time) {
-                (Some(a), Some(b)) => format!("{:>5.0}%", (b - a).max(0.0) / 2.0 * 100.0),
+                (Some(a), Some(b)) => {
+                    let pct = (b - a).max(0.0) / 2.0 * 100.0;
+                    if *pid != std::process::id() && busiest.is_none_or(|(_, top)| pct > top) {
+                        busiest = Some((*pid, pct));
+                    }
+                    format!("{pct:>5.0}%")
+                }
                 _ => "    ?%".to_owned(),
             };
             let command: String = command.chars().take(100).collect();
             format!("    {pid:>7} {state:<4} {used}  {command}")
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    (lines, busiest)
 }
 
 /// `ps`'s cumulative CPU time in seconds: `[[dd-]hh:]mm:ss[.ff]`.

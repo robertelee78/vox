@@ -51,7 +51,17 @@
 //! its claim and `working` in a separate turn, so a product that drops ownership on
 //! `blocked` is caught at checkpoint 1, not as a claim that never arrived.
 
+// Optional (decider, 2026-10-01): it needs a live model, so it blocks nothing and CI only
+// compiles it. Without `--features optional-proofs` a stand-in takes its place and says it was not
+// run (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict
+);
 
 #[path = "support/room.rs"]
 mod support;
@@ -66,12 +76,6 @@ use std::time::Duration;
 
 use support::{Out, Worker, HARNESS_SESSION_VARS, VOX};
 
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
-}
 fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -456,14 +460,16 @@ fn instructions(steps: &[&str]) -> String {
     )
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "two nodes, production Argon2id, and live model turns; CI runs it in release"]
+#[ignore = "two nodes, production Argon2id, and live model turns; optional, run it in release"]
 fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict() {
     watchdog::arm();
-    if which("opencode").is_none() || !auth_present() {
-        assert!(allow_unproven("opencode"), "UNPROVEN: the rehearsal needs `opencode` and a credential. Set VOX_PROOF_ALLOW_UNPROVEN=opencode to accept that gap deliberately.");
-        return;
-    }
+    assert!(
+        which("opencode").is_some() && auth_present(),
+        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH and a credential \
+         (~/.local/share/opencode/auth.json)"
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
