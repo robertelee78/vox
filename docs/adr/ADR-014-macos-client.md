@@ -4,8 +4,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status**: proposed. On integrate/v0.3.0 only the embedded node over FFI (requirements 11.x,
 `crates/vox-ffi`) is built. The macOS app itself (requirements 1.1–10.x) is not started; each of
-those requirements is *planned*. The iOS app (PRD-001 R30) is planned for v0.4.0, and calls (PRD-001
-R32) are planned for v0.4.0; neither is a v0.3.0 requirement.
+those requirements is *planned*. The iOS app (PRD-001 R30, #78) and calls (PRD-001 R32, #79) are
+planned for v0.4.0; neither is a v0.3.0 requirement.
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee
 **Tags**: client, macos, ux, verification, consent-ui, ffi
@@ -37,10 +37,9 @@ the client presents it.
      decrypted text for display, verification and consent states, sync status.
 1.5. The app MUST be distributed as a notarized, hardened-runtime app signed with Developer ID (direct
      download or DMG). It MUST NOT be distributed through the Mac App Store, whose sandbox does not
-     allow a long-lived background node agent. App Sandbox entitlements SHOULD be applied where they
-     are compatible with the app's other components.
-1.6. If the app installs a privileged helper or system extension, it MUST claim what it needs once, at
-     install. Nothing on the data path MUST be privileged.
+     allow a long-lived background node agent. App Sandbox entitlements MUST be applied where they are
+     compatible with the app's other components.
+1.6. The data path MUST NOT require privilege.
 
 ### 2. Identity and onboarding
 
@@ -120,7 +119,7 @@ the client presents it.
 6.1. The app MUST send text and files. *Planned.*
 6.2. Entries the user cannot decrypt MUST NOT be shown. Where the gap would confuse, the app MUST show
      a non-leaking "messages you haven't been given access to" marker.
-6.3. Calls (PRD-001 R32) are planned for v0.4.0 as an app on the app API (ADR-022) and are not part of
+6.3. Calls (PRD-001 R32, #79) are planned for v0.4.0 as an app on the app API (ADR-022) and are not part of
      this client's v0.3.0 scope.
 
 ### 7. Node operation and availability
@@ -128,8 +127,11 @@ the client presents it.
 7.1. The app MUST embed the node and run it while the app runs. *Planned; the embedding is built
      (11.x).*
 7.2. The app MUST be able to point at any user-run node as its anchor (ADR-012). Vox MUST NOT mandate
-     a topology: every option MUST be configurable and none compulsory.
-7.3. The app MUST show per-channel reachability and sync state, and node and anchor status. For a
+     a topology: every option MUST be configurable, and none MUST be made compulsory.
+7.3. Vox MUST also ship a headless node binary (the same Rust core, no UI) for an always-on box with a
+     port forward, for reachability while the Mac sleeps (ADR-012). *Built as `vox node` and
+     `vox daemon`.*
+7.4. The app MUST show per-channel reachability and sync state, and node and anchor status. For a
      two-member channel it MUST say "both must be online, or your node reachable".
 
 ### 8. Tunneling
@@ -139,13 +141,17 @@ the client presents it.
 8.2. Chat membership MUST NOT grant tunnel reach (ADR-017 decision 3). A room MAY carry chat and
      tunnels at once.
 8.3. The app's tunneling surface MUST follow ADR-017. Per-member `bind:`/`dial:` grants and a
-     privileged TUN `vox up` are withdrawn (ADR-017's third revision; PRD-001 R44 removes their code).
+     privileged TUN `vox up` are withdrawn by policy (ADR-017's third revision). Removing the
+     withdrawn capability model's remaining code (`governance::capability`'s `bind:`/`dial:`
+     prefixes and its evaluator) is *planned* (PRD-001 R44, #94).
 
 ### 9. Notifications
 
 9.1. A background LaunchAgent MUST keep the node syncing and MUST post a native local notification for
      each new decryptable entry. There MUST be no APNs and no third party (ADR-001). *Planned.*
 9.2. Notification previews MUST be hidden by default.
+9.3. The cost — a persistent background process and its battery/power use — is accepted and stated
+     honestly.
 
 ### 10. At rest and device seizure
 
@@ -164,7 +170,7 @@ the client presents it.
       *Built.*
 11.2. Only these MUST cross the boundary: in — a profile directory, passphrases (consumed, never
       returned), room links, text, app-stream labels and bytes; out — fingerprints and room ids as
-      base32, rendered messages, event notices, app-stream bytes and datagrams. No key material MUST
+      base32, rendered messages, event notices, app-stream bytes and datagrams. Key material MUST NOT
       cross. *Built.*
 11.3. The surface is `VoxNode.start(dataDir, passphrase, listen)` (creates the identity on first use,
       unlocks it after), `stop`, `fingerprint`, `rooms`, `createRoom`, `openRoom`, `joinRoom(link)`,
@@ -181,7 +187,7 @@ the client presents it.
 11.7. `crates/vox-tui/tests/ffi_swift_proof.rs` MUST prove the macOS slice from Swift against a real
       `vox daemon`: join, post, receive through `EventListener`, a 1 MiB app-stream round trip and
       100 datagrams. *Built.*
-11.8. The iOS app is planned for v0.4.0 (PRD-001 R30). On integrate/v0.3.0 the
+11.8. The iOS app is planned for v0.4.0 (PRD-001 R30, #78). On integrate/v0.3.0 the
       `ios-arm64-simulator` slice runs in a simulator (`scripts/ios-sim-smoke.sh`: start, create a
       room, post, read it back); the `ios-arm64` device slice is linked but not run; no iOS run has
       reached another node and no app bundle has been built.

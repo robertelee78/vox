@@ -32,8 +32,9 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
      through a `CancellationToken`. Rendering MUST NOT block on the core. *Built.*
 1.4. Core to UI MUST carry latest-wins state (a `ViewModel`) and ordered events that never coalesce;
      UI to core MUST carry typed commands. These MUST carry only rendered, redacted data: decrypted
-     display text, yes; keys, SKDMs, passphrases, the SEK and `self_seed`, never. Errors and command
-     results MUST be bounded types with fixed messages, not free text. *Built.*
+     display text, yes; keys, SKDMs, passphrases, the SEK and `self_seed`, never. The channels MUST be
+     bounded; view-state updates are newest-wins, and events MUST NOT be dropped. *Built (errors and
+     command results are bounded types with fixed messages).*
 
 ### 2. Stack
 
@@ -53,8 +54,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 3.3. An optional vim mode MAY be offered through configuration. *Planned.*
 3.4. A `:` command palette MUST be a modal overlay that `Esc` dismisses, and a keybind hint bar MUST
      always be shown. *Built.*
-3.5. Every action MUST be reachable by a typed `:` command, except creating and joining a room, which
-     need a passphrase and MUST go through the masked prompt (11.3), never the palette line. *Built.*
+3.5. Every action MUST be reachable by a typed `:` command. *Built, except creating and joining a
+     room, which need a passphrase and go through a masked prompt instead of the palette line.*
 
 ### 4. Verification
 
@@ -63,9 +64,10 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
      file MAY give scan-equivalent verification. *Planned.*
 4.2. The safety code MUST be the grouped decimal of `SHA-256("vox/safety/v1" ‖ pk_lo ‖ pk_hi)`, where
      `pk_lo` and `pk_hi` are the two parties' composite identity public keys (ADR-002) in ascending
-     byte order, rendered as 8 groups of 5 digits. The verification QR payload MUST be canonical CBOR
-     `[label, composite_pubkey]` of the displaying party, strictly decoded. *The derivation and QR
-     payload are built (`verify`); showing them in the TUI is planned.*
+     byte order. The verification QR payload MUST be a canonical-CBOR record of the displaying party's
+     composite public key (ADR-008 encoding). *The derivation (8 groups of 5 digits) and the QR
+     payload (`[label, composite_pubkey]`, strictly decoded) are built in `verify`; showing them in
+     the TUI is planned.*
 4.3. Verification state MUST move `unverified-TOFU → verified` on a successful scan or comparison,
      and any key change MUST reset it to `key-changed`. The state MUST be persisted per member in the
      room's store. *Planned (`:verify` answers "not available yet").*
@@ -75,7 +77,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 ### 5. Identity and onboarding
 
 5.1. The TUI MUST create an Ed25519 identity with its ML-DSA co-key and a 256-bit `self_seed`
-     (ADR-002), collected through the masked prompt. *Built.*
+     (ADR-002). *Built, through a masked prompt that echoes one `•` per character into zeroizing
+     buffers.*
 5.2. Generate path: the root MUST be held in locked, zeroized memory while unlocked and, at rest, in
      the identity vault (Argon2id over the identity passphrase), separate from every room SEK
      (ADR-010). *Built.*
@@ -117,8 +120,7 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
      MUST stay in the list marked "Blocked"; Block MUST NOT remove anyone. **Unblock** MUST restore the
      user's own outbound consent and inbound visibility, and MUST NOT claim to restore the peer's
      consent. *Planned (answers "not available yet").*
-7.4. Revoking consent MUST rotate the user's sender key to a generation the member holds no key for.
-     It is forward-only, and MUST NOT claim to recall what the member already received. *Built.*
+7.4. Revoking outbound consent MUST behave as ADR-014 requirement 5.5 states (ADR-007). *Built.*
 7.5. Per member, the TUI MUST show whether the user consented to them and, where known, whether they
      consented to the user; a newcomer MUST be told they will see each member's messages as that
      member allows. *Planned.*
@@ -133,7 +135,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 ### 9. Node operation and notifications
 
 9.1. The TUI MUST embed the node while running, or sync with a user-run node as a ciphertext-only
-     peer (1.2). Neither MUST be compulsory. It MUST show per-room reachability and sync state. *Built.*
+     peer (1.2). The TUI MUST NOT make either compulsory. It MUST show per-room reachability and sync
+     state. *Built.*
 9.2. New decryptable entries MUST show in the app (unread markers on the room list, a status line).
      *Built.*
 9.3. On a desktop session the TUI MUST also raise an OS notification, and over SSH it MUST fall back to
@@ -141,7 +144,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
      runs. *Planned.*
 9.4. `vox daemon` MUST pass every node event through the one failure reporter the CLI uses
      (`tunnel_cli::say_if_it_explains_a_failure`), so it reports an unreachable peer, a refused
-     publish or a stall as `vox node` does. *Built.*
+     publish or a stall as `vox node` does. *Built: the daemon reported no failures at all until
+     `f3f8a94e` fixed it.*
 
 ### 10. Tunneling
 
@@ -149,28 +153,29 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
       nothing reachable until the user turns it on. *Built (`vox serve`, `vox up`, `vox forward`).*
 10.2. Room membership MUST NOT grant tunnel reach (ADR-017 decision 3). *Built.*
 10.3. The TUI's tunneling surface MUST follow ADR-017. Per-member `bind:`/`dial:` grants and a
-      privileged TUN `vox up` are withdrawn (ADR-017's third revision; PRD-001 R44 removes their
-      code): `vox up` is an unprivileged SOCKS5 proxy (ADR-017 decision 5). *Built.*
+      privileged TUN `vox up` are withdrawn by policy (ADR-017's third revision). `vox up` is an
+      unprivileged SOCKS5 proxy (ADR-017 decision 5): *built*. Removing the withdrawn capability
+      model's remaining code (`governance::capability`'s `bind:`/`dial:` prefixes and its evaluator)
+      is *planned* (PRD-001 R44, #94).
 
 ### 11. At rest, lock and screen
 
 11.1. Plaintext MUST be drawn only on the alternate screen, never the primary buffer, so it never
       enters scrollback. The TUI MUST enter the alternate screen before any draw and MUST leave it,
-      cleared, with a best-effort `ESC[3J`, on every exit path. *Built.*
+      cleared, with a best-effort `ESC[3J`, on every exit path. *Built.* Known limit: non-cooperating
+      emulators, `tmux`/`screen`, or `script` may retain copies (not claimed-fixed).
 11.2. Lock MUST zeroize the room SEKs, the in-memory identity root (generate path) and the decrypted
       view models, and MUST require the identity vault and each room's passphrase again. For a
       `gpg-agent` key, Vox MUST clear only its own derived material. *Built for the generate path.*
-11.3. Passphrases MUST be read through a masked prompt that echoes one `•` per character into
-      zeroizing buffers and reports a mismatch without echoing input. *Built.*
-11.4. The TUI MUST lock after 5 minutes idle (the default) and on `SIGHUP` or a dropped connection. The
+11.3. The TUI MUST lock after 5 minutes idle (the default) and on `SIGHUP` or a dropped connection. The
       lock MUST be configurable, including off, with a direct warning. *The 5-minute idle lock, `:lock`
       and `SIGHUP` are built; configuring them is planned.*
-11.5. The node MUST track every task it hands a signer handle to and abort them all when it locks,
+11.4. The node MUST track every task it hands a signer handle to and abort them all when it locks,
       before it drops the prekey ring, so no task outlives the lock holding the identity. *Built
       (`Profile::signer_arc`).*
-11.6. Inside a detected terminal multiplexer the TUI MUST show a one-time warning that capture there
+11.5. Inside a detected terminal multiplexer the TUI MUST show a one-time warning that capture there
       is outside Vox's control. *Planned.*
-11.7. Secrets MUST be `zeroize`/`secrecy` types and MUST be memory-locked. Where locking is
+11.6. Secrets MUST be `zeroize`/`secrecy` types and MUST be memory-locked. Where locking is
       unavailable (`RLIMIT_MEMLOCK=0`), the client MUST show a prominent warning and continue with
       zeroize only. It MUST NOT pretend. *Built ("mlock unavailable (zeroize-only)").*
 
@@ -249,7 +254,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
       elsewhere MUST abort.
 17.7. Size and SHA-256 MUST both be verified before anything is renamed into place, and the transfer
       MUST be bounded by the record's `size`.
-17.8. A candidate binary MUST be closed before anything executes it.
+17.8. A candidate binary MUST be closed before anything executes it. (`vox update` never worked on
+      Linux until `4ea10789` fixed this: `execve` returned `ETXTBSY` on the still-open candidate.)
 17.9. Publishing MUST be atomic: write the candidate beside the destination on the same filesystem,
       keep the active binary as `.previous`, then rename. `--rollback` MUST restore the previous one.
 17.10. Only an install this installer made MAY be updated in place, identified by
@@ -260,7 +266,7 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
        marker that is present but not canonical MUST be reported as a broken install.
 17.11. Every release MUST also publish `proof-<triple>.json` (the real version and size, and a
        deliberately wrong `sha256`) so the updater's mismatch refusal is proved end to end (ADR-018).
-       Nothing MUST select that channel by default.
+       That channel MUST NOT be selected by default.
 17.12. On macOS, `vox update` MUST authenticate the candidate through Apple before publishing it, and
        the candidate MUST carry the same Developer ID as the installed binary. It MUST run `codesign
        --verify --strict --all-architectures` on both; parse `codesign --display --verbose=4` for each
@@ -271,11 +277,12 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
        be exactly what the record's version implies.
 17.13. `install.sh` MUST pin the expected team and identifier (`us.vox.cli`) itself and make the same
        signature and notarization checks. That pin and the workflow's `APPLE_CODESIGN_IDENTIFIER` and
-       `APPLE_TEAM_ID` MUST agree. Neither client MUST read its trust expectations from the release
+       `APPLE_TEAM_ID` MUST agree. The clients MUST NOT read their trust expectations from the release
        record.
 17.14. On Linux there is no signature check: an update rests on TLS to GitHub and the record's digest.
-       This MUST be stated as a known gap, not papered over. A detached release signature against a
-       compiled-in key is not adopted.
+       This MUST be stated as a known gap, not papered over. A detached release signature verified
+       against a key compiled into the binary is what would close that, and is deliberately not in
+       this change: it needs a release key with its own custody story. Recorded as a known gap.
 17.15. Targets MUST be `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`.
        The macOS floor MUST be 11.0, pinned with `MACOSX_DEPLOYMENT_TARGET` and asserted by the signer.
 17.16. macOS artifacts MUST be signed with a Developer ID Application certificate and notarized.
@@ -309,6 +316,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 
 18.1. The client's claims MUST be proved as ADR-018 requires: only real use of the shipped binary
       counts. There MUST be no unit-test, render-snapshot or input-injection gate.
+18.2. Known limit: the runtime's shutdown/backpressure and the terminal-compatibility matrix are
+      exercised manually, not by tests.
 
 ## Consequences
 
@@ -318,6 +327,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
   in-terminal fallback, mitigated by keeping scan primary and prompting.
 - Memory locking can be unavailable on the container targets this client favours; that is warned
   about, not hidden.
+- Terminal a11y has real limits (screen-reader/TUI variance); addressed by the executable a11y mode
+  and stated honestly. No rich media in the terminal.
 - A Linux update has no signature check (17.14).
 
 ## Related ADRs
