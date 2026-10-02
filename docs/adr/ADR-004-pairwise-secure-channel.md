@@ -4,7 +4,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status:** accepted and built in `crates/vox-core/src/pairwise/`, `node::prekeys` and
 `node::joinstream`, except: PQ post-compromise security (§"Post-quantum PCS (phased)") is not built;
-the skipped-key bounds (W3) are fixed constants, not channel-policy settings.
+the skipped-key bounds (W3) are fixed constants, not channel-policy settings; prekey bundles are
+published only at the rendezvous, not on the log (P1).
 **Deciders:** Robert E. Lee <robert@agidreams.us>
 
 ## Context
@@ -61,8 +62,9 @@ see this layer; they see only the channel.
 ### §Prekey Publication (serverless)
 
 - **P1.** There MUST be no prekey server. A member MUST publish its signed prekey bundle (ADR-002 §2)
-  as a signed record at the channel rendezvous (ADR-005, ADR-016 member bundle record); an initiator
-  fetches a bundle there and consumes a one-time prekey.
+  as a signed record at the channel rendezvous (ADR-005, ADR-016 member bundle record) or on the log
+  (ADR-008); an initiator fetches a bundle there and consumes a one-time prekey. Today bundles are
+  published only as rendezvous records; publication on the log is not built.
 - **P2.** One-time-prekey exhaustion MUST fall back to the signed last-resort prekey, never to no
   prekey.
 - **P3.** Pre-join peers MUST publish prekeys in the separate pre-join rendezvous record class

@@ -49,8 +49,9 @@ encoding. Role separation limits the blast radius of a compromise.
 - **R2.2.** A signed prekey MUST be an X25519 key plus an ML-KEM-768 keypair, both signed by the root.
   It MUST rotate every 7 days (`SIGNED_PREKEY_CADENCE_SECS`), and the previous signed prekey MUST be
   retained for one cadence to complete in-flight sessions.
-- **R2.3.** One-time prekeys MUST be X25519 and ML-KEM-768 keys, each signed by the root, each consumed
-  at most once per inbound session. The pool MUST be refilled when it drops below its low-water mark
+- **R2.3.** One-time prekeys MUST be X25519 and ML-KEM-768 keys, each signed by the root. Each one-time
+  prekey MUST be offered for at most one inbound session and MUST NOT be offered again once consumed; a
+  concurrent duplicate is graded per ADR-004 C1. The pool MUST be refilled when it drops below its low-water mark
   (`ONE_TIME_PREKEY_LOW_WATER`). When the pool is empty a session MUST fall back to the signed
   (last-resort) prekey, never to no prekey.
 - **R2.4.** A restored prekey ring MUST re-derive each public key from its stored secret and refuse a
@@ -120,7 +121,7 @@ encoding. Role separation limits the blast radius of a compromise.
   between a device and an identity.
 - **D2. (planned)** Shared root: the same root on several devices. Devices MUST share received consent
   (SKDMs) and channel state over the identity-keyed self-channel (ADR-008), so adding a device needs no
-  re-consent by peers.
+  re-consent by peers. The `self_seed` (B2) MUST be synced to a new device at enrollment.
 - **D3.** Per-device keys: each device is a distinct identity. A member MAY publish device sub-keys
   cross-signed by a shared root as a convention Vox does not enforce. Clients MUST represent device
   keys so consent is never granted to an unrecognized device by accident (ADR-014).
@@ -140,6 +141,7 @@ encoding. Role separation limits the blast radius of a compromise.
 - No central trust anchor; identity is user-controlled and interoperates with OpenPGP fingerprints.
 - Manual fingerprint verification is a UX burden (ADR-014).
 - Root loss is unrecoverable; backup is on the user.
+- With no device attestation, per-device-key users manage persona coherence themselves.
 - Composite signatures and ML-KEM prekeys are larger and slower than classical keys alone (ADR-003,
   ADR-008).
 
