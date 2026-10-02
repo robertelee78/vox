@@ -56,7 +56,9 @@
 //!   answers to …", not a host's refusal), and neither room's service is ever dialled.
 //!
 //! Every red in those two proofs says which kind it is: **PRODUCT** (what the product did, as a
-//! person sees it) or **CANNOT MEASURE** (the case was never staged, so the run says nothing).
+//! person sees it), **PRODUCT (staging)** (a step vox itself performs before the claim failed),
+//! or **APPARATUS** / **CANNOT MEASURE** (the proof's own fault, or a case the shared harness never
+//! staged, so the run says nothing).
 //!
 //! ## Why it is `#[ignore]`d
 //!
@@ -366,19 +368,19 @@ fn a_refused_socks_connect_is_refused_in_the_reply_and_says_why() {
 }
 
 /// A trusted session through `vox up`, carrying bytes: the staging both trust proofs start
-/// from. A refused or failed session is CANNOT MEASURE — the claims are about what happens
-/// *after* it; a proxy that breaks the SOCKS exchange is `socks5_connect`'s PRODUCT red.
+/// from. Every failure here is vox's own, so it is `PRODUCT (staging)`; a proxy that breaks the
+/// SOCKS exchange is `socks5_connect`'s PRODUCT red.
 fn live_session(up: &mut VoxProc, at: std::net::SocketAddr, name: &str, port: u16) -> TcpStream {
     let (code, mut s) = socks5_connect(at, name, port);
     assert_eq!(
         code,
         0,
-        "CANNOT MEASURE: staging not achieved — a trusted member's CONNECT to {name}:{port} was \
-         refused (reply {code}); vox up said:\n{}",
+        "PRODUCT (staging): vox up refused a trusted member's CONNECT to {name}:{port} \
+         (reply {code}); vox up said:\n{}",
         up.transcript()
     );
     s.set_read_timeout(Some(Duration::from_secs(30)))
-        .expect("CANNOT MEASURE: setting a read timeout on the session");
+        .expect("APPARATUS: setting a read timeout on the proof's own socket");
     let echoed = s
         .write_all(b"are you there")
         .and_then(|()| {
@@ -386,13 +388,11 @@ fn live_session(up: &mut VoxProc, at: std::net::SocketAddr, name: &str, port: u1
             s.read_exact(&mut back).map(|()| back)
         })
         .unwrap_or_else(|e| {
-            panic!(
-                "CANNOT MEASURE: staging not achieved — the trusted session carried no echo: {e}"
-            )
+            panic!("PRODUCT (staging): the trusted session through vox up carried no echo: {e}")
         });
     assert_eq!(
         &echoed, b"are you there",
-        "CANNOT MEASURE: staging not achieved — the echo came back altered"
+        "PRODUCT (staging): the trusted session through vox up altered the echo"
     );
     s
 }
@@ -415,7 +415,7 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
     let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         dialled, 1,
-        "CANNOT MEASURE: the service counted {dialled} connections for one session, so it cannot \
+        "PRODUCT (staging): the service counted {dialled} connections for one session, so it cannot \
          say whether a later one was dialled"
     );
     eprintln!("[test] step 1: a trusted session through vox up echoed; the service counted 1");
@@ -504,19 +504,16 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     let (other_port, other_accepted) = counting_echo_service();
     let other_dir = w.tmp.path().join("other-host");
     std::fs::create_dir_all(other_dir.join("cfg"))
-        .expect("CANNOT MEASURE: creating the other host's profile directory");
+        .expect("APPARATUS: creating the other host's profile directory");
     let (ok, _, err) = vox_once(&other_dir, &args(&["id"]));
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — vox id (other host): {err}"
-    );
+    assert!(ok, "PRODUCT (staging): `vox id` (other host) failed: {err}");
     let (ok, out, err) = vox_once(
         &other_dir,
         &args(&["trust", "add", &w.guest_fp, "--name", "the guest"]),
     );
     assert!(
         ok,
-        "CANNOT MEASURE: staging not achieved — the other host's trust add: {out}\n{err}"
+        "PRODUCT (staging): the other host's `vox trust add` failed: {out}\n{err}"
     );
     let mut other = VoxProc::spawn(
         "other-host",
@@ -536,7 +533,7 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     );
     assert_ne!(
         other_room, w.room,
-        "CANNOT MEASURE: staging not achieved — the other host printed this world's room"
+        "PRODUCT (staging): the other host's `vox serve` printed this world's room"
     );
     let other_name = format!("{other_room}.vox");
 
@@ -550,7 +547,7 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     let joined = accepted.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         joined, 1,
-        "CANNOT MEASURE: the joined room's service counted {joined} connections for one session"
+        "PRODUCT (staging): the joined room's service counted {joined} connections for one session"
     );
     eprintln!("[test] control: the joined room's name was carried; its service counted 1");
 
