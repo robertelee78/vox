@@ -74,7 +74,14 @@ Two fields change how a message is delivered:
 - `--urgent` — **interrupts** the named agent mid-turn instead of waiting for its
   next one. Use it when work is blocked on the answer, and not otherwise. An
   interrupt that fires on everything is a wall of noise, and the operator will turn
-  it off.
+  it off. The interrupt is a notice from Vox naming how many messages wait and from
+  whom; the messages themselves arrive in your room read, first, in that same turn.
+- `--re <entry>` — what you are answering. An answer to something you asked
+  someone is announced to you once you are idle: in Claude Code at the end of your
+  turn; in OpenCode only after ten minutes with no turn; in Codex not at all, so
+  there you read it at your next turn. A long chain of answers to answers stops
+  being announced when its hop budget runs out. One notice at a time: until you read
+  the last one (or ten minutes pass), no further notice of either kind is sent.
 
 ## Splitting work
 
