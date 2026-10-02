@@ -15,8 +15,8 @@
 //!   ([`Evaluator::authority_of`], [`Evaluator::grants`]).
 //! - **Consent visibility**: who can read whom, from the single-writer consent
 //!   timeline ([`Evaluator::can_read`], [`Evaluator::readers_of`]).
-//! - **Effective channel policy**: the latest history/TTL from policy-updates over
-//!   genesis ([`Evaluator::policy`]).
+//! - **Effective channel policy**: the genesis policy with the latest retention (TTL)
+//!   from policy-updates ([`Evaluator::policy`]).
 //!
 //! ## One causal relation + one canonical order (the unifying construction)
 //! There is a **single** causal relation (`Causality`), used identically for the
@@ -75,7 +75,6 @@ use crate::governance::entry::{GovBody, GovEntry};
 use crate::governance::genesis::{ChannelPolicy, Genesis};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
-use crate::suite::SuiteFloor;
 
 /// The verdict for an authority query: granted (with the governing capability and
 /// the effective set) or denied (with a reason).
@@ -154,11 +153,11 @@ pub struct Evaluator {
     denied: BTreeMap<Digest32, DenyReason>,
     /// The effective channel policy after applying policy-updates over genesis.
     policy: ChannelPolicy,
-    /// The current channel-global epoch after applying authorized passphrase
-    /// rotations over genesis (genesis = epoch 0).
+    /// The channel-global epoch: the genesis epoch, 0. Passphrase rotation, the only
+    /// thing that advanced it, is removed (V030-32).
     current_epoch: u64,
     /// Consent edges: author `A` → set of targets `N` that `A` currently consents
-    /// to (after single-writer latest-causal resolution + revocation rotation).
+    /// to (after single-writer latest-causal resolution).
     consent: BTreeMap<Digest32, BTreeSet<Digest32>>,
     /// The genesis **service grant** (ADR-017 decision 3): capabilities every member
     /// holds with no certificate. Empty for every channel that does not use one.
@@ -350,7 +349,6 @@ impl Evaluator {
             GovBody::ConsentRevocation(r) => r.verify(author_key),
             GovBody::ServiceGrantExclusion(x) => x.verify(author_key),
             GovBody::PolicyUpdate(p) => p.verify(author_key),
-            GovBody::PassphraseRotation(r) => r.verify(author_key),
             GovBody::Lifecycle(l) => l.verify(author_key),
         }
     }
@@ -369,15 +367,15 @@ impl Evaluator {
         self.root_admin
     }
 
-    /// The effective channel policy (history/ttl from updates).
+    /// The effective channel policy (the genesis policy, with the retention from updates).
     #[must_use]
     pub fn policy(&self) -> ChannelPolicy {
         self.policy
     }
 
-    /// The current channel-global epoch (genesis = 0, advanced by each authorized
-    /// passphrase-rotation). Callers binding sender keys / join to `(channelID,
-    /// epoch)` use this as the in-force epoch.
+    /// The current channel-global epoch: the genesis epoch, 0 (V030-32 removed the
+    /// passphrase rotation that advanced it). Callers binding sender keys / join to
+    /// `(channelID, epoch)` use this as the in-force epoch.
     #[must_use]
     pub fn current_epoch(&self) -> u64 {
         self.current_epoch
@@ -539,17 +537,13 @@ struct Resolved {
 /// concurrent-or-after fact is consulted is the **removal-wins** kill test on the
 /// final (head) authority.
 ///
-/// Two intertwined quantities are resolved together over a scope:
-/// - the **established epoch** (chain of in-effect, authorized passphrase-rotations,
-///   each chaining `old_epoch == current`), and
-/// - the **authority** (chain-to-genesis + monotonic attenuation + expiry +
-///   removal-wins + the causal-supersession/ascending-hash tie-break).
+/// Over a scope it resolves the **authority** (chain-to-genesis + monotonic
+/// attenuation + expiry + removal-wins + the causal-supersession/ascending-hash
+/// tie-break) and the established epoch, which is always the genesis epoch since
+/// passphrase rotation was removed (V030-32).
 ///
 /// An entry is **in-effect** iff its body epoch equals the epoch established in its
-/// strict past (`epoch_strict_before`): a stale- or future-epoch entry confers
-/// nothing — which structurally prevents the future-epoch bootstrap (an epoch-1
-/// cert is not in-effect at the causal position where the rotation-to-epoch-1 is
-/// being authorized, so it cannot authorize that rotation).
+/// strict past: an entry bound to any other epoch confers nothing.
 struct Resolver<'a> {
     root_admin: Digest32,
     causality: &'a Causality<'a>,
@@ -583,7 +577,7 @@ impl<'a> Resolver<'a> {
 
     /// The resolved authority+epoch over an entry's STRICT causal past
     /// (`ancestors[X]`), memoized. This is the *only* authority/epoch a decision
-    /// about `X` (authorizing a revocation, a rotation, or a delegation's issuer)
+    /// about `X` (authorizing a revocation or a delegation's issuer)
     /// may consult.
     fn strict_before(&mut self, x: &Digest32) -> Result<Resolved> {
         if let Some(r) = self.strict_before.get(x) {
@@ -602,7 +596,7 @@ impl<'a> Resolver<'a> {
 
     /// Whether entry `e` is **in-effect**: its body epoch equals the epoch
     /// established in its strict past. (Genesis/cert/consent/etc. all carry an
-    /// epoch via `channel_and_epoch`; a rotation carries its `old_epoch`.)
+    /// epoch via `channel_and_epoch`.)
     fn in_effect(&mut self, e: &GovEntry) -> Result<bool> {
         let (_cid, body_epoch) = e.body.channel_and_epoch();
         let before = self.strict_before(&e.entry_hash)?;
@@ -614,35 +608,10 @@ impl<'a> Resolver<'a> {
     /// own strict past (recursively, memoized); removal-wins is applied within
     /// `scope`.
     fn resolve_scope(&mut self, scope: &BTreeSet<Digest32>) -> Result<Resolved> {
-        // ---- Established epoch: fold in-effect, authorized rotations in canonical
-        // order, each chaining old_epoch == current. ----
-        let mut epoch = 0u64;
-        for e in &self.causality.order {
-            if !scope.contains(&e.entry_hash) {
-                continue;
-            }
-            let GovBody::PassphraseRotation(r) = &e.body else {
-                continue;
-            };
-            // In-effect: the rotation's old_epoch must equal the epoch established
-            // in ITS strict past, AND chain off the running epoch.
-            if !self.in_effect(e)? {
-                continue;
-            }
-            if r.body.old_epoch != epoch {
-                continue;
-            }
-            // Authorized: author holds passphrase-rotate in the rotation's strict
-            // past (never from concurrent/later facts).
-            let before = self.strict_before(&e.entry_hash)?;
-            let authorized = before
-                .authority
-                .get(&e.author_id)
-                .is_some_and(|c| c.grants(&Capability::PassphraseRotate));
-            if authorized && r.body.new_epoch > epoch {
-                epoch = r.body.new_epoch;
-            }
-        }
+        // ---- Established epoch: always the genesis epoch. Only a passphrase rotation
+        // ever moved it, and rotation is removed (V030-32): no command wrote one, and a
+        // body of that kind no longer parses. ----
+        let epoch = 0u64;
 
         // ---- Authorized revocations in scope: each authorized from ITS strict
         // past (not from `scope` at large, never from concurrent/later facts). ----
@@ -673,7 +642,7 @@ impl<'a> Resolver<'a> {
             if before
                 .authority
                 .get(&rb.body.issuer_id)
-                .is_some_and(|c| c.grants(&Capability::Delegate))
+                .is_some_and(|c| c.grants(&Capability::Admin))
             {
                 authorized_revs.push((e, target));
             }
@@ -710,7 +679,10 @@ impl<'a> Resolver<'a> {
             // Only the room's creator names admins (#319): a certificate any
             // other member issued confers nothing, whatever that member holds.
             let by_creator = c.body.issuer_id == self.root_admin;
-            issuer_ok.insert(e.entry_hash, unexpired && in_effect && issuer_superset && by_creator);
+            issuer_ok.insert(
+                e.entry_hash,
+                unexpired && in_effect && issuer_superset && by_creator,
+            );
 
             // Removal-wins: killed iff some authorized revocation of this delegate's
             // lineage is NOT causally-before this delegation (concurrent or after).
@@ -797,7 +769,8 @@ impl<'a> Resolver<'a> {
 
     /// Resolve the effective channel policy: fold in-effect policy-updates whose
     /// author holds `policy` in the update's STRICT past, over the canonical order,
-    /// taking the latest history/ttl.
+    /// taking the latest retention (`ttl`). A policy update carries nothing else
+    /// (V030-32): history mode and the suite floor stay as the genesis set them.
     fn resolve_policy(&mut self, genesis: &Genesis) -> Result<ChannelPolicy> {
         let mut policy = genesis.body.policy;
         let order: Vec<&GovEntry> = self.causality.order.clone();
@@ -816,26 +789,8 @@ impl<'a> Resolver<'a> {
             {
                 continue;
             }
-            if let Some(hm) = p.body.history_mode {
-                policy.history_mode = hm;
-            }
             if let Some(ttl) = p.body.ttl {
                 policy.ttl = ttl;
-            }
-            // The ciphersuite floor is raise-only (ADR-003: "the floor advances
-            // deliberately and never silently downgrades"). An authorized update
-            // naming a suite ranked below the floor in force is ignored — its
-            // other fields still apply. Both ids are registered (validated on
-            // decode / at genesis), so the lookups cannot fail; a miss would be
-            // an internal invariant breach and is treated as "not a raise".
-            if let Some(id) = p.body.min_suite {
-                let raise = SuiteFloor::new(id)
-                    .ok()
-                    .zip(SuiteFloor::new(policy.min_suite).ok())
-                    .is_some_and(|(new, cur)| cur.permits_raise_to(new));
-                if raise {
-                    policy.min_suite = id;
-                }
             }
         }
         Ok(policy)
@@ -951,7 +906,7 @@ impl<'a> Resolver<'a> {
             if before
                 .authority
                 .get(&x.body.issuer_id)
-                .is_some_and(|c| c.grants(&Capability::Delegate))
+                .is_some_and(|c| c.grants(&Capability::Admin))
             {
                 excluded.insert(x.body.target_id);
             }

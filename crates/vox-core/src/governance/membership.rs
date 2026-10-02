@@ -26,7 +26,6 @@ use crate::error::Result;
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::evaluator::Evaluator;
 use crate::governance::genesis::HistoryMode;
-use crate::governance::visibility::VisibilitySet;
 use crate::group::Skdm;
 use crate::hash::{sha256, Digest32};
 use crate::identity::composite::RootSigner;
@@ -35,9 +34,7 @@ use crate::identity::composite::RootSigner;
 /// governance log via the [`Evaluator`].
 ///
 /// Borrows the evaluator: the view is exactly the consent edges the evaluator
-/// resolved (single-writer, latest-causal), with no separate roster. It composes
-/// outbound consent (the log) with an optional inbound [`VisibilitySet`] (local,
-/// receiver-side) at the render decision.
+/// resolved (single-writer, latest-causal), with no separate roster.
 #[derive(Debug)]
 pub struct MembershipView<'a> {
     evaluator: &'a Evaluator,
@@ -55,16 +52,6 @@ impl<'a> MembershipView<'a> {
     #[must_use]
     pub fn can_read(&self, reader: &Digest32, author: &Digest32) -> bool {
         self.evaluator.can_read(reader, author)
-    }
-
-    /// Whether `viewer` would actually **render** `author`, composing both axes:
-    /// `author` has consent-granted to `viewer` (outbound, the log) **and**
-    /// `viewer` has not muted `author` (inbound, local `VisibilitySet`). This is
-    /// the render-site decision (ADR-007: the two axes are orthogonal and
-    /// independently set).
-    #[must_use]
-    pub fn renders(&self, viewer: &Digest32, author: &Digest32, inbound: &VisibilitySet) -> bool {
-        self.can_read(viewer, author) && inbound.is_visible(author)
     }
 
     /// The set of authors `reader` may currently read, derived by asking the

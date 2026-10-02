@@ -3405,6 +3405,9 @@ pub struct Node {
     /// the sweep as each room is free. A room gets its value when it is opened, so this only
     /// ever carries an edit.
     retention_dirty: std::collections::BTreeSet<Digest32>,
+    /// The `(room, node value, room value)` triples this node has already said its own retention
+    /// file asks for longer than the room keeps (V030-32): said once each, not every tick.
+    retention_warned: std::collections::BTreeSet<(Digest32, u64, u64)>,
     /// Consents decided but not yet delivered, each with the key it releases, taken at the
     /// decision (V210-30). Kept beside the keyring, sealed the same way.
     consent_keys: crate::node::pending_consent::PendingConsents,
@@ -3712,6 +3715,7 @@ impl Node {
             node_retention: crate::node::retention::RetentionConfig::default(),
             retention_read_at: 0,
             retention_dirty: std::collections::BTreeSet::new(),
+            retention_warned: std::collections::BTreeSet::new(),
             consent_keys: crate::node::pending_consent::PendingConsents::default(),
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
@@ -12051,6 +12055,9 @@ impl Node {
 
     /// Set a room's retention, then apply it here at once and push the policy-update to the
     /// other members, whose own sweeps apply it as it arrives (ADR-023 decision 2).
+    /// `vox room retention` (V030-32): the room's creator or an admin sets the **room's**
+    /// retention, on every member. Any other member sets **their own node's** retention for the
+    /// room, at or below the room's — it changes nothing anywhere else — and is refused above it.
     async fn set_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
@@ -12059,6 +12066,33 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
+        let me = match profile.signer() {
+            Ok(s) => crate::identity::composite::RootSigner::fingerprint(s),
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let (governs, room) = {
+            let ch = shared.lock().await;
+            (ch.governs_retention(&me), ch.room_retention())
+        };
+        if !governs {
+            // Longer than the room keeps is refused; `0` is forever, the longest of all.
+            if room != 0 && (ttl == 0 || ttl > room) {
+                return Outcome::Failed(Fault::AboveRoomRetention);
+            }
+            if crate::node::retention::RetentionConfig::write_room(
+                &self.paths.retention_file(),
+                channel_id,
+                ttl,
+            )
+            .is_err()
+            {
+                return Outcome::Failed(Fault::Storage);
+            }
+            self.retention_read_at = 0;
+            self.refresh_node_retention(now);
+            self.sweep_retention().await;
+            return Outcome::OwnRetention { own: ttl, room };
+        }
         if let Err(e) = shared.lock().await.set_retention(profile, ttl, now) {
             return Outcome::Failed(fault_of(&e));
         }
@@ -12121,6 +12155,20 @@ impl Node {
             };
             if self.retention_dirty.remove(cid) {
                 ch.set_node_retention(self.node_retention.for_room(cid));
+            }
+            // **A node may keep less than its room, never more** (V030-32). A file value above the
+            // room's is ignored — the shorter wins — and the node says so, once.
+            let (node, room) = (self.node_retention.for_room(cid), ch.room_retention());
+            if node != 0
+                && room != 0
+                && node > room
+                && self.retention_warned.insert((*cid, node, room))
+            {
+                let _ = self.event_tx.send(NodeEvent::RetentionAboveRoom {
+                    channel_id: *cid,
+                    node,
+                    room,
+                });
             }
             let here = ch.sweep_retention(&store, now).unwrap_or(0);
             pruned += here;

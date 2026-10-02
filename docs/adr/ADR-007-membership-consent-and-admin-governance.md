@@ -2,7 +2,10 @@
 
 **Status**: implemented (M6, `crates/vox-core/src/governance/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-22 — **the consent fold's epoch semantics are settled and proved** (ADR-017 M17.8).
+**Updated**: 2026-10-02 — **room governance is only "the creator or an admin sets the room's retention"** (V030-32,
+#380; see "Amendment: governance is retention only" below). Passphrase rotation, invite modes, the policy update's
+history-mode and suite-floor changes, the `delegate`/`invite`/`passphrase-rotate` capabilities, `#role` attributes and
+the inbound visibility opt-out are removed from the core, with their wire tags and tokens reserved. 2026-09-22 — **the consent fold's epoch semantics are settled and proved** (ADR-017 M17.8).
 An entry naming a retired epoch is **inert**, not merely old: `Evaluator::in_effect` requires an entry's
 body epoch to equal the epoch established in its strict causal past, and that gate runs before causal
 position is consulted. So a passphrase rotation empties the audience, and a pre-rotation consent grant
@@ -40,6 +43,32 @@ trust anchor, the certificate/grant schema, the consent and revocation flows, an
 resolution under partition.
 
 ## Decision
+
+### Amendment: governance is retention only (2026-10-02, V030-32)
+
+The decider chose, of the governance this ADR built: "creator or admin — but remember a member can set something
+below the room's value, but not above the room's value — but that only governs that user (if lower than the room)".
+So a room's governance is **one act**, and everything below that no command ever drove is **removed**, not kept
+inert:
+
+- **Kept.** The genesis creator holds `admin`. The creator names admins (`vox room admin add|remove`, #319): an admin
+  certificate (`0x0003`) carrying `policy`, revoked by `0x000E`, and only the creator issues either. A holder of
+  `policy` sets the room's retention with a policy-update (`0x0006`), which every member applies to what it holds
+  (PRD-001 R7, R8). The genesis policy keeps its history mode and suite floor, as created. Consent (`0x0004`,
+  `0x0005`) is unchanged; it is not governance by an admin.
+- **A member's own retention.** A member who is not the creator or an admin may keep a room's messages for **less**
+  than the room does, on their own node only: `vox room retention <room> <duration>` from such a member writes their
+  node's `retention` file for that room, and is refused above the room's value. A file value above the room's is
+  ignored, the room's shorter value is in force, and the node says so once. This is how PRD-001 R9's "the shorter
+  wins" reaches a person.
+- **Removed, tags and tokens reserved.** Passphrase rotation (the `0x0006` rotation kind: a body of that kind is
+  refused, and the epoch stays the genesis epoch); invite modes (identity-bound and open-passphrase invites); a
+  policy update's history mode and suite floor (an update carrying either is refused); the `delegate`, `invite` and
+  `passphrase-rotate` capabilities and `#role` attributes (their tokens are refused as unknown); the inbound
+  visibility opt-out. The sections below on invite modes, on rotation in "Revocation and epochs", on those
+  capabilities and on visibility describe what was built before this amendment and are superseded by it.
+- **Left to R44.** The genesis service grant (`bind:`/`dial:`) and its exclusion (`0x0013`) are withdrawn under
+  PRD-001 R44, not here.
 
 ### Trust anchor: the genesis capability
 

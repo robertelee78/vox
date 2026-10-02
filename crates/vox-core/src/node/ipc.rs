@@ -11,8 +11,8 @@
 //! ## What this is not
 //!
 //! It is deliberately **not** a mirror of [`NodeCommand`](super::api::NodeCommand). That enum carries
-//! [`Secret`](super::api::Secret) — passphrases — and reaches `CreateIdentity`,
-//! `Revoke` and `PassphraseRotate`. An agent session runs model-authored code and
+//! [`Secret`](super::api::Secret) — passphrases — and reaches `CreateIdentity` and
+//! `Revoke`. An agent session runs model-authored code and
 //! has no business issuing any of those, so the socket speaks its own narrow
 //! vocabulary and this milestone carries **events only**. Requests that let a
 //! client *act* arrive with the agent-comms protocol (ADR-020 §4), scoped to what
@@ -218,6 +218,8 @@ const T_SYNC_FAILED: u64 = 1720;
 /// [`NodeEvent::RoomNotRemembered`] (#208). Additive, and far from the other additive tags so a
 /// concurrently-developed branch that takes 1721 does not collide with it.
 const T_ROOM_NOT_REMEMBERED: u64 = 2081;
+/// `NodeEvent::RetentionAboveRoom` (V030-32): a node file value above the room's, ignored.
+const T_RETENTION_ABOVE_ROOM: u64 = 3803;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -225,6 +227,8 @@ const T_MEMBERS: u64 = 6;
 const T_ROOMS: u64 = 7;
 
 const T_BOUND: u64 = 8;
+/// `Frame::OwnRetention` (V030-32).
+const T_OWN_RETENTION: u64 = 3802;
 const T_LINK: u64 = 9;
 /// Protocol 5. 8 and 9 were taken (`T_BOUND`, `T_LINK`), which a first attempt at this
 /// collided with — the decoder then read a trusted list as a bound address and said
@@ -1009,6 +1013,16 @@ pub enum Frame {
         /// Member fingerprints, in the order the node holds them.
         members: Vec<Digest32>,
     },
+    /// The answer to a [`Request::SetRetention`] from a member who is not the room's creator or
+    /// an admin (V030-32): it set **its own node's** retention for the room, `own` seconds, while
+    /// the room keeps `room` (`0` = forever). Its own frame, so the CLI says plainly that nothing
+    /// changed for anyone else.
+    OwnRetention {
+        /// This node's retention for the room now, seconds.
+        own: u64,
+        /// The room's retention, seconds.
+        room: u64,
+    },
     /// The address a [`Request::Forward`] actually bound.
     ///
     /// Its own frame rather than a reused `Ok`, because a forward asked for port
@@ -1089,6 +1103,9 @@ impl Frame {
             }
             Frame::Bound { local } => {
                 e.array(2).uint(T_BOUND).text(local);
+            }
+            Frame::OwnRetention { own, room } => {
+                e.array(3).uint(T_OWN_RETENTION).uint(*own).uint(*room);
             }
             Frame::Link { url, note } if note.is_empty() => {
                 e.array(2).uint(T_LINK).text(url);
@@ -1268,6 +1285,17 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         }
         NodeEvent::ConnectionNote { peer, note } => {
             e.array(3).uint(T_CONNECTION_NOTE).bytes(peer).text(note);
+        }
+        NodeEvent::RetentionAboveRoom {
+            channel_id,
+            node,
+            room,
+        } => {
+            e.array(4)
+                .uint(T_RETENTION_ABOVE_ROOM)
+                .bytes(channel_id)
+                .uint(*node)
+                .uint(*room);
         }
         NodeEvent::RoomQuiet {
             channel_id,
@@ -1502,6 +1530,16 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Members { members });
         }
+        (T_OWN_RETENTION, 3) => {
+            return Ok(Frame::OwnRetention {
+                own: d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc own retention"))?,
+                room: d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room retention"))?,
+            });
+        }
         (T_BOUND, 2) => {
             return Ok(Frame::Bound {
                 local: text(d, "ipc bound address")?,
@@ -1695,6 +1733,15 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc address withheld"))?
                 .to_owned(),
+        },
+        (T_RETENTION_ABOVE_ROOM, 4) => NodeEvent::RetentionAboveRoom {
+            channel_id: digest(d)?,
+            node: d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc retention node"))?,
+            room: d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc retention room"))?,
         },
         (T_CONNECTION_NOTE, 3) => NodeEvent::ConnectionNote {
             peer: digest(d)?,
@@ -2389,6 +2436,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
+                crate::node::api::Outcome::OwnRetention { own, room } => {
+                    Frame::OwnRetention { own, room }
+                }
                 other => Frame::Error {
                     reason: other.to_string(),
                 },

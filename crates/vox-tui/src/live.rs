@@ -118,14 +118,14 @@ impl LiveCore {
             }
         });
         match out {
-            Outcome::Done | Outcome::Bound(_) => CommandStatus::Done,
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } => CommandStatus::Done,
             Outcome::Failed(f) => CommandStatus::Failed(ui_error(f)),
         }
     }
 
     fn send(&self, cmd: NodeCommand) -> CommandStatus {
         match self.rt.block_on(self.node.apply(cmd)) {
-            Outcome::Done | Outcome::Bound(_) => CommandStatus::Done,
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } => CommandStatus::Done,
             Outcome::Failed(f) => CommandStatus::Failed(ui_error(f)),
         }
     }

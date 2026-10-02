@@ -1,47 +1,30 @@
 //! The closed capability vocabulary and attenuation lattice (ADR-007
-//! §"Capability vocabulary").
+//! §"Capability vocabulary"), as trimmed by V030-32.
 //!
-//! Authorization in Vox is an SPKI/SDSI/UCAN-style *capability* model: the
-//! genesis creator holds the top capability ([`Capability::Admin`]), and every
-//! delegation may grant **only capabilities at or below the issuer's own**
-//! (monotonic attenuation — a delegation can never escalate). The evaluator
-//! ([`crate::governance::evaluator`]) recognizes **exactly** the capabilities
-//! defined here and nothing else: an unknown capability type is a verification
-//! failure, never silently ignored, so the evaluator's domain is closed and the
-//! golden-vector equality gate is well defined.
+//! **A room's governance is only "the creator or an admin sets the room's retention"** (the
+//! decider, 2026-10-02). The genesis creator holds [`Capability::Admin`]; the creator may name
+//! admins (#319), whose certificates carry `admin`; and `admin` implies [`Capability::Policy`],
+//! the one capability a governance entry needs (a retention update). The evaluator recognizes
+//! **exactly** the capabilities defined here: an unknown capability is a verification failure,
+//! never silently ignored, so the evaluator's domain is closed.
 //!
 //! ## The lattice
 //! ```text
-//!                         admin                (implies every capability below)
-//!         ┌────────┬────────┼─────────┬───────────────────┐
-//!     delegate   invite   policy  passphrase-rotate   tunnel caps
-//!                                                  (bind:<svc> / dial:<svc>
-//!                                                   + role-tag attributes #tag)
+//!            admin           (implies every capability below)
+//!         ┌────┴──────────────────┐
+//!       policy        bind:<svc> / dial:<svc>   (the genesis service grant, ADR-017)
 //! ```
-//! `admin` *implies* (is ≥) every other capability. The five named scalar
-//! capabilities (`delegate`, `invite`, `policy`, `passphrase-rotate`) plus the
-//! tunnel capabilities are otherwise mutually incomparable: holding `invite`
-//! says nothing about `policy`. The "≤" relation is therefore: `x ≤ y` iff
-//! `y == admin`, or `x == y` (a capability is ≤ itself), with tunnel
-//! capabilities additionally attenuable by service tag and role tag (below).
+//! `x ≤ y` iff `y == admin`, or `x == y`.
 //!
-//! ## Tunnel capabilities (defined here, *used* by ADR-013/M11)
-//! `bind:<service-tag>` (advertise/host a service) and `dial:<service-tag>`
-//! (consume one), plus attenuable **role-tag attributes** (e.g. `#ops`,
-//! `#ssh-hosts`). These are *registered into this one lattice* so ADR-013's ABAC
-//! policies ("`#ops` may Dial `#ssh-hosts`") are evaluated by the **same**
-//! deterministic evaluator over these grants — ADR-013 adds no parallel
-//! authorization engine (ADR-007 §"Capability vocabulary"). M6 defines them and
-//! the evaluator evaluates them; the tunnel *mechanism* that consumes a granted
-//! `bind`/`dial` is M11's job.
+//! **Removed, tokens reserved** (V030-32): `delegate`, `invite`, `passphrase-rotate` and `#role`
+//! attributes. No command ever issued them, and nothing read them but the evaluator. A token of
+//! theirs is refused as [`Error::UnknownCapability`], like any other word outside the vocabulary.
 //!
 //! ## Wire encoding
 //! A capability is a CBOR text string in a capability-set array (the cert body,
-//! [`crate::governance::cert`]). The scalar capabilities use their fixed ASCII
-//! tokens; the tunnel capabilities use a `kind:tag` / `#tag` lexical form. The
-//! set is canonicalized (sorted, deduplicated) so two implementations encode the
-//! identical bytes for the identical logical set — a precondition for the
-//! golden-vector gate.
+//! [`crate::governance::cert`]). The scalar capabilities use their fixed ASCII tokens; the
+//! service capabilities use a `kind:tag` lexical form. The set is canonicalized (sorted,
+//! deduplicated) so two implementations encode identical bytes for the identical logical set.
 
 use std::collections::BTreeSet;
 
@@ -49,52 +32,35 @@ use crate::error::{Error, Result};
 
 /// The ASCII token for [`Capability::Admin`].
 pub const TOKEN_ADMIN: &str = "admin";
-/// The ASCII token for [`Capability::Delegate`].
-pub const TOKEN_DELEGATE: &str = "delegate";
-/// The ASCII token for [`Capability::Invite`].
-pub const TOKEN_INVITE: &str = "invite";
 /// The ASCII token for [`Capability::Policy`].
 pub const TOKEN_POLICY: &str = "policy";
-/// The ASCII token for [`Capability::PassphraseRotate`].
-pub const TOKEN_PASSPHRASE_ROTATE: &str = "passphrase-rotate";
 /// The lexical prefix for a [`Capability::Bind`] tunnel capability.
 pub const PREFIX_BIND: &str = "bind:";
 /// The lexical prefix for a [`Capability::Dial`] tunnel capability.
 pub const PREFIX_DIAL: &str = "dial:";
-/// The lexical prefix for a [`Capability::Role`] attribute.
-pub const PREFIX_ROLE: &str = "#";
 
-/// The longest capability token text string accepted on decode. Service/role
-/// tags are short labels (ADR-013); this bound rejects a hostile multi-megabyte
+/// The longest capability token text string accepted on decode. Service tags are
+/// short labels (ADR-013); this bound rejects a hostile multi-megabyte
 /// "capability" before it is interned (anti-abuse, ADR-008).
 pub const MAX_CAPABILITY_LEN: usize = 256;
 
 /// A capability from the closed ADR-007 vocabulary.
 ///
-/// The `String` payloads of [`Capability::Bind`] / [`Capability::Dial`] /
-/// [`Capability::Role`] hold the *tag* only (the prefix is stripped on parse and
-/// re-applied on encode), so two equal logical tags are one value.
+/// The `String` payloads of [`Capability::Bind`] / [`Capability::Dial`] hold the
+/// *tag* only (the prefix is stripped on parse and re-applied on encode), so two
+/// equal logical tags are one value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Capability {
     /// `admin` — full governance; implies every capability below. Held by the
     /// root admin from genesis (ADR-007).
     Admin,
-    /// `delegate` — may issue admin-delegation certs (attenuable).
-    Delegate,
-    /// `invite` — may issue identity-bound invites (ADR-005).
-    Invite,
-    /// `policy` — may author policy-update entries (history / TTL).
+    /// `policy` — may author policy-update entries: the room's retention.
     Policy,
-    /// `passphrase-rotate` — may author passphrase-rotation (epoch) entries.
-    PassphraseRotate,
     /// `bind:<service-tag>` — advertise / host a tunnel service (ADR-013).
     Bind(String),
     /// `dial:<service-tag>` — consume a tunnel service (ADR-013).
     Dial(String),
-    /// `#<role-tag>` — an attenuable role-tag attribute (e.g. `#ops`), evaluated
-    /// by the same evaluator for ADR-013 ABAC (ADR-007).
-    Role(String),
 }
 
 impl Capability {
@@ -110,32 +76,23 @@ impl Capability {
         Capability::Dial(tag.into())
     }
 
-    /// A `#<tag>` role attribute.
-    #[must_use]
-    pub fn role(tag: impl Into<String>) -> Self {
-        Capability::Role(tag.into())
-    }
-
     /// Serialize to the canonical capability token (the exact text encoded in a
     /// cert body).
     #[must_use]
     pub fn to_token(&self) -> String {
         match self {
             Capability::Admin => TOKEN_ADMIN.to_owned(),
-            Capability::Delegate => TOKEN_DELEGATE.to_owned(),
-            Capability::Invite => TOKEN_INVITE.to_owned(),
             Capability::Policy => TOKEN_POLICY.to_owned(),
-            Capability::PassphraseRotate => TOKEN_PASSPHRASE_ROTATE.to_owned(),
             Capability::Bind(tag) => format!("{PREFIX_BIND}{tag}"),
             Capability::Dial(tag) => format!("{PREFIX_DIAL}{tag}"),
-            Capability::Role(tag) => format!("{PREFIX_ROLE}{tag}"),
         }
     }
 
     /// Parse a capability from its canonical token.
     ///
-    /// An unrecognized token — including a `bind:`/`dial:` with an empty tag, a
-    /// bare `#`, or any string not in the vocabulary — is
+    /// An unrecognized token — including a `bind:`/`dial:` with an empty tag, the
+    /// removed `delegate`, `invite`, `passphrase-rotate` and `#role` tokens, or any
+    /// string not in the vocabulary — is
     /// [`Error::UnknownCapability`]: the closed vocabulary admits nothing else,
     /// so the evaluator can never see a capability it does not understand.
     pub fn from_token(token: &str) -> Result<Self> {
@@ -144,17 +101,12 @@ impl Capability {
         }
         match token {
             TOKEN_ADMIN => Ok(Capability::Admin),
-            TOKEN_DELEGATE => Ok(Capability::Delegate),
-            TOKEN_INVITE => Ok(Capability::Invite),
             TOKEN_POLICY => Ok(Capability::Policy),
-            TOKEN_PASSPHRASE_ROTATE => Ok(Capability::PassphraseRotate),
             _ => {
                 if let Some(tag) = token.strip_prefix(PREFIX_BIND) {
                     nonempty_tag(tag).map(|t| Capability::Bind(t.to_owned()))
                 } else if let Some(tag) = token.strip_prefix(PREFIX_DIAL) {
                     nonempty_tag(tag).map(|t| Capability::Dial(t.to_owned()))
-                } else if let Some(tag) = token.strip_prefix(PREFIX_ROLE) {
-                    nonempty_tag(tag).map(|t| Capability::Role(t.to_owned()))
                 } else {
                     Err(Error::UnknownCapability)
                 }
@@ -170,7 +122,7 @@ impl Capability {
     /// - `admin` covers everything: `x.is_at_or_below(admin)` is always true.
     /// - Otherwise a capability is granted only by itself: `x.is_at_or_below(x)`.
     ///
-    /// Tunnel/role capabilities follow the same rule (exact-tag match, or covered
+    /// Service capabilities follow the same rule (exact-tag match, or covered
     /// by `admin`); finer service-tag-prefix attenuation is an ADR-013 policy
     /// detail layered on top, not a relaxation of this floor.
     #[must_use]
@@ -179,8 +131,8 @@ impl Capability {
     }
 }
 
-/// Reject an empty tunnel/role tag — `bind:`, `dial:`, and `#` with nothing
-/// after the prefix are not valid capabilities.
+/// Reject an empty service tag — `bind:` or `dial:` with nothing after the prefix
+/// is not a valid capability.
 fn nonempty_tag(tag: &str) -> Result<&str> {
     if tag.is_empty() {
         Err(Error::UnknownCapability)
