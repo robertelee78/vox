@@ -289,6 +289,13 @@ pub const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 /// a row — that difference is the whole of the attribution guarantee.
 const CONTINUATION: &str = "  | ";
 
+/// What begins the line under a reply that names the message it answers (V030-19). Neither
+/// `[` nor a continuation line's `  | `, so no author's text can make a line that reads as a preview.
+pub const IN_REPLY_TO: &str = "  ↳ in reply to ";
+
+/// The most characters of the answered message's words a reply's preview shows.
+pub const PREVIEW_CHARS: usize = 100;
+
 /// Whether `c` ends a line for *somebody* reading this output.
 ///
 /// Not just `\n`: a model, a terminal and a JSON viewer each have their own idea of
@@ -317,13 +324,89 @@ fn is_line_break(c: char) -> bool {
 ///
 /// Other control characters are replaced rather than passed through, for the same
 /// reason line breaks are: whatever displays this must not be steered by the text.
-fn render_row(out: &mut String, r: &vox_core::node::api::MessageRow) {
+///
+/// **A reply says what it answers** (V030-19). When the message is an envelope whose `re` names
+/// an entry, the line after its first is [`IN_REPLY_TO`] and that entry's own row in one line:
+/// its entry, its author and its first [`PREVIEW_CHARS`] characters, all read from `room`'s log
+/// by the entry hash. Nothing of the preview comes from the reply, so its author can point at a
+/// message but cannot make the preview say anything that message did not; and a `re` this room
+/// does not hold is said to be absent, never shown as the reply wrote it.
+fn render_row(
+    out: &mut String,
+    r: &vox_core::node::api::MessageRow,
+    room: &[vox_core::node::api::MessageRow],
+) {
+    let mut row = String::new();
     render_attributed(
-        out,
+        &mut row,
         &r.entry_hash,
         &crate::ident::author_id(&r.author),
         &words(&r.text),
     );
+    let Some(preview) = reply_preview(r, room) else {
+        out.push_str(&row);
+        return;
+    };
+    // After the row's first line and before its continuations, so it reads as part of the row.
+    let (first, rest) = row.split_once('\n').unwrap_or((&row, ""));
+    out.push_str(first);
+    out.push('\n');
+    out.push_str(IN_REPLY_TO);
+    out.push_str(&preview);
+    out.push('\n');
+    out.push_str(rest);
+}
+
+/// The one-line preview of the message `r` replies to, or `None` when it names none.
+fn reply_preview(
+    r: &vox_core::node::api::MessageRow,
+    room: &[vox_core::node::api::MessageRow],
+) -> Option<String> {
+    let re = vox_agentcomms::envelope::Envelope::parse(&r.text)
+        .ok()?
+        .re?;
+    let Ok(hash) = b32_decode(re.trim(), "re") else {
+        return Some("a message this room does not hold".to_owned());
+    };
+    let Some(parent) = room.iter().find(|p| p.entry_hash == hash) else {
+        return Some(format!(
+            "[{}], a message this room does not hold",
+            &b32_encode(&hash)[..8]
+        ));
+    };
+    let said = if parent.owed {
+        vox_core::node::api::NOT_RECEIVED_YET.to_owned()
+    } else {
+        let said = preview_line(&words(&parent.text));
+        match said.char_indices().nth(PREVIEW_CHARS) {
+            Some((end, _)) => format!("{}…", said[..end].trim_end()),
+            None => said,
+        }
+    };
+    Some(format!(
+        "[{} from {}] {said}",
+        &b32_encode(&parent.entry_hash)[..8],
+        preview_line(&crate::ident::author_id(&parent.author))
+    ))
+}
+
+/// `text` as one line for a preview: every [`LINE_BREAKS`] character (some are not control
+/// characters, so [`one_line`] would keep them) and run of whitespace is one space, and any other
+/// control character is replaced, so the answered message cannot start a line of its own.
+fn preview_line(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.trim().chars() {
+        if is_line_break(c) || c.is_whitespace() {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else if c.is_control() {
+            out.push('\u{fffd}');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// What a message says, as its author wrote it (V210-112).
@@ -423,13 +506,14 @@ fn render_attributed(out: &mut String, entry: &Digest32, author: &str, text: &st
 fn render(
     room_label: &str,
     rows: &[vox_core::node::api::MessageRow],
+    room: &[vox_core::node::api::MessageRow],
     notice: Option<&str>,
 ) -> (String, usize) {
     let mut body = String::new();
     let mut shown = 0usize;
     for r in rows.iter().take(MAX_INJECTED_MESSAGES) {
         let mut one = String::new();
-        render_row(&mut one, r);
+        render_row(&mut one, r, room);
         if shown > 0 && body.len() + one.len() > MAX_INJECTED_BYTES {
             break;
         }
@@ -847,7 +931,10 @@ async fn drain(
     // it was.
     let mut upto = rows.iter().rev().find(|r| !r.owed);
     if !fresh.is_empty() {
-        let (text, shown) = render(&label, &fresh, notice.as_deref());
+        // A reply's preview may name a message older than the cursor: the whole room is read for
+        // it when the coordination snapshot was, and what this read returned when not.
+        let room = snap.as_ref().map_or(&rows[..], |s| &s.rows[..]);
+        let (text, shown) = render(&label, &fresh, room, notice.as_deref());
         context.push_str(&text);
         if shown < fresh.len() {
             upto = fresh.get(shown.saturating_sub(1));
