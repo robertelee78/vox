@@ -158,11 +158,7 @@ fn post(w: &Worker, session: &str, r: &str, args: &[&str], body: &str) -> String
     all.extend_from_slice(args);
     all.push("-");
     let o = w.vox_in(Some(session), &all, Some(body));
-    assert!(
-        o.ok,
-        "CANNOT MEASURE (staging): {} could not post: {o:?}",
-        w.name
-    );
+    assert!(o.ok, "PRODUCT (staging): {} could not post: {o:?}", w.name);
     o.json()["entry_hash"]
         .as_str()
         .expect("PRODUCT: `vox room post --json` must name the entry it posted")
@@ -201,8 +197,9 @@ fn check(failures: &mut Vec<String>, ok: bool, what: String) {
     }
 }
 
-/// **Every red names its kind** (decider rule 1). A product verdict says `PRODUCT:`; a staging,
-/// precondition or harness failure says `CANNOT MEASURE` or `APPARATUS`. Anything else that
+/// **Every red names its kind** (decider rule 1). A product verdict says `PRODUCT:` (a staging step
+/// the shipped binary fails says `PRODUCT (staging)`: it is the product's); a precondition or
+/// harness failure says `CANNOT MEASURE` or `APPARATUS`. Anything else that
 /// panics (an `unwrap` or `expect` on a socket, a file, a process) is this proof's own failure,
 /// and this hook says so before its message.
 fn label_reds() {
@@ -335,7 +332,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .find(|c| !c.is_empty())
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: bob's session was never woken for the urgent message; got \
+                "PRODUCT: bob's session was never woken for the urgent message; got \
                  {got:?}; bob's daemon:\n{}",
                 daemon_err()
             )
@@ -397,10 +394,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     // The name is the signer's: carol posts an envelope that says it is from alice.
     let posing = r#"{"v":1,"from":"alice","type":"ask","to":["bob"],"urgent":true,"body":"POSING-AS-ALICE"}"#;
     let o = carol.vox_in(Some("carol-s"), &["room", "post", r, "-"], Some(posing));
-    assert!(
-        o.ok,
-        "CANNOT MEASURE (staging): carol could not post: {o:?}"
-    );
+    assert!(o.ok, "PRODUCT (staging): carol could not post: {o:?}");
     let got = collect(&inbox, Duration::from_secs(60), |g| {
         g.iter().any(|f| !content(f).is_empty())
     });
@@ -581,7 +575,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     );
     assert!(
         o.ok,
-        "CANNOT MEASURE (staging): alice could not post the forged reply: {o:?}"
+        "PRODUCT (staging): alice could not post the forged reply: {o:?}"
     );
     until(
         bob,
@@ -623,7 +617,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         Some("s-claim"),
         &["room", "claim", r, "brief", "--ttl", "2"],
     );
-    assert!(o.ok, "CANNOT MEASURE: s-claim must win `brief`: {o:?}");
+    assert!(o.ok, "PRODUCT (staging): s-claim must win `brief`: {o:?}");
     std::thread::sleep(Duration::from_secs(4));
     let told = drain(bob, r, "s-claim");
     let reported = told.contains("You no longer hold `brief`") && told.contains("lapsed");

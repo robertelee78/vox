@@ -182,7 +182,7 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
 /// The endpoint bob's daemon will wake `session` at, as the hook registered it.
 fn registered_endpoint(bob: &Worker, session: &str) -> (String, String) {
     let body = std::fs::read(bob.paths.session_file(session)).unwrap_or_else(|e| {
-        panic!("APPARATUS: `vox agent hook` registered no session {session}: {e}")
+        panic!("PRODUCT (staging): `vox agent hook` registered no session {session}: {e}")
     });
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
         panic!("PRODUCT: the session record `vox agent hook` wrote does not parse: {e}")
@@ -196,13 +196,13 @@ fn registered_endpoint(bob: &Worker, session: &str) -> (String, String) {
 /// `w` posts `text` exactly as given, through `vox room post <room> -` on its daemon.
 fn post_text(w: &Worker, room: &str, text: &str) {
     let o = w.vox_in(None, &["room", "post", room, "-"], Some(text));
-    assert!(o.ok, "APPARATUS: {} could not post: {o:?}", w.name);
+    assert!(o.ok, "PRODUCT (staging): {} could not post: {o:?}", w.name);
 }
 
 /// Alice posts `text` exactly as given, through `vox room post <room> -` on her daemon.
 fn post(alice: &Worker, room: &str, text: &str) {
     let o = alice.vox_in(None, &["room", "post", room, "-"], Some(text));
-    assert!(o.ok, "APPARATUS: alice could not post: {o:?}");
+    assert!(o.ok, "PRODUCT (staging): alice could not post: {o:?}");
 }
 
 /// Everything bob's stand-in session receives within `within`, stopping early once `done`.
@@ -283,8 +283,9 @@ fn next_notice(inbox: &mpsc::Receiver<String>, within: Duration) -> Option<(Inst
     None
 }
 
-/// **Every red names its kind** (decider rule 1). A product verdict says `PRODUCT:`; a staging
-/// or harness failure says `APPARATUS`. Anything else that panics (an `unwrap` or `expect` on a
+/// **Every red names its kind** (decider rule 1). A product verdict says `PRODUCT:` (a staging step
+/// the shipped binary fails says `PRODUCT (staging)`: it is the product's); a harness failure or a
+/// staging not achieved says `APPARATUS`. Anything else that panics (an `unwrap` or `expect` on a
 /// socket, a file, a process) is this proof's own failure, and this hook says so first.
 fn label_reds() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -927,7 +928,10 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         ],
         Some("What is the build number?"),
     );
-    assert!(o.ok, "APPARATUS: asker could not post its question: {o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT (staging): asker could not post its question: {o:?}"
+    );
     let q = o.json()["entry_hash"]
         .as_str()
         .expect("PRODUCT: `vox room post --json` must name the entry it posted")
@@ -945,7 +949,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
             &["room", "post", &room, "--type", "answer", "--re", &q, "-"],
             Some(&format!("{canary}: build 42")),
         );
-        assert!(o.ok, "APPARATUS: alice could not answer: {o:?}");
+        assert!(o.ok, "PRODUCT (staging): alice could not answer: {o:?}");
         until(
             bob,
             None,
@@ -1224,7 +1228,10 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         ],
         Some("Is the late build out?"),
     );
-    assert!(o.ok, "APPARATUS: late could not post its question: {o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT (staging): late could not post its question: {o:?}"
+    );
     let q2 = o.json()["entry_hash"]
         .as_str()
         .expect("PRODUCT: `vox room post --json` must name the entry it posted")
@@ -1245,7 +1252,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     );
     assert!(
         o.ok,
-        "APPARATUS: alice could not answer while bob was down: {o:?}"
+        "PRODUCT (staging): alice could not answer while bob was down: {o:?}"
     );
     post_text(
         &r.workers[0],
@@ -1343,7 +1350,7 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
         }
         args.push("-");
         let o = w.vox_in(Some(me), &args, Some(body));
-        assert!(o.ok, "APPARATUS: {me} could not post: {o:?}");
+        assert!(o.ok, "PRODUCT (staging): {me} could not post: {o:?}");
         o.json()["entry_hash"]
             .as_str()
             .expect("PRODUCT: `vox room post --json` must name the entry it posted")
