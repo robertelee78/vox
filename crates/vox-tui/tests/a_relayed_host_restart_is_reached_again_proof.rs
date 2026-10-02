@@ -74,7 +74,7 @@ fn trial(n: usize) -> Duration {
         let host = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
         let anchor = w.anchor.proc.transcript();
         panic!(
-            "CANNOT PROVE (trial {n}): the guest could not join over the relay ({took:?}).\n{out}\n\
+            "CANNOT MEASURE (trial {n}): the guest could not join over the relay ({took:?}).\n{out}\n\
              {err}\n--- host:\n{host}\n--- anchor:\n{anchor}"
         );
     }
@@ -82,11 +82,15 @@ fn trial(n: usize) -> Duration {
     let before =
         round_trip(at, b"before the crash", Duration::from_secs(120)).unwrap_or_else(|e| {
             panic!(
-                "CANNOT PROVE (trial {n}): no echo before the crash ({e}).\n{}",
+                "CANNOT MEASURE (trial {n}): no echo before the crash ({e}).\n{}",
                 w.fwd.as_mut().unwrap().transcript()
             )
         });
-    assert_eq!(before, b"before the crash");
+    assert!(
+        before == b"before the crash",
+        "PRODUCT (trial {n}): the bytes changed crossing the forward before the crash: {:?}",
+        String::from_utf8_lossy(&before)
+    );
     w.expect_still_relayed();
     w.assert_relayed("before the crash");
 
@@ -95,12 +99,16 @@ fn trial(n: usize) -> Duration {
     loop {
         attempts += 1;
         if let Ok(back) = round_trip(at, b"after the crash", ATTEMPT) {
-            assert_eq!(back, b"after the crash");
+            assert!(
+                back == b"after the crash",
+                "PRODUCT (trial {n}): the bytes changed crossing the forward after the crash: {:?}",
+                String::from_utf8_lossy(&back)
+            );
             break;
         }
         assert!(
             crashed.elapsed() < GIVE_UP,
-            "trial {n}: the forward never reached the restarted host ({attempts} attempts in \
+            "PRODUCT (trial {n}): the forward never reached the restarted host ({attempts} attempts in \
              {:?}).\nforward:\n{}",
             crashed.elapsed(),
             w.fwd.as_mut().unwrap().transcript()
@@ -140,7 +148,7 @@ fn a_relayed_host_that_restarts_is_reached_again_through_the_same_forward() {
     );
     assert!(
         over.is_empty(),
-        "{}/{RESTARTS} restarts took longer than {REACHED_AGAIN_WITHIN:?} to be reached again \
+        "PRODUCT: {}/{RESTARTS} restarts took longer than {REACHED_AGAIN_WITHIN:?} to be reached again \
          through the relay: {}",
         over.len(),
         over.join(", ")
