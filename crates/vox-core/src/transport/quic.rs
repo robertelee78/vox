@@ -883,32 +883,203 @@ pub struct TunnelCredit {
     tunnels: Arc<Mutex<u32>>,
     connection: Connection,
     id: u64,
-    moved: Arc<AtomicU64>,
+    watch: TunnelWatch,
 }
 
 impl TunnelCredit {
-    /// Where the tunnel's splice marks the time it last moved a byte, in Unix seconds (see
-    /// [`LiveTunnel::last_moved`]).
+    /// What the tunnel's splice marks and listens to: when it last moved a byte, and whether it
+    /// has been asked to close (see [`TunnelWatch`]).
     #[must_use]
-    pub fn moved(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.moved)
+    pub fn watch(&self) -> TunnelWatch {
+        self.watch.clone()
     }
 }
 
 impl Drop for TunnelCredit {
     fn drop(&mut self) {
         // One lock at a time, as `carry_tunnel` takes them.
-        lock(&LIVE).remove(&self.id);
-        let mut n = lock(&self.tunnels);
-        *n = n.saturating_sub(1);
-        set_tunnel_window(&self.connection, *n);
+        {
+            let mut n = lock(&self.tunnels);
+            *n = n.saturating_sub(1);
+            set_tunnel_window(&self.connection, *n);
+        }
+        let Some(live) = lock(&LIVE).remove(&self.id) else {
+            return;
+        };
+        // A tunnel that ended for a reason someone should see — closed by a person, closed as
+        // stuck, closed at its other end — is kept on the closed list with that reason.
+        if let Some(why) = lock(&self.watch.why).clone() {
+            let mut closed = lock(&CLOSED);
+            if closed.len() == CLOSED_KEPT {
+                closed.pop_front();
+            }
+            closed.push_back(ClosedTunnel {
+                id: self.id,
+                peer: live.peer,
+                service: live.service,
+                outbound: live.outbound,
+                opened: live.opened,
+                closed: unix_now(),
+                why,
+            });
+        }
     }
+}
+
+/// A running tunnel's side of its entry in the live list (V030-11): where its splice marks the
+/// time it last moved a byte, and how it is asked to close and says why it ended.
+#[derive(Clone, Debug)]
+pub struct TunnelWatch {
+    moved: Arc<AtomicU64>,
+    close: Arc<tokio::sync::Notify>,
+    why: Arc<Mutex<Option<String>>>,
+}
+
+impl TunnelWatch {
+    fn new(now: u64) -> Self {
+        Self {
+            moved: Arc::new(AtomicU64::new(now)),
+            close: Arc::new(tokio::sync::Notify::new()),
+            why: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Mark that the tunnel moved a byte just now.
+    pub fn mark_moved(&self) {
+        self.moved.store(unix_now(), Ordering::Relaxed);
+    }
+
+    /// Resolves once the tunnel is asked to close ([`close_tunnels`]), with the reason.
+    pub async fn close_asked(&self) -> String {
+        self.close.notified().await;
+        lock(&self.why).clone().unwrap_or_default()
+    }
+
+    /// Record why the tunnel ended, for [`closed_tunnels`]; the first reason stands.
+    pub fn ended(&self, why: &str) {
+        let mut w = lock(&self.why);
+        if w.is_none() {
+            *w = Some(why.to_owned());
+        }
+    }
+
+    fn ask_to_close(&self, why: &str) {
+        self.ended(why);
+        // `notify_one` keeps a permit, so a splice that has not started listening yet still
+        // hears it.
+        self.close.notify_one();
+    }
+}
+
+/// A tunnel that ended for a reason a person should see, as `vox status` and the TUI list it
+/// (V030-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedTunnel {
+    /// Its number while it ran ([`LiveTunnel::id`]).
+    pub id: u64,
+    /// The member at the other end.
+    pub peer: Digest32,
+    /// The service it reached.
+    pub service: String,
+    /// Whether this node opened it.
+    pub outbound: bool,
+    /// When it was opened, in Unix seconds.
+    pub opened: u64,
+    /// When it ended, in Unix seconds.
+    pub closed: u64,
+    /// Why: closed by a person here, closed at the other end, or closed as stuck.
+    pub why: String,
+}
+
+/// How many ended tunnels [`closed_tunnels`] keeps, newest last.
+const CLOSED_KEPT: usize = 32;
+
+/// The tunnels that ended for a reason, newest last ([`ClosedTunnel`]).
+static CLOSED: Mutex<std::collections::VecDeque<ClosedTunnel>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// The tunnels that ended for a reason a person should see, oldest first.
+#[must_use]
+pub fn closed_tunnels() -> Vec<ClosedTunnel> {
+    lock(&CLOSED).iter().cloned().collect()
+}
+
+/// Which live tunnels to close (V030-11): one by its number, or a member's — all of them, or
+/// those to one service.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TunnelSelector {
+    /// One tunnel, by [`LiveTunnel::id`].
+    pub id: Option<u64>,
+    /// The member's id as `vox status` prints it, or a prefix of it (case does not matter).
+    pub member: Option<String>,
+    /// Only the tunnels to this service.
+    pub service: Option<String>,
+}
+
+impl TunnelSelector {
+    /// Whether it names anything: a selector naming nothing closes nothing, never everything.
+    #[must_use]
+    pub fn names_something(&self) -> bool {
+        self.id.is_some() || self.member.is_some()
+    }
+
+    fn matches(&self, id: u64, t: &Live) -> bool {
+        if !self.names_something() {
+            return false;
+        }
+        let member = self.member.as_ref().is_none_or(|m| {
+            crate::node::link::b32_encode(&t.peer).starts_with(&m.to_ascii_lowercase())
+        });
+        self.id.is_none_or(|i| i == id)
+            && member
+            && self.service.as_ref().is_none_or(|s| *s == t.service)
+    }
+}
+
+/// Close every live tunnel `which` names, saying `why` to whoever looks (`vox status`, the
+/// TUI) and, by a reset with [`TUNNEL_CLOSED_CODE`](crate::tunnel::session::TUNNEL_CLOSED_CODE),
+/// to the far end. Neither untrusts anyone nor removes a service. The tunnels it asked to close,
+/// as they were.
+///
+/// # Errors
+/// What to tell the person, closing nothing, when `which` names a member by a prefix that more
+/// than one member's tunnels match: "a person closes one member's tunnels" (V030-11), and a
+/// short or mistyped prefix must not close several members' at once.
+pub fn close_tunnels(
+    which: &TunnelSelector,
+    why: &str,
+) -> std::result::Result<Vec<LiveTunnel>, String> {
+    let live = lock(&LIVE);
+    if let Some(prefix) = &which.member {
+        let members: std::collections::BTreeSet<String> = live
+            .iter()
+            .filter(|(id, t)| which.matches(**id, t))
+            .map(|(_, t)| crate::node::link::b32_encode(&t.peer))
+            .collect();
+        if members.len() > 1 {
+            return Err(format!(
+                "{prefix:?} matches more than one member with a live tunnel, so nothing was \
+                 closed — give more of the id:\n       {}",
+                members.into_iter().collect::<Vec<_>>().join("\n       ")
+            ));
+        }
+    }
+    Ok(live
+        .iter()
+        .filter(|(id, t)| which.matches(**id, t))
+        .map(|(id, t)| {
+            t.watch.ask_to_close(why);
+            t.listed(*id)
+        })
+        .collect())
 }
 
 /// One live tunnel, as `vox status` lists it (V210-81): so a person can see which tunnels hold a
 /// member's connection, and which of them is stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveTunnel {
+    /// Its number in this node, for closing it ([`TunnelSelector::id`]).
+    pub id: u64,
     /// The member at the other end.
     pub peer: Digest32,
     /// The service it reaches: a port, or a `vox room send` offer's tag.
@@ -927,7 +1098,20 @@ struct Live {
     service: String,
     outbound: bool,
     opened: u64,
-    moved: Arc<AtomicU64>,
+    watch: TunnelWatch,
+}
+
+impl Live {
+    fn listed(&self, id: u64) -> LiveTunnel {
+        LiveTunnel {
+            id,
+            peer: self.peer,
+            service: self.service.clone(),
+            outbound: self.outbound,
+            opened: self.opened,
+            last_moved: self.watch.moved.load(Ordering::Relaxed).max(self.opened),
+        }
+    }
 }
 
 /// Every tunnel this process carries now, by a number of its own. A process runs one node, so
@@ -949,16 +1133,7 @@ pub fn unix_now() -> u64 {
 /// Every tunnel this node carries now, oldest first.
 #[must_use]
 pub fn live_tunnels() -> Vec<LiveTunnel> {
-    lock(&LIVE)
-        .values()
-        .map(|t| LiveTunnel {
-            peer: t.peer,
-            service: t.service.clone(),
-            outbound: t.outbound,
-            opened: t.opened,
-            last_moved: t.moved.load(Ordering::Relaxed).max(t.opened),
-        })
-        .collect()
+    lock(&LIVE).iter().map(|(id, t)| t.listed(*id)).collect()
 }
 
 /// What a person is told when a tunnel is refused at the cap: how many are open to this member,
@@ -980,9 +1155,10 @@ fn limit_said(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> 
         .collect();
     format!(
         "{TUNNELS_PER_PEER} tunnels are already open to this member (to {})\n       \
-         to free one: close the program using it, or restart the `vox up` or `vox forward` \
+         to free one: `vox tunnel close` it (`vox status` lists every tunnel, its number, and when \
+         it last moved), close the program using it, or restart the `vox up` or `vox forward` \
          carrying it; on the host, `vox service remove` the service, or `vox trust remove` the \
-         member\n       `vox status` lists every tunnel, and when each last moved",
+         member",
         services.join(", ")
     )
 }
@@ -1017,7 +1193,7 @@ impl VoxConnection {
     pub fn carry_tunnel(&self, service: &str, outbound: bool) -> Result<TunnelCredit> {
         let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
         let opened = unix_now();
-        let moved = Arc::new(AtomicU64::new(opened));
+        let watch = TunnelWatch::new(opened);
         {
             // Counted and taken under one lock, so two tunnels asked for at once cannot both
             // take the last place.
@@ -1032,7 +1208,7 @@ impl VoxConnection {
                     service: service.to_owned(),
                     outbound,
                     opened,
-                    moved: Arc::clone(&moved),
+                    watch: watch.clone(),
                 },
             );
         }
@@ -1046,7 +1222,7 @@ impl VoxConnection {
             tunnels: Arc::clone(&self.tunnels),
             connection: self.connection.clone(),
             id,
-            moved,
+            watch,
         })
     }
 

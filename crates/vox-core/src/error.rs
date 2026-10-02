@@ -312,6 +312,11 @@ pub enum Error {
     #[error("{0}")]
     TunnelLimit(String),
 
+    /// A running tunnel was closed on purpose (V030-11): by a person (`vox tunnel close`, the
+    /// TUI), at its other end, or as stuck. Carries why, in the words `vox status` shows.
+    #[error("the tunnel was {0}")]
+    TunnelClosed(String),
+
     /// A tunnel control message (service request, stream-setup handshake) or an
     /// SSH-CA certificate was structurally malformed on parse, exceeded a size
     /// bound, or carried an out-of-domain value (ADR-013). Carries a static reason.

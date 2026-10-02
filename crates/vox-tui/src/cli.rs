@@ -832,6 +832,33 @@ pub struct DaemonArgs {
     pub metrics: Option<SocketAddr>,
 }
 
+/// `vox tunnel …` (V030-11).
+#[derive(Subcommand, Debug, Clone)]
+pub enum TunnelCmd {
+    /// Close live tunnels: one by its number, or a member's — all of them, or those to one
+    /// service. `vox status` lists them, with their numbers.
+    ///
+    /// On the host, this closes a member's sessions to your services; on a guest, a session your
+    /// `vox up` or `vox forward` carries. Nobody is untrusted and no service is removed: the
+    /// member can open a new tunnel at once. The far end is told the tunnel was closed.
+    Close(TunnelCloseArgs),
+}
+
+/// `vox tunnel close`
+#[derive(Args, Debug, Clone)]
+pub struct TunnelCloseArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The member whose tunnels to close: their id as `vox status` prints it, or the start of it.
+    #[arg(required_unless_present = "id")]
+    pub member: Option<String>,
+    /// Only the member's tunnels to this service (a port, or an offer's tag).
+    pub service: Option<String>,
+    /// One tunnel, by the number `vox status` shows for it.
+    #[arg(long, conflicts_with_all = ["member", "service"])]
+    pub id: Option<u64>,
+}
+
 /// `vox share`
 #[derive(Args, Debug, Clone)]
 pub struct ShareArgs {
@@ -1700,6 +1727,9 @@ enum Cmd {
     /// Decide which identities this node trusts (ADR-020 §3, ADR-017 decision 3).
     #[command(subcommand)]
     Trust(TrustCmd),
+    /// Close the live tunnels `vox status` lists (V030-11).
+    #[command(subcommand)]
+    Tunnel(TunnelCmd),
     /// Put `vox` on PATH and install tab completion for your shell.
     ///
     /// `install.sh` and `vox update` run this for you. It writes the completion script into
@@ -2058,6 +2088,54 @@ pub fn run() -> ExitCode {
             run_attached(async move {
                 crate::share_cli::share(&paths, &args.room, &args.path, args.count, for_).await
             })
+        }
+        Cmd::Tunnel(TunnelCmd::Close(args)) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let which = vox_core::transport::quic::TunnelSelector {
+                id: args.id,
+                member: args.member.clone(),
+                service: args.service.clone(),
+            };
+            match rt.block_on(vox_core::node::status::request_close(
+                &paths.socket_file(),
+                &which,
+            )) {
+                Ok((0, refused)) if !refused.is_empty() => {
+                    eprintln!("vox: {refused}");
+                    ExitCode::FAILURE
+                }
+                Ok((0, _)) => {
+                    eprintln!(
+                        "vox: no live tunnel matches that — `vox status` lists them, with their \
+                         numbers"
+                    );
+                    ExitCode::FAILURE
+                }
+                Ok((n, said)) => {
+                    println!("vox: closed {n} tunnel(s)\n{said}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vox: no running node answered: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Cmd::Status(args) => {
             let paths = match args.profile.paths() {

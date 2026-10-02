@@ -88,6 +88,7 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
     match ui.screen {
         Screen::ChannelList => render_channel_list(frame, chunks[0], vm, ui),
         Screen::Channel => render_channel(frame, chunks[0], vm, ui),
+        Screen::Tunnels => render_tunnels(frame, chunks[0], vm, ui),
     }
     render_status_bar(frame, chunks[1], vm);
     render_hint_bar(frame, chunks[2], ui, vm);
@@ -143,6 +144,68 @@ fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiSta
         Block::default()
             .borders(Borders::ALL)
             .title("Channels (Enter: open · : command)"),
+    );
+    frame.render_widget(list, area);
+}
+
+/// The live tunnels, one per line with its number, member, service and how long it has been
+/// still, then those that ended for a reason, with that reason (V030-11).
+fn render_tunnels(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
+    let now = vox_core::transport::quic::unix_now();
+    let ago = |t: u64| {
+        let s = now.saturating_sub(t);
+        if s < 120 {
+            format!("{s}s")
+        } else if s < 7200 {
+            format!("{}m", s / 60)
+        } else {
+            format!("{}h", s / 3600)
+        }
+    };
+    let short = |p: &vox_core::hash::Digest32| -> String {
+        vox_core::node::link::b32_encode(p)
+            .chars()
+            .take(12)
+            .collect()
+    };
+    let mut items: Vec<ListItem> = vm
+        .tunnels
+        .iter()
+        .map(|t| {
+            let marker = if ui.selected_tunnel == Some(t.id) {
+                "▶ "
+            } else {
+                "  "
+            };
+            let way = if t.outbound { "to" } else { "from" };
+            ListItem::new(format!(
+                "{marker}tunnel {} {way} {} for {}: open {}, last moved {} ago",
+                t.id,
+                short(&t.peer),
+                t.service,
+                ago(t.opened),
+                ago(t.last_moved)
+            ))
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new("  no tunnel is open"));
+    }
+    for t in vm.closed_tunnels.iter().rev() {
+        let way = if t.outbound { "to" } else { "from" };
+        items.push(ListItem::new(format!(
+            "  tunnel {} {way} {} for {} was {} {} ago",
+            t.id,
+            short(&t.peer),
+            t.service,
+            t.why,
+            ago(t.closed)
+        )));
+    }
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Tunnels (x: close the selected one · Esc: back)"),
     );
     frame.render_widget(list, area);
 }
@@ -362,11 +425,12 @@ fn render_hint_bar(frame: &mut Frame, area: Rect, ui: &UiState, vm: &ViewModel) 
     }
     let hint = match ui.screen {
         Screen::ChannelList => {
-            " ↑/↓ select · Enter open · :new <name> · :join · :unlock · :lock · Ctrl-C quit"
+            " ↑/↓ select · Enter open · t tunnels · :new <name> · :join · :unlock · :lock · Ctrl-C quit"
         }
         Screen::Channel => {
             " Tab switch pane · Enter send · PgUp/PgDn scroll · :invite · :consent grant · : command · Esc back"
         }
+        Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
     };
     frame.render_widget(Paragraph::new(hint), area);
 }

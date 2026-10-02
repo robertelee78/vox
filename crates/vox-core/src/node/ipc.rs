@@ -180,6 +180,8 @@ const T_REACH_WITHDRAWN: u64 = 1711;
 const T_PROXY_REFUSED: u64 = 1712;
 /// Additive, and deliberately away from the sequential range (see above).
 const T_STILL_RELAYED: u64 = 1713;
+/// `NodeEvent::TunnelClosed` (V030-11). Additive, numbered for the item.
+const T_TUNNEL_CLOSED: u64 = 3011;
 /// Additive, and deliberately away from the sequential range (see above).
 const T_JOIN_FAILED: u64 = 1714;
 /// Additive, and deliberately away from the sequential range (see above).
@@ -1189,6 +1191,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::StillRelayed { peer, reason } => {
             e.array(3).uint(T_STILL_RELAYED).bytes(peer).text(reason);
         }
+        NodeEvent::TunnelClosed { reason } => {
+            e.array(2).uint(T_TUNNEL_CLOSED).text(reason);
+        }
         NodeEvent::ProxyRefused { reason } => {
             e.array(2).uint(T_PROXY_REFUSED).text(reason);
         }
@@ -1579,6 +1584,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             reason: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc proxy refusal reason"))?
+                .to_owned(),
+        },
+        (T_TUNNEL_CLOSED, 2) => NodeEvent::TunnelClosed {
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc tunnel close reason"))?
                 .to_owned(),
         },
         (T_PEER_UNREACHABLE, 3) => NodeEvent::PeerUnreachable {
@@ -2008,6 +2019,12 @@ async fn serve_requests(
         // PRD-001 R35: `vox status`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
             crate::node::status::serve(&mut stream, handle).await?;
+            continue;
+        }
+        // V030-11: `vox tunnel close`. The live tunnels are this process's, so it is answered
+        // here, and the connection serves on.
+        if let Some(which) = crate::node::status::close_request(&body) {
+            crate::node::status::serve_close(&mut stream, &which).await?;
             continue;
         }
         // Protocol 6: an app request turns the connection into an app connection for
