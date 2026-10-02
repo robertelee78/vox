@@ -511,6 +511,15 @@ pub(crate) const BASE_RTT_WINDOW: Duration = Duration::from_secs(10);
 /// lone packet only when its delayed-acknowledgement timer fires (up to 25 ms), and these samples are
 /// `now - sent`, with that delay in them.
 pub(crate) const SMALL_ROUND_BYTES: u64 = 32 << 10;
+/// A round that acknowledged fewer packets than this cannot time the path, so it is no evidence of a
+/// queue. Its samples are `now - sent`, and a peer acknowledges a lone packet only when its
+/// delayed-acknowledgement timer fires (up to 25 ms), so a round of one or two packets carries that
+/// delay in every sample. At tier 2's floor of two 8192-byte datagrams on R41's 6%-loss link, the
+/// round minimum read 12.5 / 39.5 / 40.6 ms (p10 / p50 / p90) on a 10.6 ms base, a queue in 62 of 84
+/// rounds where there was none; each loss then counted as congestion and cut the window back to the
+/// floor, which kept the rounds that small: Vox carried 1.7 Mbit/s against a Cubic flow's 22.6
+/// (fix-adr024-bbr, R41 at 493b5453).
+pub(crate) const TIMED_ROUND_PACKETS: u32 = 4;
 /// A queue is building when a round's minimum round trip exceeds the base by this much…
 ///
 /// Measured on R41's lossy arm, where no loss is congestion: at each loss, the last round's minimum
@@ -579,6 +588,8 @@ pub(crate) struct PathSignals {
     loss_baseline: Option<f64>,
     small_round_min: Option<Duration>,
     round_packets: u32,
+    /// The last finished round acknowledged at least [`TIMED_ROUND_PACKETS`].
+    last_round_timed: bool,
 }
 
 impl Default for PathSignals {
@@ -607,6 +618,7 @@ impl PathSignals {
             loss_baseline: None,
             small_round_min: None,
             round_packets: 0,
+            last_round_timed: false,
         }
     }
 
@@ -664,7 +676,10 @@ impl PathSignals {
                 self.small_round_min = Some(m);
             }
         }
-        self.last_round_min = self.round_min.or(self.last_round_min);
+        self.last_round_timed = self.round_packets >= TIMED_ROUND_PACKETS;
+        if self.last_round_timed {
+            self.last_round_min = self.round_min.or(self.last_round_min);
+        }
         self.recent.push_back(RoundLoss {
             sent: self.round_sent,
             lost: self.round_lost,
@@ -713,7 +728,7 @@ impl PathSignals {
     /// for as long as it sends, and never drains it: fix-adr024-bbr's trace showed the windowed
     /// minimum drift to 100-114 ms on a 10.6 ms link, after which overflow losses read as losses
     /// without a queue and a clean link climbed to tier 2. A base that reads high turns congestion
-    /// into "random" loss, which is unfair; one that reads low only costs tier 2 its gain. A round
+    /// into "random" loss, and a clean link climbs to tier 2; one that reads low only costs tier 2 its gain. A round
     /// that carried little data had no queue of its own behind it (slow start's first rounds, and
     /// the quiet moments between transfers), so its minimum is the path's round trip; it is replaced
     /// at the next small round, not kept as a minimum, so a path whose round trip grows is followed
@@ -726,9 +741,10 @@ impl PathSignals {
         }
     }
 
-    /// The last finished round's minimum round trip.
+    /// The last finished round's minimum round trip, or `None` when that round was too small to time
+    /// the path ([`TIMED_ROUND_PACKETS`]).
     pub(crate) fn round_min_rtt(&self) -> Option<Duration> {
-        self.last_round_min
+        self.last_round_min.filter(|_| self.last_round_timed)
     }
 
     pub(crate) fn srtt(&self) -> Duration {
@@ -738,8 +754,9 @@ impl PathSignals {
     /// Is a queue building? The last finished round's minimum round trip stands above the base by
     /// at least [`QUEUE_DELAY_MIN`] or [`QUEUE_DELAY_SHARE`] of it, whichever is larger. A round's
     /// minimum, not its smoothed round trip: one delayed acknowledgement must not read as a queue.
+    /// A round too small to time the path ([`TIMED_ROUND_PACKETS`]) is no evidence of one.
     pub(crate) fn queue_building(&self) -> bool {
-        let (Some(base), Some(round)) = (self.min_rtt(), self.last_round_min) else {
+        let (Some(base), Some(round)) = (self.min_rtt(), self.round_min_rtt()) else {
             return false;
         };
         let rise = round.saturating_sub(base);
