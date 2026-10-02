@@ -328,8 +328,10 @@ pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// failed try costs at most [`DUAL_STACK_SELF_TEST`]; a collision is rare outside a machine holding
 /// thousands of IPv4 ports, where one in two can collide, and 32 keeps even that from failing.
 const DUAL_STACK_TRIES: usize = 32;
-/// How long a dual-stack bind waits for its own IPv4 self-test datagram (see [`bind_udp`]).
-const DUAL_STACK_SELF_TEST: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long a dual-stack bind waits for its own IPv4 self-test datagrams (see [`bind_udp`]). The
+/// datagrams are on loopback or to this machine's own address, so they are in the socket's buffer
+/// as soon as they are sent; this only bounds a test whose datagram went to another program.
+const DUAL_STACK_SELF_TEST: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Bind the endpoint's UDP socket to `addr`.
 ///
@@ -365,6 +367,7 @@ fn bind_udp(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     if !dual_stack {
         return Ok(socket);
     }
+    let mut misses: Vec<String> = Vec::new();
     for _ in 0..DUAL_STACK_TRIES {
         let port = socket
             .local_addr()
@@ -374,19 +377,21 @@ fn bind_udp(addr: SocketAddr) -> Result<std::net::UdpSocket> {
                 reason: e.to_string(),
             })?
             .port();
-        if hears_ipv4(&socket, port) {
-            return Ok(socket);
-        }
+        let missed = match hears_ipv4(&socket, port) {
+            Ok(()) => return Ok(socket),
+            Err(missed) => missed,
+        };
         if addr.port() != 0 {
             return Err(Error::LocalBind {
                 addr,
                 in_use: true,
                 reason: format!(
                     "IPv4 traffic to port {port} reaches another program, which holds that port \
-                     on IPv4; on it this node would hear IPv6 only"
+                     on IPv4; on it this node would hear IPv6 only ({missed})"
                 ),
             });
         }
+        misses.push(missed);
         // Bound before the old socket closes, so the kernel cannot hand back the same port.
         socket = bind(addr)?;
     }
@@ -395,7 +400,14 @@ fn bind_udp(addr: SocketAddr) -> Result<std::net::UdpSocket> {
         in_use: true,
         reason: format!(
             "{DUAL_STACK_TRIES} ports in a row were each held on IPv4 by another program, so \
-             this node would hear IPv6 only on any of them"
+             this node would hear IPv6 only on any of them (the last: {})",
+            misses
+                .iter()
+                .rev()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
         ),
     })
 }
@@ -415,24 +427,25 @@ fn routable_ipv4() -> Option<std::net::Ipv4Addr> {
 /// Whether a datagram sent over IPv4 to each address a node advertises — `127.0.0.1` and the
 /// routable IPv4 address — on `port` reaches `socket` (see [`bind_udp`]). Everything the test sent
 /// that arrived is drained, so none of it reaches QUIC.
-fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> bool {
+fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<(), String> {
+    let started = std::time::Instant::now();
     let mut targets = vec![std::net::Ipv4Addr::LOCALHOST];
     targets.extend(routable_ipv4());
     let Ok(probe) = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) else {
-        return true; // no test is possible; never refuse a bind for that
+        return Ok(()); // no test is possible; never refuse a bind for that
     };
-    let mut owed: Vec<Vec<u8>> = Vec::new();
+    let mut owed: Vec<(std::net::Ipv4Addr, Vec<u8>)> = Vec::new();
     for target in targets {
         let mut nonce = [0u8; 16];
         if getrandom::fill(&mut nonce).is_err() {
-            return true;
+            return Ok(());
         }
         let mut text = b"vox dual-stack self-test ".to_vec();
         text.extend_from_slice(&nonce);
         if probe.send_to(&text, (target, port)).is_err() {
-            return true;
+            return Ok(());
         }
-        owed.push(text);
+        owed.push((target, text));
     }
     let deadline = std::time::Instant::now() + DUAL_STACK_SELF_TEST;
     let mut buf = [0u8; 64];
@@ -442,17 +455,32 @@ fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> bool {
             break;
         }
         match socket.recv_from(&mut buf) {
-            Ok((n, _)) => owed.retain(|t| buf[..n] != t[..]),
+            Ok((n, _)) => owed.retain(|(_, t)| buf[..n] != t[..]),
             Err(_) => break,
         }
     }
-    // Drain: nothing the test sent may reach QUIC.
+    // **What already arrived is read, whatever the clock says.** A process descheduled past the
+    // deadline between sending and its first read used to give up on datagrams sitting in its own
+    // buffer: measured at load ~47, a node refused all 32 ports it tried, 1.25 s apart. So the
+    // buffer is drained before the verdict, and the drain also keeps every test datagram from QUIC.
     if socket.set_nonblocking(true).is_ok() {
-        while socket.recv_from(&mut buf).is_ok() {}
+        while let Ok((n, _)) = socket.recv_from(&mut buf) {
+            owed.retain(|(_, t)| buf[..n] != t[..]);
+        }
         let _ = socket.set_nonblocking(false);
     }
     let _ = socket.set_read_timeout(None);
-    owed.is_empty()
+    if owed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "port {port}: nothing sent to {} arrived within {} ms",
+        owed.iter()
+            .map(|(at, _)| at.to_string())
+            .collect::<Vec<_>>()
+            .join(" or "),
+        started.elapsed().as_millis()
+    ))
 }
 
 impl VoxEndpoint {
