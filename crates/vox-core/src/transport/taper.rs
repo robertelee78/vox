@@ -102,6 +102,9 @@ pub(crate) const CLIMB_3_TIME: Duration = Duration::from_secs(2);
 pub(crate) const CLIMB_3_QUEUE_ROUNDS: u32 = 8;
 /// The window Vox's delivered rate is measured over, for tier 3's speed check.
 pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(2);
+/// The delivered-rate meter keeps one point per this much time, not one per acknowledged packet,
+/// so it holds at most [`RATE_WINDOW`] / this many points however fast the link is.
+pub(crate) const RATE_POINT: Duration = Duration::from_millis(10);
 /// Tier 3 is left when its delivered rate falls under this share of tier 2's at the switch.
 pub(crate) const TIER3_SLOWER: f64 = 0.9;
 /// Tier 3 is locked out this long after a first exit for being slower…
@@ -168,7 +171,7 @@ struct Streak {
 impl Streak {
     fn update(&mut self, now: Instant, holds: bool) {
         if holds {
-            self.rounds += 1;
+            self.rounds = self.rounds.saturating_add(1);
             self.since.get_or_insert(now);
         } else {
             *self = Self::default();
@@ -224,7 +227,8 @@ pub(crate) struct Tapered {
     rounds_in_tier: u32,
     /// Vox's delivered rate at 2 -> 3, bytes per second.
     tier3_entry_rate: f64,
-    /// (time, bytes acknowledged so far) over the last [`RATE_WINDOW`], oldest first.
+    /// (time, bytes acknowledged so far) over the last [`RATE_WINDOW`], oldest first, one point per
+    /// [`RATE_POINT`].
     acked: std::collections::VecDeque<(Instant, u64)>,
     acked_total: u64,
     /// Tier 2's loss baseline while it settles: bytes sent since 1 -> 2, and the baseline marked.
@@ -480,7 +484,15 @@ impl Controller for Tapered {
     ) {
         self.signals.on_ack(now, sent, bytes, app_limited, rtt);
         self.acked_total = self.acked_total.saturating_add(bytes);
-        self.acked.push_back((now, self.acked_total));
+        // One point per RATE_POINT: the rate over the window is the bytes since the oldest point,
+        // and the total keeps counting between points, so nothing is lost by not storing each.
+        if self
+            .acked
+            .back()
+            .is_none_or(|&(t, _)| now.saturating_duration_since(t) >= RATE_POINT)
+        {
+            self.acked.push_back((now, self.acked_total));
+        }
         while self
             .acked
             .front()

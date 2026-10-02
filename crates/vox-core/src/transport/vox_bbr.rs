@@ -845,10 +845,10 @@ impl BandwidthEstimation {
         let Some(record) = record else {
             return;
         };
-        // Several packets can share one send instant (one batch); keep the record for the rest.
-        if self.sent.get(1).is_none_or(|next| next.sent != sent) {
-            self.sent.pop_front();
-        }
+        // quinn reports a batched send (several datagrams in one transmit) as one `on_sent`, and
+        // each of its packets' acknowledgements separately, all with the batch's send instant. The
+        // record stays until a packet sent after the batch is acknowledged, so every packet of the
+        // batch yields a sample, not only the first.
         self.first_sent_time = Some(record.sent);
         let send_elapsed = record
             .sent
