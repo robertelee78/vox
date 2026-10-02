@@ -2178,6 +2178,15 @@ pub async fn get_file(
         ) else {
             continue;
         };
+        // An offer is another member's text, and these fields are printed (V210-154): one that
+        // is not a SHA-256 in hex, or whose tag or name is not one line, is not an offer.
+        let hex64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+        if !hex64(&sha256)
+            || !vox_agentcomms::envelope::is_valid_name(&tag, vox_agentcomms::envelope::MAX_NAME)
+            || !vox_agentcomms::envelope::is_valid_name(&name, 255)
+        {
+            continue;
+        }
         let matches = name == selector || sha256.starts_with(selector) || tag == selector;
         if !matches || offers.iter().any(|o| o.author == r.author && o.tag == tag) {
             continue;

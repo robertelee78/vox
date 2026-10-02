@@ -699,14 +699,15 @@ fn anchor_close_reason(
             {
                 Some(crate::wire::WireError::ShuttingDown) => "the anchor stopped".to_owned(),
                 Some(code) => format!("the anchor closed it: {code}"),
-                None => e.to_string(),
+                // The anchor's own reason text: shown, never raw (V210-154).
+                None => crate::text::peer_error(e),
             }
         }
         quinn::ConnectionError::LocallyClosed => match closed_here {
             Some(code) => format!("closed here: {code}"),
             None => "closed here".to_owned(),
         },
-        other => other.to_string(),
+        other => crate::text::peer_error(other),
     }
 }
 

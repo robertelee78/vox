@@ -79,7 +79,12 @@ pub fn render(json: &str) -> String {
             );
         }
         if let Some(f) = r.get("last_failure").and_then(|f| f.as_str()) {
-            let _ = write!(out, "; last failure: {f}");
+            // It can carry what a peer said (V210-154): shown on one line, capped.
+            let _ = write!(
+                out,
+                "; last failure: {}",
+                vox_core::text::shown(f, 2 * vox_core::text::PEER_REASON_MAX)
+            );
         }
         // A session that runs on: which end opened it, the step it is at and for how long
         // (V210-110).

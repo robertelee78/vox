@@ -714,7 +714,8 @@ fn handshake_failed(e: quinn::ConnectionError) -> Error {
         }
         C::TimedOut => Error::Handshake("the peer did not answer".to_owned()),
         C::LocallyClosed => Error::Handshake("this node's endpoint is closing".to_owned()),
-        other => Error::Handshake(other.to_string()),
+        // Whatever the peer wrote as its close reason is shown, never raw (V210-154).
+        other => Error::Handshake(crate::text::peer_error(&other)),
     }
 }
 
