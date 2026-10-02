@@ -883,18 +883,19 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     // its socket buffers and drops, so it cannot say what the emulator carries unshaped; the per-link
     // calibration below is paced by the link and can.)
     let mut report = Vec::new();
-    let (t, r, _) = measure(tunnel, sink_addr, &done, &carried, None);
-    report.push(format!(
-        "unshaped (efficiency, not gated; bounded by the emulator): tunnel {:.1} MB/s, raw loopback TCP {:.1} MB/s, {:.1}%",
-        t / 1e6,
-        r / 1e6,
-        100.0 * t / r
-    ));
-
     let mut failed = Vec::new();
     // An APPARATUS fault on one link or arm makes that one CANNOT MEASURE and the run goes on: one
     // late window must not void every other link's and arm's figures.
     let mut cannot = Vec::new();
+    match measure(tunnel, sink_addr, &done, &carried, None) {
+        Ok((t, r, _)) => report.push(format!(
+            "unshaped (efficiency, not gated; bounded by the emulator): tunnel {:.1} MB/s, raw loopback TCP {:.1} MB/s, {:.1}%",
+            t / 1e6,
+            r / 1e6,
+            100.0 * t / r
+        )),
+        Err(fault) => cant(&mut cannot, fault),
+    }
     // Diagnostic knob (test-side only): `VOX_PERF_ONLY` runs just the links whose name contains it.
     for l in LINKS {
         if !perf_only(l.name) {
@@ -927,7 +928,13 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         *link.lock().unwrap() = Some(l);
         std::thread::sleep(Duration::from_millis(500));
         let drops_before = TAIL_DROPS.load(std::sync::atomic::Ordering::Relaxed);
-        let (t, r, rounds) = measure(tunnel, raw, &done, &carried, Some(l));
+        let (t, r, rounds) = match measure(tunnel, raw, &done, &carried, Some(l)) {
+            Ok(m) => m,
+            Err(fault) => {
+                cant(&mut cannot, fault);
+                continue;
+            }
+        };
         let tail_drops = TAIL_DROPS.load(std::sync::atomic::Ordering::Relaxed) - drops_before;
         let ratio = t / r;
         let late = rounds.iter().map(|x| x.2).max().unwrap_or_default();
@@ -1031,14 +1038,15 @@ type Round = (f64, f64, Duration);
 /// Median throughput of the tunnel and of raw over `ROUNDS` interleaved transfers, and a check that
 /// the tunnel's bytes crossed the shaper: a tunnel that bypassed it would score whatever it liked.
 /// Also each round's tunnel and raw figures, and how late the emulator ran during its tunnel
-/// transfer.
+/// transfer. A tunnel whose bytes did not cross the emulator (a relayed transfer: the anchor is not
+/// behind it) is that link's CANNOT MEASURE, returned for the caller to collect.
 fn measure(
     tunnel: SocketAddr,
     raw: SocketAddr,
     done: &mpsc::Receiver<(Instant, Instant)>,
     carried: &std::sync::atomic::AtomicU64,
     link: Option<Link>,
-) -> (f64, f64, Vec<Round>) {
+) -> Result<(f64, f64, Vec<Round>), String> {
     let mut t = Vec::new();
     let mut r = Vec::new();
     let mut rounds = Vec::new();
@@ -1048,14 +1056,15 @@ fn measure(
         t.push(transfer(tunnel, done));
         let late = take_lateness();
         let crossed = carried.load(std::sync::atomic::Ordering::Relaxed) - before;
-        assert!(
-            crossed >= BYTES,
-            "CANNOT MEASURE {link:?}: only {crossed} of the tunnel's {BYTES} bytes crossed the emulated link"
-        );
+        if crossed < BYTES {
+            return Err(format!(
+                "CANNOT MEASURE {link:?}: only {crossed} of the tunnel's {BYTES} bytes crossed the emulated link"
+            ));
+        }
         r.push(transfer(raw, done));
         rounds.push((t[t.len() - 1], r[r.len() - 1], late));
     }
-    (median(t), median(r), rounds)
+    Ok((median(t), median(r), rounds))
 }
 
 // ---- ADR-024's arms: a lossy link, a congested link, a link that changes ------------------------
