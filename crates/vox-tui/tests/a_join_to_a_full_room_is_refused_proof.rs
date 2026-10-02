@@ -40,21 +40,23 @@
 //! each member checks the cap against its own view, so two newcomers answered at the same moment
 //! by two different members can each take the room's last place. Before, each member then
 //! refused the newcomer the other had admitted, as over the cap: the room split, each newcomer a
-//! member on one side only, told it had joined. Now a member admits what another admitted, up to
-//! the cap plus the join slots (`AUTHORS_CEILING`): the cap is soft by at most that. Staged with
+//! member on one side only, told it had joined. Now a member always admits what another admitted,
+//! past the cap if it must be, and says so in its log (the decider, plan 21874119: v0.2.10 is
+//! honest-only; a strict cap is V030-30). Staged with
 //! the cap at [`CAP`]: the host and one member, both up, and the room one place short; two
 //! newcomers join at once, one from each member's invite (an invite names its member as the
 //! first to answer), each held by `VOX_TEST_ADMISSION_GATE` (test-knobs only) at its admission
 //! until both members are about to admit, then let go together. Asserted: every newcomer told it joined is on **both** members' rosters
-//! within [`CONVERGE_WITHIN`], and neither roster ever lists more than the ceiling. If only one
-//! newcomer got in, the joins did not race: CANNOT MEASURE.
+//! within [`CONVERGE_WITHIN`] — no split — and a member that admitted one past the cap says so
+//! ("admitted past the room's cap"). If only one newcomer got in, and every member refused the
+//! other as full, the joins did not race: CANNOT MEASURE.
 //!
 //! **Mutations that must turn it red:** the admission's result dropped again (in
 //! `NetEvent::JoinAdmit`, the ack answered `Ok(())` whatever `admit_author` returned): the
 //! newcomer is told it joined. A failed admission answered with `JoinReject::Refused` again (in
 //! `run_responder`): the second arm's joiner is told its passphrase is likely wrong. A member
-//! learned from a board refused past the cap again (`admit_from_board` limited to the cap, not
-//! the ceiling): the racing arm's rosters never converge.
+//! learned from a board refused past the cap again (`admit_from_board` limited to the cap): the
+//! racing arm's rosters never converge — a split room, `PRODUCT:`.
 
 #![cfg(unix)]
 
@@ -75,8 +77,6 @@ const CAP: usize = 3;
 const KNOB: &str = "VOX_TEST_MAX_AUTHORS";
 /// How soon both members' rosters must list every newcomer told it joined.
 const CONVERGE_WITHIN: std::time::Duration = std::time::Duration::from_secs(90);
-/// How far past the cap joins answered at once can take a room (`JOIN_OVERSHOOT`).
-const OVERSHOOT: usize = 16;
 /// The knob that holds a member's admissions until a file appears.
 const GATE: &str = "VOX_TEST_ADMISSION_GATE";
 /// The knob that fails every joiner's admission on the member answering it.
@@ -356,15 +356,6 @@ fn joins_answered_at_once_by_two_members_converge() {
     loop {
         on_host = roster(&host);
         on_bob = roster(&bob);
-        for (who, r) in [("host", &on_host), ("bob", &on_bob)] {
-            assert!(
-                r.len() <= CAP + OVERSHOOT,
-                "PRODUCT: {who}'s roster lists {} members, past the ceiling of {} (cap {CAP} + \
-                 {OVERSHOOT})",
-                r.len(),
-                CAP + OVERSHOOT
-            );
-        }
         let has_all = |r: &Vec<String>| want.iter().all(|w| r.iter().any(|m| m == w));
         if has_all(&on_host) && has_all(&on_bob) {
             break;
@@ -383,5 +374,19 @@ fn joins_answered_at_once_by_two_members_converge() {
         "[proof] both rosters list all 4 ({} past the cap of {CAP}) {:?} after the joins",
         4 - CAP,
         t0.elapsed()
+    );
+    // **Said, by a member that admitted one past the cap.** The one that learned the other's
+    // newcomer from the board is the one past it; which one it is depends on the race.
+    let t1 = std::time::Instant::now();
+    let said = loop {
+        let said: String = [&_host_d, &_bob_d].iter().map(|d| d.transcript()).collect();
+        if said.contains("admitted past the room's cap") || t1.elapsed() > CONVERGE_WITHIN {
+            break said;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+    assert!(
+        said.contains("admitted past the room's cap"),
+        "PRODUCT: the room went past its cap of {CAP} and neither member's log says so:\n{said}"
     );
 }

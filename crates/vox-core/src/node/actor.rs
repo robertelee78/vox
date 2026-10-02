@@ -347,9 +347,6 @@ const SETUP_PATIENCE: Duration = Duration::from_secs(5);
 /// never finished and keep everyone else out for as long as a member waits on a proof of work.
 /// Past the cap the heaviest source gives up its newest slot; see [`crate::node::joinslots`].
 const JOINS_IN_FLIGHT: usize = 16;
-// A room's soft cap overshoots by at most the joins answered at once (V210-128).
-const _OVERSHOOT_IS_THE_JOIN_SLOTS: () =
-    assert!(JOINS_IN_FLIGHT == crate::node::channel::JOIN_OVERSHOOT);
 
 /// How many identity-passphrase checks may run at once.
 ///
@@ -7157,6 +7154,7 @@ impl Node {
                 &set.bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
+                self.net.as_deref(),
             )
             .await;
         }
@@ -8190,6 +8188,7 @@ impl Node {
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
+                self.net.as_deref(),
             )
             .await;
         }
@@ -8846,6 +8845,7 @@ impl Node {
                                     &set.bundles,
                                     ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                                     now,
+                                    Some(&net),
                                 )
                                 .await;
                                 // What the peer's board holds is filed on this node's own, so its board
@@ -9384,6 +9384,7 @@ impl Node {
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
+                self.net.as_deref(),
             )
             .await;
             return shared.lock().await.is_author(peer);
@@ -11460,6 +11461,7 @@ async fn admit_board_records(
     records: &[crate::nat::record::MemberBundleRecord],
     quota: usize,
     now: u64,
+    net: Option<&NodeNet>,
 ) -> usize {
     // **Only records for keys not yet admitted are verified, and outside the room's lock**
     // (V210-71). Every record on a board was verified again on every outbound session, under the
@@ -11507,6 +11509,22 @@ async fn admit_board_records(
             match channel.admit_from_board(store, key, &record.admission, now) {
                 Ok(true) => {
                     admitted += 1;
+                    // **Past the cap only when another member admitted it on its own view**
+                    // (V210-128): said, so a room that went past its cap shows how.
+                    let (members, cap) =
+                        (channel.author_count(), crate::node::channel::max_authors());
+                    if members > cap {
+                        if let Some(net) = net {
+                            net.manager().note(
+                                key.fingerprint(),
+                                format!(
+                                    "admitted past the room's cap of {cap} (now {members} members): \
+                                     another member admitted it, at the same moment as this node's \
+                                     own last place"
+                                ),
+                            );
+                        }
+                    }
                     false
                 }
                 // Already admitted: nothing to do and nothing to retry.
