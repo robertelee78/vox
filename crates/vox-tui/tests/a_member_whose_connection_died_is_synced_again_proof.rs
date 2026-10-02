@@ -31,11 +31,12 @@
 //! frozen (else PRODUCT (staging)). The product exposes no line or counter for the close itself, so
 //! the premise rests on those three.
 //!
-//! **Apparatus clock.** Each poll of the two members' rooms spawns two `vox room read`s, which this
-//! proof cannot subtract, so every poll's own duration is measured on the same clock as
-//! [`BACK_WITHIN`], along with when carol first answered a read after `SIGCONT`. If the slowest of
-//! those exceeds [`APPARATUS_BUDGET`] and the rows were late, the runner owned the time:
-//! `CANNOT MEASURE: apparatus took X`. Otherwise a late sync is `PRODUCT: took X (apparatus Y)`.
+//! **Apparatus clock.** From carol's `SIGCONT`, a thread of this process sleeps 10 ms at a time and
+//! keeps the most it overslept: the runner's own stall, which vox cannot move. If it overslept more
+//! than [`APPARATUS_BUDGET`] and the rows were late, the runner owned the time: `CANNOT MEASURE:
+//! the runner stalled`. Otherwise a late sync is `PRODUCT: took X (runner stalled at most Y)`. The
+//! slowest poll (two `vox room read`s) and when carol first answered after `SIGCONT` are vox's own
+//! timing: printed, never the clock.
 //!
 //! Mutation: the scheduler's reach removed (nothing dials a member for sync) → red.
 
@@ -70,8 +71,8 @@ const BACK_WITHIN: Duration = Duration::from_secs(10);
 const SETUP: Duration = Duration::from_secs(90);
 /// `SILENCE_IS_DEATH`: a connection silent this long is dropped as dead.
 const SILENCE_LINE: Duration = Duration::from_secs(30);
-/// The slowest single poll (two `vox room read`s), or carol's first answer after `SIGCONT`, the
-/// runner may take before a late sync is the runner's, not vox's.
+/// The most the runner may oversleep one 10 ms sleep before a late sync is the runner's, not
+/// vox's.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
 fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
@@ -172,6 +173,49 @@ fn rows_read(data: &Path, room: &str, tag: &str) -> Result<usize, String> {
     Ok((0..POSTS)
         .filter(|i| out.contains(&format!("{tag}-{i:03}")))
         .count())
+}
+
+/// The runner's own clock: a thread that sleeps 10 ms at a time and keeps the most it overslept.
+/// It measures whether this process was scheduled, never vox: a slow vox does not move it, so a
+/// late result with this clock quiet is the product's.
+struct RunnerStall {
+    worst_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunnerStall {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let worst_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worst, stopped) = (
+            std::sync::Arc::clone(&worst_us),
+            std::sync::Arc::clone(&stop),
+        );
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let asked = Instant::now();
+                std::thread::sleep(Duration::from_millis(10));
+                let over = asked.elapsed().saturating_sub(Duration::from_millis(10));
+                worst.fetch_max(
+                    u64::try_from(over.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+        });
+        Self { worst_us, stop }
+    }
+
+    /// The most the runner overslept one 10 ms sleep since [`RunnerStall::start`].
+    fn worst(&self) -> Duration {
+        Duration::from_micros(self.worst_us.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for RunnerStall {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[test]
@@ -355,6 +399,7 @@ fn a_member_whose_connection_died_is_synced_again() {
     );
 
     // ---- 4. carol continued: each holds rows the other lacks ------------------------------------
+    let stall = RunnerStall::start();
     signal(&carol, "-CONT");
     let back = Instant::now();
     println!(
@@ -362,7 +407,7 @@ fn a_member_whose_connection_died_is_synced_again() {
         carol_frozen.elapsed()
     );
     let (mut bob_has, mut carol_has) = (0, 0);
-    // The apparatus: each poll's own duration, and when carol first answered a read.
+    // Vox's own timing, printed: each poll's duration, and when carol first answered a read.
     let (mut slowest, mut carol_answered, mut last_err) = (Duration::ZERO, None, None);
     while back.elapsed() < BACK_WITHIN {
         let poll = Instant::now();
@@ -386,11 +431,11 @@ fn a_member_whose_connection_died_is_synced_again() {
     }
     let took = back.elapsed();
     let read = bob_has.min(carol_has);
-    let apparatus = slowest.max(carol_answered.unwrap_or(took));
+    let apparatus = stall.worst();
     println!(
         "[proof] {took:.1?} after both were back: bob reads {bob_has}/{POSTS} of carol's rows, \
-         carol reads {carol_has}/{POSTS} of bob's; apparatus: slowest poll {slowest:.1?}, carol \
-         first answered {carol_answered:.1?} after SIGCONT"
+         carol reads {carol_has}/{POSTS} of bob's; slowest poll {slowest:.1?}, carol first \
+         answered {carol_answered:.1?} after SIGCONT; the runner overslept at most {apparatus:?}"
     );
     if read < POSTS {
         println!("---- bob said ----\n{}", bob.transcript());
@@ -400,12 +445,12 @@ fn a_member_whose_connection_died_is_synced_again() {
     if read < POSTS {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (slowest poll {slowest:?}, carol first \
-             answered {carol_answered:?} after SIGCONT, budget {APPARATUS_BUDGET:?}); bob reads \
-             {bob_has}/{POSTS}, carol {carol_has}/{POSTS} within {BACK_WITHIN:?}"
+            "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by {apparatus:?} \
+             (budget {APPARATUS_BUDGET:?}) while bob read {bob_has}/{POSTS} and carol \
+             {carol_has}/{POSTS} within {BACK_WITHIN:?}"
         );
         panic!(
-            "PRODUCT: took more than {took:?} (apparatus {apparatus:?}): members whose connection \
+            "PRODUCT: took more than {took:?} (runner stalled at most {apparatus:?}): members whose connection \
              was dropped as dead were not synced with each other again within {BACK_WITHIN:?}: bob \
              reads {bob_has}/{POSTS} of carol's rows, carol {carol_has}/{POSTS} of bob's{}",
             last_err.map_or_else(String::new, |e| format!("; the last read: {e}"))

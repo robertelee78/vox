@@ -27,11 +27,12 @@
 //! alice and the anchor were frozen carol ended no session with alice: bob carried them.
 //!
 //! ## Apparatus clock
-//! Carol's first answer after `SIGCONT` is timed on the same clock: the first read of her room
-//! returns only once her process runs again and her control socket answers. If carol fell short
-//! and that first answer took longer than [`APPARATUS_BUDGET`], the runner, not bob, owned the
-//! window: `CANNOT MEASURE: apparatus took X`. Otherwise the red is
-//! `PRODUCT: took X (apparatus Y)`.
+//! From carol's `SIGCONT`, a thread of this process sleeps 10 ms at a time and keeps the most it
+//! overslept: the runner's own stall, which vox cannot move. If carol fell short and the runner
+//! overslept more than [`APPARATUS_BUDGET`], the runner, not bob, owned the window: `CANNOT
+//! MEASURE: the runner stalled`. Otherwise the red is `PRODUCT: took X (runner stalled at most
+//! Y)`. When carol's socket first answered after `SIGCONT` is vox's own timing: printed, never the
+//! clock.
 //!
 //! ## Mutation
 //! `absorb_arrived` never raises `gen` (the verifier's mutant B): bob stores alice's entries, but no
@@ -68,8 +69,7 @@ const MARGIN: Duration = Duration::from_secs(3);
 /// was a CANNOT MEASURE.
 const STAGING: Duration = Duration::from_secs(3);
 const SETUP: Duration = Duration::from_secs(90);
-/// How long carol's control socket may take to first answer after `SIGCONT` before a shortfall is
-/// the runner's.
+/// The most the runner may oversleep one 10 ms sleep before a shortfall is the runner's.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
 fn texts_of(m: &Member, room: &str) -> Vec<String> {
@@ -82,6 +82,49 @@ fn relayed_count(texts: &[String]) -> usize {
     (0..POSTS)
         .filter(|i| texts.iter().any(|t| *t == format!("relay-{i}")))
         .count()
+}
+
+/// The runner's own clock: a thread that sleeps 10 ms at a time and keeps the most it overslept.
+/// It measures whether this process was scheduled, never vox: a slow vox does not move it, so a
+/// late result with this clock quiet is the product's.
+struct RunnerStall {
+    worst_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunnerStall {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let worst_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worst, stopped) = (
+            std::sync::Arc::clone(&worst_us),
+            std::sync::Arc::clone(&stop),
+        );
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let asked = Instant::now();
+                std::thread::sleep(Duration::from_millis(10));
+                let over = asked.elapsed().saturating_sub(Duration::from_millis(10));
+                worst.fetch_max(
+                    u64::try_from(over.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+        });
+        Self { worst_us, stop }
+    }
+
+    /// The most the runner overslept one 10 ms sleep since [`RunnerStall::start`].
+    fn worst(&self) -> Duration {
+        Duration::from_micros(self.worst_us.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for RunnerStall {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[test]
@@ -236,10 +279,11 @@ fn a_member_relays_what_it_learned() {
     // ---- 4. alice and the anchor frozen; carol back: only bob can give her the entries --------
     alice_d.signal("-STOP");
     anchor.signal("-STOP");
+    let stall = RunnerStall::start();
     carol_d.signal("-CONT");
     let back = Instant::now();
     let mut have = 0;
-    // The apparatus: when carol's control socket first answered after SIGCONT.
+    // Vox's own timing, printed: when carol's control socket first answered after SIGCONT.
     let mut answered = None;
     while back.elapsed() < BOUND {
         have = relayed_count(&texts_of(&carol, &room));
@@ -251,9 +295,12 @@ fn a_member_relays_what_it_learned() {
     }
     let took = back.elapsed();
     let answered = answered.unwrap_or(took);
+    let runner = stall.worst();
+    drop(stall);
     println!(
         "[proof] carol reads {have}/{POSTS} of alice's entries {took:.1?} after she was continued \
-         (bound {BOUND:?}); apparatus: her socket first answered {answered:.1?} after SIGCONT"
+         (bound {BOUND:?}); her socket first answered {answered:.1?} after SIGCONT; the runner \
+         overslept at most {runner:?}"
     );
     let ended = ended_with_alice() - ended_before;
     println!("[proof] sessions carol ended with alice meanwhile: {ended}");
@@ -267,13 +314,13 @@ fn a_member_relays_what_it_learned() {
     // window), so a short count is the product's: bob did not relay what he learned. Both sides'
     // sessions and connections are printed, so the red says which event was lost.
     assert!(
-        have == POSTS || answered <= APPARATUS_BUDGET,
-        "CANNOT MEASURE: apparatus took {answered:?} (carol's socket first answered that long after \
-         SIGCONT, budget {APPARATUS_BUDGET:?}); carol read {have}/{POSTS} within {BOUND:?}"
+        have == POSTS || runner <= APPARATUS_BUDGET,
+        "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by {runner:?} (budget \
+         {APPARATUS_BUDGET:?}) while carol read {have}/{POSTS} within {BOUND:?}"
     );
     assert!(
         have == POSTS,
-        "PRODUCT: took more than {took:?} (apparatus {answered:?}): carol reads {have}/{POSTS} of \
+        "PRODUCT: took more than {took:?} (runner stalled at most {runner:?}): carol reads {have}/{POSTS} of \
          alice's entries {BOUND:?} after she was continued: bob holds all {POSTS} and did not hand \
          them on\nbob's status:\n{}\ncarol's status:\n{}\nbob:\n{}\ncarol:\n{}",
         bob.status(),

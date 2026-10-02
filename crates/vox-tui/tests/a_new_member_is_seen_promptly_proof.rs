@@ -9,11 +9,12 @@
 //! Here Bob joins, then Carol joins. The clock starts when Carol's `vox room join` returns. It stops
 //! when Bob's `vox room roster` lists her. The bound is [`BOUND`], printed with every sample.
 //!
-//! **Apparatus clock.** Each poll spawns one `vox room roster`, which this proof cannot subtract,
-//! so every poll's own duration is measured on the same clock. If the slowest poll took longer
-//! than [`APPARATUS_BUDGET`] and Bob listed Carol late, the runner owned the time:
-//! `CANNOT MEASURE: apparatus took X`. Otherwise a late listing is
-//! `PRODUCT: took X (apparatus Y)`, with the daemons' stderr.
+//! **Apparatus clock.** While Bob's roster is polled, a thread of this process sleeps 10 ms at a
+//! time and keeps the most it overslept: the runner's own stall, which vox cannot move. If it
+//! overslept more than [`APPARATUS_BUDGET`] and Bob listed Carol late, the runner owned the time:
+//! `CANNOT MEASURE: the runner stalled`. Otherwise a late listing is `PRODUCT: took X (runner
+//! stalled at most Y)`, with the daemons' stderr. The slowest `vox room roster` is vox's own
+//! timing: printed, never the clock.
 //!
 //! Mutation: take out the prompt pass-on (`note_new_members`). Bob then learns of Carol only on his
 //! periodic sync, and the proof goes red.
@@ -24,7 +25,7 @@
 //! hours after the join, so every member who joined in that time was also counted as waiting: a
 //! room of 301 showed `301m/256p`. Once Bob and Carol are in, the anchor's last board line must show
 //! the room with all three members and nobody pending, within [`BOARD_PATIENCE`]. Its first line
-//! naming three members not printed in that time is CANNOT MEASURE (the anchor never learned the
+//! naming three members not printed in that time is PRODUCT (staging) (the anchor never learned the
 //! room's members, which is not this claim); three members with anyone pending is the product red,
 //! quoting the line. Mutation: a pre-join record kept after its joiner is admitted
 //! (`RendezvousStore::forget_prejoin` a no-op) — the line reads `3m/2p`.
@@ -204,8 +205,8 @@ fn spawn_anchor(root: &Path) -> (Proc, String) {
 
 /// How soon after Carol's join returns Bob must list her.
 const BOUND: Duration = Duration::from_secs(3);
-/// The slowest single poll (one `vox room roster`) the runner may take before a late listing is
-/// the runner's, not vox's.
+/// The most the runner may oversleep one 10 ms sleep before a late listing is the runner's, not
+/// vox's.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(1);
 
 /// How long the anchor may take to print a board line counting all three members.
@@ -228,6 +229,49 @@ fn counts(entry: &str) -> Option<(usize, usize)> {
     let m = parts.next()?.strip_suffix('m')?.parse().ok()?;
     let p = parts.next()?.strip_suffix('p')?.parse().ok()?;
     Some((m, p))
+}
+
+/// The runner's own clock: a thread that sleeps 10 ms at a time and keeps the most it overslept.
+/// It measures whether this process was scheduled, never vox: a slow vox does not move it, so a
+/// late result with this clock quiet is the product's.
+struct RunnerStall {
+    worst_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunnerStall {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let worst_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worst, stopped) = (
+            std::sync::Arc::clone(&worst_us),
+            std::sync::Arc::clone(&stop),
+        );
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let asked = Instant::now();
+                std::thread::sleep(Duration::from_millis(10));
+                let over = asked.elapsed().saturating_sub(Duration::from_millis(10));
+                worst.fetch_max(
+                    u64::try_from(over.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+        });
+        Self { worst_us, stop }
+    }
+
+    /// The most the runner overslept one 10 ms sleep since [`RunnerStall::start`].
+    fn worst(&self) -> Duration {
+        Duration::from_micros(self.worst_us.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for RunnerStall {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[test]
@@ -285,7 +329,8 @@ fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
         );
     }
     let joined_at = Instant::now();
-    // The apparatus: the slowest single poll.
+    let stall = RunnerStall::start();
+    // Vox's own timing, printed: the slowest single poll.
     let mut slowest = Duration::ZERO;
     let seen = loop {
         let poll = Instant::now();
@@ -299,13 +344,15 @@ fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    let runner = stall.worst();
+    drop(stall);
     let alice_lists = alice
         .vox(&["room", "roster", &room], None)
         .1
         .contains(&carol_fp);
     eprintln!(
         "[proof] bob listed carol {} after her join returned (bound {BOUND:?}); alice lists her: \
-         {alice_lists}; apparatus: slowest roster poll {slowest:?}",
+         {alice_lists}; slowest roster poll {slowest:?}; the runner overslept at most {runner:?}",
         seen.map_or("never within 60 s".to_owned(), |d| format!("{d:?}"))
     );
     // The anchor's operator: all three as members, nobody still waiting to join.
@@ -329,7 +376,7 @@ fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
         .filter(|(m, _)| *m >= 3)
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: the anchor printed no board line counting the room's 3 members \
+                "PRODUCT (staging): the anchor printed no board line counting the room's 3 members \
                  within {BOARD_PATIENCE:?}; its last entry for the room was {entry:?}"
             )
         });
@@ -342,14 +389,14 @@ fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
     );
     if seen.is_none_or(|d| d > BOUND) {
         assert!(
-            slowest <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {slowest:?} for one roster poll (budget \
-             {APPARATUS_BUDGET:?}); bob listed carol after {seen:?}"
+            runner <= APPARATUS_BUDGET,
+            "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by {runner:?} (budget \
+             {APPARATUS_BUDGET:?}) while bob listed carol after {seen:?}"
         );
         let stderr =
             |n: &str| std::fs::read_to_string(root.join(format!("{n}.err"))).unwrap_or_default();
         panic!(
-            "PRODUCT: took {seen:?} (apparatus {slowest:?}): bob listed carol beyond {BOUND:?} after \
+            "PRODUCT: took {seen:?} (runner stalled at most {runner:?}; slowest poll {slowest:?}): bob listed carol beyond {BOUND:?} after \
              her join returned: a member who joins through another reaches the rest of the room \
              only on their periodic sync\nbob's daemon:\n{}\ncarol's daemon:\n{}",
             stderr("bob"),

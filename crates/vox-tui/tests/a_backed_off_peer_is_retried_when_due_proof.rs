@@ -39,11 +39,12 @@
 //! CANNOT MEASURE: nothing in the proof restarts a node.
 //!
 //! ## Apparatus clock
-//! (1) is timed from `SIGCONT`, so it also holds the runner's own time to bring Bob back. On the
-//! same clock the proof records when Bob first answers after `SIGCONT` (a shipped
-//! `vox status --json` against his node returns) and the largest gap between its polls of Bob's
-//! room. If either exceeds [`APPARATUS_BUDGET`] and Bob read late, the runner owned the window:
-//! `CANNOT MEASURE: apparatus took X`. Otherwise a late read is `PRODUCT: took X (apparatus Y)`.
+//! (1) is timed from `SIGCONT`. On the same timeline a thread of this process sleeps 10 ms at a
+//! time and keeps the most it overslept: the runner's own stall, which vox cannot move. If it
+//! overslept more than [`APPARATUS_BUDGET`] and Bob read late, the runner owned the window:
+//! `CANNOT MEASURE: the runner stalled`. Otherwise a late read is `PRODUCT: took X (runner
+//! stalled at most Y)`. When Bob first answered after `SIGCONT`, and the largest gap between
+//! polls of his room, are vox's own timing: printed, never the clock.
 //! (2) reads Alice's own counters before Bob is continued, so it needs no clock.
 //!
 //! ## Mutation
@@ -68,9 +69,52 @@ const BOUND: Duration = Duration::from_secs(3);
 /// How long after the failure is seen that Bob is continued.
 const AFTER_FAILURE: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
-/// The most the runner may take to bring Bob back and answer (or to come round to its next poll)
-/// before a late read is the runner's, not vox's.
+/// The most the runner may oversleep one 10 ms sleep before a late read is the runner's, not
+/// vox's.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(1);
+
+/// The runner's own clock: a thread that sleeps 10 ms at a time and keeps the most it overslept.
+/// It measures whether this process was scheduled, never vox: a slow vox does not move it, so a
+/// late result with this clock quiet is the product's.
+struct RunnerStall {
+    worst_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunnerStall {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let worst_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worst, stopped) = (
+            std::sync::Arc::clone(&worst_us),
+            std::sync::Arc::clone(&stop),
+        );
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let asked = Instant::now();
+                std::thread::sleep(Duration::from_millis(10));
+                let over = asked.elapsed().saturating_sub(Duration::from_millis(10));
+                worst.fetch_max(
+                    u64::try_from(over.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+        });
+        Self { worst_us, stop }
+    }
+
+    /// The most the runner overslept one 10 ms sleep since [`RunnerStall::start`].
+    fn worst(&self) -> Duration {
+        Duration::from_micros(self.worst_us.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for RunnerStall {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 #[test]
 #[ignore = "two real daemons with production Argon2id, one frozen for ~20 s; CI runs it in release"]
@@ -145,11 +189,12 @@ fn a_backed_off_peer_is_retried_when_due() {
                 .map(|r| r["backoff"].clone())
         })
         .unwrap_or(serde_json::Value::Null);
+    let stall = RunnerStall::start();
     bob_d.signal("-CONT");
     let resumed = Instant::now();
     let b_mid = bob.status();
-    // The apparatus: when Bob first answered after SIGCONT (his `vox status --json` returned),
-    // and the largest gap between two polls of his room, on the same clock as `read_at`.
+    // Vox's own timing, printed: when Bob first answered after SIGCONT (his `vox status --json`
+    // returned), and the largest gap between two polls of his room.
     let answered = resumed.elapsed();
     let mut read_at = None;
     let (mut last_poll, mut max_gap) = (Instant::now(), Duration::ZERO);
@@ -163,7 +208,7 @@ fn a_backed_off_peer_is_retried_when_due() {
         }
         std::thread::sleep(POLL);
     }
-    let apparatus = answered.max(max_gap);
+    let apparatus = stall.worst();
     std::thread::sleep(Duration::from_millis(500));
     let (a1, b1) = (alice.status(), bob.status());
     // A counter that went backwards was reset by a restart: nothing below would mean anything.
@@ -187,7 +232,8 @@ fn a_backed_off_peer_is_retried_when_due() {
          backoff then {backoff}; bob continued {:?} after the freeze; read {read_at:?} after \
          continuing; alice opened {a_retried} to bob between her post and bob's continuing \
          (the failed one and the retry), {a_after} after; bob opened {b_opened} to alice after; \
-         apparatus: bob first answered {answered:?} after SIGCONT, largest poll gap {max_gap:?}",
+         bob first answered {answered:?} after SIGCONT, largest poll gap {max_gap:?}; the runner \
+         overslept at most {apparatus:?}",
         failures(&a_fail).join(" | "),
         resumed - frozen,
     );
@@ -199,8 +245,8 @@ fn a_backed_off_peer_is_retried_when_due() {
     );
     let Some(read_at) = read_at else {
         panic!(
-            "PRODUCT: bob never read alice's post within 40 s of being continued (apparatus \
-             {apparatus:?})\nalice:\n{}\nbob:\n{}",
+            "PRODUCT: bob never read alice's post within 40 s of being continued (the runner \
+             overslept at most {apparatus:?})\nalice:\n{}\nbob:\n{}",
             alice_d.transcript(),
             bob_d.transcript()
         )
@@ -208,12 +254,12 @@ fn a_backed_off_peer_is_retried_when_due() {
     if read_at > BOUND {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (bob first answered {answered:?} after \
-             SIGCONT, largest poll gap {max_gap:?}, budget {APPARATUS_BUDGET:?}); bob read alice's \
-             post {read_at:?} after being continued"
+            "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by {apparatus:?} \
+             (budget {APPARATUS_BUDGET:?}) while bob read alice's post {read_at:?} after being \
+             continued"
         );
         panic!(
-            "PRODUCT: took {read_at:?} (apparatus {apparatus:?}): bob read alice's post past \
+            "PRODUCT: took {read_at:?} (runner stalled at most {apparatus:?}): bob read alice's post past \
              {BOUND:?} after being continued: the backed-off port was not retried when due"
         );
     }

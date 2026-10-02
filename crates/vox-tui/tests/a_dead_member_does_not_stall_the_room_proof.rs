@@ -17,10 +17,11 @@
 //! catches is a wait for the dead member's 30 s silence (21.9–29.5 s measured). [`BOUND`] (5 s) is
 //! a sixth of that, so a red is the defect and not a slow spawn.
 //!
-//! **Apparatus clock.** Every poll's own duration (spawning `vox room read` and reading its
-//! output) is measured on the same timeline. If the slowest poll while a post was awaited took
-//! longer than [`APPARATUS_BUDGET`], the runner, not vox, owned that time: the red is
-//! `CANNOT MEASURE: apparatus took X`. Otherwise a late post is `PRODUCT: took X (apparatus Y)`.
+//! **Apparatus clock.** While each post is awaited, a thread of this process sleeps 10 ms at a time
+//! and keeps the most it overslept: the runner's own stall, which vox cannot move. If it overslept
+//! more than [`APPARATUS_BUDGET`] while a late post was awaited, the runner owned that time:
+//! `CANNOT MEASURE: the runner stalled`. Otherwise a late post is `PRODUCT: took X (runner stalled
+//! at most Y)`. The slowest `vox room read` is vox's own timing: printed, never the clock.
 //!
 //! Mutation: key the session guard by room again (the pre-fix behaviour), and posts wait behind
 //! the push to the dead member.
@@ -201,11 +202,54 @@ fn spawn_anchor(root: &Path) -> (Proc, String) {
 
 /// A post between two live members is readable within this; the defect waits out a 30 s silence.
 const BOUND: Duration = Duration::from_secs(5);
-/// The slowest single poll (one `vox room read`) the runner may take before a late post is the
-/// runner's, not vox's.
+/// The most the runner may oversleep one 10 ms sleep before a late post is the runner's, not
+/// vox's.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 /// Posts timed after Carol dies.
 const POSTS: usize = 5;
+
+/// The runner's own clock: a thread that sleeps 10 ms at a time and keeps the most it overslept.
+/// It measures whether this process was scheduled, never vox: a slow vox does not move it, so a
+/// late result with this clock quiet is the product's.
+struct RunnerStall {
+    worst_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunnerStall {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let worst_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worst, stopped) = (
+            std::sync::Arc::clone(&worst_us),
+            std::sync::Arc::clone(&stop),
+        );
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let asked = Instant::now();
+                std::thread::sleep(Duration::from_millis(10));
+                let over = asked.elapsed().saturating_sub(Duration::from_millis(10));
+                worst.fetch_max(
+                    u64::try_from(over.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+        });
+        Self { worst_us, stop }
+    }
+
+    /// The most the runner overslept one 10 ms sleep since [`RunnerStall::start`].
+    fn worst(&self) -> Duration {
+        Duration::from_micros(self.worst_us.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for RunnerStall {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 #[test]
 #[ignore = "a real anchor and three real daemons with production Argon2id; CI runs it in release"]
@@ -341,7 +385,8 @@ fn a_dead_member_does_not_stall_the_room() {
             "PRODUCT: alice's `vox room post` failed with carol dead: {err}"
         );
         let posted = Instant::now();
-        // The apparatus: the slowest single poll while this post was awaited.
+        let stall = RunnerStall::start();
+        // Vox's own timing, printed: the slowest single poll while this post was awaited.
         let mut slowest = Duration::ZERO;
         let seen = loop {
             let poll = Instant::now();
@@ -361,29 +406,31 @@ fn a_dead_member_does_not_stall_the_room() {
             std::thread::sleep(Duration::from_millis(50));
         };
         eprintln!(
-            "[proof] post {i} after carol died: bob read it {} (apparatus: slowest poll {slowest:?})",
+            "[proof] post {i} after carol died: bob read it {} (slowest poll {slowest:?}; the \
+             runner overslept at most {:?})",
             seen.map_or("never within 40 s".to_owned(), |d| format!(
                 "{d:?} after it was posted"
-            ))
+            )),
+            stall.worst()
         );
-        took.push((seen, slowest));
+        took.push((seen, stall.worst()));
     }
     let stalled: Vec<String> = took
         .iter()
         .enumerate()
         .filter(|(_, (t, a))| t.is_none_or(|d| d > BOUND) && *a > APPARATUS_BUDGET)
-        .map(|(i, (t, a))| format!("post {}: {t:?}, apparatus took {a:?}", i + 1))
+        .map(|(i, (t, a))| format!("post {}: {t:?}, the runner overslept {a:?}", i + 1))
         .collect();
     assert!(
         stalled.is_empty(),
-        "CANNOT MEASURE: apparatus took more than {APPARATUS_BUDGET:?} for one poll while a late \
-         post was awaited: {stalled:?}"
+        "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by more than \
+         {APPARATUS_BUDGET:?} while a late post was awaited: {stalled:?}"
     );
     let late: Vec<String> = took
         .iter()
         .enumerate()
         .filter(|(_, (t, _))| t.is_none_or(|d| d > BOUND))
-        .map(|(i, (t, a))| format!("post {}: took {t:?} (apparatus {a:?})", i + 1))
+        .map(|(i, (t, a))| format!("post {}: took {t:?} (runner stalled at most {a:?})", i + 1))
         .collect();
     assert!(
         late.is_empty(),

@@ -24,12 +24,12 @@
 //! stopped keeps the signer, the ring and the passphrase until its dials run out, and only then
 //! answers.
 //!
-//! **Apparatus clock.** The answer time is read on the same timeline as two measures of the
-//! runner itself: how long bob's TUI driver took to show LOCKED once the test asked for the lock
-//! (the pty round trip), and the largest gap between two of the test's own 100 ms polls of the
-//! join while it waited for the answer. If the answer was late and either exceeded its budget
-//! ([`LOCK_ACK_BUDGET`], [`POLL_GAP_BUDGET`]), the runner stalled and the red is
-//! `CANNOT MEASURE: apparatus took X`; otherwise it is `PRODUCT: took X (apparatus Y)`.
+//! **Apparatus clock.** The answer time is read on the same timeline as the runner's own stall: the
+//! largest gap between two of the test's 100 ms polls of the join (a `waitpid` and a sleep, which
+//! vox cannot slow). If the answer was late and that gap exceeded [`POLL_GAP_BUDGET`], the runner
+//! stalled and the red is `CANNOT MEASURE: the runner stalled`; otherwise it is `PRODUCT: took X
+//! (apparatus Y)`. How long the TUI took to show LOCKED is vox's own timing: printed, never the
+//! clock.
 //!
 //! **Mutation that must turn it red:** the joiner spawned detached again (`tokio::spawn` instead of
 //! `join_tasks`): measured, bob's join answered 27.6 s after the lock, in 2 of 2 runs, against
@@ -58,8 +58,6 @@ const IN_FLIGHT: Duration = Duration::from_secs(3);
 const ANSWERED: Duration = Duration::from_secs(10);
 /// How long alice has, once resumed, for a join still running to reach her and complete.
 const SETTLE: Duration = Duration::from_secs(40);
-/// The pty round trip from asking for the lock to seeing LOCKED, past which the runner stalled.
-const LOCK_ACK_BUDGET: Duration = Duration::from_secs(10);
 /// The largest gap between two 100 ms polls of the join, past which the runner stalled.
 const POLL_GAP_BUDGET: Duration = Duration::from_secs(2);
 
@@ -350,12 +348,14 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
          said: {}",
         std::fs::read_to_string(alice.join("daemon.err")).unwrap_or_default()
     );
-    let stalled = lock_ack > LOCK_ACK_BUDGET || poll_gap > POLL_GAP_BUDGET;
-    let apparatus = format!("LOCKED shown after {lock_ack:?}, largest poll gap {poll_gap:?}");
+    let stalled = poll_gap > POLL_GAP_BUDGET;
+    let apparatus = format!(
+        "largest poll gap {poll_gap:?}, budget {POLL_GAP_BUDGET:?}; LOCKED shown after {lock_ack:?}"
+    );
     let Some((status, took)) = answered else {
         assert!(
             !stalled,
-            "CANNOT MEASURE: apparatus took {apparatus}, and bob's `vox room join` did not answer \
+            "CANNOT MEASURE: the runner stalled ({apparatus}), and bob's `vox room join` did not answer \
              within {SETTLE:?} of the lock"
         );
         panic!(
@@ -380,7 +380,7 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
     if took >= ANSWERED {
         assert!(
             !stalled,
-            "CANNOT MEASURE: apparatus took {apparatus}, and bob's join answered {took:?} after the \
+            "CANNOT MEASURE: the runner stalled ({apparatus}), and bob's join answered {took:?} after the \
              lock"
         );
         panic!(
