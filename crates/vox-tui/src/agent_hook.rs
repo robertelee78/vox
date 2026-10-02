@@ -518,13 +518,11 @@ fn wake_header(room_label: &str, room_name: &str, author: &str) -> String {
     )
 }
 
-/// `text` as one line: line breaks and other control characters replaced, so a name cannot start
-/// a line of its own in a model's context.
+/// `text` as one line, so a name cannot start a line of its own in a model's context: every
+/// control character and U+2028/U+2029 replaced, cut to about 64 bytes. It is
+/// [`vox_agentcomms::envelope::shown`], the one sanitiser for names (V210-123).
 fn one_line(text: &str) -> String {
-    text.trim()
-        .chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect()
+    vox_agentcomms::envelope::shown(text.trim(), vox_agentcomms::envelope::SHOWN_NAME)
 }
 
 /// The rows of `rows` that `prompt` is the wake for (V210-112): the prompt is [`render_wake`]'s
