@@ -1351,6 +1351,7 @@ pub mod mutant {
         AuthorUnclassifiable,
         OldRowIds,
         AuthorMisbound,
+        AdminUnentitled,
     }
 
     fn mode() -> Mode {
@@ -1365,6 +1366,7 @@ pub mod mutant {
                 "author-unclassifiable" => Mode::AuthorUnclassifiable,
                 "old-row-ids" => Mode::OldRowIds,
                 "author-misbound" => Mode::AuthorMisbound,
+                "admin-unentitled" => Mode::AdminUnentitled,
                 _ => Mode::Correct,
             };
             eprintln!(
@@ -1372,6 +1374,13 @@ pub mod mutant {
             );
             mode
         })
+    }
+
+    /// Whether this build names admins though its identity is not the room's creator (#319): the
+    /// admin with a modified client whose certificate no node may honour.
+    #[must_use]
+    pub fn admins_unentitled() -> bool {
+        mode() == Mode::AdminUnentitled
     }
 
     /// The `HAVE` to send, and the entries to serve unasked.
@@ -1422,7 +1431,8 @@ pub mod mutant {
             | Mode::ServeSlowly
             | Mode::AuthorUnclassifiable
             | Mode::OldRowIds
-            | Mode::AuthorMisbound => asked,
+            | Mode::AuthorMisbound
+            | Mode::AdminUnentitled => asked,
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
             Mode::StripPayload => asked

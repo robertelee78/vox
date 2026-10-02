@@ -11837,7 +11837,9 @@ fn fault_of(e: &Error) -> Fault {
         Error::Profile("this node is still reading the room after joining it") => {
             Fault::StillJoining
         }
-        Error::Profile("only the room's creator may add or remove an admin") => Fault::NotCreator,
+        Error::Profile("only the room's creator may add or remove an admin") => {
+            Fault::NotRoomCreator
+        }
         Error::Profile("that member is not an admin of the room") => Fault::NotAnAdmin,
         Error::Profile(
             "that identity is not a member of the room" | "the room's creator is its admin already",

@@ -466,7 +466,7 @@ pub enum Accepted {
 /// Why a room is over (V030-08).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomEnd {
-    /// Its creator ended it for everyone.
+    /// Its creator, or an admin the creator named, ended it for everyone.
     ByCreator,
     /// Nothing was said in it for the idle end its creator chose.
     Idle {
@@ -478,7 +478,7 @@ pub enum RoomEnd {
 impl std::fmt::Display for RoomEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RoomEnd::ByCreator => f.write_str("its creator ended it"),
+            RoomEnd::ByCreator => f.write_str("its creator or an admin ended it"),
             RoomEnd::Idle { idle_secs } => write!(
                 f,
                 "nothing was said in it for {}, the idle end its creator chose",
@@ -5447,7 +5447,8 @@ impl ChannelState {
     }
 
     /// Make `member` an admin of the room (V030-08, the decider 2026-10-01): an admin
-    /// certificate from the creator, carrying `admin`. Only the creator may — not another admin —
+    /// certificate from the creator, carrying what a delegated admin holds and never `delegate`
+    /// ([`Self::delegated_admin_caps`]). Only the creator may — not another admin —
     /// and only for a member of the room.
     pub fn add_admin(
         &mut self,
@@ -5456,7 +5457,14 @@ impl ChannelState {
         now_secs: u64,
     ) -> Result<Digest32> {
         let signer = profile.signer()?;
-        if signer.fingerprint() != self.evaluator.root_admin() {
+        // The client's own check. The room's is the certificate: it carries no `delegate`, so an
+        // admin's certificate for anyone else verifies nowhere (#319).
+        #[cfg(feature = "mutant-sender")]
+        let entitled = signer.fingerprint() == self.evaluator.root_admin()
+            || crate::log::sync::mutant::admins_unentitled();
+        #[cfg(not(feature = "mutant-sender"))]
+        let entitled = signer.fingerprint() == self.evaluator.root_admin();
+        if !entitled {
             return Err(Error::Profile(
                 "only the room's creator may add or remove an admin",
             ));
@@ -5477,16 +5485,27 @@ impl ChannelState {
             &self.channel_id,
             self.epoch,
             key,
-            crate::governance::capability::CapabilitySet::from_iter_caps([
-                crate::governance::capability::Capability::Admin,
-            ]),
+            Self::delegated_admin_caps(),
             0,
         )?;
         self.append_governance(profile, &cert.to_wire(), now_secs)
     }
 
-    /// Take `member`'s admin back (V030-08): revoke every admin certificate the creator issued
-    /// it. Only the creator may.
+    /// What a delegated admin holds (#319): ending the room, its policy (retention) and passphrase
+    /// rotation — **not** `delegate`. With `delegate` (which `admin` implies), an admin could name
+    /// further admins, every node would honour them, and "only the creator names admins" would be
+    /// the client's word alone.
+    #[must_use]
+    pub fn delegated_admin_caps() -> crate::governance::capability::CapabilitySet {
+        use crate::governance::capability::Capability;
+        crate::governance::capability::CapabilitySet::from_iter_caps([
+            Capability::Policy,
+            Capability::PassphraseRotate,
+        ])
+    }
+
+    /// Take `member`'s admin back (V030-08): revoke every admin certificate naming it, whoever
+    /// issued it. Only the creator may.
     pub fn remove_admin(
         &mut self,
         profile: &Profile,
@@ -5514,7 +5533,7 @@ impl ChannelState {
             .iter()
             .filter(|e| {
                 matches!(&e.body, GovBody::AdminCert(c)
-                    if c.body.issuer_id == me && c.body.delegate_pubkey.fingerprint() == *member)
+                    if c.body.delegate_pubkey.fingerprint() == *member)
             })
             .map(|e| e.entry_hash)
             .filter(|h| !revoked.contains(h))

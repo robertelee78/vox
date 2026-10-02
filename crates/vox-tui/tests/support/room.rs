@@ -272,6 +272,15 @@ impl Worker {
         let anchor = self.anchor.clone();
         start_daemon(self, &anchor, err);
     }
+
+    /// Stop this worker's daemon and start it again from `exe` with `env`, as it was started
+    /// otherwise: a member that is to run a faulty build (the mutant sender).
+    #[allow(dead_code)] // only proofs that run a faulty member call it
+    pub fn restart_daemon_as(&mut self, exe: &str, env: &[(&str, &str)], err: &std::path::Path) {
+        drop(self.daemon.take());
+        let anchor = self.anchor.clone();
+        start_daemon_as(self, exe, env, &anchor, err);
+    }
 }
 
 /// A room shared by every worker, and the processes that serve it. Dropping it kills
@@ -415,7 +424,20 @@ fn worker(tmp: &std::path::Path, name: &str) -> Worker {
 }
 
 fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
-    let child = Command::new(VOX)
+    start_daemon_as(w, VOX, &[], anchor, err);
+}
+
+/// [`start_daemon`] from `exe` with `env` beside it: a proof that runs one member as a faulty
+/// build (the mutant sender) names it here.
+fn start_daemon_as(
+    w: &mut Worker,
+    exe: &str,
+    env: &[(&str, &str)],
+    anchor: &str,
+    err: &std::path::Path,
+) {
+    let child = Command::new(exe)
+        .envs(env.iter().copied())
         .args([
             "daemon",
             "--listen",
@@ -431,7 +453,7 @@ fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
         .stdout(Stdio::null())
         .stderr(log_file(err))
         .spawn()
-        .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX} daemon: {e}"));
+        .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {exe} daemon: {e}"));
     w.daemon = Some(Proc(child));
     w.anchor = anchor.to_owned();
     let started = Instant::now();

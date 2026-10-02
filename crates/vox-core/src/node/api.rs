@@ -613,6 +613,8 @@ pub enum Fault {
     /// Only the room's creator may do that — end the room (or an admin it delegated), or choose
     /// its idle end (V030-08).
     NotCreator,
+    /// Only the room's creator adds or removes an admin (#319); an admin may not.
+    NotRoomCreator,
     /// This node joined the room a moment ago and is still reading it; its own entries wait until
     /// it has (V030-08: a member that joins again must not reuse a position of its earlier feed).
     StillJoining,
@@ -726,7 +728,7 @@ impl Fault {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
             }
             Fault::NotAdmin => {
-                "only the room's admin may change that, and this identity is not its admin\n       the admin is whoever created the room; ask them"
+                "only the room's admin may change that, and this identity is not its admin\n       the room's creator and the admins it named are; `vox room admin list` shows who"
             }
             Fault::RoomEnded => {
                 "this room has ended — its creator ended it, or nothing was said in it for the idle end its creator chose — so it takes no new message\n       what was said stays readable here until you `vox room forget` it"
@@ -742,6 +744,9 @@ impl Fault {
             }
             Fault::ResponderLeft => {
                 "the member that answered has left that room, so it lets nobody in\n       your passphrase was never checked; ask a member still in the room for an address"
+            }
+            Fault::NotRoomCreator => {
+                "only the room's creator adds or removes an admin, and this identity did not create the room"
             }
             Fault::NotAnAdmin => {
                 "that member is not an admin of the room\n       `vox room admin list` shows who is"
@@ -838,6 +843,7 @@ fault_names!(
     NotCreator,
     StillJoining,
     NotAnAdmin,
+    NotRoomCreator,
     JoinedRoomEnded,
     ResponderLeft,
     Internal,
