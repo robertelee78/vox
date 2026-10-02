@@ -159,6 +159,7 @@ impl Anchor {
     /// draining what it printed for `settle` (see [`Self::circuits`]). The anchor reports on
     /// change, every 500 ms, and a circuit it carried lasts at least a retired path's 60 s grace,
     /// so a circuit asked of it at any point in a run is in one of these reports (V210-122).
+    /// No report at all is `CANNOT MEASURE`, never 0.
     pub fn circuits_ever(&mut self, settle: Duration) -> usize {
         let _ = self.circuits(settle);
         self.proc
@@ -170,7 +171,13 @@ impl Anchor {
                 after.split_whitespace().next()?.parse::<usize>().ok()
             })
             .max()
-            .unwrap_or(0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "CANNOT MEASURE: the anchor printed no `… circuit(s) carried` report, so how \
+                     many circuits it ever carried is unknown. It said:\n{}",
+                    self.proc.transcript()
+                )
+            })
     }
 
     /// The circuit count in the latest status report this anchor printed, if it printed one.

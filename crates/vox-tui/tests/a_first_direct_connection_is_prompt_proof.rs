@@ -30,11 +30,12 @@
 //! - the pair is on the direct path (an echo whose bytes crossed the forward) in under 2000 ms;
 //! - every sample reached the direct path at all ([`GIVE_UP`]), and the forward carried bytes.
 //!
-//! - **the anchor never carries a circuit** (V210-122): its own `circuit(s) carried` report stays at
-//!   0 for the whole run, the guest's join included; the guest's `vox status --json` counts no
-//!   circuit asked for to the host, by any `vox up` or by a `vox forward`, which reaches the host
-//!   the moment it starts (the case R41's transcripts showed); and no first answer comes over the
-//!   circuit. A reachable host must cost the anchor nothing (ADR-012).
+//! - **the side that can reach directly asks for no circuit** (V210-122): the guest's
+//!   `vox status --json` counts no circuit asked for to the host, by any `vox up` or by a
+//!   `vox forward`, which reaches the host the moment it starts over a direct path with 30 ms of
+//!   latency (the case R41's transcripts showed). The host's circuits to the guest, which it cannot
+//!   dial, are legitimate bridges (the decider, 2026-10-02) and are printed, not asserted, with the
+//!   anchor's own count.
 //!
 //! Printed: min / median / p95 / max of both, how many first answers came over the circuit, and
 //! how many dials began before `vox up` said it was up.
@@ -43,8 +44,9 @@
 //! 2.5 s in `nat::reachability::connect_direct_within`. The first answer still comes fast, over the
 //! anchor's circuit, and the direct path lands only after 2.5 s — red on the direct bound.
 //!
-//! And for V210-122: `DIRECT_HEAD_START` set to 0, the old race. A circuit through the anchor is
-//! asked for beside every direct dial, so the anchor reports carrying one: red, as PRODUCT.
+//! And for V210-122: `DIRECT_HEAD_START` set to 0, the old race. The guest's `vox forward` asks for
+//! a circuit through the anchor beside its direct dial over the 30 ms path, and the guest's status
+//! counts it: red, as PRODUCT.
 //!
 //! Replaces `crates/vox-core/tests/perf_r42_first_connect_open_gate.rs`, which ran every node in
 //! process on a NAT simulator.
@@ -88,7 +90,7 @@ const PAYLOAD: usize = 16 * 1024;
 
 /// Start the guest's `vox forward` to the host's service, wait until it says it reached the host,
 /// read how many circuits it asked for to the host while it still runs, and stop it (by its PID).
-fn forward_once(w: &ForwardedWorld) -> (String, Option<u64>) {
+fn forward_once(w: &ForwardedWorld) -> (String, u64) {
     use world::{args, room_pass_file, VoxProc};
     let mut fwd = VoxProc::spawn(
         "forward",
@@ -110,24 +112,41 @@ fn forward_once(w: &ForwardedWorld) -> (String, Option<u64>) {
     let line = fwd.expect_line("`vox forward` saying it reached the host", |l| {
         l.contains("vox: reached ") && l.contains(" ms (")
     });
-    let asked = circuits_asked(&w.guest_dir, &w.host_fp);
+    let asked = circuits_asked(&w.guest_dir, &w.host_fp, "the guest's `vox forward`");
     interrupt(&mut fwd, Duration::from_secs(15));
     (line, asked)
 }
 
 /// How many circuits the node running on the profile at `dir` has asked a relay for, to `peer`,
-/// from its `vox status --json` (`reach[].circuits`); `None` if it did not answer.
-fn circuits_asked(dir: &std::path::Path, peer: &str) -> Option<u64> {
-    let (ok, out, _) = world::vox_once(dir, &world::args(&["status", "--json"]));
-    if !ok {
-        return None;
-    }
-    // A peer it never reached for has no row: none asked.
-    let Some(row) = out.split("{\"peer\":\"").find(|r| r.starts_with(peer)) else {
-        return Some(0);
+/// from its `vox status --json` (`reach[].circuits`, counted where every circuit is asked for).
+///
+/// **Never a silent 0.** A status that does not answer, or answers without its `reach` section,
+/// measured nothing: `CANNOT MEASURE`, naming `who`. A `reach` section with no row for `peer` is
+/// a measured 0 — a row is there for every peer this node ran a ladder to or asked a circuit for.
+fn circuits_asked(dir: &std::path::Path, peer: &str, who: &str) -> u64 {
+    let (ok, out, err) = world::vox_once(dir, &world::args(&["status", "--json"]));
+    assert!(
+        ok,
+        "CANNOT MEASURE: {who}'s `vox status --json` did not answer, so how many circuits it asked \
+         for is unknown.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    let Some(reach) = out.split("\"reach\":[").nth(1) else {
+        panic!(
+            "CANNOT MEASURE: {who}'s `vox status --json` has no `reach` section, so how many \
+             circuits it asked for is unknown:\n{out}"
+        );
     };
-    let n = row.split("\"circuits\":").nth(1)?;
-    n.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    let reach = reach.split(']').next().unwrap_or_default();
+    let Some(row) = reach.split("{\"peer\":\"").find(|r| r.starts_with(peer)) else {
+        return 0;
+    };
+    row.split("\"circuits\":")
+        .nth(1)
+        .and_then(|n| n.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: {who}'s `reach` row for {peer} has no circuit count: {row}")
+        })
 }
 
 fn stats(label: &str, samples: &[Duration]) -> Duration {
@@ -251,9 +270,9 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         any.push(a);
         direct.push(d);
         // The circuits this `vox up` asked a relay for, to the host it could reach directly.
-        let asked = circuits_asked(&w.guest_dir, &w.host_fp);
-        eprintln!("[proof] sample {i}: the guest asked for {asked:?} circuit(s) to the host");
-        guest_circuits += asked.unwrap_or(0);
+        let asked = circuits_asked(&w.guest_dir, &w.host_fp, "the guest's `vox up`");
+        eprintln!("[proof] sample {i}: the guest asked for {asked} circuit(s) to the host");
+        guest_circuits += asked;
         if !interrupt(&mut up, Duration::from_secs(15)) {
             eprintln!("[proof] sample {i}: `vox up` did not exit on Ctrl-C within 15 s; killed");
         }
@@ -274,38 +293,43 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         w.forward.to_host() > 0 && w.forward.to_guest() > 0,
         "CANNOT MEASURE: the forward carried nothing, so there was no direct path to time"
     );
-    // **A reachable host costs the anchor nothing** (V210-122, ADR-012). Every reach raced a circuit
-    // through the anchor against the direct dial; the circuit lost, was retired, and the anchor
-    // carried it for its 60 s grace. With the direct dial's head start, no circuit is asked for:
-    // the anchor's own report never counts one, at any point of the run — the join included.
+    // **A side that can reach directly never asks for a circuit** (V210-122, ADR-012). Every reach
+    // raced a circuit through the anchor against the direct dial; the circuit lost, was retired,
+    // and the anchor carried it for its 60 s grace. With the direct dial's head start, the guest —
+    // which reaches the host through the forward — asks for none, by any `vox up` or `vox forward`.
+    //
+    // **The host's circuits are not counted** (the decider, 2026-10-02, on #321). The host cannot
+    // dial the guest at all (`[::1]`, no forward), so when it reaches the guest while no guest
+    // process has connected to it, the anchor bridging them is what an anchor is for. They are
+    // printed, with the anchor's own count and any first answer that rode one, and not asserted.
+    // That the host asks the guest to dial back instead is planned for v0.3.0.
+    //
     // The case R41's transcripts showed: a `vox forward` reaches the host the moment it starts,
     // with its anchor already connected. That reach raced a circuit through the anchor against the
     // direct dial, and over a path with any latency the circuit — through an anchor next door —
     // won. So the forward now holds each datagram to the host for FORWARD_DELAY: a direct path a
     // real network would have, slower than the anchor's but well inside the direct dial's head
-    // start. The host is reachable, so no circuit may be asked for.
+    // start.
     w.forward.set_delay(FORWARD_DELAY);
     let (reached, forward_asked) = forward_once(&w);
     w.forward.set_delay(Duration::ZERO);
     eprintln!(
-        "[proof] `vox forward` to the reachable host: {reached}; it asked for {forward_asked:?} \
+        "[proof] `vox forward` to the reachable host: {reached}; it asked for {forward_asked} \
          circuit(s) to the host"
     );
-    guest_circuits += forward_asked.unwrap_or(0);
+    guest_circuits += forward_asked;
     let ever = w.anchor.circuits_ever(Duration::from_secs(2));
     let guest_fp = world::fingerprint(&w.guest_dir, "guest");
-    let host_asked = circuits_asked(&w.host_dir, &guest_fp);
+    let host_asked = circuits_asked(&w.host_dir, &guest_fp, "the host");
     eprintln!(
         "[proof] the most circuits the anchor ever reported carrying: {ever}; the guest asked for \
-         {guest_circuits} to the host; the host asked for {host_asked:?} to the guest"
+         {guest_circuits} to the host; the host asked for {host_asked} to the guest"
     );
     assert!(
-        ever == 0 && guest_circuits == 0 && first_over_circuit == 0,
-        "PRODUCT: the host was directly reachable through the forward the whole run, yet the \
-         anchor reported carrying up to {ever} circuit(s), the guest asked for {guest_circuits}, \
-         and {first_over_circuit} of {SAMPLES} \
-         first answers came over the circuit: an anchor carried a circuit nobody needed.\n\
-         anchor:\n{}",
+        guest_circuits == 0,
+        "PRODUCT: the guest reached the host directly through the forward, yet it asked for \
+         {guest_circuits} circuit(s) to the host: a side that could reach directly made an anchor \
+         carry a circuit for it.\nanchor:\n{}",
         w.anchor.proc.transcript()
     );
     let over_any = any.iter().filter(|d| **d >= TARGET).count();
