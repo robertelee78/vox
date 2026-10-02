@@ -11,59 +11,59 @@
 [0m$ [0mls -la crates/vox-core/src/governance/ crates/vox-core/src/node/ crates/vox-core/src/tunnel/ 2>&1
 crates/vox-core/src/governance/:
 total 528
-drwxr-xr-x@ 15 robert.lee  wheel    480 Sep 21 16:32 .
-drwxr-xr-x@ 33 robert.lee  wheel   1056 Sep 21 16:32 ..
--rw-r--r--@  1 robert.lee  wheel  12134 Sep 21 16:32 capability.rs
--rw-r--r--@  1 robert.lee  wheel  19183 Sep 21 16:32 cert.rs
--rw-r--r--@  1 robert.lee  wheel  13453 Sep 21 16:32 consent.rs
--rw-r--r--@  1 robert.lee  wheel  12914 Sep 21 16:32 entry.rs
--rw-r--r--@  1 robert.lee  wheel  47602 Sep 21 16:32 evaluator.rs
--rw-r--r--@  1 robert.lee  wheel  23475 Sep 21 16:32 genesis.rs
--rw-r--r--@  1 robert.lee  wheel   5720 Sep 21 16:32 invite.rs
--rw-r--r--@  1 robert.lee  wheel   6104 Sep 21 16:32 membership.rs
--rw-r--r--@  1 robert.lee  wheel  14087 Sep 21 16:32 policy.rs
--rw-r--r--@  1 robert.lee  wheel   8560 Sep 21 16:32 rotation.rs
--rw-r--r--@  1 robert.lee  wheel   7619 Sep 21 16:32 servicegrant.rs
--rw-r--r--@  1 robert.lee  wheel  70552 Sep 21 16:32 vectors.rs
--rw-r--r--@  1 robert.lee  wheel   3433 Sep 21 16:32 visibility.rs
+drwxr-xr-x@ 15 user        wheel    480 Sep 21 16:32 .
+drwxr-xr-x@ 33 user        wheel   1056 Sep 21 16:32 ..
+-rw-r--r--@  1 user        wheel  12134 Sep 21 16:32 capability.rs
+-rw-r--r--@  1 user        wheel  19183 Sep 21 16:32 cert.rs
+-rw-r--r--@  1 user        wheel  13453 Sep 21 16:32 consent.rs
+-rw-r--r--@  1 user        wheel  12914 Sep 21 16:32 entry.rs
+-rw-r--r--@  1 user        wheel  47602 Sep 21 16:32 evaluator.rs
+-rw-r--r--@  1 user        wheel  23475 Sep 21 16:32 genesis.rs
+-rw-r--r--@  1 user        wheel   5720 Sep 21 16:32 invite.rs
+-rw-r--r--@  1 user        wheel   6104 Sep 21 16:32 membership.rs
+-rw-r--r--@  1 user        wheel  14087 Sep 21 16:32 policy.rs
+-rw-r--r--@  1 user        wheel   8560 Sep 21 16:32 rotation.rs
+-rw-r--r--@  1 user        wheel   7619 Sep 21 16:32 servicegrant.rs
+-rw-r--r--@  1 user        wheel  70552 Sep 21 16:32 vectors.rs
+-rw-r--r--@  1 user        wheel   3433 Sep 21 16:32 visibility.rs
 
 crates/vox-core/src/node/:
 total 1072
-drwxr-xr-x@ 24 robert.lee  wheel     768 Sep 21 16:32 .
-drwxr-xr-x@ 33 robert.lee  wheel    1056 Sep 21 16:32 ..
--rw-r--r--@  1 robert.lee  wheel  130897 Sep 21 16:32 actor.rs
--rw-r--r--@  1 robert.lee  wheel   12703 Sep 21 16:32 anchor.rs
--rw-r--r--@  1 robert.lee  wheel   18887 Sep 21 16:32 api.rs
--rw-r--r--@  1 robert.lee  wheel   91745 Sep 21 16:32 channel.rs
--rw-r--r--@  1 robert.lee  wheel   17922 Sep 21 16:32 circuitstream.rs
--rw-r--r--@  1 robert.lee  wheel    2567 Sep 21 16:32 content.rs
--rw-r--r--@  1 robert.lee  wheel   22392 Sep 21 16:32 coordstream.rs
--rw-r--r--@  1 robert.lee  wheel    2843 Sep 21 16:32 headless.rs
--rw-r--r--@  1 robert.lee  wheel   26195 Sep 21 16:32 joinstream.rs
--rw-r--r--@  1 robert.lee  wheel   14949 Sep 21 16:32 link.rs
--rw-r--r--@  1 robert.lee  wheel   18006 Sep 21 16:32 net.rs
--rw-r--r--@  1 robert.lee  wheel   43668 Sep 21 16:32 network.rs
--rw-r--r--@  1 robert.lee  wheel    8273 Sep 21 16:32 pairwise_stream.rs
--rw-r--r--@  1 robert.lee  wheel    4556 Sep 21 16:32 passphrase.rs
--rw-r--r--@  1 robert.lee  wheel    5560 Sep 21 16:32 paths.rs
--rw-r--r--@  1 robert.lee  wheel   26219 Sep 21 16:32 prekeys.rs
--rw-r--r--@  1 robert.lee  wheel    9130 Sep 21 16:32 profile.rs
--rw-r--r--@  1 robert.lee  wheel    6012 Sep 21 16:32 resolver.rs
--rw-r--r--@  1 robert.lee  wheel   13074 Sep 21 16:32 store.rs
--rw-r--r--@  1 robert.lee  wheel    6374 Sep 21 16:32 syncstream.rs
--rw-r--r--@  1 robert.lee  wheel    7281 Sep 21 16:32 tunnel.rs
--rw-r--r--@  1 robert.lee  wheel    8373 Sep 21 16:32 up.rs
+drwxr-xr-x@ 24 user        wheel     768 Sep 21 16:32 .
+drwxr-xr-x@ 33 user        wheel    1056 Sep 21 16:32 ..
+-rw-r--r--@  1 user        wheel  130897 Sep 21 16:32 actor.rs
+-rw-r--r--@  1 user        wheel   12703 Sep 21 16:32 anchor.rs
+-rw-r--r--@  1 user        wheel   18887 Sep 21 16:32 api.rs
+-rw-r--r--@  1 user        wheel   91745 Sep 21 16:32 channel.rs
+-rw-r--r--@  1 user        wheel   17922 Sep 21 16:32 circuitstream.rs
+-rw-r--r--@  1 user        wheel    2567 Sep 21 16:32 content.rs
+-rw-r--r--@  1 user        wheel   22392 Sep 21 16:32 coordstream.rs
+-rw-r--r--@  1 user        wheel    2843 Sep 21 16:32 headless.rs
+-rw-r--r--@  1 user        wheel   26195 Sep 21 16:32 joinstream.rs
+-rw-r--r--@  1 user        wheel   14949 Sep 21 16:32 link.rs
+-rw-r--r--@  1 user        wheel   18006 Sep 21 16:32 net.rs
+-rw-r--r--@  1 user        wheel   43668 Sep 21 16:32 network.rs
+-rw-r--r--@  1 user        wheel    8273 Sep 21 16:32 pairwise_stream.rs
+-rw-r--r--@  1 user        wheel    4556 Sep 21 16:32 passphrase.rs
+-rw-r--r--@  1 user        wheel    5560 Sep 21 16:32 paths.rs
+-rw-r--r--@  1 user        wheel   26219 Sep 21 16:32 prekeys.rs
+-rw-r--r--@  1 user        wheel    9130 Sep 21 16:32 profile.rs
+-rw-r--r--@  1 user        wheel    6012 Sep 21 16:32 resolver.rs
+-rw-r--r--@  1 user        wheel   13074 Sep 21 16:32 store.rs
+-rw-r--r--@  1 user        wheel    6374 Sep 21 16:32 syncstream.rs
+-rw-r--r--@  1 user        wheel    7281 Sep 21 16:32 tunnel.rs
+-rw-r--r--@  1 user        wheel    8373 Sep 21 16:32 up.rs
 
 crates/vox-core/src/tunnel/:
 total 128
-drwxr-xr-x@  8 robert.lee  wheel    256 Sep 21 16:32 .
-drwxr-xr-x@ 33 robert.lee  wheel   1056 Sep 21 16:32 ..
--rw-r--r--@  1 robert.lee  wheel   2688 Sep 21 16:32 addr.rs
--rw-r--r--@  1 robert.lee  wheel   4111 Sep 21 16:32 authz.rs
--rw-r--r--@  1 robert.lee  wheel   9157 Sep 21 16:32 service.rs
--rw-r--r--@  1 robert.lee  wheel  12483 Sep 21 16:32 session.rs
--rw-r--r--@  1 robert.lee  wheel   7275 Sep 21 16:32 socks.rs
--rw-r--r--@  1 robert.lee  wheel  14961 Sep 21 16:32 sshca.rs
+drwxr-xr-x@  8 user        wheel    256 Sep 21 16:32 .
+drwxr-xr-x@ 33 user        wheel   1056 Sep 21 16:32 ..
+-rw-r--r--@  1 user        wheel   2688 Sep 21 16:32 addr.rs
+-rw-r--r--@  1 user        wheel   4111 Sep 21 16:32 authz.rs
+-rw-r--r--@  1 user        wheel   9157 Sep 21 16:32 service.rs
+-rw-r--r--@  1 user        wheel  12483 Sep 21 16:32 session.rs
+-rw-r--r--@  1 user        wheel   7275 Sep 21 16:32 socks.rs
+-rw-r--r--@  1 user        wheel  14961 Sep 21 16:32 sshca.rs
 [0m
 [0m✱ [0mGlob "crates/vox-core/src/governance/**"[90m 13 matches[0m
 [0m→ [0mRead crates/vox-core/src/governance/genesis.rs
