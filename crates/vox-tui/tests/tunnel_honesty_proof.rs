@@ -200,18 +200,19 @@ fn a_quiet_session_still_carries_bytes() {
 
     // Step 1: the session carries bytes, so what follows measures the quiet and not a path
     // that never worked.
-    let mut s = TcpStream::connect(at).expect("APPARATUS: connect to the forward's own port");
+    let mut s = TcpStream::connect(at)
+        .expect("PRODUCT (staging): the forward's own port refused a connection");
     s.set_read_timeout(Some(
         vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
     ))
     .expect("APPARATUS: set a read timeout");
     s.write_all(b"before the quiet")
-        .expect("CANNOT MEASURE: the session never took a first write");
+        .expect("PRODUCT (staging): the forward never took the session's first write");
     let mut back = [0u8; 16];
     if let Err(e) = s.read_exact(&mut back) {
         panic!(
-            "CANNOT MEASURE: the session never carried bytes ({e}), so whether it survives a \
-             quiet cannot be measured. The forward said:\n{}",
+            "PRODUCT (staging): the session never carried bytes ({e}), so whether it survives a \
+             quiet was never reached. The forward said:\n{}",
             fwd.transcript()
         );
     }
