@@ -88,12 +88,12 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
         Some(0) => {
             assert!(
                 said.contains("truth PASS"),
-                "exit 0 without a PASS line: {said}"
+                "APPARATUS: the driver exited 0 without a PASS line: {said}"
             );
             assert_eq!(
                 (claims.len(), green),
                 (15, 15),
-                "a PASS must rest on all 15 claims, each ok: {said}"
+                "APPARATUS: the driver said PASS without all 15 claims ok: {said}"
             );
         }
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
