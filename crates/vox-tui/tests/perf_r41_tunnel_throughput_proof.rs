@@ -24,7 +24,8 @@
 //! fairness to other flows is not a goal and is not gated. On a clean 400 Mbit/s, 2 ms LAN-like link,
 //! which the emulator carries under ordinary load, every 2 s window is at the clean bar (90% of raw);
 //! on a 200 Mbit/s, 10 ms Wi-Fi-like link at 1% and at 6% loss the tunnel carries at least
-//! [`LOSSY_WIN`] of a Cubic flow on the same loss; on a link it shares with a Cubic flow (200 Mbit/s
+//! [`LOSSY_WIN`] of a Cubic flow on the same loss, and from its first lossy second no 2 s window
+//! falls under [`STALL_FLOOR`] of that flow (no stall, no settle allowance); on a link it shares with a Cubic flow (200 Mbit/s
 //! through a one-BDP and a quarter-BDP queue, and a 400 Mbit/s, 2 ms LAN-like link through a one-BDP
 //! queue, each over [`CONGESTED_MEASURE`]), its rate is at least [`CONGESTED_FLOOR`] of that flow's,
 //! never slower than the controller it replaces; and on a link that goes clean, lossy and clean
@@ -1320,6 +1321,13 @@ const CLEAN_MEASURE: Duration = Duration::from_secs(30);
 
 /// The decider: on the lossy link Vox must carry at least twice the comparison flow.
 const LOSSY_WIN: f64 = 2.0;
+/// No stall (the decider, 2026-10-02): on a lossy link no 2 s window of Vox's may fall under this
+/// share of the Cubic flow's mean rate on the same loss, judged from the first second the link is
+/// lossy, with no settle allowance. A tier switch that stalls the transfer, or a tier that cuts to its
+/// floor and stays there, shows here even when the rest of the run averages over the bar: tier 2 at
+/// its two-packet floor carried 1.7 Mbit/s against a Cubic flow's 22.6 at 6% loss (fix-adr024-bbr,
+/// 493b5453). Half, not all: the Cubic flow's own 2 s windows swing around its mean.
+const STALL_FLOOR: f64 = 0.5;
 /// On a congested link Vox is never slower than the controller it replaces: its rate is at least
 /// half the competing Cubic flow's (today's controller, Cubic itself, measured 1.01x, 1.01x and
 /// 1.07x on these arms). Below it, Vox gives way, and a tunnel crawls beside one download. There is
@@ -1340,8 +1348,10 @@ const CONGESTED_MEASURE: Duration = Duration::from_secs(60);
 /// The window a person's speed is read in.
 const WINDOW: Duration = Duration::from_secs(1);
 /// The changing arm: each phase's length, and how soon after the loss ends Vox must be back at the
-/// clean bar.
-const PHASE: Duration = Duration::from_secs(20);
+/// clean bar. 30 s, so the 6% phase spans the climb to tier 3 (tier 1's dwell and three losses, then
+/// tier 2's dwell and 32 MiB of loss trend at a few tens of Mbit/s, then the trial's 20 rounds and
+/// 2 s) and the no-stall floor judges the seconds through the switch.
+const PHASE: Duration = Duration::from_secs(30);
 const RECOVER_WITHIN: Duration = Duration::from_secs(5);
 /// The paused arm: the 1%-loss link, a transfer that stops for [`PAUSE`] and resumes.
 const PAUSED_NAME: &str = "paused, Wi-Fi-like, 200 Mbit/s, 10 ms RTT, 1% loss, 3 s pause";
@@ -1865,7 +1875,10 @@ fn taper_arms(
         *link.lock().unwrap() = Some(lossy);
         let stop = Arc::new(AtomicBool::new(false));
         let pump = stream_to(tunnel, Arc::clone(&stop));
-        let v = judged(&windows(settle_and_measure, |_| {}));
+        let all_v = windows(settle_and_measure, |_| {});
+        // Every second but the first, in which the stream starts: the stall floor allows no settle.
+        let from_start = &all_v[1..];
+        let v = judged(&all_v);
         stop.store(true, Relaxed);
         let _ = pump.join();
         std::thread::sleep(Duration::from_secs(2));
@@ -1874,7 +1887,7 @@ fn taper_arms(
         let c = judged(&windows(settle_and_measure, |_| {}));
         stop.store(true, Relaxed);
         std::thread::sleep(Duration::from_secs(1));
-        if let Some(e) = late_fault(lossy.name, &v)
+        if let Some(e) = late_fault(lossy.name, from_start)
             .or_else(|| crossed_fault(lossy.name, &v))
             .or_else(|| late_fault(lossy.name, &c))
             .or_else(|| competed_fault(lossy.name, &c))
@@ -1885,7 +1898,23 @@ fn taper_arms(
         let (vm, cm) = (mean_of(&v, |x| x.vox), mean_of(&c, |x| x.other));
         lossy_bars.push((lossy.name, cm * LOSSY_WIN));
         let ratio = vm / cm;
-        let verdict = if ratio >= LOSSY_WIN {
+        let stalls = windows_below(from_start, cm * STALL_FLOOR);
+        let verdict = if stalls > 0 {
+            failed.push(format!(
+                "{}: the emulator was on time and the comparison flow (Cubic, same loss) carried \
+                 {:.1} Mbit/s; {stalls} of vox's 2 s windows from its first second fell under \
+                 {:.0}% of that ({:.1} Mbit/s): vox stalls on a lossy link; per-second vox {:?}",
+                lossy.name,
+                cm / 1e6,
+                STALL_FLOOR * 100.0,
+                cm * STALL_FLOOR / 1e6,
+                mbit(from_start, |x| x.vox)
+            ));
+            format!(
+                "STALLED ({stalls} windows under {:.0}% of Cubic)",
+                STALL_FLOOR * 100.0
+            )
+        } else if ratio >= LOSSY_WIN {
             format!("ok (>= {LOSSY_WIN:.1}x)")
         } else {
             failed.push(format!(
@@ -1908,7 +1937,7 @@ fn taper_arms(
             cm / 1e6,
             lateness(&v),
             lateness(&c),
-            mbit(&v, |x| x.vox),
+            mbit(from_start, |x| x.vox),
             mbit(&c, |x| x.other)
         ),
         );
@@ -1972,7 +2001,18 @@ fn taper_arms(
         let below = |w: &[Window]| windows_below(w, bar);
         let r = RECOVER_WITHIN.as_secs() as usize;
         let lossy_mean = mean_of(&lossy[CLIMB_WITHIN.as_secs() as usize..], |x| x.vox);
+        let stall_floor = lossy_bar / LOSSY_WIN * STALL_FLOOR;
+        let stalls = windows_below(lossy, stall_floor);
         let mut verdicts = Vec::new();
+        if stalls > 0 {
+            verdicts.push(format!(
+                "phase LOSSY: {stalls} of its 2 s windows from the first lossy second under {:.0}% \
+                 of the Cubic flow on the same loss ({:.1} Mbit/s): vox stalls when the link turns \
+                 lossy",
+                STALL_FLOOR * 100.0,
+                stall_floor / 1e6
+            ));
+        }
         if below(clean1) > 0 {
             verdicts.push(format!(
                 "phase CLEAN (first): {} of its 2 s windows below the clean bar",
