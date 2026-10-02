@@ -180,8 +180,8 @@ where
 /// **Why it is minutes rather than seconds.** The bound was 20s, then 90s, and both were
 /// calibrated on an idle machine. The measured first-connect wait on a quiet box has been
 /// 7.7s and 88s across runs — an order of magnitude apart for the same code — because what
-/// the wait covers is a cold node connecting to an anchor, syncing a board and dialling a
-/// peer through the ADR-012 ladder, possibly relayed. Under a loaded machine the 90s bound
+/// the wait covers is a cold node connecting to the host, or to an anchor when it needs one,
+/// syncing a board and dialling a peer through the ADR-012 ladder, possibly relayed. Under a loaded machine the 90s bound
 /// expired and the *original* defect reappeared: the proxy refused a real request that would
 /// have succeeded shortly after. A bound that turns into the bug it fixed whenever the
 /// machine is busy is not a fix, so this is generous on purpose. A host that is genuinely

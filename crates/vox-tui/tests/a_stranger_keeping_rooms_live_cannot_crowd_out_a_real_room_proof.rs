@@ -52,6 +52,8 @@
 
 #[path = "support/hostile.rs"]
 mod hostile;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 #[path = "support/world.rs"]
@@ -478,6 +480,7 @@ fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
 #[test]
 #[ignore = "real vox processes with production Argon2id and a flood; run in release"]
 fn a_room_whose_members_are_away_is_not_crowded_out() {
+    test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
     watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir().unwrap();
     let (anchor_dir, victim_dir) = (

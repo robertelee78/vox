@@ -1,5 +1,6 @@
 //! ADR-021 M21.5 — **the adapter stream has no gaps across lag, crash and restart**,
-//! and `board --json` is the fold of the rows, through the shipped `vox` binary.
+//! and a second client on the same node is never stalled or cut by the first (RP-18, RP-45),
+//! through the shipped `vox` binary.
 //!
 //! A tracker's adapter is a program that consumes a room with `vox room tail --since
 //! <cursor> --json`, persists its cursor after processing each row, and resumes from
@@ -25,10 +26,32 @@
 //! - the consumer **killed three times** with SIGKILL at points inside the bursts, each
 //!   time restarted from the cursor it had persisted.
 //!
+//! - a **second consumer** of the same room on the same node, attached at the same time
+//!   and never paused or killed, as a second tracker's adapter would be (RP-18, RP-45).
+//!
 //! What it asserts: the union of every row the consumer emitted, after the starting
 //! cursor, **equals** the room's log after that cursor — no gap — and every duplicate
-//! is explained by a restart. Then, separately: `board --json` equals the ownership the
-//! claim fold computes independently from the same rows.
+//! is explained by a restart. Then, separately: `board --json` shows what a person expects
+//! of the claims made through the CLI — the contested resource held by alice's session, the
+//! handed-off one by bob's, the lapsed claim gone.
+//!
+//! Every message is posted with `vox room post`, as a person or an agent posts.
+//!
+//! And of the second consumer, which shares the node with the first throughout:
+//! - **a wedged client cannot stall the node** (RP-45): while the first is frozen, the
+//!   second receives all 900 of bob's appends before the first is continued;
+//! - **one client dying disturbs no other** (RP-18): across the first's three SIGKILLs it
+//!   keeps running and ends holding every one of the 1,800 messages, with no restart.
+//!
+//! Every red says whose it is: `PRODUCT:` for what the node or `vox room tail` did,
+//! `CANNOT MEASURE:` for staging that was not achieved.
+//!
+//! ## Mutations
+//! - the node's subscription pumps share one lock across their socket writes: the frozen
+//!   client's full socket holds it, and the second client receives nothing while it is
+//!   frozen (RP-45 goes red);
+//! - a client's death ends every subscription: the second client is cut off at the first
+//!   SIGKILL and misses the rest (RP-18 goes red).
 
 #![cfg(unix)]
 
@@ -43,8 +66,6 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use support::{until, Out, Worker, HARNESS_SESSION_VARS, VOX};
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One run of the consumer: a `tail` process, and a reader thread that forwards its
 /// lines — unless paused, when it stops reading the pipe altogether, so the pipe fills,
@@ -94,13 +115,33 @@ fn start(w: &Worker, r: &str, cursor: &str, stderr: &std::path::Path) -> Run {
     Run { child, rx, paused }
 }
 
+/// Whatever path leaves the proof — a red included, above all the expected one at a frozen
+/// consumer — takes its `tail` with it: resumed (a stopped process outlives its parent as an
+/// orphan in state T), killed and reaped, by its own handle. A child already reaped is left
+/// alone, so no PID that may since have been reused is ever signalled.
+impl Drop for Run {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = Command::new("kill")
+                .args(["-CONT", &self.child.id().to_string()])
+                .status();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// Send `sig` (`-STOP`, `-CONT`) to the consumer by its PID.
 fn signal(run: &Run, sig: &str) {
     let ok = Command::new("kill")
         .args([sig, &run.child.id().to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill {sig} {}", run.child.id());
+    assert!(
+        ok,
+        "CANNOT MEASURE: staging not achieved — `kill {sig} {}` failed",
+        run.child.id()
+    );
 }
 
 /// Process up to `n` rows, waiting at most `idle` for each, persisting the cursor after
@@ -117,10 +158,14 @@ fn consume(
         let Ok(line) = run.rx.recv_timeout(idle) else {
             break;
         };
-        let row: serde_json::Value = serde_json::from_str(line.trim()).expect("NDJSON row");
+        let row: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: `vox room tail --json` printed a line that is not JSON ({e}): {line:?}"
+            )
+        });
         assert_eq!(
             row["schema"], "vox.room.row/1",
-            "an adapter must refuse any other schema"
+            "PRODUCT: `vox room tail --json` printed a row of another schema"
         );
         let h = row["entry_hash"].as_str().unwrap().to_owned();
         *seen.entry(h.clone()).or_default() += 1;
@@ -128,6 +173,51 @@ fn consume(
         got += 1;
     }
     got
+}
+
+/// The second consumer (RP-18, RP-45): a `tail` of the same room on the same node, never
+/// paused or killed, its rows drained by a thread of its own as fast as they arrive — a
+/// second tracker's adapter, attached alongside the first.
+struct Steady {
+    run: Run,
+    rows: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Steady {
+    fn start(w: &Worker, r: &str, cursor: &str, stderr: &std::path::Path) -> Self {
+        let mut run = start(w, r, cursor, stderr);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let feed = std::mem::replace(&mut run.rx, rx);
+        drop(tx);
+        let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let into = rows.clone();
+        std::thread::spawn(move || {
+            while let Ok(line) = feed.recv() {
+                let row: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_default();
+                if let Some(h) = row["entry_hash"].as_str() {
+                    into.lock().unwrap().push(h.to_owned());
+                }
+            }
+        });
+        Self { run, rows }
+    }
+
+    /// The distinct rows it has emitted so far.
+    fn distinct(&self) -> BTreeSet<String> {
+        self.rows.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Wait up to `secs` for it to hold at least `n` distinct rows; how many it holds.
+    fn wait_for(&self, n: usize, secs: u64) -> usize {
+        let end = std::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            let have = self.distinct().len();
+            if have >= n || std::time::Instant::now() >= end {
+                return have;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 fn say(i: usize, pad: usize) -> String {
@@ -167,13 +257,12 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
-    let cid = room.cid;
 
     // ---- the fold half: a contested claim, a completed handoff, a lapse ----
+    let o = alice.vox(Some("a1"), &["room", "claim", &r, "contested"]);
     assert!(
-        alice
-            .vox(Some("a1"), &["room", "claim", &r, "contested"])
-            .ok
+        o.ok,
+        "PRODUCT: alice's claim of a free resource was refused: {o:?}"
     );
     until(
         bob,
@@ -182,20 +271,22 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         &["room", "board", &r, "--json"],
         |o: &Out| o.ok && support::resource(&o.json(), "contested").is_some(),
     );
+    let o = bob.vox(Some("b1"), &["room", "claim", &r, "contested"]);
     assert_eq!(
-        bob.vox(Some("b1"), &["room", "claim", &r, "contested"])
-            .code,
-        Some(1)
+        o.code,
+        Some(1),
+        "PRODUCT: bob's claim of a resource alice holds did not exit 1: {o:?}"
     );
-    assert!(alice.vox(Some("a1"), &["room", "claim", &r, "passed"]).ok);
+    let o = alice.vox(Some("a1"), &["room", "claim", &r, "passed"]);
     assert!(
-        alice
-            .vox(
-                Some("a1"),
-                &["room", "handoff", &r, "passed", "--to", &bob.b32()[..16]]
-            )
-            .ok
+        o.ok,
+        "PRODUCT: alice's claim of a free resource was refused: {o:?}"
     );
+    let o = alice.vox(
+        Some("a1"),
+        &["room", "handoff", &r, "passed", "--to", &bob.b32()[..16]],
+    );
+    assert!(o.ok, "PRODUCT: alice's handoff to bob was refused: {o:?}");
     until(
         bob,
         None,
@@ -205,10 +296,15 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             o.ok && support::resource(&o.json(), "passed").is_some_and(|x| x["state"] == "pending")
         },
     );
-    assert!(bob.vox(Some("b1"), &["room", "claim", &r, "passed"]).ok);
+    let o = bob.vox(Some("b1"), &["room", "claim", &r, "passed"]);
     assert!(
-        bob.vox(Some("b1"), &["room", "claim", &r, "lapsed", "--ttl", "1"])
-            .ok
+        o.ok,
+        "PRODUCT: bob could not take the resource handed to him: {o:?}"
+    );
+    let o = bob.vox(Some("b1"), &["room", "claim", &r, "lapsed", "--ttl", "1"]);
+    assert!(
+        o.ok,
+        "PRODUCT: bob's claim of a free resource was refused: {o:?}"
     );
     std::thread::sleep(Duration::from_secs(2));
     until(
@@ -225,23 +321,6 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         },
     );
     let rows = bob.vox(None, &["room", "read", &r, "--json"]).ndjson();
-    let posted: Vec<vox_agentcomms::Posted> = rows
-        .iter()
-        .filter_map(|x| {
-            let env = vox_agentcomms::Envelope::parse(x["text"].as_str()?).ok()?;
-            Some(vox_agentcomms::Posted {
-                entry_hash: vox_agentcomms::claim::from_b32(x["entry_hash"].as_str()?)?,
-                author: vox_agentcomms::claim::from_b32(x["author"].as_str()?)?,
-                created_millis: x["created_millis"].as_u64()?,
-                envelope: env,
-            })
-        })
-        .collect();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let independent = vox_agentcomms::claim::fold(&posted, VERSION, now);
     let board = bob.vox(None, &["room", "board", &r, "--json"]).json();
     let from_board: BTreeMap<String, (String, String)> = board["resources"]
         .as_array()
@@ -257,31 +336,27 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             )
         })
         .collect();
-    let from_fold: BTreeMap<String, (String, String)> = independent
-        .resources
-        .iter()
-        .map(|(k, s)| match s {
-            vox_agentcomms::State::Held { owner, .. } => (
-                k.clone(),
-                (
-                    vox_agentcomms::claim::b32(&owner.author),
-                    owner.session.clone(),
-                ),
-            ),
-            vox_agentcomms::State::Pending { .. } => (k.clone(), (String::new(), String::new())),
-        })
-        .collect();
+    // What the board must show, as a person reads it: the contested resource held by alice's
+    // session `a1`, the handed-off one by bob's session `b1`, and the lapsed claim gone. (The
+    // comparison with `vox_agentcomms::claim::fold` is gone: the board is that fold, so it could
+    // not fail.)
     assert_eq!(
-        from_board, from_fold,
-        "board --json is not the fold of the room's rows"
+        from_board.get("contested"),
+        Some(&(alice.b32(), "a1".to_owned())),
+        "PRODUCT: board --json does not show alice's session a1 holding the contested resource: \
+         {board}"
     );
     assert_eq!(
-        from_board.get("contested").map(|x| x.1.as_str()),
-        Some("a1")
+        from_board.get("passed"),
+        Some(&(bob.b32(), "b1".to_owned())),
+        "PRODUCT: board --json does not show bob's session b1 holding the handed-off resource: \
+         {board}"
     );
-    assert_eq!(from_board.get("passed").map(|x| x.1.as_str()), Some("b1"));
-    assert!(!from_board.contains_key("lapsed"));
-    eprintln!("[proof] board --json == independent fold: {from_board:?}");
+    assert!(
+        !from_board.contains_key("lapsed"),
+        "PRODUCT: board --json still shows a claim whose ttl lapsed: {board}"
+    );
+    eprintln!("[proof] board --json: {from_board:?}");
 
     // ---- the stream half ----
     let start_cursor = rows.last().unwrap()["entry_hash"]
@@ -291,27 +366,18 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let stderr = tmp.path().join("tail.stderr");
 
     // The producer, driven in phases by the proof so a burst lands exactly while the
-    // consumer is not reading.
+    // consumer is not reading: `vox room post`, as a person or an agent posts.
     let mut n = 0usize;
     let mut burst = |w: &Worker, count: usize, pad: usize| {
-        let sock = w.paths.socket_file();
         let first = n;
         n += count;
-        rt.block_on(async move {
-            let mut c = vox_core::node::ipc::IpcClient::open(&sock).await.unwrap();
-            for i in first..first + count {
-                match c
-                    .request(&vox_core::node::ipc::Request::Post {
-                        channel_id: cid,
-                        text: say(i, pad),
-                    })
-                    .await
-                {
-                    Ok(vox_core::node::ipc::Frame::Ok) => {}
-                    other => panic!("post {i}: {other:?}"),
-                }
-            }
-        });
+        for i in first..first + count {
+            let o = w.vox(None, &["room", "post", &r, &say(i, pad)]);
+            assert!(
+                o.ok,
+                "PRODUCT: `vox room post` of message {i} failed: {o:?}"
+            );
+        }
     };
 
     let mut cursor = start_cursor.clone();
@@ -328,6 +394,11 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         );
     };
 
+    // The second consumer (RP-18, RP-45), attached alongside the first from the same cursor
+    // and left alone for the whole run.
+    let steady_err = tmp.path().join("steady.stderr");
+    let mut steady = Steady::start(bob, &r, &start_cursor, &steady_err);
+
     // Run 1: freeze the consumer while 899 of bob's 900 local appends land, each padded
     // to LAG_PAD, so the stream MUST lag whatever the machine's socket buffer (see LAG_PAD).
     let mut run = start(bob, &r, &cursor, &stderr);
@@ -339,11 +410,29 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     assert_eq!(
         consume(&run, 1, idle, &mut cursor, &mut seen),
         1,
-        "the consumer is subscribed and live before it is frozen"
+        "CANNOT MEASURE: staging not achieved — the consumer was not subscribed and live \
+         before it was to be frozen (no row within {idle:?})"
+    );
+    // Both clients are attached and live before one is frozen: the staging RP-18 and RP-45
+    // need.
+    assert_eq!(
+        steady.wait_for(1, 10),
+        1,
+        "CANNOT MEASURE: staging not achieved — the second consumer was not subscribed and \
+         live before the first was to be frozen (no row within 10s)"
     );
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     signal(&run, "-STOP"); // frozen: it reads nothing, so only the kernel buffer absorbs
     burst(bob, 899, LAG_PAD);
+    // **A wedged client cannot stall the node** (RP-45): while the first is still frozen,
+    // the second receives every one of bob's 900 appends.
+    let during = steady.wait_for(900, 60);
+    eprintln!("[proof] while one client was frozen, the other received {during} of 900 rows");
+    assert_eq!(
+        during, 900,
+        "PRODUCT: while one `vox room tail` was frozen, the other received only {during} of \
+         bob's 900 appends within 60s — a wedged client stalled the node"
+    );
     std::thread::sleep(Duration::from_secs(2));
     signal(&run, "-CONT");
     run.paused.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -361,7 +450,8 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let live = consume(&run, 200, idle, &mut cursor, &mut seen);
     assert_eq!(
         live, 200,
-        "rows synced from another node must reach a LIVE consumer, not only a restarted one"
+        "PRODUCT: rows synced from another node must reach a LIVE consumer, not only a \
+         restarted one"
     );
     kill(&mut run, &mut restarts, &cursor, &seen);
     // Run 3: stall under another synced burst, then die.
@@ -375,7 +465,6 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     kill(&mut run, &mut restarts, &cursor, &seen);
     // The rest, while nobody is listening.
     burst(alice, 300, 0);
-    assert_eq!(n, 1800);
 
     let all = until(
         bob,
@@ -405,7 +494,8 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     assert_eq!(
         after.len(),
         1800,
-        "the log after the starting cursor is the burst"
+        "CANNOT MEASURE: staging not achieved — the log after the starting cursor is not the \
+         1,800-message burst"
     );
 
     let mut run = start(bob, &r, &cursor, &stderr);
@@ -419,6 +509,38 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     }
     let _ = run.child.kill();
     let _ = run.child.wait();
+
+    // **One client dying disturbs no other** (RP-18): the second consumer, attached
+    // throughout, survived the first's three SIGKILLs and holds every message.
+    let held = steady.wait_for(1800, 60);
+    let still_running = steady.run.child.try_wait().ok().flatten().is_none();
+    let steady_said = std::fs::read_to_string(&steady_err).unwrap_or_default();
+    let _ = steady.run.child.kill();
+    let _ = steady.run.child.wait();
+    let steady_rows = steady.distinct();
+    let steady_missing = expected
+        .iter()
+        .filter(|h| !steady_rows.contains(**h))
+        .count();
+    let steady_dups = steady.rows.lock().unwrap().len() - steady_rows.len();
+    eprintln!(
+        "[proof] second client: {held} distinct rows held; missing {steady_missing} of {}; \
+         duplicated {steady_dups}; still running {still_running}; lag reports {}",
+        expected.len(),
+        steady_said.matches("fell behind").count()
+    );
+    assert!(
+        still_running,
+        "PRODUCT: the second `vox room tail` ended on its own while the first was killed \
+         {restarts} times. It said: {steady_said}"
+    );
+    assert_eq!(
+        steady_missing,
+        0,
+        "PRODUCT: the second `vox room tail`, attached throughout, never received \
+         {steady_missing} of the {} messages after the first was killed {restarts} times",
+        expected.len()
+    );
 
     let missing: Vec<&&String> = expected
         .iter()
@@ -439,20 +561,21 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     );
     assert!(
         missing.is_empty(),
-        "GAP: {} rows after the cursor were never emitted: {:?}",
+        "PRODUCT: GAP: {} rows after the cursor were never emitted: {:?}",
         missing.len(),
         &missing[..missing.len().min(5)]
     );
     assert!(
         extra.is_empty(),
-        "rows from before the starting cursor were emitted: {extra:?}"
+        "PRODUCT: rows from before the starting cursor were emitted: {extra:?}"
     );
     assert!(
         lags > 0,
-        "the consumer never lagged, so this run proved nothing about lag"
+        "CANNOT MEASURE: staging not achieved — the consumer never lagged, so this run proved \
+         nothing about lag"
     );
     assert!(
         dups as u32 <= restarts * 600,
-        "duplicates beyond what restarts explain: {dups}"
+        "PRODUCT: duplicates beyond what restarts explain: {dups}"
     );
 }

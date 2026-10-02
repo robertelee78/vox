@@ -55,7 +55,9 @@ step() {
 
 step "fmt" cargo fmt --all --check
 step "clippy" polite cargo clippy --all-targets -- -D warnings
-step "debug suite" polite cargo test --workspace --no-fail-fast
+# The proofs build with the test-only knobs (V210-105); no shipped build has them.
+step "clippy (test knobs)" polite cargo clippy --all-targets --features vox-tui/test-knobs -- -D warnings
+step "debug suite" polite cargo test --workspace --no-fail-fast --features vox-tui/test-knobs
 step "rustdoc" env RUSTDOCFLAGS="-D warnings" nice -n 10 cargo doc --workspace --no-deps
 # ADR-025 P9 and P10 run against the mutant sender, built from this commit (as CI builds it).
 if VOX_MUTANT_SENDER=$(polite scripts/build-mutant-sender.sh); then
@@ -65,7 +67,7 @@ else
   bad "building the mutant sender"
 fi
 step "release suite (all proofs, live-model and transport included)" \
-  polite cargo test --release --workspace --no-fail-fast -- --ignored
+  polite cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored
 
 # ---- the CI run on this commit: passed, and every job well inside its limit ----
 note "CI on $head ..."

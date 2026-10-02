@@ -272,7 +272,40 @@ fn a_worker_on_another_version_is_refused_by_name() {
         Some("a1"),
         &["room", "post", r, "who is still on the old vox?"],
     );
-    assert!(o.ok, "plain conversation must never be refused: {o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT: plain conversation was refused while coordination is: {o:?}"
+    );
+    // **And structured conversation**: a reply addressed to a session, urgent, is still
+    // conversation — only `--work` takes part in coordination. A refusal that reached
+    // every structured post stayed green while this checked only the plain form.
+    let re = alice
+        .vox(None, &["room", "read", r, "--json"])
+        .ndjson()
+        .last()
+        .and_then(|x| x["entry_hash"].as_str().map(str::to_owned))
+        .expect("APPARATUS: alice's own read shows no row to reply to");
+    let o = alice.vox(
+        Some("a1"),
+        &[
+            "room",
+            "post",
+            r,
+            "--type",
+            "say",
+            "--to",
+            "b1",
+            "--urgent",
+            "--re",
+            &re,
+            "please upgrade your vox",
+        ],
+    );
+    assert!(
+        o.ok,
+        "PRODUCT: a structured non-work post (`--type say --to --urgent --re`) was refused \
+         while coordination is: {o:?}"
+    );
 
     // ---- (2) unknown, then different ----
     let other = another_version();

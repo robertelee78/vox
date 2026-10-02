@@ -35,6 +35,21 @@
 //! 7. **zero operator commands**: every work observation in the room was written by a
 //!    model's own session (its `from` is an OpenCode session id), and every `assign` by
 //!    the tracker.
+//!
+//! **Points 4 and 5 are the stub tracker's own rules, not product proofs.** Vox has no
+//! phase: what it contributes there is the typed `result` row and the board after a
+//! `release`, which the other checkpoints already prove. Never moving past Acceptance is
+//! the stub's `observe` and `board` applying the tracker's rules, so a red there is the
+//! APPARATUS (the stub), and nothing Vox does can turn it red or green. They stay because
+//! the rehearsal shows the tracker's rules holding on Vox's real rows, not as a claim.
+//!
+//! Every red names its side. Each model turn's `vox` commands are recorded with how `vox`
+//! answered (`support::model_shim`): a step the model never ran is CANNOT MEASURE (the
+//! apparatus); a step `vox` refused is PRODUCT, quoting the refusal; and a step `vox`
+//! accepted that never arrives is PRODUCT. Each step that a checkpoint judges runs in its
+//! own turn when an earlier step's failure would otherwise hide it — w2's `blocked` follows
+//! its claim and `working` in a separate turn, so a product that drops ownership on
+//! `blocked` is caught at checkpoint 1, not as a claim that never arrived.
 
 #![cfg(unix)]
 
@@ -49,7 +64,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use support::{until, Out, Worker, HARNESS_SESSION_VARS, VOX};
+use support::{Out, Worker, HARNESS_SESSION_VARS, VOX};
 
 fn allow_unproven(name: &str) -> bool {
     std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
@@ -265,7 +280,8 @@ impl Tracker {
             assert!(
                 !item.history.contains(&Phase::ReleaseReady)
                     && !item.history.contains(&Phase::Done),
-                "{k}: an observation moved an item past Acceptance: {:?}",
+                "APPARATUS (the stub tracker's own rule, not a product proof): {k}: an \
+                 observation moved an item past Acceptance: {:?}",
                 item.history
             );
         }
@@ -393,6 +409,40 @@ impl Agent<'_> {
     }
 }
 
+impl Agent<'_> {
+    /// One model turn running `steps`, each judged from what its shell ran: a step `vox`
+    /// refused is a PRODUCT red quoting the refusal; a step the model never ran is CANNOT
+    /// MEASURE, with the model's reply.
+    fn run(&mut self, oc_cfg: &Path, bin_dir: &Path, calls: &Path, room: &str, steps: &[&str]) {
+        let _ = std::fs::write(calls, "");
+        let reply = self.turn(oc_cfg, bin_dir, room, &instructions(steps), None);
+        for step in steps {
+            let words: Vec<String> = step
+                .split_whitespace()
+                .map(|w| w.trim_matches('\'').to_owned())
+                .collect();
+            let mut needles = vec![format!("room {}", words[2])];
+            if let Some(i) = words.iter().position(|w| w == "--type") {
+                needles.push(format!("--type {}", words[i + 1]));
+            }
+            needles.extend(words.iter().filter(|w| w.starts_with("wl:")).cloned());
+            let ran = support::vox_accepted(calls, self.name, &format!("`{step}`"), |a| {
+                needles.iter().all(|n| a.contains(n.as_str()))
+            });
+            assert!(
+                ran,
+                "CANNOT MEASURE (apparatus, not product): {} never ran `{step}` — nothing \
+                 reached `vox`. Its shell ran: {:?}. Its reply:\n{reply}",
+                self.name,
+                support::model_calls(calls)
+                    .iter()
+                    .map(|c| c.args.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 fn instructions(steps: &[&str]) -> String {
     format!(
         "You are a worker in a shared Vox room ($VOX_ROOM). Use your shell to run each of \
@@ -424,13 +474,21 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
 
-    let fixture = std::env::temp_dir().join("vox-tracker-rehearsal");
+    // **One fixture per `vox` under test, never one for the machine** (as the drain proof's):
+    // every run rewrites its `bin/vox`, so two trees sharing one path ran each other's `vox`.
+    // Keyed by the binary's path, a tree still reuses its own OpenCode install.
+    let fixture = std::env::temp_dir().join(format!("vox-tracker-rehearsal-{:016x}", {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        VOX.hash(&mut h);
+        h.finish()
+    }));
     let oc_cfg = fixture.join("config");
     let bin_dir = fixture.join("bin");
     std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let _ = std::fs::remove_file(bin_dir.join("vox"));
-    std::os::unix::fs::symlink(VOX, bin_dir.join("vox")).unwrap();
+    let calls = fixture.join("model-shell-calls.log");
+    support::model_shim(&bin_dir, &calls);
     let mut agents = Vec::new();
     for (w, name) in [(alice, "w1"), (bob, "w2")] {
         let project = fixture.join(name);
@@ -487,9 +545,8 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         );
         assert!(o.ok, "the tracker could not assign: {o:?}");
     }
-    until(
+    support::arrives(
         alice,
-        None,
         "the assignments to reach alice",
         &["room", "read", &r],
         |o: &Out| o.stdout.contains(item2),
@@ -505,16 +562,15 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     // w1 takes item 1 — ownership only.
     let (w1, w2) = agents.split_at_mut(1);
     let (w1, w2) = (&mut w1[0], &mut w2[0]);
-    let _ = w1.turn(
+    w1.run(
         &oc_cfg,
         &bin_dir,
+        &calls,
         &r,
-        &instructions(&["vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#1' --ttl 45"]),
-        None,
+        &["vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#1' --ttl 45"],
     );
-    let w1_session = until(
+    let w1_session = support::arrives(
         bob,
-        None,
         "w1's claim to reach the tracker's node",
         &["room", "board", &r, "--json"],
         |o: &Out| o.ok && support::resource(&o.json(), item1).is_some(),
@@ -525,7 +581,7 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         .map(str::to_owned);
     assert!(
         w1.session.as_deref().is_some_and(|s| s.starts_with("ses")),
-        "w1's claim must carry its OpenCode session: {w1_session}"
+        "PRODUCT: w1's claim must carry its OpenCode session: {w1_session}"
     );
     let w1_acquisition = support::resource(&w1_session, item1).unwrap()["acquisition"]
         .as_str()
@@ -537,41 +593,35 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     let i1 = &tracker.items[item1];
     assert!(
         i1.owner.is_some(),
-        "the claim must give w1 ownership: {i1:?}"
+        "PRODUCT: the claim must give w1 ownership: {i1:?}"
     );
     assert_eq!(
         i1.phase,
         Phase::Ready,
-        "a claim must leave the item Ready: {i1:?}"
+        "PRODUCT: a claim must leave the item Ready: {i1:?}"
     );
     assert!(
         i1.attempts.is_empty(),
-        "a claim must start no attempt: {i1:?}"
+        "PRODUCT: a claim must start no attempt: {i1:?}"
     );
 
     // w1 starts its attempt — `working`, with the id Vox seeds.
-    let _ = w1.turn(
+    w1.run(
         &oc_cfg,
         &bin_dir,
+        &calls,
         &r,
-        &instructions(&[
-            "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#1' starting",
-        ]),
-        None,
+        &["vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#1' starting"],
     );
-    until(
-        bob,
-        None,
-        "w1's working",
-        &["room", "read", &r],
-        |o: &Out| o.stdout.contains("starting"),
-    );
+    support::arrives(bob, "w1's working", &["room", "read", &r], |o: &Out| {
+        o.stdout.contains("starting")
+    });
     adapter.pump(&mut tracker);
     let i1 = &tracker.items[item1];
     assert_eq!(
         i1.phase,
         Phase::Executing,
-        "`working` must start the attempt: {i1:?}"
+        "PRODUCT: `working` must start the attempt: {i1:?}"
     );
     assert_eq!(
         i1.attempts
@@ -579,20 +629,29 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
             .map(|a| a.id.as_str())
             .collect::<Vec<_>>(),
         [w1_acquisition.as_str()],
-        "the attempt's id must be the one Vox seeded from the claim: {i1:?}"
+        "PRODUCT: the attempt's id must be the one Vox seeded from the claim: {i1:?}"
     );
-    assert!(!i1.attempts[0].start.is_empty(), "{i1:?}");
+    assert!(
+        !i1.attempts[0].start.is_empty(),
+        "PRODUCT: the `working` row carries no entry hash: {i1:?}"
+    );
 
-    // w2 takes item 2, starts, and is blocked.
-    let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
-        "vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#2' --ttl 600",
-        "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' starting",
-        "vox room post \"$VOX_ROOM\" --type blocked --work 'wl:rehearsal#2' --data '{\"reason\":\"waiting on the schema\"}' blocked",
-    ]), None);
-    let b = until(
+    // w2 takes item 2 and starts — and only then, in a turn of its own, is blocked: a
+    // product that drops ownership on `blocked` must be caught at checkpoint 1, and with all
+    // three in one turn it showed only as a claim that never reached the board.
+    w2.run(
+        &oc_cfg,
+        &bin_dir,
+        &calls,
+        &r,
+        &[
+            "vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#2' --ttl 600",
+            "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' starting",
+        ],
+    );
+    let b = support::arrives(
         bob,
-        None,
-        "w2's claim",
+        "w2's claim to reach the tracker's node",
         &["room", "board", &r, "--json"],
         |o: &Out| o.ok && support::resource(&o.json(), item2).is_some(),
     )
@@ -600,30 +659,44 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     w2.session = support::resource(&b, item2)
         .and_then(|x| x["owner_session"].as_str())
         .map(str::to_owned);
-    until(
-        bob,
-        None,
-        "w2's blocked",
-        &["room", "read", &r],
-        |o: &Out| o.stdout.contains("waiting on the schema"),
-    );
+    w2.run(&oc_cfg, &bin_dir, &calls, &r, &[
+        "vox room post \"$VOX_ROOM\" --type blocked --work 'wl:rehearsal#2' --data '{\"reason\":\"waiting on the schema\"}' blocked",
+    ]);
+    support::arrives(bob, "w2's blocked", &["room", "read", &r], |o: &Out| {
+        o.stdout.contains("waiting on the schema")
+    });
     adapter.pump(&mut tracker);
-    tracker.board(&bob.vox(None, &["room", "board", &r, "--json"]).json());
+    let board = bob.vox(None, &["room", "board", &r, "--json"]).json();
+    tracker.board(&board);
 
     // ---- (1) blocked never changes Work phase ----
     let i2 = &tracker.items[item2];
-    assert_eq!(i2.phase, Phase::Executing, "{i2:?}");
-    assert_eq!(i2.health, Health::Blocked, "{i2:?}");
-    assert_eq!(tracker.items[item1].phase, Phase::Executing);
+    assert_eq!(
+        i2.phase,
+        Phase::Executing,
+        "PRODUCT: `blocked` changed Work phase — w2 held {item2} and had started it before \
+         `blocked`, and after it the board no longer shows it held: {i2:?}\nboard: {board}"
+    );
+    assert_eq!(
+        i2.health,
+        Health::Blocked,
+        "PRODUCT: w2's `blocked` row did not reach the tracker as a blocker on {item2}: {i2:?}"
+    );
+    assert_eq!(
+        tracker.items[item1].phase,
+        Phase::Executing,
+        "PRODUCT: w1's started item left Executing with nothing but w2's work in between: {:?}",
+        tracker.items[item1]
+    );
     eprintln!("[proof] checkpoint 1: {:?}", tracker.items);
 
     // ---- (6) the tracker goes away; work continues ----
     let resume = tracker.cursor.clone().unwrap();
     adapter.stop();
-    let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
+    w2.run(&oc_cfg, &bin_dir, &calls, &r, &[
         "vox room post \"$VOX_ROOM\" --type failed --work 'wl:rehearsal#2' --data '{\"reason\":\"the schema never came\"}' giving-up",
         "vox room release \"$VOX_ROOM\" 'wl:rehearsal#2'",
-    ]), None);
+    ]);
     // (3) w1 dies mid-attempt: its turn is killed and it never renews.
     let _ = w1.turn(
         &oc_cfg,
@@ -632,9 +705,8 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         &instructions(&["sleep 300"]),
         Some(Duration::from_secs(8)),
     );
-    until(
+    support::arrives(
         bob,
-        None,
         "w2's failure while the tracker is down",
         &["room", "read", &r],
         |o: &Out| o.stdout.contains("the schema never came"),
@@ -650,20 +722,28 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     assert_eq!(
         i2.phase,
         Phase::Ready,
-        "a failed attempt must leave the item retryable: {i2:?}"
+        "PRODUCT: a failed attempt must leave the item retryable: {i2:?}"
     );
     assert_eq!(
         i2.attempts.first().and_then(|a| a.outcome),
         Some("work failure"),
-        "{i2:?}"
+        "PRODUCT: w2's `failed` row, read from the resumed cursor, did not end its attempt: \
+         {i2:?}"
     );
-    assert!(i2.owner.is_none(), "{i2:?}");
+    assert!(
+        i2.owner.is_none(),
+        "PRODUCT: w2's release left it holding {item2}: {i2:?}"
+    );
     // ---- (3) the killed worker's item is retryable, not failed, not done ----
-    assert_eq!(i1.phase, Phase::Ready, "{i1:?}");
+    assert_eq!(
+        i1.phase,
+        Phase::Ready,
+        "PRODUCT: the killed worker's lapsed lease did not leave {item1} retryable: {i1:?}"
+    );
     assert_eq!(
         i1.attempts.first().and_then(|a| a.outcome),
         Some("expired or released"),
-        "{i1:?}"
+        "PRODUCT: the killed worker's attempt ended other than by its lease: {i1:?}"
     );
     eprintln!(
         "[proof] checkpoint 2 (after the tracker's absence): {:?}",
@@ -673,14 +753,13 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     // ---- (2, continued) a retry exists only from its `working` ----
     // w2 re-claims, notes progress and even asserts a result — none of which starts an
     // attempt.
-    let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
+    w2.run(&oc_cfg, &bin_dir, &calls, &r, &[
         "vox room claim \"$VOX_ROOM\" --work 'wl:rehearsal#2' --ttl 600",
         "vox room post \"$VOX_ROOM\" --type status --work 'wl:rehearsal#2' looking-again",
         "vox room post \"$VOX_ROOM\" --type result --work 'wl:rehearsal#2' --data '{\"evidence\":[{\"kind\":\"commit\",\"ref\":\"1111aaaa\"}]}' premature",
-    ]), None);
-    until(
+    ]);
+    support::arrives(
         bob,
-        None,
         "w2's premature result",
         &["room", "read", &r],
         |o: &Out| o.stdout.contains("1111aaaa"),
@@ -688,66 +767,75 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     adapter.pump(&mut tracker);
     tracker.board(&bob.vox(None, &["room", "board", &r, "--json"]).json());
     let i2 = &tracker.items[item2];
-    assert!(i2.owner.is_some(), "{i2:?}");
+    assert!(
+        i2.owner.is_some(),
+        "PRODUCT: w2's re-claim did not give it {item2}: {i2:?}"
+    );
     assert_eq!(
         i2.phase,
         Phase::Ready,
-        "re-claim, status and an unstarted result must leave it Ready: {i2:?}"
+        "PRODUCT: re-claim, status and an unstarted result must leave it Ready: {i2:?}"
     );
     assert_eq!(
         i2.attempts.len(),
         1,
-        "no retry exists before its `working`: {i2:?}"
+        "PRODUCT: no retry exists before its `working`: {i2:?}"
     );
     assert_eq!(
         i2.candidate, None,
-        "an unstarted result is an assertion, not a candidate: {i2:?}"
+        "PRODUCT: an unstarted result is an assertion, not a candidate: {i2:?}"
     );
-    assert_eq!(i2.unstarted_results, 1, "{i2:?}");
+    assert_eq!(
+        i2.unstarted_results, 1,
+        "PRODUCT: the premature `result` row did not reach the tracker: {i2:?}"
+    );
 
     // ---- (4) the retry starts, and submits a candidate: Acceptance at most ----
-    let _ = w2.turn(&oc_cfg, &bin_dir, &r, &instructions(&[
+    w2.run(&oc_cfg, &bin_dir, &calls, &r, &[
         "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' retrying",
         "vox room post \"$VOX_ROOM\" --type result --work 'wl:rehearsal#2' --data '{\"evidence\":[{\"kind\":\"commit\",\"ref\":\"9f3c2e1a\"}]}' candidate-ready",
-    ]), None);
-    until(
-        bob,
-        None,
-        "w2's result",
-        &["room", "read", &r],
-        |o: &Out| o.stdout.contains("9f3c2e1a"),
-    );
+    ]);
+    support::arrives(bob, "w2's result", &["room", "read", &r], |o: &Out| {
+        o.stdout.contains("9f3c2e1a")
+    });
     adapter.pump(&mut tracker);
     tracker.board(&bob.vox(None, &["room", "board", &r, "--json"]).json());
+    // Reaching Acceptance rests on Vox's typed `result` row (the started attempt's id and
+    // its evidence ref): PRODUCT. Going no further is the stub's own rule (see the module
+    // note), checked by `never_past_acceptance`.
     assert_eq!(
         tracker.items[item2].phase,
         Phase::Acceptance,
-        "{:?}",
+        "PRODUCT: the retry's `result` row did not reach the tracker as the started attempt's \
+         result with its evidence: {:?}",
         tracker.items[item2]
     );
-    assert_eq!(tracker.items[item2].candidate.as_deref(), Some("9f3c2e1a"));
+    assert_eq!(
+        tracker.items[item2].candidate.as_deref(),
+        Some("9f3c2e1a"),
+        "PRODUCT: the `result` row lost its evidence ref"
+    );
     let i2 = &tracker.items[item2];
     assert_eq!(
         i2.attempts.len(),
         2,
-        "the retry is a second attempt: {i2:?}"
+        "PRODUCT: the retry is a second attempt: {i2:?}"
     );
     assert_ne!(
         i2.attempts[0].id, i2.attempts[1].id,
-        "a retry has its own id: {i2:?}"
+        "PRODUCT: a retry has its own id: {i2:?}"
     );
 
     // ---- (5) release never means Done ----
-    let _ = w2.turn(
+    w2.run(
         &oc_cfg,
         &bin_dir,
+        &calls,
         &r,
-        &instructions(&["vox room release \"$VOX_ROOM\" 'wl:rehearsal#2'"]),
-        None,
+        &["vox room release \"$VOX_ROOM\" 'wl:rehearsal#2'"],
     );
-    until(
+    support::arrives(
         bob,
-        None,
         "w2's release",
         &["room", "board", &r, "--json"],
         |o: &Out| o.ok && support::resource(&o.json(), item2).is_none(),
@@ -757,7 +845,8 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     assert_eq!(
         tracker.items[item2].phase,
         Phase::Acceptance,
-        "release must not mean Done: {:?}",
+        "APPARATUS (the stub tracker's own rule, not a product proof): its `board` treated a \
+         release as Done: {:?}",
         tracker.items[item2]
     );
     tracker.never_past_acceptance();
@@ -778,13 +867,16 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
             row["envelope"]["from"].as_str().unwrap_or(""),
         );
         if kind == "assign" {
-            assert_eq!(from, "tracker", "only the tracker assigns: {row}");
+            assert_eq!(from, "tracker", "PRODUCT: only the tracker assigns: {row}");
         } else {
             assert!(
                 sessions.iter().any(|s| s == from),
-                "a work observation not written by a model's own session: {row}"
+                "PRODUCT: a work observation not written by a model's own session: {row}"
             );
         }
     }
-    assert!(tracker.rows_seen > 0);
+    assert!(
+        tracker.rows_seen > 0,
+        "PRODUCT: `vox room tail --since --json` emitted no row"
+    );
 }
