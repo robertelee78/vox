@@ -120,18 +120,18 @@ try:
                     return (rows[i + 1] if i + 1 < len(rows) else ""), "\u25b6" in r
             return None, False
         if not tui.until(lambda: label_of(GRANT)[0] is not None, 60, 1):
-            give(2, f"APPARATUS: {GRANT} is not in the members pane:\n{tui.text()}")
+            give(1, f"RED: PRODUCT (staging): {GRANT} is not in the members pane:\n{tui.text()}")
         for _ in range(8):
             if label_of(GRANT)[1]:
                 break
             key("\x1b[B", 0.5)  # Down
         if not label_of(GRANT)[1]:
-            give(2, f"APPARATUS: could not put the marker on {GRANT}:\n{tui.text()}")
+            give(1, f"RED: PRODUCT (staging): Down never put the marker on {GRANT}:\n{tui.text()}")
         key(":consent grant\r", 2)
         granted = tui.until(lambda: "consented" in (label_of(GRANT)[0] or ""), 60, 1)
         gone_check()
         if not granted:
-            give(1, f"RED: :consent grant never showed {GRANT} consented:\n{tui.text()}")
+            give(1, f"RED: PRODUCT (staging): :consent grant never showed {GRANT} consented:\n{tui.text()}")
         print(f"{TAG} the TUI consented to {GRANT}")
     before = tui.text()
     stage(":close")

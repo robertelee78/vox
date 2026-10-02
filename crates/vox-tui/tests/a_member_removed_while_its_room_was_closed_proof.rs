@@ -23,7 +23,8 @@
 //! - (b) bob posts after the reopen: carol renders them (the per-room consent survives the reopen,
 //!   and bob's posts went out), and alice renders **0** of them 20 s after carol has;
 //! - (c) bob trusts alice again, and within 120 s renders alice's posts made after that, and those
-//!   from (a) too (they reached him; only her key was missing).
+//!   from (a) too (they reached him; only her key was missing); and alice renders bob's post made
+//!   after the re-trust.
 //!
 //! **Mutations that must turn it red:** the key drop on opening disabled (`forget_untrusted_keys`
 //! in `act_on_removals_while_closed`): (a) red. The lock change on opening disabled (the `revoke`
@@ -72,17 +73,19 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS (harness): spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS (harness): vox stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS (harness): write vox stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS (harness): wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -93,8 +96,10 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 /// Start `vox daemon` with `stdin` piped in (the identity passphrase, then any room passphrase
 /// lines), its output to files by the profile, and wait until its socket answers.
 fn daemon(dir: &Path, tag: &str, stdin: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS (harness): the daemon's stdout file");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS (harness): the daemon's stderr file");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -104,10 +109,14 @@ fn daemon(dir: &Path, tag: &str, stdin: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS (harness): spawn vox daemon");
     // Write, then close: the daemon reads stdin to EOF before it binds its socket.
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(stdin.as_bytes()).unwrap();
+    let mut pipe = child
+        .stdin
+        .take()
+        .expect("APPARATUS (harness): daemon stdin");
+    pipe.write_all(stdin.as_bytes())
+        .expect("APPARATUS (harness): write daemon stdin");
     drop(pipe);
     let d = Daemon(child);
     attached(dir, tag);
@@ -127,7 +136,7 @@ fn attached(dir: &Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "CANNOT MEASURE: {tag}'s daemon never answered: {last}\nits stderr: {}",
+        "PRODUCT (staging): {tag}'s `vox daemon` never answered `vox room list`: {last}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
     );
 }
@@ -160,27 +169,33 @@ fn until(within: Duration, mut ok: impl FnMut() -> bool) -> bool {
 
 fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
-    assert!(ok, "CANNOT MEASURE: the post {text} was refused: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox room post` of {text} was refused: {err}"
+    );
 }
 
 #[test]
 #[ignore = "three real daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     watchdog::arm_for(Duration::from_secs(1300));
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS (harness): a temporary directory");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     let carol = tmp.path().join("carol");
     let mut fps = Vec::new();
     for d in [&alice, &bob, &carol] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS (harness): a profile directory");
         let (ok, out, err) = vox(d, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): `vox id` failed: {err}");
         fps.push(out.trim().to_owned());
     }
     let trust = |who: &Path, whom: usize, name: &str| {
         let (ok, _, err) = vox(who, &["trust", "add", &fps[whom], "--name", name], None);
-        assert!(ok, "trust add {name}: {err}");
+        assert!(
+            ok,
+            "PRODUCT (staging): `vox trust add` of {name} failed: {err}"
+        );
     };
     trust(&alice, 1, "bob");
     trust(&bob, 0, "alice");
@@ -194,21 +209,24 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         &["room", "create", "--name", "c"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "room create: {err}");
+    assert!(ok, "PRODUCT (staging): `vox room create` failed: {err}");
     let room = attached(&alice, "alice")
         .split_whitespace()
         .next()
-        .expect("the room's id in `room list`")
+        .expect("PRODUCT (staging): `vox room list` names no room after `vox room create`")
         .to_owned();
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "invite: {err}");
+    assert!(ok, "PRODUCT (staging): `vox room invite` failed: {err}");
     for (d, who) in [(&bob, "bob"), (&carol, "carol")] {
         let (ok, _, err) = vox(
             d,
             &["room", "join", link.trim(), "--name", "c"],
             Some(&format!("{ROOMPASS}\n")),
         );
-        assert!(ok, "CANNOT MEASURE: {who} could not join: {err}");
+        assert!(
+            ok,
+            "PRODUCT (staging): {who}'s `vox room join` failed: {err}"
+        );
     }
     // Bob reads alice before anything else happens.
     let mut n = 0;
@@ -220,7 +238,7 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     });
     assert!(
         read_before,
-        "CANNOT MEASURE: bob never read alice, so dropping her key would show nothing"
+        "PRODUCT (staging): bob, who trusts alice and is trusted by her, never read her posts in 120 s"
     );
 
     // ---- bob's TUI consents to carol in C (no trust) and closes C ------------------------
@@ -249,14 +267,14 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     );
     assert!(
         !said.contains("closed APPARATUS"),
-        "APPARATUS (precondition not met): the TUI driver (exit {:?}): {said}",
+        "APPARATUS (harness): the TUI driver's own fault (exit {:?}): {said}",
         out.code
     );
     assert!(
         out.code == Some(0)
             && said.contains("closed the TUI consented to")
             && said.contains("closed the TUI said done to :close"),
-        "PRODUCT: bob's `vox tui` did not consent to carol in room C and close it as a person \
+        "PRODUCT (staging): bob's `vox tui` did not consent to carol in room C and close it as a person \
          does; exit {:?} at stage {:?}:\n{said}",
         out.code,
         out.stage
@@ -267,10 +285,13 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     let line = attached(&bob, "bob-2");
     assert!(
         line.lines().any(|l| l.contains("[closed]")),
-        "APPARATUS (precondition not met): room C is open at the removal: {line}"
+        "PRODUCT (staging): room C, closed in the TUI, is open again when bob's daemon restarts: {line}"
     );
     let (ok, o, e) = vox(&bob, &["trust", "remove", &fps[0]], None);
-    assert!(ok, "bob removes alice: {o}{e}");
+    assert!(
+        ok,
+        "PRODUCT (staging): bob's `vox trust remove` of alice failed: {o}{e}"
+    );
     drop(bob_d);
 
     // ---- C opens again: its passphrase to bob's daemon ----------------------------------------
@@ -278,7 +299,7 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     let line = attached(&bob, "bob-3");
     assert!(
         !line.lines().any(|l| l.contains("[closed]")),
-        "APPARATUS (precondition not met): room C did not open with its passphrase: {line}"
+        "PRODUCT (staging): `vox daemon`, given room C's passphrase, did not open C: {line}"
     );
 
     // ---- (a) alice's posts after the removal stay unreadable to bob ---------------------------
@@ -307,14 +328,23 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
 
     // ---- (c) bob trusts alice again and reads her again --------------------------------------
     let (ok, _, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
-    assert!(ok, "bob trusts alice again: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): bob's `vox trust add` of alice failed: {err}"
+    );
     post(&alice, &room, "ALICE-AFTER-RETRUST");
+    post(&bob, &room, "BOB-AFTER-RETRUST");
     let t0 = Instant::now();
     let c = until(Duration::from_secs(120), || {
         reads(&bob, &room, "ALICE-AFTER-RETRUST") && reads(&bob, &room, "ALICE-AFTER-REMOVAL 3")
     });
+    // And the other direction: alice, who never stopped trusting bob, reads him again too.
+    let c_alice = until(Duration::from_secs(120), || {
+        reads(&alice, &room, "BOB-AFTER-RETRUST")
+    });
     println!(
-        "[proof] (c) bob reads alice again after trusting her: {c} ({:?})",
+        "[proof] (c) bob reads alice again after trusting her: {c}; alice reads bob again: \
+         {c_alice} ({:?})",
         t0.elapsed()
     );
 
@@ -332,5 +362,10 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         c,
         "PRODUCT: (c) bob trusted alice again, yet within 120 s he does not read her posts in \
          room C (after the re-trust, and those after the removal): her key never came back"
+    );
+    assert!(
+        c_alice,
+        "PRODUCT: (c) bob trusted alice again, yet within 120 s she does not read his post made \
+         after it in room C: his key never came back to her"
     );
 }
