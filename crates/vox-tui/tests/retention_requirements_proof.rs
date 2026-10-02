@@ -221,6 +221,24 @@ fn retention(dir: &Path) -> Option<u64> {
     status(dir)["rooms"][0]["retention"].as_u64()
 }
 
+/// The room's effective retention on `dir` once `vox status` can say: it reports `null` while a
+/// sync session holds the room (`RoomStatus::retention`), which is not an answer, so a single
+/// read can land on it. A room that is never readable in 30 s is PRODUCT (staging).
+fn settled_retention(dir: &Path, who: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(r) = retention(dir) {
+            return r;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): {who}'s `vox status --json` never reported the room's retention \
+             within 30 s (null while a session holds the room)"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Poll until the room's effective retention on `dir` is `want`, and return how long it took.
 /// `side` is the red's label: `PRODUCT` where reaching it is the claim, `PRODUCT (staging)` where
 /// it sets the scene.
@@ -333,11 +351,14 @@ fn r6_a_room_with_no_retention_keeps_every_message_however_old() {
     trust(&alice, &bob_fp, "bob");
     trust(&bob, &alice_fp, "alice");
     // Nobody set a retention: the room's must be forever on both members.
-    let (ra, rb) = (retention(&alice), retention(&bob));
+    let (ra, rb) = (
+        settled_retention(&alice, "alice"),
+        settled_retention(&bob, "bob"),
+    );
     println!("R6: retention nobody set — alice {ra:?}, bob {rb:?} (0 = forever)");
     assert_eq!(
         (ra, rb),
-        (Some(0), Some(0)),
+        (0, 0),
         "PRODUCT: a new room must keep history forever"
     );
 
@@ -450,8 +471,8 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
     std::thread::sleep(Duration::from_secs(3));
     for (dir, who) in members {
         assert_eq!(
-            retention(dir),
-            Some(604_800),
+            settled_retention(dir, who),
+            604_800,
             "PRODUCT: {who}: a refused change must change nothing"
         );
     }
