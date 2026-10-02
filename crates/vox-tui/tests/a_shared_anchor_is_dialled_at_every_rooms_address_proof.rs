@@ -454,8 +454,9 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     if !alive {
         let said = std::fs::read_to_string(anchor_dir.join("anchor-again.err")).unwrap_or_default();
         // Its port is handed back to it; another process taking it meanwhile is this machine's.
+        // That is the one exit vox words as its own address in use (`AddrInUse`).
         assert!(
-            !said.contains("in use"),
+            !said.contains("a local address it needs is already in use"),
             "CANNOT MEASURE: the restarted anchor's port was taken meanwhile, so bob had nothing to \
              reach: {said:?}"
         );

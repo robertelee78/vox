@@ -171,6 +171,27 @@ impl std::ops::Deref for Rt {
 impl Drop for Rt {
     fn drop(&mut self) {
         if let Some(rt) = self.0.take() {
+            // Shut down under a task still holding a timer, a worker of this runtime panics
+            // "A Tokio 1.x context was found, but it is being shutdown". That is the attacker's
+            // own runtime going away after the verdict: said once, as the apparatus's, not as a
+            // second red.
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let msg = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                if msg.contains("it is being shutdown") {
+                    eprintln!(
+                        "[apparatus] the attacker's runtime shut down under one of its tasks, \
+                         after the verdict: {msg}"
+                    );
+                } else {
+                    previous(info);
+                }
+            }));
             rt.shutdown_background();
         }
     }
