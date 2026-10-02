@@ -20,7 +20,9 @@
 //! transport for a tracker's observations, not a tracker (ADR-021 §1).
 
 use vox_agentcomms::claim::{self, Fold, Posted};
-use vox_agentcomms::envelope::{Context, Envelope, HELLO, WORK_KEY};
+use vox_agentcomms::envelope::{
+    is_valid_name, shown, Context, Envelope, HELLO, MAX_NAME, SHOWN_NAME, WORK_KEY,
+};
 use vox_agentcomms::ops::{self, OpIndex, Verdict};
 use vox_agentcomms::version::{self, Stamp, VersionTable, VOX_KEY};
 use vox_core::hash::Digest32;
@@ -51,30 +53,50 @@ pub const EXIT_CONFLICT: u8 = 4;
 /// **Not `VOX_AGENT_NAME`.** That is the name a session is *addressed* by, and it is
 /// set in harness settings shared by every session of the harness — using it as the
 /// owner would make two sessions one owner again, the defect ADR-021 F3 names.
+///
+/// **A session that is not one line of at most [`MAX_NAME`] bytes names nothing**
+/// (V210-123): the session is the `from` of every post, and other agents' drains, boards
+/// and claim answers print it, so a newline in it would start a line of its own in their
+/// contexts. [`require_session`] says so rather than treating it as absent.
 #[must_use]
 pub fn session(flag: Option<&str>) -> Option<String> {
-    let from_env = |k: &str| std::env::var(k).ok();
-    flag.map(str::to_owned)
+    named_session(flag)
+        .map(|(_, s)| s)
+        .filter(|s| is_valid_name(s, MAX_NAME))
+}
+
+/// What names the session, and where it came from, before it is checked.
+fn named_session(flag: Option<&str>) -> Option<(&'static str, String)> {
+    let from_env = |k: &'static str| std::env::var(k).ok().map(|v| (k, v));
+    flag.map(|f| ("--session", f.to_owned()))
         .or_else(|| from_env("VOX_SESSION"))
         .or_else(|| from_env("CLAUDE_CODE_SESSION_ID"))
         .or_else(|| from_env("CODEX_THREAD_ID"))
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .map(|(k, s)| (k, s.trim().to_owned()))
+        .filter(|(_, s)| !s.is_empty())
 }
 
 /// The session, or a refusal that says how to name one.
 ///
 /// # Errors
-/// When nothing names a session.
+/// When nothing names a session, or what names it is not one line of at most
+/// [`MAX_NAME`] bytes.
 pub fn require_session(flag: Option<&str>) -> Result<String, AppError> {
-    session(flag).ok_or_else(|| {
-        AppError::Usage(
+    match named_session(flag) {
+        Some((_, s)) if is_valid_name(&s, MAX_NAME) => Ok(s),
+        Some((from, s)) => Err(AppError::Usage(format!(
+            "the session named by {from} ({}) is refused: a session must be at most \
+             {MAX_NAME} bytes on one line, with no control characters or line separators, \
+             because other agents' rooms print it",
+            shown(&s, SHOWN_NAME)
+        ))),
+        None => Err(AppError::Usage(
             "no session: work coordination is owned per session (ADR-021 §4), and nothing \
              names this one. Run inside Claude Code or Codex, set VOX_SESSION, or pass \
              --session."
                 .into(),
-        )
-    })
+        )),
+    }
 }
 
 /// Where this process is working, read from Git.
@@ -485,9 +507,9 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
             "\n  worker {} session {} runs vox {}; required {}",
             crate::ident::author_id(&p.author),
             if p.session.is_empty() {
-                "(none)"
+                "(none)".to_owned()
             } else {
-                &p.session
+                shown(&p.session, SHOWN_NAME)
             },
             p.stamp.describe(&table.mine),
             table.mine

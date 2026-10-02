@@ -193,6 +193,10 @@ pub fn parse_op(env: &Envelope) -> Result<ClaimOp, String> {
         .filter(|r| !r.is_empty())
         .ok_or("no data.resource")?
         .to_owned();
+    // Both are printed into other agents' contexts (V210-123), so both must stay on one line.
+    if !crate::envelope::is_valid_name(&resource, crate::envelope::MAX_RESOURCE) {
+        return Err("data.resource is too long or not on one line".into());
+    }
     if env.from.is_empty() {
         return Err("no session (`from` is empty)".into());
     }
@@ -221,6 +225,12 @@ pub fn parse_op(env: &Envelope) -> Result<ClaimOp, String> {
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
+            if to_session
+                .as_deref()
+                .is_some_and(|s| !crate::envelope::is_valid_name(s, crate::envelope::MAX_NAME))
+            {
+                return Err("data.to_session is too long or not on one line".into());
+            }
             let ttl_secs = ttl("ttl_secs")
                 .filter(|t| *t > 0)
                 .ok_or("a handoff needs data.ttl_secs, so it has a finite deadline")?;
