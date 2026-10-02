@@ -46,7 +46,9 @@
 //! since a key taken and merely hidden would render the moment his ring names her. Before that,
 //! alice's key changes: she removes carol from her ring and trusts her again, which rotates her
 //! sender key, so every post so far sits under a **retired** generation, and she posts once more
-//! under the new one (carol renders it, or `CANNOT MEASURE`). Alice's daemon starts again, and
+//! under the new one (carol renders it, or `CANNOT MEASURE`). Dave, whom alice trusts and who
+//! never trusted her, then trusts her while she is online, and within 120 s renders every post
+//! she made after trusting him, the retired generation's included. Alice's daemon starts again, and
 //! within 120 s bob renders **every** post she made after trusting him, those under the retired
 //! generation included, in both rooms.
 //!
@@ -328,11 +330,14 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     let alice = member(tmp.path(), "alice", &spec);
     let bob = member(tmp.path(), "bob", &spec);
     let carol = member(tmp.path(), "carol", &spec);
+    // Dave reads alice only once he trusts her, while she is online (V210-118 c2).
+    let dave = member(tmp.path(), "dave", &spec);
 
     let rooms = [make_room(&alice, "one"), make_room(&alice, "two")];
     for ((_, link), name) in rooms.iter().zip(["one", "two"]) {
         join(&bob, link, name);
         join(&carol, link, name);
+        join(&dave, link, name);
     }
 
     // ---- the decisions: bob's ring names carol, never alice ----
@@ -341,6 +346,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     alice.trust(&carol);
     carol.trust(&alice);
     carol.trust(&bob);
+    alice.trust(&dave);
 
     let mut alice_read_bob = Vec::new();
     for ((room, _), name) in rooms.iter().zip(["one", "two"]) {
@@ -522,6 +528,54 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
             ),
             "CANNOT MEASURE: carol never rendered alice's post after the rotation in room {name}, \
              so alice's new generation is not provably out"
+        );
+    }
+
+    // **Dave trusts alice while she is online,** after her key changed: he must read every post
+    // she made after trusting him, the ones under the retired generation included. Only the live
+    // generation was offered again (the verifier's claim 4 on #316).
+    for (name, room, _) in &alice_posted {
+        let n = count(&dave.vox(&["room", "read", room], None).1, "A118-");
+        assert_eq!(
+            n, 0,
+            "dave renders {n} of alice's posts in room {name} before he trusts her"
+        );
+    }
+    dave.trust(&alice);
+    let trusted_at = Instant::now();
+    for (name, room, posted) in &alice_posted {
+        let mut want: Vec<String> = (1..=*posted)
+            .map(|k| format!("A118-IN-{name} {k}"))
+            .collect();
+        want.push(format!("A118-FINAL-IN-{name}"));
+        want.push(format!("A118-WHILE-CAROL-REMOVED-IN-{name}"));
+        want.push(format!("A118-AFTER-ROTATION-IN-{name}"));
+        let all = until(
+            &format!("dave renders all of alice's posts in room {name}"),
+            Duration::from_secs(120).saturating_sub(trusted_at.elapsed()),
+            || {
+                let seen = dave.vox(&["room", "read", room], None).1;
+                want.iter()
+                    .all(|w| seen.lines().any(|l| l.ends_with(w.as_str())))
+            },
+        );
+        let seen = dave.vox(&["room", "read", room], None).1;
+        assert!(
+            all,
+            "dave trusted alice while she was online, yet within 120 s he renders {} of her {} \
+             posts in room {name} (missing: {:?}): a generation retired before his trust was \
+             never offered again",
+            count(&seen, "A118-"),
+            want.len(),
+            want.iter()
+                .filter(|w| !seen.lines().any(|l| l.ends_with(w.as_str())))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "[proof] room {name}: dave reads all {} of alice's posts, the retired generation's \
+             included, {:?} after trusting her",
+            want.len(),
+            trusted_at.elapsed()
         );
     }
 
