@@ -902,6 +902,11 @@ impl World {
 
     /// `vox forward <room> <host> <port>` from `dir`; returns it and the address it bound.
     pub fn forward(&self, name: &str, dir: &Path) -> (VoxProc, SocketAddr) {
+        self.forward_port(name, dir, self.service_port)
+    }
+
+    /// [`World::forward`] to `port` on the host, which need not be a port it offers.
+    pub fn forward_port(&self, name: &str, dir: &Path, port: u16) -> (VoxProc, SocketAddr) {
         let mut fwd = VoxProc::spawn(
             name,
             dir,
@@ -909,7 +914,7 @@ impl World {
                 "forward",
                 &self.room,
                 &self.host_fp,
-                &self.service_port.to_string(),
+                &port.to_string(),
                 "127.0.0.1:0",
                 "--passphrase-file",
                 &self.passphrase_file(),
@@ -1057,7 +1062,7 @@ pub fn round_trip(at: SocketAddr, payload: &[u8], patience: Duration) -> std::io
 }
 
 /// How a read ended: bytes, an orderly EOF, a reset, or still open when the clock ran out.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ending {
     Eof,
     Reset,
