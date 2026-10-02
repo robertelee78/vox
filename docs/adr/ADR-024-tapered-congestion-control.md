@@ -354,7 +354,11 @@ times the rate); congestion loss climbs (4.59% to 13.00%). So tier 3 is entered 
   ADR-024 guarantees speed only (the decider, 2026-10-02): tier 3 exists to be faster and is kept
   only while it is. Vox's delivered rate over the last 2 s is recorded at 2 → 3; once tier 3 has
   dwelt, a round whose rate over the same window is under 0.9× of it takes the connection back to
-  tier 2. Tier 3 is entered only when no such back-off is running.
+  tier 2. Tier 3 is entered only when no such back-off is running. The exit is judged only when no
+  application-limited round fell within the last 2 s: a transfer that pauses is not a slower tier 3.
+  Unproven for speed: a mutant without this guard stayed green on the 6% paused arm, because
+  application-limited rounds are already skipped; it guards an application that sends below the
+  window without quinn marking its rounds application-limited.
 - **Back-off after such an exit:** tier 3 is locked out for 30 s (`BACKOFF_FIRST`), doubled after each
   further exit up to 8 min (`BACKOFF_MAX`), and reset to 30 s only after a stay in tier 3 of 5 min
   (`BACKOFF_RESET`) without one.
@@ -402,8 +406,15 @@ shows the speed a person sees after the pause.
 
 ### Tier 1 ↔ 2 and dwell
 
-- **1 → 2:** at least 3 losses without a queue within 8 rounds, and the loss share over the last
-  32 MiB at least 0.5% (`TIER2_ENTRY_SHARE`), once tier 1's dwell (below) is over. That same share is
+- **1 → 2:** once tier 1's dwell (below) is over, all of: at least 3 losses of either kind (with or
+  without a queue) in the last 8 rounds (`CLIMB_1_LOSSES`, `CLIMB_1_ROUNDS`); no queue held for 8
+  rounds in a row (`CLIMB_3_QUEUE_ROUNDS`) through at least the last 8 rounds; and the loss share
+  over the last 32 MiB at least 0.5% (`TIER2_ENTRY_SHARE`). Losses of either kind, because past the
+  5% cap every loss is called congestion: counting only losses without a queue held Vox in tier 1
+  for 18 s and more on the changing 6% arm, climbing only when the share happened to dip
+  (fix-adr024-bbr's trace). The loss share itself is exact: on the 6% arm Vox's own lost-over-sent
+  read 0.0594 against the emulator's 0.0594 of bytes dropped at random, and the 32 MiB trend
+  varies by about 0.35 points (one standard deviation, about 4,000 datagrams) around it. That share is
   tier 2's loss baseline, and it follows the trend up (never down) until tier 2 has sent 32 MiB of
   its own, then holds. Without the 0.5%, a link that turned lossy mid-transfer entered tier 2 with
   a baseline drawn from its clean history (about 0.1%), its random loss then read as loss that grew,
@@ -452,7 +463,10 @@ risks, stated plainly:
 - Clean links keep Cubic's speed: the clean LAN-like arm read 396.4 Mbit/s against a 347.4 bar (90%
   of raw). Lossy links run 2.929× a Cubic flow at 1% loss and 9.210× at 6% (joint candidate
   4b1d7808, fix-adr024-bbr, one run each, `runs/m243-m244/speed-4b1d7808.log`), without paying BBR's
-  cost where it hurts.
+  cost where it hurts. The full R41 on c4 (`eb15a78c`, one run, `runs/m243-m244/full-c4-eb15a78c.log`)
+  read 3.165× at 1% and 9.978× at 6%, the 1 Gbit/s LAN and WAN links at 102.9% of raw, and every
+  changing and paused arm at its bars; its clean LAN-like and shallow congested arms were CANNOT
+  MEASURE (calibration 93.4%; emulator 29 ms late).
 - It stays on quinn 0.11; tier 1 and tier 3 are Vox's ports of quinn's own controllers, and quinn
   is not patched. One dependency is added directly, `tracing` (default features off, `std`), which
   quinn already brings in: each tier switch emits `tracing::debug!` under the target
@@ -461,9 +475,13 @@ risks, stated plainly:
 ### Negative
 - Loss differentiation can misread congestion as random loss. If it does, Vox sends harder than a
   Cubic flow would and can take a competing flow's share; ADR-024 accepts that (fairness is a
-  non-goal, 2026-10-02). The opposite misreading, congestion handling that leaves Vox slower than the
-  controller it replaces, is what R41's congested arms gate, at a deep, a shallow and a LAN-length
-  queue.
+  non-goal, 2026-10-02), and it is measured: on c4 (`eb15a78c`), sharing the 1-BDP congested link Vox
+  carried 192.9 Mbit/s and the Cubic flow 3.1 (62.2×), and on the LAN-like one 361.8 against 22.0
+  (16.4×), where on `4b1d7808` the same arms read 1.015× and 1.695×. The likely cause, not traced:
+  since 1 → 2 counts losses with a queue too, a congested link's overflow losses take Vox up the
+  tiers as random loss does. The opposite
+  misreading, congestion handling that leaves Vox slower than the controller it replaces, is what
+  R41's congested arms gate, at a deep, a shallow and a LAN-length queue.
 - A tier-3 stay on a path that is in fact congested takes competing flows' share for as long as it
   lasts (above); accepted.
 - For 10 s after a path's round trip grows, the old base makes every loss read as congestion.
@@ -502,8 +520,13 @@ risks, stated plainly:
     from the stream's second second, the settle included; on the changing arms over the whole lossy
     phase). A tier switch that stalls a transfer, or a tier stuck at its floor, shows here even where
     the run's mean clears the bar;
-  - **paused**, the 1%-loss link with a transfer that stops for 3 s (longer than `IDLE_RESTART`) and
-    resumes: past an 8 s climb, back at the lossy bar;
+  - **paused**, the 1%- and the 6%-loss link with a transfer that stops for 3 s (longer than
+    `IDLE_RESTART`) and resumes: back at the lossy bar within 8 s at 1% and within 20 s at 6%
+    (`TIER3_WITHIN`), and its mean past that at the bar;
+  - **tier 3 within 20 s** (`TIER3_WITHIN`), on the 6% lossy, changing and paused arms: the first 2 s
+    window at the lossy bar (2× the Cubic flow) ends within 20 s of the loss starting or the transfer
+    resuming, so a late climb cannot pass on the mean. Healthy climbs reached it at 5–12 s and the
+    defect at 18–29 s; 20 s, not 15, so as not to fit the bound to one sample;
   - **clean LAN-like**, 400 Mbit/s, 2 ms: every one of 30 seconds at the clean bar (90% of raw), the
     proof that a clean link is not held in a tier that slows it. 400 Mbit/s because the userspace
     emulator calibrates that rate on a machine doing ordinary work; R41's 1 Gbit/s LAN link often
@@ -530,8 +553,9 @@ risks, stated plainly:
     rate is at least 0.5× the comparison flow's; the changing arms hold as M24.2 states; and no
     switch between tiers stalls a transfer. The post
     says, for each arm, what it shows with tier 3 on and off.
-  - Every proof drives the shipped binary and is mutation-checked. R41 is to be an optional proof
-    (cargo feature `optional-proofs`, #301): it blocks nothing, and the verifier runs it.
+  - Every proof drives the shipped binary and is mutation-checked. R41 is an optional proof
+    (cargo feature `optional-proofs`, #301's sort delta `90cbb071`): it blocks nothing, and the
+    verifier runs it.
 
 ## Links
 **Depends on**: ADR-011 (transport substrate), PRD-001 R41.
