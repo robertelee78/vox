@@ -4,7 +4,7 @@
 //! | Tier | Controller |
 //! |---|---|
 //! | 1 | [`VoxCubic`]: every loss is congestion |
-//! | 2 | [`VoxCubic`], loss-aware: a loss [`PathSignals`] does not judge congestion takes no cut (M24.3) |
+//! | 2 | [`VoxCubic`], loss-aware: a loss [`PathSignals`] does not judge congestion takes no cut, and the window stops growing while even a small queue shows (M24.3) |
 //! | 3 | [`VoxBbr`]: quinn's BBR, owned by Vox |
 //!
 //! Every connection starts in tier 1 and moves **one tier at a time, both ways** (ADR-024 rules 1
@@ -521,6 +521,12 @@ impl Controller for Tapered {
         let rounds = self.signals.rounds();
         self.signals
             .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+        // Tier 2 stops growing while even a small standing queue shows (fix-adr024's tier-2
+        // fairness hold, `PathSignals::holding`); no other tier holds.
+        let hold = self.tier_id == TierId::Two && self.signals.holding();
+        if let Tier::Cubic(cubic) = &mut self.tier {
+            cubic.set_hold_growth(hold);
+        }
         self.tier.controller_mut().on_end_acks(
             now,
             in_flight,
