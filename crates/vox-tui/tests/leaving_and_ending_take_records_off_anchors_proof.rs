@@ -173,16 +173,35 @@ fn a_leave_and_an_end_take_their_records_off_the_anchor() {
         "APPARATUS: carol's faulty node did not put its room withdraw to an anchor (anchors: \
          {put_to:?}), so a board's refusal of it was not staged. It said:\n{said}"
     );
+    // The faulty node says what the board answered its put: an answer is what makes the board's
+    // count below a verdict on the board rather than on a put that never arrived.
+    let deadline = Instant::now() + WITHIN;
+    let answer = loop {
+        let said = std::fs::read_to_string(&carol_err).unwrap_or_default();
+        let answers: Vec<String> = said
+            .lines()
+            .filter_map(|l| l.split_once("a board answered a withdraw: ").map(|(_, a)| a.to_owned()))
+            .collect();
+        if let Some(a) = answers.iter().find(|a| !a.starts_with("no answer")) {
+            break a.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: no board answered carol's room withdraw within {WITHIN:?}, so a board's \
+             refusal of it was not staged. It said:\n{said}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
     let (moved, n) = board_until(&out, &short, SETTLE, |n| n != Some(3));
     assert!(
-        !moved,
-        "PRODUCT: the anchor took a room withdraw from carol, whose admin was taken back: its board \
-         now counts {n:?}.\nanchor:\n{}",
+        !moved && answer.starts_with("refused"),
+        "PRODUCT: the anchor took a room withdraw from carol, whose admin was taken back: it \
+         answered {answer:?} and its board now counts {n:?}.\nanchor:\n{}",
         anchor()
     );
     eprintln!(
-        "[proof] withdraw: the anchor refused a removed admin's room withdraw; still 3 members \
-         {SETTLE:?} later"
+        "[proof] withdraw: the anchor refused a removed admin's room withdraw ({answer}); still 3 \
+         members {SETTLE:?} later"
     );
 
     let o = carol.vox(None, &["room", "leave", id]);

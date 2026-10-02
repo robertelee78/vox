@@ -11293,18 +11293,48 @@ impl Node {
         }
     }
 
-    /// Put `withdraws` on the board at `conn`, off the actor.
+    /// Put `withdraws` on the board at `conn`, off the actor. A put the board never answered —
+    /// a stream that would not open, or broke — is tried again a few times while the connection
+    /// lasts, so a leave or end made just after this node reconnected still reaches the board at
+    /// once, not at its next reconnect. A board's refusal is its answer and is not retried.
     fn put_withdraws(conn: &Arc<VoxConnection>, withdraws: Vec<Vec<u8>>) {
         if withdraws.is_empty() {
             return;
         }
         let conn = Arc::clone(conn);
         tokio::spawn(async move {
-            let Ok(mut client) = crate::nat::service::RendezvousClient::open(&conn).await else {
-                return;
-            };
-            for w in &withdraws {
-                let _ = client.put(w).await;
+            let mut pending = withdraws;
+            for wait_ms in [0_u64, 250, 1_000, 2_000, 4_000] {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                let Ok(mut client) = crate::nat::service::RendezvousClient::open(&conn).await
+                else {
+                    continue;
+                };
+                let mut unanswered = Vec::new();
+                for w in pending {
+                    let said = client.put(&w).await;
+                    #[cfg(feature = "mutant-sender")]
+                    eprintln!(
+                        "{}: a board answered a withdraw: {}",
+                        crate::log::sync::mutant::MARKER,
+                        match &said {
+                            Ok(()) => "taken".to_owned(),
+                            Err(crate::error::Error::RendezvousRejected(r)) => {
+                                format!("refused ({r})")
+                            }
+                            Err(e) => format!("no answer ({e})"),
+                        }
+                    );
+                    match said {
+                        Ok(()) | Err(crate::error::Error::RendezvousRejected(_)) => {}
+                        Err(_) => unanswered.push(w),
+                    }
+                }
+                client.finish();
+                if unanswered.is_empty() {
+                    return;
+                }
+                pending = unanswered;
             }
         });
     }
