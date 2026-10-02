@@ -475,6 +475,10 @@ pub fn dial_backs() -> std::collections::BTreeMap<Digest32, (u64, u64)> {
         .clone()
 }
 
+/// Why a punch session could not be opened when the coordinator holds no connection to the peer
+/// — and so, at that moment, could not carry a circuit to it either (V030-27).
+pub const COORDINATOR_CANNOT_REACH: &str = "coord: coordinator cannot reach the peer";
+
 /// Open a punch session to `target` through `coordinator`: the `RELAY` ask and the
 /// `RELAYING` acknowledgement, leaving the streams ready for
 /// [`run_punch_initiator`].
@@ -487,9 +491,7 @@ pub async fn open_punch_session(
     match next_frame(&mut recv).await? {
         CoordFrame::Relaying => Ok((send, recv)),
         CoordFrame::Refused { reason } => Err(match reason {
-            CoordRefusal::NotConnected => {
-                Error::HolePunchFailed("coord: coordinator cannot reach the peer")
-            }
+            CoordRefusal::NotConnected => Error::HolePunchFailed(COORDINATOR_CANNOT_REACH),
             CoordRefusal::NotAuthorized => {
                 Error::HolePunchFailed("coord: coordinator will not relay for us")
             }

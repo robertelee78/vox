@@ -724,7 +724,7 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: {n} never joined: {out}{err}"
+                "PRODUCT (staging): {n} never joined: {out}{err}"
             );
             std::thread::sleep(Duration::from_secs(5));
         }
@@ -753,7 +753,7 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: {n} knows only {knows:?} of the four members"
+                "PRODUCT (staging): {n} knows only {knows:?} of the four members"
             );
             std::thread::sleep(Duration::from_millis(500));
         }

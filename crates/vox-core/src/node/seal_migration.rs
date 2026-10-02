@@ -32,8 +32,7 @@ use crate::node::{pending_consent, prekeys, trust};
 /// Re-seal every node-wide blob in `store` that still opens only under its legacy key, in one
 /// transaction. Returns how many blobs were re-sealed.
 ///
-/// Anchor pages are not among them: only a headless `vox node` keeps them, and it has no vault
-/// (see [`crate::node::anchor::anchor_sek`]).
+/// An anchor's pages are not among them: an anchor keeps none (ADR-023 decision 6).
 ///
 /// # Errors
 /// A key cannot be derived, or the store cannot be read or written.
