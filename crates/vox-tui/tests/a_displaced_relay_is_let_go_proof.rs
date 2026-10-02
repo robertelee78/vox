@@ -314,3 +314,169 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
     interrupt(&mut up, Duration::from_secs(15));
     drop(up);
 }
+
+/// V210-81 (#272 c6) — **the per-member tunnel cap holds across a path upgrade**, through the
+/// shipped `vox`, on the staging above.
+///
+/// The cap is per member (decider, 2026-10-01): "Past the per-member cap (16), a new tunnel is
+/// refused". A member has two connections at once whenever a direct path displaces a relayed one,
+/// since the relayed one stays open while its tunnels run. c5 counted per connection, so the new
+/// connection started at 0: a member could open 16 tunnels relayed and 16 more direct, and closing
+/// one of the old ones freed nothing on the count that refused the next.
+///
+/// **Staging, observed** (CANNOT MEASURE otherwise): 15 sessions through `vox up` while the
+/// forward is closed, each echoing over the anchor's circuit; the forward opens, and a 16th
+/// request rides it (the pair went direct, reported displaced by either side), and is held.
+///
+/// **Asserted:** a 17th session, with 15 tunnels on the displaced path and 1 on the direct one, is
+/// refused, and `vox up` says "16 tunnels are already open to this member"; then, one of the
+/// relayed sessions closed, a new session is carried within [`FREED_WITHIN`].
+///
+/// **The mutation that must turn it red:** counting each connection's own tunnels again (c5): the
+/// direct connection carries 1, so the 17th is carried.
+#[test]
+#[ignore = "production Argon2id + a real PoW, a relayed pair upgraded at the tunnel cap; run in release"]
+fn the_tunnel_cap_holds_across_a_path_upgrade() {
+    /// How long a closed session's tunnel may take to give its place back: its splice ends, and
+    /// waits at most `ACK_BOUND` (10 s) for the far end to acknowledge what it sent.
+    const FREED_WITHIN: Duration = Duration::from_secs(20);
+    const CAP: usize = vox_core::transport::quic::TUNNELS_PER_PEER as usize;
+    const LIMIT_SAID: &str = "16 tunnels are already open to this member";
+    watchdog::arm();
+    let mut w = ForwardedWorld::new(false);
+    eprintln!(
+        "[proof] guest joined through the relay in {:?}; forward {} (closed) for the host at {}",
+        w.joined_in, w.forward.public, w.forward.host
+    );
+    let hostname = w.hostname();
+    let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
+    let (mut up, proxy, _) = w.up("up");
+    // One echo on a session; whether it came back, and whether it crossed the forward.
+    let echo = |s: &mut std::net::TcpStream, w: &ForwardedWorld| -> (bool, bool) {
+        let sent = w.forward.to_host();
+        let ok = echo_over(s, &payload, Duration::from_secs(10));
+        (ok, w.forward.to_host() - sent >= PAYLOAD as u64)
+    };
+
+    // 15 sessions over the anchor's circuit, each held open.
+    let mut relayed = Vec::new();
+    for i in 0..CAP - 1 {
+        let (code, mut s) = socks5_connect(proxy, &hostname, w.service_port);
+        assert_eq!(
+            code,
+            0,
+            "PRODUCT (staging): vox up refused relayed session {i} of {} (SOCKS reply {code}), \
+             below the cap.\nup:\n{}",
+            CAP - 1,
+            up.transcript()
+        );
+        let (ok, direct) = echo(&mut s, &w);
+        assert!(
+            ok && !direct,
+            "CANNOT MEASURE: relayed session {i} did not echo over the circuit (came back: {ok}, \
+             crossed the forward: {direct})"
+        );
+        relayed.push(s);
+    }
+    w.anchor.assert_relayed("with 15 sessions open");
+
+    // A direct path becomes possible; a 16th request finds it and is held.
+    w.forward.open();
+    let opened = Instant::now();
+    let mut on_direct = None;
+    while opened.elapsed() < UPGRADE_WITHIN {
+        std::thread::sleep(Duration::from_millis(500));
+        let (code, mut s) = socks5_connect(proxy, &hostname, w.service_port);
+        if code == 0 && echo(&mut s, &w) == (true, true) {
+            on_direct = Some(s);
+            break;
+        }
+    }
+    let Some(mut on_direct) = on_direct else {
+        panic!(
+            "CANNOT MEASURE: {UPGRADE_WITHIN:?} after the forward opened, no request rode it — the \
+             pair never went direct.\nup:\n{}",
+            up.transcript()
+        );
+    };
+    let displaced = |p: &world::VoxProc| {
+        p.timed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(_, l)| l.contains("displaced the one held") && l.contains("Relayed)"))
+    };
+    assert!(
+        displaced(&w.host) || displaced(&up),
+        "CANNOT MEASURE: a request rode the forward, but neither side reported its relayed \
+         connection displaced, so the member may not have two connections.\nup:\n{}\nhost:\n{}",
+        up.transcript(),
+        w.host.transcript()
+    );
+    let (ok, _) = echo(&mut relayed[0], &w);
+    assert!(
+        ok,
+        "CANNOT MEASURE: a relayed session stopped answering after the upgrade, so the displaced \
+         path no longer carries the 15"
+    );
+    eprintln!(
+        "[proof] 15 sessions on the displaced relayed path, 1 on the direct path {:?} after the \
+         forward opened",
+        opened.elapsed()
+    );
+
+    // The 17th: refused, saying why, though the direct connection carries only one.
+    let asked = Instant::now();
+    let (code, _refused) = socks5_connect(proxy, &hostname, w.service_port);
+    // Only what `vox up` said after this request was made: a polling request above may have
+    // met the cap while an earlier one was still finishing.
+    let told = loop {
+        if let Some(l) = up
+            .said_since(asked)
+            .into_iter()
+            .find(|l| l.starts_with("[+") && l.contains(LIMIT_SAID))
+        {
+            break Ok(l);
+        }
+        if asked.elapsed() > Duration::from_secs(10) {
+            break Err(up.said_since(asked).join("\n"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!(
+        "[proof] the 17th session: SOCKS reply {code} after {:?}; vox up said: {told:?}",
+        asked.elapsed()
+    );
+    assert!(
+        code != 0 && told.is_ok(),
+        "PRODUCT: with 16 tunnels open to the host — 15 on the displaced relayed path, 1 on the \
+         direct one — a 17th was not refused saying {LIMIT_SAID:?}: SOCKS reply {code}; {told:?}"
+    );
+
+    // Closing any one of the member's tunnels gives its place back, wherever it ran.
+    drop(relayed.pop());
+    let closed = Instant::now();
+    let mut carried = false;
+    while closed.elapsed() < FREED_WITHIN {
+        let (code, mut s) = socks5_connect(proxy, &hostname, w.service_port);
+        if code == 0 && echo(&mut s, &w).0 {
+            carried = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    eprintln!(
+        "[proof] after closing one relayed session, a new one carried: {carried} after {:?}",
+        closed.elapsed()
+    );
+    assert!(
+        carried,
+        "PRODUCT: after one of the member's 16 sessions was closed, no new session was carried \
+         within {FREED_WITHIN:?}: closing a tunnel the refusal points at freed nothing.\nup:\n{}",
+        up.transcript()
+    );
+    let _ = echo(&mut on_direct, &w);
+    drop(relayed);
+    interrupt(&mut up, Duration::from_secs(15));
+    drop(up);
+}

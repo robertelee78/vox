@@ -120,6 +120,17 @@ const MEMBER_REDIAL_SECS: u64 = 30;
 /// circuit's stream, which happens on the endpoint driver's next turn.
 const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
 
+/// How long a stopping node waits for tunnels that finished their stream to have their last bytes
+/// acknowledged before it closes its connections (see `stop_network`).
+///
+/// **Shorter than `vox daemon`'s 5 s stop patience**, on purpose. The daemon gives its node that
+/// long to stop and then leaves, dropping the node's tasks; at an equal bound, a stop that waited
+/// the whole of it (a peer that vanished holding unacknowledged bytes) raced the daemon's leaving
+/// with its connection closes, and a close that lost left every other peer to learn of the stop
+/// only by its idle timeout. The bound still covers a reply of several MiB draining over a slow
+/// path.
+const STOP_ACK_BOUND: Duration = Duration::from_secs(3);
+
 /// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
 /// thread, an aborted join — to let go of the profile's store before answering. With the network
 /// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
@@ -3740,6 +3751,10 @@ impl Node {
     /// node presents no network identity at all.
     async fn stop_network(&mut self) {
         if let Some(net) = self.net.take() {
+            // **A finished tunnel's last bytes first.** A close drops what the peer has not yet
+            // acknowledged, so a node stopped right after a reply was finished cut it short at
+            // the far end (V210-81).
+            crate::tunnel::session::all_acknowledged(STOP_ACK_BOUND).await;
             // **Relayed connections first**, while the circuits their closes travel in still run,
             // then everything else. Closing them all at once closed each circuit's carrier in the
             // same instant, so a relayed peer never received the CONNECTION_CLOSE. It learned this
@@ -5466,7 +5481,6 @@ impl Node {
                         // better path appearing does not close it under a live session.
                         let carried = Arc::clone(&connection);
                         tokio::spawn(async move {
-                            let _carried = carried;
                             let refusals = events.clone();
                             let served = crate::node::tunnel::serve_reporting(
                                 peer,
@@ -5474,6 +5488,7 @@ impl Node {
                                 recv,
                                 snapshot,
                                 Some(events),
+                                Some(&carried),
                             )
                             .await;
                             // The result used to be dropped here, so a host refusing a member —
@@ -9650,6 +9665,9 @@ impl Node {
         tokio::spawn(async move {
             let result = match net.reach(host, &endpoints).await {
                 Ok(conn) => {
+                    // A forward whose every connection would be refused is refused now, in
+                    // words, rather than bound and then resetting each connection (V210-81).
+                    let room = conn.room_for_a_tunnel();
                     let _ = tx
                         .send(NetEvent::Dialed {
                             conn,
@@ -9657,7 +9675,7 @@ impl Node {
                             board: false,
                         })
                         .await;
-                    Ok(())
+                    room
                 }
                 Err(e) => Err(e),
             };
@@ -9690,10 +9708,14 @@ impl Node {
         result: crate::error::Result<()>,
     ) -> Outcome {
         if let Err(e) = result {
-            let _ = self.event_tx.send(NodeEvent::PeerUnreachable {
-                peer: *host,
-                why: e.to_string(),
-            });
+            // A member reached, whose connection carries all the tunnels it may, is not one
+            // that could not be reached.
+            if !matches!(e, Error::TunnelLimit(_)) {
+                let _ = self.event_tx.send(NodeEvent::PeerUnreachable {
+                    peer: *host,
+                    why: e.to_string(),
+                });
+            }
             return Outcome::Failed(fault_of(&e));
         }
         // The room may have closed while the dial ran.
@@ -10256,6 +10278,7 @@ fn fault_of(e: &Error) -> Fault {
         // fault: falling through to `Internal` made the join walk stop after one responder.
         Error::LadderExhausted(_) => Fault::Unreachable,
         Error::LocalBind { .. } => Fault::AddressInUse,
+        Error::TunnelLimit(_) => Fault::TunnelLimit,
         Error::Profile("no identity in this profile") => Fault::NoIdentity,
         Error::Profile("identity already exists in this profile") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
