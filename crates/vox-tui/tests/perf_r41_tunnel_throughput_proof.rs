@@ -21,7 +21,7 @@
 //! bounds the 10 Gbit/s figure; that is reported with it, not hidden.
 //!
 //! **ADR-024's arms** (the decider, 2026-10-01; see `taper_arms`): on a clean 400 Mbit/s, 2 ms
-//! LAN-like link, which the emulator carries under ordinary load, every second is at the clean bar
+//! LAN-like link, which the emulator carries under ordinary load, every 2 s window is at the clean bar
 //! (90% of raw); on a 200 Mbit/s, 10 ms Wi-Fi-like
 //! link at 1% and at 6% loss the tunnel carries at least [`LOSSY_WIN`] of a Cubic flow on the same
 //! loss; on a link it shares with a Cubic flow (200 Mbit/s through a one-BDP and a quarter-BDP queue,
@@ -29,7 +29,7 @@
 //! between [`FAIR_LOW`] and [`FAIR_HIGH`] of that flow's; on a lossy link shared with a Cubic flow
 //! (1% and 6% loss, one-BDP queue) that flow keeps at least [`SHARED_KEEP`] of its solo rate; and on
 //! a link that goes clean, lossy and
-//! clean again under one transfer, every second of each clean phase (past [`RECOVER_WITHIN`] after
+//! clean again under one transfer, every 2 s window of each clean phase (past [`RECOVER_WITHIN`] after
 //! the loss) is at the clean bar and the lossy phase clears the lossy bar. These are judged by the
 //! speed a person sees, never by which controller the tunnel is running. The comparison flow is
 //! quinn's stock Cubic over the same emulated link, not kernel TCP: see the comment above
@@ -968,11 +968,13 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     }
     let mut cannot = Vec::new();
     taper_arms(
-        tunnel,
-        &link,
-        &bottleneck,
-        raw,
-        &done,
+        Rig {
+            tunnel,
+            link: &link,
+            bottleneck: &bottleneck,
+            raw,
+            done: &done,
+        },
         &mut report,
         &mut failed,
         &mut cannot,
@@ -1142,7 +1144,8 @@ const CONGESTED_LAN: Link = Link {
 /// which is the case a delay-based reading of loss gets wrong: tier 2's guard is what keeps Vox
 /// fair on it.
 const CONGESTED_SHALLOW: Link = Link {
-    name: "congested, shallow buffer, 200 Mbit/s, 10 ms RTT, 1/4-BDP queue, shared with a Cubic flow",
+    name:
+        "congested, shallow buffer, 200 Mbit/s, 10 ms RTT, 1/4-BDP queue, shared with a Cubic flow",
     queue_bdps: Some(0.25),
     ..CONGESTED
 };
@@ -1158,7 +1161,7 @@ const CLEAN_LAN: Link = Link {
     gated: true,
     queue_bdps: None,
 };
-/// How long the clean LAN-like arm is judged, every second of it.
+/// How long the clean LAN-like arm is judged, every 2 s window of it.
 const CLEAN_MEASURE: Duration = Duration::from_secs(30);
 
 /// The decider: on the lossy link Vox must carry at least twice the comparison flow.
@@ -1210,7 +1213,10 @@ fn changing_name(lossy: &Link) -> String {
 }
 
 /// Write to the tunnel at `to` as fast as it takes, until `stop`.
-fn stream_to(to: SocketAddr, stop: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
+fn stream_to(
+    to: SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut chunk = vec![0x5au8; CHUNK];
         chunk[0] = STREAM_MARK;
@@ -1290,7 +1296,10 @@ fn mbit(w: &[Window], f: impl Fn(&Window) -> f64) -> Vec<String> {
 /// 4 ms rise in a round's minimum round trip. A round's minimum is over every packet in it, so one
 /// late release does not move it, but lateness that lasts can fake or hide it (ADR-024).
 fn late_fault(arm: &str, w: &[Window]) -> Option<String> {
-    let over = w.iter().filter(|x| x.late_share >= LATE_PACKET_SHARE).count();
+    let over = w
+        .iter()
+        .filter(|x| x.late_share >= LATE_PACKET_SHARE)
+        .count();
     if over as f64 > LATE_SECONDS_SHARE * w.len() as f64 {
         return Some(format!(
             "CANNOT MEASURE {arm} (APPARATUS): in {over} of {} judged seconds the emulator released \
@@ -1522,6 +1531,29 @@ fn competitor_sender(
     });
 }
 
+/// What ADR-024's arms run on: the tunnel, the link both shapers apply, the tunnel's queue toward the
+/// host (shared with the comparison flow), and the raw-TCP path with its sink's completions.
+struct Rig<'a> {
+    tunnel: SocketAddr,
+    link: &'a Shared,
+    bottleneck: &'a Arc<Mutex<Pacer>>,
+    raw: SocketAddr,
+    done: &'a mpsc::Receiver<(Instant, Instant)>,
+}
+
+/// How many 2 s windows of `w` (each pair of neighbouring seconds) average under `bar`.
+///
+/// A clean link is judged in 2 s windows, not single seconds: the sink's counters are read once a
+/// second, and bytes that land just past a boundary move from one second to the next. On a clean
+/// 200 Mbit/s phase, fix-adr024-bbr found every second under the bar beside one above the link's
+/// own rate (166/230, 173/224, 169/229, 174/222: each pair about 2 x 199), which is when the bytes
+/// landed, not how fast vox sent them.
+fn windows_below(w: &[Window], bar: f64) -> usize {
+    w.windows(2)
+        .filter(|p| (p[0].vox + p[1].vox) / 2.0 < bar)
+        .count()
+}
+
 /// The comparison flow must have run, or there was nothing to compare with.
 fn competed_fault(arm: &str, w: &[Window]) -> Option<String> {
     (mean_of(w, |x| x.other) <= 0.0).then(|| {
@@ -1535,16 +1567,19 @@ fn competed_fault(arm: &str, w: &[Window]) -> Option<String> {
 /// ADR-024's arms, on the running tunnel. Each PRODUCT verdict goes into `failed`, each APPARATUS
 /// fault into `cannot` (that arm only: the others still measure), each figure into `report`.
 fn taper_arms(
-    tunnel: SocketAddr,
-    link: &Shared,
-    bottleneck: &Arc<Mutex<Pacer>>,
-    raw: SocketAddr,
-    done: &mpsc::Receiver<(Instant, Instant)>,
+    rig: Rig<'_>,
     report: &mut Vec<String>,
     failed: &mut Vec<String>,
     cannot: &mut Vec<String>,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let Rig {
+        tunnel,
+        link,
+        bottleneck,
+        raw,
+        done,
+    } = rig;
     let wanted = perf_only;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1560,7 +1595,7 @@ fn taper_arms(
     );
     let settle_and_measure = SETTLE + MEASURE;
 
-    // The clean LAN-like link: every second at the clean bar, so no tier slows a clean link.
+    // The clean LAN-like link: every 2 s window at the clean bar, so no tier slows a clean link.
     'clean: {
         if !wanted(CLEAN_LAN.name) {
             break 'clean;
@@ -1570,10 +1605,12 @@ fn taper_arms(
             .iter()
             .map(|w| format!("{:.1}%", w * 8.0 / CLEAN_LAN.bits_per_sec * 100.0))
             .collect();
-        let fidelity =
-            windows_cal.iter().copied().fold(f64::INFINITY, f64::min) * 8.0 / CLEAN_LAN.bits_per_sec;
+        let fidelity = windows_cal.iter().copied().fold(f64::INFINITY, f64::min) * 8.0
+            / CLEAN_LAN.bits_per_sec;
         if fidelity < EMULATOR_FIDELITY {
-            cant(cannot, format!(
+            cant(
+                cannot,
+                format!(
                 "CANNOT MEASURE {} (APPARATUS): the emulator itself delivered only {:.1}% of the \
                  link's rate in a calibration window (windows {pct:?}; each must reach {:.0}%), so \
                  this arm would measure the emulator, not vox (load: {})",
@@ -1581,7 +1618,8 @@ fn taper_arms(
                 fidelity * 100.0,
                 EMULATOR_FIDELITY * 100.0,
                 uptime()
-            ));
+            ),
+            );
             break 'clean;
         }
         *link.lock().unwrap() = Some(CLEAN_LAN);
@@ -1595,20 +1633,21 @@ fn taper_arms(
         let _ = pump.join();
         std::thread::sleep(Duration::from_secs(1));
         let w = &all[SETTLE.as_secs() as usize..];
-        if let Some(e) = late_fault(CLEAN_LAN.name, w).or_else(|| crossed_fault(CLEAN_LAN.name, w)) {
+        if let Some(e) = late_fault(CLEAN_LAN.name, w).or_else(|| crossed_fault(CLEAN_LAN.name, w))
+        {
             cant(cannot, e);
             break 'clean;
         }
-        let below = w.iter().filter(|x| x.vox < bar).count();
+        let below = windows_below(w, bar);
         let verdict = if below == 0 {
             "ok".to_owned()
         } else {
             failed.push(format!(
                 "{}: the emulator carried the link (calibration windows {pct:?}) and was on time; \
-                 {below} of {} seconds were under the clean bar of {:.1} Mbit/s ({:.0}% of raw \
+                 {below} of {} 2 s windows were under the clean bar of {:.1} Mbit/s ({:.0}% of raw \
                  {:.1}), slowest {:.1} Mbit/s: vox slows a clean link",
                 CLEAN_LAN.name,
-                w.len(),
+                w.len().saturating_sub(1),
                 bar / 1e6,
                 MIN_RATIO * 100.0,
                 raw_rate / 1e6,
@@ -1617,7 +1656,7 @@ fn taper_arms(
             "BELOW".to_owned()
         };
         note(report, format!(
-            "{}: clean bar {:.1} Mbit/s ({:.0}% of raw {:.1}); vox mean {:.1} Mbit/s, {below} seconds \
+            "{}: clean bar {:.1} Mbit/s ({:.0}% of raw {:.1}); vox mean {:.1} Mbit/s, {below} 2 s windows \
              below — {verdict}; calibration {pct:?}; {}; per-second {:?}",
             CLEAN_LAN.name,
             bar / 1e6,
@@ -1674,7 +1713,9 @@ fn taper_arms(
             ));
             format!("BELOW {LOSSY_WIN:.1}x")
         };
-        note(report, format!(
+        note(
+            report,
+            format!(
             "{}: vox {:.1} Mbit/s, Cubic on the same loss {:.1} Mbit/s, {ratio:.3}x — {verdict}; \
              vox's {}; the Cubic flow's {}; per-second vox {:?}, Cubic {:?}",
             lossy.name,
@@ -1684,7 +1725,8 @@ fn taper_arms(
             lateness(&c),
             mbit(&v, |x| x.vox),
             mbit(&c, |x| x.other)
-        ));
+        ),
+        );
     }
 
     // The lossy shared links: the Cubic flow alone, then with Vox, on the same link.
@@ -1775,10 +1817,9 @@ fn taper_arms(
         stop.store(true, Relaxed);
         let _ = pump.join();
         std::thread::sleep(Duration::from_secs(1));
-        if let Some(e) =
-            late_fault(congested.name, &w)
-                .or_else(|| crossed_fault(congested.name, &w))
-                .or_else(|| competed_fault(congested.name, &w))
+        if let Some(e) = late_fault(congested.name, &w)
+            .or_else(|| crossed_fault(congested.name, &w))
+            .or_else(|| competed_fault(congested.name, &w))
         {
             cant(cannot, e);
             continue;
@@ -1818,21 +1859,24 @@ fn taper_arms(
             pairs.iter().copied().fold(f64::INFINITY, f64::min),
             pairs.iter().copied().fold(0.0, f64::max)
         ));
-        note(report, format!(
-            "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.3}x over {} s — {verdict}; {}; \
+        note(
+            report,
+            format!(
+                "{}: vox {:.1} Mbit/s, Cubic {:.1} Mbit/s, {ratio:.3}x over {} s — {verdict}; {}; \
              per-second vox {:?}, Cubic {:?}",
-            congested.name,
-            vm / 1e6,
-            cm / 1e6,
-            CONGESTED_MEASURE.as_secs(),
-            lateness(&w),
-            mbit(&w, |x| x.vox),
-            mbit(&w, |x| x.other)
-        ));
+                congested.name,
+                vm / 1e6,
+                cm / 1e6,
+                CONGESTED_MEASURE.as_secs(),
+                lateness(&w),
+                mbit(&w, |x| x.vox),
+                mbit(&w, |x| x.other)
+            ),
+        );
     }
 
     // The changing links: clean, lossy, clean, under one running transfer, at 1% loss (tier 2's
-    // case) and at 5% (tier 3's).
+    // case) and at 6% (tier 3's).
     for lossy_link in [WIFI, WIFI_HEAVY] {
         let name = changing_name(&lossy_link);
         if !wanted(&name) {
@@ -1852,10 +1896,13 @@ fn taper_arms(
             .find(|(n, _)| *n == lossy_link.name)
             .map(|&(_, b)| b)
         else {
-            cant(cannot, format!(
+            cant(
+                cannot,
+                format!(
                 "CANNOT MEASURE {name} (APPARATUS): the lossy arm it is judged against did not \
                  measure (precondition unmet)"
-            ));
+            ),
+            );
             continue;
         };
         let stop = Arc::new(AtomicBool::new(false));
@@ -1878,13 +1925,13 @@ fn taper_arms(
             cant(cannot, e);
             continue;
         }
-        let below = |w: &[Window]| w.iter().filter(|x| x.vox < bar).count();
+        let below = |w: &[Window]| windows_below(w, bar);
         let r = RECOVER_WITHIN.as_secs() as usize;
         let lossy_mean = mean_of(&lossy[CLIMB_WITHIN.as_secs() as usize..], |x| x.vox);
         let mut verdicts = Vec::new();
         if below(clean1) > 0 {
             verdicts.push(format!(
-                "phase CLEAN (first): {} of its seconds below the clean bar",
+                "phase CLEAN (first): {} of its 2 s windows below the clean bar",
                 below(clean1)
             ));
         }
@@ -1898,7 +1945,7 @@ fn taper_arms(
         }
         if below(&clean2[r..]) > 0 {
             verdicts.push(format!(
-                "phase RECOVERY (second clean): {} of its seconds after the first {} s below the clean \
+                "phase RECOVERY (second clean): {} of its 2 s windows after the first {} s below the clean \
                  bar (not back to full speed {} s after the loss ended, or fell back again)",
                 below(&clean2[r..]),
                 RECOVER_WITHIN.as_secs(),
@@ -1918,18 +1965,21 @@ fn taper_arms(
             ));
             "BELOW".to_owned()
         };
-        note(report, format!(
-            "{name}: clean bar {:.1} Mbit/s ({:.0}% of raw {:.1}), lossy bar {:.1} Mbit/s; \
+        note(
+            report,
+            format!(
+                "{name}: clean bar {:.1} Mbit/s ({:.0}% of raw {:.1}), lossy bar {:.1} Mbit/s; \
              per-second clean {:?}, lossy {:?}, clean {:?} — {verdict}; {}",
-            bar / 1e6,
-            MIN_RATIO * 100.0,
-            raw_rate / 1e6,
-            lossy_bar / 1e6,
-            mbit(clean1, |x| x.vox),
-            mbit(lossy, |x| x.vox),
-            mbit(clean2, |x| x.vox),
-            lateness(&all[s..])
-        ));
+                bar / 1e6,
+                MIN_RATIO * 100.0,
+                raw_rate / 1e6,
+                lossy_bar / 1e6,
+                mbit(clean1, |x| x.vox),
+                mbit(lossy, |x| x.vox),
+                mbit(clean2, |x| x.vox),
+                lateness(&all[s..])
+            ),
+        );
     }
 
     // The paused link: one tunnel on the 1%-loss link that stops sending for longer than the
@@ -1964,8 +2014,8 @@ fn taper_arms(
         stop.store(true, Relaxed);
         let _ = pump.join();
         let judged_after = &after[CLIMB_WITHIN.as_secs() as usize..];
-        if let Some(e) =
-            late_fault(PAUSED_NAME, judged_after).or_else(|| crossed_fault(PAUSED_NAME, judged_after))
+        if let Some(e) = late_fault(PAUSED_NAME, judged_after)
+            .or_else(|| crossed_fault(PAUSED_NAME, judged_after))
         {
             cant(cannot, e);
             break 'paused;
