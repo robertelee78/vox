@@ -399,8 +399,16 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     // The listener echoes: whatever comes out of it goes straight back in, and once the
     // whole mebibyte has, its input ends — which ends its half of the stream.
     {
-        let mut from = listen.child.stdout.take().unwrap();
-        let mut into = listen.child.stdin.take().unwrap();
+        let mut from = listen
+            .child
+            .stdout
+            .take()
+            .expect("APPARATUS: the listener's stdout pipe");
+        let mut into = listen
+            .child
+            .stdin
+            .take()
+            .expect("APPARATUS: the listener's stdin pipe");
         let total = payload.len();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
@@ -421,7 +429,11 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     let mut open = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
     let echoed = Arc::new(Mutex::new(Vec::new()));
     {
-        let mut from = open.child.stdout.take().unwrap();
+        let mut from = open
+            .child
+            .stdout
+            .take()
+            .expect("APPARATUS: the opener's stdout pipe");
         let sink = Arc::clone(&echoed);
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
@@ -429,10 +441,16 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
                 if n == 0 {
                     break;
                 }
-                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                sink.lock()
+                    .expect("APPARATUS: the echo buffer's lock")
+                    .extend_from_slice(&buf[..n]);
             }
         });
-        let mut into = open.child.stdin.take().unwrap();
+        let mut into = open
+            .child
+            .stdin
+            .take()
+            .expect("APPARATUS: the opener's stdin pipe");
         let data = payload.clone();
         std::thread::spawn(move || {
             let _ = into.write_all(&data);
@@ -440,7 +458,10 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     }
     let started = Instant::now();
     let status = open.exited_within(TIMEOUT);
-    let got = echoed.lock().unwrap().clone();
+    let got = echoed
+        .lock()
+        .expect("APPARATUS: the echo buffer's lock")
+        .clone();
     let (want, have) = (Sha256::digest(&payload), Sha256::digest(&got));
     eprintln!(
         "round trip: sent {} bytes, got back {} in {:?}; sha256 sent {:x} got {:x}; opener \
@@ -453,17 +474,21 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
         open.said(),
         listen.said()
     );
-    assert_eq!(got.len(), payload.len(), "every byte must come back");
-    assert_eq!(want, have, "the round trip must be byte-for-byte");
+    assert_eq!(
+        got.len(),
+        payload.len(),
+        "PRODUCT: every byte must come back"
+    );
+    assert_eq!(want, have, "PRODUCT: the round trip must be byte-for-byte");
     assert!(
         status.is_some_and(|s| s.success()),
-        "the opener must end cleanly"
+        "PRODUCT: the opener must end cleanly"
     );
     let (a, b) = (s.alice.app(), s.bob.app());
     assert_eq!(
         (a.n("accepted"), b.n("opened")),
         (1, 1),
-        "alice {a:?} bob {b:?}"
+        "PRODUCT: alice must count 1 accepted and bob 1 opened: alice {a:?} bob {b:?}"
     );
     drop((listen, open));
 
@@ -472,12 +497,18 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     listen.listening();
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     {
-        let from = listen.child.stdout.take().unwrap();
+        let from = listen
+            .child
+            .stdout
+            .take()
+            .expect("APPARATUS: the listener's stdout pipe");
         let sink = Arc::clone(&lines);
         std::thread::spawn(move || {
             for line in std::io::BufReader::new(from).lines() {
                 let Ok(line) = line else { return };
-                sink.lock().unwrap().push(line);
+                sink.lock()
+                    .expect("APPARATUS: the line buffer's lock")
+                    .push(line);
             }
         });
     }
@@ -488,23 +519,42 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     // receive buffer.
     std::thread::sleep(Duration::from_millis(500));
     {
-        let mut into = open.child.stdin.take().unwrap();
+        let mut into = open
+            .child
+            .stdin
+            .take()
+            .expect("APPARATUS: the opener's stdin pipe");
         for i in 0..1000 {
-            writeln!(into, "datagram {i:04}").unwrap();
+            writeln!(into, "datagram {i:04}").unwrap_or_else(|e| {
+                panic!("PRODUCT: `vox app open --datagrams` stopped taking its input: {e}")
+            });
             if i % 10 == 0 {
-                into.flush().unwrap();
+                into.flush().unwrap_or_else(|e| {
+                    panic!("PRODUCT: `vox app open --datagrams` stopped taking its input: {e}")
+                });
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        into.flush().unwrap();
+        into.flush().unwrap_or_else(|e| {
+            panic!("PRODUCT: `vox app open --datagrams` stopped taking its input: {e}")
+        });
         // Held open until the count is in: the end of input is the end of the stream.
         let until = Instant::now() + Duration::from_secs(20);
-        while lines.lock().unwrap().len() < 1000 && Instant::now() < until {
+        while lines
+            .lock()
+            .expect("APPARATUS: the line buffer's lock")
+            .len()
+            < 1000
+            && Instant::now() < until
+        {
             std::thread::sleep(Duration::from_millis(50));
         }
         drop(into);
     }
-    let got = lines.lock().unwrap().clone();
+    let got = lines
+        .lock()
+        .expect("APPARATUS: the line buffer's lock")
+        .clone();
     let distinct: std::collections::BTreeSet<&String> = got.iter().collect();
     let expected: std::collections::BTreeSet<String> =
         (0..1000).map(|i| format!("datagram {i:04}")).collect();
@@ -521,7 +571,7 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
     assert_eq!(
         (distinct.len(), intact),
         (1000, 1000),
-        "all 1000 datagrams must arrive, each intact"
+        "PRODUCT: all 1000 datagrams must arrive, each intact"
     );
 }
 
@@ -550,27 +600,35 @@ fn an_opener_outside_the_responders_ring_reaches_no_listener() {
     assert_eq!(
         a.n("inbound"),
         1,
-        "bob's stream must have reached alice's gate: {a:?}"
+        "CANNOT MEASURE: staging not achieved — bob's stream must have reached alice's gate: {a:?}"
     );
     assert_eq!(
         a.announced(),
         0,
-        "the listener must see 0 incoming streams from an opener outside the ring: {a:?}"
+        "PRODUCT: the listener must see 0 incoming streams from an opener outside the ring: {a:?}"
     );
-    assert_eq!(a.n("refused_untrusted"), 1, "{a:?}");
-    assert_eq!(a.n("accepted"), 0, "{a:?}");
+    assert_eq!(
+        a.n("refused_untrusted"),
+        1,
+        "PRODUCT: alice's gate must refuse bob as untrusted: {a:?}"
+    );
+    assert_eq!(
+        a.n("accepted"),
+        0,
+        "PRODUCT: nothing may be accepted from an opener outside the ring: {a:?}"
+    );
     assert!(
         status.is_some_and(|s| !s.success()),
-        "the opener must fail, not hang"
+        "PRODUCT: the opener must fail, not hang"
     );
     assert!(
         open.said().contains("refused by the peer"),
-        "and say only that it was refused: {}",
+        "PRODUCT: the opener must say only that it was refused: {}",
         open.said()
     );
     assert!(
         listener_running && !listen.said().contains(" from "),
-        "the listener must never have accepted anything, and still be waiting: {}",
+        "PRODUCT: the listener must never have accepted anything, and still be waiting: {}",
         listen.said()
     );
 }
@@ -596,17 +654,20 @@ fn a_target_outside_the_openers_ring_is_refused_locally() {
     assert_eq!(
         b.n("refused_locally"),
         1,
-        "bob's node must refuse the open itself: {b:?}"
+        "PRODUCT: bob's node must refuse the open itself: {b:?}"
     );
     assert_eq!(
         a.n("inbound"),
         0,
-        "nothing may reach the target when the opener's node refuses: {a:?}"
+        "PRODUCT: nothing may reach the target when the opener's node refuses: {a:?}"
     );
-    assert!(status.is_some_and(|s| !s.success()), "the opener must fail");
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "PRODUCT: the opener must fail"
+    );
     assert!(
         open.said().contains("not in this node's keyring"),
-        "and say why, since it is this node's own decision: {}",
+        "PRODUCT: the opener must say why, since it is its own node's decision: {}",
         open.said()
     );
 }
@@ -618,19 +679,26 @@ async fn probe(
     first: &[u8],
     then: &[u8],
 ) -> (String, String) {
-    let (mut send, mut recv) = conn.open_stream().await.unwrap();
+    let (mut send, mut recv) = conn
+        .open_stream()
+        .await
+        .expect("CANNOT MEASURE: staging not achieved — the attacker could not open a stream");
     vox_core::transport::framing::write_frame(&mut send, first)
         .await
-        .unwrap();
+        .expect(
+            "CANNOT MEASURE: staging not achieved — the attacker could not write its first frame",
+        );
     vox_core::transport::framing::write_frame(&mut send, then)
         .await
-        .unwrap();
+        .expect(
+            "CANNOT MEASURE: staging not achieved — the attacker could not write its second frame",
+        );
     let read = tokio::time::timeout(Duration::from_secs(20), recv.read_to_end(4096))
         .await
-        .expect("the node must answer, not leave the stream hanging");
+        .expect("PRODUCT: the node must answer, not leave the stream hanging");
     let stopped = tokio::time::timeout(Duration::from_secs(20), send.stopped())
         .await
-        .expect("the node must stop the write, not leave it hanging");
+        .expect("PRODUCT: the node must stop the write, not leave it hanging");
     (format!("{read:?}"), format!("{stopped:?}"))
 }
 
@@ -640,7 +708,7 @@ fn stop(mut p: VoxProc) {
         .args(["-TERM", &p.child.id().to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill -TERM {}", p.name);
+    assert!(ok, "CANNOT MEASURE: kill -TERM {}", p.name);
     let until = Instant::now() + Duration::from_secs(20);
     while Instant::now() < until {
         if matches!(p.child.try_wait(), Ok(Some(_))) {
@@ -648,7 +716,10 @@ fn stop(mut p: VoxProc) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("{}'s daemon did not stop on SIGTERM", p.name);
+    panic!(
+        "CANNOT MEASURE: staging not achieved — {}'s daemon did not stop on SIGTERM",
+        p.name
+    );
 }
 
 /// **(4) The untrusted tier says nothing.** mallory joined the room — it is a member, and
@@ -680,47 +751,52 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
     let report = s.alice.status();
     let alice_addr = report["listening"]
         .as_array()
-        .expect("alice's report lists where she listens")
+        .expect("CANNOT MEASURE: staging not achieved — alice's report lists where she listens")
         .iter()
         .filter_map(Value::as_str)
         .filter_map(|m| vox_core::nat::multiaddr::Multiaddr::parse(m).ok())
         .filter_map(|m| m.socket_addr())
         .find(|a| a.ip().is_loopback())
-        .expect("alice listens on loopback");
+        .expect("CANNOT MEASURE: staging not achieved — alice listens on loopback");
     let room_id = report["rooms"]
         .as_array()
         .and_then(|rs| rs.iter().find(|r| r["name"] == "calls"))
         .and_then(|r| r["id"].as_str())
-        .map(|id| vox_core::node::link::b32_decode(id, "room id").unwrap())
-        .unwrap_or_else(|| panic!("alice's report lists the room: {report}"));
+        .map(|id| {
+            vox_core::node::link::b32_decode(id, "room id")
+                .expect("CANNOT MEASURE: staging not achieved — the room id in alice's report")
+        })
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: staging not achieved — alice's report lists the room: {report}")
+        });
     let alice_id = vox_core::node::link::b32_decode(&s.alice.fp, "fingerprint")
-        .expect("`vox id` prints the whole fingerprint");
+        .expect("CANNOT MEASURE: staging not achieved — `vox id` prints the whole fingerprint");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
+        .expect("APPARATUS: a tokio runtime");
     let (app, unknown, before, after) = rt.block_on(async {
         let paths = vox_core::node::paths::Paths::resolve(
             "default",
             Some(&mallory_data),
             Some(&mallory_data.join("cfg")),
         )
-        .unwrap();
+        .expect("CANNOT MEASURE: staging not achieved — mallory's profile paths");
         let mut profile = vox_core::node::profile::Profile::open(paths)
-            .expect("mallory's profile opens once her daemon is gone");
-        profile.unlock(IDENTITY.as_bytes()).unwrap();
-        let signer = profile.signer_arc().unwrap();
+            .expect("CANNOT MEASURE: staging not achieved — mallory's profile opens once her daemon is gone");
+        profile.unlock(IDENTITY.as_bytes()).expect("CANNOT MEASURE: staging not achieved — mallory's identity unlocks");
+        let signer = profile.signer_arc().expect("CANNOT MEASURE: staging not achieved — mallory's signer");
         let ep =
-            vox_core::transport::quic::VoxEndpoint::bind(&*signer, "127.0.0.1:0".parse().unwrap())
-                .unwrap();
+            vox_core::transport::quic::VoxEndpoint::bind(&*signer, "127.0.0.1:0".parse().expect("APPARATUS: an address"))
+                .expect("CANNOT MEASURE: staging not achieved — the attacker's endpoint binds");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("APPARATUS: the clock")
             .as_secs();
-        let conn = ep.connect(alice_addr, alice_id, now).await.unwrap();
-        assert_eq!(conn.peer_id(), alice_id);
+        let conn = ep.connect(alice_addr, alice_id, now).await.unwrap_or_else(|e| panic!("CANNOT MEASURE: staging not achieved — the attacker could not connect to alice: {e}"));
+        assert_eq!(conn.peer_id(), alice_id, "CANNOT MEASURE: staging not achieved — the attacker reached a node that is not alice");
         let open = vox_core::node::app::AppOpen {
             channel_id: room_id,
             labels: vec![LABEL.to_owned()],
@@ -756,22 +832,22 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
     assert_eq!(
         after.n("inbound"),
         before.n("inbound") + 1,
-        "mallory's app stream must have reached the app gate — otherwise it was refused as \
-         a stream kind and this compares nothing"
+        "CANNOT MEASURE: staging not achieved — mallory's app stream must have reached the app \
+         gate; otherwise it was refused as a stream kind and this compares nothing"
     );
     assert_eq!(
         after.n("refused_untrusted"),
         before.n("refused_untrusted") + 1,
-        "alice's gate must refuse mallory's app stream as untrusted: {after:?}"
+        "PRODUCT: alice's gate must refuse mallory's app stream as untrusted: {after:?}"
     );
     assert_eq!(
         app, unknown,
-        "an untrusted peer's app refusal must be indistinguishable from an unknown stream \
-         kind"
+        "PRODUCT: an untrusted peer's app refusal must be indistinguishable from an unknown \
+         stream kind"
     );
     assert!(
         told_exit.is_some_and(|s| !s.success()) && told.said().contains("no-listener"),
-        "a trusted member is told why: {}",
+        "PRODUCT: a trusted member is told why: {}",
         told.said()
     );
 }
@@ -788,22 +864,40 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
     let mut open = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
     // Live in both directions first: a line each way.
     let heard = |p: &mut Proc| {
-        let mut out = std::io::BufReader::new(p.child.stdout.take().unwrap());
+        let mut out =
+            std::io::BufReader::new(p.child.stdout.take().expect("APPARATUS: a stdout pipe"));
         let mut line = String::new();
-        out.read_line(&mut line).unwrap();
+        out.read_line(&mut line)
+            .expect("APPARATUS: read a line from a vox app pipe");
         (line, out)
     };
-    let mut to_listen = listen.child.stdin.take().unwrap();
-    let mut to_open = open.child.stdin.take().unwrap();
-    writeln!(to_open, "hello from bob").unwrap();
-    to_open.flush().unwrap();
+    let mut to_listen = listen
+        .child
+        .stdin
+        .take()
+        .expect("APPARATUS: the listener's stdin pipe");
+    let mut to_open = open
+        .child
+        .stdin
+        .take()
+        .expect("APPARATUS: the opener's stdin pipe");
+    writeln!(to_open, "hello from bob")
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox app open` stopped taking its input: {e}"));
+    to_open
+        .flush()
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox app open` stopped taking its input: {e}"));
     let (at_alice, _a_out) = heard(&mut listen);
-    writeln!(to_listen, "hello from alice").unwrap();
-    to_listen.flush().unwrap();
+    writeln!(to_listen, "hello from alice")
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox app listen` stopped taking its input: {e}"));
+    to_listen
+        .flush()
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox app listen` stopped taking its input: {e}"));
     let (at_bob, _b_out) = heard(&mut open);
     assert_eq!(
         (at_alice.trim(), at_bob.trim()),
-        ("hello from bob", "hello from alice")
+        ("hello from bob", "hello from alice"),
+        "CANNOT MEASURE: staging not achieved — the stream must be live both ways before trust \
+         is withdrawn"
     );
     // Both stdins stay open: nothing but the withdrawal can end this stream. alice
     // withdraws with `vox trust remove`, and the clock starts as she runs it.
@@ -826,19 +920,19 @@ fn withdrawing_trust_tears_down_a_live_app_stream() {
     );
     assert!(
         a.n("withdrawn") >= 1,
-        "alice's node must have torn the stream down: {a:?}"
+        "PRODUCT: alice's node must have torn the stream down: {a:?}"
     );
     assert!(
         alice_side.is_some() && bob_side.is_some(),
-        "both ends must be torn down within 5 s of the untrust"
+        "PRODUCT: both ends must be torn down within 5 s of the untrust"
     );
     assert!(
         alice_side.is_some_and(|s| !s.success()) && bob_side.is_some_and(|s| !s.success()),
-        "and each must say it was cut, not that it ended"
+        "PRODUCT: each end must say it was cut, not that it ended"
     );
     assert!(
         open.said().contains("closed before it ended"),
-        "bob's end must say why: {}",
+        "PRODUCT: bob's end must say why: {}",
         open.said()
     );
     drop((to_listen, to_open));
