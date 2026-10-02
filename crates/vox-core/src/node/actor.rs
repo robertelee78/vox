@@ -6333,75 +6333,42 @@ impl Node {
                         // is what tells `retire_expired` the path is still carrying, so a
                         // better path appearing does not close it under a live session.
                         let carried = Arc::clone(&connection);
-                        // `vox status` lists the tunnel while it is served: the report
-                        // arrives on a private channel, is filed, and is passed on.
-                        let guard = self.status.tunnel();
-                        let (served_tx, mut served_rx) = broadcast::channel(4);
-                        let clock = Arc::clone(&self.clock);
+                        // `vox status` lists the tunnel while it runs from the one list of live
+                        // tunnels the credit keeps (V210-81): not a second list of its own.
                         tokio::spawn(async move {
-                            let serving = crate::node::tunnel::serve_reporting(
+                            let served = crate::node::tunnel::serve_reporting(
                                 peer,
                                 send,
                                 recv,
                                 snapshot,
-                                Some(served_tx),
+                                Some(events.clone()),
                                 Some(crate::tunnel::session::UdpHost { conn: &conn, flows }),
                                 Some(&*carried),
-                            );
-                            tokio::pin!(serving);
+                            )
+                            .await;
                             let who: String = crate::node::link::b32_encode(&peer)
                                 .chars()
                                 .take(12)
                                 .collect();
-                            loop {
-                                tokio::select! {
-                                    // The result used to be dropped here, so a host refusing a
-                                    // member — untrusted, no such service, its own service down
-                                    // — said nothing anywhere (PRD-001 R36).
-                                    served = &mut serving => {
-                                        match served {
-                                            // Refusals only: a session that ends in an error
-                                            // after it was accepted is a disconnect, not a no.
-                                            Err(e @ crate::error::Error::TunnelDenied(_)) => {
-                                                let _ = events.send(NodeEvent::ProxyRefused {
-                                                    reason: format!("refused {who} a tunnel: {e}"),
-                                                });
-                                            }
-                                            // Closed on purpose (V030-11): the host is told
-                                            // too, as a close.
-                                            Err(e @ crate::error::Error::TunnelClosed(_)) => {
-                                                let _ = events.send(NodeEvent::TunnelClosed {
-                                                    reason: format!("a session from {who}: {e}"),
-                                                });
-                                            }
-                                            _ => {}
-                                        }
-                                        break;
-                                    }
-                                    ev = served_rx.recv() => {
-                                        let Ok(ev) = ev else { continue };
-                                        if let NodeEvent::TunnelServed {
-                                            channel_id,
-                                            client,
-                                            service_tag,
-                                        } = &ev
-                                        {
-                                            guard.serving(crate::node::status::ServedTunnel {
-                                                client: *client,
-                                                channel_id: *channel_id,
-                                                service_tag: service_tag.clone(),
-                                                since: clock(),
-                                            });
-                                        }
-                                        let _ = events.send(ev);
-                                    }
+                            // The result used to be dropped here, so a host refusing a member —
+                            // untrusted, no such service, its own service down — said nothing
+                            // anywhere (PRD-001 R36).
+                            match served {
+                                // Refusals only: a session that ends in an error after it was
+                                // accepted is a disconnect, not a no.
+                                Err(e @ crate::error::Error::TunnelDenied(_)) => {
+                                    let _ = events.send(NodeEvent::ProxyRefused {
+                                        reason: format!("refused {who} a tunnel: {e}"),
+                                    });
                                 }
+                                // Closed on purpose (V030-11): the host is told too, as a close.
+                                Err(e @ crate::error::Error::TunnelClosed(_)) => {
+                                    let _ = events.send(NodeEvent::TunnelClosed {
+                                        reason: format!("a session from {who}: {e}"),
+                                    });
+                                }
+                                _ => {}
                             }
-                            // A report that raced the end is still passed on.
-                            while let Ok(ev) = served_rx.try_recv() {
-                                let _ = events.send(ev);
-                            }
-                            drop(guard);
                         });
                     }
                     Inbound::App { peer, send, recv } => {
@@ -11458,7 +11425,7 @@ impl Node {
     /// [`StatusBook`]: crate::node::status::StatusBook
     fn status_report(&mut self) -> crate::node::status::StatusReport {
         use crate::node::status::{
-            add_stats, DialedTunnel, MemberStatus, PeerStatus, RoomStatus, StatusReport,
+            add_stats, ForwardStatus, MemberStatus, PeerStatus, RoomStatus, StatusReport,
         };
         self.note_peers_seen();
         let now = self.now();
@@ -11539,11 +11506,10 @@ impl Node {
                 });
             }
         }
-        report.tunnels_served = self.status.served_now();
-        report.tunnels_dialed = view
+        report.forwards = view
             .forwards
             .iter()
-            .map(|f| DialedTunnel {
+            .map(|f| ForwardStatus {
                 channel_id: f.channel_id,
                 host: f.host,
                 service_tag: f.service_tag.clone(),
