@@ -2575,7 +2575,7 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
     {
         Ok(Frame::Ok) => {
             println!("vox: joined {local_name}");
-            println!("     you can read this room; whether anyone can read YOU is their decision");
+            println!("     you read a member once you trust it and it trusts you: `vox trust add`");
             Ok(())
         }
         // The daemon sends the outcome's name; turn it into the same guidance `vox connect`
@@ -2686,6 +2686,7 @@ pub async fn trust_add(
                 crate::ident::author_id(&target)
             );
             println!("     it may now read what you write in every room you share — now and later");
+            println!("     and you read what it writes, once it trusts you too");
             println!("     and reach every service you bind to a room you are both in");
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
             Ok(())

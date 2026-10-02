@@ -255,6 +255,9 @@ pub enum KeyRefusal {
     NotAccepted = 0x23,
     /// The hello in front of the key was not accepted, so the key behind it was never read.
     HelloRefused = 0x24,
+    /// The key opened, but its owner has not trusted the member it came from, so this node does
+    /// not read that member (V210-118). Sent again, and taken, once its owner trusts it.
+    NotTrusted = 0x25,
 }
 
 impl KeyRefusal {
@@ -272,6 +275,7 @@ impl KeyRefusal {
             0x22 => "the key did not open under the session it holds".into(),
             0x23 => "the room would not take the key".into(),
             0x24 => "its hello was not accepted".into(),
+            0x25 => "its owner has not trusted us, so it does not read us yet".into(),
             0x05 => "refused at accept: it may not take a key from us yet".into(),
             other => format!("reset with code {other}"),
         }
