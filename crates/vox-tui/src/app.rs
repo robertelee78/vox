@@ -847,13 +847,34 @@ const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `vox daemon` waits for its node to stop on SIGTERM or Ctrl-C before leaving anyway.
 /// A clean stop takes milliseconds; this is for a node stuck waiting on a peer that vanished.
 /// It must stay longer than the node's own worst-case stop
-/// ([`vox_core::node::actor::STOP_WORST_CASE`], 4.45 s, which names each of its waits), so a stop
+/// ([`vox_core::node::actor::STOP_WORST_CASE`], 4.45 s, the sum of the stop's budget), so a stop
 /// that waits every one of them out still closes its connections before the daemon leaves.
 const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 const _: () = assert!(
     vox_core::node::actor::STOP_WORST_CASE.as_millis() + 500 <= SHUTDOWN_PATIENCE.as_millis(),
     "the daemon gives a stop that waits out every bound at least 0.5 s more"
 );
+
+/// The test-only variable that shortens [`SHUTDOWN_PATIENCE`], in milliseconds (see
+/// [`shutdown_patience`]).
+#[cfg(feature = "test-knobs")]
+const TEST_SHUTDOWN_PATIENCE_ENV: &str = "VOX_TEST_SHUTDOWN_PATIENCE_MS";
+
+/// [`SHUTDOWN_PATIENCE`], or **shorter**, read from `VOX_TEST_SHUTDOWN_PATIENCE_MS` in a build with
+/// the `test-knobs` feature. **Test-only: for proofs; no shipped build reads it** (V210-105). The
+/// node's stop is budgeted to fit the real patience, so no real scene runs past it; a proof stages
+/// a stop that gives up, and what the daemon then says and how it exits, with a shorter one. It
+/// only ever shortens it; unset, empty or unparsable is the real patience.
+fn shutdown_patience() -> std::time::Duration {
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var(TEST_SHUTDOWN_PATIENCE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(ms).min(SHUTDOWN_PATIENCE);
+    }
+    SHUTDOWN_PATIENCE
+}
 
 /// How long one wake may take before it is abandoned.
 const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1474,17 +1495,20 @@ pub fn run_daemon(
         });
     }
 
-    rt.block_on(async {
+    let stopped = rt.block_on(async {
         // **SIGHUP stops it too** (V210-108). It used to be ignored, on the reading that a daemon
         // has no terminal to lose and a service manager sends SIGHUP to ask for a reload. But this
         // daemon has nothing to reload, and people start it from tmux and ssh sessions, whose
         // closing sends SIGHUP: an ignored hangup left a daemon nobody could see still holding the
         // profile. Each of the four stops it the same way.
-        // A server's stop is its normal end: it says which signal and exits 0, as a service manager
-        // expects of a service it stopped.
+        // A server's stop is its normal end: once its node has stopped it says which signal and
+        // exits 0, as a service manager expects of a service it stopped. A stop that did not
+        // finish says so and exits non-zero (below).
         let signal = stop.await;
-        say(format_args!("vox daemon: stopped by {}", signal.name()));
-        say(format_args!("vox daemon: shutting down"));
+        say(format_args!(
+            "vox daemon: shutting down on {}",
+            signal.name()
+        ));
         // **Bounded.** The node handles one thing at a time, so `Shutdown` waits behind whatever
         // it is doing — and it can be doing a network round trip to a peer that has vanished.
         // Measured: a daemon that had joined a room through an anchor, with the anchor gone,
@@ -1492,21 +1516,34 @@ pub fn run_daemon(
         // node finished publishing to a board nobody was reading. A service manager's SIGTERM
         // has to mean stop. Whatever the node was mid-way through is lost either way; its
         // state on disk is committed per step, so nothing half-written is left by leaving.
-        if tokio::time::timeout(SHUTDOWN_PATIENCE, node.apply(NodeCommand::Shutdown))
+        let patience = shutdown_patience();
+        let finished = tokio::time::timeout(patience, node.apply(NodeCommand::Shutdown))
             .await
-            .is_err()
-        {
-            let _ = writeln!(
-                io::stderr(),
-                "vox daemon: the node did not stop within {}s — it was mid-way through a network \
-                 exchange with a peer that is not answering; stopping anyway",
-                SHUTDOWN_PATIENCE.as_secs()
-            );
-        }
+            .is_ok();
+        (signal, patience, finished)
     });
     // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync
     // session runs on one.
     rt.shutdown_timeout(SHUTDOWN_PATIENCE);
+    let (signal, patience, finished) = stopped;
+    if !finished {
+        // **A stop that gave up is not a stop** (decider, V210-93). The daemon leaves, as it must,
+        // but its node's ordered stop was cut short: the closes it had not yet sent never left,
+        // and those peers learn it went only by their own timeouts. That is a failure, said as
+        // one, with an error status, never "stopped by …" and 0.
+        return Err(AppError::Refused {
+            code: 1,
+            message: format!(
+                "the daemon did not finish stopping on {} within {}s: its node was mid-way \
+                 through a network exchange with a peer that is not answering. It left anyway, so \
+                 a peer it had not yet said goodbye to learns it went only when its connection \
+                 times out",
+                signal.name(),
+                patience.as_secs_f64()
+            ),
+        });
+    }
+    say(format_args!("vox daemon: stopped by {}", signal.name()));
     Ok(())
 }
 

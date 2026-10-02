@@ -1861,9 +1861,12 @@ pub fn run() -> ExitCode {
                 args.passphrase_file.clone(),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
+                // Not `eprintln!`: after a hangup stderr can be a terminal that is gone, and a
+                // write that fails there must not turn the reason into a panic.
                 Err(e) => {
-                    eprintln!("vox: {e}");
-                    ExitCode::FAILURE
+                    use std::io::Write as _;
+                    let _ = writeln!(io::stderr(), "vox: {e}");
+                    e.exit_code()
                 }
             }
         }

@@ -122,42 +122,46 @@ const RELAYED_CLOSE_LEAD: Duration = Duration::from_millis(50);
 
 /// How long stopping the network waits for its connections' closes to leave (see `stop_network`).
 /// They leave on the endpoint driver's next turns; this is a ceiling for one that cannot. A term
-/// of [`STOP_WORST_CASE`].
+/// of the stop's budget (see `STOP_ACK_BOUND`).
 const CLOSE_FLUSH: Duration = Duration::from_millis(600);
 
 /// How long stopping the network waits for its peers to confirm they heard it is stopping (see
 /// `ConnectionManager::say_goodbye`), in each of its two rounds (relayed connections, then the
 /// rest). A live peer confirms within a round trip; this is spent only on one that does not
-/// answer, and is a ceiling, not a wait. A term, twice, of [`STOP_WORST_CASE`].
+/// answer, and is a ceiling, not a wait. A term, twice, of the stop's budget (see
+/// `STOP_ACK_BOUND`).
 const GOODBYE_PATIENCE: Duration = Duration::from_millis(400);
 
 /// How long a stopping node waits for tunnels that finished their stream to have their last bytes
-/// acknowledged before it closes its connections (see `stop_network`).
+/// acknowledged before it closes its connections (see `stop_network`). The bound still covers a
+/// reply of several MiB draining over a slow path.
 ///
-/// **Shorter than `vox daemon`'s 5 s stop patience**, on purpose. The daemon gives its node that
-/// long to stop and then leaves, dropping the node's tasks; at an equal bound, a stop that waited
-/// the whole of it (a peer that vanished holding unacknowledged bytes) raced the daemon's leaving
-/// with its connection closes, and a close that lost left every other peer to learn of the stop
-/// only by its idle timeout. The bound still covers a reply of several MiB draining over a slow
-/// path. A term of [`STOP_WORST_CASE`].
-const STOP_ACK_BOUND: Duration = Duration::from_secs(3);
-
-/// **The longest a node's network can take to stop** (`stop_network`), every wait spent to its
-/// ceiling: a peer that vanished holding a finished tunnel's unacknowledged bytes, and peers that
-/// answer neither the goodbye nor the close. The budget, against `vox daemon`'s 5 s stop patience:
+/// **The budget for the whole stop.** This is the first of the stop's waits, and all of them
+/// together must end inside `vox daemon`'s 5 s stop patience. The daemon gives its node that long
+/// and then leaves, dropping the node's tasks, so a stop still under way is cut short, and the
+/// peers whose closes were cut learn of the stop only by inference (V210-93). Every wait spent to
+/// its ceiling (a peer that vanished holding a finished tunnel's unacknowledged bytes, and peers
+/// that answer neither the goodbye nor the close):
 ///
 /// | term | bound |
 /// |---|---|
-/// | finished tunnels' last bytes acknowledged (`STOP_ACK_BOUND`) | 3 s |
-/// | the goodbye, relayed connections then the rest (2 × `GOODBYE_PATIENCE`) | 0.8 s |
-/// | relayed closes' lead over their carriers (`RELAYED_CLOSE_LEAD`) | 0.05 s |
-/// | the closes leaving (`CLOSE_FLUSH`) | 0.6 s |
-/// | **total** | **4.45 s** |
+/// | finished tunnels' last bytes acknowledged (this bound) | 3 s |
+/// | the goodbye, relayed connections then the rest (2 × [`GOODBYE_PATIENCE`]) | 0.8 s |
+/// | relayed closes' lead over their carriers ([`RELAYED_CLOSE_LEAD`]) | 0.05 s |
+/// | the closes leaving ([`CLOSE_FLUSH`]) | 0.6 s |
+/// | **sum** ([`STOP_WORST_CASE`]) | **4.45 s**, against 5 s |
 ///
-/// That leaves the daemon at least half a second, under load, to see the stop through: its patience
-/// ends a stop that has not finished ("the node did not stop within 5s … stopping anyway"), and a
-/// stop cut short there leaves its peers to learn of it by inference (V210-93). `vox daemon`
-/// asserts the margin at compile time against its `SHUTDOWN_PATIENCE`.
+/// The last term is the one a patience too short cuts: by then the goodbye is said and the closes
+/// are queued, but a stop whose closes have not left has not finished. With the goodbye at 0.5 s a
+/// round and the flush at 1 s, the sum was 5.05 s, and the patience ran out inside that flush. The
+/// half second left over is for the daemon itself under load. A bound raised here must come out of
+/// another term.
+const STOP_ACK_BOUND: Duration = Duration::from_secs(3);
+
+/// **The longest a node's network can take to stop** (`stop_network`): the sum of the whole stop's
+/// budget, set out term by term in `STOP_ACK_BOUND`'s doc (4.45 s). Held at 4.5 s or less here,
+/// and `vox daemon` checks at compile time that its 5 s `SHUTDOWN_PATIENCE` leaves at least half a
+/// second beyond it.
 pub const STOP_WORST_CASE: Duration = Duration::from_millis(
     (STOP_ACK_BOUND.as_millis()
         + 2 * GOODBYE_PATIENCE.as_millis()
