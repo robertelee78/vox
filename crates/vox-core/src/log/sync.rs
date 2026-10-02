@@ -1434,7 +1434,8 @@ pub mod mutant {
             | Mode::ServeSlowly
             | Mode::AuthorUnclassifiable
             | Mode::OldRowIds
-            | Mode::AuthorMisbound => asked,
+            | Mode::AuthorMisbound
+            | Mode::RefuseSessions => asked,
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
             Mode::StripPayload => asked
