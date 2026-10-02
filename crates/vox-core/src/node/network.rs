@@ -98,6 +98,14 @@ pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 /// it, which is everything ADR-012's anchor principle says it must not do.
 pub const DIRECT_HEAD_START: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The longest a reach's circuits wait for a **dial-back** under way (V030-22), counted from the
+/// reach's start: the peer asked, through a coordinator, to dial this node directly. The wait ends
+/// as soon as the peer says how its dial went (`Dialled`): a peer that could not dial says so at
+/// once, so a pair that cannot reach each other pays about one round trip through the coordinator
+/// more than the head start; this caps a peer whose dial is still under way. Measured: the peer's
+/// post-quantum handshake took 150–575 ms on a machine at load 45–97.
+pub const DIAL_BACK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(3000);
+
 #[cfg(feature = "test-knobs")]
 fn test_advertise() -> Option<EndpointList> {
     let value = std::env::var(TEST_ADVERTISE_ENV).ok()?;
@@ -1031,7 +1039,8 @@ impl NodeNet {
         // anchor carrying the host's circuit). Not knowing an address is not knowing there is no
         // direct path, so they wait the head start too.
         let (direct_failed, failed) = tokio::sync::watch::channel(false);
-        if !candidates.is_empty() {
+        let has_direct = !candidates.is_empty();
+        if has_direct {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
             // The addresses go into the label: "all direct candidates failed" is not a
@@ -1046,14 +1055,137 @@ impl NodeNet {
                 (label, result)
             });
         }
-        for relay in self.helpers(peer) {
+        // **Then ask the peer to dial back** (V030-22): a reach with no direct path of its own — no
+        // candidate it can dial, or a direct rung that failed — asks the peer, through each
+        // coordinator it is connected to, to dial this node directly. It is the hole-punch
+        // exchange (`coordstream`): signalling only, at most a few frames, never a data path, and
+        // the peer answers it under the same rule as any relayed punch session. A host that
+        // cannot dial its guest at all, while the guest could dial it, bridged through the anchor
+        // for every sync; now the guest dials it back, and no circuit is asked for.
+        let started = tokio::time::Instant::now();
+        let punching = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let helpers = self.helpers(peer);
+        for coordinator in &helpers {
+            let observed = self.observed_or_ask(coordinator.peer_id()).await;
+            let Ok(local_eps) = self.local_endpoints() else {
+                continue;
+            };
+            let local = coordstream::punch_endpoints(observed, &local_eps);
+            let coordinator = Arc::clone(coordinator);
+            let endpoint = Arc::clone(self.manager.endpoint());
+            let now = self.now();
+            let label = format!("dial-back via {}", short_id(coordinator.peer_id()));
+            let mut failed = failed.clone();
+            let punching = Arc::clone(&punching);
+            let manager = Arc::clone(&self.manager);
+            set.spawn(async move {
+                // With a direct rung of its own, only once that rung has failed.
+                if has_direct {
+                    let ended = failed.wait_for(|f| *f).await.is_err();
+                    if ended && !*failed.borrow() {
+                        return (
+                            label,
+                            Err(Error::Unreachable(
+                                "not asked for: a direct connection answered first",
+                            )),
+                        );
+                    }
+                }
+                punching.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let session = async {
+                    let (mut send, mut recv) =
+                        coordstream::open_punch_session(&coordinator, peer).await?;
+                    coordstream::count_dial_back(peer, false);
+                    let plan =
+                        coordstream::run_punch_initiator(&mut send, &mut recv, local).await?;
+                    coordstream::count_dial_back(peer, true);
+                    Ok::<_, Error>((send, recv, plan))
+                }
+                .await;
+                let result = match session {
+                    Err(e) => Err(e),
+                    // **The peer's dial is the point**, not this node's: a node that cannot dial
+                    // its peer fails its own half at once. So this waits for the peer's word on its
+                    // own dial (`Dialled`) — not a guessed time: a post-quantum handshake on a
+                    // loaded machine takes from tens to hundreds of milliseconds, and a peer that
+                    // could not dial at all says so at once — and, if it connected, for its
+                    // connection to be filed. Never past the dial-back's patience.
+                    Ok((_send, mut recv, plan)) => {
+                        let answered_at = started.elapsed();
+                        let patience = started + DIAL_BACK_PATIENCE;
+                        let own = coordstream::execute_punch(endpoint, plan, peer, now);
+                        let word = coordstream::recv_dial_outcome(&mut recv);
+                        tokio::pin!(own, word);
+                        let mut own_failed: Option<Error> = None;
+                        let mut peer_said: Option<bool> = None;
+                        let outcome = loop {
+                            if peer_said == Some(true) && manager.existing(&peer).is_some() {
+                                break Err(Error::Unreachable(
+                                    "not this rung's: the peer dialled back",
+                                ));
+                            }
+                            // The peer could not dial: nothing direct is coming from it, so the
+                            // circuits are held no longer. This node's own half is given up with it
+                            // — fired at the same moment as the peer's, it shares its fate.
+                            if peer_said == Some(false) {
+                                break Err(own_failed.take().unwrap_or(Error::Unreachable(
+                                    "dial-back: the peer could not dial back",
+                                )));
+                            }
+                            tokio::select! {
+                                r = &mut own, if own_failed.is_none() => match r {
+                                    Ok(conn) => break Ok(conn),
+                                    Err(e) => own_failed = Some(e),
+                                },
+                                said = &mut word, if peer_said.is_none() => {
+                                    peer_said = Some(said.unwrap_or(false));
+                                }
+                                () = tokio::time::sleep(std::time::Duration::from_millis(10)),
+                                    if peer_said == Some(true) => {}
+                                () = tokio::time::sleep_until(patience) => {
+                                    break Err(own_failed.take().unwrap_or(Error::Unreachable(
+                                        "dial-back: no word from the peer within the patience",
+                                    )));
+                                }
+                            }
+                        };
+                        // Said, so a pair that still bridges shows why: how long the peer took to
+                        // answer, what it said of its dial, and whether its connection came.
+                        manager.note(
+                            peer,
+                            format!(
+                                "a dial-back was answered {} ms into the reach; the peer said its \
+                                 dial {}; its connection {} by {} ms",
+                                answered_at.as_millis(),
+                                match peer_said {
+                                    Some(true) => "connected",
+                                    Some(false) => "failed",
+                                    None => "was still under way",
+                                },
+                                if manager.existing(&peer).is_some() {
+                                    "had arrived"
+                                } else {
+                                    "had not arrived"
+                                },
+                                started.elapsed().as_millis()
+                            ),
+                        );
+                        outcome
+                    }
+                };
+                punching.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                (label, result)
+            });
+        }
+        for relay in helpers {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
             let label = format!("circuit via {}", short_id(relay.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
+            let punching = Arc::clone(&punching);
             set.spawn(async move {
-                let deadline = tokio::time::Instant::now() + DIRECT_HEAD_START;
+                let deadline = started + DIRECT_HEAD_START;
                 loop {
                     // This ladder's direct rung failed: nothing direct is coming from it.
                     if *failed.borrow() {
@@ -1078,6 +1210,21 @@ impl NodeNet {
                         _ = failed.changed() => {}
                         () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                     }
+                }
+                // A dial-back under way: wait for the peer's connection, within its patience.
+                let patience = started + DIAL_BACK_PATIENCE;
+                while punching.load(std::sync::atomic::Ordering::SeqCst) > 0
+                    && tokio::time::Instant::now() < patience
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                if manager.existing(&peer).is_some() {
+                    return (
+                        label,
+                        Err(Error::Unreachable(
+                            "not asked for: a direct connection answered first",
+                        )),
+                    );
                 }
                 (
                     label,
@@ -1254,13 +1401,36 @@ impl NodeNet {
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<Arc<VoxConnection>> {
+        let t0 = std::time::Instant::now();
         let observed = self.observed_or_ask(coordinator).await;
+        let asked_ms = t0.elapsed().as_millis();
         let local = coordstream::punch_endpoints(observed, &self.local_endpoints()?);
         let plan = coordstream::run_punch_responder(&mut send, &mut recv, local).await?;
-        let conn =
+        let planned_ms = t0.elapsed().as_millis();
+        let targets = join_addrs(&plan.targets);
+        let dialled =
             coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
-                .await?;
-        Ok(self.manager.adopt(conn).await)
+                .await;
+        // **Said, either way** (V030-22): this is the dial a peer that cannot reach this node asked
+        // for, and when it fails that peer bridges through its coordinator; without this, nothing
+        // on either side said why.
+        let _ = coordstream::send_dial_outcome(&mut send, dialled.is_ok()).await;
+        self.manager.note(
+            peer,
+            match &dialled {
+                Ok(_) => format!(
+                    "dialled it back at {targets} as it asked, in {} ms (its own address \
+                     known at {asked_ms} ms, the exchange done at {planned_ms} ms)",
+                    t0.elapsed().as_millis()
+                ),
+                Err(e) => format!(
+                    "could not dial it back at {targets} as it asked, after {} ms (its own \
+                     address known at {asked_ms} ms, the exchange done at {planned_ms} ms): {e}",
+                    t0.elapsed().as_millis()
+                ),
+            },
+        );
+        Ok(self.manager.adopt(dialled?).await)
     }
 
     /// What this node's board anchors: every channel it holds a genesis for, with

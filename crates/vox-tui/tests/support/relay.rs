@@ -180,6 +180,29 @@ impl Anchor {
             })
     }
 
+    /// Where the anchor's output stands now, after draining it: pass it to
+    /// [`Self::circuits_since`] to read only the reports printed after this moment.
+    pub fn mark(&mut self) -> usize {
+        let _ = self.proc.transcript();
+        self.proc.seen.len()
+    }
+
+    /// The most circuits the anchor reported carrying in what it printed after `mark`, after
+    /// draining for `settle`. With no report since, the count it last reported (a report is
+    /// printed on change only); with none at all, `CANNOT MEASURE`.
+    pub fn circuits_since(&mut self, mark: usize, settle: Duration) -> usize {
+        let last = self.circuits(settle);
+        self.proc.seen[mark.min(self.proc.seen.len())..]
+            .iter()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("vox node: ")?;
+                let (_, after) = rest.split_once(" peer(s) connected, ")?;
+                after.split_whitespace().next()?.parse::<usize>().ok()
+            })
+            .max()
+            .map_or(last, |m| m.max(last))
+    }
+
     /// The circuit count in the latest status report this anchor printed, if it printed one.
     fn last_report(&self) -> Option<usize> {
         self.proc.seen.iter().rev().find_map(|l| {

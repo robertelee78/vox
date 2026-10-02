@@ -38,6 +38,8 @@ use crate::nat::multiaddr::EndpointList;
 const KIND_CONNECT: u64 = 0;
 /// CBOR discriminant for a `Sync` coordination message.
 const KIND_SYNC: u64 = 1;
+/// CBOR discriminant for a `Dialled` coordination message (V030-22).
+const KIND_DIALLED: u64 = 2;
 
 /// A DCUtR coordination message exchanged over the relay (not an ADR-008 log
 /// struct — it rides a dedicated relay stream, so it has its own compact,
@@ -51,10 +53,19 @@ pub enum CoordMessage {
     },
     /// The synchronization trigger (step 3/4).
     Sync,
+    /// The responder's dial is over (V030-22): `reached` says whether it connected. A node that
+    /// asked its peer to dial it back waits for this rather than guessing how long a dial takes —
+    /// a post-quantum handshake on a loaded machine takes from tens to hundreds of milliseconds,
+    /// and a peer that could not dial at all says so at once.
+    Dialled {
+        /// Whether the responder's dial connected.
+        reached: bool,
+    },
 }
 
 impl CoordMessage {
-    /// Canonical CBOR encoding: `Connect` → `[0, endpoints]`, `Sync` → `[1]`.
+    /// Canonical CBOR encoding: `Connect` → `[0, endpoints]`, `Sync` → `[1]`, `Dialled` →
+    /// `[2, 0|1]`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
@@ -65,6 +76,9 @@ impl CoordMessage {
             }
             CoordMessage::Sync => {
                 e.array(1).uint(KIND_SYNC);
+            }
+            CoordMessage::Dialled { reached } => {
+                e.array(2).uint(KIND_DIALLED).uint(u64::from(*reached));
             }
         }
         e.finish()
@@ -82,7 +96,12 @@ impl CoordMessage {
                 CoordMessage::Connect { observed }
             }
             (KIND_SYNC, 1) => CoordMessage::Sync,
-            (KIND_CONNECT | KIND_SYNC, _) => {
+            (KIND_DIALLED, 2) => match d.uint()? {
+                0 => CoordMessage::Dialled { reached: false },
+                1 => CoordMessage::Dialled { reached: true },
+                _ => return Err(Error::HolePunchFailed("coord message dialled flag")),
+            },
+            (KIND_CONNECT | KIND_SYNC | KIND_DIALLED, _) => {
                 return Err(Error::HolePunchFailed("coord message arity"))
             }
             _ => return Err(Error::HolePunchFailed("coord message unknown kind")),

@@ -989,16 +989,24 @@ impl SyncBook {
         s.push_str("],\"reach\":[");
         // Ladders from this book; circuits counted where every outbound circuit is asked for
         // (`circuitstream::connect_through`). Every peer either names, in one row.
+        // Dial-backs (V030-22) counted where each is asked for, in the ladder.
         let circuits = crate::node::circuitstream::outbound_circuits();
-        let peers: std::collections::BTreeSet<&Digest32> =
-            b.ladders.keys().chain(circuits.keys()).collect();
+        let dial_backs = crate::node::coordstream::dial_backs();
+        let peers: std::collections::BTreeSet<&Digest32> = b
+            .ladders
+            .keys()
+            .chain(circuits.keys())
+            .chain(dial_backs.keys())
+            .collect();
         for (i, peer) in peers.into_iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
+            let (asked, answered) = dial_backs.get(peer).copied().unwrap_or((0, 0));
             let _ = write!(
                 s,
-                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{}}}",
+                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{},\"dial_backs\":{asked},\
+                 \"dial_backs_answered\":{answered}}}",
                 b32_encode(peer),
                 b.ladders.get(peer).copied().unwrap_or(0),
                 circuits.get(peer).copied().unwrap_or(0)

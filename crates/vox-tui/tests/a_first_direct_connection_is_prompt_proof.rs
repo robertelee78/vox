@@ -44,6 +44,18 @@
 //! 2.5 s in `nat::reachability::connect_direct_within`. The first answer still comes fast, over the
 //! anchor's circuit, and the direct path lands only after 2.5 s — red on the direct bound.
 //!
+//! - **the anchor carries nothing for the pair** (V030-22): its own `circuit(s) carried` report
+//!   never goes above 0 for the whole run, the host's reaches for a guest it cannot dial included;
+//! - **the host asks a guest to dial back** (V030-22): an **optional** second test,
+//!   `the_host_asks_a_guest_to_dial_back`, stages it — carol joins from an anchor-only address and
+//!   comes online; the host must reach her. It is a known open question on the candidate (#335)
+//!   and blocks nothing until settled; without `optional-proofs` it says it did not run.
+//!
+//! For V030-22 the whole-run "anchor carried 0" assertion is red only in a run where the host
+//! happens to reach for a guest that is online but not connected to it, so a mutant that removes the
+//! dial-back is not reliably red here; the deterministic arm is the optional
+//! `the_host_asks_a_guest_to_dial_back` (an open question, #335).
+//!
 //! And for V210-122: `DIRECT_HEAD_START` set to 0, the old race. The guest's `vox forward` asks for
 //! a circuit through the anchor beside its direct dial over the 30 ms path, and the guest's status
 //! counts it: red, as PRODUCT.
@@ -52,6 +64,12 @@
 //! process on a NAT simulator.
 
 #![cfg(unix)]
+// Without the feature the staged dial-back arm is only its stand-in; its code still compiles.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(the_host_asks_a_guest_to_dial_back);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -87,6 +105,157 @@ const GIVE_UP: Duration = Duration::from_secs(10);
 /// The echo payload: big enough that a request which rode the forward is unmistakable in its byte
 /// count, small enough to be one flight.
 const PAYLOAD: usize = 16 * 1024;
+
+/// **Optional, and a known open question** (V030-22, #335): run with `--features
+/// optional-proofs`. On the candidate it is red: carol's own `vox up` reaches for the host before
+/// it has read the host's board record, asks the host to dial back (the host cannot), and bridges;
+/// her later dial-back then lands direct in 5–6 ms. Not blocking until that case is settled.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "production Argon2id + a real PoW, a third member staged; run by hand, not in CI"]
+fn the_host_asks_a_guest_to_dial_back() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
+    watchdog::arm();
+    let mut w = ForwardedWorld::new(true);
+    dial_back_is_asked_for(&mut w);
+}
+
+/// **The host asks a guest to dial back** (V030-22, #335), staged so it must, and with nothing of
+/// the guest's own in flight to the host: carol joins from an address that names **only the
+/// anchor** (the host's own entries taken out), so her room holds no address for the host and her
+/// `vox up` dials only the anchor. She is online, the host cannot dial her at all (`[::1]`), and
+/// the host posts to the room: to deliver, it must reach her.
+///
+/// An earlier staging held the guest's own dial of the host back (forward closed, or slow) instead;
+/// those stalled attempts were answered by the host ahead of the dial-back, one post-quantum
+/// handshake at a time, and the dial-back's own connection came 1–3 s late — the staging, not the
+/// product (measured: every send `Ok`, the host's handshakes 150–575 ms each at load 45–97).
+///
+/// Asserted: the host asked carol to dial back and she answered (`reach.dial_backs_answered`, or the
+/// case was never staged: `CANNOT MEASURE`), the host asked for no circuit to her, and the anchor
+/// carried none from the post on.
+fn dial_back_is_asked_for(w: &mut ForwardedWorld) {
+    use world::{args, room_pass_file, vox_once, VoxProc};
+    let carol = w.tmp.path().join("carol");
+    world::mkdir(&carol.join("cfg"));
+    let carol_fp = world::fingerprint(&carol, "carol");
+    let (ok, out, err) = vox_once(
+        &w.host_dir,
+        &args(&["trust", "add", &carol_fp, "--name", "carol"]),
+    );
+    assert!(
+        ok,
+        "CANNOT MEASURE: the host's `vox trust add` of carol:\n{out}{err}"
+    );
+    let anchor_only = without_entry_of(&w.address, &w.host_fp);
+    assert!(
+        !anchor_only.contains(&format!("a={}", w.host_fp)),
+        "CANNOT MEASURE: the host's entry is still in carol's address: {anchor_only}"
+    );
+    let (ok, out, err) = vox_once(
+        &carol,
+        &args(&[
+            "connect",
+            &anchor_only,
+            "--passphrase-file",
+            &room_pass_file(&carol, &w.passphrase),
+            "--anchor",
+            &w.anchor.v6_spec,
+            "--listen",
+            "[::1]:0",
+        ]),
+    );
+    assert!(
+        ok,
+        "CANNOT MEASURE: carol could not join from the anchor-only address:\n{out}{err}"
+    );
+    // Counted from before carol comes online: the host reaches for her as soon as she does.
+    let before = (
+        reach_count(&w.host_dir, &carol_fp, "the host", "circuits"),
+        reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs_answered"),
+    );
+    let mark = w.anchor.mark();
+    let mut up = VoxProc::spawn(
+        "carol-up",
+        &carol,
+        &args(&[
+            "up",
+            &w.room,
+            "--passphrase-file",
+            &room_pass_file(&carol, &w.passphrase),
+            "--bind",
+            "127.0.0.1:0",
+            "--anchor",
+            &w.anchor.v6_spec,
+            "--listen",
+            "[::1]:0",
+        ]),
+    );
+    up.expect_line("carol's proxy is up", |l| l.starts_with("vox up on "));
+    let (ok, out, err) = vox_once(
+        &w.host_dir,
+        &args(&["room", "post", &w.room, "for carol, by a dial-back"]),
+    );
+    assert!(
+        ok,
+        "CANNOT MEASURE: the host's `vox room post` failed:\n{out}{err}"
+    );
+    // Until the host has reached for carol one way or the other, or 10 s.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let now = (
+            reach_count(&w.host_dir, &carol_fp, "the host", "circuits"),
+            reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs_answered"),
+        );
+        if now != before {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let carried = w.anchor.circuits_since(mark, Duration::from_secs(2));
+    let circuits = reach_count(&w.host_dir, &carol_fp, "the host", "circuits") - before.0;
+    let answered =
+        reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs_answered") - before.1;
+    eprintln!(
+        "[proof] staged dial-back: the host's dial-backs answered {answered}, circuits asked \
+         {circuits}; the anchor carried up to {carried} since carol came online"
+    );
+    let host = w.host.transcript();
+    let said = up.transcript();
+    interrupt(&mut up, Duration::from_secs(15));
+    assert!(
+        answered > 0 || circuits > 0,
+        "CANNOT MEASURE: once carol came online the host neither asked carol to dial back nor asked \
+         for a circuit to her, so the case was not staged.\nhost:\n{host}\ncarol:\n{said}"
+    );
+    assert!(
+        answered > 0 && circuits == 0 && carried == 0,
+        "PRODUCT: the host, which cannot dial carol, had to reach her while she could dial the \
+         host; it must ask her to dial back and ask for no circuit. Dial-backs answered: \
+         {answered}; circuits asked: {circuits}; the anchor carried up to {carried}.\nhost:\n\
+         {host}\ncarol:\n{said}\nanchor:\n{}",
+        w.anchor.proc.transcript()
+    );
+}
+
+/// `address` with `who`'s entry (its `a=` and the `b=` addresses after it) taken out.
+fn without_entry_of(address: &str, who: &str) -> String {
+    let (head, query) = address.split_once('?').expect("an address with a query");
+    let mut kept = Vec::new();
+    let mut skipping = false;
+    for part in query.split('&') {
+        if let Some(id) = part.strip_prefix("a=") {
+            skipping = id == who;
+        } else if !part.starts_with("b=") {
+            skipping = false;
+        }
+        if !skipping {
+            kept.push(part);
+        }
+    }
+    format!("{head}?{}", kept.join("&"))
+}
 
 /// Start the guest's `vox forward` to the host's service, wait until it says it reached the host,
 /// read how many circuits it asked for to the host while it still runs, and stop it (by its PID).
@@ -124,6 +293,12 @@ fn forward_once(w: &ForwardedWorld) -> (String, u64) {
 /// measured nothing: `CANNOT MEASURE`, naming `who`. A `reach` section with no row for `peer` is
 /// a measured 0 — a row is there for every peer this node ran a ladder to or asked a circuit for.
 fn circuits_asked(dir: &std::path::Path, peer: &str, who: &str) -> u64 {
+    reach_count(dir, peer, who, "circuits")
+}
+
+/// `field` of `peer`'s `reach` row in the `vox status --json` of the node on `dir`, under the same
+/// rule as [`circuits_asked`]: no answer or no `reach` section is `CANNOT MEASURE`, no row is 0.
+fn reach_count(dir: &std::path::Path, peer: &str, who: &str, field: &str) -> u64 {
     let (ok, out, err) = world::vox_once(dir, &world::args(&["status", "--json"]));
     assert!(
         ok,
@@ -140,12 +315,12 @@ fn circuits_asked(dir: &std::path::Path, peer: &str, who: &str) -> u64 {
     let Some(row) = reach.split("{\"peer\":\"").find(|r| r.starts_with(peer)) else {
         return 0;
     };
-    row.split("\"circuits\":")
+    row.split(&format!("\"{field}\":"))
         .nth(1)
         .and_then(|n| n.split(|c: char| !c.is_ascii_digit()).next())
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: {who}'s `reach` row for {peer} has no circuit count: {row}")
+            panic!("CANNOT MEASURE: {who}'s `reach` row for {peer} has no {field:?}: {row}")
         })
 }
 
@@ -324,6 +499,16 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
     eprintln!(
         "[proof] the most circuits the anchor ever reported carrying: {ever}; the guest asked for \
          {guest_circuits} to the host; the host asked for {host_asked} to the guest"
+    );
+    // **A pair that can reach each other directly costs the anchor nothing** (V030-22, #335): the
+    // anchor's own report never counts a circuit, at any point of the run, the host's reaches for
+    // a guest it cannot dial included — it asks the guest to dial back instead.
+    assert!(
+        ever == 0,
+        "PRODUCT: the guest can dial the host, yet the anchor reported carrying up to {ever} \
+         circuit(s) for the pair (the host asked for {host_asked}).\nhost:\n{}\nanchor:\n{}",
+        w.host.transcript(),
+        w.anchor.proc.transcript()
     );
     assert!(
         guest_circuits == 0,

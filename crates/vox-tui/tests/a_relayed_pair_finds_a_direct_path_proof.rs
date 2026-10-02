@@ -38,7 +38,9 @@
 //! **The mutations that must turn it red:** `retry_upgrades_if_due` returning at once (nothing
 //! retries — no second attempt, and the opened forward is never found); and `UPGRADE_RETRY` raised
 //! to 600 s (the retry comes too late for both bounds). And for V210-122: `DIRECT_HEAD_START` raised
-//! to 2 s, so the relay is held back past the bound.
+//! to 2 s, so the relay is held back past the bound. And for V030-22: the initiator of a dial-back
+//! holding its circuits for its own dial after the peer said its dial failed (`Dialled { reached:
+//! false }`) — measured 3017 ms, red past the same bound.
 //!
 //! Replaces `crates/vox-core/tests/relayed_path_is_retried.rs`, which ran every node in process on
 //! a NAT simulator with an injected clock.
