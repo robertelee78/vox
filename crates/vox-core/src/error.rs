@@ -386,13 +386,15 @@ pub enum Error {
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
 
-    /// The room already holds as many members as a room can (`MAX_AUTHORS`), so the member that
+    /// The room is at its cap (`MAX_AUTHORS`; soft by `JOIN_OVERSHOOT`), so the member that
     /// answered the join could not admit the joiner, and refused it. Before this the refusal was
     /// dropped and the joiner was told it was in: it exited 0, a member of nothing.
-    #[error("the room is full: {members} members")]
+    #[error("the room is full: {members} members, cap {cap}")]
     RoomFull {
         /// How many members the room holds.
         members: u64,
+        /// The room's cap, as the refusing member enforces it.
+        cap: u64,
     },
 
     /// The member answering a join accepted the passphrase, and then could not admit the joiner:

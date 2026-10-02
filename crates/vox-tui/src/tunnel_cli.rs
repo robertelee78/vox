@@ -989,22 +989,41 @@ pub(crate) fn join_advice_after(
     }
 }
 
-/// `RoomFull`'s advice, with the cap **in force**: the count the member that refused the join
-/// gave (a full room holds exactly its cap), never a constant this side assumes — a test build's
-/// lowered cap and the shipped 1,024 are both stated as they are. Without the count, no number.
+/// `RoomFull`'s advice, with the cap **in force**: the count and cap the member that refused the
+/// join gave ("the room is full: N members, cap C"), never a constant this side assumes — a test
+/// build's lowered cap and the shipped 1,024 are both stated as they are. Without them, no number.
+///
+/// **The cap is soft, and says so** (V210-128): joins answered at the same moment by different
+/// members can each take the last place, and every member then admits them all rather than split
+/// the room, up to the cap plus [`JOIN_OVERSHOOT`](vox_core::node::channel::JOIN_OVERSHOOT).
 fn room_full_advice(said: &str) -> String {
-    const SAID: &str = "the room is full: ";
-    let count = said.find(SAID).and_then(|at| {
-        let digits: String = said[at + SAID.len()..]
+    fn number_after(said: &str, label: &str) -> Option<u64> {
+        let at = said.find(label)? + label.len();
+        let digits: String = said[at..]
             .chars()
             .take_while(char::is_ascii_digit)
             .collect();
-        digits.parse::<u64>().ok()
+        digits.parse().ok()
+    }
+    let members = number_after(said, "the room is full: ");
+    let cap = said
+        .find("the room is full: ")
+        .and_then(|at| number_after(&said[at..], " members, cap "));
+    let head = match (members, cap) {
+        (Some(n), Some(c)) => format!(
+            "the room is full: it has {} members, and a room takes {}",
+            thousands(n),
+            thousands(c)
+        ),
+        _ => "the room is full".to_owned(),
+    };
+    let soft = cap.map_or(String::new(), |c| {
+        format!(
+            "\n       (the cap is soft: joins answered at the same moment by different members can take a room to {})",
+            thousands(c + vox_core::node::channel::JOIN_OVERSHOOT as u64)
+        )
     });
-    let cap = count.map_or(String::new(), |n| format!(" ({})", thousands(n)));
-    format!(
-        "the room is full: it holds as many members as a room can{cap}\n       your passphrase was accepted; nobody else can join this room"
-    )
+    format!("{head}\n       your passphrase was accepted; nobody else can join this room{soft}")
 }
 
 /// `n` with a comma between each three digits, as the house style writes a count (1,024).
