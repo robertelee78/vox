@@ -291,8 +291,10 @@ pub struct RendezvousStore {
     /// `(channelID, author)` → the time of the member's withdraw (V030-14): its records stamped
     /// no later are refused, so a peer still mirroring them cannot put them back.
     withdrawn_members: HashMap<(Digest32, Digest32), u64>,
-    /// Rooms withdrawn whole (V030-14): nothing of them is taken again.
-    withdrawn_rooms: std::collections::HashSet<Digest32>,
+    /// Rooms withdrawn whole (V030-14): nothing of them is taken again. With the signed room
+    /// withdraw that took it off when the room was ended, which a joiner is shown so it can be
+    /// told the room ended rather than that nobody published it; `None` for a node's own forget.
+    withdrawn_rooms: HashMap<Digest32, Option<Vec<u8>>>,
     /// `channelID` → its newest admin roster as the creator signed it: `(timestamp_ms, admins)`
     /// (V030-14). Who besides the creator may take the room off this board.
     rosters: HashMap<Digest32, (u64, BTreeSet<Digest32>)>,
@@ -337,8 +339,9 @@ impl RendezvousStore {
     }
 
     /// Take a whole room off this board — its genesis and every record — and take nothing of it
-    /// again (V030-14). Returns how many records went.
-    pub fn withdraw_room(&mut self, channel_id: &Digest32) -> usize {
+    /// again (V030-14). `ended` is the signed room withdraw when the room was ended, kept to show
+    /// a joiner. Returns how many records went.
+    pub fn withdraw_room(&mut self, channel_id: &Digest32, ended: Option<Vec<u8>>) -> usize {
         let mut gone = usize::from(self.genesis.remove(channel_id).is_some());
         self.members.retain(|(cid, _), b| {
             let keep = cid != channel_id;
@@ -364,8 +367,17 @@ impl RendezvousStore {
         self.genesis_arrived.remove(channel_id);
         self.genesis_sources.remove(channel_id);
         self.rosters.remove(channel_id);
-        self.withdrawn_rooms.insert(*channel_id);
+        let kept = self.withdrawn_rooms.entry(*channel_id).or_default();
+        if ended.is_some() {
+            *kept = ended;
+        }
         gone
+    }
+
+    /// The signed room withdraw an end took the room off this board with (V030-14), if it was.
+    #[must_use]
+    pub fn room_ended(&self, channel_id: &Digest32) -> Option<&[u8]> {
+        self.withdrawn_rooms.get(channel_id)?.as_deref()
     }
 
     /// Take the room's admin roster, if it is newer than the one held (V030-14). The caller has
@@ -376,7 +388,7 @@ impl RendezvousStore {
         timestamp_ms: u64,
         admins: impl IntoIterator<Item = Digest32>,
     ) -> bool {
-        if self.withdrawn_rooms.contains(channel_id) {
+        if self.withdrawn_rooms.contains_key(channel_id) {
             return false;
         }
         match self.rosters.get(channel_id) {
@@ -399,7 +411,7 @@ impl RendezvousStore {
 
     /// Whether a withdraw refuses a record of `author` in `channel_id` stamped `timestamp`.
     fn withdrawn(&self, channel_id: &Digest32, author: &Digest32, timestamp: u64) -> bool {
-        self.withdrawn_rooms.contains(channel_id)
+        self.withdrawn_rooms.contains_key(channel_id)
             || self
                 .withdrawn_members
                 .get(&(*channel_id, *author))
@@ -580,7 +592,7 @@ impl RendezvousStore {
     ) -> Result<()> {
         genesis.verify()?;
         let channel_id = genesis.channel_id();
-        if self.withdrawn_rooms.contains(&channel_id) {
+        if self.withdrawn_rooms.contains_key(&channel_id) {
             return Err(Error::RendezvousRejected("withdrawn"));
         }
         if let Some(existing) = self.genesis.get(&channel_id) {

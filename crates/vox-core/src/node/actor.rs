@@ -2278,11 +2278,19 @@ impl Joiner {
                     Err(e) => Err(format!("board {} was not reached: {e}", short_id(id))),
                     Ok(conn) => match net.fetch_channel(&conn, &room, 0).await {
                         Err(e) => Err(format!("board {} could not be read: {e}", short_id(id))),
-                        Ok(set) if set.genesis.is_none() => Err(format!(
-                            "board {} has nothing for room {}",
-                            short_id(id),
-                            short_id(room)
-                        )),
+                        Ok(set) if set.genesis.is_none() => Err(match set.ended_by {
+                            Some(by) => format!(
+                                "board {} says room {} has ended: {} ended it",
+                                short_id(id),
+                                short_id(room),
+                                short_id(by)
+                            ),
+                            None => format!(
+                                "board {} has nothing for room {}",
+                                short_id(id),
+                                short_id(room)
+                            ),
+                        }),
                         Ok(set) => Ok((conn, set)),
                     },
                 };
@@ -2303,8 +2311,11 @@ impl Joiner {
         others.sort();
         why.extend(others.into_iter().map(|(_, said)| said));
         steps.took("the other boards (none held the room)", t);
+        // A board that took the room off at its end says so (V030-14): that is the answer, not a
+        // room nobody published.
+        let ended = why.iter().any(|w| w.contains(" has ended: "));
         Err(JoinerLost {
-            fault,
+            fault: if ended { Fault::JoinedRoomEnded } else { fault },
             why,
             steps: JoinSteps::default(),
         })
@@ -2497,12 +2508,20 @@ impl Joiner {
         let mut tried: std::collections::BTreeSet<Digest32> = [board.peer_id()].into();
         let (mut board, mut set) = match fetched {
             Ok(set) if set.genesis.is_some() => (board, set),
-            Ok(_) => {
-                let why = vec![format!(
-                    "board {} has nothing for room {}",
-                    short(board.peer_id()),
-                    short(parsed.channel_id)
-                )];
+            Ok(set) => {
+                let why = vec![match set.ended_by {
+                    Some(by) => format!(
+                        "board {} says room {} has ended: {} ended it",
+                        short(board.peer_id()),
+                        short(parsed.channel_id),
+                        short(by)
+                    ),
+                    None => format!(
+                        "board {} has nothing for room {}",
+                        short(board.peer_id()),
+                        short(parsed.channel_id)
+                    ),
+                }];
                 self.another_board_with_the_room(&tried, why, Fault::RoomNotOnBoard, steps)
                     .await?
             }

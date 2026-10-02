@@ -773,7 +773,8 @@ pub enum Fault {
     StillJoining,
     /// The member named is not an admin of the room, so there is no admin to take back (V030-08).
     NotAnAdmin,
-    /// A join reached a room that has ended (V030-08): a member said so before checking anything.
+    /// A join reached a room that has ended (V030-08): a member said so before checking anything,
+    /// or a board that took the room off at its end did (V030-14).
     JoinedRoomEnded,
     /// The member a join reached has left the room (V030-08), so it answers no join for it.
     ResponderLeft,
@@ -899,7 +900,7 @@ impl Fault {
                 "only the room's creator, or an admin it delegated, may do that — and this identity is neither"
             }
             Fault::JoinedRoomEnded => {
-                "that room has ended — a member said so — so it takes nobody in\n       your passphrase was never checked; the room is over, not your access to it"
+                "that room has ended — a member or its board said so — so it takes nobody in\n       your passphrase was never checked; the room is over, not your access to it"
             }
             Fault::ResponderLeft => {
                 "the member that answered has left that room, so it lets nobody in\n       your passphrase was never checked; ask a member still in the room for an address"

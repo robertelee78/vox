@@ -334,6 +334,10 @@ pub struct RecordSet {
     pub prejoins: Vec<PreJoinRecord>,
     /// The channel genesis, if the board holds it.
     pub genesis: Option<Genesis>,
+    /// Who ended the room, when the board took it off at a signed end instead (V030-14). The
+    /// board's word: it checked the withdraw against the room's creator or admin roster, which a
+    /// joiner does not hold.
+    pub ended_by: Option<Digest32>,
 }
 
 /// Which rooms a board keeps for a peer that brings their genesis — the rooms it will
@@ -533,6 +537,10 @@ impl RendezvousService {
                 if kinds.contains(RecordKinds::GENESIS) {
                     if let Some(g) = store.genesis(channel_id) {
                         out.push(RendezvousResponse::Record(g.to_wire()));
+                    } else if let Some(ended) = store.room_ended(channel_id) {
+                        // In the genesis's place: the room was ended, and this is the withdraw
+                        // that took it off (V030-14).
+                        out.push(RendezvousResponse::Record(ended.to_vec()));
                     }
                 }
                 drop(store);
@@ -726,7 +734,7 @@ impl RendezvousService {
                         store.withdraw_member(&w.channel_id, &w.author_id, w.timestamp);
                     }
                     WithdrawScope::Room => {
-                        store.withdraw_room(&w.channel_id);
+                        store.withdraw_room(&w.channel_id, Some(record.to_vec()));
                     }
                 }
                 Ok(())
@@ -896,6 +904,16 @@ impl RendezvousClient {
                                 ));
                             }
                             set.genesis = Some(g);
+                        }
+                        StructTag::BoardWithdraw if kinds.contains(RecordKinds::GENESIS) => {
+                            use crate::nat::withdraw::{BoardWithdraw, WithdrawScope};
+                            let w = BoardWithdraw::from_wire(&wire)?;
+                            if w.channel_id != *channel_id || w.scope != WithdrawScope::Room {
+                                return Err(Error::MalformedRendezvous(
+                                    "rendezvous get: withdraw is not this room's end",
+                                ));
+                            }
+                            set.ended_by = Some(w.author_id);
                         }
                         _ => {
                             return Err(Error::MalformedRendezvous(

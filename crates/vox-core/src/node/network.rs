@@ -1465,7 +1465,7 @@ impl NodeNet {
         store
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .withdraw_room(channel_id);
+            .withdraw_room(channel_id, None);
     }
 
     /// Put a framed record on **this node's own** board, without a network round
