@@ -75,6 +75,10 @@ const KILLED_WITHIN: Duration = Duration::from_secs(11);
 /// How soon after a SIGTERM the forward must say it: the close arrives at once and the next 1 s
 /// tick reads it. Short of the 8 s any inference from silence needs.
 const CLOSED_WITHIN: Duration = Duration::from_secs(3);
+/// The most this machine's own clock may stall (a `vox --version` start, or the redial poll's
+/// slowest turn past its 200 ms sleep and 2 s echo) before a missed [`BACK_WITHIN`] is the
+/// runner's, not the forward's.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
@@ -92,7 +96,7 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
         "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
-        w.fwd.as_mut().unwrap().transcript()
+        forward(&mut w).transcript()
     );
     w.expect_still_relayed();
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
@@ -120,18 +124,23 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
 
     // ---- the forward carries again within BACK_WITHIN -----------------------------------------
     let mut carried = None;
+    let mut slowest_turn = Duration::ZERO;
     while back.elapsed() < BACK_WITHIN + Duration::from_secs(20) {
+        let turn = Instant::now();
         if round_trip(at, b"after", Duration::from_secs(2)).is_ok_and(|b| b == b"after") {
             carried = Some(back.elapsed());
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
+        // A turn is at most a 2 s echo and a 200 ms sleep; anything past that is this machine.
+        slowest_turn = slowest_turn.max(turn.elapsed().saturating_sub(Duration::from_millis(2200)));
     }
-    let said = w.fwd.as_mut().unwrap().transcript();
+    let apparatus = slowest_turn.max(apparatus_spawn(&w.guest_dir));
+    let said = forward(&mut w).transcript();
     let saw_it_go = said.lines().any(|l| l.contains(GONE));
     eprintln!(
         "[proof] the forward carried again {carried:?} after the anchor was back (bound \
-         {BACK_WITHIN:?}); it said its anchor went: {saw_it_go}"
+         {BACK_WITHIN:?}, apparatus {apparatus:?}); it said its anchor went: {saw_it_go}"
     );
     let carried = carried.unwrap_or_else(|| {
         panic!(
@@ -142,11 +151,18 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
             w.host.as_mut().map(|h| h.transcript()).unwrap_or_default()
         )
     });
-    assert!(
-        carried < BACK_WITHIN,
-        "PRODUCT: the forward carried again only {carried:?} after its anchor was back, over {BACK_WITHIN:?}: \
-         a lost anchor waited for a periodic redial\n---- the forward ----\n{said}"
-    );
+    if carried >= BACK_WITHIN {
+        assert!(
+            apparatus <= APPARATUS_BUDGET,
+            "CANNOT MEASURE: apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
+             forward carried again only {carried:?} after its anchor was back"
+        );
+        panic!(
+            "PRODUCT: the forward carried again only {carried:?} after its anchor was back, over \
+             {BACK_WITHIN:?} (apparatus {apparatus:?}): a lost anchor waited for a periodic \
+             redial\n---- the forward ----\n{said}"
+        );
+    }
     assert!(
         saw_it_go,
         "PRODUCT: the forward did not say its anchor connection went ({GONE:?})\n{said}"
@@ -194,6 +210,25 @@ fn assert_says_stopped(who: &str, said: &str, anchor: &str) {
     );
 }
 
+/// How long this machine takes to start the shipped binary (`vox --version`, against the profile
+/// at `dir`). A stalled runner stalls this too.
+fn apparatus_spawn(dir: &std::path::Path) -> Duration {
+    let t = Instant::now();
+    let (ok, out, err) = world::vox_once(dir, &world::args(&["--version"]));
+    assert!(
+        ok,
+        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {out}{err}"
+    );
+    t.elapsed()
+}
+
+/// The guest's `vox forward`, which [`RelayWorld::forward`] started.
+fn forward(w: &mut RelayWorld) -> &mut world::VoxProc {
+    w.fwd
+        .as_mut()
+        .expect("APPARATUS: the proof reads the forward before it started it")
+}
+
 /// Send `sig` to `pid`. A signal that cannot be sent leaves the scene unstaged: CANNOT MEASURE.
 fn kill<const N: usize>(args: [&str; N]) {
     let sent = std::process::Command::new("kill")
@@ -239,7 +274,7 @@ fn a_killed_anchor_is_noticed_promptly() {
 fn an_anchor_stopped_while_it_carries_a_transfer_is_said_to_have_stopped() {
     let mut w = stopped_for_good("INT", CLOSED_WITHIN, true, false);
     let anchor = anchor_id(&w);
-    let said = w.fwd.as_mut().unwrap().transcript();
+    let said = forward(&mut w).transcript();
     assert_says_stopped("the forward", &said, &anchor);
 }
 
@@ -251,10 +286,10 @@ fn an_anchor_stopped_while_it_carries_a_transfer_is_said_to_have_stopped() {
 fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
     let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false, false);
     let anchor = anchor_id(&w);
-    let said = w.fwd.as_mut().unwrap().transcript();
+    let said = forward(&mut w).transcript();
     assert_says_stopped("the forward", &said, &anchor);
     // ---- and a forward stops on SIGTERM, saying so (V210-108's contract, #303) ----------------
-    let fwd = w.fwd.as_mut().unwrap();
+    let fwd = forward(&mut w);
     let signalled = Instant::now();
     kill(["-TERM", &fwd.child.id().to_string()]);
     let status = loop {
@@ -303,7 +338,7 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
 fn a_connection_held_only_through_the_stopped_anchor_says_so() {
     let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false, true);
     let anchor = anchor_id(&w);
-    let said = w.fwd.as_mut().unwrap().transcript();
+    let said = forward(&mut w).transcript();
     assert_says_stopped("the forward", &said, &anchor);
 }
 
@@ -333,10 +368,10 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
         "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
-        w.fwd.as_mut().unwrap().transcript()
+        forward(&mut w).transcript()
     );
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
-    let fwd = w.fwd.as_mut().unwrap();
+    let fwd = forward(&mut w);
     if host_too {
         // The forward holds its host, which it names as an anchor too, over the only path it has
         // to it: a circuit through the anchor about to be stopped (the families are split, so its
@@ -415,12 +450,12 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
             "CANNOT MEASURE: the transfer through the forward never echoed {TRANSFER_FLOWING} bytes \
              ({} did)\n{}",
             t.echoed(),
-            w.fwd.as_mut().unwrap().transcript()
+            forward(&mut w).transcript()
         );
     }
 
     // ---- the anchor is stopped, and stays down --------------------------------------------------
-    let fwd_pid = w.fwd.as_mut().unwrap().child.id().to_string();
+    let fwd_pid = forward(&mut w).child.id().to_string();
     if carrying {
         kill(["-STOP", &fwd_pid]);
         std::thread::sleep(FROZEN_BEFORE_STOP);
@@ -457,7 +492,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
 
     // ---- the forward says so ---------------------------------------------------------------------
     // Watched well past the bound, so a red prints how long it did take.
-    let fwd = w.fwd.as_mut().unwrap();
+    let fwd = forward(&mut w);
     let mut said = None;
     while stopped.elapsed() < within + Duration::from_secs(30) {
         let _ = fwd.transcript();
@@ -654,7 +689,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
     for round in 1..=STOPS_AT_ONCE {
         // The next "connected" line, read as it arrives: the stop follows it at once. The first
         // may already have been read while the forward started.
-        let fwd = w.fwd.as_mut().unwrap();
+        let fwd = forward(&mut w);
         let reached = if round == 1 && fwd.seen.iter().any(|l| l.contains(CONNECTED)) {
             Some(Instant::now())
         } else {
@@ -663,7 +698,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
         assert!(
             reached.is_some(),
             "CANNOT MEASURE: round {round}: the forward never said it reached its anchor\n{}",
-            w.fwd.as_mut().unwrap().transcript()
+            forward(&mut w).transcript()
         );
         kill(["-INT", &w.anchor.proc.child.id().to_string()]);
         let stopping = Instant::now();
@@ -695,7 +730,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
             .count()
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    let fwd = w.fwd.as_mut().unwrap();
+    let fwd = forward(&mut w);
     let mut said = fwd.transcript();
     while said_of_it(&said) < stops && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
