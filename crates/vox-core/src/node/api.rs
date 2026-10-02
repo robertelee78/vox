@@ -831,6 +831,10 @@ pub enum Fault {
     /// a room can, so it could not admit the joiner. **Not [`Fault::Refused`]**, which reads as a
     /// wrong passphrase, and never a success: this was told it had joined, and exited 0.
     RoomFull,
+    /// A member accepted the passphrase and then could not admit the joiner: it was locked or
+    /// closing mid-join, or its store refused the write (V210-128). **Not [`Fault::Refused`]**,
+    /// whose advice is "usually the passphrase is wrong": this one was accepted.
+    NotAdmittedAfterJoin,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
     /// A consent named a member this node has not admitted to the room (yet): it holds no
@@ -959,6 +963,9 @@ impl Fault {
             Fault::RoomFull => {
                 "the room is full: it holds as many members as a room can\n       your passphrase was accepted; nobody else can join this room"
             }
+            Fault::NotAdmittedAfterJoin => {
+                "a member accepted your passphrase, then could not admit you: it was locked or closing, or could not write its store\n       your passphrase was accepted — this is not a verdict on it\n       run the join again; another member, or this one once it is running, can admit you"
+            }
             Fault::Refused => "the other side refused",
             Fault::NotAdmitted => {
                 "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
@@ -1058,6 +1065,7 @@ fault_names!(
     SolveTooSlow,
     MembersBusy,
     RoomFull,
+    NotAdmittedAfterJoin,
     Refused,
     NotAdmitted,
     NotConsented,

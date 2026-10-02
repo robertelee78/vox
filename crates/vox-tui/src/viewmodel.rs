@@ -218,6 +218,8 @@ pub enum UiError {
     JoinMembersBusy,
     /// The room already holds as many members as a room can, so the join was refused.
     JoinRoomFull,
+    /// A member accepted the passphrase and then could not admit this identity (V210-128).
+    JoinNotAdmitted,
     /// Join proof-of-possession / identity mismatch.
     JoinProofMismatch,
     /// No reachable peer / your node — "both must be online" for a 2-member channel.
@@ -304,6 +306,9 @@ impl UiError {
             }
             UiError::JoinRoomFull => {
                 "the room is full: it holds as many members as a room can — nobody else can join"
+            }
+            UiError::JoinNotAdmitted => {
+                "a member accepted your passphrase but could not admit you (it was locking or closing) — try again"
             }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — the host or a member must be online",

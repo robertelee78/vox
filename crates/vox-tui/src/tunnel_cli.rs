@@ -1192,6 +1192,7 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::SolveTooSlow) => Fault::SolveTooSlow.explain(),
         Some(Fault::MembersBusy) => Fault::MembersBusy.explain(),
         Some(Fault::RoomFull) => Fault::RoomFull.explain(),
+        Some(Fault::NotAdmittedAfterJoin) => Fault::NotAdmittedAfterJoin.explain(),
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
         // responder, so it is the responder that says no. Leading with "the refusal is
