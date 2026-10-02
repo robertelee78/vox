@@ -483,15 +483,15 @@ the injection; it used to do that silently, on any error.
   to arrive once, through this drain, in the same turn. Measured 2026-10-01 against Claude Code 2.1.287: a
   message written to its messaging socket runs `UserPromptSubmit` with that message as `prompt`, whether the
   session is idle, generating, or between tool calls. The daemon is to recount what is still unread just before
-  it wakes, and to keep at most one wake outstanding per session; that dedupes and drops nothing.
+  it wakes, and to keep at most one wake outstanding per session; that is to dedupe and to drop nothing.
 - **An idle session is to be told when a reply to it waits** (V030-20). This changes the urgent-only rule above
-  for one case: a reply (`re`) to a post the session addressed to someone, unread and the session idle, gets an
-  announce-only notice now, then 5, 20 and 60 minutes after each previous one, then no more; a fresh reply
-  restarts it. A reply notice is a wake: it obeys the one-outstanding rule above (the plan owner,
-  2026-10-02). Idle and busy come from the harness's own end-of-turn hook (`Stop`, `SessionEnd`), never from the
-  network. It is never a delivery cap: the reply is always in the next turn's drain.
-- **A sender is to be told how each addressee can be reached** (V030-17): a session's `hello` says whether it
-  can be interrupted, and `vox room post --to` reports it ("codex: urgent will not interrupt it").
+  for one case: a reply (`re`) to a post the session addressed to someone, unread and the session idle, is to get an
+  announce-only notice at once, then 5, 20 and 60 minutes after each previous one, then no more; a fresh reply
+  is to restart it. A reply notice is to be a wake: it is to obey the one-outstanding rule above (the plan
+  owner, 2026-10-02). Idle and busy are to come from the harness's own end-of-turn hook (`Stop`, `SessionEnd`),
+  never from the network. It is never to be a delivery cap: the reply is to be in the next turn's drain.
+- **A sender is to be told how each addressee can be reached** (V030-17): a session's `hello` is to say whether it
+  can be interrupted, and `vox room post --to` is to report it ("codex: urgent will not interrupt it").
 - **The OpenCode fence is to carry a per-turn nonce** and a relayed wake is never to be labelled the user's
   message (V030-21).
 
@@ -549,9 +549,9 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
   **MUST NOT** auto-reply to `status`, `hello`, `bye` or `ack` at all.
 - `hops` **MUST** be decremented on relay and the message dropped at zero. The default **MUST** be 8
   (ruflo ADR-097's value, whose default "alone closes the recursion-loop class").
-- **A reply that names no parent still spends a hop** (V210-121). A budget counted along `re` was
-  bypassed by leaving `re` out, an ordinary omission, and two agents answering each other urgently
-  that way woke each other for ever. So a session's post right after a wake **MUST** answer the
+- **A session cannot escape the hop budget by omitting `re` when it was woken** (V210-121). A
+  budget counted along `re` was bypassed by leaving `re` out, an ordinary omission, and two agents
+  answering each other urgently that way woke each other for ever. So a session's post right after a wake **MUST** answer the
   message that woke it when exactly one such wake is unanswered (an explicit `re` still wins), and
   an urgent one with two or more unanswered **MUST** be refused until it names one; a raw
   urgent envelope with no `re` from a session with an unanswered wake **MUST** be refused; and the
