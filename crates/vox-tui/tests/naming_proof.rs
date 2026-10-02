@@ -29,6 +29,10 @@
 //!    daemon, and alice reaches each service through the name in (1) and (2) with no daemon ever
 //!    restarted. (It used to open the profile itself, so the daemon had to be stopped first, and
 //!    started again with every room's passphrase.)
+//! 6. **`vox service list` shows it while the daemon runs** (V030-24): carol lists *work* with her
+//!    daemon running, and the service just added is there; after her daemon stops, the one-shot
+//!    `vox service list` still shows it. (`list` used to open the profile while `add` asked the
+//!    daemon, so it was refused for a profile the daemon held.)
 //!
 //! **A red names its side.** A `vox` command that fails while setting the scene — an identity, a
 //! trust, a daemon, a room, an invite, a join, bob holding carol as a member, the proxy — is the
@@ -275,6 +279,27 @@ impl Member {
         );
     }
 
+    /// `vox service list <room>`: whether it succeeded, and what it said. With the room
+    /// passphrase from a file, as the one-shot form needs it once no daemon holds the room.
+    fn list(&self, room: &str, pass: &str) -> (bool, String) {
+        let pass_file = self.dir.join("room.pass");
+        std::fs::write(&pass_file, pass).expect("APPARATUS: write the room passphrase file");
+        let (ok, out, err) = vox(
+            &self.dir,
+            &[
+                "service",
+                "list",
+                room,
+                "--passphrase-file",
+                pass_file.to_str().unwrap(),
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            None,
+        );
+        (ok, format!("{out}{err}"))
+    }
+
     /// `vox forward <name> 22 0`: whether it bound, and what it said.
     fn forward(&self, name: &str) -> (bool, String) {
         let mut p = VoxProc::spawn(
@@ -429,6 +454,14 @@ fn a_local_name_reaches_the_node_it_names() {
     bob.serve(&family, family_pass, nas_echo);
     carol.serve(&family, family_pass, laptop_echo);
     carol.serve(&work, work_pass, laptop_work_echo);
+    // (6) Listed while the daemon runs: `vox service list` asks it.
+    let (ok, listed) = carol.list(&work, work_pass);
+    let offered = format!("22  →  {laptop_work_echo}");
+    assert!(
+        ok && listed.contains(&offered),
+        "PRODUCT: carol's `vox service list` with her daemon running does not show the service \
+         she just added ({offered}): {listed}"
+    );
 
     // alice joins work too.
     alice.join(&carol.invite(&work), "work", work_pass);
@@ -599,8 +632,18 @@ fn a_local_name_reaches_the_node_it_names() {
         pids,
         "PRODUCT: a daemon was restarted or exited after its service was added"
     );
+    // (6) The daemon stopped, the one-shot `vox service list` still shows carol's service: it
+    // was kept, not only offered for the daemon's run.
+    drop(carol.daemon.take());
+    let (ok, listed) = carol.list(&work, work_pass);
+    assert!(
+        ok && listed.contains(&offered),
+        "PRODUCT: after carol's daemon stopped, `vox service list` does not show the service she \
+         added while it ran ({offered}): {listed}"
+    );
     eprintln!(
-        "[proof] 3 services added to 2 running daemons, each reached by name, none restarted"
+        "[proof] 3 services added to 2 running daemons, each reached by name, none restarted; \
+         listed with the daemon running and after it stopped"
     );
     drop((up, alice, bob, carol, anchor));
 }

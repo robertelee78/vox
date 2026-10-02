@@ -459,6 +459,46 @@ in a closing line** and delivered on the next turn, because the cursor moves onl
 shown. A cursor the node no longer holds restarts from the room's first message **and says so** in
 the injection; it used to do that silently, on any error.
 
+**A wake announces; the message arrives once, through the drain** (v0.3.0, V030-15). A wake is
+the harness's own user message, where the operator speaks, so it carries no byte of any message
+and nothing else an author chose: "N urgent messages addressed to you from <petnames> in room
+<name>", the petnames from this node's keyring. Claude Code runs `UserPromptSubmit` for a message
+written to its messaging socket, idle, mid-generation or between tool calls (measured on 2.1.287),
+and OpenCode's relayed prompt runs `chat.message`, so the drain delivers the messages in the turn
+the wake starts, **urgent addressed rows and V030-20's replies first** within its bound. What a
+bounded drain shows past its cursor is remembered as delivered ahead of the cursor and not shown
+or announced again. The daemon **recounts** the unread urgent addressed rows past the session's
+cursor just before it wakes and sends nothing when there are none. A session has **at most one
+notice outstanding**: none more until its cursor moves or `agent_wake_hold` (10 minutes) passes,
+which dedupes and drops nothing. A notice that does not arrive (the endpoint fails or times out)
+stays owed and is tried again once the hold passes or the cursor moves. Messages that land
+while the daemon is down reach its node by sync once it starts, and are announced as any new
+message is. When the daemon starts it also counts every session from its cursor: that guards only
+a daemon killed between a message reaching its store and the wake loop's next look (at most 2 s),
+a window no real-binary proof can stage, so this guard is unproven by mutant. The
+cursor and the set shown ahead of it are one file, written whole, so the daemon never reads one
+without the other. Codex is unchanged: it has no wake path.
+
+**An idle session is told when a reply to it is waiting** (v0.3.0, V030-20; the decider changed
+the urgent-only rule above for this case, 2026-10-01). A reply is a row whose `re` names a post by
+this session that addressed someone, not its own, and not `ack`, `status`, `hello`, `bye`, `ping`
+or `pong`, and it must have hops left (§9): two sessions answering each other's answers stop
+being announced when the budget runs out. While one is unread and the session is idle, the session gets a notice as above, then
+one after each wait of `agent_reply_nudges` (5, 20 and 60 minutes), then no more; a fresher reply
+starts the series again. **A reply's notice is a wake** (the plan owner, 2026-10-02): it obeys the
+one-outstanding rule above, so each notice of a series, a fresher reply's first one included, also
+waits until the cursor moves or `agent_wake_hold` passes. A session has at most one wake
+outstanding, of either kind; when the session does not read, the series' waits are at least the
+hold. Idle comes from the harness: Claude Code's `Stop` and `SessionEnd` hooks
+run `vox agent hook`, which records idle or removes the registration and prints nothing;
+`UserPromptSubmit` records busy. A session busy for `agent_busy_idle` (10 minutes) with no hook
+activity counts as idle: Claude Code runs no `Stop` for a turn interrupted with Esc, and OpenCode
+and Codex report no end of turn to Vox (OpenCode documents a `session.idle` plugin event but not
+its fields, so it is not used). The series lives in the session's record (`sessions/notices/`), so
+a daemon restart resumes it. The three timings are settings in the profile's settings file; a
+value that does not read, an empty schedule or a zero is refused, said on the daemon's stderr
+(again every ten minutes while it stands), and the default used.
+
 ### 7. The node MUST fan out to several local clients without any of them able to stall it
 
 Measured on `main` (`spike-1`): the actor emits every event with `event_tx.send(..).await` on a
@@ -1016,24 +1056,20 @@ Both unknowns are already spiked; neither remains open.
   > client's `promptAsync`; `opencode_plugin_proof` interrupts a plain, hand-opened `opencode` mid-tool
   > through `vox daemon`.
 
-  > **Named defect, 2026-10-01 (V210-112): a woken OpenCode session was given the message twice.**
-  > The relayed wake is a user message, so the plugin's drain ran on it and read the same message
-  > into the same prompt; that read also showed every agent message as its raw envelope JSON. Fixed
-  > 2026-10-01 for v0.2.10: the daemon's `prompt` frame names its entry, the plugin passes the entries
-  > it has relayed to `vox agent hook --woken`, and the drain skips them until its cursor passes them
-  > (measured: OpenCode runs the wake's `chat.message` before `promptAsync` returns, so the plugin also
-  > matches the prompt by its text); the drain renders an envelope's `body`. `opencode_plugin_proof`
-  > reads the session as OpenCode stored it and asserts one copy of the woken message, one of a
-  > message that woke nothing, and no envelope JSON. **A Claude Code wake had the same defect:**
-  > measured against a live Claude Code 2.1.287, a message written to its messaging socket runs
-  > `UserPromptSubmit` with that message as `prompt`, so the drain read the woken message into the
-  > same turn. The drain now recognises its own wake in the `prompt` it runs on (the wake's opening, its
-  > room's label, the entry and every word) and skips that entry; `remote_interrupt_proof` (5) runs the
-  > hook on the wake its stand-in socket received and asserts the room read leaves it out. That spike
-  > also showed Claude Code presenting the wake as a message "from another Claude session … a
-  > teammate's request", so the wake now opens by saying plainly it is a Vox room message: who sent
-  > it, in which room, relayed by Vox, and not a request from another agent session (the decider,
-  > 2026-10-01). V210-79's sentence that follows it is unchanged.
+  > **Named defect, 2026-10-01 (V210-112): a woken session was given the message twice.** A
+  > wake is the harness's own user message, so the drain ran on it and read the same message into
+  > the same turn: OpenCode's relayed prompt runs the plugin's `chat.message`, and Claude Code runs
+  > `UserPromptSubmit` for a message written to its messaging socket, with that message as `prompt`
+  > (measured against a live Claude Code 2.1.287). That read also showed every agent message as its
+  > raw envelope JSON. v0.2.10 fixed it by having the drain skip what a wake had delivered (`vox
+  > agent hook --woken`, and matching the wake's text in the prompt). **In v0.3.0 that mechanism is
+  > gone (V030-15):** a wake is an announce-only notice that carries no byte of any message, so
+  > there is nothing for the drain to skip. The message reaches the model once, through the drain
+  > of the turn the notice starts, first in its read; the drain renders an envelope's `body`.
+  > `remote_interrupt_proof` runs the hook on the notice its stand-in socket received and asserts
+  > the message is read once and first, and that no byte of it reached the socket. The notice says
+  > plainly it comes from Vox, not from the person the agent works for (the decider, 2026-10-01).
+  > V210-79's sentence that follows it is unchanged.
 
   > **Named defect, 2026-09-24 (ADR-021 F15) — found by reading, then reproduced through the real
   > `vox daemon`; fix proposed in #16.** `vox daemon`

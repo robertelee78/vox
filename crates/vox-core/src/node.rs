@@ -24,7 +24,6 @@
 //! useful unit.
 
 pub mod actor;
-pub mod anchor;
 pub mod api;
 pub mod app;
 pub mod appipc;

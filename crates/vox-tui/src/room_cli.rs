@@ -1511,6 +1511,39 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
     }
 }
 
+/// `vox service list`, asked of the node already running this profile (V030-24).
+///
+/// `add` and `remove` go to the daemon (V030-06), but `list` opened the profile itself, which
+/// redb refuses while the daemon holds it: a person who had just added a service could not list
+/// it. It prints what the one-shot form prints (`tunnel_cli::service_list`).
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or the node cannot say.
+pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client.request(&Request::Services { channel_id }).await {
+        Ok(Frame::Services { room, services }) => {
+            let short = crate::tunnel_cli::short_id_of(&channel_id);
+            if services.is_empty() {
+                println!("vox: no services offered in {short}");
+                return Ok(());
+            }
+            println!("vox: services offered in {room} ({short})");
+            for (tag, addr) in &services {
+                println!("  {tag}  →  {addr}");
+            }
+            Ok(())
+        }
+        // The node's reason, as `vox service list` without a daemon gives it.
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+            "cannot list that room's services: {reason}"
+        ))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox room handoff` — relinquish a resource and reserve it for another harness,
 /// named by fingerprint (a unique prefix of a room member's), and optionally one exact
 /// session of it.

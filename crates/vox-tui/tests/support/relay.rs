@@ -155,6 +155,54 @@ impl Anchor {
         }
     }
 
+    /// The most circuits the anchor has reported carrying at any moment since it started, after
+    /// draining what it printed for `settle` (see [`Self::circuits`]). The anchor reports on
+    /// change, every 500 ms, and a circuit it carried lasts at least a retired path's 60 s grace,
+    /// so a circuit asked of it at any point in a run is in one of these reports (V210-122).
+    /// No report at all is `CANNOT MEASURE`, never 0.
+    pub fn circuits_ever(&mut self, settle: Duration) -> usize {
+        let _ = self.circuits(settle);
+        self.proc
+            .seen
+            .iter()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("vox node: ")?;
+                let (_, after) = rest.split_once(" peer(s) connected, ")?;
+                after.split_whitespace().next()?.parse::<usize>().ok()
+            })
+            .max()
+            .unwrap_or_else(|| {
+                panic!(
+                    "CANNOT MEASURE: the anchor printed no `… circuit(s) carried` report, so how \
+                     many circuits it ever carried is unknown. It said:\n{}",
+                    self.proc.transcript()
+                )
+            })
+    }
+
+    /// Where the anchor's output stands now, after draining it: pass it to
+    /// [`Self::circuits_since`] to read only the reports printed after this moment.
+    pub fn mark(&mut self) -> usize {
+        let _ = self.proc.transcript();
+        self.proc.seen.len()
+    }
+
+    /// The most circuits the anchor reported carrying in what it printed after `mark`, after
+    /// draining for `settle`. With no report since, the count it last reported (a report is
+    /// printed on change only); with none at all, `CANNOT MEASURE`.
+    pub fn circuits_since(&mut self, mark: usize, settle: Duration) -> usize {
+        let last = self.circuits(settle);
+        self.proc.seen[mark.min(self.proc.seen.len())..]
+            .iter()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("vox node: ")?;
+                let (_, after) = rest.split_once(" peer(s) connected, ")?;
+                after.split_whitespace().next()?.parse::<usize>().ok()
+            })
+            .max()
+            .map_or(last, |m| m.max(last))
+    }
+
     /// The circuit count in the latest status report this anchor printed, if it printed one.
     fn last_report(&self) -> Option<usize> {
         self.proc.seen.iter().rev().find_map(|l| {

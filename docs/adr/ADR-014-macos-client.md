@@ -1,307 +1,213 @@
 # ADR-014: macOS Client
 
-**Status**: proposed — the app is not started; **its FFI foundation is built** (`crates/vox-ffi`, 2026-09-25: the embedded node over UniFFI, an XCFramework for macOS and iOS, proved from Swift — see §"The embedded node (built)"). The Rust TUI client, ADR-015, landed first as the initial client surface.
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status**: proposed. On integrate/v0.3.0 only the embedded node over FFI (requirements 11.x,
+`crates/vox-ffi`) is built. The macOS app itself (requirements 1.1–10.x) is not started; each of
+those requirements is *planned*. The iOS app (PRD-001 R30, #78) and calls (PRD-001 R32, #79) are
+planned for v0.4.0; neither is a v0.3.0 requirement.
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — wording reconciled: the TUI is the first client; this ADR is the first *native GUI* surface.
-**Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: client, macos, ux, verification, consent-ui, architecture
+**Deciders**: Robert E. Lee
+**Tags**: client, macos, ux, verification, consent-ui, ffi
 
 ## Context
 
-The macOS client is the first *native GUI* surface over the Rust core (the Rust TUI client, ADR-015,
-is the first client surface overall) and the primary real-world use (the
-author and his wife, across devices; macOS first, with an Apple developer account). Its job is to
-make Vox's novel trust model usable: per-sender consent (ADR-007), member/key verification
-(ADR-002), channel join (ADR-005), the replicated log (ADR-008), at-rest protection (ADR-010), and
-connectivity/node operation (ADR-012). Research is authoritative on the make-or-break part —
-**key-verification UX** — and that evidence drives the trust-ceremony design below; the remaining
-UX is designed from Vox's established architecture and established secure-messenger patterns,
-marked as such. This ADR specifies the complete macOS client capability with no open questions: it
-fixes distribution, the FFI contract, identity storage on macOS, the navigation model, channel
-policy defaults, the verification and consent ceremonies, node/availability operation, notifications,
-and the at-rest UX — every one a concrete, executable decision. Capabilities surfaced by their own
-ADRs (tunneling UI → ADR-013; voice/video → a future capability ADR; iOS/Linux clients → their own
-ADRs) are referenced, not duplicated, and are not deferrals.
+The macOS client is the first native GUI over the Rust core; the Rust TUI client (ADR-015) is the
+first client of any kind. The primary users are the decider and his family, across devices, macOS
+first. The client's job is to make Vox's trust model usable: per-sender consent (ADR-007), member
+verification (ADR-002), joining (ADR-005), the replicated log (ADR-008), at-rest protection (ADR-010)
+and node operation (ADR-012). Research on key-verification UX (ARES 2023, Signal's safety-number
+evolution) drives requirement 4. Tunneling has its own ADRs (ADR-013, ADR-017); this ADR only says how
+the client presents it.
 
-## Decision
+## Requirements
 
-### Client architecture
+### 1. Architecture
 
-- **Headless Rust core.** All protocol logic (ADR-002…ADR-013) lives in a Rust core library that
-  also runs the local node (swarm, sync, transport — ADR-008/011/012). The UI is a thin front end
-  over a stable, typed API.
-- **Native SwiftUI over the Rust core via UniFFI.** The macOS app is native SwiftUI; the Rust core
-  is compiled to a static library with **UniFFI**-generated Swift bindings. Rationale: native gives
-  first-class macOS integration the security model needs — Keychain/Secure Enclave for the at-rest
-  unlock factor (ADR-010), `NetworkExtension`/`utun` for tunneling (ADR-013), notarization and
-  hardened runtime — while UniFFI gives a typed, memory-safe boundary and lets **the same core be
-  reused on iOS** (SwiftUI) and Linux (its own UI). **Rejected:** Tauri/Electron (webview = weaker
-  native integration, larger attack surface, no clean Secure Enclave / NetworkExtension path).
-- **FFI contract (binding).** The core exposes an **async, callback/stream API** — SwiftUI never
-  makes a blocking call into the core, and the node's sync/connectivity events are delivered to the
-  UI as streams. Private keys and the SEK **never cross the FFI as long-lived plaintext**;
-  signing/decryption happen inside the core (or `gpg-agent`/Secure Enclave), which holds secrets in
-  locked, zeroized memory (`mlock`/`zeroize`, ADR-002/ADR-010). The Swift layer receives only the
-  rendered state it must display (decrypted text for the view, verification/consent states, sync
-  status) — never raw secret material.
-- **Distribution: Developer ID, notarized.** Shipped as a **notarized, hardened-runtime app via
-  Developer ID** (direct download / DMG), **not** the Mac App Store. Rationale: the App Store sandbox
-  cannot accommodate the `NetworkExtension` + privileged helper that tunneling requires (ADR-013) or
-  a long-lived background node agent. App Sandbox entitlements are applied where compatible with those
-  components. **The privileged helper / system extension is load-bearing, not conditional** (amended
-  2026-09-21): ADR-017 decision 5 makes the Vox interface the way a person reaches a room-bound service,
-  so `ssh user@<id>.vox` does not work without it. It claims an interface and the `.vox` resolver **once,
-  at install** — nothing on the data path is privileged, and no port is ever bound.
+1.1. All protocol logic MUST live in the Rust core, which also runs the local node. The app MUST be a
+     thin front end over a typed API. *Planned.*
+1.2. The app MUST be native SwiftUI over the Rust core, compiled as a static library with
+     UniFFI-generated Swift bindings. Tauri and Electron MUST NOT be used. *Planned; the binding is
+     built (11.x).*
+1.3. The core MUST expose an async API with callbacks or streams. SwiftUI MUST NOT make a blocking call
+     into the core, and node events MUST reach the UI as streams.
+1.4. Private keys and the SEK MUST NOT cross the FFI as long-lived plaintext. Signing and decryption
+     MUST happen inside the core (or `gpg-agent`, or the Secure Enclave), which holds secrets in
+     locked, zeroized memory (ADR-002, ADR-010). The Swift layer MUST receive only rendered state:
+     decrypted text for display, verification and consent states, sync status.
+1.5. The app MUST be distributed as a notarized, hardened-runtime app signed with Developer ID (direct
+     download or DMG). It MUST NOT be distributed through the Mac App Store, whose sandbox does not
+     allow a long-lived background node agent. App Sandbox entitlements MUST be applied where they are
+     compatible with the app's other components.
+1.6. The data path MUST NOT require privilege.
 
-### Identity & onboarding
+### 2. Identity and onboarding
 
-- Generate or import a GPG/Ed25519 identity (paired with its ML-DSA co-key, ADR-002); display the
-  identity as a plain-language **safety code** (not "fingerprint" — evidence: the term confuses
-  non-cryptographers).
-- **Identity-key storage on macOS (binding).** The Secure Enclave **cannot** hold the Vox identity
-  key — the Enclave stores only NIST P-256 keys, while the identity is Ed25519 + ML-DSA. The Enclave's
-  role is strictly the ADR-010 *at-rest unlock factor* (a biometric-gated random secret), never the
-  identity itself. Concretely:
-  - **Generate path (default).** The core generates the Ed25519+ML-DSA root and holds it in locked,
-    zeroized memory while unlocked. At rest the root is wrapped in a **separate identity vault** — an
-    *identity* factor (Argon2id over an identity passphrase, or a Secure-Enclave-gated random secret),
-    **distinct from any per-channel SEK** (ADR-010), so the identity key is available to derive each
-    channel's SEK without circularity, and a warm, screen-unlocked but Vox-locked Mac never exposes the
-    identity. A user-facing GnuPG install is **not required** for this path.
-  - **Import path (fully built, not stubbed).** A user may bind an existing GPG Ed25519 primary/subkey
-    (or a YubiKey/smartcard) as the root; signing is delegated to `gpg-agent`/the card and the private
-    key never leaves it (ADR-002). `gpg-agent` is engaged **only** on this explicit path.
-- **Mandatory encrypted backup.** Guided encrypted identity **backup/export** (OpenPGP format,
-  ADR-002) during onboarding; root loss is unrecoverable, so the app **insists on a verified backup
-  before first use**. (Hardware-bound import keys are backed up by the user's existing card/agent
-  practice; the app states this honestly rather than implying it can export a non-exportable key.)
-- **Per-channel identity selection.** Identity choice is an explicit, always-visible step at
-  create/join that **pre-selects the main/last-used identity** (the common case is one tap) and shows
-  which key you are acting as; creating a **fresh per-channel pseudonymous identity** (ADR-002) is a
-  prominent option on the same screen. Vox never silently reuses an identity across channels.
-- **Device add / device loss (stated honestly).** Adding or restoring a **shared-root** device backfills
-  channels *and received consent* from a surviving device via the self-channel (ADR-008) — **no
-  re-consent**. If **all** devices are lost (identity backup only, no sibling to sync from), recovery is
-  **rejoin each channel + be re-consented** by members: inbound consent grants were device-local and are
-  gone, while outbound consent you authored is on the log and recovers. The app surfaces this in
-  onboarding rather than implying seamless recovery.
+2.1. The app MUST generate or import an Ed25519 identity with its ML-DSA co-key (ADR-002), and MUST
+     present it as a **safety code**, never as a "fingerprint". *Planned.*
+2.2. The Secure Enclave MUST NOT hold the identity key (it stores only P-256 keys). It MAY hold only
+     the ADR-010 at-rest unlock factor: a biometric-gated random secret.
+2.3. **Generate path (default).** The core MUST generate the root and hold it in locked, zeroized
+     memory while unlocked. At rest the root MUST be wrapped in an identity vault whose factor
+     (Argon2id over an identity passphrase, or a Secure-Enclave-gated random secret) is distinct from
+     every per-channel SEK (ADR-010). This path MUST NOT require GnuPG.
+2.4. **Import path.** A user MAY bind an existing GPG Ed25519 key or a smartcard as the root. Signing
+     MUST then be delegated to `gpg-agent` or the card, and the private key MUST NOT leave it.
+     `gpg-agent` MUST be engaged only on this path.
+2.5. The app MUST require a verified, encrypted identity backup (OpenPGP format, ADR-002) before first
+     use. For a hardware-bound key it MUST say that the card's own backup practice applies and MUST
+     NOT imply it can export the key.
+2.6. Identity selection MUST be an explicit, visible step at create and join. It MUST pre-select the
+     main or last-used identity, MUST show which key the user acts as, and MUST offer a fresh
+     per-channel pseudonymous identity (ADR-002) on the same screen. The app MUST NOT silently reuse an
+     identity across channels.
+2.7. Onboarding MUST state recovery honestly: a restored shared-root device backfills channels and
+     received consent from a surviving device through the self-channel (ADR-008), with no
+     re-consent; with every device lost, the user rejoins each channel and needs to be re-consented.
 
-### Channel create / join
+### 3. Channel create, join and navigation
 
-- **Create:** the creator (root admin) sets channel policy up front and can change it later (ADR-007).
-  **Policy defaults** the create screen starts on (both options always supported):
-  - **Authorship: attributable** (per-message signatures → **non-repudiable to insiders and outsiders**;
-    ADR-009). Deniable mode — outsider-repudiable content — is the explicit opt-in.
-  - **History: full history** (new members *may* be given prior messages; per-sender consent still
-    gates what decrypts; ADR-007). Forward-only is an explicit opt-in.
-  - **Retention/TTL: never expire** (ADR-010), changeable anytime.
-- **Join:** present an invite as a **single scannable QR + copyable code that carries only the
-  channelID (rendezvous, ADR-005)**, with the **passphrase shared over a separate out-of-band
-  channel** by default — never both in one artifact, so a leaked QR alone cannot join. The UI
-  explains the split in plain language. (Conservative design; this sub-area had no surviving verified
-  evidence.)
-- Set expectations explicitly: joining grants nothing readable until members consent (ADR-007).
+3.1. The create screen MUST start on these policy defaults, and the creator MUST be able to change
+     them (ADR-007): authorship attributable (ADR-009); history full, with forward-only as an
+     opt-in; retention never expires (ADR-010). *Planned.* Deniable authorship is not offered:
+     deniable mode is removed (PRD-001 R43).
+3.2. An invite MUST be one scannable QR and copyable code carrying only the channel ID (ADR-005). The
+     passphrase MUST be shared out of band and MUST NOT be in the same artifact, and the UI MUST
+     explain why.
+3.3. The UI MUST tell a joiner that joining grants nothing readable until members consent (ADR-007).
+3.4. Home MUST be the list of channels the user created or joined; creating or joining MUST be the
+     primary action, and each channel MAY have a local name. There MUST be no contacts tier and no
+     separate 1:1 path: a two-member channel is the only direct message (ADR-001).
+3.5. Members MUST be shown by a local nickname bound to a verified key, never by an account.
+3.6. Nicknames, verification state and received consent MUST sync across the user's own shared-root
+     devices through the self-channel (ADR-008). The client MUST add no protocol for this. Per-device
+     identities keep this state device-local.
 
-### Navigation model
+### 4. Verification
 
-The channel is the unit of communication (ADR-001 principle 2): there is **no contacts tier and no
-special 1:1 path** — a two-member channel *is* the only "direct message."
+4.1. QR scan, in person, MUST be the default verification ceremony. Manual digit comparison MUST be a
+     fallback only. *Planned.*
+4.2. The safety code MUST be per pair, numeric and grouped, derived as ADR-015 requirement 4.2 pins
+     it, so both clients agree. The QR MUST encode the same identity material.
+4.3. The app MUST prompt for verification at a new member, before a consent decision and on any key
+     change. It MUST NOT bury verification behind a menu.
+4.4. The ceremony MUST be one scan on one screen.
+4.5. The app MUST raise key-change alerts and show a per-member state: verified, unverified (TOFU) or
+     key-changed, detected locally over the log. Server-based key transparency MUST NOT be adopted.
 
-- **Home = the list of channels (swarms)** the user has created or joined. Creating or joining a
-  channel is the primary action. The user can give each channel a **local name**.
-- **Members are shown by a local nickname bound to their identity key.** The same key may recur across
-  channels (shared-root identity) or a person may deliberately use different keys per channel
-  (pseudonymity, ADR-002); a nickname is a private label over a *verified key*, never an account.
-- **Nickname, verification state, and received consent sync across the user's own devices**
-  (shared-root strategy) via the **personal self-channel — specified in ADR-008** (identity-keyed
-  rendezvous in ADR-005). The client only surfaces the resulting synced state; it adds no protocol.
-  Because the self-channel also syncs received SKDMs, a newly added/restored shared-root device gains
-  access with **no re-consent**. Users on the **per-device-key** strategy have no shared root, so their
-  state stays device-local — composes cleanly, no special case.
+### 5. Per-sender consent
 
-### Member list & verification ceremony (evidence-driven)
+5.1. The consent UI MUST ship complete. User testing MUST be continuous and MUST NOT be a release gate.
+     *Planned.*
+5.2. When a newcomer joins, each member MUST be asked whether to allow them to read their messages,
+     shown with that member's verification state.
+5.3. Verification, outbound consent and inbound visibility MUST be three separate, labelled
+     per-member states with independent controls. They MUST NOT be merged into one switch.
+5.4. Per member, the app MUST show whether the user has consented to them and, where known, whether
+     they have consented to the user. A newcomer MUST be told they will see each member's messages as
+     that member allows.
+5.5. Outbound consent ("share / stop sharing my messages") MUST rotate the user's sender key without
+     them (ADR-007). Inbound visibility ("see / stop seeing their messages") MUST be local: no
+     rotation and no log entry.
+5.6. **Block** MUST revoke outbound consent and turn off inbound visibility in one action. A blocked
+     member MUST stay in the member list, marked "Blocked"; Block MUST NOT remove anyone (ADR-007).
+     **Unblock** MUST restore the user's outbound consent and inbound visibility, and MUST always be
+     available from the member's entry.
 
-The single most failure-prone part of any E2EE app; the research is unambiguous, so these are
-requirements, not preferences:
+### 6. Messaging
 
-- **QR / in-person scan is the DEFAULT trust ceremony.** Manual digit comparison is a *fallback
-  only* — long numeric fingerprints suffer ~43% false-acceptance against near-collision (AitM)
-  fingerprints because users short-circuit comparisons (ARES 2023). Do not make manual comparison the
-  headline path.
-- **Safety-code format.** Per-pair, **numeric, grouped** (Signal's evolution: rename, per-conversation
-  1:1 mapping, numeric to halve comparison load), derived from `SHA-256(Ed25519_pub ‖ ML-DSA_pub)` of
-  both parties (ADR-002). The QR encodes the same identity material for one-scan verification; the
-  grouped numeric code is the manual fallback.
-- **Proactively prompt** verification at trust-relevant moments — new member, *before a consent
-  decision*, and on any key change — never bury it behind a menu. Evidence: unprompted ceremonies
-  succeed ~14% vs ~78% when the UI names the task; so name the task and guide it.
-- **Fast, one step.** Single-scan, single-screen (evidence: ~11-minute ceremonies discourage use).
-- **Key-change alerts + TOFU indicators** surfaced automatically over the log; verification state per
-  member (verified / unverified-TOFU / key-changed). (Server-dependent key transparency like CONIKS is
-  not adopted — no central server; local key-change detection over the log is.)
+6.1. The app MUST send text and files. *Planned.*
+6.2. Entries the user cannot decrypt MUST NOT be shown. Where the gap would confuse, the app MUST show
+     a non-leaking "messages you haven't been given access to" marker.
+6.3. Calls (PRD-001 R32, #79) are planned for v0.4.0 as an app on the app API (ADR-022) and are not part of
+     this client's v0.3.0 scope.
 
-### Per-sender consent UX (the differentiator)
+### 7. Node operation and availability
 
-No verified external precedent survived (the Cwtch claims were refuted), so this is designed
-carefully from ADR-007. Per the engineering mantra it **ships complete and production-quality** —
-it is *not* a stub awaiting a future milestone, and usability validation is **not a release gate**.
-Structured user testing runs **continuously** and feeds iterative refinement; ADR-007's protocol
-guarantees stand regardless of it. The bar is "ship the best-designed version, complete" — never a
-reason to withhold the surface or ship it incomplete.
+7.1. The app MUST embed the node and run it while the app runs. *Planned; the embedding is built
+     (11.x).*
+7.2. The app MUST be able to point at any user-run node as its anchor (ADR-012). Vox MUST NOT mandate
+     a topology: every option MUST be configurable, and Vox MUST NOT make any of them compulsory.
+7.3. Vox MUST also ship a headless node binary (the same Rust core, no UI) for an always-on box with a
+     port forward, for reachability while the Mac sleeps (ADR-012). *Built as `vox node` and
+     `vox daemon`.*
+7.4. The app MUST show per-channel reachability and sync state, and node and anchor status. For a
+     two-member channel it MUST say "both must be online, or your node reachable".
 
-- Consent is an explicit, **per-member decision**: when a newcomer joins the swarm, each member is
-  prompted "Allow [member] to read your messages?", tied to that member's verification state to
-  encourage *verify-before-consent*.
-- **Three distinct, clearly-labeled states per member — never conflated:** *verification* ("is this
-  really them?"), *outbound consent* ("should they see my messages?"), and *inbound visibility* ("do I
-  want to see theirs?"). Independent toggles, not one trusted/untrusted switch.
-- **Honest partial-visibility display:** show, per member, whether you've consented to them and (where
-  known) whether they've consented to you; show a newcomer a clear "you'll see each member's messages
-  as they allow you" state rather than a confusing empty/partial timeline.
-- **Per-member controls (both directions, ADR-007):**
-  - *Outbound consent* — "share / stop sharing my messages with them" (rotates `A`'s sender key
-    excluding them).
-  - *Inbound visibility* — "see / stop seeing their messages" (local; drops their sender key from your
-    view; no rotation, no log entry).
-- **Block — the common combined action.** Realistic flow: member-2 joins, member-1 consents, then later
-  member-1 wants nothing to do with member-2. A single **"Block [member]"** action handles **both
-  directions at once** — revoke outbound consent *and* opt out inbound visibility — so the user isn't
-  forced to reason about two toggles in the moment. The per-member panel still exposes the two toggles
-  individually for the less-common asymmetric cases.
-  - **Block is NOT removal.** There is no removal (ADR-007); the blocked member **remains visible in
-    the channel/swarm member list**, shown with a clear **"Blocked"** state. You simply stop sharing
-    with and seeing them.
-  - **Unblock re-consents both directions** — restores outbound consent (re-shares your sender key
-    going forward, ADR-007) and inbound visibility (resumes rendering them). It is always available
-    from the member's entry in the list.
+### 8. Tunneling
 
-### Messaging
+8.1. Tunneling MUST be present and discoverable in the app and MUST be off by default: nothing is
+     reachable through it until the user turns it on. Off by default MUST NOT mean hidden. *Planned.*
+8.2. Chat membership MUST NOT grant tunnel reach (ADR-017 decision 3). A room MAY carry chat and
+     tunnels at once.
+8.3. The app's tunneling surface MUST follow ADR-017. Per-member `bind:`/`dial:` grants and a
+     privileged TUN `vox up` are withdrawn by policy (ADR-017's third revision). Removing the
+     withdrawn capability model's remaining code (`governance::capability`'s `bind:`/`dial:`
+     prefixes and its evaluator) is *planned* (PRD-001 R44, #94).
 
-- **Text and files.** Files are carried as ordinary log payloads (ADR-008): content-encrypted with a
-  fresh nonce, **chunked above a size threshold (default 256 KiB/chunk)** with a **chunk-manifest entry**
-  `{ file_id, total_len, content_type, chunk_hashes[] }` (canonical-CBOR, ADR-008) that orders
-  reassembly and lets a receiver fetch/verify chunks independently; render-gated and TTL-pruned like any
-  payload (ADR-010). No separate file-transfer path.
-- **Render-gating:** undecryptable entries are not shown (ADR-008); where a gap would be confusing,
-  show an honest, non-leaking "messages you haven't been given access to" marker rather than silently
-  dropping context.
-- Voice/video are a separate future capability ADR (the transport datagram path, ADR-011, is built to
-  carry them) — out of this client capability's scope, not deferred work within it.
+### 9. Notifications
 
-### Connectivity, availability & node operation
+9.1. A background LaunchAgent MUST keep the node syncing and MUST post a native local notification for
+     each new decryptable entry. There MUST be no APNs and no third party (ADR-001). *Planned.*
+9.2. Notification previews MUST be hidden by default.
+9.3. The cost — a persistent background process and its battery/power use — is accepted and stated
+     honestly.
 
-- **The macOS app embeds the node** (the core runs the local node, above) whenever it is running.
-- **Headless node build.** Vox also ships a **headless node binary** (same Rust core, no UI) for an
-  always-on box (LAN machine / mini PC) with a port-forward, for reachability while the Mac sleeps
-  (ADR-012). The client can **point at any user-run node** as its rendezvous/relay+store anchor. Vox
-  **mandates no topology** — how the household stays reachable is the users' to arrange (ADR-001/012);
-  the client makes every user-run option configurable and none compulsory.
-- **Surface emergent availability honestly** (ADR-001/ADR-012): per-channel reachability and sync
-  state; for a two-member channel, clearly communicate "both must be online (or your node must be
-  reachable)" and current status; show sync progress and node/rendezvous status (patterns informed by
-  Briar/SimpleX intermittent-connectivity UX; designed, evidence-gap noted).
+### 10. At rest and device seizure
 
-### Tunneling — a first-class capability, OFF by default (not hidden, not removed)
+10.1. The SEK MUST live only in memory while unlocked. Locking MUST zeroize it and require the channel
+      passphrase and the identity factor again (ADR-010). *Planned.*
+10.2. The default MUST be a 5-minute idle lock plus lock on sleep. The lock MUST be configurable,
+      including off, and turning it off MUST state that a warm Mac then exposes the local vault.
+10.3. Biometrics MUST gate only the identity factor and MUST NOT replace the passphrase factor.
+10.4. Disappearing messages MUST follow the room's TTL (ADR-010), off by default.
+10.5. The app MUST hide notification previews by default and SHOULD deter screenshots where the OS
+      allows.
 
-- **Tunneling is fully present in the client; it just defaults to off.** "Off by default" means **no
-  services are advertised, no `bind:`/`dial:` grants are active, and the TUN interface is down until the
-  user turns them on** — *not* that the feature is hidden or stripped. It is discoverable and available
-  in the UI (the ADR-013 surfaces: `vox service add`, `vox forward`, `vox up`, and per-member
-  `bind:`/`dial:` grants), simply shipped in the inactive state.
-- **This is a safe default, not a restriction.** It upholds the protocol invariant that tunnel access is
-  never *inherited* from chat membership (ADR-013): nothing is reachable until the user explicitly grants
-  it. A swarm can carry both chat and tunnels at once (the compute-node case); turning tunneling on is a
-  deliberate, available action, and a chat-only deployment simply leaves it off.
+### 11. The embedded node (PRD-001 R30, R31)
 
-### Notifications
-
-- **Serverless local notifications.** A background **LaunchAgent** keeps the node syncing; on a new
-  *decryptable* entry it posts a native macOS local notification. No APNs, no third party (consistent
-  with ADR-001). The cost — a persistent background process and its battery/power use — is accepted
-  and stated honestly. Notification previews are hidden by default (screen-security, below).
-
-### At-rest & device-seizure UX
-
-- **App-lock.** The SEK lives only in memory while unlocked; lock zeroizes it and forces re-auth =
-  channel passphrase + identity factor (ADR-010). **Default: 5-minute idle timeout + lock on sleep.**
-  The lock is **fully user-configurable, including disabling it entirely** — honoring user autonomy,
-  with the **honest, documented consequence** that a warm Mac with lock disabled exposes the local
-  vault (the one exposure ADR-010 otherwise bounds; the app states this plainly at the point of
-  change).
-- On Secure-Enclave hardware, biometrics gate the *identity factor* only and **never replace the
-  passphrase factor** (ADR-010).
-- **Disappearing messages** tied to admin TTL (default never-expire, so off by default; ADR-010).
-- **Screen-security:** hide message previews in notifications by default; deter screenshots where the
-  OS permits.
-
-### The embedded node (built, 2026-09-25 — PRD-001 R30/R31)
-
-The FFI contract above is built as `crates/vox-ffi`: UniFFI proc-macro bindings over the node, so an
-app runs the node **in its own process** — which is the only option on iOS, where an app cannot run a
-daemon beside itself.
-
-- **What crosses.** In: a profile directory, passphrases (consumed by the core, never returned), room
-  links, text, app-stream labels and bytes. Out: fingerprints and room ids as base32, rendered
-  messages, event notices, app-stream bytes and datagrams. No key material.
-- **Surface.** `VoxNode.start(dataDir, passphrase, listen)` creates the identity on first use and
-  unlocks it after; `stop`; `rooms`, `createRoom`, `openRoom`, `joinRoom(link)`, `invite`, `post`,
-  `read`; `subscribe(EventListener)`; `trust`/`untrust`; and the app API (ADR-022 decision 7):
-  `appListen` → `AppListener.next/accept`, `appOpen` → `AppStream.read/write/finish/sendDatagram/
-  recvDatagram`. No tunnels.
-- **Never blocking.** Every call that waits is Swift `async`; the work runs on the node's own tokio
-  runtime and the Swift side only awaits it.
-- **Every readable message is delivered once**, including others' as sync brings them in or a sender
-  key makes them readable. The node's own `NewEntry` event covers local posts only, so the listener
-  compares the open rooms' timelines with what it has delivered whenever an event arrives or the view
-  changes. (Found by the proof: the first version delivered only the app's own posts.)
-- **Packaging.** `scripts/build-xcframework.sh` builds `VoxFFI.xcframework` — `ios-arm64`,
-  `ios-arm64-simulator`, and one `macos-arm64_x86_64` slice, each a static library — and generates
-  the Swift bindings from the built library, so they cannot drift from it.
-- **Proved** by `crates/vox-tui/tests/ffi_swift_proof.rs`: the script is run, a Swift program is
-  compiled with `swiftc` against the macOS slice, and it embeds the node, joins a room a real `vox
-  daemon` created, posts what the daemon's `vox room read` shows, receives the daemon's post through
-  its `EventListener`, and round-trips 1 MiB (SHA-256 equal) and 100 datagrams with `vox app listen`
-  on the daemon. Mutation: the listener's `on_message` never called → the daemon's post never
-  arrives, red.
-- **iOS, stated exactly.** `scripts/ios-sim-smoke.sh` links the `ios-arm64-simulator` slice into a
-  Swift program and runs it in an iOS simulator with `xcrun simctl spawn`: it starts the node, creates
-  a room, posts and reads the post back (run 2026-09-25 on an iPhone 17 simulator, iOS 26.5). The
-  `ios-arm64` device slice is **linked** into the same program with `swiftc -target
-  arm64-apple-ios15.0` and **not run**: no device was available. No iOS run has reached another node,
-  and nothing has been built as an app bundle with `xcodebuild`.
+11.1. `crates/vox-ffi` MUST expose the node over UniFFI so that an app runs it in its own process.
+      *Built.*
+11.2. Only these MUST cross the boundary: in — a profile directory, passphrases (consumed, never
+      returned), room links, text, app-stream labels and bytes; out — fingerprints and room ids as
+      base32, rendered messages, event notices, app-stream bytes and datagrams. Key material MUST NOT
+      cross. *Built.*
+11.3. The surface is `VoxNode.start(dataDir, passphrase, listen)` (creates the identity on first use,
+      unlocks it after), `stop`, `fingerprint`, `rooms`, `createRoom`, `openRoom`, `joinRoom(link)`,
+      `invite`, `post`, `read`, `subscribe(EventListener)`, `trust`, `untrust`, and the app API
+      (ADR-022): `appListen` → `AppListener.next/accept`, `appOpen` →
+      `AppStream.read/write/finish/sendDatagram/recvDatagram`. It MUST NOT expose tunnels. *Built.*
+11.4. Every call that waits MUST be Swift `async`, with the work on the node's own tokio runtime.
+      *Built.*
+11.5. Every readable message MUST be delivered to the listener exactly once, including other
+      members' messages as sync brings them in or a sender key makes them readable. *Built.*
+11.6. `scripts/build-xcframework.sh` MUST build `VoxFFI.xcframework` with `ios-arm64`,
+      `ios-arm64-simulator` and one `macos-arm64_x86_64` slice, each a static library, and MUST
+      generate the Swift bindings from the built library. *Built.*
+11.7. `crates/vox-tui/tests/ffi_swift_proof.rs` MUST prove the macOS slice from Swift against a real
+      `vox daemon`: join, post, receive through `EventListener`, a 1 MiB app-stream round trip and
+      100 datagrams. *Built.*
+11.8. The iOS app is planned for v0.4.0 (PRD-001 R30, #78). On integrate/v0.3.0 the
+      `ios-arm64-simulator` slice runs in a simulator (`scripts/ios-sim-smoke.sh`: start, create a
+      room, post, read it back); the `ios-arm64` device slice is linked but not run; no iOS run has
+      reached another node and no app bundle has been built.
 
 ## Consequences
 
-### Positive
-- Native SwiftUI+UniFFI gives the security integrations the model depends on and reuses the Rust core
-  on iOS/Linux.
-- Verification is designed against the known fatal flaw of E2EE UX (scan-first, prompted, one-step).
-- Per-sender consent and verification are presented as distinct, honest axes — the differentiator
-  made tangible.
-- Every section is concretely specified (storage, FFI contract, defaults, node operation,
-  notifications, lock behavior), so an engineer can execute without re-deciding architecture.
+- SwiftUI over UniFFI gives the Keychain, Secure Enclave and notarization integration the security
+  model needs, and the same core serves iOS. Each platform needs its own UI.
+- The FFI boundary has to be kept free of secrets and blocking calls (1.3, 1.4).
+- Per-sender consent has no verified precedent; it carries design risk, met by continuous user
+  testing, while ADR-007's protocol guarantees do not depend on it.
+- Developer ID distribution gives up the Mac App Store in exchange for a background agent and the
+  freedom to install system components.
+- The self-channel sync (3.6) is a real mechanism to build and test.
 
-### Negative
-- Native UI is macOS-specific: Linux/iOS reuse the core but need their own UIs (their own ADRs).
-- The UniFFI boundary must be carefully designed to avoid leaking secrets or blocking on the core
-  (mitigated by the async/stream contract above).
-- The per-sender consent UX is genuinely novel with no verified precedent — it carries design risk
-  addressed by **continuous user-testing and iterative refinement** (not a release gate, not a
-  deferred protocol requirement; the underlying protocol guarantees of ADR-007 do not depend on it).
-- Developer-ID distribution forgoes Mac App Store discovery/auto-update in exchange for the system
-  extension / privileged-helper / background-agent freedom the capability set requires.
-- The personal self-channel for nickname/verification sync is a real mechanism to build and test (not
-  free), justified by cross-device usability for shared-root users.
+## Related ADRs
 
-### Neutral
-- Choosing native-per-platform over a single cross-platform UI is a deliberate trade of code reuse for
-  integration depth and security.
-- App-lock-disable and topology are deliberately left to the user, consistent with Vox's
-  user-autonomy posture; the client states the consequences rather than enforcing a policy.
-
-## Links
-**Depends on**: ADR-002, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009, ADR-010, ADR-012, ADR-013.
-- First user-facing surface of the capability series.
+ADR-001, ADR-002, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009, ADR-010, ADR-012, ADR-013, ADR-015
+(peer client; requirement 4.2's derivation), ADR-017 (room-bound services and the entry point),
+ADR-022 (app API).
 
 ## Engineering Mantra
 
