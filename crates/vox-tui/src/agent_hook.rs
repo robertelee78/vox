@@ -379,6 +379,37 @@ fn render_attributed(out: &mut String, entry: &Digest32, author: &str, text: &st
     out.push('\n');
 }
 
+/// The envelope types that are agents coordinating rather than talking (V030-18): presence,
+/// progress and the claim protocol. A request or a question (`assign`, `ask`, `answer`) is
+/// conversation and is never collapsed.
+const COORDINATION: &[&str] = &[
+    vox_agentcomms::envelope::HELLO,
+    vox_agentcomms::envelope::BYE,
+    vox_agentcomms::envelope::work::STATUS,
+    vox_agentcomms::envelope::work::WORKING,
+    vox_agentcomms::envelope::work::BLOCKED,
+    vox_agentcomms::envelope::work::RESULT,
+    vox_agentcomms::envelope::work::FAILED,
+    vox_agentcomms::envelope::work::ACCEPT,
+    vox_agentcomms::envelope::work::DECLINE,
+    vox_agentcomms::envelope::work::ACK,
+    vox_agentcomms::claim::CLAIM,
+    vox_agentcomms::claim::RELEASE,
+    vox_agentcomms::claim::HANDOFF,
+    vox_agentcomms::claim::RENEW,
+    "ping",
+    "pong",
+];
+
+/// The coordination type of `row` when the drain counts it rather than shows it (V030-18):
+/// coordination traffic not addressed to this session. `None` means it goes in full —
+/// anything addressed to `names`, prose, and anything that does not parse.
+fn chatter_kind(row: &vox_core::node::api::MessageRow, names: &[String]) -> Option<String> {
+    let e = vox_agentcomms::envelope::Envelope::parse(&row.text).ok()?;
+    (!names.iter().any(|n| e.is_addressed_to(n)) && COORDINATION.contains(&e.kind.as_str()))
+        .then_some(e.kind)
+}
+
 /// Render the messages an agent has not seen, for injection into its context, and
 /// say how many of them it holds.
 ///
@@ -411,23 +442,54 @@ fn render_attributed(out: &mut String, entry: &Digest32, author: &str, text: &st
 /// because the cursor advances only past what was shown. The caller orders `rows`: what is owed
 /// to this session first, then the rest oldest first.
 ///
-/// Returns the text and how many of `rows` it carries (always at least one when
-/// `rows` is non-empty, so a single oversized message cannot wedge the cursor).
+/// **Coordination chatter is counted, not shown** (V030-18). Another session's `hello`,
+/// `status`, claims and the like landed in full in the model's context every turn, though
+/// they are for the board and not for this agent. Each such row goes into one closing line
+/// counting them by kind; a row addressed to this session goes in full whatever its kind,
+/// and prose is never collapsed. A counted row is read as surely as a shown one: the cursor
+/// passes both, and `vox room read` has the whole of it.
+///
+/// Returns the text and how many of `rows` it carries, shown or counted (always at least one
+/// when `rows` is non-empty, so a single oversized message cannot wedge the cursor).
 fn render(
     room_label: &str,
     rows: &[vox_core::node::api::MessageRow],
     notice: Option<&str>,
+    names: &[String],
 ) -> (String, usize) {
     let mut body = String::new();
     let mut shown = 0usize;
-    for r in rows.iter().take(MAX_INJECTED_MESSAGES) {
+    let mut full = 0usize;
+    let mut chatter = std::collections::BTreeMap::<String, usize>::new();
+    for r in rows {
+        if let Some(kind) = chatter_kind(r, names) {
+            *chatter.entry(kind).or_default() += 1;
+            shown += 1;
+            continue;
+        }
+        if full == MAX_INJECTED_MESSAGES {
+            break;
+        }
         let mut one = String::new();
         render_row(&mut one, r);
-        if shown > 0 && body.len() + one.len() > MAX_INJECTED_BYTES {
+        if full > 0 && body.len() + one.len() > MAX_INJECTED_BYTES {
             break;
         }
         body.push_str(&one);
+        full += 1;
         shown += 1;
+    }
+    if !chatter.is_empty() {
+        let kinds: Vec<String> = chatter
+            .iter()
+            .map(|(kind, n)| format!("{n} {}", one_line(kind)))
+            .collect();
+        body.push_str(&format!(
+            "{} coordination message(s) from other sessions, not shown ({}); \
+             `vox room read {room_label}` has them\n",
+            chatter.values().sum::<usize>(),
+            kinds.join(", "),
+        ));
     }
     let mut out = String::new();
     if let Some(n) = notice {
@@ -804,7 +866,7 @@ async fn drain(
     let (text, shown) = if fresh.is_empty() {
         (String::new(), 0)
     } else {
-        render(&label, &fresh, notice.as_deref())
+        render(&label, &fresh, notice.as_deref(), &names)
     };
     let shown_now: std::collections::BTreeSet<Digest32> =
         fresh[..shown].iter().map(|r| r.entry_hash).collect();
