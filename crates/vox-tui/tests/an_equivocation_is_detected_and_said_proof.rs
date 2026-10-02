@@ -135,7 +135,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a temp path is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -150,7 +152,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
 
 /// A stopped member's whole profile, copied: a second process of the same identity.
 fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
+    std::fs::create_dir_all(to).expect("APPARATUS: cannot make a directory");
     for e in std::fs::read_dir(from).unwrap() {
         let e = e.unwrap();
         let target = to.join(e.file_name());
@@ -158,7 +160,7 @@ fn copy_dir(from: &Path, to: &Path) {
         if kind.is_dir() {
             copy_dir(&e.path(), &target);
         } else if kind.is_file() {
-            std::fs::copy(e.path(), &target).unwrap();
+            std::fs::copy(e.path(), &target).expect("APPARATUS: cannot copy a staging file");
         }
         // A socket or a lock of the stopped process is not part of the profile.
     }
@@ -215,10 +217,10 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     // Four joins; 36 unlocks: five `vox id`s, twenty `trust add`s, nine daemon starts, the room
     // created, and carol's TUI.
     watchdog::arm_for_setup(4, 36);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: cannot make a directory");
         d
     };
     let (anchor_dir, alice_dir, bob_dir, carol_dir, eve_dir, frank_dir) = (
@@ -231,7 +233,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     );
     let (eve2_dir, frank2_dir) = (tmp.path().join("eve2"), tmp.path().join("frank2"));
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: cannot write a staging file");
 
     let port = free_udp_port();
     let listen = format!("127.0.0.1:{port}");
@@ -525,7 +527,12 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     // ---- the TUI says both, each on its own line, by carol's names for them (V210-66) ----------
     // Carol's real `vox tui`, on her stopped profile, in a pty (`tests/pty/tui_equivocation.py`).
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_equivocation.py");
-    let (data, cfg) = (carol_dir.to_str().unwrap(), carol_dir.join("cfg"));
+    let (data, cfg) = (
+        carol_dir
+            .to_str()
+            .expect("APPARATUS: a temp path is not UTF-8"),
+        carol_dir.join("cfg"),
+    );
     // The driver waits on the TUI's unlock.
     let out = pty_driver::run_for(
         script,
@@ -533,7 +540,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
             env!("CARGO_BIN_EXE_vox"),
             "eq",
             data,
-            cfg.to_str().unwrap(),
+            cfg.to_str().expect("APPARATUS: a temp path is not UTF-8"),
             "eq",
         ],
         watchdog::debug_cost(0, 1),

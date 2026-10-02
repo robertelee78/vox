@@ -194,7 +194,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .enable_all()
         .build()
         .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob", "carol"]));
     let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
     let r = room.id.as_str();
@@ -702,8 +702,9 @@ fn live(
     }));
     let project = fixture.join("project");
     let oc_cfg = fixture.join("config");
-    std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
-    std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
+    std::fs::create_dir_all(project.join(".opencode/plugin"))
+        .expect("APPARATUS: cannot make a directory");
+    std::fs::create_dir_all(oc_cfg.join("opencode")).expect("APPARATUS: cannot make a directory");
     // Vox's plugin, installed as a person installs it: it is what registers the session with
     // bob's daemon, and what relays the wake into it.
     let plugin = bob.vox(None, &["agent", "plugin", "opencode"]);
@@ -711,7 +712,8 @@ fn live(
         plugin.ok && plugin.stdout.contains("vox agent hook"),
         "CANNOT MEASURE: vox agent plugin opencode: {plugin:?}"
     );
-    std::fs::write(project.join(".opencode/plugin/vox.js"), &plugin.stdout).unwrap();
+    std::fs::write(project.join(".opencode/plugin/vox.js"), &plugin.stdout)
+        .expect("APPARATUS: cannot write a staging file");
     // The model answers in text only: a tool call would wait on a permission nobody grants.
     std::fs::write(
         project.join("opencode.json"),
