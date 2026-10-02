@@ -401,13 +401,91 @@ const COORDINATION: &[&str] = &[
     "pong",
 ];
 
+/// Who this session is, as far as the drain asks whether a row is **for** it (V030-18).
+struct Reader {
+    /// The names `to` may address it by: its session id, and `VOX_AGENT_NAME`, the petname it
+    /// answers to — as `vox room post` counts what is addressed to it.
+    names: Vec<String>,
+    /// The session id, which a handoff names in `data.to_session`.
+    session: String,
+    /// This node's fingerprint, which a handoff names in `data.to_fp`.
+    me: Option<Digest32>,
+    /// Every entry this session posted, which a reply names in `re`.
+    posted: std::collections::BTreeSet<Digest32>,
+    /// Every resource this session handed off, which a `decline` refusing it names.
+    handed_off: std::collections::BTreeSet<String>,
+}
+
+impl Reader {
+    /// `session` on this node, addressed by `names`, whose own entries are found in `room` (the
+    /// whole room when the caller has it, so a reply to an entry older than the cursor is still
+    /// known for one).
+    fn new(
+        names: Vec<String>,
+        session: &str,
+        me: Option<Digest32>,
+        room: &[vox_core::node::api::MessageRow],
+    ) -> Self {
+        let mut posted = std::collections::BTreeSet::new();
+        let mut handed_off = std::collections::BTreeSet::new();
+        for r in room.iter().filter(|r| me == Some(r.author)) {
+            let Ok(e) = vox_agentcomms::envelope::Envelope::parse(&r.text) else {
+                continue;
+            };
+            if e.from != session || e.from.is_empty() {
+                continue;
+            }
+            posted.insert(r.entry_hash);
+            if e.kind == vox_agentcomms::claim::HANDOFF {
+                if let Some(res) = e.data.get("resource").and_then(|v| v.as_str()) {
+                    handed_off.insert(res.to_owned());
+                }
+            }
+        }
+        Self {
+            names,
+            session: session.to_owned(),
+            me,
+            posted,
+            handed_off,
+        }
+    }
+
+    /// Whether `e` is for this session, by any field that can say so:
+    /// - `to` names it;
+    /// - it is a handoff reserved for it: `data.to_fp` is this node and `data.to_session`
+    ///   is this session, or names none (any session of this harness may take it);
+    /// - its `re` answers an entry this session posted (a `result`, `accept` or `decline`
+    ///   answering its `assign`, an `answer` to its `ask`);
+    /// - it is a `decline` of a handoff this session made.
+    ///
+    /// `claim`, `release` and `renew` name no one: they are the poster's own holding, and what
+    /// they change for this session is said by the lost-claims notice, not by the row.
+    fn addressed_by(&self, e: &vox_agentcomms::envelope::Envelope) -> bool {
+        let data = |k: &str| e.data.get(k).and_then(serde_json::Value::as_str);
+        let handoff_to_me = e.kind == vox_agentcomms::claim::HANDOFF
+            && self.me.is_some()
+            && data("to_fp").and_then(vox_agentcomms::claim::from_b32) == self.me
+            && data("to_session").is_none_or(|s| s.is_empty() || s == self.session);
+        let answers_mine =
+            e.re.as_deref()
+                .and_then(|re| b32_decode(re.trim(), "re").ok())
+                .is_some_and(|re| self.posted.contains(&re));
+        let declines_mine = e.kind == vox_agentcomms::envelope::work::DECLINE
+            && data("resource").is_some_and(|r| self.handed_off.contains(r));
+        self.names.iter().any(|n| e.is_addressed_to(n))
+            || handoff_to_me
+            || answers_mine
+            || declines_mine
+    }
+}
+
 /// The coordination type of `row` when the drain counts it rather than shows it (V030-18):
-/// coordination traffic not addressed to this session. `None` means it goes in full —
-/// anything addressed to `names`, prose, and anything that does not parse.
-fn chatter_kind(row: &vox_core::node::api::MessageRow, names: &[String]) -> Option<String> {
+/// coordination traffic that is not for this session ([`Reader::addressed_by`]). `None` means
+/// it goes in full — anything for this session, prose, and anything that does not parse.
+fn chatter_kind(row: &vox_core::node::api::MessageRow, reader: &Reader) -> Option<String> {
     let e = vox_agentcomms::envelope::Envelope::parse(&row.text).ok()?;
-    (!names.iter().any(|n| e.is_addressed_to(n)) && COORDINATION.contains(&e.kind.as_str()))
-        .then_some(e.kind)
+    (COORDINATION.contains(&e.kind.as_str()) && !reader.addressed_by(&e)).then_some(e.kind)
 }
 
 /// Render the messages an agent has not seen, for injection into its context, and
@@ -455,14 +533,14 @@ fn render(
     room_label: &str,
     rows: &[vox_core::node::api::MessageRow],
     notice: Option<&str>,
-    names: &[String],
+    reader: &Reader,
 ) -> (String, usize) {
     let mut body = String::new();
     let mut shown = 0usize;
     let mut full = 0usize;
     let mut chatter = std::collections::BTreeMap::<String, usize>::new();
     for r in rows {
-        if let Some(kind) = chatter_kind(r, names) {
+        if let Some(kind) = chatter_kind(r, reader) {
             *chatter.entry(kind).or_default() += 1;
             shown += 1;
             continue;
@@ -866,7 +944,11 @@ async fn drain(
     let (text, shown) = if fresh.is_empty() {
         (String::new(), 0)
     } else {
-        render(&label, &fresh, notice.as_deref(), &names)
+        // A reply may answer an entry older than the cursor: the whole room is read for this
+        // session's own entries when the coordination snapshot was, and this read when not.
+        let whole = snap.as_ref().map_or(&rows[..], |s| &s.rows[..]);
+        let reader = Reader::new(names.clone(), &input.session_id, me, whole);
+        render(&label, &fresh, notice.as_deref(), &reader)
     };
     let shown_now: std::collections::BTreeSet<Digest32> =
         fresh[..shown].iter().map(|r| r.entry_hash).collect();
