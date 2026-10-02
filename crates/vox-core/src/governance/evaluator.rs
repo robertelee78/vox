@@ -707,7 +707,10 @@ impl<'a> Resolver<'a> {
             let issuer_authority = before.authority.get(&c.body.issuer_id);
             let issuer_superset =
                 issuer_authority.is_some_and(|ic| c.body.capability_set.is_within(ic));
-            issuer_ok.insert(e.entry_hash, unexpired && in_effect && issuer_superset);
+            // Only the room's creator names admins (#319): a certificate any
+            // other member issued confers nothing, whatever that member holds.
+            let by_creator = c.body.issuer_id == self.root_admin;
+            issuer_ok.insert(e.entry_hash, unexpired && in_effect && issuer_superset && by_creator);
 
             // Removal-wins: killed iff some authorized revocation of this delegate's
             // lineage is NOT causally-before this delegation (concurrent or after).
