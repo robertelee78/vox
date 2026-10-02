@@ -1324,6 +1324,7 @@ pub async fn trust_add(
     }
     println!("vox: trusting {} as {petname:?}", short(&target));
     println!("     it may now read what you write in every room you share — now and later");
+    println!("     and you read what it writes, once it trusts you too");
     println!("     and reach every service you bind to a room you are both in");
     println!("     `vox trust remove` undoes it and changes the lock everywhere");
     Ok(())

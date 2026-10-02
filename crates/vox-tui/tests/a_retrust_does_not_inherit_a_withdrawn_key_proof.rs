@@ -215,6 +215,10 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
         );
         assert!(ok, "PRODUCT (staging): a join failed: {err}");
     }
+    // Bob trusts carol from the start: a node reads only whom its owner trusts (V210-118), so
+    // what this measures is carol's decision alone.
+    let (ok, _, err) = vox(bob_dir, &["trust", "add", &fps[2], "--name", "carol"], None);
+    assert!(ok, "bob trusts carol: {err}");
     // Both hold the room and each other's admission before carol decides anything.
     let (ok, _, err) = vox(
         carol_dir,

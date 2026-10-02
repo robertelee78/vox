@@ -34,7 +34,18 @@
 //! - Drop the late-grind check in `run_initiator` (the old report): case 2 red, bob is told no
 //!   member could be reached.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    a_joiner_slower_than_the_old_patience_gets_in,
+    a_joiner_slower_than_the_patience_is_told_why
+);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -251,8 +262,9 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "a grind floored at 150s, production Argon2id and a real anchor; CI runs it in release"]
+#[ignore = "a grind floored at 150s, production Argon2id and a real anchor; optional, run it in release"]
 fn a_joiner_slower_than_the_old_patience_gets_in() {
     test_knobs::require(&["VOX_TEST_SOLVE_AT_LEAST_MS"]);
     watchdog::arm();
@@ -299,8 +311,9 @@ fn a_joiner_slower_than_the_old_patience_gets_in() {
     );
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "a grind floored at 485s, production Argon2id and a real anchor; CI runs it in release"]
+#[ignore = "a grind floored at 485s, production Argon2id and a real anchor; optional, run it in release"]
 fn a_joiner_slower_than_the_patience_is_told_why() {
     test_knobs::require(&["VOX_TEST_SOLVE_AT_LEAST_MS"]);
     watchdog::arm();

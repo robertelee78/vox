@@ -1,5 +1,5 @@
 //! V210-71 (#262), finding 4 — **a room of many members keeps answering its own member while it
-//! syncs**, through the shipped binary. Opt-in (`--features heavy-proofs`): its staging joins
+//! syncs**, through the shipped binary. Opt-in (`--features optional-proofs`): its staging joins
 //! [`MEMBERS`] identities, which takes minutes, so it is not part of every CI run.
 //!
 //! **The defect.** Every outbound sync session starts by fetching the room's records from the
@@ -42,7 +42,15 @@
 //! **Mutation that must turn it red.** `admit_board_records` back to its old shape: the room's lock
 //! held across verifying every record on the board, admitted or not.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_room_of_many_members_syncs_without_holding_its_lock);
 
 #[path = "support/sync_pair.rs"]
 mod sync_pair;
@@ -68,8 +76,9 @@ const MIN_SESSIONS: u64 = 10;
 /// 121-681 ms without. See the module docs for the margin on each side.
 const P90_BOUND: Duration = Duration::from_millis(75);
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "opt-in heavy proof: stages a room of many members through the shipped binary"]
+#[ignore = "optional proof: stages a room of many members through the shipped binary"]
 fn a_room_of_many_members_syncs_without_holding_its_lock() {
     // Staging [`MEMBERS`] joins takes minutes, past the default 600 s watchdog (ADR-018 §6) on a
     // loaded machine; this opt-in proof takes a budget of its own unless one is set.

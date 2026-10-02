@@ -255,6 +255,9 @@ pub enum KeyRefusal {
     NotAccepted = 0x23,
     /// The hello in front of the key was not accepted, so the key behind it was never read.
     HelloRefused = 0x24,
+    /// The key opened, but its owner has not trusted the member it came from, so this node does
+    /// not read that member (V210-118). Sent again, and taken, once its owner trusts it.
+    NotTrusted = 0x25,
 }
 
 impl KeyRefusal {
@@ -272,6 +275,7 @@ impl KeyRefusal {
             0x22 => "the key did not open under the session it holds".into(),
             0x23 => "the room would not take the key".into(),
             0x24 => "its hello was not accepted".into(),
+            0x25 => "its owner has not trusted us, so it does not read us yet".into(),
             0x05 => "refused at accept: it may not take a key from us yet".into(),
             other => format!("reset with code {other}"),
         }
@@ -288,16 +292,26 @@ impl KeyRefusal {
 /// within `patience`) counts as not taken. Sending a key twice is harmless; never sending it
 /// leaves a member unable to read. Awaited on its own task, never on the actor: the answer
 /// comes after the recipient's actor has handled the key.
-pub async fn refused(mut recv: quinn::RecvStream, patience: std::time::Duration) -> Option<String> {
+pub async fn refused(recv: quinn::RecvStream, patience: std::time::Duration) -> Option<String> {
+    refusal(recv, patience).await.map(|(why, _)| why)
+}
+
+/// [`refused`], and whether the recipient **answered**: `true` for a refusal it made (a reset with
+/// a code, or a wrong byte), `false` when the key never reached a decision (the connection lost,
+/// the stream ended unanswered, no answer in time).
+pub async fn refusal(
+    mut recv: quinn::RecvStream,
+    patience: std::time::Duration,
+) -> Option<(String, bool)> {
     let mut byte = [0u8; 1];
     match tokio::time::timeout(patience, recv.read_exact(&mut byte)).await {
         Ok(Ok(())) if byte[0] == KEY_TAKEN => None,
-        Ok(Ok(())) => Some(format!("answered {}", byte[0])),
+        Ok(Ok(())) => Some((format!("answered {}", byte[0]), true)),
         Ok(Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)))) => {
-            Some(KeyRefusal::describe(code.into_inner()))
+            Some((KeyRefusal::describe(code.into_inner()), true))
         }
-        Ok(Err(e)) => Some(e.to_string()),
-        Err(_) => Some(format!("no answer within {}s", patience.as_secs())),
+        Ok(Err(e)) => Some((e.to_string(), false)),
+        Err(_) => Some((format!("no answer within {}s", patience.as_secs()), false)),
     }
 }
 

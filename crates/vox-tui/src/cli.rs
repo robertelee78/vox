@@ -844,8 +844,12 @@ enum AgentCmd {
     /// A skill is on-demand only, so it cannot be what guarantees an agent reads
     /// its room — that is `vox agent hook`'s job. This carries what a hook cannot.
     ///
+    /// Install it at **user scope**, beside the hook `vox agent plugin claude` puts in
+    /// `~/.claude/settings.json`, so a session opened in any repository has both:
+    ///
     /// ```text
-    /// vox agent skill > .claude/skills/vox-agent-comms/SKILL.md
+    /// mkdir -p ~/.claude/skills/vox-agent-comms
+    /// vox agent skill > ~/.claude/skills/vox-agent-comms/SKILL.md
     /// ```
     Skill,
     /// Trust Vox's drain hook in a harness that gates hooks on trust. Only Codex
@@ -1861,14 +1865,24 @@ pub fn run() -> ExitCode {
                 args.passphrase_file.clone(),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
+                // Not `eprintln!`: after a hangup stderr can be a terminal that is gone, and a
+                // write that fails there must not turn the reason into a panic.
                 Err(e) => {
-                    eprintln!("vox: {e}");
-                    ExitCode::FAILURE
+                    use std::io::Write as _;
+                    let _ = writeln!(io::stderr(), "vox: {e}");
+                    e.exit_code()
                 }
             }
         }
         Cmd::Agent(AgentCmd::Skill) => {
             print!("{}", crate::agent_hook::AGENT_SKILL);
+            // Where it goes, on stderr so it does not land in the file (V210-121): user scope,
+            // beside the hook in `~/.claude/settings.json`, so every repository gets both.
+            eprintln!(
+                "vox: install at user scope, beside the hook in ~/.claude/settings.json: \
+                 mkdir -p ~/.claude/skills/vox-agent-comms && vox agent skill > \
+                 ~/.claude/skills/vox-agent-comms/SKILL.md"
+            );
             ExitCode::SUCCESS
         }
         Cmd::Agent(AgentCmd::Trust(args)) => match args.harness.to_ascii_lowercase().as_str() {
@@ -1928,9 +1942,11 @@ pub fn run() -> ExitCode {
                      \"vox agent hook\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
                 );
                 eprintln!(
-                    "vox: merge that into ~/.claude/settings.json, or .claude/settings.json \
-                     in a project.\n     Set VOX_ROOM in the session's environment, or pass \
-                     --room to the hook, so it knows which room to drain."
+                    "vox: merge that into ~/.claude/settings.json (user scope, so a session \
+                     opened in any repository drains its room), and install the skill beside \
+                     it: vox agent skill > ~/.claude/skills/vox-agent-comms/SKILL.md\n     Set \
+                     VOX_ROOM in the session's environment, or pass --room to the hook, so it \
+                     knows which room to drain."
                 );
                 ExitCode::SUCCESS
             }

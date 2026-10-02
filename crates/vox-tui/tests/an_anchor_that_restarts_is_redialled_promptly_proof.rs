@@ -37,6 +37,13 @@
 
 #![cfg(unix)]
 
+// One test here is optional (decider, 2026-10-01): the one named below. CI only compiles it, and
+// without `--features optional-proofs` a stand-in says it was not run
+// (`support/optional_proof.rs`; docs/release/optional-proofs.md). The rest block.
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_connection_held_only_through_the_stopped_anchor_says_so);
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -316,7 +323,7 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
     );
 }
 
-/// **What else a relay's stop ends** (V210-93; opt-in, `--features heavy-proofs`). The forward
+/// **What else a relay's stop ends** (V210-93; optional, `--features optional-proofs`). The forward
 /// also names its host as an anchor (`--anchor`): the families are split, so its only path to the
 /// host is a circuit through the anchor that is stopped (SIGTERM). The forward must say the anchor
 /// stopped, and of its host — still running — that the connection went because its path ran
@@ -331,9 +338,9 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
 ///
 /// Mutation: the relay's stop not carried to the connections over its circuits (the reason left to
 /// the probe) → red on the host's line, with the probe's verdict.
-#[cfg(feature = "heavy-proofs")]
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "opt-in proof: real binaries, production Argon2id and a PoW; run with --features heavy-proofs"]
+#[ignore = "real binaries, production Argon2id and a PoW; optional, run it in release"]
 fn a_connection_held_only_through_the_stopped_anchor_says_so() {
     let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false, true);
     let anchor = anchor_id(&w);
