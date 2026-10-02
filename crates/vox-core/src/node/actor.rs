@@ -782,6 +782,9 @@ enum NetEvent {
         chain_id: u64,
         /// What the recipient's side said.
         why: String,
+        /// Whether the recipient answered (a refusal it made), rather than the key being lost
+        /// on its way (see `pairwise_stream::refused`).
+        answered: bool,
         /// The serial of the session the key was sealed under (V210-78).
         session: Option<u64>,
         /// Whether it was one of the keys of the history `peer` was owed.
@@ -1418,6 +1421,7 @@ async fn write_pairwise_jobs(
                     peer,
                     chain_id,
                     why: e.to_string(),
+                    answered: false,
                     session,
                     history,
                     epoch,
@@ -1459,12 +1463,13 @@ fn watch_delivery(tx: mpsc::Sender<NetEvent>, sent: quinn::RecvStream, w: Watche
         epoch,
     } = w;
     tokio::spawn(async move {
-        let event = match crate::node::pairwise_stream::refused(sent, KEY_DELIVERY_PATIENCE).await {
-            Some(why) => NetEvent::SkdmRefused {
+        let event = match crate::node::pairwise_stream::refusal(sent, KEY_DELIVERY_PATIENCE).await {
+            Some((why, answered)) => NetEvent::SkdmRefused {
                 channel_id,
                 peer: target,
                 chain_id,
                 why,
+                answered,
                 session,
                 history,
                 epoch,
@@ -4897,6 +4902,7 @@ impl Node {
                 peer,
                 chain_id,
                 why,
+                answered,
                 session,
                 history,
                 epoch,
@@ -4967,6 +4973,20 @@ impl Node {
                     self.accepted_hello.remove(&key);
                     self.reopen.remove(&key);
                     self.session_serial.remove(&key);
+                }
+                // **Lost, not refused** (V210-80): the key never reached the member's decision —
+                // its connection closed under it (a tie-break retiring one of two crossed
+                // connections does exactly that), or no answer came. Nothing says the member
+                // would refuse it, so it is resent on the next tick over the connection held
+                // then, with no backoff. A backoff here held two members who had just connected
+                // 2 s and then 4 s more, seen through the shipped binary as a read at 6.2 s.
+                if !answered {
+                    let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                        channel_id,
+                        peer,
+                        why,
+                    });
+                    return;
                 }
                 // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
                 // from the board) is retried promptly, and one that does not stops costing a
