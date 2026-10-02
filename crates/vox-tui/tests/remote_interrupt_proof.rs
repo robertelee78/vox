@@ -46,7 +46,9 @@
 //!    is sent for it, and the daemon says it was already read;
 //! 4. a wedged session (an OpenCode plugin's wake socket, registered by `vox agent hook
 //!    --session` with `VOX_OPENCODE_WAKE_SOCKET`/`_TOKEN`, that accepts and never answers) does
-//!    not stall bob's wakes.
+//!    not stall bob's wakes;
+//! 9. **a notice that is not taken stays owed**: a plugin socket that refuses the first prompt
+//!    gets the notice again once the hold (the profile's `agent_wake_hold`, here 6 s) has passed.
 //!
 //! `an_idle_agent_is_told_when_a_reply_to_it_is_waiting` (V030-20): bob's session `asker` asks
 //! alice something, and alice answers (`--re`), each answer carrying a canary. The schedule is
@@ -63,7 +65,10 @@
 //! 6. the turn that notice starts reads each answer **once**; and an answer the session read
 //!    before going idle again is **never announced**;
 //! 7. `SessionEnd` removes the registration: a later answer wakes nothing;
-//! 8. `vox agent plugin claude` prints the `UserPromptSubmit`, `Stop` and `SessionEnd` entries.
+//! 8. `vox agent plugin claude` prints the `UserPromptSubmit`, `Stop` and `SessionEnd` entries;
+//! 9. **what lands while the daemon is down is announced when it starts**: bob's daemon stopped,
+//!    alice answers an idle session's question and sends it an urgent message; once the daemon
+//!    is back, both are counted in a notice.
 //!
 //! (8) of the first test: sixty older messages and one urgent, more than one turn's 50: the turn
 //! the wake starts shows the urgent one first and 49 others, a second urgent wake counts only the
@@ -179,6 +184,12 @@ fn registered_endpoint(bob: &Worker, session: &str) -> (String, String) {
     )
 }
 
+/// `w` posts `text` exactly as given, through `vox room post <room> -` on its daemon.
+fn post_text(w: &Worker, room: &str, text: &str) {
+    let o = w.vox_in(None, &["room", "post", room, "-"], Some(text));
+    assert!(o.ok, "APPARATUS: {} could not post: {o:?}", w.name);
+}
+
 /// Alice posts `text` exactly as given, through `vox room post <room> -` on her daemon.
 fn post(alice: &Worker, room: &str, text: &str) {
     let o = alice.vox_in(None, &["room", "post", room, "-"], Some(text));
@@ -211,6 +222,41 @@ fn contents(frames: &[String]) -> Vec<String> {
         .filter(|v| v["type"] == "user")
         .filter_map(|v| v["message"]["content"].as_str().map(str::to_owned))
         .collect()
+}
+
+/// A stand-in for the Vox OpenCode plugin's wake socket that **refuses** its first `refuse`
+/// prompts, as the plugin does when OpenCode will not take one (`{"error":…}`, not gone), and
+/// takes the rest. Each prompt's text, when it arrived, and whether it was taken.
+fn flaky(path: &std::path::Path, refuse: usize) -> mpsc::Receiver<(Instant, String, bool)> {
+    use std::io::{BufRead as _, Write as _};
+    let listener = UnixListener::bind(path).expect("bind the stand-in plugin socket");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for (n, stream) in listener.incoming().enumerate() {
+            let Ok(stream) = stream else { continue };
+            let mut reader = std::io::BufReader::new(&stream);
+            let (mut auth, mut prompt) = (String::new(), String::new());
+            if reader.read_line(&mut auth).is_err() || reader.read_line(&mut prompt).is_err() {
+                continue;
+            }
+            let text = serde_json::from_str::<serde_json::Value>(prompt.trim())
+                .ok()
+                .and_then(|v| v["text"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let taken = n >= refuse;
+            let answer = if taken {
+                r#"{"ok":true}"#
+            } else {
+                r#"{"error":"the session would not take it"}"#
+            };
+            let _ = writeln!(&stream, "{answer}");
+            eprintln!("[receipt] the plugin socket got (taken {taken}): {text}");
+            if tx.send((Instant::now(), text, taken)).is_err() {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 /// The next notice `inbox` receives within `within`, and when it arrived.
@@ -670,6 +716,77 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         ),
     );
 
+    // ---- (9) a notice that does not arrive stays owed, and is sent again after the hold ----
+    // The hold is the profile's own setting, shortened to 6 s (its default is 10 minutes).
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(bob.paths.config_file())
+            .expect("APPARATUS: open bob's settings file");
+        writeln!(f, "\nagent_wake_hold = 6s").unwrap();
+    }
+    let flaky_path = tmp.path().join("flaky.sock");
+    let attempts = flaky(&flaky_path, 1);
+    let flaky_s = flaky_path.to_string_lossy().into_owned();
+    hook(
+        bob,
+        &[
+            ("VOX_OPENCODE_WAKE_SOCKET", flaky_s.as_str()),
+            ("VOX_OPENCODE_WAKE_TOKEN", "flaky-token"),
+            ("VOX_AGENT_NAME", "flaky"),
+        ],
+        &[
+            "agent",
+            "hook",
+            "--room",
+            &room,
+            "--session",
+            "session-flaky",
+        ],
+        None,
+    );
+    assert_eq!(
+        registered_endpoint(bob, "session-flaky"),
+        ("opencode".to_owned(), flaky_s.clone()),
+        "APPARATUS: session-flaky must be registered at the test's own socket"
+    );
+    post(
+        alice,
+        &room,
+        r#"{"v":1,"type":"ask","to":["flaky"],"urgent":true,"body":"flaky: CANARY-RETRY"}"#,
+    );
+    let Ok(refused) = attempts.recv_timeout(Duration::from_secs(30)) else {
+        panic!(
+            "APPARATUS (9): the urgent message never reached session-flaky's socket, so its \
+             refusal was never staged; bob's daemon:\n{}",
+            bob_err()
+        );
+    };
+    let retried = attempts.recv_timeout(Duration::from_secs(30)).ok();
+    let gap = retried.as_ref().map(|r| (r.0 - refused.0).as_secs_f64());
+    println!(
+        "[proof] (9) the first notice was refused; tried again {}s later, taken {}; the daemon \
+         said it stays owed: {}",
+        gap.map_or("never".to_owned(), |g| format!("{g:.1}")),
+        retried.as_ref().is_some_and(|r| r.2),
+        bob_err().contains("it stays owed")
+    );
+    check(
+        &mut failures,
+        retried.as_ref().is_some_and(|r| {
+            r.2 && r.1.contains("1 urgent message addressed to you from alice")
+                && !r.1.contains("CANARY-RETRY")
+        }) && gap.is_some_and(|g| g >= 5.5),
+        format!(
+            "PRODUCT (9): a notice that was not taken must stay owed and be sent again once the \
+             6 s hold has passed; refused at once, then {:?} after {gap:?} s; bob's daemon:\n{}",
+            retried.map(|r| r.1),
+            bob_err()
+        ),
+    );
+
     assert!(
         failures.is_empty(),
         "{} claim(s) failed:\n- {}",
@@ -938,6 +1055,91 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         format!(
             "PRODUCT (7): SessionEnd must print nothing and remove the registration, and a \
              later answer must wake nothing; printed {end:?}, gone {gone}, got {ended:?}"
+        ),
+    );
+
+    // ---- (9) what lands while the daemon is down is announced when it starts ----
+    let late_path = tmp.path().join("late.sock");
+    let late_inbox = listen(&late_path);
+    let late_s = late_path.to_string_lossy().into_owned();
+    let late_env = [
+        ("CLAUDE_CODE_MESSAGING_SOCKET", late_s.as_str()),
+        ("CLAUDE_CODE_MESSAGING_TOKEN", "late-token"),
+        ("VOX_AGENT_NAME", "late"),
+    ];
+    let late = |w: &Worker, name: &str| {
+        hook(
+            w,
+            &late_env,
+            &["agent", "hook", "--room", &room],
+            Some(&hook_json(
+                name,
+                "late",
+                (name == "UserPromptSubmit").then_some("hi"),
+            )),
+        )
+    };
+    let _ = late(&r.workers[1], "UserPromptSubmit");
+    let o = r.workers[1].vox_in(
+        Some("late"),
+        &[
+            "room", "post", &room, "--type", "ask", "--to", "alice", "--json", "-",
+        ],
+        Some("Is the late build out?"),
+    );
+    assert!(o.ok, "APPARATUS: late could not post its question: {o:?}");
+    let q2 = o.json()["entry_hash"]
+        .as_str()
+        .expect("`vox room post --json` names the entry")
+        .to_owned();
+    until(
+        &r.workers[0],
+        None,
+        "late's question to reach alice",
+        &["room", "read", &room],
+        |o| o.stdout.contains("Is the late build out?"),
+    );
+    let _ = late(&r.workers[1], "Stop");
+    r.stop(1);
+    let o = r.workers[0].vox_in(
+        Some("alice-s"),
+        &["room", "post", &room, "--type", "answer", "--re", &q2, "-"],
+        Some("CANARY-START-R: it is out"),
+    );
+    assert!(
+        o.ok,
+        "APPARATUS: alice could not answer while bob was down: {o:?}"
+    );
+    post_text(
+        &r.workers[0],
+        &room,
+        r#"{"v":1,"type":"ask","to":["late"],"urgent":true,"body":"late: CANARY-START-U"}"#,
+    );
+    // Long enough for both to reach the anchor, from which bob's node takes them when it starts.
+    std::thread::sleep(Duration::from_secs(3));
+    let started = Instant::now();
+    r.restart(1);
+    let up = started.elapsed().as_secs_f64();
+    let frames = collect(&late_inbox, Duration::from_secs(20), |g| {
+        g.contains("urgent message") && g.contains("repl")
+    });
+    let told = contents(&frames).join("\n");
+    println!(
+        "[proof] (9) after a restart ({up:.1}s to come back): urgent counted {}, reply counted {}, \
+         message bytes at the socket {}",
+        told.contains("urgent message addressed to you from alice"),
+        told.contains("repl"),
+        frames.join("\n").contains("CANARY-START")
+    );
+    check(
+        &mut failures,
+        told.contains("urgent message addressed to you from alice")
+            && told.contains("repl")
+            && !frames.join("\n").contains("CANARY-START"),
+        format!(
+            "PRODUCT (9): an urgent message and a reply that landed while the daemon was down \
+             must be announced once it is back; got {told:?}; bob's daemon:\n{}",
+            bob_err()
         ),
     );
 
