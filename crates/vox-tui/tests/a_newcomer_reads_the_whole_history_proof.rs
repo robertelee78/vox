@@ -26,8 +26,10 @@
 //! **Asserted:** bob's paged read shows every `post <i>` text, **each once and in order**, within
 //! 300 s of his join. Two arms: [`a_newcomer_reads_a_short_history_once_each_in_order`] (60 posts
 //! read 25 to a page) **blocks**; [`a_newcomer_trusted_before_every_post_reads_all_of_them`] (1,500
-//! posts read 500 to a page, across the rotation at 1,000) is **optional** for its staging time. Precondition, or `CANNOT MEASURE`: alice's own paged read shows all 1,500,
-//! and bob renders alice's post made *after* his join (so his log and his key did arrive).
+//! posts read 500 to a page, across the rotation at 1,000) is **optional** for its staging time.
+//! Alice's own paged read must show every post she made once each in order, or it is a `PRODUCT`
+//! red: each was accepted. The one precondition, or `CANNOT MEASURE`: bob renders alice's post made
+//! *after* his join (so his log and his key did arrive).
 //!
 //! **Every participant is the shipped binary.** Nothing in this process runs a node, opens a
 //! store or speaks a wire protocol; each step is a `vox` process with its own
