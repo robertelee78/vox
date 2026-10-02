@@ -238,6 +238,7 @@ const MID: usize = 5_000;
 
 /// **Optional** (`--features optional-proofs`): a room of this many posts from one author, past
 /// 65,536, where any 16-bit count or index would wrap. Staging alone takes most of an hour.
+#[cfg(feature = "optional-proofs")]
 const LARGE: usize = 100_000;
 
 #[test]
