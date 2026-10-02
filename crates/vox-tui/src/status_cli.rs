@@ -155,28 +155,21 @@ fn render(v: &Value) -> String {
         "  relaying {} circuit(s) for others",
         v.get("relaying").and_then(Value::as_u64).unwrap_or(0)
     );
+    // **One listing of tunnels** (V210-81): each live tunnel once, from the node's one list,
+    // whichever way it was opened. A forward is listed apart: it is a door, not a tunnel.
     let _ = writeln!(o, "\ntunnels");
-    for t in arr("tunnels_served") {
+    // Every live tunnel, with how long since it last moved a byte (V210-81).
+    tunnels(v, &mut o);
+    for t in arr("forwards") {
         let _ = writeln!(
             o,
-            "  serving {} to {} (room {})",
-            s(t, "service"),
-            short(s(t, "client")),
-            short(s(t, "room"))
-        );
-    }
-    for t in arr("tunnels_dialed") {
-        let _ = writeln!(
-            o,
-            "  forwarding {} to {}'s {} (room {})",
+            "  forward {} to {}'s {} (room {})",
             s(t, "local"),
             short(s(t, "host")),
             s(t, "service"),
             short(s(t, "room"))
         );
     }
-    // Every live tunnel, with how long since it last moved a byte (V210-81).
-    tunnels(v, &mut o);
     let d = &v["datagrams"];
     let a = &v["app"];
     let n = |x: &Value, k: &str| x.get(k).and_then(Value::as_u64).unwrap_or(0);
