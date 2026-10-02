@@ -21,12 +21,41 @@
 #   7. teardown  after everything stops, no utun the proof made exists and no route to
 #                the room's /24 or /64 remains (`ifconfig -l` and `netstat -rn` diffs).
 #
-# Run it, from the repository, as:
+# ## Run it (one command, from the repository)
 #
-#     cargo build --release -p vox-tui
 #     sudo scripts/family-lan-proof.sh
 #
-# or `sudo scripts/family-lan-proof.sh /path/to/vox` for another binary.
+# It builds `target/release/vox` first, as you (never as root), and takes a few minutes:
+# production Argon2id on four profiles and a real proof of work per join. Or give it a binary:
+# `sudo scripts/family-lan-proof.sh /path/to/vox`. Without sudo, `scripts/family-lan-proof.sh
+# --preflight` runs every step before the root one (the room, three members, the joins) and
+# stops there: it needs no root and makes no interface.
+#
+# Every line it prints also goes to a log, `family-lan-proof.log` in its temporary directory,
+# whose path it prints last: paste that file back. It holds test passphrases and the run's
+# fingerprints only, never anything of your own profile.
+#
+# Each claim prints `PASS` or `FAIL`, and a FAIL names its side:
+# - `PRODUCT` — vox did the wrong thing (the line quotes what it did and the counters);
+# - `CANNOT MEASURE` — the run could not stage the claim (a setup step that is not the claim
+#   failed, quoted), so it proves nothing either way;
+# - `APPARATUS` — the script stopped on an error of its own before every claim ran.
+# The last line is `RESULT: PASS` only if every claim passed.
+#
+# ## Undo
+#
+# Nothing to undo after it ends, however it ends (normally, Ctrl-C, the terminal closing, an
+# error): a trap stops everything it started, by PID, and the utun interfaces go away with
+# the helper that made them. Teardown then compares `ifconfig -l` and `netstat -rn` with
+# what they were before and FAILs if anything of the proof's is left. If it was killed
+# outright (`kill -9`, a power cut), the leftovers are:
+# - `vox` processes it started: `pgrep -lf 'vox lan|vox node'`, then `kill <pid>` each;
+# - a utun interface: it is removed when the process holding it exits, so the step above
+#   removes it (`ifconfig -l` shows what exists);
+# - a route to the room's /24 or /64, if one outlived its interface: `sudo route -n delete
+#   -net <subnet>` (teardown prints the subnet);
+# - the temporary directory it printed: `rm -rf` it.
+# It never touches your own vox profile (~/Library/Application Support/vox).
 #
 # What runs as root, and why: `vox lan helper` (it creates the utun interfaces — that is
 # its whole job) and this script's own bookkeeping (killing what it started, `ifconfig`
@@ -48,27 +77,58 @@
 
 set -uo pipefail
 
-if [[ $EUID -ne 0 ]]; then
-    echo "run it with sudo: sudo $0 ${*:-}" >&2
-    exit 2
-fi
-if [[ -z ${SUDO_USER:-} || $SUDO_USER == root ]]; then
-    echo "run it with sudo from your own account (it needs SUDO_USER to run the nodes as you)" >&2
-    exit 2
+PREFLIGHT=0
+if [[ ${1:-} == --preflight ]]; then
+    PREFLIGHT=1
+    shift
 fi
 if [[ $(uname) != Darwin ]]; then
     echo "this proof is for macOS (utun); the Linux device is not built yet" >&2
     exit 2
 fi
+if [[ $PREFLIGHT == 1 ]]; then
+    # Everything before the root step, as you: no sudo anywhere.
+    [[ $EUID -ne 0 ]] || { echo "--preflight runs without sudo" >&2; exit 2; }
+    RUN_AS=$(id -un)
+    # `env` runs the command as it is; an empty array is "unbound" to bash 3.2 under set -u.
+    AS_USER=(env)
+else
+    if [[ $EUID -ne 0 ]]; then
+        echo "run it with sudo: sudo $0 ${*:-}   (or $0 --preflight, without root)" >&2
+        exit 2
+    fi
+    if [[ -z ${SUDO_USER:-} || $SUDO_USER == root ]]; then
+        echo "run it with sudo from your own account (it needs SUDO_USER to run the nodes as you)" >&2
+        exit 2
+    fi
+    RUN_AS=$SUDO_USER
+    AS_USER=(sudo -u "$SUDO_USER")
+fi
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-VOX=${1:-$REPO/target/release/vox}
 PY=/usr/bin/python3
-[[ -x $VOX ]] || { echo "no vox binary at $VOX — cargo build --release -p vox-tui" >&2; exit 2; }
 [[ -x $PY ]] || { echo "no $PY (install the Xcode command line tools)" >&2; exit 2; }
+if [[ -n ${1:-} ]]; then
+    VOX=$1
+else
+    VOX=$REPO/target/release/vox
+    # Built as you, never as root: a root-owned target/ would break your next cargo build.
+    echo "building $VOX as $RUN_AS (cargo build --release -p vox-tui)"
+    if [[ $PREFLIGHT == 1 ]]; then
+        (cd "$REPO" && cargo build --release -p vox-tui) || { echo "the build failed" >&2; exit 2; }
+    else
+        sudo -u "$SUDO_USER" -i bash -c "cd '$REPO' && cargo build --release -p vox-tui" \
+            || { echo "the build failed" >&2; exit 2; }
+    fi
+fi
+[[ -x $VOX ]] || { echo "no vox binary at $VOX" >&2; exit 2; }
 
-AS_USER=(sudo -u "$SUDO_USER")
 WORK=$("${AS_USER[@]}" mktemp -d /tmp/vox-lan-proof.XXXXXX)
+LOG=$WORK/family-lan-proof.log
+# Everything printed from here on also goes to the log to paste back.
+exec > >(tee -a "$LOG") 2>&1
+echo "family-lan-proof: $(date -u +%Y-%m-%dT%H:%M:%SZ), $(sw_vers -productName) $(sw_vers -productVersion), $("$VOX" --version 2>/dev/null)"
+[[ $PREFLIGHT == 1 ]] && echo "PREFLIGHT: every step before the root one, as $RUN_AS; no interface is made"
 IDENTITY="lan proof identity"
 PIDS=()
 IFACES=()
@@ -78,7 +138,12 @@ TORN_DOWN=0
 
 say() { printf '\n== %s\n' "$*"; }
 pass() { RESULTS+=("PASS  $*"); printf 'PASS  %s\n' "$*"; }
-fail() { RESULTS+=("FAIL  $*"); printf 'FAIL  %s\n' "$*"; FAILED=1; }
+# A claim vox got wrong.
+fail() { RESULTS+=("FAIL  PRODUCT: $*"); printf 'FAIL  PRODUCT: %s\n' "$*"; FAILED=1; }
+# A step the claims stand on that could not be staged: the run proves nothing either way.
+cannot() { RESULTS+=("FAIL  CANNOT MEASURE: $*"); printf 'FAIL  CANNOT MEASURE: %s\n' "$*"; FAILED=1; }
+# The script's own fault: it stopped on an error of its own, so the claims after it never ran.
+apparatus() { RESULTS+=("FAIL  APPARATUS: $*"); printf 'FAIL  APPARATUS: %s\n' "$*"; FAILED=1; }
 
 snapshot() { # $1 = before|after
     ifconfig -l | tr ' ' '\n' | sort >"$WORK/$1.ifaces"
@@ -93,7 +158,7 @@ snapshot() { # $1 = before|after
 voxcmd() { # member
     VOXCMD=("${AS_USER[@]}" env
         VOX_DATA_DIR="$WORK/$1/data" VOX_CONFIG_DIR="$WORK/$1/cfg"
-        VOX_IDENTITY_PASSPHRASE="$IDENTITY" VOX_ROOM_PASSPHRASE="${ROOM_PP:-}"
+        VOX_IDENTITY_PASSPHRASE="$IDENTITY"
         "$VOX")
 }
 vox_as() { # member args... — in the foreground
@@ -137,10 +202,10 @@ teardown() {
     say "teardown: stopping ${#PIDS[@]} processes by PID"
     local p
     # The LANs and the helper first, then the rest.
-    for p in "${PIDS[@]}"; do stop_pid "$p"; done
+    for p in ${PIDS[@]+"${PIDS[@]}"}; do stop_pid "$p"; done
     wait 2>/dev/null
     local left=0
-    for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
+    for p in ${PIDS[@]+"${PIDS[@]}"}; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
     echo "processes still running: $left"
     rm -f "$WORK/helper.sock"
     sleep 1
@@ -153,26 +218,36 @@ teardown() {
     say "routes: diff of \`netstat -rn\` before -> after (anything here is not ours unless flagged)"
     diff "$WORK/before.routes" "$WORK/after.routes" | sed 's/^/    /' || true
     local stale=""
-    for i in "${IFACES[@]}"; do
+    for i in ${IFACES[@]+"${IFACES[@]}"}; do
         grep -qx "$i" "$WORK/after.ifaces" && stale+=" interface:$i"
         grep -qw "$i" "$WORK/after.routes" && stale+=" route-via:$i"
     done
     if [[ -n ${SUBNET4:-} ]] && grep -q "^${SUBNET4%.0/24}" "$WORK/after.routes"; then stale+=" route:$SUBNET4"; fi
     if [[ -n ${PREFIX6:-} ]] && grep -qi "^${PREFIX6%%::*}" "$WORK/after.routes"; then stale+=" route:$PREFIX6"; fi
-    if [[ ${#IFACES[@]} -eq 0 ]]; then
-        fail "teardown: no interface was ever made, so there was nothing to tear down"
+    if [[ $PREFLIGHT == 1 ]]; then
+        if [[ -z $stale && $left == 0 ]]; then
+            pass "teardown: 0 processes left, no interface or route of the run's"
+        else
+            fail "teardown: left behind:$stale (processes: $left)"
+        fi
+    elif [[ ${#IFACES[@]} -eq 0 ]]; then
+        cannot "teardown: no interface was ever made, so there was nothing to tear down"
     elif [[ -z $stale && $left == 0 ]]; then
         pass "teardown: ${#IFACES[@]} utuns (${IFACES[*]}) gone, no route to ${SUBNET4:-?} or ${PREFIX6:-?} left, 0 processes left"
     else
         fail "teardown: left behind:$stale (processes: $left)"
     fi
     say "summary"
-    printf '%s\n' "${RESULTS[@]}"
+    printf '%s\n' ${RESULTS[@]+"${RESULTS[@]}"}
     echo
+    if [[ $FAILED == 0 && ${#RESULTS[@]} -gt 0 ]]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; fi
     echo "logs and profiles (test passphrases only): $WORK"
+    echo "paste this file back: $LOG"
+    [[ $PREFLIGHT == 0 ]] && chown -R "$SUDO_USER" "$WORK" 2>/dev/null
 }
-trap 'rc=$?; teardown; [[ $rc != 0 ]] && FAILED=1; exit $FAILED' EXIT
-trap 'echo "interrupted"; FAILED=1; exit 1' INT TERM
+# An exit that no FAIL line explains is the script's own error, named before the summary.
+trap 'rc=$?; if [[ $rc != 0 && $FAILED == 0 ]]; then apparatus "the script stopped on an error of its own (exit $rc, quoted above) before every claim ran"; fi; teardown; exit $FAILED' EXIT
+trap 'cannot "interrupted by a signal before every claim ran"; exit 1' INT TERM HUP
 
 snapshot before
 say "before: $(wc -l <"$WORK/before.ifaces" | tr -d ' ') interfaces, $(wc -l <"$WORK/before.routes" | tr -d ' ') routes"
@@ -300,7 +375,7 @@ elif cmd == "mdns-listen":       # ifname addr secs
     heard = sum(1 for data, _ in until(s, secs) if NAME in data)
     print(json.dumps({"heard": heard}))
 PYEOF
-chown "$SUDO_USER" "$WORK/probe.py"
+chown "$RUN_AS" "$WORK/probe.py"
 PROBE=("${AS_USER[@]}" "$PY" "$WORK/probe.py")
 probe() { "${PROBE[@]}" "$@"; }
 jget() { # file python-expression-over-d
@@ -312,27 +387,35 @@ say "setting up the room (production Argon2id and a real proof of work: a few mi
 for m in anchor alice bob carol; do "${AS_USER[@]}" mkdir -p "$WORK/$m/cfg"; done
 voxcmd anchor
 bg anchor "${VOXCMD[@]}" node --listen 127.0.0.1:0
-ANCHOR=$(wait_line "$WORK/anchor.log" '^ *[A-Za-z0-9]+@/ip4/' 180 | tr -d '[:space:]') || exit 1
+ANCHOR=$(wait_line "$WORK/anchor.log" '^ *[A-Za-z0-9]+@/ip4/' 180 | tr -d '[:space:]') \
+    || { cannot "the anchor (vox node) never printed its address"; exit 1; }
 echo "anchor $ANCHOR"
 for m in alice bob carol; do
-    FP=$(vox_as "$m" id | tr -d '[:space:]') || { fail "vox id ($m)"; exit 1; }
+    FP=$(vox_as "$m" id | tr -d '[:space:]') || { cannot "vox id ($m) failed"; exit 1; }
     eval "FP_$m=$FP"
     echo "$m $FP"
 done
 vox_as alice trust add "$FP_bob" --name bob >/dev/null && vox_as bob trust add "$FP_alice" --name alice >/dev/null \
     && vox_as carol trust add "$FP_alice" --name alice >/dev/null && vox_as carol trust add "$FP_bob" --name bob >/dev/null \
-    || { fail "trust add"; exit 1; }
+    || { cannot "vox trust add failed"; exit 1; }
 echo "alice <-> bob trust each other; carol trusts both; nobody trusts carol"
 voxcmd alice
 bg serve "${VOXCMD[@]}" serve 9/udp --name lan --anchor "$ANCHOR" --listen 127.0.0.1:0
 # Everything after the label: a generated passphrase may hold spaces.
-ROOM=$(wait_line "$WORK/serve.log" '^room ' 300 | sed -E 's/^room +//') || exit 1
-ADDRESS=$(wait_line "$WORK/serve.log" '^address ' 60 | sed -E 's/^address +//') || exit 1
-ROOM_PP=$(wait_line "$WORK/serve.log" '^passphrase ' 60 | sed -E 's/^passphrase +//') || exit 1
+ROOM=$(wait_line "$WORK/serve.log" '^room ' 300 | sed -E 's/^room +//') \
+    || { cannot "vox serve never printed its room"; exit 1; }
+ADDRESS=$(wait_line "$WORK/serve.log" '^address ' 60 | sed -E 's/^address +//') \
+    || { cannot "vox serve never printed its address"; exit 1; }
+ROOM_PP=$(wait_line "$WORK/serve.log" '^passphrase ' 60 | sed -E 's/^passphrase +//') \
+    || { cannot "vox serve never printed the room's passphrase"; exit 1; }
 echo "room $ROOM"
+# The room passphrase goes in a file: vox refuses it on a command line or in the environment.
+ROOM_PASS_FILE=$WORK/room.pass
+(umask 077 && printf '%s\n' "$ROOM_PP" >"$ROOM_PASS_FILE")
+chown "$RUN_AS" "$ROOM_PASS_FILE"
 for m in bob carol; do
-    vox_as "$m" connect "$ADDRESS" --passphrase "$ROOM_PP" --anchor "$ANCHOR" --listen 127.0.0.1:0 \
-        >"$WORK/connect-$m.log" 2>&1 || { fail "vox connect ($m): $(tail -3 "$WORK/connect-$m.log")"; exit 1; }
+    vox_as "$m" connect "$ADDRESS" --passphrase-file "$ROOM_PASS_FILE" --anchor "$ANCHOR" --listen 127.0.0.1:0 \
+        >"$WORK/connect-$m.log" 2>&1 || { cannot "vox connect ($m): $(tail -3 "$WORK/connect-$m.log")"; exit 1; }
     echo "$m joined"
     # PRD-001 D8: a one-shot `vox connect` leaves the host deaf for up to its 30 s
     # handshake bound, so the next join waits it out (as the proofs' harness does).
@@ -340,21 +423,45 @@ for m in bob carol; do
 done
 stop_pid "$PID_serve"
 
+# What each `vox lan up` is given (as `lan_args <member>`, into LAN_ARGS).
+ALLOW=47010,47011,47030
+lan_args() {
+    LAN_ARGS=(lan up "$ROOM" --passphrase-file "$ROOM_PASS_FILE" --anchor "$ANCHOR"
+        --listen 127.0.0.1:0 --helper-socket "$WORK/helper.sock" --stats-file "$WORK/$1.json"
+        --allow "$ALLOW")
+}
+
+if [[ $PREFLIGHT == 1 ]]; then
+    pass "preflight: the room, three members and both joins, everything before the root step"
+    # `vox lan up` asks for its helper before anything else, so without root it can only be
+    # refused; refused for the helper, it took every argument the root run gives it.
+    lan_args alice
+    if vox_as alice "${LAN_ARGS[@]}" >"$WORK/lan_preflight.log" 2>&1; then
+        cannot "vox lan up ran with no helper: $(tail -3 "$WORK/lan_preflight.log")"
+    elif grep -q 'no LAN helper is answering' "$WORK/lan_preflight.log"; then
+        pass "preflight: vox lan up takes the run's arguments and stops only at the missing helper (root)"
+    else
+        cannot "vox lan up refused the run's arguments: $(tail -3 "$WORK/lan_preflight.log")"
+    fi
+    say "PREFLIGHT ends here: the next step is \`vox lan helper\`, which needs root (sudo $0)"
+    exit 0
+fi
+
 # ---- the helper (root) and three LANs (not root) ----
 # The decider's rule: nothing is reachable over the LAN unless its port is listed. The
 # checks' own ports are listed; 47040 and 47041 are the unlisted ones check 6 knocks on.
-ALLOW=47010,47011,47030
-say "vox lan helper (root) and three vox lan up (as $SUDO_USER), each --allow $ALLOW"
+say "vox lan helper (root) and three vox lan up (as $RUN_AS), each --allow $ALLOW"
 bg helper "$VOX" lan helper --socket "$WORK/helper.sock"
-wait_line "$WORK/helper.log" 'serving uid' 30 || exit 1
+wait_line "$WORK/helper.log" 'serving uid' 30 \
+    || { fail "vox lan helper (as root) never said it was serving: $(tail -3 "$WORK/helper.log")"; exit 1; }
 for m in alice bob carol; do
     voxcmd "$m"
-    bg "lan_$m" "${VOXCMD[@]}" lan up "$ROOM" --anchor "$ANCHOR" --listen 127.0.0.1:0 \
-        --helper-socket "$WORK/helper.sock" --stats-file "$WORK/$m.json" \
-        --allow "$ALLOW"
+    lan_args "$m"
+    bg "lan_$m" "${VOXCMD[@]}" "${LAN_ARGS[@]}"
 done
 for m in alice bob carol; do
-    LINE=$(wait_line "$WORK/lan_$m.log" '^vox lan up on utun' 300) || exit 1
+    LINE=$(wait_line "$WORK/lan_$m.log" '^vox lan up on utun' 300) \
+        || { fail "vox lan up ($m) never said which utun it is on: $(tail -3 "$WORK/lan_$m.log")"; exit 1; }
     IF=$(echo "$LINE" | awk '{print $5}')
     IFACES+=("$IF")
     eval "IF_$m=$IF"
