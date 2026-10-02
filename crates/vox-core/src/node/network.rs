@@ -1549,6 +1549,14 @@ impl NodeNet {
                     .iter()
                     .find(|r| r.author_id == member && !r.endpoints.is_empty())
                 {
+                    // Said, so a person — and a proof — can see where the address came from.
+                    self.manager.note(
+                        member,
+                        format!(
+                            "its address was read from board {}'s record; this node held none",
+                            short_id(board.peer_id())
+                        ),
+                    );
                     return record.endpoints.clone();
                 }
             }

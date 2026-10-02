@@ -176,6 +176,7 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
     let before = (
         reach_count(&w.host_dir, &carol_fp, "the host", "circuits"),
         reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs_answered"),
+        reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs"),
     );
     let mark = w.anchor.mark();
     // A direct path with latency, as a real one has: carol's own dial of the host then takes a few
@@ -213,6 +214,7 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
         let now = (
             reach_count(&w.host_dir, &carol_fp, "the host", "circuits"),
             reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs_answered"),
+            reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs"),
         );
         if now != before {
             break;
@@ -224,25 +226,32 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
     let circuits = reach_count(&w.host_dir, &carol_fp, "the host", "circuits") - before.0;
     let answered =
         reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs_answered") - before.1;
+    let asked = reach_count(&w.host_dir, &carol_fp, "the host", "dial_backs") - before.2;
     eprintln!(
-        "[proof] staging {n}: the host's dial-backs answered {answered}, circuits asked \
-         {circuits}; the anchor carried up to {carried} since carol came online"
+        "[proof] staging {n}: the host's dial-backs asked {asked}, answered {answered}; circuits \
+         asked {circuits}; the anchor carried up to {carried} since carol came online"
     );
     w.forward.set_delay(Duration::ZERO);
     let host = w.host.transcript();
     let said = up.transcript();
     interrupt(&mut up, Duration::from_secs(15));
-    if answered == 0 && carried == 0 {
+    // **Not staged** only when the host relayed no dial-back to carol and the anchor carried nothing
+    // (ac-ver286c2 on f854f8ed: a dial-back asked and never answered is a verdict, not a miss). A
+    // circuit the host asked for while no dial-back could even be relayed went to a carol not
+    // connected to the anchor — her exited `vox connect` — and the anchor refused it: that is not
+    // the case under test either way.
+    if asked == 0 && carried == 0 {
         return Staging::NotStaged(format!(
-            "no dial-back answered and nothing carried (circuits asked: {circuits}); carol \
-             reached the host herself, or the host did not need her"
+            "the host relayed no dial-back to carol and nothing was carried (circuits asked, all \
+             refused: {circuits}); carol reached the host herself, or the host did not need her"
         ));
     }
     assert!(
         answered > 0 && carried == 0,
         "PRODUCT: the host, which cannot dial carol, had to reach her while she could dial the \
          host; it must ask her to dial back, and the anchor must carry nothing for them. \
-         Dial-backs answered: {answered}; circuits asked: {circuits}; the anchor carried up to \
+         Dial-backs asked: {asked}, answered: {answered}; circuits asked: {circuits}; the anchor \
+         carried up to \
          {carried}.\nhost:\n{host}\ncarol:\n{said}\nanchor:\n{}",
         w.anchor.proc.transcript()
     );
@@ -336,12 +345,33 @@ fn a_node_reads_the_board_before_bridging() {
     );
     let said = fwd.transcript();
     interrupt(&mut fwd, Duration::from_secs(15));
+    // **The premise, observed** (ac-ver286c2 on f854f8ed): dave's node must have held no address
+    // for the host, so the forward had to read the board. The product says when it did. A reach
+    // that asked for a dial-back or a circuit also held none. Neither: dave's node already held
+    // the host's record when the forward started — this run measured nothing about a board read.
+    for note in said.lines().filter(|l| l.contains("connection to ")) {
+        eprintln!("[proof] dave's forward said: {note}");
+    }
+    let read_the_board = said.contains("its address was read from board");
+    let held_none = read_the_board || asked > 0 || dial_backs > 0;
     assert!(
-        asked == 0 && carried == 0,
+        held_none,
+        "CANNOT MEASURE (staging not achieved): dave's forward reached the host directly without \
+         reading a board and without asking for a dial-back or a circuit — his node already held the \
+         host's record when the forward started, so this run says nothing about reading the board \
+         before bridging.\ndave:\n{said}"
+    );
+    assert!(
+        read_the_board && asked == 0 && carried == 0,
         "PRODUCT: dave's node held no address for the host, and the host's board record on the \
-         anchor gave one dave could dial; it must read the board and go direct, yet it asked for \
-         {asked} circuit(s) ({dial_backs} dial-back(s)) and the anchor carried up to {carried}.\n\
-         dave:\n{said}\nanchor:\n{}",
+         anchor gave one dave could dial; it must read the board and go direct, yet it {} and \
+         asked for {asked} circuit(s) ({dial_backs} dial-back(s)), the anchor carrying up to \
+         {carried}.\ndave:\n{said}\nanchor:\n{}",
+        if read_the_board {
+            "read the board"
+        } else {
+            "did not say it read the board"
+        },
         w.anchor.proc.transcript()
     );
 }
