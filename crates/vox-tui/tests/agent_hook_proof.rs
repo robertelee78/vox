@@ -721,6 +721,60 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         out.len(),
         want.len()
     );
+
+    // (7c) A `decline` carries neither `to` nor `re`: it names only the resource. When that is a
+    // resource this session handed off, the refusal is for it, and goes in full; the work is now
+    // free, and nobody else will tell it. The reader's own claim and handoff are not news to it.
+    run(&[
+        "room",
+        "claim",
+        &label,
+        "docs",
+        "--session",
+        "codex-session-1",
+    ]);
+    run(&[
+        "room",
+        "handoff",
+        &label,
+        "docs",
+        "--to",
+        &fp,
+        "--to-session",
+        "worker-a",
+        "--session",
+        "codex-session-1",
+    ]);
+    run(&["room", "decline", &label, "docs", "--session", "worker-a"]);
+    let (ok, all, err) = hook(&data, &cfg, &["room", "read", &label], "");
+    assert!(ok, "APPARATUS: room read failed: {err}");
+    let (ok, out, err) = hook_as(
+        &data,
+        &cfg,
+        &["agent", "hook", "--room", &room, "--format", "text"],
+        &codex_input("codex-session-1"),
+        Some("reader"),
+    );
+    assert!(ok, "APPARATUS: the hook failed: {err}");
+    eprintln!(
+        "[proof] V030-18 (7c) injected {} bytes for the decline of the reader's handoff:\n{out}",
+        out.len()
+    );
+    let decline_row = row_for(
+        &all,
+        "declining the handoff of docs",
+        "declining the handoff of docs",
+    );
+    assert_eq!(
+        out.matches(decline_row.as_str()).count(),
+        1,
+        "PRODUCT: the decline of this session's own handoff must reach it as one full row \
+         {decline_row:?}, not be counted; the drain injected:\n{out}"
+    );
+    assert!(
+        !out.contains("coordination message(s)"),
+        "PRODUCT: the decline was counted as chatter; the drain injected:\n{out}"
+    );
     // `vox room read` still has the whole of what was counted.
     assert!(
         all.contains("CHATTER-CANARY"),
