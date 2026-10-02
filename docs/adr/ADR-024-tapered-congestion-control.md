@@ -412,7 +412,9 @@ shows the speed a person sees after the pause.
   over the last 32 MiB at least 0.5% (`TIER2_ENTRY_SHARE`). Losses of either kind, because past the
   5% cap every loss is called congestion: counting only losses without a queue held Vox in tier 1
   for 18 s and more on the changing 6% arm, climbing only when the share happened to dip
-  (fix-adr024-bbr's trace). The loss share itself is exact: on the 6% arm Vox's own lost-over-sent
+  (fix-adr024-bbr's trace). A mutant that restores the old count is red in R41's full sequence (one
+  run): the 6% paused arm stayed near 20 Mbit/s for 21 s after the resume, and the 1% lossy arm read
+  1.596×; the 6% lossy arm itself stayed green in that run (10.257×). The loss share itself is exact: on the 6% arm Vox's own lost-over-sent
   read 0.0594 against the emulator's 0.0594 of bytes dropped at random, and the 32 MiB trend
   varies by about 0.35 points (one standard deviation, about 4,000 datagrams) around it. That share is
   tier 2's loss baseline, and it follows the trend up (never down) until tier 2 has sent 32 MiB of
