@@ -99,6 +99,7 @@ const OP_ACCEPTED: u64 = 6;
 /// `8` — the joiner's ratchet message that opens the responder's sending direction.
 const OP_OPEN: u64 = 8;
 const OP_REJECTED: u64 = 7;
+const OP_FULL: u64 = 9;
 
 /// Why a responder refused a join (see the module docs: deliberately coarse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +206,14 @@ pub enum JoinFrame {
     },
     /// The join was refused.
     Rejected(JoinReject),
+    /// The join was refused because the room is full: the exchange succeeded, and the responder
+    /// could not admit the joiner, as the room already holds `members` (V210, the silent join).
+    /// Sent where `Accepted` would have been. Its own frame, not a [`JoinReject`], because it
+    /// carries the count.
+    Full {
+        /// How many members the room holds.
+        members: u64,
+    },
     /// **Step 8, joiner → responder:** one ratchet message with an empty plaintext,
     /// whose only job is to open the responder's sending direction (M17.6).
     ///
@@ -286,6 +295,9 @@ impl JoinFrame {
             Self::Rejected(r) => {
                 e.array(2).uint(OP_REJECTED).uint(u64::from(*r as u8));
             }
+            Self::Full { members } => {
+                e.array(2).uint(OP_FULL).uint(*members);
+            }
         }
         e.finish()
     }
@@ -349,6 +361,7 @@ impl JoinFrame {
                     .map_err(|_| Error::MalformedJoin("reject reason range"))?;
                 Self::Rejected(JoinReject::from_u8(v).ok_or(Error::MalformedJoin("reject reason"))?)
             }
+            (OP_FULL, 2) => Self::Full { members: d.uint()? },
             _ => return Err(Error::MalformedJoin("join frame op")),
         };
         d.finish()?;
@@ -737,6 +750,7 @@ pub async fn run_initiator(
     let witness = match recv_frame(&mut recv).await? {
         JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
         JoinFrame::Rejected(r) => return Err(rejected(r)),
+        JoinFrame::Full { members } => return Err(Error::RoomFull { members }),
         _ => return Err(Error::MalformedJoin("expected accepted")),
     };
     // Checked here, against the identity the handshake pinned, so a responder cannot
@@ -826,7 +840,10 @@ pub async fn refuse_join_as(mut send: SendStream, reason: JoinReject) {
 ///
 /// # `admit_before_accepting`
 /// Called with the joiner's proven identity **after the exchange succeeds and before the
-/// acceptance frame goes out**, and awaited. That ordering is the whole reason it exists.
+/// acceptance frame goes out**, and awaited. That ordering is the whole reason it exists. An
+/// `Err` is an admission that did not happen: the joiner is refused instead of accepted —
+/// [`JoinFrame::Full`] for a room already full, a plain refusal otherwise — and the exchange
+/// returns that error.
 ///
 /// The joiner treats `Accepted` as "I am in", and the very next thing it does is publish its
 /// records to this node's board. Those records are refused unless this node has already admitted
@@ -853,7 +870,7 @@ pub async fn run_responder<F, Fut>(
 ) -> Result<JoinOutcome>
 where
     F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = Result<()>>,
 {
     let exchange = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring);
     // **Ended for a newcomer, and told so** (V210-92). The slot this exchange holds can be given
@@ -869,8 +886,19 @@ where
     };
     match &mut result {
         Ok(outcome) => {
-            // **Admitted before it is told it is in.** See `admit_before_accepting`.
-            admit_before_accepting(outcome.peer.identity.clone()).await;
+            // **Admitted before it is told it is in.** See `admit_before_accepting`. And told it
+            // is in only if it was: an admission that failed was dropped here, so a joiner the
+            // room could not take (it was full) heard `Accepted`, exited 0, and was a member of
+            // nothing.
+            if let Err(e) = admit_before_accepting(outcome.peer.identity.clone()).await {
+                let refusal = match e {
+                    Error::RoomFull { members } => JoinFrame::Full { members },
+                    _ => JoinFrame::Rejected(JoinReject::Refused),
+                };
+                let _ = send_frame(&mut send, &refusal).await;
+                let _ = send.finish();
+                return Err(e);
+            }
             // The witness `responder_exchange` minted beside the verification that
             // justifies it. The joiner keeps it: it is what makes that key admissible
             // to anyone else (M17.6).

@@ -311,6 +311,11 @@ impl Member {
         self.daemon_env(bin, anchor, &[("VOX_MUTANT_SENDER_MODE", mode)])
     }
 
+    /// [`Member::daemon_with`], behind `anchor`.
+    pub fn daemon_with_anchor(&self, anchor: Option<&str>, env: &[(&str, &str)]) -> Proc {
+        self.daemon_env(VOX, anchor, env)
+    }
+
     fn daemon_env(&self, bin: &str, anchor: Option<&str>, env: &[(&str, &str)]) -> Proc {
         let mut argv = vec!["daemon", "--listen", "127.0.0.1:0"];
         if let Some(a) = anchor {
