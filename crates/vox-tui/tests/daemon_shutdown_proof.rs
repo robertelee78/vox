@@ -31,12 +31,18 @@
 //! offers a [`FILE_BYTES`]-byte file (under a tunnel's window) with `vox room send`, Bob starts
 //! `vox room get`, and at its first bytes Bob's daemon is frozen (SIGSTOP), so Alice's tunnel
 //! finishes its stream with the tail unacknowledged; then Alice's daemon gets SIGINT.
-//! Asserted: it exits within [`PATIENCE`] and never says it gave up. Preconditions (else the
+//! Asserted: it exits within [`PATIENCE`], never says it gave up, and reports the stop as a
+//! success (it says "stopped by SIGINT" and exits 0, as a service manager expects of a service it
+//! stopped). The node's worst-case stop is budgeted under the patience, each wait named
+//! (`STOP_WORST_CASE`: 3 s for the tail, 2 × 0.4 s for the goodbye, 0.05 s for relayed closes'
+//! lead, 0.6 s for the closes to leave; 4.45 s against 5 s); this scene spends the tail's wait and,
+//! with Bob frozen, the goodbye's and the flush's too. Preconditions (else the
 //! attempt is staged again, up to [`ATTEMPTS`] times, then CANNOT MEASURE): Alice's
 //! `vox room send` read the whole file (it closes the file once it has), the collector did
 //! not have it, and the stop took at least [`WAITED`] (a tail acknowledged before the stop
-//! makes it immediate). Mutation: `STOP_ACK_BOUND` back at 5 s — the daemon exits after about
-//! 5.04 s saying "the node did not stop within 5s": red.
+//! makes it immediate). Mutations: `STOP_ACK_BOUND` back at 5 s — the daemon exits after about
+//! 5.04 s saying "the node did not stop within 5s": red; the goodbye's patience past the budget
+//! (1.5 s, the compile-time budget checks removed) — red the same way.
 
 #![cfg(unix)]
 
@@ -371,7 +377,7 @@ fn read_offsets(pid: u32, name: &str) -> Option<Vec<u64>> {
 
 /// One staging. `None` when a precondition did not hold; else how long Alice's daemon took to
 /// exit after SIGINT, and what it said.
-fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
+fn attempt(root: &Path, n: usize) -> Option<(Duration, std::process::ExitStatus, String)> {
     let alice = Member::new(&root.join(format!("a{n}")), "alice");
     let bob = Member::new(&root.join(format!("b{n}")), "bob");
     alice.trust(&bob);
@@ -473,14 +479,13 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
 
     let stop = Instant::now();
     alice_d.signal("-INT");
-    let took = loop {
-        if alice_d
+    let (took, status) = loop {
+        if let Some(status) = alice_d
             .child
             .try_wait()
             .expect("APPARATUS: poll Alice's daemon's exit")
-            .is_some()
         {
-            break stop.elapsed();
+            break (stop.elapsed(), status);
         }
         assert!(
             stop.elapsed() < Duration::from_secs(30),
@@ -501,7 +506,7 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, String)> {
         eprintln!("[proof] attempt {n}: not staged: the tail was acknowledged before the stop");
         return None;
     }
-    Some((took, said))
+    Some((took, status, said))
 }
 
 #[test]
@@ -510,7 +515,7 @@ fn a_stop_waits_out_last_bytes_within_its_patience() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
-    let (took, said) = (0..ATTEMPTS)
+    let (took, status, said) = (0..ATTEMPTS)
         .find_map(|n| attempt(root, n))
         .unwrap_or_else(|| {
             panic!(
@@ -519,10 +524,21 @@ fn a_stop_waits_out_last_bytes_within_its_patience() {
             )
         });
     let gave_up = said.lines().find(|l| l.contains(GAVE_UP));
-    eprintln!("[proof] Alice's daemon exited {took:?} after SIGINT; gave up: {gave_up:?}");
+    let stopped = said
+        .lines()
+        .any(|l| l.contains("vox daemon: stopped by SIGINT"));
+    eprintln!(
+        "[proof] Alice's daemon exited {took:?} after SIGINT ({status}); said it was stopped by \
+         SIGINT: {stopped}; gave up: {gave_up:?}"
+    );
     assert!(
         gave_up.is_none() && took < PATIENCE,
         "PRODUCT: a daemon stopped with a finished tunnel's tail unacknowledged must finish its own stop \
          within its {PATIENCE:?} patience: it exited {took:?} after SIGINT and said {gave_up:?}"
+    );
+    assert!(
+        status.success() && stopped,
+        "PRODUCT: a daemon stopped by SIGINT must report the stop as a success (\"stopped by SIGINT\", \
+         exit 0): it exited {status} and said it was stopped by SIGINT: {stopped}\n{said}"
     );
 }
