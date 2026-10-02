@@ -202,6 +202,58 @@ pub const WAITING_FOR_PROFILE: &str = "vox: waiting for another vox that is usin
 
 /// Apply `cmd` (creating or unlocking the identity), and if the node says it is waiting for
 /// another vox holding the profile, say so on stderr — once, while it waits.
+/// Which kind of socket a failed bind was for, so it can be asked again (V210-134).
+#[derive(Clone, Copy)]
+pub(crate) enum Socket {
+    /// The node's QUIC port (`--listen`).
+    Udp,
+    /// A local TCP port: `vox up --bind`, a forward's local port.
+    Tcp,
+}
+
+/// What the operating system says now when `addr` is bound as `socket`, quoted after a failed
+/// bind so the person reads its own words (V210-134): the node's [`Fault`] names the cause
+/// but cannot carry the text. `None` if the address binds now (it was freed in between).
+pub(crate) fn bind_said(addr: SocketAddr, socket: Socket) -> Option<String> {
+    let err = match socket {
+        Socket::Udp => std::net::UdpSocket::bind(addr).err(),
+        Socket::Tcp => std::net::TcpListener::bind(addr).err(),
+    }?;
+    Some(err.to_string())
+}
+
+/// The message for a failed bind of `addr`: what `fault` names, and the operating system's own
+/// words (V210-134). `None` if `fault` is not a failed bind.
+pub(crate) fn bind_failure(addr: SocketAddr, socket: Socket, fault: Fault) -> Option<String> {
+    if !fault.is_bind() {
+        return None;
+    }
+    let what = match (fault, socket) {
+        (Fault::AddressInUse, Socket::Udp) => {
+            "something else already holds that UDP port".to_owned()
+        }
+        (Fault::AddressInUse, Socket::Tcp) => {
+            "that port is already in use: another program holds it".to_owned()
+        }
+        (Fault::AddressNotHere, _) => format!("{} is not an address of this machine", addr.ip()),
+        _ => "it could not be listened on".to_owned(),
+    };
+    let said = bind_said(addr, socket)
+        .map(|os| format!(" (the system says: {os})"))
+        .unwrap_or_default();
+    let remedy = match fault {
+        Fault::AddressInUse => format!(
+            "\n       Pick another, or stop whatever holds it (`lsof -i :{}` names it).",
+            addr.port()
+        ),
+        Fault::AddressNotHere => "\n       Use an address this machine has (`ifconfig` lists \
+                                  them), or 127.0.0.1."
+            .to_owned(),
+        _ => String::new(),
+    };
+    Some(format!("{what}{said}{remedy}"))
+}
+
 pub async fn apply_saying_waits(node: &NodeHandle, cmd: NodeCommand) -> Outcome {
     let mut events = node.subscribe();
     let apply = node.apply(cmd);
@@ -263,6 +315,11 @@ pub async fn open_profile(
     if out == Outcome::Failed(Fault::ProfileBusy) {
         return Err(profile_busy(&socket));
     }
+    if let Outcome::Failed(fault) = out {
+        if let Some(why) = bind_failure(listen, Socket::Udp, fault) {
+            return Err(AppError::Usage(format!("cannot listen on {listen}: {why}")));
+        }
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot open this profile's identity: {out}"
@@ -296,6 +353,11 @@ async fn open_room(
     .await;
     if out == Outcome::Failed(Fault::ProfileBusy) {
         return Err(profile_busy(&socket));
+    }
+    if let Outcome::Failed(fault) = out {
+        if let Some(why) = bind_failure(listen, Socket::Udp, fault) {
+            return Err(AppError::Usage(format!("cannot listen on {listen}: {why}")));
+        }
     }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
@@ -478,6 +540,11 @@ pub async fn forward(
         // and cannot be granted — `vox grant`, the only thing that issued it, is
         // withdrawn too. What actually decides is the host's keyring, and the host is
         // the only one who can change it.
+        if let Outcome::Failed(fault) = out {
+            if let Some(why) = bind_failure(local, Socket::Tcp, fault) {
+                return Err(AppError::Usage(format!("cannot forward to {local}: {why}")));
+            }
+        }
         if !matches!(out, Outcome::Failed(Fault::Unreachable | Fault::Refused)) {
             return Err(AppError::Usage(format!("cannot forward to {local}: {out}")));
         }
@@ -772,6 +839,13 @@ impl Waiting {
 /// file, and a tool that edits it unasked is a tool that will one day edit it wrongly.
 pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Result<(), AppError> {
     let out = node.apply(NodeCommand::Up { channel_id, bind }).await;
+    if let Outcome::Failed(fault) = out {
+        if let Some(why) = bind_failure(bind, Socket::Tcp, fault) {
+            return Err(AppError::Usage(format!(
+                "cannot bring the proxy up on {bind}: {why}"
+            )));
+        }
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot bring the proxy up on {bind}: {out}"
