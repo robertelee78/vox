@@ -15,14 +15,21 @@
 //!
 //! **Asserted,** with hard-coded bounds: bob's `vox room join` fails, and within [`ANSWERED`] of
 //! the lock, and what it prints names the lock (not "run `vox id`", V210-94); and alice's roster, read [`SETTLE`] after she is resumed, does not name bob.
-//! Preconditions, or `CANNOT MEASURE`: the join had not returned when bob locked; alice's roster
-//! names alice.
+//! Preconditions, or `CANNOT MEASURE`: the join had not returned when bob locked. Alice's roster
+//! names alice, or `PRODUCT (staging)`.
 //!
 //! **What separates the fix from the defect is the answer time.** The lock also closes the node's
 //! endpoint, so a join left running cannot reach alice over it and the roster stays clean either
 //! way; the roster check guards against a join that completes regardless. A join that is not
 //! stopped keeps the signer, the ring and the passphrase until its dials run out, and only then
 //! answers.
+//!
+//! **Apparatus clock.** The answer time is read on the same timeline as two measures of the
+//! runner itself: how long bob's TUI driver took to show LOCKED once the test asked for the lock
+//! (the pty round trip), and the largest gap between two of the test's own 100 ms polls of the
+//! join while it waited for the answer. If the answer was late and either exceeded its budget
+//! ([`LOCK_ACK_BUDGET`], [`POLL_GAP_BUDGET`]), the runner stalled and the red is
+//! `CANNOT MEASURE: apparatus took X`; otherwise it is `PRODUCT: took X (apparatus Y)`.
 //!
 //! **Mutation that must turn it red:** the joiner spawned detached again (`tokio::spawn` instead of
 //! `join_tasks`): measured, bob's join answered 27.6 s after the lock, in 2 of 2 runs, against
@@ -51,6 +58,10 @@ const IN_FLIGHT: Duration = Duration::from_secs(3);
 const ANSWERED: Duration = Duration::from_secs(10);
 /// How long alice has, once resumed, for a join still running to reach her and complete.
 const SETTLE: Duration = Duration::from_secs(40);
+/// The pty round trip from asking for the lock to seeing LOCKED, past which the runner stalled.
+const LOCK_ACK_BUDGET: Duration = Duration::from_secs(10);
+/// The largest gap between two 100 ms polls of the join, past which the runner stalled.
+const POLL_GAP_BUDGET: Duration = Duration::from_secs(2);
 
 /// A child process, killed by its own PID when dropped.
 struct Proc(Child);
@@ -84,12 +95,13 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(text.as_bytes()).expect("write stdin");
+        let mut pipe = child.stdin.take().expect("APPARATUS: vox's stdin");
+        pipe.write_all(text.as_bytes())
+            .expect("APPARATUS: write vox's stdin");
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -102,7 +114,7 @@ fn signal(pid: u32, sig: &str) {
         .args([sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill {sig} {pid} failed");
+    assert!(ok, "APPARATUS: kill {sig} {pid} failed");
 }
 
 /// Wait up to `within` for `path` to exist.
@@ -129,40 +141,45 @@ fn attached(dir: &Path) -> String {
         last = err;
         std::thread::sleep(Duration::from_millis(200));
     }
-    panic!("CANNOT MEASURE: alice's daemon never answered: {last}");
+    panic!("PRODUCT (staging): alice's daemon never answered: {last}");
 }
 
 #[test]
 #[ignore = "real vox daemon and vox tui in a pty, production Argon2id; CI runs it in release"]
 fn a_join_in_flight_when_the_node_locks_does_not_complete() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     let cues = tmp.path().join("cues");
     for d in [&alice, &bob] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: a profile dir");
     }
-    std::fs::create_dir_all(&cues).unwrap();
+    std::fs::create_dir_all(&cues).expect("APPARATUS: the cue dir");
     let mut fps = Vec::new();
     for dir in [&alice, &bob] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         fps.push(out.trim().to_owned());
     }
     let (alice_fp, bob_fp) = (fps[0].clone(), fps[1].clone());
 
     // ---- alice: a daemon and a room ------------------------------------------------------
-    let alice_err = std::fs::File::create(alice.join("daemon.err")).unwrap();
+    let alice_err =
+        std::fs::File::create(alice.join("daemon.err")).expect("APPARATUS: the daemon's log");
     let mut alice_daemon = command(&alice, &["daemon", "--listen", "127.0.0.1:0"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::from(alice_err))
         .spawn()
-        .expect("spawn alice's daemon");
+        .expect("APPARATUS: spawn alice's daemon");
     {
-        let mut pipe = alice_daemon.stdin.take().expect("daemon stdin");
-        pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+        let mut pipe = alice_daemon
+            .stdin
+            .take()
+            .expect("APPARATUS: the daemon's stdin");
+        pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+            .expect("APPARATUS: write the daemon's stdin");
     }
     let alice_daemon = Proc(alice_daemon);
     let alice_pid = alice_daemon.0.id();
@@ -175,15 +192,15 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
         &["room", "create", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: vox room create: {err}");
+    assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
     let room = attached(&alice)
         .split_whitespace()
         .filter(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned)
         .find(|w| !before.contains(w))
-        .expect("CANNOT MEASURE: no new room id in alice's `room list`");
+        .expect("PRODUCT (staging): no new room id in alice's `room list`");
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "CANNOT MEASURE: vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
     let link = link.trim().to_owned();
 
     // ---- bob: the real TUI, unlocked -----------------------------------------------------
@@ -195,19 +212,34 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
                 script,
                 &[
                     VOX,
-                    bob.to_str().unwrap(),
-                    bob.join("cfg").to_str().unwrap(),
+                    bob.to_str().expect("APPARATUS: a UTF-8 path"),
+                    bob.join("cfg").to_str().expect("APPARATUS: a UTF-8 path"),
                     IDENTITY,
-                    cues.to_str().unwrap(),
+                    cues.to_str().expect("APPARATUS: a UTF-8 path"),
                     "bob",
                 ],
             )
         })
     };
-    assert!(
-        cue(&cues.join("unlocked"), Duration::from_secs(120)),
-        "CANNOT MEASURE: bob's TUI never unlocked"
-    );
+    if !cue(&cues.join("unlocked"), Duration::from_secs(120)) {
+        // A driver that gave up (pyte missing, no unlock screen) has already said why.
+        let said = if driver.is_finished() {
+            driver.join().map_or_else(
+                |_| "the TUI driver thread panicked".to_owned(),
+                |d| format!("the driver exited {:?} saying:\n{}", d.code, d.stdout),
+            )
+        } else {
+            "the driver is still running".to_owned()
+        };
+        // The driver typed the identity passphrase and watched the status line for 60 s: a TUI
+        // that never said "unlocked" is the product's. Anything else (pyte missing, a hung
+        // driver) is the apparatus's.
+        assert!(
+            !said.contains("the TUI never unlocked"),
+            "PRODUCT (staging): bob's TUI never unlocked with his identity passphrase; {said}"
+        );
+        panic!("CANNOT MEASURE: bob's TUI driver never got as far as the unlock; {said}");
+    }
 
     // ---- a join that cannot finish yet, and a lock while it runs --------------------------
     signal(alice_pid, "-STOP");
@@ -216,28 +248,58 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox room join");
+        .expect("APPARATUS: spawn vox room join");
     {
-        let mut pipe = join.stdin.take().expect("join stdin");
-        pipe.write_all(format!("{ROOMPASS}\n").as_bytes()).unwrap();
+        let mut pipe = join.stdin.take().expect("APPARATUS: the join's stdin");
+        pipe.write_all(format!("{ROOMPASS}\n").as_bytes())
+            .expect("APPARATUS: write the join's stdin");
     }
     std::thread::sleep(IN_FLIGHT);
-    let early = join.try_wait().expect("poll the join");
-    std::fs::write(cues.join("lock"), b"").unwrap();
+    let early = join.try_wait().expect("APPARATUS: poll the join");
+    std::fs::write(cues.join("lock"), b"").expect("APPARATUS: write the lock cue");
+    let asked = Instant::now();
     let locked = cue(&cues.join("locked"), Duration::from_secs(30));
     let locked_at = Instant::now();
+    let lock_ack = locked_at - asked;
     signal(alice_pid, "-CONT");
     assert!(
         early.is_none(),
         "CANNOT MEASURE: bob's join returned before he locked ({early:?}), so no join was in \
          flight"
     );
-    assert!(locked, "CANNOT MEASURE: bob's TUI never showed LOCKED");
+    if !locked {
+        // The driver typed `:lock` and watches the screen for LOCKED for 20 s, then says what it
+        // saw; give it that long to finish.
+        let t = Instant::now();
+        while !driver.is_finished() && t.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let said = if driver.is_finished() {
+            driver.join().map_or_else(
+                |_| "the TUI driver thread panicked".to_owned(),
+                |d| format!("the driver exited {:?} saying:\n{}", d.code, d.stdout),
+            )
+        } else {
+            "the driver is still running".to_owned()
+        };
+        // A TUI that was typed `:lock` and never showed LOCKED did not take the lock: the
+        // product's (a node whose actor a join holds cannot answer it). A driver that never got
+        // to `:lock`, or hung, is the apparatus's.
+        assert!(
+            !said.contains("the TUI never showed LOCKED after :lock"),
+            "PRODUCT: bob typed `:lock` while his join was in flight, and his TUI never showed \
+             LOCKED; {said}"
+        );
+        panic!("CANNOT MEASURE: bob's TUI driver never typed `:lock` to completion; {said}");
+    }
 
     // ---- what the join came to ------------------------------------------------------------
     let mut answered = None;
+    let (mut last_poll, mut poll_gap) = (Instant::now(), Duration::ZERO);
     while locked_at.elapsed() < SETTLE {
-        if let Some(status) = join.try_wait().expect("poll the join") {
+        poll_gap = poll_gap.max(last_poll.elapsed());
+        last_poll = Instant::now();
+        if let Some(status) = join.try_wait().expect("APPARATUS: poll the join") {
             answered = Some((status, locked_at.elapsed()));
             break;
         }
@@ -246,19 +308,24 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
     if answered.is_none() {
         let _ = join.kill();
     }
-    let joined = join.wait_with_output().expect("reap the join");
-    let said = String::from_utf8_lossy(&joined.stderr).into_owned();
+    let joined = join.wait_with_output().expect("APPARATUS: reap the join");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&joined.stdout),
+        String::from_utf8_lossy(&joined.stderr)
+    );
     std::thread::sleep(SETTLE.saturating_sub(locked_at.elapsed()));
     let (ok, roster, err) = vox(&alice, &["room", "roster", &room], None);
-    assert!(ok, "CANNOT MEASURE: alice's roster: {err}");
+    assert!(ok, "PRODUCT (staging): alice's roster failed: {err}");
     let names = |fp: &str| roster.lines().any(|l| l.trim().starts_with(&fp[..26]));
-    std::fs::write(cues.join("stop"), b"").unwrap();
+    std::fs::write(cues.join("stop"), b"").expect("APPARATUS: write the stop cue");
     let driven = driver
         .join()
-        .unwrap_or_else(|p| std::panic::resume_unwind(p));
+        .expect("APPARATUS: the TUI driver thread panicked");
     println!(
         "[proof] bob's join answered {:?} after the lock: {}; alice's roster has {} member(s), \
-         bob among them: {}; the TUI driver exited {:?} after {:?} at {:?}",
+         bob among them: {}; the TUI driver exited {:?} after {:?} at {:?}; apparatus: LOCKED \
+         shown {lock_ack:?} after the lock was asked for, largest poll gap {poll_gap:?}",
         answered.as_ref().map(|(_, t)| *t),
         said.trim(),
         roster.lines().count(),
@@ -274,34 +341,53 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
     );
     assert!(
         names(&alice_fp),
-        "CANNOT MEASURE: alice's roster does not name alice:\n{roster}"
+        "PRODUCT (staging): alice's roster does not name alice:\n{roster}"
     );
     assert!(
         !names(&bob_fp),
-        "a join signed after the lock completed: alice admitted bob {SETTLE:?} after she was \
+        "PRODUCT: a join signed after the lock completed: alice admitted bob {SETTLE:?} after she was \
          resumed, though bob locked while the join ran\nbob's join said: {said}\nalice's daemon \
          said: {}",
         std::fs::read_to_string(alice.join("daemon.err")).unwrap_or_default()
     );
-    let (status, took) = answered.unwrap_or_else(|| {
-        panic!("bob's `vox room join` did not answer within {SETTLE:?} of the lock")
-    });
+    let stalled = lock_ack > LOCK_ACK_BUDGET || poll_gap > POLL_GAP_BUDGET;
+    let apparatus = format!("LOCKED shown after {lock_ack:?}, largest poll gap {poll_gap:?}");
+    let Some((status, took)) = answered else {
+        assert!(
+            !stalled,
+            "CANNOT MEASURE: apparatus took {apparatus}, and bob's `vox room join` did not answer \
+             within {SETTLE:?} of the lock"
+        );
+        panic!(
+            "PRODUCT: bob's `vox room join` did not answer within {SETTLE:?} of the lock \
+             (apparatus: {apparatus}); it said: {}",
+            said.trim()
+        );
+    };
     assert!(
         !status.success(),
-        "bob's `vox room join` succeeded after he locked"
+        "PRODUCT: bob's `vox room join` succeeded ({status}) after he locked; it said: {}",
+        said.trim()
     );
     // **And it says why: the lock** (V210-94). It said "this profile has no unlocked identity, so
     // there is nobody to join as / run `vox id` to make one", which sent a person who had just
     // locked to make a second identity.
     assert!(
         said.contains("identity is locked") && !said.contains("vox id"),
-        "bob's `vox room join` failed after the lock without naming it — the product said: {}",
+        "PRODUCT: bob's `vox room join` failed after the lock without naming it; it said: {}",
         said.trim()
     );
-    assert!(
-        took < ANSWERED,
-        "bob's `vox room join` answered only {took:?} after the lock (bound {ANSWERED:?}): the \
-         join ran on after it"
-    );
+    if took >= ANSWERED {
+        assert!(
+            !stalled,
+            "CANNOT MEASURE: apparatus took {apparatus}, and bob's join answered {took:?} after the \
+             lock"
+        );
+        panic!(
+            "PRODUCT: took {took:?} (apparatus {apparatus}): bob's `vox room join` answered only \
+             after the bound {ANSWERED:?} — the join ran on after the lock; it said: {}",
+            said.trim()
+        );
+    }
     drop(alice_daemon);
 }

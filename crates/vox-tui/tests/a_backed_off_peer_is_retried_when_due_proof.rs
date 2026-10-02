@@ -32,8 +32,19 @@
 //! is continued. Without the wakeup, the next trigger is a periodic sync, 30 s after the warm-up:
 //! at least 6 s after Bob is continued.
 //!
-//! ## Precondition (else CANNOT MEASURE)
-//! Alice's session to Bob failed while Bob was frozen (`failed` rose within 28 s).
+//! ## Preconditions
+//! The pair read each other before the freeze, and Alice's session to Bob failed while Bob was
+//! frozen (`failed` rose within 28 s): each is the product's, so a miss is `PRODUCT (staging)`.
+//! Her `opened` counter did not go backwards (a restarted node starts it again at 0), else
+//! CANNOT MEASURE: nothing in the proof restarts a node.
+//!
+//! ## Apparatus clock
+//! (1) is timed from `SIGCONT`, so it also holds the runner's own time to bring Bob back. On the
+//! same clock the proof records when Bob first answers after `SIGCONT` (a shipped
+//! `vox status --json` against his node returns) and the largest gap between its polls of Bob's
+//! room. If either exceeds [`APPARATUS_BUDGET`] and Bob read late, the runner owned the window:
+//! `CANNOT MEASURE: apparatus took X`. Otherwise a late read is `PRODUCT: took X (apparatus Y)`.
+//! (2) reads Alice's own counters before Bob is continued, so it needs no clock.
 //!
 //! ## Mutation
 //! Remove `BackoffExpired`: nothing re-evaluates the port until an unrelated trigger, so Alice
@@ -57,12 +68,15 @@ const BOUND: Duration = Duration::from_secs(3);
 /// How long after the failure is seen that Bob is continued.
 const AFTER_FAILURE: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
+/// The most the runner may take to bring Bob back and answer (or to come round to its next poll)
+/// before a late read is the runner's, not vox's.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(1);
 
 #[test]
 #[ignore = "two real daemons with production Argon2id, one frozen for ~20 s; CI runs it in release"]
 fn a_backed_off_peer_is_retried_when_due() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let alice = Member::new(root, "alice");
     let bob = Member::new(root, "bob");
@@ -90,7 +104,7 @@ fn a_backed_off_peer_is_retried_when_due() {
         }
         assert!(
             start.elapsed() < Duration::from_secs(90),
-            "CANNOT MEASURE: the pair never read each other\nalice:\n{}\nbob:\n{}",
+            "PRODUCT (staging): the pair never read each other in 90 s\nalice:\n{}\nbob:\n{}",
             alice_d.transcript(),
             bob_d.transcript()
         );
@@ -116,7 +130,8 @@ fn a_backed_off_peer_is_retried_when_due() {
     let Some(failed_at) = failed_at else {
         bob_d.signal("-CONT");
         panic!(
-            "CANNOT MEASURE: alice's session to frozen bob never failed within 28 s (counters: {})",
+            "PRODUCT (staging): alice's session to frozen bob never failed within 28 s (counters: \
+             {})",
             a_fail
         );
     };
@@ -133,43 +148,73 @@ fn a_backed_off_peer_is_retried_when_due() {
     bob_d.signal("-CONT");
     let resumed = Instant::now();
     let b_mid = bob.status();
+    // The apparatus: when Bob first answered after SIGCONT (his `vox status --json` returned),
+    // and the largest gap between two polls of his room, on the same clock as `read_at`.
+    let answered = resumed.elapsed();
     let mut read_at = None;
+    let (mut last_poll, mut max_gap) = (Instant::now(), Duration::ZERO);
     while resumed.elapsed() < Duration::from_secs(40) {
+        let now = Instant::now();
+        max_gap = max_gap.max(now - last_poll);
+        last_poll = now;
         if rb.has(cb, text) {
             read_at = Some(resumed.elapsed());
             break;
         }
         std::thread::sleep(POLL);
     }
+    let apparatus = answered.max(max_gap);
     std::thread::sleep(Duration::from_millis(500));
     let (a1, b1) = (alice.status(), bob.status());
-    let a_retried =
-        counter(&a_mid, "opened", Some(&bob.fp)) - counter(&a0, "opened", Some(&bob.fp));
-    let b_opened =
-        counter(&b1, "opened", Some(&alice.fp)) - counter(&b_mid, "opened", Some(&alice.fp));
-    let a_after = counter(&a1, "opened", Some(&bob.fp)) - counter(&a_mid, "opened", Some(&bob.fp));
+    // A counter that went backwards was reset by a restart: nothing below would mean anything.
+    let rose = |who: &str, later: &serde_json::Value, earlier: &serde_json::Value, peer: &str| {
+        let (l, e) = (
+            counter(later, "opened", Some(peer)),
+            counter(earlier, "opened", Some(peer)),
+        );
+        l.checked_sub(e).unwrap_or_else(|| {
+            panic!(
+                "CANNOT MEASURE: {who}'s `opened` counter went backwards ({e} -> {l}): the node \
+                 was restarted under the proof"
+            )
+        })
+    };
+    let a_retried = rose("alice", &a_mid, &a0, &bob.fp);
+    let b_opened = rose("bob", &b1, &b_mid, &alice.fp);
+    let a_after = rose("alice", &a1, &a_mid, &bob.fp);
     println!(
         "[proof] P8: bob frozen; alice's session failed {failed_at:?} after the freeze (\"{}\"); \
          backoff then {backoff}; bob continued {:?} after the freeze; read {read_at:?} after \
          continuing; alice opened {a_retried} to bob between her post and bob's continuing \
-         (the failed one and the retry), {a_after} after; bob opened {b_opened} to alice after",
+         (the failed one and the retry), {a_after} after; bob opened {b_opened} to alice after; \
+         apparatus: bob first answered {answered:?} after SIGCONT, largest poll gap {max_gap:?}",
         failures(&a_fail).join(" | "),
         resumed - frozen,
     );
-    let read_at = read_at.unwrap_or_else(|| {
-        panic!(
-            "bob never read alice's post within 40 s of being continued\nalice:\n{}",
-            alice_d.transcript()
-        )
-    });
-    assert!(
-        read_at <= BOUND,
-        "bob read alice's post {read_at:?} after being continued, past {BOUND:?}: the backed-off \
-         port was not retried when due"
-    );
     assert!(
         a_retried >= 2,
-        "alice's port did not retry while bob was frozen: she opened {a_retried} session(s) to him \
-         between her post and his continuing (the failed one, and a retry when the backoff was due)"
+        "PRODUCT: alice's port did not retry while bob was frozen: her `vox status` shows \
+         {a_retried} session(s) opened to him between her post and his continuing (the failed \
+         one, and a retry when the backoff was due)"
     );
+    let Some(read_at) = read_at else {
+        panic!(
+            "PRODUCT: bob never read alice's post within 40 s of being continued (apparatus \
+             {apparatus:?})\nalice:\n{}\nbob:\n{}",
+            alice_d.transcript(),
+            bob_d.transcript()
+        )
+    };
+    if read_at > BOUND {
+        assert!(
+            apparatus <= APPARATUS_BUDGET,
+            "CANNOT MEASURE: apparatus took {apparatus:?} (bob first answered {answered:?} after \
+             SIGCONT, largest poll gap {max_gap:?}, budget {APPARATUS_BUDGET:?}); bob read alice's \
+             post {read_at:?} after being continued"
+        );
+        panic!(
+            "PRODUCT: took {read_at:?} (apparatus {apparatus:?}): bob read alice's post past \
+             {BOUND:?} after being continued: the backed-off port was not retried when due"
+        );
+    }
 }

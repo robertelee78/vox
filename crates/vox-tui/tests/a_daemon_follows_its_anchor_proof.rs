@@ -88,9 +88,6 @@ const IDENTITY: &str = "daemon passphrase";
 const FOLLOW_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
 /// How long bob may take to render alice's post once both have joined and trust.
 const READ_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
-/// Join attempts for bob, 5 s apart: a join can be turned away while the host is busy
-/// admitting (a separate, known defect), and the harness in `support/room.rs` allows 6.
-const JOIN_ATTEMPTS: u32 = 6;
 const ROOM_PASS: &str = "a room passphrase\n";
 
 struct Proc(Child);
@@ -128,13 +125,14 @@ fn vox_stdin(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .expect("APPARATUS: spawn vox");
     if let Some(text) = input {
-        let mut pipe = child.stdin.take().expect("vox stdin");
-        pipe.write_all(text.as_bytes()).expect("write stdin");
+        let mut pipe = child.stdin.take().expect("APPARATUS: vox stdin");
+        pipe.write_all(text.as_bytes())
+            .expect("APPARATUS: write vox stdin");
         drop(pipe);
     }
-    let out = child.wait_with_output().expect("vox ran");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -167,12 +165,12 @@ fn a_bad_anchors_file_line_is_skipped_and_named() {
 /// a line whose host does not resolve.
 fn follow(dead_ports: &[u16], bad_line: bool) {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
 
     // ---- a real anchor, on a port nobody knew at startup ----
     let anchor_data = tmp.path().join("anchor-data");
     let anchor_cfg = tmp.path().join("anchor-cfg");
-    std::fs::create_dir_all(&anchor_cfg).unwrap();
+    std::fs::create_dir_all(&anchor_cfg).expect("APPARATUS: harness file I/O");
     let mut anchor = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
@@ -184,13 +182,15 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             // the pipe, so the anchor died the moment the daemon reached it — hidden only
             // because the joiner then went to the daemon directly.
             .stdout(Stdio::from(
-                std::fs::File::create(tmp.path().join("anchor.out")).unwrap(),
+                std::fs::File::create(tmp.path().join("anchor.out"))
+                    .expect("APPARATUS: harness file I/O"),
             ))
             .stderr(Stdio::from(
-                std::fs::File::create(tmp.path().join("anchor.err")).unwrap(),
+                std::fs::File::create(tmp.path().join("anchor.err"))
+                    .expect("APPARATUS: harness file I/O"),
             ))
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: spawn vox node"),
     );
     // `vox node` writes its own spec into its config dir; that file is the truth.
     let anchors_file = anchor_cfg.join("anchors");
@@ -198,8 +198,9 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     let real_spec = loop {
         assert!(
             std::time::Instant::now() < deadline,
-            "the anchor never wrote its spec to {}",
-            anchors_file.display()
+            "PRODUCT (staging): the anchor never wrote its spec to {}; its stderr: {:?}",
+            anchors_file.display(),
+            std::fs::read_to_string(tmp.path().join("anchor.err")).unwrap_or_default()
         );
         if let Ok(text) = std::fs::read_to_string(&anchors_file) {
             if let Some(line) = text
@@ -216,13 +217,22 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     // ---- a client profile, and an anchors file pointing at nothing ----
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
-    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::create_dir_all(&cfg).expect("APPARATUS: harness file I/O");
     let (ok, fp, err) = vox(&data, &cfg, &["id"]);
-    assert!(ok, "vox id: {err}");
-    assert_eq!(fp.trim().len(), 52, "`vox id` prints a fingerprint: {fp:?}");
+    assert!(ok, "PRODUCT (staging): alice's `vox id` failed: {err}");
+    assert_eq!(
+        fp.trim().len(),
+        52,
+        "PRODUCT (staging): `vox id` did not print a fingerprint: {fp:?}"
+    );
     // The same identity, a different port: reachable by nobody. This stands in for the
     // address a name used to resolve to.
-    let anchor_id = real_spec.split_once('@').expect("a well-formed spec").0;
+    let anchor_id = real_spec
+        .split_once('@')
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): the anchor wrote a spec with no `@`: {real_spec:?}")
+        })
+        .0;
     let wrong_specs: Vec<String> = dead_ports
         .iter()
         .map(|p| format!("{anchor_id}@/ip4/127.0.0.1/udp/{p}"))
@@ -238,7 +248,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         anchors_file_for(&cfg),
         format!("{bad}{}\n", wrong_specs.join("\n")),
     )
-    .unwrap();
+    .expect("APPARATUS: harness file I/O");
 
     // ---- the daemon starts against the address that is wrong ----
     let mut daemon = Command::new(VOX)
@@ -248,12 +258,14 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
-            std::fs::File::create(tmp.path().join("daemon.err")).unwrap(),
+            std::fs::File::create(tmp.path().join("daemon.err"))
+                .expect("APPARATUS: harness file I/O"),
         ))
         .spawn()
-        .expect("spawn vox daemon");
-    let mut pipe = daemon.stdin.take().expect("daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+        .expect("APPARATUS: spawn vox daemon");
+    let mut pipe = daemon.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .expect("APPARATUS: write the daemon's passphrase");
     drop(pipe);
     let _daemon = Proc(daemon);
 
@@ -263,19 +275,21 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         // With a bad line, a daemon that will not start is the defect, not a precondition.
         assert!(
             !bad_line || std::time::Instant::now() < deadline,
-            "the daemon did not start with an anchors file whose line 1 names a host that does \
+            "PRODUCT: the daemon did not start with an anchors file whose line 1 names a host that does \
              not resolve: one bad line must be skipped, not fail every anchor. Its stderr: \
              {stderr:?}"
         );
         assert!(
             std::time::Instant::now() < deadline,
-            "CANNOT MEASURE: the daemon never answered on its control socket; its stderr: {stderr:?}"
+            "PRODUCT (staging): the daemon never answered on its control socket; its stderr: \
+             {stderr:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     // ---- the anchor moves: the configuration is rewritten under the running daemon ----
-    std::fs::write(anchors_file_for(&cfg), format!("{bad}{real_spec}\n")).unwrap();
+    std::fs::write(anchors_file_for(&cfg), format!("{bad}{real_spec}\n"))
+        .expect("APPARATUS: harness file I/O");
 
     // ---- it must reach the anchor without being restarted ----
     // Creating a room and getting an invite that names the anchor is the observable
@@ -287,12 +301,17 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         &["room", "create", "--name", "mission"],
         Some(ROOM_PASS),
     );
-    assert!(ok, "room create on the daemon: {err}");
+    assert!(ok, "PRODUCT: room create on the daemon failed: {err}");
     let room = {
-        let (_, out, _) = vox(&data, &cfg, &["room", "list"]);
+        let (_, out, err) = vox(&data, &cfg, &["room", "list"]);
         out.split_whitespace()
             .find(|w| w.len() == 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-            .expect("a room id")
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: `vox room list` shows no room id after `room create`: {out:?} \
+                     {err:?}"
+                )
+            })
             .to_owned()
     };
 
@@ -304,11 +323,11 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     let real_port = real_spec
         .rsplit('/')
         .next()
-        .expect("a port in the anchor spec")
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no port in the anchor's spec {real_spec:?}"))
         .to_owned();
     assert!(
         !dead_ports.iter().any(|p| p.to_string() == real_port),
-        "the specs must differ by address, or this gate measures nothing"
+        "CANNOT MEASURE: the specs must differ by address, or this gate measures nothing"
     );
     let started = std::time::Instant::now();
     let mut last = String::new();
@@ -330,7 +349,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     );
     assert!(
         followed,
-        "the daemon never reached the anchor its configuration now names, after {:?}. It \
+        "PRODUCT: the daemon never reached the anchor its configuration now names, after {:?}. It \
          started against {wrong_spec}, the file was rewritten to {real_spec} while it ran, \
          and an anchor spec may be a NAME precisely so it can move — a node that resolves \
          once holds the address it got at startup for ever. The invite said: {last:?}\n\
@@ -343,7 +362,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     let issued = last.trim().to_owned();
     assert!(
         issued.contains(&format!("/udp/{real_port}")) && !issued.contains('\n'),
-        "CANNOT MEASURE: the invite is not one link naming the real port: {issued:?}"
+        "PRODUCT (staging): the invite is not one link naming the real port: {issued:?}"
     );
     // **Only the anchor.** An invite also names the issuing node itself, last, with its
     // own addresses — and on loopback those are always reachable, so bob could join
@@ -375,7 +394,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     );
     assert!(
         addresses.len() == 1 && addresses[0].ends_with(&format!("/udp/{real_port}")),
-        "the invite's entry for the moved anchor must name only its new address, port \
+        "PRODUCT: the invite's entry for the moved anchor must name only its new address, port \
          {real_port}; it names {addresses:?}. The {} address(es) it had before the move were \
          kept beside the new one rather than replaced.",
         dead_ports.len()
@@ -389,20 +408,20 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         println!("[proof] the daemon named the bad line {named} time(s) on its stderr");
         assert!(
             named >= 1,
-            "the daemon followed the anchor but never said which line of its anchors file it \
+            "PRODUCT: the daemon followed the anchor but never said which line of its anchors file it \
              skipped (\"line 1 is skipped\"). Its stderr: {stderr:?}"
         );
     }
     let bob_data = tmp.path().join("bob-data");
     let bob_cfg = tmp.path().join("bob-cfg");
-    std::fs::create_dir_all(&bob_cfg).unwrap();
+    std::fs::create_dir_all(&bob_cfg).expect("APPARATUS: harness file I/O");
     let (ok, bob_fp, err) = vox(&bob_data, &bob_cfg, &["id"]);
-    assert!(ok, "bob: vox id: {err}");
+    assert!(ok, "PRODUCT (staging): bob's `vox id` failed: {err}");
     let bob_fp = bob_fp.trim().to_owned();
     assert_eq!(
         bob_fp.len(),
         52,
-        "`vox id` prints a fingerprint: {bob_fp:?}"
+        "PRODUCT (staging): bob's `vox id` did not print a fingerprint: {bob_fp:?}"
     );
     let alice_fp = fp.trim().to_owned();
     // Bob has no anchors file and no --anchor: the link is the only way to the room.
@@ -417,54 +436,45 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         .env("VOX_CONFIG_DIR", &bob_cfg)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(std::fs::File::create(&bob_err).unwrap()))
+        .stderr(Stdio::from(
+            std::fs::File::create(&bob_err).expect("APPARATUS: harness file I/O"),
+        ))
         .spawn()
-        .expect("spawn bob's vox daemon");
-    let mut pipe = bob.stdin.take().expect("bob's daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+        .expect("APPARATUS: spawn bob's vox daemon");
+    let mut pipe = bob.stdin.take().expect("APPARATUS: bob's daemon stdin");
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .expect("APPARATUS: write bob's passphrase");
     drop(pipe);
     let _bob = Proc(bob);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !vox(&bob_data, &bob_cfg, &["room", "list"]).0 {
         assert!(
             std::time::Instant::now() < deadline,
-            "CANNOT MEASURE: bob's daemon never answered on its control socket; its stderr: {:?}",
+            "PRODUCT (staging): bob's daemon never answered on its control socket; its stderr: {:?}",
             std::fs::read_to_string(&bob_err).unwrap_or_default()
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
+    // One attempt: a join that fails is the product failing, and retrying past it would hide it.
     let join_started = std::time::Instant::now();
-    let mut join_attempts = 0u32;
-    let mut join_errors = Vec::new();
-    let joined = loop {
-        join_attempts += 1;
-        let (ok, _, err) = vox_stdin(
-            &bob_data,
-            &bob_cfg,
-            &["room", "join", &link, "--name", "mission"],
-            Some(ROOM_PASS),
-        );
-        if ok {
-            break true;
-        }
-        join_errors.push(err.trim().to_owned());
-        if join_attempts >= JOIN_ATTEMPTS {
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(5));
-    };
+    let (joined, _, join_error) = vox_stdin(
+        &bob_data,
+        &bob_cfg,
+        &["room", "join", &link, "--name", "mission"],
+        Some(ROOM_PASS),
+    );
     println!(
-        "[proof] bob joined through the moved anchor: {joined} after {join_attempts} attempt(s), {:?}",
+        "[proof] bob joined through the moved anchor: {joined} in one attempt, {:?}",
         join_started.elapsed()
     );
     assert!(
         joined,
-        "bob could not join the room through the link alice issued after the anchor moved \
-         ({join_attempts} attempts). The link names the anchor at {real_spec}, bob has no \
-         other anchor, so alice must have reached the anchor at its new address and \
-         registered the room there. Join errors: {join_errors:?}\nalice's stderr: {:?}\n\
-         bob's stderr: {:?}",
+        "PRODUCT: bob could not join the room through the link alice issued after the anchor \
+         moved. The link names the anchor at {real_spec}, bob has no other anchor, so alice \
+         must have reached the anchor at its new address and registered the room there. The \
+         join said: {:?}\nalice's stderr: {:?}\nbob's stderr: {:?}",
+        join_error.trim(),
         std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default(),
         std::fs::read_to_string(&bob_err).unwrap_or_default()
     );
@@ -472,13 +482,16 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     // Trust after the join, as `support/room.rs` does (forward-only rooms release a key
     // at once to a member trusted after joining).
     let (ok, _, err) = vox(&data, &cfg, &["trust", "add", &bob_fp, "--name", "bob"]);
-    assert!(ok, "alice trusts bob: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox trust add` failed: {err}"
+    );
     let (ok, _, err) = vox(
         &bob_data,
         &bob_cfg,
         &["trust", "add", &alice_fp, "--name", "alice"],
     );
-    assert!(ok, "bob trusts alice: {err}");
+    assert!(ok, "PRODUCT (staging): bob's `vox trust add` failed: {err}");
 
     // ---- step 3: bob renders a post by alice, carried through the moved anchor ----
     let nonce = format!(
@@ -486,7 +499,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("APPARATUS: clock before the epoch")
             .as_nanos()
     );
     let read_started = std::time::Instant::now();
@@ -502,7 +515,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             &cfg,
             &["room", "post", &room, &format!("{nonce} #{posts}")],
         );
-        assert!(ok, "alice posts: {err}");
+        assert!(ok, "PRODUCT: alice's vox room post failed: {err}");
         std::thread::sleep(std::time::Duration::from_secs(2));
         let (_, out, _) = vox(&bob_data, &bob_cfg, &["room", "read", &room]);
         if out.contains(&nonce) {
@@ -516,7 +529,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     );
     assert!(
         rendered,
-        "bob joined but never rendered a post by alice ({posts} posts over {:?}). The room \
+        "PRODUCT: bob joined but never rendered a post by alice ({posts} posts over {:?}). The room \
          is reachable only through the anchor that moved. bob's read said: {bob_saw:?}\n\
          alice's stderr: {:?}\nbob's stderr: {:?}",
         read_started.elapsed(),
@@ -526,7 +539,11 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
 
     // The anchor must still be the one serving: a join that went anywhere else would
     // not be the claim.
-    let alive = anchor.0.try_wait().expect("anchor status").is_none();
+    let alive = anchor
+        .0
+        .try_wait()
+        .expect("APPARATUS: the anchor's exit status could not be read")
+        .is_none();
     let anchor_out = std::fs::read_to_string(tmp.path().join("anchor.out")).unwrap_or_default();
     println!(
         "[proof] anchor alive at the end: {alive}; its last line: {:?}",
@@ -534,7 +551,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     );
     assert!(
         alive,
-        "CANNOT MEASURE: the anchor exited during the run. stdout: {anchor_out:?} stderr: {:?}",
+        "PRODUCT (staging): the anchor exited during the run. stdout: {anchor_out:?} stderr: {:?}",
         std::fs::read_to_string(tmp.path().join("anchor.err")).unwrap_or_default()
     );
 }
@@ -543,7 +560,9 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
 /// except `anchor_id`'s; the channel id and the responder pin (`r=`) are kept. Returns
 /// the link and how many entries were dropped.
 fn only_anchor(link: &str, anchor_id: &str) -> (String, usize) {
-    let (head, query) = link.split_once('?').expect("an invite link has a query");
+    let (head, query) = link.split_once('?').unwrap_or_else(|| {
+        panic!("PRODUCT: `vox room invite` printed a link with no query: {link:?}")
+    });
     let mut kept = Vec::new();
     let mut keeping = false;
     let mut dropped = 0;

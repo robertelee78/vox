@@ -66,27 +66,64 @@ mod watchdog;
 
 use std::time::{Duration, Instant};
 
-use sync_pair::{anchor, announced, counter, failures, mutant_sender, Member};
+use sync_pair::{anchor, announced, counter, failures, mutant_sender, Member, Proc};
 
 /// How long a post may take to reach a member before it counts as never.
 const ARRIVES_WITHIN: Duration = Duration::from_secs(30);
 
-/// Whether `m` reads `text` in `room` now (`vox room read`, which needs the room open).
-fn reads(m: &Member, room: &str, text: &str) -> bool {
-    let (ok, out, _) = m.vox(&["room", "read", room], None);
-    ok && out.lines().any(|l| l.ends_with(text))
+/// Whether `m` reads `text` in `room` now (`vox room read`, which needs the room open); `Err`
+/// quotes a `vox room read` that failed, so a failing read is never taken for "not yet".
+fn reads(m: &Member, room: &str, text: &str) -> Result<bool, String> {
+    let (ok, out, err) = m.vox(&["room", "read", room], None);
+    if ok {
+        Ok(out.lines().any(|l| l.ends_with(text)))
+    } else {
+        Err(format!("{out}{err}").trim().to_owned())
+    }
 }
 
-/// Wait until `m` reads `text`, up to [`ARRIVES_WITHIN`]; how long it took, or `None`.
-fn arrives(m: &Member, room: &str, text: &str) -> Option<Duration> {
+/// Wait until `m` reads `text`, up to [`ARRIVES_WITHIN`]; how long it took, or why not: never
+/// shown by reads that worked, or the last `vox room read` that failed, quoted.
+fn arrives(m: &Member, room: &str, text: &str) -> Result<Duration, String> {
     let t = Instant::now();
+    let mut failed = None;
     while t.elapsed() < ARRIVES_WITHIN {
-        if reads(m, room, text) {
-            return Some(t.elapsed());
+        match reads(m, room, text) {
+            Ok(true) => return Ok(t.elapsed()),
+            Ok(false) => failed = None,
+            Err(e) => failed = Some(e),
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    None
+    Err(match failed {
+        Some(e) => format!("not read within {ARRIVES_WITHIN:?}; `vox room read` failed: {e}"),
+        None => format!("`vox room read` worked and did not show it within {ARRIVES_WITHIN:?}"),
+    })
+}
+
+/// Send `sig` to `p`, and check from `ps` that it took: stopped after `-STOP`, running after
+/// `-CONT`.
+fn signal_took(p: &Proc, sig: &str, who: &str) {
+    p.signal(sig);
+    let state = |pid: u32| {
+        std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default()
+    };
+    let t = Instant::now();
+    loop {
+        let st = state(p.pid());
+        if st.starts_with('T') == (sig == "-STOP") {
+            return;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "APPARATUS: kill {sig} of {who}'s process did not take: its state is {st:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// `m`'s count of refused entries, from `from` or from anyone.
@@ -123,7 +160,7 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
     const MODE: &str = "author-unclassifiable";
     watchdog::arm();
     let sender = mutant_sender();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let (_anchor, spec) = anchor(root);
     let alice = Member::new(root, "alice");
@@ -143,8 +180,8 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
     let first = "alice, before mallory posts";
     alice.post(&room, first);
     assert!(
-        arrives(&bob, &room, first).is_some(),
-        "CANNOT MEASURE: alice's first post never reached bob, before anything hostile"
+        arrives(&bob, &room, first).is_ok(),
+        "PRODUCT (staging): alice's first post never reached bob, before anything hostile"
     );
 
     let since = refused(&bob, None);
@@ -156,6 +193,11 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
         "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
         mallory_d.transcript()
     );
+    assert!(
+        refused >= 1,
+        "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
+        bob.status()
+    );
     let after = "alice, after mallory's entry";
     alice.post(&room, after);
     let took = arrives(&bob, &room, after);
@@ -163,13 +205,14 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
         "[proof] unclassifiable: bob refused {refused} entr(ies); alice's next post reached him: \
          {took:?}"
     );
-    assert!(
-        took.is_some(),
-        "alice's post made after mallory's unclassifiable entry never reached bob within \
-         {ARRIVES_WITHIN:?}: the room's sync stopped\nbob's status: {}\nbob:\n{}",
-        bob.status(),
-        bob_d.transcript()
-    );
+    if let Err(e) = &took {
+        panic!(
+            "PRODUCT: alice's post made after mallory's unclassifiable entry never reached bob \
+             ({e}): the room's sync stopped\nbob's status: {}\nbob:\n{}",
+            bob.status(),
+            bob_d.transcript()
+        );
+    }
     // A refusal is not a failed session: before, it ended bob's session with the refusal as its
     // reason and poisoned the room's sync until a reopen, and alice's post came only when she
     // pushed it again. The reason is hard-coded here.
@@ -179,12 +222,7 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
         .collect();
     assert!(
         poisoned.is_empty(),
-        "mallory's unclassifiable entry failed bob's sync sessions: {poisoned:?}"
-    );
-    assert!(
-        refused >= 1,
-        "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
-        bob.status()
+        "PRODUCT: mallory's unclassifiable entry failed bob's sync sessions: {poisoned:?}"
     );
 
     // ---- bob restarts: the room is held again, whole, and nothing hostile was stored --------
@@ -195,15 +233,17 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
     println!(
         "[proof] unclassifiable: after a restart bob reads it: {reopened:?}; set aside: {aside:?}"
     );
-    assert!(
-        reopened.is_some(),
-        "after a restart bob's room is not open, or has lost alice's post\nbob's status: {}",
-        bob.status()
-    );
+    if let Err(e) = &reopened {
+        panic!(
+            "PRODUCT: after a restart bob's room is not open, or has lost alice's post ({e})\n\
+             bob's status: {}",
+            bob.status()
+        );
+    }
     assert!(
         aside.is_empty(),
-        "mallory's unclassifiable entry was stored before it was refused: the reopen set aside \
-         {aside:?}"
+        "PRODUCT: mallory's unclassifiable entry was stored before it was refused: the reopen \
+         set aside {aside:?}"
     );
 }
 
@@ -213,7 +253,7 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     const MODE: &str = "strip-payload";
     watchdog::arm();
     let sender = mutant_sender();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let (anchor_d, spec) = anchor(root);
     let alice = Member::new(root, "alice");
@@ -233,15 +273,17 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     let warm = "alice, while everyone is up";
     alice.post(&room, warm);
     assert!(
-        arrives(&mallory, &room, warm).is_some(),
+        arrives(&mallory, &room, warm).is_ok(),
         "CANNOT MEASURE: alice's first post never reached mallory"
     );
     // Not a precondition: bob may take this one from mallory too, stripped.
-    assert!(
-        arrives(&bob, &room, warm).is_some(),
-        "bob never read alice's first post: he holds an empty copy\nbob's status: {}",
-        bob.status()
-    );
+    if let Err(e) = arrives(&bob, &room, warm) {
+        panic!(
+            "PRODUCT: bob never read alice's first post ({e}): he holds an empty copy\n\
+             bob's status: {}",
+            bob.status()
+        );
+    }
 
     // ---- bob's only copy of alice's post is mallory's --------------------------------------
     let sessions = |m: &Member| {
@@ -251,18 +293,19 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     let with_mallory = sessions(&mallory);
     // Bob may have refused a stripped copy already, of the first post: only a new one counts.
     let since = refused(&bob, Some(&mallory));
-    bob_d.signal("-STOP");
+    signal_took(&bob_d, "-STOP", "bob");
     let post = "alice, while bob was away";
     alice.post(&room, post);
     let held = arrives(&mallory, &room, post);
     // The anchor holds the room's entries too, and would serve bob the whole one.
-    alice_d.signal("-STOP");
-    anchor_d.signal("-STOP");
-    bob_d.signal("-CONT");
-    assert!(
-        held.is_some(),
-        "CANNOT MEASURE: mallory never had alice's post, so bob could not get it from her"
-    );
+    signal_took(&alice_d, "-STOP", "alice");
+    signal_took(&anchor_d, "-STOP", "the anchor");
+    signal_took(&bob_d, "-CONT", "bob");
+    if let Err(e) = held {
+        panic!(
+            "CANNOT MEASURE: mallory never had alice's post, so bob could not get it from her: {e}"
+        );
+    }
     let refused = refused_by(&bob, Some(&mallory), since);
     let served = sessions(&mallory).saturating_sub(with_mallory);
     assert!(
@@ -275,31 +318,36 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
         "CANNOT MEASURE: bob had no session with mallory while alice was stopped\nbob's status: {}",
         bob.status()
     );
-
-    // ---- alice comes back: bob gets her post whole ------------------------------------------
-    alice_d.signal("-CONT");
-    anchor_d.signal("-CONT");
-    let took = arrives(&bob, &room, post);
-    println!("[proof] stripped: bob refused {refused} entr(ies) from mallory; alice's post reached him: {took:?}");
-    assert!(
-        took.is_some(),
-        "bob never read alice's post after mallory served it stripped: he holds an empty one\n\
-         bob's status: {}",
-        bob.status()
-    );
     assert!(
         refused >= 1,
-        "bob had {served} session(s) with mallory while alice was stopped and refused nothing"
+        "CANNOT MEASURE: mallory's stripped copy never reached bob: he had {served} session(s) \
+         with her while alice was stopped and refused nothing\nbob's status: {}",
+        bob.status()
     );
+
+    // ---- alice comes back: bob gets her post whole ------------------------------------------
+    signal_took(&alice_d, "-CONT", "alice");
+    signal_took(&anchor_d, "-CONT", "the anchor");
+    let took = arrives(&bob, &room, post);
+    println!("[proof] stripped: bob refused {refused} entr(ies) from mallory; alice's post reached him: {took:?}");
+    if let Err(e) = &took {
+        panic!(
+            "PRODUCT: bob never read alice's post after mallory served it stripped ({e}): he holds \
+             an empty one\nbob's status: {}",
+            bob.status()
+        );
+    }
     drop(bob_d);
     let _bob_d = bob.daemon(Some(&spec));
     let reopened = arrives(&bob, &room, post);
     println!("[proof] stripped: after a restart bob reads it: {reopened:?}");
-    assert!(
-        reopened.is_some(),
-        "after a restart bob's room is not open, or has lost alice's post\nbob's status: {}",
-        bob.status()
-    );
+    if let Err(e) = &reopened {
+        panic!(
+            "PRODUCT: after a restart bob's room is not open, or has lost alice's post ({e})\n\
+             bob's status: {}",
+            bob.status()
+        );
+    }
 }
 
 #[test]
@@ -308,7 +356,7 @@ fn a_message_lost_to_the_old_row_ids_is_reported() {
     const MODE: &str = "old-row-ids";
     watchdog::arm();
     let sender = mutant_sender();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let (_anchor, spec) = anchor(root);
     let alice = Member::new(root, "alice");
@@ -324,10 +372,9 @@ fn a_message_lost_to_the_old_row_ids_is_reported() {
         alice.post(&room, p);
     }
     for p in hers {
-        assert!(
-            arrives(&bob, &room, p).is_some(),
-            "CANNOT MEASURE: bob never received {p:?}"
-        );
+        if let Err(e) = arrives(&bob, &room, p) {
+            panic!("CANNOT MEASURE: bob never received {p:?}: {e}");
+        }
     }
     // ---- bob's store is damaged the old way: restart, post ---------------------------------
     drop(bob_d);
@@ -342,11 +389,14 @@ fn a_message_lost_to_the_old_row_ids_is_reported() {
 
     // ---- the shipped daemon opens it --------------------------------------------------------
     let _bob_d = bob.daemon(Some(&spec));
+    if let Err(e) = arrives(&bob, &room, "bob, after the restart") {
+        panic!("PRODUCT: the shipped daemon does not hold bob's room: {e}");
+    }
+    let (read_ok, read, read_err) = bob.vox(&["room", "read", &room], None);
     assert!(
-        arrives(&bob, &room, "bob, after the restart").is_some(),
-        "CANNOT MEASURE: the shipped daemon does not hold bob's room"
+        read_ok,
+        "PRODUCT: bob's `vox room read` failed after it had shown his post: {read}{read_err}"
     );
-    let (_, read, _) = bob.vox(&["room", "read", &room], None);
     let kept = hers
         .iter()
         .filter(|p| read.lines().any(|l| l.ends_with(**p)))
@@ -367,7 +417,7 @@ fn a_message_lost_to_the_old_row_ids_is_reported() {
     assert_eq!(
         lost.len(),
         hers.len() - kept,
-        "bob lost {} of alice's posts to the old row ids; vox status reports {lost:?}",
+        "PRODUCT: bob lost {} of alice's posts to the old row ids; vox status reports {lost:?}",
         hers.len() - kept
     );
 }
@@ -378,7 +428,7 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
     const MODE: &str = "author-misbound";
     watchdog::arm();
     let sender = mutant_sender();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let (_anchor, spec) = anchor(root);
     let alice = Member::new(root, "alice");
@@ -398,8 +448,8 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
     let first = "alice, before mallory posts";
     alice.post(&room, first);
     assert!(
-        arrives(&bob, &room, first).is_some(),
-        "CANNOT MEASURE: alice's first post never reached bob, before anything hostile"
+        arrives(&bob, &room, first).is_ok(),
+        "PRODUCT (staging): alice's first post never reached bob, before anything hostile"
     );
 
     let since = refused(&bob, None);
@@ -411,6 +461,11 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
         "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
         mallory_d.transcript()
     );
+    assert!(
+        refused >= 1,
+        "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
+        bob.status()
+    );
     let after = "alice, after mallory's entry";
     alice.post(&room, after);
     let took = arrives(&bob, &room, after);
@@ -418,13 +473,14 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
         "[proof] misbound: bob refused {refused} entr(ies); alice's next post reached him: \
          {took:?}"
     );
-    assert!(
-        took.is_some(),
-        "alice's post made after mallory's misbound governance entry never reached bob within \
-         {ARRIVES_WITHIN:?}: the room's sync stopped\nbob's status: {}\nbob:\n{}",
-        bob.status(),
-        bob_d.transcript()
-    );
+    if let Err(e) = &took {
+        panic!(
+            "PRODUCT: alice's post made after mallory's misbound governance entry never reached \
+             bob ({e}): the room's sync stopped\nbob's status: {}\nbob:\n{}",
+            bob.status(),
+            bob_d.transcript()
+        );
+    }
     // A refusal is not a failed session: before, it ended bob's session with the refusal as its
     // reason and poisoned the room's sync until a reopen, and alice's post came only when she
     // pushed it again. The reason is hard-coded here.
@@ -434,12 +490,7 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
         .collect();
     assert!(
         poisoned.is_empty(),
-        "mallory's misbound governance entry failed bob's sync sessions: {poisoned:?}"
-    );
-    assert!(
-        refused >= 1,
-        "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
-        bob.status()
+        "PRODUCT: mallory's misbound governance entry failed bob's sync sessions: {poisoned:?}"
     );
 
     // ---- bob restarts: the room is held again, whole, and nothing hostile was stored --------
@@ -448,14 +499,16 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
     let reopened = arrives(&bob, &room, after);
     let aside = set_aside(&bob);
     println!("[proof] misbound: after a restart bob reads it: {reopened:?}; set aside: {aside:?}");
-    assert!(
-        reopened.is_some(),
-        "after a restart bob's room is not open, or has lost alice's post\nbob's status: {}",
-        bob.status()
-    );
+    if let Err(e) = &reopened {
+        panic!(
+            "PRODUCT: after a restart bob's room is not open, or has lost alice's post ({e})\n\
+             bob's status: {}",
+            bob.status()
+        );
+    }
     assert!(
         aside.is_empty(),
-        "mallory's misbound governance entry was stored before it was refused: the reopen set aside \
-         {aside:?}"
+        "PRODUCT: mallory's misbound governance entry was stored before it was refused: the \
+         reopen set aside {aside:?}"
     );
 }
