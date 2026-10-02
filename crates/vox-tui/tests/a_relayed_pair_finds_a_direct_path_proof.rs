@@ -43,7 +43,15 @@
 //! Replaces `crates/vox-core/tests/relayed_path_is_retried.rs`, which ran every node in process on
 //! a NAT simulator with an injected clock.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_relayed_pair_finds_a_direct_path_once_one_becomes_possible);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -119,6 +127,7 @@ fn is_still_relayed(l: &str) -> bool {
     l.starts_with("! vox: still relayed to")
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "production Argon2id + a real PoW, a relayed pair held across two 60 s retries; run in release"]
 fn a_relayed_pair_finds_a_direct_path_once_one_becomes_possible() {

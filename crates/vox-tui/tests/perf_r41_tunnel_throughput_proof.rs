@@ -56,7 +56,15 @@
 //! `VOX_PERF_ONLY=<text>` runs only the links and arms whose name contains it, or any of several
 //! texts separated by `|`.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(r41_a_tunnel_does_not_throttle_the_link_it_runs_over);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -713,8 +721,9 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "three real vox processes, production Argon2id and ~2 GB through an emulated link; CI runs it in release"]
+#[ignore = "three real vox processes, production Argon2id and ~2 GB through an emulated link; optional, run it in release"]
 fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     // The raw-TCP links take about 4 minutes; ADR-024's arms add about 10 (each runs a settle and a
