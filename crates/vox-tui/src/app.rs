@@ -928,11 +928,24 @@ async fn judge(
         .find(|c| c.channel_id == *channel_id)
         .and_then(|c| c.local_name.clone())
         .unwrap_or_default();
+    let me = view.identity.as_ref().map(|i| i.fingerprint);
     for session in crate::wake::registered(paths) {
         if session.room != room || session.name.is_empty() {
             continue;
         }
         if !envelope.may_interrupt(&session.name) {
+            continue;
+        }
+        // **Not a session already in this conversation** (V210-121): a reply chain that comes
+        // back to a session that spoke in it is two agents keeping each other awake. The hop
+        // budget ends such a chain eventually; this ends it at the first turn back. It queues.
+        if me.is_some_and(|me| crate::wake::in_chain(&envelope, timeline, &me, &session.session)) {
+            eprintln!(
+                "vox daemon: not interrupting session {} for {}: it already spoke in the reply \
+                 chain this answers; it reads it on its next turn",
+                session.session,
+                &vox_core::node::link::b32_encode(&row.entry_hash)[..12]
+            );
             continue;
         }
         // **Attributed and framed as the drain is** (V210-79): the wake arrives as the
@@ -944,6 +957,10 @@ async fn judge(
             &author,
             &envelope.body,
         );
+        // Recorded **before** the wake is sent, so the session's answer with no `--re` replies to
+        // this (V210-121) however soon it comes: recorded after, an answer could beat the record.
+        // A wake that then fails still put the message before the session's next turn.
+        crate::wake::note_woke(paths, &session.session, &room, &row.entry_hash);
         let entry = vox_core::node::link::b32_encode(&row.entry_hash);
         let paths = paths.clone();
         // **One wedged session must not stall every other wake.** Each is its own task,

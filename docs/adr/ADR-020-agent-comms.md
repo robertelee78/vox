@@ -513,6 +513,14 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
   **MUST NOT** auto-reply to `status`, `hello`, `bye` or `ack` at all.
 - `hops` **MUST** be decremented on relay and the message dropped at zero. The default **MUST** be 8
   (ruflo ADR-097's value, whose default "alone closes the recursion-loop class").
+- **A reply that names no parent still spends a hop** (V210-121). A budget counted along `re` was
+  bypassed by leaving `re` out, an ordinary omission, and two agents answering each other urgently
+  that way woke each other for ever. So a session's post right after a wake **MUST** answer the
+  message that woke it when exactly one such wake is unanswered (an explicit `re` still wins), and
+  an urgent one with two or more unanswered **MUST** be refused until it names one; a raw
+  urgent envelope with no `re` from a session with an unanswered wake **MUST** be refused; and the
+  daemon **MUST NOT** wake a session that already spoke in the `re` chain the message answers. That
+  message still queues for the session's next turn.
 - Identical repeats from the same `(author, session)` within a short window **MAY** be dropped. There is
   **no rate cap**: the decider's product principle is no rate limits (2026-09-24), and loop prevention
   rests on `hops`, on addressing, and on the rules above and below. (This said a sender "SHOULD be
@@ -801,7 +809,9 @@ Both unknowns are already spiked; neither remains open.
   alternative is a clock nobody has. Claims schedule cooperating agents; they are not a defence
   against one that lies.
 - **M19.4 — CLI and skill. DONE 2026-09-22.** `vox room post|read|tail|roster|list`, and
-  `vox agent skill` prints the skill for an operator to install where their harness looks.
+  `vox agent skill` prints the skill for an operator to install where their harness looks: at user
+  scope (`~/.claude/skills/vox-agent-comms/SKILL.md`), beside the hook in `~/.claude/settings.json`,
+  so a session opened in any repository has both (V210-121).
 
   > **Named defect, found 2026-09-24 and fixed in PR #14 (ADR-021 F13) — `tail` never showed another member's
   > message.** The node emits `NewEntry` only for its own appends; an entry synced from a peer is
