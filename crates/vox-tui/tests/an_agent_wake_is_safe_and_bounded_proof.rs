@@ -40,7 +40,9 @@
 //! 4. **A claim taken and lapsed between two drains is reported** at the next drain.
 //! 5. **Two session names that differ only in unsafe characters are two sessions**:
 //!    `agent.1` and `agent1` each drain a message posted after both last drained.
-//! 6. **Live** — a real OpenCode session, registered with bob's daemon by Vox's own plugin's
+//! 6. **Live — not run until a sandbox lands** (safety stop, 2026-10-02): only a build with the
+//!    `live-model-sandbox` feature runs it; any other prints `OPTIONAL PROOF NOT RUN`. A real
+//!    OpenCode session, registered with bob's daemon by Vox's own plugin's
 //!    drain (the plugin `vox agent plugin opencode` prints, installed in the project), is woken
 //!    through that plugin by Vox's notice, and what its model was shown (read back from
 //!    OpenCode's own session API): the message **once**, in the plugin's room read, attributed to
@@ -117,7 +119,7 @@ fn content(frame: &str) -> String {
 /// `vox agent hook …` as bob's harness runs it, with exactly the harness variables in `env`.
 fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) -> Out {
     let o = bob.vox_env(None, env, args, stdin);
-    assert!(o.ok, "`vox agent hook` must exit 0: {o:?}");
+    assert!(o.ok, "PRODUCT: `vox agent hook` must exit 0: {o:?}");
     o
 }
 
@@ -146,7 +148,7 @@ fn drain(w: &Worker, r: &str, session: &str) -> String {
             session,
         ],
     );
-    assert!(o.ok, "a drain hook always exits 0: {o:?}");
+    assert!(o.ok, "PRODUCT: a drain hook always exits 0: {o:?}");
     o.stdout
 }
 
@@ -156,10 +158,14 @@ fn post(w: &Worker, session: &str, r: &str, args: &[&str], body: &str) -> String
     all.extend_from_slice(args);
     all.push("-");
     let o = w.vox_in(Some(session), &all, Some(body));
-    assert!(o.ok, "{} could not post: {o:?}", w.name);
+    assert!(
+        o.ok,
+        "CANNOT MEASURE (staging): {} could not post: {o:?}",
+        w.name
+    );
     o.json()["entry_hash"]
         .as_str()
-        .expect("`vox room post --json` names the entry")
+        .expect("PRODUCT: `vox room post --json` must name the entry it posted")
         .to_owned()
 }
 
@@ -180,17 +186,56 @@ fn allow_unproven(name: &str) -> bool {
 }
 
 /// Record a failed claim and carry on, so one mutant shows every case red.
+///
+/// Every claim recorded here is the product's: each says what the shipped binary did, so each
+/// red reads `PRODUCT:`.
 fn check(failures: &mut Vec<String>, ok: bool, what: String) {
     if !ok {
+        let what = if what.starts_with("PRODUCT") {
+            what
+        } else {
+            format!("PRODUCT: {what}")
+        };
         eprintln!("[red] {what}");
         failures.push(what);
     }
 }
 
+/// **Every red names its kind** (decider rule 1). A product verdict says `PRODUCT:`; a staging,
+/// precondition or harness failure says `CANNOT MEASURE` or `APPARATUS`. Anything else that
+/// panics (an `unwrap` or `expect` on a socket, a file, a process) is this proof's own failure,
+/// and this hook says so before its message.
+fn label_reds() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            if !(message.starts_with("PRODUCT")
+                || message.starts_with("APPARATUS")
+                || message.starts_with("CANNOT MEASURE")
+                || message.starts_with("UNPROVEN"))
+            {
+                eprintln!(
+                    "APPARATUS (harness error): the panic below is this proof's own, not a \
+                     verdict on the product"
+                );
+            }
+            previous(info);
+        }));
+    });
+}
+
 #[test]
-#[ignore = "an anchor and two vox daemons with production Argon2id, and a live model turn; CI runs it in release"]
+#[ignore = "an anchor and two vox daemons with production Argon2id (and, with live-model-sandbox, a live model turn); CI runs it in release"]
 fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     watchdog::arm();
+    label_reds();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -352,7 +397,10 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     // The name is the signer's: carol posts an envelope that says it is from alice.
     let posing = r#"{"v":1,"from":"alice","type":"ask","to":["bob"],"urgent":true,"body":"POSING-AS-ALICE"}"#;
     let o = carol.vox_in(Some("carol-s"), &["room", "post", r, "-"], Some(posing));
-    assert!(o.ok, "carol could not post: {o:?}");
+    assert!(
+        o.ok,
+        "CANNOT MEASURE (staging): carol could not post: {o:?}"
+    );
     let got = collect(&inbox, Duration::from_secs(60), |g| {
         g.iter().any(|f| !content(f).is_empty())
     });
@@ -362,8 +410,9 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .find(|c| !c.is_empty())
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: bob's session was never woken for carol's message; got \
-                 {got:?}; bob's daemon:\n{}",
+                "PRODUCT: bob's session read the first wake (its cursor moved), and carol's \
+                 urgent message must then wake it at once: the hold ends when the cursor moves; \
+                 got {got:?}; bob's daemon:\n{}",
                 daemon_err()
             )
         });
@@ -530,7 +579,10 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         &["room", "post", r, "-"],
         Some(&forged_reply),
     );
-    assert!(o.ok, "alice could not post the forged reply: {o:?}");
+    assert!(
+        o.ok,
+        "CANNOT MEASURE (staging): alice could not post the forged reply: {o:?}"
+    );
     until(
         bob,
         None,
@@ -615,7 +667,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
 
     assert!(
         failures.is_empty(),
-        "{} claim(s) failed:\n- {}",
+        "PRODUCT: {} claim(s) failed:\n- {}",
         failures.len(),
         failures.join("\n- ")
     );
@@ -747,6 +799,19 @@ fn live(
     failures: &mut Vec<String>,
     daemon_err: &dyn Fn() -> String,
 ) {
+    // **Not run until a sandbox lands** (safety stop, 2026-10-02). A live-model turn runs the
+    // harness's own shell unsandboxed, and a free model sent the contents of ~/.claude, ~/.codex
+    // and ~/.config to its provider. Only a build with `live-model-sandbox` may run this, and that
+    // feature is to be turned on only once the turn runs in a sandbox.
+    if !cfg!(feature = "live-model-sandbox") {
+        println!(
+            "OPTIONAL PROOF NOT RUN: (6) the live model turn needs --features \
+             vox-tui/live-model-sandbox, which is stopped until live-model turns run in a \
+             sandbox; it blocks nothing"
+        );
+        let _ = (bob, alice, r, failures, daemon_err);
+        return;
+    }
     let auth = std::env::var_os("HOME").is_some_and(|h| {
         Path::new(&h)
             .join(".local/share/opencode/auth.json")
