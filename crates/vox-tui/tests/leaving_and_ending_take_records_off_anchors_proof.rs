@@ -134,11 +134,28 @@ fn a_leave_and_an_end_take_their_records_off_the_anchor() {
         }
     }
     // Carol, an admin no longer, runs the faulty build: it takes the room off boards anyway.
+    // The anchor prints `holding <addr> for <member>` each time a member's node puts its record;
+    // the faulty build's withdraw goes to the anchors it is connected to, so it waits for one.
+    let carol_on_anchor = {
+        let tag = format!(" for {}", &room.workers[2].b32()[..26]);
+        move |text: &str| text.lines().filter(|l| l.contains(" holding ") && l.contains(&tag)).count()
+    };
+    let before = carol_on_anchor(&anchor());
     let carol_err = tmp.path().join("carol.mutant.err");
     room.workers[2].restart_daemon_as(
         &mutant,
         &[("VOX_MUTANT_SENDER_MODE", "withdraw-unentitled")],
         &carol_err,
+    );
+    let deadline = Instant::now() + WITHIN;
+    while carol_on_anchor(&anchor()) <= before && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        carol_on_anchor(&anchor()) > before,
+        "APPARATUS: carol's faulty node did not reach the anchor within {WITHIN:?} of its \
+         restart, so its withdraw would not be put there.\nanchor:\n{}",
+        anchor()
     );
     let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
     let o = carol.vox(None, &["room", "end", id]);
@@ -147,10 +164,14 @@ fn a_leave_and_an_end_take_their_records_off_the_anchor() {
         "PRODUCT: carol, whose admin was taken back, was not refused `vox room end`: {o:?}"
     );
     let said = std::fs::read_to_string(&carol_err).unwrap_or_default();
+    let put_to = said
+        .lines()
+        .find_map(|l| l.split_once("put a room withdraw for ")?.1.split(" to ").nth(1))
+        .and_then(|rest| rest.split(' ').next()?.parse::<usize>().ok());
     assert!(
-        said.contains("putting a room withdraw"),
-        "APPARATUS: carol's faulty node never put its room withdraw, so a board's refusal of it was \
-         not staged. It said:\n{said}"
+        put_to.is_some_and(|n| n > 0),
+        "APPARATUS: carol's faulty node did not put its room withdraw to an anchor (anchors: \
+         {put_to:?}), so a board's refusal of it was not staged. It said:\n{said}"
     );
     let (moved, n) = board_until(&out, &short, SETTLE, |n| n != Some(3));
     assert!(

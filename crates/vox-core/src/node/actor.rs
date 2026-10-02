@@ -10390,26 +10390,27 @@ impl Node {
 
     /// Take a room off boards (V030-14): sign a withdraw — this identity's own records after a
     /// leave, the whole room after an end — and put it on this node's board and every anchor
-    /// connected now. One that connects later is told when it does (`withdrawn`).
+    /// connected now, and say how many those were. One that connects later is told when it does
+    /// (`withdrawn`).
     async fn withdraw_from_boards(
         &mut self,
         channel_id: &Digest32,
         scope: crate::nat::withdraw::WithdrawScope,
-    ) {
+    ) -> usize {
         let now = self.now();
         let (Some(net), Some(profile)) = (self.net.as_ref().map(Arc::clone), self.profile.as_ref())
         else {
-            return;
+            return 0;
         };
-        let Ok(signer) = profile.signer() else { return };
+        let Ok(signer) = profile.signer() else { return 0 };
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return;
+            return 0;
         };
         let epoch = shared.lock().await.epoch();
         let Ok(w) =
             crate::nat::withdraw::BoardWithdraw::build(signer, channel_id, epoch, scope, now)
         else {
-            return;
+            return 0;
         };
         let wire = w.to_wire();
         let _ = net.publish_local(&wire);
@@ -10419,9 +10420,10 @@ impl Node {
             .iter()
             .filter_map(|id| net.manager().existing(id))
             .collect();
-        for conn in anchors {
-            Self::put_withdraws(&conn, vec![wire.clone()]);
+        for conn in &anchors {
+            Self::put_withdraws(conn, vec![wire.clone()]);
         }
+        anchors.len()
     }
 
     /// The room's admin roster, signed (V030-14), when this node is its creator: who besides it a
@@ -10497,16 +10499,15 @@ impl Node {
                 #[cfg(feature = "mutant-sender")]
                 if crate::log::sync::mutant::withdraws_unentitled() {
                     drop(ch);
+                    let anchors = self
+                        .withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
+                        .await;
                     eprintln!(
-                        "{}: putting a room withdraw for {} though this node may not end it",
+                        "{}: put a room withdraw for {} to {anchors} anchor(s) though this node \
+                         may not end it",
                         crate::log::sync::mutant::MARKER,
                         crate::node::network::short_id(*channel_id)
                     );
-                    self.withdraw_from_boards(
-                        channel_id,
-                        crate::nat::withdraw::WithdrawScope::Room,
-                    )
-                    .await;
                 }
                 return Outcome::Failed(fault_of(&e));
             }
