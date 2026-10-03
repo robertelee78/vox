@@ -161,7 +161,10 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
     let lossy: Arc<Mutex<Knob>> = Arc::default();
     let lossy_in = Arc::clone(&lossy);
     let mut w = World::build(&Setup {
-        specs: vec![format!("{sink_port}={sink_port}/udp"), format!("{echo_port}={echo_port}")],
+        specs: vec![
+            format!("{sink_port}={sink_port}/udp"),
+            format!("{echo_port}={echo_port}"),
+        ],
         trusted: true,
         path: PathKind::Relayed,
         guest_leg: Some(Box::new(move |anchor| {
