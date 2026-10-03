@@ -5,11 +5,10 @@
 //!
 //! ```text
 //! vox node create a; vox node create b                   (data root D)
-//! vox daemon --listen 127.0.0.1:0                        (D's one daemon, no node attached)
-//! vox --node a serve web=<echo port>                     (held: a attached for as long as it runs)
+//! vox --node a serve web=<echo port> --listen 127.0.0.1:0 (starts D's daemon; a held while it runs)
 //! vox node attach b; vox --node b room create bx; vox --node b room invite bx
-//! vox node create r; vox daemon --listen 127.0.0.1:0     (data root R, the remote)
-//! vox --node r connect <a's address>; vox node attach r; vox --node r room join <b's link>
+//! vox node create r                                     (data root R, the remote)
+//! vox --node r connect <a's address> --listen …; vox node attach r; vox --node r room join <b's link>
 //! vox trust add … (a and b trust r, r trusts b)
 //! vox --node b room post bx …; vox --node r room read …  (while a serves)
 //! vox --node r forward web.<a>.<room>.vox                (r reaches a's service: bytes echo)
@@ -48,6 +47,38 @@ impl Drop for Kid {
     }
 }
 
+/// The pid of the daemon holding `dir`'s lock (it writes it there), if one does.
+fn daemon_pid(dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(dir.join(".daemon").join("lock"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Stops the daemon of a data root by its pid when dropped, and waits for it to go (never by a
+/// pattern).
+struct Reaper(PathBuf);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        let Some(pid) = daemon_pid(&self.0) else {
+            return;
+        };
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline
+            && Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|s| s.success())
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
 /// One data root: its directory, and a passphrase file per node.
 struct Root {
     dir: PathBuf,
@@ -76,8 +107,7 @@ impl Root {
             ["--node", node, rest @ ..] => cmd.args(rest).args(["--node", node]),
             _ => cmd.args(args),
         };
-        cmd
-            .env("VOX_DATA_DIR", &self.dir)
+        cmd.env("VOX_DATA_DIR", &self.dir)
             .env("VOX_CONFIG_DIR", self.dir.join("cfg"))
             .env_remove("VOX_NODE")
             .env_remove("VOX_PROFILE")
@@ -300,21 +330,9 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
         "PRODUCT (staging): three nodes, three fingerprints: {a_fp} {b_fp} {r_fp}"
     );
 
-    // ---- one daemon per data root -------------------------------------------------------
-    let (d_daemon, _) = d.spawn("daemon", &["daemon", "--listen", "127.0.0.1:0"]);
-    let (r_daemon, _) = r.spawn("daemon", &["daemon", "--listen", "127.0.0.1:0"]);
-    for root in [&d, &r] {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !root.run(&["node", "list"]).1.contains("detached") {
-            assert!(
-                Instant::now() < deadline,
-                "PRODUCT (staging): the daemon in {} never answered: {}",
-                root.dir.display(),
-                root.said("daemon")
-            );
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    }
+    // ---- no daemon yet: the first verb that holds a node starts it (S-2) ------------------
+    let _d_daemon = Reaper(d.dir.clone());
+    let _r_daemon = Reaper(r.dir.clone());
 
     // ---- a serves, held through the daemon -------------------------------------------------
     let echo = echo_service();
@@ -327,6 +345,8 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
             "a",
             "serve",
             &spec,
+            "--listen",
+            "127.0.0.1:0",
             "--identity-passphrase-file",
             a_pf.to_str().unwrap(),
         ],
@@ -366,7 +386,7 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
         "PRODUCT: vox serve holds a UDP socket of its own, so it hosts a node:\n{}",
         own.join("\n")
     );
-    let daemons = udp_sockets(d_daemon.0.id());
+    let daemons = udp_sockets(daemon_pid(&d.dir).expect("PRODUCT: no daemon holds D's lock"));
     assert!(
         !daemons.is_empty(),
         "CANNOT MEASURE: lsof lists no UDP socket for the daemon either"
@@ -399,8 +419,15 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
             room_pf.to_str().unwrap(),
         ],
     );
+    let bx = d
+        .ok("PRODUCT:", &["--node", "b", "room", "list"])
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some("bx"))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("PRODUCT: b's room list does not show bx")
+        .to_owned();
     let b_link = d
-        .ok("PRODUCT:", &["--node", "b", "room", "invite", "bx"])
+        .ok("PRODUCT:", &["--node", "b", "room", "invite", &bx])
         .lines()
         .next()
         .unwrap_or_default()
@@ -429,6 +456,8 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
             "r",
             "connect",
             &address,
+            "--listen",
+            "127.0.0.1:0",
             "--passphrase-file",
             a_pass_file.to_str().unwrap(),
             "--identity-passphrase-file",
@@ -491,13 +520,13 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
             "b",
             "room",
             "post",
-            "bx",
+            &bx,
             "said by b while a serves",
         ],
     );
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let (_, out, _) = r.run(&["--node", "r", "room", "read", "bx", "--json"]);
+        let (_, out, _) = r.run(&["--node", "r", "room", "read", &bx, "--json"]);
         if out.contains("said by b while a serves") {
             break;
         }
@@ -570,6 +599,4 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
 
     drop(conn);
     drop(serve);
-    drop(d_daemon);
-    drop(r_daemon);
 }
