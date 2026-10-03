@@ -37,7 +37,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::atrest::idfactor::SignatureIdentityFactor;
 use crate::atrest::sek::{Argon2Profile, Sek};
@@ -687,7 +687,11 @@ pub struct ChannelState {
     /// more valuable. It is wiped by [`ChannelState::lock_now`] with the SEK, never
     /// written to disk, and never crosses the client boundary (no view, event or
     /// `Debug` output carries it).
-    passphrase: Zeroizing<Vec<u8>>,
+    ///
+    /// `None` once locked. An empty passphrase is a passphrase (V030-36, decider 2026-10-02:
+    /// "technically optional"), so emptiness cannot mean "locked": a room made with none was
+    /// read as locked and could never answer a join.
+    passphrase: Option<Zeroizing<Vec<u8>>>,
     /// Every content entry still holding its body, by age (ADR-023 decision 2).
     retention: RetentionIndex,
     /// This node's own retention for the room, seconds; `0` is no node limit. Set by the
@@ -1346,7 +1350,7 @@ impl ChannelState {
             channel_id,
             genesis,
             local_name: local_name.to_owned(),
-            passphrase: Zeroizing::new(channel_passphrase.to_vec()),
+            passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
             created: now_secs,
             epoch,
             sek,
@@ -1803,7 +1807,7 @@ impl ChannelState {
             channel_id: *channel_id,
             genesis,
             local_name,
-            passphrase: Zeroizing::new(channel_passphrase.to_vec()),
+            passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
             created,
             epoch,
             sek,
@@ -2095,7 +2099,7 @@ impl ChannelState {
             channel_id: *channel_id,
             genesis: genesis.clone(),
             local_name: local_name.to_owned(),
-            passphrase: Zeroizing::new(channel_passphrase.to_vec()),
+            passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
             created: now_secs,
             epoch,
             sek,
@@ -5606,8 +5610,8 @@ impl ChannelState {
         self.sek.lock_now();
         // Wipe the retained passphrase with the SEK: after an app-lock this channel
         // can neither unseal nor answer a join until it is reopened (ADR-010/015).
-        self.passphrase.zeroize();
-        self.passphrase = Zeroizing::new(Vec::new());
+        // `Zeroizing` wipes it as it drops.
+        self.passphrase = None;
     }
 
     /// The retained channel passphrase, for answering an ADR-005 join (the only
@@ -5616,10 +5620,10 @@ impl ChannelState {
     /// Stays crate-internal: it is a secret, and the only legitimate consumer is the
     /// node's own join-responder path.
     pub(crate) fn join_passphrase(&self) -> Result<&[u8]> {
-        if self.passphrase.is_empty() {
-            return Err(Error::AtRestLocked);
-        }
-        Ok(self.passphrase.as_slice())
+        self.passphrase
+            .as_deref()
+            .map(Vec::as_slice)
+            .ok_or(Error::AtRestLocked)
     }
 
     /// The ADR-005 binding parameters for a join in this channel: its channelID,
@@ -5635,7 +5639,7 @@ impl ChannelState {
     /// Whether this channel can currently answer an inbound join.
     #[must_use]
     pub fn can_answer_join(&self) -> bool {
-        !self.passphrase.is_empty()
+        self.passphrase.is_some()
     }
 }
 

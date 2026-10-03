@@ -4,9 +4,6 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status:** accepted. Built in `crates/vox-core/src/join/` (M3), `node::joinstream` (ADR-016 M14.4)
 and `node::link`, except:
-- J-2 is not met: the core refuses an empty room passphrase (`OpenRooms::remember` returns
-  `SizeLimitExceeded`, and `ChannelState::join_passphrase` treats an empty passphrase as locked, so
-  the room cannot answer a join).
 - J-5: `<room>.vox` still resolves to the room's creator on this tree; its removal is V030-25 (#339).
 - J-24: the ≈ 1–2 s mobile solve target is not measured, because no mobile client exists (ADR-014 is
   macOS).

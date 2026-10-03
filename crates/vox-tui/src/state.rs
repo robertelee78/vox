@@ -476,12 +476,13 @@ impl UiState {
                 None => Action::Redraw,
             },
             PromptKind::CreateIdentity => {
-                if p.fields[0].as_str() != p.fields[1].as_str() || p.fields[0].is_empty() {
-                    self.status_message =
-                        Some("passphrases do not match (or empty) — try again".into());
+                // An empty passphrase is accepted, and encouraged against (V030-36).
+                if p.fields[0].as_str() != p.fields[1].as_str() {
+                    self.status_message = Some("passphrases do not match — try again".into());
                     self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateIdentity, None));
                     return Action::Redraw;
                 }
+                self.status_message = no_passphrase_note(&p.fields[0]);
                 Action::Dispatch(Command::CreateIdentity {
                     passphrase: secret(&p.fields[0]),
                 })
@@ -493,15 +494,15 @@ impl UiState {
                     self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateChannel, None));
                     return Action::Redraw;
                 }
-                if p.fields[1].as_str() != p.fields[2].as_str() || p.fields[1].is_empty() {
-                    self.status_message =
-                        Some("passphrases do not match (or empty) — try again".into());
+                if p.fields[1].as_str() != p.fields[2].as_str() {
+                    self.status_message = Some("passphrases do not match — try again".into());
                     let mut again = Prompt::new(PromptKind::CreateChannel, None);
                     again.fields[0] = Zeroizing::new(name);
                     again.step = 1;
                     self.mode = Mode::Prompt(again);
                     return Action::Redraw;
                 }
+                self.status_message = no_passphrase_note(&p.fields[1]);
                 Action::Dispatch(Command::CreateChannel {
                     local_name: name,
                     passphrase: secret(&p.fields[1]),
@@ -517,6 +518,7 @@ impl UiState {
                     self.mode = Mode::Prompt(again);
                     return Action::Redraw;
                 }
+                self.status_message = no_passphrase_note(&p.fields[2]);
                 Action::Dispatch(Command::Join {
                     local_name: name,
                     link,
@@ -775,4 +777,12 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         _ => return None,
     };
     Some(Parsed::Core(cmd))
+}
+
+/// The status line for a passphrase left empty: it is accepted, and one is encouraged (V030-36,
+/// decider 2026-10-02: "passphrase is a good idea, but is technically optional").
+fn no_passphrase_note(passphrase: &Zeroizing<String>) -> Option<String> {
+    passphrase
+        .is_empty()
+        .then(|| "no passphrase; going on without one. A passphrase is encouraged.".into())
 }

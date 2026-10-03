@@ -2748,7 +2748,7 @@ pub fn run() -> ExitCode {
         Cmd::Trust(TrustCmd::List(args))
             if args.identity_passphrase.is_none()
                 && args.identity_passphrase_file.is_none()
-                && std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none_or(|p| p.is_empty())
+                && std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none()
                 && !std::io::IsTerminal::is_terminal(&io::stdin()) =>
         {
             eprintln!(
