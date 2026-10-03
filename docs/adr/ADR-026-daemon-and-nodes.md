@@ -153,7 +153,8 @@ network presence from the start: there is no interim design with one socket per 
 
 - **S-1.** `vox daemon` MUST run in the foreground. SIGHUP, SIGTERM, SIGINT and SIGQUIT MUST each
   detach every node cleanly and then stop the daemon.
-- **S-2. Auto-start.** A client, an agent's hook included, that finds no daemon MUST start
+- **S-2. Auto-start.** A client that may attach a node (L-2: a session-holding verb, an agent's hook,
+  the TUI, `vox node attach`) and finds no daemon MUST start
   `vox daemon --detach`, writing its stderr to `<data root>/.daemon/log` from its first line, and MUST
   wait up to 15 s for the socket. After that it MUST fail, saying the daemon did not start and naming
   the log's path. Concurrent starts MUST end with exactly one daemon (D-1).

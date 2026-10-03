@@ -243,7 +243,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
       built.*
 16.5. A passphrase sent to the daemon (attach, a keyring change) MUST travel in a zeroizing buffer end to end
       (ADR-026 C-6). *Decided, not built.*
-16.6. A client that finds no daemon MUST start one (ADR-026 S-2) before sending its request.
+16.6. A client that may attach a node and finds no daemon MUST start one (ADR-026 S-2) before
+      sending its request; a one-shot verb whose node is not attached MUST refuse (ADR-026 L-2).
       *Decided, not built.*
 
 ### 17. Install and update

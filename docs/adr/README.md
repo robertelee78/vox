@@ -89,7 +89,7 @@ planned. This is the roll-up.
 | 023 | accepted; M23.1–M23.6 built except where marked |
 | 024 | accepted, speed only; M24.1–M24.5 built, the taper is the default controller |
 | 025 | accepted; built as V210-34 (#209) |
-| 026 | accepted 2026-10-03, **not built** (#397); amends 005, 010, 011, 012, 013, 015, 016, 017, 020, 021 |
+| 026 | accepted 2026-10-03, **not built** (#397); amends 005, 007, 010, 011, 012, 013, 014, 015, 016, 017, 020, 021, 023 |
 
 ## Conformance-vector obligations
 
