@@ -18,9 +18,13 @@
 //! it" only when every one of them, and its own, folds to this claimant.
 //!
 //! **Why exactly one of two crossing claims wins.** Each claimant's node is a member the other
-//! asks, and it answers only once it holds the asker's claim — and it already holds its own. So
-//! whichever claim the room's order puts first is in the set that every answer to the other one
-//! folds, and the other is told it lost, and to whom, at once.
+//! asks, and it answers only once it holds the asker's claim. Its own claim is then either
+//! already in its log, so in the set it answers with and folded by the asker, or posted later,
+//! and a node stamps every post later than every post it holds
+//! (`ChannelState::stamp_after_held`), so that claim sorts after the asker's whatever the two
+//! clocks say. Either way the set each claimant folds puts the same claim first: the winner is
+//! told it holds it, and the other that it lost, and to whom, at once. The order rests on the
+//! stamps, not on the clocks agreeing.
 //!
 //! **Online is what the asker observes**, as for the room cap: a member it holds a connection to
 //! or reaches within [`REACH_PATIENCE`]. One it cannot reach, or that does not answer within

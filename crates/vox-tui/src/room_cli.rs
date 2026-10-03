@@ -1484,8 +1484,9 @@ pub async fn claim_resource(
         Some(State::Held { owner, .. }) if *owner == me => (
             false,
             format!(
-                "{resource} is not agreed yet: {}. Your claim stands in the room; claim it again \
-                 to ask again, or release it",
+                "{resource} is not agreed yet: {}. Your claim stands in the room: it is yours \
+                 unless such a member claimed it first, and if so you will be told. Claim it \
+                 again to ask again, or release it",
                 unagreed
                     .iter()
                     .map(|(m, why)| format!("member {} {why}", crate::ident::author_id(m)))

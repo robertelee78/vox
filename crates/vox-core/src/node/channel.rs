@@ -452,6 +452,11 @@ pub struct Rendered {
     pub text: String,
 }
 
+/// How far ahead of this node's clock another member's post may be stamped and still push this
+/// node's next stamp past it (see `ChannelState::stamp_after_held`): ten minutes covers clocks
+/// that drift, and stops one far-off clock from dragging the room's stamps with it.
+pub const STAMP_LEAD_LIMIT_MILLIS: u64 = 10 * 60 * 1000;
+
 /// An open (SEK-unlocked) channel on this device.
 pub struct ChannelState {
     channel_id: Digest32,
@@ -3861,6 +3866,29 @@ impl ChannelState {
         MembershipView::new(&self.evaluator).can_read(me, author)
     }
 
+    /// **The time to stamp a new post with**: the clock, or just past the latest post this node
+    /// holds in the room if that is later (V210-168).
+    ///
+    /// Posts are ordered by their stamps (the claim fold sorts on them), and each author's clock
+    /// is its own. Without this, a node whose clock is behind could post *after* it held another
+    /// member's post, and its post still sorted first: a member that had agreed another's claim
+    /// came first then claimed the same item and won it, so two agents were told "you hold it".
+    /// With it, a post made after another one was held always sorts after it.
+    ///
+    /// A post stamped more than [`STAMP_LEAD_LIMIT_MILLIS`] ahead of this clock does not move it:
+    /// one member's wrong clock must not carry every later post in the room into the future.
+    fn stamp_after_held(&self, now_millis: u64) -> u64 {
+        let limit = now_millis.saturating_add(STAMP_LEAD_LIMIT_MILLIS);
+        self.timeline
+            .iter()
+            .map(|r| r.created_millis)
+            .filter(|m| *m <= limit)
+            .max()
+            .map_or(now_millis, |latest| {
+                now_millis.max(latest.saturating_add(1))
+            })
+    }
+
     /// Author a text message: encrypt under this identity's sender chain, wrap in
     /// a signed ADR-008 log entry, accept it into the DAG, and persist entry +
     /// rendering + advanced chain state atomically. Returns the rendered message.
@@ -3885,6 +3913,7 @@ impl ChannelState {
                 "this identity is not an author of the channel",
             ));
         }
+        let now_millis = self.stamp_after_held(now_millis);
         let content = Content::text(now_millis, text)?;
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;

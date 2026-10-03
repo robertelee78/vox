@@ -219,7 +219,7 @@ fn lost_claims(
     now: &std::collections::BTreeSet<String>,
 ) -> Vec<String> {
     use vox_agentcomms::claim::{self, State};
-    let own_latest = |resource: &str| {
+    let own_ops = |resource: &str| -> Vec<&vox_agentcomms::claim::Posted> {
         snap.posted
             .iter()
             .filter(|p| {
@@ -228,16 +228,22 @@ fn lost_claims(
                     && p.envelope.data.get("resource").and_then(|v| v.as_str()) == Some(resource)
                     && claim::is_claim_protocol(&p.envelope)
             })
-            .max_by_key(|p| (p.created_millis, p.entry_hash))
+            .collect()
     };
-    let own_last = |resource: &str| own_latest(resource).map(|p| p.envelope.kind.clone());
-    // **Lost to a claim that crossed it**, not lapsed (V210-168): this session's latest claim on
-    // it was never applied, because another came first in the room's order.
+    let own_last = |resource: &str| {
+        own_ops(resource)
+            .into_iter()
+            .max_by_key(|p| (p.created_millis, p.entry_hash))
+            .map(|p| p.envelope.kind.clone())
+    };
+    // **Lost to a claim that crossed it**, not lapsed (V210-168): no claim this session made on
+    // it ever applied, because another came first in the room's order. One that applied once and
+    // then ran out lapsed, even if the session claimed it again while it held it (that repeat
+    // folds `Lost`: it found the resource held, by itself).
     let crossed = |resource: &str| {
-        own_latest(resource).is_some_and(|p| {
-            p.envelope.kind == claim::CLAIM
-                && snap.fold.outcomes.get(&p.entry_hash) == Some(&claim::Outcome::Lost)
-        })
+        own_ops(resource)
+            .iter()
+            .all(|p| snap.fold.outcomes.get(&p.entry_hash) != Some(&claim::Outcome::Applied))
     };
     use vox_agentcomms::envelope::{shown, MAX_RESOURCE, SHOWN_NAME};
     // Sessions and resources are the authors' own text: on one line and cut, so none can
@@ -271,7 +277,7 @@ fn lost_claims(
             // it is in now is the rest of the news.
             Some(State::Held { owner, .. }) if crossed => format!(
                 "You do not hold `{r}`: your claim crossed with {}'s, which came first, so they \
-                 hold it.",
+                 hold it. Stop work on it.",
                 who(&owner.author, &owner.session)
             ),
             Some(State::Held { owner, .. }) => format!(

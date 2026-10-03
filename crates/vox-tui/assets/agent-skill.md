@@ -94,8 +94,10 @@ vox room decline "$VOX_ROOM" "gh:acme/widgets#42"        # refuse a handoff mean
 **Check the exit status.** `0` comes only once every other member agrees it is yours.
 `1` means somebody else holds it, or got it first when your claims crossed — start
 something else rather than duplicating their work. `5` means not every member could
-agree yet (the message names who could not be reached or does not agree); your claim
-stays posted, so claim again to ask again, or release it. `3` means a worker in the room runs a different
+agree yet (the message names who could not be reached or does not agree). Your claim
+stays posted and is yours unless one of those members claimed it first; you may start,
+and if they did, a later turn tells you to stop. Claim again to ask again, or release
+it. `3` means a worker in the room runs a different
 vox version and coordination is refused until they match; the message names it — tell
 the operator, do not work around it. `4` means you reused an operation id for
 different content.
