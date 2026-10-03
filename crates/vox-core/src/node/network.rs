@@ -485,6 +485,13 @@ impl NodeNet {
         self.service.on_admitted(hook);
     }
 
+    /// Be told when a signed withdraw takes records off this node's board (V030-14). Set before
+    /// this is shared, like [`Self::on_board_growth`]; see
+    /// [`crate::nat::service::RendezvousService::on_withdrawn`].
+    pub fn on_board_withdraw(&mut self, hook: crate::nat::service::AdmittedHook) {
+        self.service.on_withdrawn(hook);
+    }
+
     /// Which rooms this node keeps a board for when a peer brings their genesis — an anchor's
     /// job, and no other node's. Set before this is shared, like [`Self::on_board_growth`];
     /// see [`crate::nat::service::RendezvousService::serve_rooms`].

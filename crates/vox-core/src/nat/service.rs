@@ -386,6 +386,8 @@ pub struct RendezvousService {
     clock: Clock,
     /// See [`RendezvousService::on_admitted`].
     admitted: Option<AdmittedHook>,
+    /// See [`RendezvousService::on_withdrawn`].
+    withdrawn: Option<AdmittedHook>,
     /// See [`RendezvousService::serve_rooms`].
     rooms: AnchorRooms,
 }
@@ -420,6 +422,7 @@ impl RendezvousService {
             oracle,
             clock,
             admitted: None,
+            withdrawn: None,
             rooms: AnchorRooms::Held,
         }
     }
@@ -455,6 +458,14 @@ impl RendezvousService {
     /// reconcile with, for no reason a person could see.
     pub fn on_admitted(&mut self, hook: AdmittedHook) {
         self.admitted = Some(hook);
+    }
+
+    /// Be told when a signed withdraw takes records off this board (V030-14). Nothing else
+    /// happens on a node when a room ends — its members go quiet — so without this a board that
+    /// had taken the room off kept showing it, in `vox node` and `vox status`, until something
+    /// unrelated next published the node's view.
+    pub fn on_withdrawn(&mut self, hook: AdmittedHook) {
+        self.withdrawn = Some(hook);
     }
 
     /// The shared store (for the owning node's own reads and pruning).
@@ -633,6 +644,7 @@ impl RendezvousService {
         // a refresh made two members' boards wake each other about a hundred times a second, and
         // each wake cost the actor 3–40 ms that a local post then queued behind.
         let mut grew: Option<Digest32> = None;
+        let mut withdrew: Option<Digest32> = None;
         let res = match tag {
             StructTag::RendezvousRecord => {
                 let rec =
@@ -737,6 +749,7 @@ impl RendezvousService {
                         store.withdraw_room(&w.channel_id, Some(record.to_vec()));
                     }
                 }
+                withdrew = Some(w.channel_id);
                 Ok(())
             }
             // A room's admins, from its creator (V030-14).
@@ -764,6 +777,9 @@ impl RendezvousService {
         // declined by the ADR-012 floor says nothing.
         if res.is_ok() {
             if let (Some(hook), Some(cid)) = (self.admitted.as_ref(), grew) {
+                hook(cid);
+            }
+            if let (Some(hook), Some(cid)) = (self.withdrawn.as_ref(), withdrew) {
                 hook(cid);
             }
         }

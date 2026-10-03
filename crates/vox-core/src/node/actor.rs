@@ -474,6 +474,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
+        NetEvent::BoardWithdrew => "showing a board a withdraw took records off",
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
         NetEvent::ChannelUnsealed { .. } => "holding a room whose key was unwrapped",
         NetEvent::Dialed { .. } => "adopting a connection a join dialled",
@@ -1301,6 +1302,8 @@ enum NetEvent {
         /// The room whose board grew.
         channel_id: Digest32,
     },
+    /// A signed withdraw took records off this node's board (V030-14): what it shows changed.
+    BoardWithdrew,
     /// A peer connected and opened a stream the actor must handle.
     Stream {
         /// The connection it arrived on, kept alive for the reply.
@@ -4831,6 +4834,12 @@ impl Node {
             net.on_board_growth(Arc::new(move |channel_id: Digest32| {
                 let _ = tx.try_send(NetEvent::BoardGrew { channel_id });
             }));
+            // A withdraw changes what the board shows (V030-14): an event, so the view is
+            // published for it. `try_send` for the same reason as above.
+            let tx = self.net_tx.clone();
+            net.on_board_withdraw(Arc::new(move |_: Digest32| {
+                let _ = tx.try_send(NetEvent::BoardWithdrew);
+            }));
         }
         let net = Arc::new(net);
         self.net = Some(Arc::clone(&net));
@@ -6250,6 +6259,8 @@ impl Node {
                 };
                 self.answer_when_published(channel_id, reply, outcome).await;
             }
+            // Nothing to do but publish the view, which every event does once handled.
+            NetEvent::BoardWithdrew => {}
             NetEvent::BoardGrew { channel_id } => {
                 // Pass it on, which for a member means its anchors. A node that is not a member of
                 // this room falls out of `publish_channel_to_anchor` on its missing admission, so
