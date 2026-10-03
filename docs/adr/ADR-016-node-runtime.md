@@ -122,7 +122,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
   - The joiner MUST open with `WANT {channelID, epoch}`.
   - Routes MUST be tried in this order: the link's anchors, the configured anchors, any anchor already connected.
   - A board with no address record for the responder MUST be re-read until `JOIN_ADDRESS_PATIENCE` (20 s) runs out, not treated as unreachable at once.
-  - Joining a room this node already holds MUST update the room's stored address (and anchors) from the new link. **Planned:** decider ruling of 2026-10-03; not built on this tree.
+  - Joining a room this node already holds MUST update the room's address, not refuse (V210-167, `reach_by_address`): the members the link names are dialled there, and those that answer, with the anchors it names, are kept as the room's (`keep_room_address`). An address at which no member answers MUST change nothing. See ADR-005 J-3.
 - **NR-28a.** An identity with no live pre-join record MUST be classed `Unknown`, and MUST reach the board and nothing else.
 - **NR-29.** The joiner side of a join MUST run off the actor (V29-08).
 - **NR-30.** Joining grants log authorship only.
@@ -154,8 +154,8 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 - **NR-35.** Streams MUST be typed by their first frame (ADR-011, typed streams): `sync` 1, `join` 2, `pairwise` 3, `rendezvous` 4, `tunnel` 5, `coord` 6, `circuit` 7, `goodbye` 8, `app` 9. A `sync`, `join` or `pairwise` stream MUST name its room.
 - **NR-36 (M14.8–M14.10, M15.1b, V210-122).** `NodeNet::reach` MUST climb the whole ADR-012 ladder: a live connection, a direct dial, a hole punch over a coordinator's `coord` stream, then a relayed circuit.
   - It MUST race the rungs and adopt whichever lands first.
-  - A pair that can only be relayed MUST take its relay circuit at once. A dial-back MAY race the circuit, and MUST NOT hold it or delay it. **Planned:** decider ruling of 2026-10-03. On this tree a circuit still waits `DIRECT_HEAD_START` (500 ms, `node/network.rs:108`) and, after a join, the dial-back (V030-27, 17b262ed).
-  - A pair that is not relay-only MAY give a direct path up to `DIRECT_HEAD_START` before asking a relay, and MUST yield to a direct path that lands in that time.
+  - A pair that can only be relayed MUST take its relay circuit at once; a dial-back MAY race the circuit, and MUST NOT hold or delay it (ADR-012 N-21, `reach_ladder`).
+  - While a direct dial is under way, a circuit MUST wait at most `DIRECT_HEAD_START` (500 ms) and MUST yield to a direct path that lands in that time.
   - A relayed connection MUST then try to upgrade (`NetEvent::BetterPath`).
   - Candidates the socket cannot address MUST be dropped before dialling.
   - A hole punch MAY be coordinated by any connected peer that will relay signalling. An inbound punch MUST be answered on its own task.

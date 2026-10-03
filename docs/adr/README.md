@@ -73,7 +73,7 @@ planned. This is the roll-up.
 | 009 | **withdrawn** (R43); the deniable code is removed (b0f82185) |
 | 010 | accepted; built (`atrest/`, `node/`) except where marked planned |
 | 011 | built (`transport/`); the PEN, the observed group (#382) and the interop matrix are not |
-| 012 | accepted; all four rungs built; a relay-only pair taking its circuit at once (2026-10-03) is planned |
+| 012 | accepted; all four rungs built, a relay-only pair taking its circuit at once |
 | 013 | accepted; built except where marked |
 | 014 | proposed; only the embedded node over FFI (`crates/vox-ffi`) is built |
 | 015 | implemented in part (`crates/vox-tui`), each requirement marked |
