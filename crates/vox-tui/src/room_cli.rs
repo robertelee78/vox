@@ -97,15 +97,23 @@ fn held_since(since_secs: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let ago = now.saturating_sub(since_secs);
-    let elapsed = if ago < 60 {
-        format!("{ago}s ago")
-    } else if ago < 3600 {
-        format!("{}m ago", ago / 60)
-    } else if ago < 86_400 {
-        format!("{}h{:02}m ago", ago / 3600, (ago % 3600) / 60)
+    // A stamp can be later than this clock: another member's clock is ahead, or a post was
+    // stamped after one it held (V210-168). Say so rather than "0s ago".
+    let span = |n: u64| {
+        if n < 60 {
+            format!("{n}s")
+        } else if n < 3600 {
+            format!("{}m", n / 60)
+        } else if n < 86_400 {
+            format!("{}h{:02}m", n / 3600, (n % 3600) / 60)
+        } else {
+            format!("{}d", n / 86_400)
+        }
+    };
+    let elapsed = if since_secs > now {
+        format!("{} ahead of this clock", span(since_secs - now))
     } else {
-        format!("{}d ago", ago / 86_400)
+        format!("{} ago", span(now - since_secs))
     };
     // A fixed-offset UTC stamp without pulling in a date library: the fields are
     // arithmetic on the epoch, and the only calendar subtlety is leap years.
@@ -1485,10 +1493,17 @@ pub async fn claim_resource(
             false,
             format!(
                 "{resource} is not agreed yet: {}. Your claim is posted, but it is not sure to be \
-                 yours: a claim by such a member can still be ordered before it, even one made \
-                 after it.{} Run `vox room board {room}` later to see who holds it, claim it \
+                 yours{}.{} Run `vox room board {room}` later to see who holds it, claim it \
                  again to ask again, or release it",
-                unagreed_text(&unagreed),
+                unagreed_text(&me.author, &unagreed),
+                // A member that has not agreed can still post a claim ordered first. A post the
+                // claim is stamped before is already made: the note below says what that means.
+                if unagreed.iter().any(|(_, w)| !w.starts_with(STAMPED_AHEAD)) {
+                    ": a claim by such a member can still be ordered before it, even one made \
+                     after it"
+                } else {
+                    ""
+                },
                 clocks_note(&unagreed),
             ),
             coord::EXIT_UNAGREED,
@@ -1504,7 +1519,11 @@ pub async fn claim_resource(
                 if clocks_note(&unagreed).is_empty() {
                     String::new()
                 } else {
-                    format!(" ({}.{})", unagreed_text(&unagreed), clocks_note(&unagreed))
+                    format!(
+                        " ({}.{})",
+                        unagreed_text(&me.author, &unagreed),
+                        clocks_note(&unagreed)
+                    )
                 }
             ),
             1,
@@ -1570,30 +1589,51 @@ pub async fn claim_resource(
     )
 }
 
-/// Why members did not agree to a claim, as one line naming each.
-fn unagreed_text(unagreed: &[(Digest32, String)]) -> String {
+/// Why members did not agree to a claim, as one line naming each: `me` is the claimant, named
+/// "you".
+fn unagreed_text(me: &Digest32, unagreed: &[(Digest32, String)]) -> String {
     unagreed
         .iter()
-        .map(|(m, why)| format!("member {} {why}", crate::ident::author_id(m)))
+        .map(|(m, why)| {
+            if m == me {
+                format!("you {why}")
+            } else {
+                format!("member {} {why}", crate::ident::author_id(m))
+            }
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }
 
-/// What a claimant must know when a member's clock is too far from its own (V210-168): the room
-/// orders claims by the stamps their nodes gave them, so the board can name one made later.
-fn clocks_note(unagreed: &[(Digest32, String)]) -> &'static str {
+/// What a claimant must know when clocks are too far apart (V210-168): the room orders claims by
+/// the stamps their nodes gave them, so the board can name a holder whose claim was made later.
+fn clocks_note(unagreed: &[(Digest32, String)]) -> String {
+    let mut note = String::new();
     if unagreed
         .iter()
         .any(|(_, why)| why.starts_with(CLOCKS_APART))
     {
-        " While the clocks are apart, the board can name a holder whose claim was made later."
-    } else {
-        ""
+        note.push_str(
+            " While the clocks are apart, the board can name a holder whose claim was made later.",
+        );
     }
+    if unagreed
+        .iter()
+        .any(|(_, why)| why.starts_with(STAMPED_AHEAD))
+    {
+        note.push_str(
+            " The room orders claims by their stamps, so it can order yours before a claim made \
+             earlier, whose maker may have been told they hold it.",
+        );
+    }
+    note
 }
 
 /// How a member whose clock is too far from the claimant's is described.
 const CLOCKS_APART: &str = "has a clock more than";
+
+/// How the author of a post the claim is stamped before, although made after, is described.
+const STAMPED_AHEAD: &str = "made a post stamped more than";
 
 /// The claim-protocol `type`s an agreement compares (V210-168).
 const CLAIM_TYPES: &[&str] = &[
@@ -1683,6 +1723,11 @@ async fn agreement(
                 Agreement::ClocksApart => Some(format!(
                     "{CLOCKS_APART} {} minutes away from yours, too far apart to order claims by; \
                      set both clocks right",
+                    vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
+                )),
+                Agreement::StampedAhead => Some(format!(
+                    "{STAMPED_AHEAD} {} minutes ahead of your clock, and your claim is stamped \
+                     before it although it was made after; check both clocks",
                     vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
                 )),
             };

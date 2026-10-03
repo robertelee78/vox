@@ -9364,11 +9364,11 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
             return;
         };
-        let (epoch, others) = {
+        let (epoch, others, skipped) = {
             let c = shared.lock().await;
             let me = c.me();
             let others: Vec<Digest32> = c.members().into_iter().filter(|m| *m != me).collect();
-            (c.epoch(), others)
+            (c.epoch(), others, c.skipped_when_stamped(&entry))
         };
         let net = self.net.as_ref().map(Arc::clone);
         let members: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = others
@@ -9391,7 +9391,7 @@ impl Node {
         let view = self.view_tx.subscribe();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
-            let r = agree_round(net, tx, view, question, members).await;
+            let r = agree_round(net, tx, view, question, members, skipped).await;
             let _ = report.send(r);
             let _ = reply.send(Outcome::Done);
         });
@@ -11826,6 +11826,7 @@ async fn agree_round(
     mut view: watch::Receiver<crate::node::api::NodeView>,
     question: crate::node::agreestream::Ask,
     members: Vec<(Digest32, crate::nat::multiaddr::EndpointList)>,
+    skipped: Vec<Digest32>,
 ) -> crate::node::agreestream::Report {
     use crate::node::agreestream::{self as agree, Agreement, Answer, Asking};
     let deadline = tokio::time::Instant::now() + agree::ASK_PATIENCE;
@@ -11917,7 +11918,7 @@ async fn agree_round(
     }
 
     let mine = own_listed(&view.borrow(), &question.channel_id, &question.types);
-    let members = asked
+    let mut members: Vec<(Digest32, Agreement)> = asked
         .into_iter()
         .map(|(m, a)| {
             let stands = match a {
@@ -11932,6 +11933,10 @@ async fn agree_round(
             (m, stands)
         })
         .collect();
+    // **A post this node held and did not stamp the claim after** (`stamp_after_held`): the claim
+    // can sort before it although it was made after, so whatever the members answered, the claim
+    // is not agreed. Its author is named, this node itself included, beside its answer.
+    members.extend(skipped.into_iter().map(|a| (a, Agreement::StampedAhead)));
     agree::Report {
         mine: mine.len() as u64,
         members,

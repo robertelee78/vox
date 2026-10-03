@@ -27,16 +27,24 @@
 //! so that claim sorts after the asker's. Either way the set each claimant folds puts the same
 //! claim first: the winner is told it holds it, and the other that it lost, and to whom, at once.
 //!
-//! **Clocks more than [`STAMP_LEAD_LIMIT_MILLIS`] apart break that edge, in either direction.**
+//! **A stamp more than [`STAMP_LEAD_LIMIT_MILLIS`] from a clock breaks that edge, either way.**
 //! A member whose clock is that far behind the claim's stamp would stamp its own later claim
-//! before it. A claimant whose clock is that far behind a member's skipped that member's posts
-//! when it stamped, so its claim can sort before a claim the member already holds, even one
-//! another agent was told it holds. So the question carries the claimant's clock, and a member
-//! does not agree when that clock is more than the limit from its own, or when the claim is
-//! stamped more than the limit ahead of it: it answers [`Answer::ClocksApart`], and the claimant
-//! is told the clocks are apart instead of "you hold it". The room still orders posts by their
-//! stamps, so while the clocks stay apart a later claim can be ordered first; the claimant is
-//! told that too.
+//! before it, so it does not agree: the question carries the claimant's clock, and a member
+//! answers [`Answer::ClocksApart`] when that clock is more than the limit from its own, or when
+//! the claim is stamped more than the limit ahead of its clock.
+//!
+//! The other way is seen only by the claimant's node. When it stamped the claim, it held posts
+//! stamped more than the limit ahead of its clock, and did not stamp the claim after them: so the
+//! claim can sort before a claim made earlier, even one another agent was told it holds. That
+//! needs no clock far from another's now — a stamp is pushed up to the limit past its author's
+//! clock, and a clock that was ahead and is set back leaves its node's earlier stamps ahead of it.
+//! So the claimant's node remembers, for each post it makes, the authors of the posts it held
+//! stamped later (`ChannelState::skipped_when_stamped`), and reports each as
+//! [`Agreement::StampedAhead`] whatever the members answered.
+//!
+//! Either way the claimant is told why instead of "you hold it". The room still orders posts by
+//! their stamps, so a claim can be ordered before one made earlier; the claimant is told that
+//! too.
 //!
 //! **Online is what the asker observes**, as for the room cap: a member it holds a connection to
 //! or reaches within [`REACH_PATIENCE`]. One it cannot reach, or that does not answer within
@@ -340,6 +348,10 @@ pub enum Agreement {
     /// Reached, and its clock is more than [`STAMP_LEAD_LIMIT_MILLIS`] from the asker's, or behind
     /// the post's stamp by more than that.
     ClocksApart,
+    /// Not an answer: the asker's node held a post by this author (another member, or the asker
+    /// itself) stamped more than [`STAMP_LEAD_LIMIT_MILLIS`] ahead of the asker's clock when it
+    /// stamped its own, so its own post can sort before that one although it was made after.
+    StampedAhead,
 }
 
 /// What an agreement round found, for the client.
@@ -348,7 +360,9 @@ pub struct Report {
     /// How many posts of the asked types the asker's node held when it compared: the client
     /// reads them and checks it read exactly that many, or asks again.
     pub mine: u64,
-    /// Every other member of the room, and where it stands.
+    /// Every other member of the room, and where it stands; and, beside that, every author of a
+    /// post the asker's post is stamped before although made after ([`Agreement::StampedAhead`]),
+    /// the asker itself included.
     pub members: Vec<(Digest32, Agreement)>,
 }
 
@@ -402,6 +416,9 @@ pub fn encode_report(e: &mut Encoder, r: &Report) {
             }
             Agreement::ClocksApart => {
                 e.array(1).uint(6);
+            }
+            Agreement::StampedAhead => {
+                e.array(1).uint(7);
             }
         }
     }
@@ -459,6 +476,7 @@ pub fn decode_report(d: &mut Decoder<'_>) -> Result<Report> {
             (4, 1) => Agreement::Unreachable,
             (5, 1) => Agreement::Unanswered,
             (6, 1) => Agreement::ClocksApart,
+            (7, 1) => Agreement::StampedAhead,
             _ => return Err(bad("agreement report: verdict")),
         };
         members.push((m, a));

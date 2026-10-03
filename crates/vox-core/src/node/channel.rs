@@ -457,6 +457,9 @@ pub struct Rendered {
 /// that drift, and stops one far-off clock from dragging the room's stamps with it.
 pub const STAMP_LEAD_LIMIT_MILLIS: u64 = 10 * 60 * 1000;
 
+/// How many of this node's own posts `ChannelState::skipped_when_stamped` remembers.
+const SKIPPED_KEPT: usize = 64;
+
 /// An open (SEK-unlocked) channel on this device.
 pub struct ChannelState {
     channel_id: Digest32,
@@ -540,6 +543,11 @@ pub struct ChannelState {
     /// written to disk, and never crosses the client boundary (no view, event or
     /// `Debug` output carries it).
     passphrase: Zeroizing<Vec<u8>>,
+    /// This node's latest posts that were stamped earlier than a post it already held (V210-168):
+    /// each post's entry hash, and the authors of the held posts stamped more than
+    /// [`STAMP_LEAD_LIMIT_MILLIS`] ahead of the clock, which `stamp_after_held` did not stamp it
+    /// after. Memory only, the newest [`SKIPPED_KEPT`]: a claim asks about its own post at once.
+    skipped: std::collections::VecDeque<(Digest32, Vec<Digest32>)>,
     poisoned: bool,
     /// The room's **generation** (ADR-025 D1): bumped by every entry persisted, from any source.
     /// In memory; a restart resets it together with every sync port. Shared with the actor, which
@@ -1165,6 +1173,7 @@ impl ChannelState {
             history: BTreeMap::new(),
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
+            skipped: std::collections::VecDeque::new(),
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
@@ -1534,6 +1543,7 @@ impl ChannelState {
             history,
             entitled,
             trust_marks,
+            skipped: std::collections::VecDeque::new(),
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
@@ -1809,6 +1819,7 @@ impl ChannelState {
             history: BTreeMap::new(),
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
+            skipped: std::collections::VecDeque::new(),
             poisoned: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
@@ -3867,26 +3878,51 @@ impl ChannelState {
     }
 
     /// **The time to stamp a new post with**: the clock, or just past the latest post this node
-    /// holds in the room if that is later (V210-168).
+    /// holds in the room if that is later (V210-168); and the authors of the held posts it is
+    /// *not* stamped after.
     ///
     /// Posts are ordered by their stamps (the claim fold sorts on them), and each author's clock
     /// is its own. Without this, a node whose clock is behind could post *after* it held another
     /// member's post, and its post still sorted first: a member that had agreed another's claim
     /// came first then claimed the same item and won it, so two agents were told "you hold it".
-    /// With it, a post made after another one was held always sorts after it.
+    /// With it, a post made after another one was held sorts after it.
     ///
     /// A post stamped more than [`STAMP_LEAD_LIMIT_MILLIS`] ahead of this clock does not move it:
-    /// one member's wrong clock must not carry every later post in the room into the future.
-    fn stamp_after_held(&self, now_millis: u64) -> u64 {
+    /// one member's wrong clock must not carry every later post in the room into the future. Such
+    /// a post is skipped, so the new post can sort before it although it was made after; its
+    /// author is returned, and a claim made so is not called agreed.
+    fn stamp_after_held(&self, now_millis: u64) -> (u64, Vec<Digest32>) {
         let limit = now_millis.saturating_add(STAMP_LEAD_LIMIT_MILLIS);
-        self.timeline
+        let stamp = self
+            .timeline
             .iter()
             .map(|r| r.created_millis)
             .filter(|m| *m <= limit)
             .max()
             .map_or(now_millis, |latest| {
                 now_millis.max(latest.saturating_add(1))
-            })
+            });
+        let mut skipped: Vec<Digest32> = self
+            .timeline
+            .iter()
+            .filter(|r| r.created_millis > limit)
+            .map(|r| r.author)
+            .collect();
+        skipped.sort_unstable();
+        skipped.dedup();
+        (stamp, skipped)
+    }
+
+    /// The authors of the posts this node held, stamped later than its own post `entry`, when it
+    /// stamped `entry` (see `stamp_after_held`). Empty when it skipped none, or when `entry` is
+    /// not one of this node's latest posts.
+    #[must_use]
+    pub fn skipped_when_stamped(&self, entry: &Digest32) -> Vec<Digest32> {
+        self.skipped
+            .iter()
+            .find(|(e, _)| e == entry)
+            .map(|(_, a)| a.clone())
+            .unwrap_or_default()
     }
 
     /// Author a text message: encrypt under this identity's sender chain, wrap in
@@ -3913,7 +3949,7 @@ impl ChannelState {
                 "this identity is not an author of the channel",
             ));
         }
-        let now_millis = self.stamp_after_held(now_millis);
+        let (now_millis, skipped) = self.stamp_after_held(now_millis);
         let content = Content::text(now_millis, text)?;
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
@@ -3991,6 +4027,12 @@ impl ChannelState {
         }
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !skipped.is_empty() {
+            if self.skipped.len() >= SKIPPED_KEPT {
+                self.skipped.pop_front();
+            }
+            self.skipped.push_back((entry_hash, skipped));
+        }
         self.timeline.push(rendered);
         self.timeline
             .last()
