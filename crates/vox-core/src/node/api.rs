@@ -464,6 +464,9 @@ pub struct ChannelDetail {
     pub retention: u64,
     /// How many generations of this node's own sender key it still holds here (PRD-001 R14).
     pub key_generations: usize,
+    /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
+    /// receiving side).
+    pub received_key_generations: usize,
     /// Authors this node froze here for signing two entries at one position (ADR-008).
     pub frozen: Vec<Digest32>,
     /// Entries this node refused here as at or below their author's checkpoint since it opened

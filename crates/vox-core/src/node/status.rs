@@ -123,6 +123,9 @@ pub struct RoomStatus {
     /// How many generations of this node's own sender key it still holds here (PRD-001
     /// R14: one, unless a full-history grant is still owed).
     pub key_generations: usize,
+    /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
+    /// receiving side: a generation read to the end is deleted).
+    pub received_key_generations: usize,
     /// Authors this node froze here for signing two entries at one position (ADR-008).
     pub frozen: Vec<Digest32>,
     /// Entries this node refused here as at or below their author's checkpoint since it opened
@@ -330,13 +333,14 @@ impl StatusReport {
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
                 opt(r.last_sync),
                 r.retention,
                 r.key_generations,
+                r.received_key_generations,
                 frozen,
                 r.refused_below_checkpoint,
                 list(members)

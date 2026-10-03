@@ -2,11 +2,10 @@
 //! between two online nodes whose only path is a relay circuit is delivered, and within R40's
 //! **1 s**.
 //!
-//! Until now the relayed half of R40 was proved only on the NAT simulator
-//! (`vox-core/tests/perf_r40_relayed_chat_gate.rs`), because nothing in the binary forces a relay.
-//! `support/relay.rs` forces one with the product's own `--listen`: a real `vox node` anchor on
-//! `[::]`, alice's `vox daemon` on `127.0.0.1`, bob's on `[::1]`. Neither daemon can send a
-//! datagram to the other, so the anchor's circuit is the only path.
+//! The binary has no switch that forces a relay, so `support/relay.rs` forces one with the
+//! product's own `--listen`: a real `vox node` anchor on `[::]`, alice's `vox daemon` on
+//! `127.0.0.1`, bob's on `[::1]`. Neither daemon can send a datagram to the other, so the
+//! anchor's circuit is the only path.
 //!
 //! **Relayed is asserted, before and after the samples**, from the anchor's own count of circuits
 //! carried, so a direct path cannot pass this silently. **The split is checked first**, as a

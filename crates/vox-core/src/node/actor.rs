@@ -266,6 +266,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         consented: ch.consented().into_iter().collect(),
         retention: ch.effective_retention(),
         key_generations: ch.key_generations(),
+        received_key_generations: ch.received_key_generations(),
         frozen,
         refused_below_checkpoint,
     }
@@ -4158,18 +4159,30 @@ impl Node {
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
         if node.headless.is_some() {
-            // **Stored anchor pages are deleted on upgrade** (ADR-023 decision 6): an anchor
-            // kept a ciphertext copy of every room it served until then, and holds none now.
-            if node.anchor_boards && node.paths.store_file().is_file() {
-                // The profile's lock first (V210-100): this opens the profile's store, as every
-                // other vox on the profile does, and lets it go only after the store is closed.
+            // **An upgraded anchor deletes its store file** (ADR-023 decision 6; decider,
+            // 2026-10-02, R45): an anchor kept a ciphertext copy of every room it served in it
+            // until then, and keeps nothing on disk for a room now, so the file goes whole.
+            let store_file = node.paths.store_file();
+            if node.anchor_boards && store_file.is_file() {
+                // The profile's lock first (V210-100), as every other vox on the profile takes
+                // it: nothing else has the store open while it goes.
                 let lock = crate::node::profile::lock_profile(&node.paths, &profile_wait)?;
-                let store_file = node.paths.store_file();
-                crate::node::profile::open_letting_go(|| {
-                    crate::node::store::Store::open(&store_file)
-                })?
-                .keep_lock(lock)
-                .delete_retired_anchor_pages()?;
+                if crate::node::profile::Profile::exists(&node.paths) {
+                    // **Unless a member's vault is here too**: then the store is that member's
+                    // rooms, run as `vox node` on the same data directory. Only the anchor's own
+                    // retired pages go; the member's data is never touched.
+                    crate::node::profile::open_letting_go(|| {
+                        crate::node::store::Store::open(&store_file)
+                    })?
+                    .keep_lock(lock)
+                    .delete_retired_anchor_pages()?;
+                } else {
+                    std::fs::remove_file(&store_file).map_err(|e| Error::Path {
+                        op: "delete the anchor's retired store",
+                        detail: format!("{}: {e}", store_file.display()),
+                    })?;
+                    drop(lock);
+                }
             }
             node.start_network()?;
         }
@@ -4418,7 +4431,7 @@ impl Node {
                     self.deliver_owed_consents(None).await;
                     // R14: a superseded generation's key goes once no full-history grant
                     // still has to release it.
-                    self.prune_superseded_keys().await;
+                    let pruned = self.prune_superseded_keys().await;
                     // Paths change on the tick with no event to say so — a retired connection
                     // closed, a circuit this node relayed ended — and a view published only on
                     // events kept showing them: an anchor with no rooms reported a circuit it
@@ -4427,7 +4440,7 @@ impl Node {
                     // connection died (D1a) and raises the periodic request (D7).
                     self.sync_tick().await;
                     let ran = self.schedule().await;
-                    if ran || self.paths_moved() {
+                    if ran || pruned || self.paths_moved() {
                         self.publish().await;
                     }
                     // Retention on every tick: the index is ordered by age, so a pass that
@@ -8713,10 +8726,14 @@ impl Node {
     /// (V210-45) — a trusted identity not yet consented to, joined or not, and history not
     /// yet delivered. Deleting those left a member trusted before it joined unable to read
     /// what was posted after its trust (found by #226's log-path proof: 3 of 6).
-    async fn prune_superseded_keys(&mut self) {
+    ///
+    /// Returns whether any generation went, so the view `vox status` reads is published again:
+    /// it carries the counts, and nothing else on a quiet tick republishes it.
+    async fn prune_superseded_keys(&mut self) -> bool {
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
-            return;
+            return false;
         };
+        let mut pruned = false;
         let full: std::collections::BTreeSet<Digest32> = self
             .trust
             .trusted()
@@ -8730,14 +8747,22 @@ impl Node {
             let Ok(mut channel) = shared.try_lock() else {
                 continue;
             };
+            // Other members' generations this node has read to the end go too (R14 on the
+            // receiving side), whatever this node still owes with its own.
+            pruned |= channel
+                .prune_superseded_receivers(&store)
+                .is_ok_and(|n| n > 0);
             if channel.key_generations() <= 1 || !channel.owed_consents(&full).is_empty() {
                 continue;
             }
             let keep_from = channel
                 .oldest_generation_needed(&trusted, now_secs)
                 .unwrap_or(u64::MAX);
-            let _ = channel.prune_superseded_origins(&store, keep_from);
+            pruned |= channel
+                .prune_superseded_origins(&store, keep_from)
+                .is_ok_and(|n| n > 0);
         }
+        pruned
     }
 
     /// Issue consent to every trusted, admitted author that does not hold it yet,
@@ -12821,6 +12846,7 @@ impl Node {
                 last_sync: self.status.room_synced.get(&room.channel_id).copied(),
                 retention: room.retention,
                 key_generations: room.key_generations,
+                received_key_generations: room.received_key_generations,
                 frozen: room.frozen.clone(),
                 refused_below_checkpoint: room.refused_below_checkpoint,
                 members,
