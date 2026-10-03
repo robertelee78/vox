@@ -25,13 +25,13 @@
 //!
 //! **Which side a red is on.** `PRODUCT:` quotes what vox said or did (a join refused, an anchor
 //! that would not stop, bob not back in time); a `vox` step of the setup that failed is
-//! `PRODUCT (staging):`, quoting it; `CANNOT MEASURE:` names a precondition that was not met;
+//! `PRODUCT (staging):`, quoting it; `APPARATUS:` names a precondition that was not met;
 //! `APPARATUS:` names a fault of this proof's own (a process it could not start, a file
 //! it could not write, a signal it could not send). Each join is tried **once**: a join turned
 //! away is the product's red, not something to retry past. The bound is read against an
-//! **apparatus clock** on the same timeline — how long this machine takes to start a `vox
-//! --version`, and the poll's slowest turn — and a bound missed while that was over
-//! [`APPARATUS_BUDGET`] is CANNOT MEASURE.
+//! **apparatus clock** on the same timeline — how long this machine takes to start
+//! `/usr/bin/true` (not vox, so a slow vox reads as the product's), and the poll's slowest turn — and a bound missed while that was over
+//! [`APPARATUS_BUDGET`] is APPARATUS (runner stalled).
 //!
 //! **Mutation that must turn it red:** the union filled room by room and cut at eight
 //! (`kept_anchors` in `actor.rs`, candidate 2): the first room's eight dead ports are all bob
@@ -249,14 +249,21 @@ fn join(dir: &Path, link: &str, name: &str) -> (bool, String) {
     (ok, format!("{}{}", out.trim(), err.trim()))
 }
 
-/// The apparatus clock: how long this machine takes, now, to start a `vox` that does nothing
-/// (`vox --version` on the profile at `dir`). A stalled runner stalls this too.
-fn apparatus_spawn(dir: &Path) -> Duration {
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
     let t = Instant::now();
-    let (ok, out, err) = vox(dir, &["--version"], None);
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
         ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {out}{err}"
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }
@@ -360,7 +367,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     );
     assert!(
         dead.iter().all(|a| stale_link.contains(a)) && !stale_link.contains(&real_addr),
-        "CANNOT MEASURE: the stale link does not name the anchor at the eight dead ports only: \
+        "APPARATUS: the stale link does not name the anchor at the eight dead ports only: \
          {stale_link}"
     );
     println!(
@@ -372,7 +379,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     // ---- bob, with no anchor of his own, joins both -----------------------------------------------
     assert!(
         !bob_dir.join("cfg").join("anchors").exists(),
-        "CANNOT MEASURE: bob has an anchors file, so the anchor would be configured"
+        "PRODUCT (staging): bob has an anchors file, so the anchor would be configured"
     );
     let (_bob, bob_err) = daemon(&bob_dir, &[]);
     let (ok, _, err) = vox(
@@ -451,7 +458,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
         std::thread::sleep(Duration::from_millis(200));
     };
     let alive = the_anchor.0.try_wait().ok().flatten().is_none();
-    let apparatus = slowest_turn.max(apparatus_spawn(&bob_dir));
+    let apparatus = slowest_turn.max(apparatus_spawn());
     let said_it_went = std::fs::read_to_string(&bob_err)
         .unwrap_or_default()
         .contains("the connection to this anchor is gone");
@@ -470,7 +477,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
                 || said.contains("something else already holds that UDP port"));
         assert!(
             !port_taken,
-            "CANNOT MEASURE: the restarted anchor's port was taken meanwhile, so bob had nothing to \
+            "APPARATUS: the restarted anchor's port was taken meanwhile, so bob had nothing to \
              reach: {said:?}"
         );
         panic!(
@@ -490,7 +497,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     if back >= BACK_WITHIN {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while bob \
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while bob \
              was back only {back:?} after the anchor's restart"
         );
         panic!(

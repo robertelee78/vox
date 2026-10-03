@@ -11,10 +11,10 @@ an unknown command (`:zzz`) first, so "done" afterwards can only be the close's 
 
 Exit 0 = the TUI said "done" to `:close`. 1 = a product red, with its screen: `RED: vox tui
 exited before it asked to unlock`, `RED: the TUI never unlocked`, `RED: no "done" after
-:close`, or `RED: vox tui exited at <stage>`; or `HUNG at <stage>` with the driver's stack (`vox_pty.py`, V210-54) — every wait here is
+:close`, or `RED: vox tui exited at <stage>`, `RED: PRODUCT (staging): the status line still says done after
+:zzz` (an unknown command must replace it, or a later "done" proves nothing); or `HUNG at <stage>` with the driver's stack (`vox_pty.py`, V210-54) — every wait here is
 bounded, so a driver past its budget is a TUI that stopped reading what was typed. 2 = apparatus
-only: pyte missing, the status line not reset by `:zzz` (the staging this driver needs), or the
-driver's own error. The caller confirms the room is closed on its own, with `vox room list`. The
+only: pyte missing, or the driver's own error. The caller confirms the room is closed on its own, with `vox room list`. The
 TUI is killed by its PID, with bounded waits.
 
 **A TUI that never unlocks is the product, not the apparatus** (V210-107). It was reported as
@@ -162,7 +162,8 @@ try:
     stage(":close")
     key(":zzz\r", 1.5)
     if "done" in status():
-        give(2, f"APPARATUS: the status line still says done after :zzz:\n{tui.text()}")
+        give(1, f"RED: PRODUCT (staging): the status line still says done after :zzz, an unknown "
+                f"command:\n{tui.text()}")
     key(":close\r", 1)
     closed = tui.until(lambda: tui.closed or "done" in status(), 20)
     gone_check()

@@ -124,7 +124,7 @@ fn apparatus_spawn() -> Duration {
 }
 
 /// Red if the claim and its drain took past [`SHORT_TTL`]. They are `vox` verbs, so a slow one is
-/// `PRODUCT (staging)`; it is `CANNOT MEASURE` only when the apparatus clock taken right after
+/// `PRODUCT (staging)`; it is `APPARATUS (runner stalled)` only when the apparatus clock taken right after
 /// (`/usr/bin/true`, not vox) is over [`APPARATUS_BUDGET`].
 fn recorded_within_ttl(since: Instant, what: &str) {
     let took = since.elapsed();
@@ -134,7 +134,7 @@ fn recorded_within_ttl(since: Instant, what: &str) {
     let apparatus = apparatus_spawn();
     assert!(
         apparatus <= APPARATUS_BUDGET,
-        "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
+        "APPARATUS (runner stalled): apparatus took {apparatus:?} (`/usr/bin/true`, budget \
          {APPARATUS_BUDGET:?}) right after claiming {what} and recording it in a drain took \
          {took:?}, so the runner, not the node, may be slow"
     );

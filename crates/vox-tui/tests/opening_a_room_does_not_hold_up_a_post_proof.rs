@@ -28,7 +28,8 @@
 //! **Asserted:** every post that overlapped the open, from its start to the room being open,
 //! answered within [`BOUND`], V210-08's bound for a post on loopback. The bound is asserted
 //! **before** the preconditions, so a post over it is red whatever else the run shows.
-//! A post that failed is a `PRODUCT` red too. Preconditions, or `APPARATUS`: the open took at least
+//! A post that failed is a `PRODUCT` red too, and a vox step of the staging that failed is
+//! `PRODUCT (staging)`. Preconditions this proof does not control are `APPARATUS`: the open took at least
 //! [`MIN_OPEN`] (else there was nothing to wait for), and at least [`MIN_DURING`] posts overlapped
 //! it.
 //!

@@ -26,6 +26,14 @@
 //! Within [`BOUND`] of carol's return, **carol reads all [`POSTS`]** of alice's entries, and while
 //! alice and the anchor were frozen carol ended no session with alice: bob carried them.
 //!
+//! ## Apparatus clock
+//! From carol's `SIGCONT`, a thread of this process sleeps 10 ms at a time and keeps the most it
+//! overslept: the runner's own stall, which vox cannot move. If carol fell short and the runner
+//! overslept more than [`APPARATUS_BUDGET`], the runner, not bob, owned the window:
+//! `APPARATUS (runner stalled)`. Otherwise the red is `PRODUCT: took X (runner stalled at most
+//! Y)`. When carol's socket first answered after `SIGCONT` is vox's own timing: printed, never the
+//! clock.
+//!
 //! ## Mutation
 //! `absorb_arrived` never raises `gen` (the verifier's mutant B): bob stores alice's entries, but no
 //! port of his becomes due, and nothing else asks for a session with carol until the next tick,
@@ -61,6 +69,8 @@ const MARGIN: Duration = Duration::from_secs(3);
 /// was a CANNOT MEASURE.
 const STAGING: Duration = Duration::from_secs(3);
 const SETUP: Duration = Duration::from_secs(90);
+/// The most the runner may oversleep one 10 ms sleep before a shortfall is the runner's.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
 fn texts_of(m: &Member, room: &str) -> Vec<String> {
     let mut r = m.reader();
@@ -74,11 +84,54 @@ fn relayed_count(texts: &[String]) -> usize {
         .count()
 }
 
+/// The runner's own clock: a thread that sleeps 10 ms at a time and keeps the most it overslept.
+/// It measures whether this process was scheduled, never vox: a slow vox does not move it, so a
+/// late result with this clock quiet is the product's.
+struct RunnerStall {
+    worst_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunnerStall {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let worst_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worst, stopped) = (
+            std::sync::Arc::clone(&worst_us),
+            std::sync::Arc::clone(&stop),
+        );
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let asked = Instant::now();
+                std::thread::sleep(Duration::from_millis(10));
+                let over = asked.elapsed().saturating_sub(Duration::from_millis(10));
+                worst.fetch_max(
+                    u64::try_from(over.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+        });
+        Self { worst_us, stop }
+    }
+
+    /// The most the runner overslept one 10 ms sleep since [`RunnerStall::start`].
+    fn worst(&self) -> Duration {
+        Duration::from_micros(self.worst_us.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for RunnerStall {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[test]
-#[ignore = "real vox processes timed against the 30 s periodic request; run under the timing lock"]
+#[ignore = "real vox processes timed against the 30 s periodic request; CI runs it in release"]
 fn a_member_relays_what_it_learned() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let (anchor, spec) = sync_pair::anchor(root);
     let alice = Member::new(root, "alice");
@@ -120,7 +173,7 @@ fn a_member_relays_what_it_learned() {
         }
         assert!(
             start.elapsed() < SETUP,
-            "CANNOT MEASURE: after {SETUP:?} the members do not all read each other: {missing:?}"
+            "PRODUCT (staging): after {SETUP:?} the members do not all read each other: {missing:?}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -139,7 +192,7 @@ fn a_member_relays_what_it_learned() {
     while b_tick.is_none() || c_tick.is_none() {
         assert!(
             watch.elapsed() < TICK * 2,
-            "CANNOT MEASURE: in {:?}, bob opened a session to carol: {}, carol to bob: {}; the \
+            "PRODUCT (staging): in {:?}, bob opened a session to carol: {}, carol to bob: {}; the \
              periodic request was not seen",
             TICK * 2,
             b_tick.is_some(),
@@ -155,7 +208,10 @@ fn a_member_relays_what_it_learned() {
         }
         (b_last, c_last) = (b, c);
     }
-    let ticks = [b_tick.unwrap(), c_tick.unwrap()];
+    let ticks = [
+        b_tick.expect("APPARATUS: set by the loop above"),
+        c_tick.expect("APPARATUS: set by the loop above"),
+    ];
     // The first tick of `seen`'s series at or after `t`.
     let next_tick = |seen: Instant, t: Instant| {
         let mut n = seen;
@@ -176,7 +232,7 @@ fn a_member_relays_what_it_learned() {
         go += Duration::from_millis(250);
         assert!(
             go < now + TICK,
-            "CANNOT MEASURE: no {window:?} window clear of both ticks"
+            "APPARATUS: no {window:?} window clear of both ticks"
         );
     }
     println!(
@@ -218,7 +274,7 @@ fn a_member_relays_what_it_learned() {
     );
     assert!(
         bob_has == POSTS,
-        "CANNOT MEASURE: within {STAGING:?} bob reads only {bob_has}/{POSTS} of alice's entries, so \
+        "PRODUCT (staging): within {STAGING:?} bob reads only {bob_has}/{POSTS} of alice's entries, so \
          he holds nothing to relay\nbob:\n{}",
         bob_d.transcript()
     );
@@ -226,20 +282,28 @@ fn a_member_relays_what_it_learned() {
     // ---- 4. alice and the anchor frozen; carol back: only bob can give her the entries --------
     alice_d.signal("-STOP");
     anchor.signal("-STOP");
+    let stall = RunnerStall::start();
     carol_d.signal("-CONT");
     let back = Instant::now();
     let mut have = 0;
+    // Vox's own timing, printed: when carol's control socket first answered after SIGCONT.
+    let mut answered = None;
     while back.elapsed() < BOUND {
         have = relayed_count(&texts_of(&carol, &room));
+        answered.get_or_insert(back.elapsed());
         if have == POSTS {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     let took = back.elapsed();
+    let answered = answered.unwrap_or(took);
+    let runner = stall.worst();
+    drop(stall);
     println!(
         "[proof] carol reads {have}/{POSTS} of alice's entries {took:.1?} after she was continued \
-         (bound {BOUND:?})"
+         (bound {BOUND:?}); her socket first answered {answered:.1?} after SIGCONT; the runner \
+         overslept at most {runner:?}"
     );
     let ended = ended_with_alice() - ended_before;
     println!("[proof] sessions carol ended with alice meanwhile: {ended}");
@@ -247,16 +311,21 @@ fn a_member_relays_what_it_learned() {
     anchor.signal("-CONT");
     assert!(
         ended == 0,
-        "CANNOT MEASURE: carol ended {ended} session(s) with alice, so bob was not her only source"
+        "PRODUCT (staging): carol ended {ended} session(s) with alice, so bob was not her only source"
     );
     // The staging held (bob holds all of them, carol ended nothing with alice, no tick in the
     // window), so a short count is the product's: bob did not relay what he learned. Both sides'
     // sessions and connections are printed, so the red says which event was lost.
     assert!(
+        have == POSTS || runner <= APPARATUS_BUDGET,
+        "APPARATUS (runner stalled): the runner stalled: it overslept a 10 ms sleep by {runner:?} (budget \
+         {APPARATUS_BUDGET:?}) while carol read {have}/{POSTS} within {BOUND:?}"
+    );
+    assert!(
         have == POSTS,
-        "PRODUCT: carol reads {have}/{POSTS} of alice's entries {BOUND:?} after she was continued: \
-         bob holds all {POSTS} and did not hand them on\nbob's status:\n{}\ncarol's status:\n{}\n\
-         bob:\n{}\ncarol:\n{}",
+        "PRODUCT: took more than {took:?} (runner stalled at most {runner:?}): carol reads {have}/{POSTS} of \
+         alice's entries {BOUND:?} after she was continued: bob holds all {POSTS} and did not hand \
+         them on\nbob's status:\n{}\ncarol's status:\n{}\nbob:\n{}\ncarol:\n{}",
         bob.status(),
         carol.status(),
         bob_d.transcript(),

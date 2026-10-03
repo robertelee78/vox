@@ -21,7 +21,7 @@
 //!
 //! **Asserted.**
 //! 1. The history exists: at least [`MIN_ENTRIES`] of the members' trust changes succeeded (each
-//!    is one governance entry). Fewer is `APPARATUS` (staging not achieved).
+//!    is one governance entry). Fewer is `PRODUCT (staging)`: vox refused trust changes.
 //! 2. **The join, from the start of the attempt that got in to the newcomer reading a post the
 //!    host made after it, takes less than [`JOIN_BOUND`] of work** — its time less the two steps
 //!    that are the joiner's own CPU and nothing else: the admission puzzle (`solve`) and sealing
@@ -103,9 +103,9 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     let out = child
         .wait_with_output()
         .expect("APPARATUS (harness): vox finished");
@@ -128,17 +128,19 @@ fn vox_timed(data: &Path, argv: &[&str], cap: Duration) -> (bool, Duration, Stri
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(&out_file).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(&out_file).expect("APPARATUS: create a staging file"),
+        ))
         .stderr(Stdio::from(
             std::fs::OpenOptions::new()
                 .append(true)
                 .open(&out_file)
-                .unwrap(),
+                .expect("APPARATUS: open a log file"),
         ))
         .spawn()
         .expect("APPARATUS (harness): run vox");
     let ok = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.try_wait().expect("APPARATUS: poll a child process") {
             break status.success();
         }
         if t0.elapsed() >= cap {
@@ -167,7 +169,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -177,7 +181,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("APPARATUS (precondition not met): {name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 fn fingerprint(data: &Path) -> String {
@@ -202,15 +206,15 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     } else {
         watchdog::arm();
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, host_dir, newcomer_dir) = (dir("anchor"), dir("host"), dir("newcomer"));
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
 
     // ---- staging, all through the shipped binary ----------------------------------------
     let mut anchor = VoxProc::spawn(
@@ -222,7 +226,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .unwrap()
+        .expect("APPARATUS: the line matched for the spec holds it")
         .to_owned();
     let host_fp = fingerprint(&host_dir);
     let newcomer_fp = fingerprint(&newcomer_dir);
@@ -332,7 +336,10 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
                 })
             })
             .collect();
-        flips.into_iter().map(|t| t.join().unwrap()).sum()
+        flips
+            .into_iter()
+            .map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .sum()
     });
     println!(
         "[proof] history: {entries} trust changes by {MEMBERS} members in {:?}",
@@ -340,7 +347,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     );
     assert!(
         entries >= MIN_ENTRIES,
-        "APPARATUS (precondition not met): only {entries} of {} trust changes succeeded (need {MIN_ENTRIES})",
+        "PRODUCT (staging): only {entries} of {} trust changes succeeded (need {MIN_ENTRIES})",
         MEMBERS * CYCLES * 2
     );
 
@@ -358,7 +365,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let newcomer = daemon("newcomer", &newcomer_dir, &spec, &pass_file);
     let t_join = Instant::now();
     let Some((tries, got_in_from)) = attempts(&newcomer_dir, "newcomer") else {
-        panic!("PRODUCT (staging): the newcomer could not join");
+        panic!("PRODUCT: the newcomer could not join");
     };
     let joined = Instant::now();
     // The newcomer's daemon names each step of its join: `join got in — board …, solve …`.
@@ -387,7 +394,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let (solve, seal) = (step_secs("solve"), step_secs("seal"));
     assert!(
         solve > 0.0 && seal > 0.0,
-        "APPARATUS (precondition not met): the newcomer's daemon did not name its join's solve and seal: {steps:?}"
+        "PRODUCT: the newcomer's daemon did not name its join's solve and seal: {steps:?}"
     );
     let marker = "posted by the host after the newcomer joined";
     let (ok, _, err) = vox_once(&host_dir, &args(&["room", "post", &room, marker]));

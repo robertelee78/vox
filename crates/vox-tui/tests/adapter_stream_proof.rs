@@ -27,7 +27,7 @@
 //!   time restarted from the cursor it had persisted.
 //! - then the consumer's **node** killed with SIGKILL and started again (ADR-021 F19), after
 //!   alice and bob have posted alternately so bob's local order differs from canonical
-//!   order (the proof says CANNOT MEASURE if it does not).
+//!   order (the proof says PRODUCT (staging) if it does not).
 //!
 //! - a **second consumer** of the same room on the same node, attached at the same time
 //!   and never paused or killed, as a second tracker's adapter would be (RP-18, RP-45).
@@ -54,7 +54,7 @@
 //! meaning across a reboot was read from the code, not proved.
 //!
 //! Every red says whose it is: `PRODUCT:` for what the node or `vox room tail` did,
-//! `CANNOT MEASURE:` for staging that was not achieved.
+//! `PRODUCT (staging):` for staging that was not achieved.
 //!
 //! ## Mutations
 //! - the node's subscription pumps share one lock across their socket writes: the frozen
@@ -154,11 +154,7 @@ fn signal(run: &Run, sig: &str) {
         .args([sig, &run.child.id().to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — `kill {sig} {}` failed",
-        run.child.id()
-    );
+    assert!(ok, "APPARATUS: `kill {sig} {}` failed", run.child.id());
 }
 
 /// Process up to `n` rows, waiting at most `idle` for each, persisting the cursor after
@@ -658,7 +654,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     );
     assert!(
         lags > 0,
-        "CANNOT MEASURE: staging not achieved — the consumer never lagged, so this run proved \
+        "PRODUCT (staging): the consumer never lagged, so this run proved \
          nothing about lag"
     );
     assert!(
@@ -684,10 +680,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             .args([sig, &bob_pid.to_string()])
             .status()
             .is_ok_and(|s| s.success());
-        assert!(
-            ok,
-            "CANNOT MEASURE: staging not achieved — `kill {sig} {bob_pid}` failed"
-        );
+        assert!(ok, "APPARATUS: `kill {sig} {bob_pid}` failed");
     };
     for i in 0..20 {
         to_bob("-STOP");
@@ -770,12 +763,12 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     );
     assert!(
         off_canonical > 0,
-        "CANNOT MEASURE (staging not achieved): bob's local order equals canonical order, so a node \
+        "PRODUCT (staging): bob's local order equals canonical order, so a node \
          that rebuilt it canonically on reopen could not be told apart"
     );
     assert!(
         followed.len() >= 40,
-        "CANNOT MEASURE (staging not achieved): only {} rows follow the consumer's cursor {cursor}",
+        "PRODUCT (staging): only {} rows follow the consumer's cursor {cursor}",
         followed.len()
     );
 

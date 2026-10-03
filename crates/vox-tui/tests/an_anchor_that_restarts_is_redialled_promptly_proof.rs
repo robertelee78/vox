@@ -82,7 +82,7 @@ const KILLED_WITHIN: Duration = Duration::from_secs(11);
 /// How soon after a SIGTERM the forward must say it: the close arrives at once and the next 1 s
 /// tick reads it. Short of the 8 s any inference from silence needs.
 const CLOSED_WITHIN: Duration = Duration::from_secs(3);
-/// The most this machine's own clock may stall (a `vox --version` start, or the redial poll's
+/// The most this machine's own clock may stall (a `/usr/bin/true` start, or the redial poll's
 /// slowest turn past its 200 ms sleep and 2 s echo) before a missed [`BACK_WITHIN`] is the
 /// runner's, not the forward's.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
@@ -142,7 +142,7 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
         // A turn is at most a 2 s echo and a 200 ms sleep; anything past that is this machine.
         slowest_turn = slowest_turn.max(turn.elapsed().saturating_sub(Duration::from_millis(2200)));
     }
-    let apparatus = slowest_turn.max(apparatus_spawn(&w.guest_dir));
+    let apparatus = slowest_turn.max(apparatus_spawn());
     let said = forward(&mut w.fwd).transcript();
     let saw_it_go = said.lines().any(|l| l.contains(GONE));
     eprintln!(
@@ -161,7 +161,7 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     if carried >= BACK_WITHIN {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
              forward carried again only {carried:?} after its anchor was back"
         );
         panic!(
@@ -217,14 +217,21 @@ fn assert_says_stopped(who: &str, said: &str, anchor: &str) {
     );
 }
 
-/// How long this machine takes to start the shipped binary (`vox --version`, against the profile
-/// at `dir`). A stalled runner stalls this too.
-fn apparatus_spawn(dir: &std::path::Path) -> Duration {
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
     let t = Instant::now();
-    let (ok, out, err) = world::vox_once(dir, &world::args(&["--version"]));
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
         ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {out}{err}"
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }
@@ -235,13 +242,13 @@ fn forward(fwd: &mut Option<world::VoxProc>) -> &mut world::VoxProc {
         .expect("APPARATUS: the proof reads the forward before it started it")
 }
 
-/// Send `sig` to `pid`. A signal that cannot be sent leaves the scene unstaged: CANNOT MEASURE.
+/// Send `sig` to `pid`. A signal that cannot be sent leaves the scene unstaged: APPARATUS.
 fn kill<const N: usize>(args: [&str; N]) {
     let sent = std::process::Command::new("kill")
         .args(args)
         .status()
         .is_ok_and(|s| s.success());
-    assert!(sent, "CANNOT MEASURE: `kill {}` failed", args.join(" "));
+    assert!(sent, "APPARATUS: `kill {}` failed", args.join(" "));
 }
 
 /// The anchor's identity, from its `--anchor` spec.
@@ -334,7 +341,7 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
 /// **Optional, and why.** Whether the forward holds that relayed connection as its host's — rather
 /// than keep redialling the host directly, with "dialling this anchor failed … no direct
 /// candidates" — is not settled by anything the proof controls (a filing question of its own,
-/// reported apart from V210-93). Held, the claim is measured; not held, the arm says CANNOT MEASURE.
+/// reported apart from V210-93). Held, the claim is measured; not held, the arm says PRODUCT (staging).
 ///
 /// Mutation: the relay's stop not carried to the connections over its circuits (the reason left to
 /// the probe) → red on the host's line, with the probe's verdict.
@@ -388,7 +395,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
         // relay; and once it holds that connection as the host's, it stops redialling it — the
         // last "dialling this anchor failed …; the next try is in N s" goes N s and more without a
         // "dialling this anchor again". Until then the host is not held as an anchor and there is
-        // nothing of it for the stop to end: CANNOT MEASURE, not a verdict.
+        // nothing of it for the stop to end: PRODUCT (staging), not a verdict.
         let about_host = format!("connection to {host12} — dialling this anchor");
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -482,7 +489,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
             "{}the anchor did not exit within 10 s of SIG{signal}",
             // SIGKILL is the kernel's to carry out; any other stop is the product's to obey.
             if signal == "KILL" {
-                "CANNOT MEASURE: "
+                "APPARATUS: the kernel did not carry out SIGKILL: "
             } else {
                 "PRODUCT: `vox node` did not obey a stop: "
             }

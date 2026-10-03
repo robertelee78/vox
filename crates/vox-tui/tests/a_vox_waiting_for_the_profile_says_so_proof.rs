@@ -40,9 +40,11 @@
 //! anywhere (quoted if it is) and every box border row ends with its partner; after SIGCONT the
 //! TUI answers as above.
 //!
-//! Every red names its side: a PRODUCT verdict quotes what the product said or drew; a staging
-//! step that did not happen (A never took the lock, a signal could not be sent, the TUI driver did
-//! not run to the end, v0.2.9 could not write its profile) is CANNOT MEASURE (apparatus).
+//! Every red names its side: a PRODUCT verdict quotes what the product said or drew; a vox step
+//! of the staging that failed (A never said it took the lock, `vox id` for arm 5, the TUI driver
+//! saying the TUI failed or hung) is PRODUCT (staging); only the proof's own machinery (a signal
+//! that could not be sent, `lsof` that would not run, the released v0.2.9 binary it stages with,
+//! a driver that stopped for any other reason) is APPARATUS, CANNOT MEASURE.
 //!
 //! Mutations that must turn it red: the notice removed (B waits in silence, arms 1–4); the notice
 //! written to stderr by the lock or the node (arms 3–4: CLI text on the TUI's screen); the waiter
@@ -103,7 +105,7 @@ fn signal(pid: u32, sig: &str) {
         .is_ok_and(|s| s.success());
     assert!(
         ok,
-        "CANNOT MEASURE (apparatus): could not send {sig} to vox A (pid {pid}), so the staging \
+        "APPARATUS, CANNOT MEASURE: could not send {sig} to vox A (pid {pid}), so the staging \
          (A stopped holding the lock) did not happen"
     );
 }
@@ -132,8 +134,8 @@ fn hold_and_stop(label: &str, data: &Path, a_args: &[&str]) -> (VoxProc, u32) {
     }
     assert!(
         held,
-        "CANNOT MEASURE (apparatus): vox A never said it holds the profile lock, so nothing below \
-         would wait on it; A said:\n{}",
+        "PRODUCT (staging): vox A never said it holds the profile lock, so nothing below would \
+         wait on it; A said:\n{}",
         a.transcript()
     );
     let pid = a.child.id();
@@ -144,7 +146,7 @@ fn hold_and_stop(label: &str, data: &Path, a_args: &[&str]) -> (VoxProc, u32) {
 /// Wait until `p` exits or `deadline` passes: its status and when it was seen to exit.
 fn exit_of(p: &mut VoxProc, deadline: Instant) -> Option<(ExitStatus, Instant)> {
     loop {
-        if let Some(s) = p.child.try_wait().unwrap() {
+        if let Some(s) = p.child.try_wait().expect("APPARATUS: poll a child process") {
             return Some((s, Instant::now()));
         }
         if Instant::now() >= deadline {
@@ -160,10 +162,18 @@ fn exits(a: &mut VoxProc, b: &mut VoxProc) -> [Option<(ExitStatus, Instant)>; 2]
     let (mut ea, mut eb) = (None, None);
     while (ea.is_none() || eb.is_none()) && Instant::now() < deadline {
         if ea.is_none() {
-            ea = a.child.try_wait().unwrap().map(|s| (s, Instant::now()));
+            ea = a
+                .child
+                .try_wait()
+                .expect("APPARATUS: poll a child process")
+                .map(|s| (s, Instant::now()));
         }
         if eb.is_none() {
-            eb = b.child.try_wait().unwrap().map(|s| (s, Instant::now()));
+            eb = b
+                .child
+                .try_wait()
+                .expect("APPARATUS: poll a child process")
+                .map(|s| (s, Instant::now()));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -195,7 +205,11 @@ fn cli_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str], then: &Th
         }
     }
     std::thread::sleep(STOPPED_FOR);
-    let b_still_waiting = b.child.try_wait().unwrap().is_none();
+    let b_still_waiting = b
+        .child
+        .try_wait()
+        .expect("APPARATUS: poll a child process")
+        .is_none();
     let waited = t0.elapsed();
     signal(a_pid, "-CONT");
     let resumed = Instant::now();
@@ -285,7 +299,7 @@ fn past_patience_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str])
     let lsof = dir.as_ref().map(|d| {
         let out = Command::new("lsof").args(["-t", "--", d]).output();
         let out = out.unwrap_or_else(|e| {
-            panic!("CANNOT MEASURE (apparatus): could not run `lsof {d}` as B advised: {e}")
+            panic!("APPARATUS, CANNOT MEASURE: could not run `lsof {d}` as B advised: {e}")
         });
         String::from_utf8_lossy(&out.stdout).into_owned()
     });
@@ -385,10 +399,19 @@ fn tui_arm(label: &str, data: &Path, mode: &str, a_args: &[&str], answer: &[&str
             .find_map(|l| l.strip_prefix(&format!("{label} {p}")))
             .map(str::to_owned)
     };
+    // The driver prints `<tag> RED: PRODUCT…` or `HUNG at` when `vox tui` failed (no prompt, no
+    // answer, a wait that never ended): the product's, at staging. Anything else that stops it is
+    // the driver's own machinery.
+    let side = if said.contains(&format!("{label} RED: PRODUCT"))
+        || said.contains(&format!("{label} HUNG at"))
+    {
+        "PRODUCT (staging)"
+    } else {
+        "APPARATUS"
+    };
     assert!(
         !out.has_verdict(label) && out.code == Some(0) && line("AFTER:").is_some(),
-        "CANNOT MEASURE (apparatus): the {label} arm's TUI driver did not run to the end — a \
-         hang, a TUI it could not reap, or a prompt that never showed (exit {:?}, stage {:?}): \
+        "{side}: the {label} arm's TUI driver did not run to the end (exit {:?}, stage {:?}): \
          {said}",
         out.code,
         out.stage
@@ -438,10 +461,10 @@ fn a_vox_waiting_for_the_profile_says_so() {
     } else {
         900
     }));
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let old = previous_release();
@@ -452,10 +475,11 @@ fn a_vox_waiting_for_the_profile_says_so() {
             .env("VOX_CONFIG_DIR", data.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
             .output()
-            .unwrap();
+            .expect("APPARATUS: run a process");
         assert!(
             out.status.success(),
-            "CANNOT MEASURE (apparatus): v0.2.9 `vox {argv:?}` failed: {}",
+            "APPARATUS, CANNOT MEASURE: the v0.2.9 release this proof stages with failed \
+             `vox {argv:?}`: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -494,7 +518,7 @@ fn a_vox_waiting_for_the_profile_says_so() {
     );
     assert!(
         ok,
-        "CANNOT MEASURE (apparatus): `vox trust list` afterwards failed: {listed}{err}"
+        "PRODUCT: cli-migration: `vox trust list` afterwards failed: {listed}{err}"
     );
     if red.iter().all(|r| !r.contains("cli-migration")) {
         for name in ["x", "y"] {
@@ -533,7 +557,7 @@ fn a_vox_waiting_for_the_profile_says_so() {
     let (ok, made, err) = vox_once(&erin, &args(&["id"]));
     assert!(
         ok,
-        "CANNOT MEASURE (apparatus): `vox id` could not make the profile for arm 5: {made}{err}"
+        "PRODUCT (staging): `vox id` could not make the profile for arm 5: {made}{err}"
     );
     red.extend(past_patience_arm(
         "cli-past-patience",
@@ -542,5 +566,5 @@ fn a_vox_waiting_for_the_profile_says_so() {
         &["trust", "add", &y_fp, "--name", "y"],
     ));
 
-    assert!(red.is_empty(), "{red:#?}");
+    assert!(red.is_empty(), "PRODUCT: {red:#?}");
 }

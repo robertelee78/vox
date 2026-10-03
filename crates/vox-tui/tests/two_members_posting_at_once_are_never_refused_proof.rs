@@ -349,7 +349,14 @@ fn two_members_posting_at_once_are_never_refused() {
         .collect();
     let [alice, bob] = &members;
     let (ok, _, err) = alice.vox(
-        &["room", "create", "--passphrase-file", "-", "--name", "mission"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
         Some(ROOM_PASS),
     );
     assert!(
@@ -369,7 +376,15 @@ fn two_members_posting_at_once_are_never_refused() {
     // One join, no retry: a join that fails is a defect in joining, which is not what this proves,
     // and retrying would hide it.
     let (ok, out, err) = bob.vox(
-        &["room", "join", "--passphrase-file", "-", &link, "--name", "mission"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
         Some(ROOM_PASS),
     );
     assert!(

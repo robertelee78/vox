@@ -38,8 +38,8 @@
 //!
 //! **Which side a red is on.** A red that quotes what `vox` printed is `PRODUCT:`; a fixture that
 //! could not be made (a directory, a spawn, a pipe) is `APPARATUS:`; setup that the product
-//! refused before the claim could be reached (`vox id`, the daemon, the room) is `CANNOT
-//! MEASURE:` with what it said. Every `vox` here runs with the harness's own session variables
+//! refused before the claim could be reached (`vox id`, the daemon, the room) is
+//! `PRODUCT (staging):` with what it said. Every `vox` here runs with the harness's own session variables
 //! removed, so the hook under test never picks up the session of the agent running the proof.
 //!
 //! Not proved here, and stated rather than implied: that a harness actually

@@ -13,7 +13,7 @@
 //! - the host's report of that dial names the node that answered (B) and the one it expected (A),
 //!   and the TLS alert;
 //! - A red is PRODUCT, quoting what the host said. A node that never printed its spec, or a host
-//!   that never reported the dial, is CANNOT MEASURE.
+//!   that never reported the dial, is PRODUCT (staging).
 //!
 //! **The mutation that must turn it red:** the verifier no longer records why it refused (V210-143's
 //! `VerifiedPeer::reject` removed), so the report carries only quinn's generic reason.
@@ -44,7 +44,7 @@ fn node(dir: &std::path::Path, name: &str) -> (VoxProc, String) {
         .to_owned();
     assert!(
         spec.contains('@'),
-        "CANNOT MEASURE (precondition unmet): node {name} printed no `fp@address` spec: {spec:?}"
+        "PRODUCT (staging): node {name} printed no `fp@address` spec: {spec:?}"
     );
     (p, spec)
 }
@@ -56,8 +56,12 @@ fn a_dial_that_reaches_another_node_names_who_answered() {
     let tmp = tempdir();
     let (_a, a_spec) = node(&tmp.path().join("a"), "node-a");
     let (_b, b_spec) = node(&tmp.path().join("b"), "node-b");
-    let (a_fp, _) = a_spec.split_once('@').unwrap();
-    let (b_fp, b_addr) = b_spec.split_once('@').unwrap();
+    let (a_fp, _) = a_spec
+        .split_once('@')
+        .expect("PRODUCT (staging): vox node printed a spec with no '@'");
+    let (b_fp, b_addr) = b_spec
+        .split_once('@')
+        .expect("PRODUCT (staging): vox node printed a spec with no '@'");
     // Told to reach A, at B's address.
     let wrong = format!("{a_fp}@{b_addr}");
     let host_dir = tmp.path().join("host");

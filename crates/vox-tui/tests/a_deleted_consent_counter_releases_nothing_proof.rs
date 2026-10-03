@@ -24,9 +24,11 @@
 //! **Asserted,** with hard-coded numbers, after bob keeps reading 45 s past the moment his
 //! required posts arrived (a late history release must be caught): bob reads **0** of posts 1–20
 //! and exactly posts 21–30. A TUI that does not close C as a person does (exits, never unlocks,
-//! never answers `:close`) is a product red; the TUI driver's own apparatus is `CANNOT MEASURE`.
-//! Preconditions, or `CANNOT MEASURE`: the row existed and was deleted; C was closed at the decision and open after; alice reads all
-//! 30 posts; bob reads post 30 (without it, 0 pre-trust posts would say nothing).
+//! never answers `:close`) is a `PRODUCT (staging)` red; the TUI driver's own apparatus is
+//! `APPARATUS`. Preconditions the product must meet, or `PRODUCT (staging)`: C was closed at
+//! the decision and open after; alice reads all 30 posts; bob reads post 30 (without it, 0
+//! pre-trust posts would say nothing). The attack's own staging, or `PRODUCT (staging)`: the row
+//! existed and was deleted, with every vox process of alice's stopped.
 //!
 //! **Every participant is the shipped binary.** One step is not a `vox` command, because it is the
 //! attack: deleting the row. The test opens alice's `store.redb` with `redb` for that alone, only
@@ -83,17 +85,17 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: vox stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: write vox stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -104,8 +106,10 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 /// Start `vox daemon` with `stdin` piped in (the identity passphrase, then any room passphrase
 /// lines), its output to files by the profile.
 fn daemon(dir: &Path, tag: &str, stdin: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: harness file I/O");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: harness file I/O");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -115,10 +119,11 @@ fn daemon(dir: &Path, tag: &str, stdin: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: spawn vox daemon");
     // Write, then close: the daemon reads stdin to EOF before it binds its socket.
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(stdin.as_bytes()).unwrap();
+    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(stdin.as_bytes())
+        .expect("APPARATUS: write the daemon's stdin");
     drop(pipe);
     Daemon(child)
 }
@@ -136,7 +141,7 @@ fn attached(dir: &Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "CANNOT MEASURE: {tag}'s daemon never answered: {last}\nits stderr: {}",
+        "PRODUCT (staging): {tag}'s daemon never answered: {last}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
     );
 }
@@ -146,7 +151,7 @@ fn room_line(dir: &Path, tag: &str, room: &str) -> String {
     attached(dir, tag)
         .lines()
         .find(|l| l.contains(room))
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: {tag}'s room list does not name {room}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): {tag}'s room list does not name {room}"))
         .to_owned()
 }
 
@@ -157,12 +162,13 @@ fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize) {
         &["room", "read", room, "--json", "--limit", "500"],
         None,
     );
-    assert!(ok, "vox room read --json refused: {err}");
+    assert!(ok, "PRODUCT: vox room read --json refused: {err}");
     let mut seen = BTreeSet::new();
     let mut rows = 0usize;
     for l in out.lines().filter(|l| !l.trim().is_empty()) {
-        let row: serde_json::Value =
-            serde_json::from_str(l).unwrap_or_else(|e| panic!("bad row ({e}): {l}"));
+        let row: serde_json::Value = serde_json::from_str(l).unwrap_or_else(|e| {
+            panic!("PRODUCT: vox room read --json printed a row that is not JSON ({e}): {l}")
+        });
         if let Some(n) = row["text"]
             .as_str()
             .and_then(|t| t.strip_prefix("post "))
@@ -178,7 +184,7 @@ fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize) {
 fn post_range(alice: &Path, room: &str, lo: usize, hi: usize) {
     for i in lo..=hi {
         let (ok, _, err) = vox(alice, &["room", "post", room, &format!("post {i}")], None);
-        assert!(ok, "CANNOT MEASURE: alice's post {i} was refused: {err}");
+        assert!(ok, "PRODUCT (staging): alice's post {i} was refused: {err}");
     }
 }
 
@@ -197,30 +203,42 @@ fn ranges(seen: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
 /// The profile's `store.redb`, under `<data>/<profile>/`.
 fn store_file(dir: &Path) -> PathBuf {
     std::fs::read_dir(dir)
-        .unwrap()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot list the profile dir {dir:?}: {e}"))
         .filter_map(Result::ok)
         .map(|e| e.path().join("store.redb"))
         .find(|p| p.is_file())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: no <profile>/store.redb under {dir:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no <profile>/store.redb under {dir:?}"))
 }
 
 /// The attack: delete the counter's row from a stopped node's store. Returns the rows the `meta`
 /// table held before, and the deleted row's length (`None`: there was no such row).
 fn delete_counter(dir: &Path) -> (Vec<String>, Option<usize>) {
     const META: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("meta");
-    let db = redb::Database::open(store_file(dir)).expect("open alice's stopped store");
-    let tx = db.begin_write().unwrap();
+    // Opening fails while any vox process still holds the store: the staging (every process of
+    // alice's stopped) was not achieved.
+    let db = redb::Database::open(store_file(dir)).unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): store still held, or unreadable, when it should be stopped: {e}")
+    });
+    let tx = db
+        .begin_write()
+        .unwrap_or_else(|e| panic!("APPARATUS: redb write transaction on alice's store: {e}"));
     let (names, removed) = {
-        let mut table = tx.open_table(META).unwrap();
+        let mut table = tx
+            .open_table(META)
+            .unwrap_or_else(|e| panic!("APPARATUS: open alice's meta table: {e}"));
         let names = redb::ReadableTable::iter(&table)
-            .unwrap()
+            .unwrap_or_else(|e| panic!("APPARATUS: list alice's meta table: {e}"))
             .filter_map(Result::ok)
             .map(|(k, _)| k.value().to_owned())
             .collect::<Vec<_>>();
-        let removed = table.remove(COUNTER_ROW).unwrap().map(|v| v.value().len());
+        let removed = table
+            .remove(COUNTER_ROW)
+            .unwrap_or_else(|e| panic!("APPARATUS: delete the counter row: {e}"))
+            .map(|v| v.value().len());
         (names, removed)
     };
-    tx.commit().unwrap();
+    tx.commit()
+        .unwrap_or_else(|e| panic!("APPARATUS: commit the counter's deletion: {e}"));
     (names, removed)
 }
 
@@ -228,37 +246,46 @@ fn delete_counter(dir: &Path) -> (Vec<String>, Option<usize>) {
 #[ignore = "real vox daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     let carol = tmp.path().join("carol");
     for d in [&alice, &bob, &carol] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: harness file I/O");
     }
     let mut fps = Vec::new();
     for dir in [&alice, &bob, &carol] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         fps.push(out.trim().to_owned());
     }
     let (ok, _, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
-    assert!(ok, "bob trusts alice: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): bob's trust add of alice failed: {err}"
+    );
 
     // ---- alice's counter moves past its first value; room C gets its pre-trust posts ----------
     let first = daemon(&alice, "alice-1", &format!("{IDENTITY}\n"));
     attached(&alice, "alice-1");
     let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
-    assert!(ok, "alice trusts carol: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's trust add of carol failed: {err}"
+    );
     let (ok, _, err) = vox(
         &alice,
         &["room", "create", "--passphrase-file", "-", "--name", "c"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
-    let room = attached(&alice, "alice-1")
+    assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
+    let listing = attached(&alice, "alice-1");
+    let room = listing
         .split_whitespace()
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .expect("the new room's id in `room list`")
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): no room id in `room list` after create: {listing:?}")
+        })
         .to_owned();
     post_range(&alice, &room, 1, 20);
     drop(first);
@@ -283,7 +310,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     );
     assert!(
         out.has_verdict("cargo"),
-        "CANNOT MEASURE: the TUI driver was stopped before it gave a verdict — by its faulthandler \
+        "APPARATUS: the TUI driver was stopped before it gave a verdict — by its faulthandler \
          backstop, or from outside — at stage {:?} (exit {:?}): {said}",
         out.stage.as_deref().unwrap_or("(before its first stage)"),
         out.code
@@ -291,7 +318,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     println!("[proof] tui: {}", said.trim());
     assert!(
         !said.contains("cargo APPARATUS"),
-        "CANNOT MEASURE: the TUI driver's own apparatus failed (exit {:?}): {said}",
+        "APPARATUS: the TUI driver's own apparatus failed (exit {:?}): {said}",
         out.code
     );
     // Closing the room is staging for this claim, but a TUI that does not do it — exits, never
@@ -299,8 +326,8 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     // is the product failing a person, not the test (V210-107's verdict on 480c6a73).
     assert!(
         out.code == Some(0) && said.contains("cargo the TUI said done to :close"),
-        "PRODUCT: alice's `vox tui` did not unlock, open room C and close it as a person does; \
-         the driver exited {:?} at stage {:?} and saw this screen:\n{said}",
+        "PRODUCT (staging): alice's `vox tui` did not unlock, open room C and close it as a person \
+         does; the driver exited {:?} at stage {:?} and saw this screen:\n{said}",
         out.code,
         out.stage.as_deref().unwrap_or("(before its first stage)")
     );
@@ -312,7 +339,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     );
     assert!(
         removed.is_some(),
-        "CANNOT MEASURE: alice's store holds no {COUNTER_ROW:?} row to delete (rows: {rows:?})"
+        "PRODUCT (staging): alice's store holds no {COUNTER_ROW:?} row to delete (rows: {rows:?})"
     );
 
     // ---- alice trusts bob while C is closed -----------------------------------------------------
@@ -321,10 +348,14 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     println!("[proof] at the decision: {}", line.trim());
     assert!(
         line.contains("[closed]"),
-        "CANNOT MEASURE: room C is open at the decision, so this is not the closed-room path: {line}"
+        "PRODUCT (staging): room C is open at the decision, so this is not the closed-room path: \
+         {line}"
     );
     let (ok, _, err) = vox(&alice, &["trust", "add", &fps[1], "--name", "bob"], None);
-    assert!(ok, "alice trusts bob: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's trust add of bob, with room C closed, failed: {err}"
+    );
     drop(second);
 
     // ---- C opens again (its passphrase to the daemon); alice posts after the trust ------------
@@ -333,7 +364,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     println!("[proof] after reopening: {}", line.trim());
     assert!(
         !line.contains("[closed]"),
-        "CANNOT MEASURE: room C did not reopen from its passphrase line: {line}\nalice's daemon \
+        "PRODUCT (staging): room C did not reopen from its passphrase line: {line}\nalice's daemon \
          said: {}",
         std::fs::read_to_string(alice.join("daemon-alice-3.err")).unwrap_or_default()
     );
@@ -341,7 +372,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     let (mine, rows) = read_posts(&alice, &room);
     assert!(
         mine.len() == 30 && rows == 30,
-        "CANNOT MEASURE: alice herself reads {} distinct posts in {rows} rows, not 30",
+        "PRODUCT (staging): alice herself reads {} distinct posts in {rows} rows, not 30",
         mine.len()
     );
 
@@ -349,7 +380,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     let _bob_daemon = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
     attached(&bob, "bob");
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
     let (ok, _, err) = vox(
         &bob,
         &[
@@ -363,7 +394,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
         ],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: vox room join: {err}");
+    assert!(ok, "PRODUCT (staging): vox room join failed: {err}");
 
     let t0 = Instant::now();
     let mut all = BTreeSet::new();
@@ -400,14 +431,14 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     );
     assert!(
         pre.is_empty(),
-        "LEAK: after the counter was deleted, bob reads {} posts alice sealed before she trusted \
+        "PRODUCT: LEAK: after the counter was deleted, bob reads {} posts alice sealed before she trusted \
          him: {:?}",
         pre.len(),
         ranges(pre.iter().copied())
     );
     assert!(
         post.contains(&30),
-        "CANNOT MEASURE: bob never read post 30, made after alice trusted him, so his key never \
+        "PRODUCT (staging): bob never read post 30, made after alice trusted him, so his key never \
          arrived\nbob's daemon said: {}\nalice's daemon said: {}",
         std::fs::read_to_string(bob.join("daemon-bob.err")).unwrap_or_default(),
         std::fs::read_to_string(alice.join("daemon-alice-3.err")).unwrap_or_default()
@@ -415,6 +446,6 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     assert_eq!(
         post,
         (21..=30).collect::<Vec<_>>(),
-        "bob must read exactly posts 21-30, the 10 alice made after trusting him"
+        "PRODUCT: bob must read exactly posts 21-30, the 10 alice made after trusting him"
     );
 }

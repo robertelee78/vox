@@ -90,7 +90,7 @@ fn attack(
 #[ignore = "real vox processes with production Argon2id and two real joins; run in release"]
 fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir, bravo_dir, charlie_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "victim"),
@@ -98,7 +98,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
         profile_dir(tmp.path(), "charlie"),
     );
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
 
     // ---- the operator trusts the victim, and serves only trusted rooms ---------------------
     let victim_id = fingerprint(&victim_dir);
@@ -112,7 +112,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     );
     assert!(
         ok,
-        "CANNOT MEASURE: the operator's vox trust add: {out}{err}"
+        "PRODUCT (staging): the operator's vox trust add: {out}{err}"
     );
     let anchor_port = free_port();
     let (mut anchor, spec) = hostile::anchor_with(
@@ -127,13 +127,13 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     );
     assert!(
         said.contains("serving only rooms made by the 1 identity this profile trusts"),
-        "CANNOT MEASURE: `vox node --serve trusted` did not say it serves only trusted rooms: {said}"
+        "PRODUCT (staging): `vox node --serve trusted` did not say it serves only trusted rooms: {said}"
     );
     let anchor_id = vox_core::node::link::b32_decode(
-        spec.split('@').next().expect("an anchor spec"),
+        spec.split('@').next().expect("PRODUCT: an anchor spec"),
         "anchor fingerprint",
     )
-    .expect("the anchor's fingerprint");
+    .expect("PRODUCT: the anchor's fingerprint");
 
     // ---- 1. the trusted creator's room, end to end -----------------------------------------
     let victim_port = free_port();
@@ -157,14 +157,16 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
         println!("[proof] {name} joins the trusted creator's room: ok={ok}");
         assert!(
             ok,
-            "a member could not join a trusted creator's room: {out}{err}"
+            "PRODUCT: a member could not join a trusted creator's room: {out}{err}"
         );
         std::thread::sleep(Duration::from_secs(3));
         drop(d);
     }
     let bravo = member_signer(&bravo_dir);
     let charlie = member_signer(&charlie_dir);
-    let anchor_addr = format!("127.0.0.1:{anchor_port}").parse().unwrap();
+    let anchor_addr = format!("127.0.0.1:{anchor_port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
     let rt = Rt::new();
     let (_b, bravo_a) = rt.block_on(connect(&*bravo, anchor_addr, anchor_id));
     let (_c, charlie_a) = rt.block_on(connect(&*charlie, anchor_addr, anchor_id));
@@ -173,7 +175,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     println!("[proof] the anchor's board serves the trusted room's genesis: {served:?}");
     assert!(
         served == Ok(true),
-        "a `--serve trusted` anchor does not keep the board of a room its operator's trusted \
+        "PRODUCT: a `--serve trusted` anchor does not keep the board of a room its operator's trusted \
          identity made ({served:?})"
     );
     let deadline = Instant::now() + CONTROL_PATIENCE;
@@ -188,7 +190,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     println!("[proof] bravo → charlie through the anchor: {control:?}, offered {control_offers}");
     assert!(
         control == CircuitAnswer::Opened && control_offers >= 1,
-        "a `--serve trusted` anchor would not relay between two members of a trusted room \
+        "PRODUCT: a `--serve trusted` anchor would not relay between two members of a trusted room \
          ({control:?}, {control_offers} offered)"
     );
 
@@ -201,33 +203,38 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
         ttl: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     };
-    let genesis = Genesis::create(&s, hostile::now(), policy).unwrap();
+    let genesis = Genesis::create(&s, hostile::now(), policy)
+        .expect("APPARATUS: build the stand-in peer's records");
     let fake = genesis.channel_id();
     let t = hostile::now();
-    let ring2 = PrekeyRing::generate(&s2, &[0x3D; 32], t).unwrap();
-    let witness = JoinWitness::build(&s, &fake, 0, &s2.fingerprint(), t).unwrap();
+    let ring2 = PrekeyRing::generate(&s2, &[0x3D; 32], t)
+        .expect("APPARATUS: generate the stand-in peer's prekeys");
+    let witness = JoinWitness::build(&s, &fake, 0, &s2.fingerprint(), t)
+        .expect("APPARATUS: build the stand-in peer's records");
     let s2_bundle = MemberBundleRecord::build(
         &s2,
         &fake,
         0,
-        ring2.bundle(&s2.public_key()).unwrap(),
+        ring2
+            .bundle(&s2.public_key())
+            .expect("APPARATUS: build the stand-in peer's records"),
         1,
         t,
         3600,
         Admission::Witnessed(Box::new(witness)),
     )
-    .unwrap()
+    .expect("APPARATUS: build the stand-in peer's records")
     .to_wire();
     let s2_address = RendezvousRecord::build(
         &s2,
         &fake,
         0,
-        EndpointList::new(Vec::new()).unwrap(),
+        EndpointList::new(Vec::new()).expect("APPARATUS: build the stand-in peer's records"),
         1,
         t,
         3600,
     )
-    .unwrap()
+    .expect("APPARATUS: build the stand-in peer's records")
     .to_wire();
     let (_s, s_a) = rt.block_on(connect(&s, anchor_addr, anchor_id));
     let (_s2, s2_a) = rt.block_on(connect(&s2, anchor_addr, anchor_id));
@@ -244,7 +251,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     );
     assert!(
         published.is_err() && joined.is_err() && on_board == Ok(false),
-        "a `--serve trusted` anchor kept the board of a room a stranger made (genesis \
+        "PRODUCT: a `--serve trusted` anchor kept the board of a room a stranger made (genesis \
          {published:?}, bundle {joined:?}, served {on_board:?})"
     );
 
@@ -257,12 +264,12 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     );
     assert!(
         to_self != CircuitAnswer::Opened && got_self == 0,
-        "a `--serve trusted` anchor relayed between two identities of a stranger whose room it \
+        "PRODUCT: a `--serve trusted` anchor relayed between two identities of a stranger whose room it \
          should not serve ({to_self:?}, {got_self} offered)"
     );
     assert!(
         to_charlie != CircuitAnswer::Opened && got_charlie == 0,
-        "a `--serve trusted` anchor carried a stranger's circuit to a member ({to_charlie:?}, \
+        "PRODUCT: a `--serve trusted` anchor carried a stranger's circuit to a member ({to_charlie:?}, \
          {got_charlie} offered)"
     );
 }

@@ -26,10 +26,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 /// **Every red names which it is** (the decider's rule 1). A step of the proof's own staging that
-/// fails — a file, a process, the release server — is `CANNOT MEASURE (harness error)` at its line;
+/// fails — a file, a process, the release server — is `APPARATUS (harness error)` at its line;
 /// a claim `install.sh` broke is `PRODUCT:` (see [`report`]). Nothing here unwraps bare.
 trait Staged<T> {
-    /// The value, or `CANNOT MEASURE (harness error)` naming this line and what failed.
+    /// The value, or `APPARATUS (harness error)` naming this line and what failed.
     fn staged(self) -> T;
 }
 
@@ -37,7 +37,7 @@ impl<T, E: std::fmt::Debug> Staged<T> for Result<T, E> {
     #[track_caller]
     fn staged(self) -> T {
         let at = std::panic::Location::caller();
-        self.unwrap_or_else(|e| panic!("CANNOT MEASURE (harness error) at {at}: {e:?}"))
+        self.unwrap_or_else(|e| panic!("APPARATUS (harness error) at {at}: {e:?}"))
     }
 }
 
@@ -45,7 +45,7 @@ impl<T> Staged<T> for Option<T> {
     #[track_caller]
     fn staged(self) -> T {
         let at = std::panic::Location::caller();
-        self.unwrap_or_else(|| panic!("CANNOT MEASURE (harness error) at {at}: nothing there"))
+        self.unwrap_or_else(|| panic!("APPARATUS (harness error) at {at}: nothing there"))
     }
 }
 
@@ -486,9 +486,11 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
                 ),
             ));
         } else {
-            claims.push(blocked(
+            // The first install is install.sh's own work: its failure is the product's.
+            claims.push(claim(
                 "install.reruns_after_a_cut_short_run",
-                format!("staging not achieved: the first install failed, said {said_first:?}"),
+                false,
+                format!("(staging) the first install failed, said {said_first:?}"),
             ));
         }
     }
@@ -526,7 +528,8 @@ fn report(claims: &[Claim], receipts: &BTreeMap<String, String>, allowed: &[Stri
     );
     assert!(
         unproven.is_empty(),
-        "CANNOT MEASURE: {} claim(s) unproven — close the gap, or name it in VOX_PROOF_ALLOW_UNPROVEN:\n{}",
+        "APPARATUS: {} claim(s) unproven, because this proof's own release server did not \
+         start — close the gap, or name it in VOX_PROOF_ALLOW_UNPROVEN:\n{}",
         unproven.len(),
         unproven
             .iter()

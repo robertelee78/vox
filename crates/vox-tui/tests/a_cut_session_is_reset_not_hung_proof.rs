@@ -35,7 +35,7 @@
 //! error naming the connection), never by stalling and never with a clean end. With the daemon
 //! frozen, `vox room send` exits within [`STOP_WITHIN`] of SIGTERM, saying [`FROZEN_SAID`].
 //!
-//! ## Preconditions (else CANNOT MEASURE)
+//! ## Preconditions (else PRODUCT (staging))
 //! Each collector had received bytes, and not the whole file, when the offer was stopped.
 //!
 //! ## Mutation
@@ -181,7 +181,7 @@ fn a_cut_session_is_reset_not_hung() {
         while !rb.texts(cb).iter().any(|t| t.contains(&name)) {
             assert!(
                 t0.elapsed() < Duration::from_secs(60),
-                "CANNOT MEASURE: round {round}: Bob never read the offer\n{}",
+                "PRODUCT (staging): round {round}: Bob never read the offer\n{}",
                 said(&send_out)
             );
             std::thread::sleep(Duration::from_millis(50));
@@ -205,7 +205,7 @@ fn a_cut_session_is_reset_not_hung() {
         while bytes_in(&dir) == 0 {
             assert!(
                 t1.elapsed() < Duration::from_secs(60),
-                "CANNOT MEASURE: round {round}: the collector received nothing\n{}",
+                "PRODUCT (staging): round {round}: the collector received nothing\n{}",
                 said(&get_out)
             );
             std::thread::sleep(Duration::from_millis(1));
@@ -230,7 +230,7 @@ fn a_cut_session_is_reset_not_hung() {
                 break if status.success() {
                     // The whole file arrived before the cut took effect.
                     panic!(
-                        "CANNOT MEASURE: round {round}: the collector finished before the cut \
+                        "PRODUCT (staging): round {round}: the collector finished before the cut \
                          ({held} bytes at the cut)"
                     );
                 } else if text.contains("stalled") {
@@ -279,7 +279,7 @@ fn a_cut_session_is_reset_not_hung() {
     while !rb.texts(cb).iter().any(|t| t.contains(name)) {
         assert!(
             t0.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: the frozen-daemon arm: Bob never read the offer\n{}",
+            "PRODUCT (staging): the frozen-daemon arm: Bob never read the offer\n{}",
             said(&send_out)
         );
         std::thread::sleep(Duration::from_millis(50));

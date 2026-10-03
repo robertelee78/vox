@@ -40,7 +40,7 @@
 //! (`STOP_WORST_CASE`: 3 s for the tail, 2 × 0.4 s for the goodbye, 0.05 s for relayed closes'
 //! lead, 0.6 s for the closes to leave; 4.45 s against 5 s); this scene spends the tail's wait and,
 //! with Bob frozen, the goodbye's and the flush's too. Preconditions (else the
-//! attempt is staged again, up to [`ATTEMPTS`] times, then CANNOT MEASURE): Alice's
+//! attempt is staged again, up to [`ATTEMPTS`] times, then `PRODUCT (staging)`, since each is vox's doing): Alice's
 //! `vox room send` read the whole file (it closes the file once it has), the collector did
 //! not have it, and the stop took at least [`WAITED`] (a tail acknowledged before the stop
 //! makes it immediate). Mutations: `STOP_ACK_BOUND` back at 5 s — the daemon exits after about
@@ -54,7 +54,7 @@
 //! scene runs past the real patience (the stop is budgeted under it), so the proof shortens it with
 //! the test-only `VOX_TEST_SHUTDOWN_PATIENCE_MS` (the `test-knobs` feature) to [`SHORT_PATIENCE`],
 //! and stages the same unacknowledged tail, whose wait alone is longer. Staged when the stop took
-//! at least that patience (else again, up to [`ATTEMPTS`] times, then CANNOT MEASURE). Mutation: a
+//! at least that patience (else again, up to [`ATTEMPTS`] times, then `PRODUCT (staging)`). Mutation: a
 //! give-up that keeps saying "stopped by SIGINT" and exiting 0 — red, PRODUCT.
 
 #![cfg(unix)]
@@ -100,7 +100,9 @@ fn collect(stream: impl Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            sink.lock().unwrap().push(line);
+            sink.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
+                .push(line);
         }
     });
     lines
@@ -118,12 +120,13 @@ impl Proc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(stdin.as_bytes()).expect("write stdin");
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn {name}: {e}"));
+        let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+        pipe.write_all(stdin.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(pipe);
-        let out = collect(child.stdout.take().expect("stdout"));
-        let err = collect(child.stderr.take().expect("stderr"));
+        let out = collect(child.stdout.take().expect("APPARATUS: stdout"));
+        let err = collect(child.stderr.take().expect("APPARATUS: stderr"));
         Self {
             name,
             child,
@@ -133,7 +136,10 @@ impl Proc {
     }
 
     fn stdout(&self) -> Vec<String> {
-        self.out.lock().unwrap().clone()
+        self.out
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .clone()
     }
 
     fn expect_out(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
@@ -148,7 +154,10 @@ impl Proc {
             "{}: never printed {what}; stdout {:#?}\nstderr:\n{}",
             self.name,
             self.stdout(),
-            self.err.lock().unwrap().join("\n")
+            self.err
+                .lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
+                .join("\n")
         );
     }
 }
@@ -164,11 +173,12 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: &str) -> (bool, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
-    let mut pipe = child.stdin.take().expect("stdin");
-    pipe.write_all(stdin.as_bytes()).expect("write");
+        .expect("APPARATUS: spawn vox");
+    let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+    pipe.write_all(stdin.as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     (
         out.status.success(),
         format!(
@@ -191,10 +201,10 @@ fn alive(pid: u32) -> bool {
 #[ignore = "three real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, host_dir, joiner_dir) = (dir("anchor"), dir("host"), dir("joiner"));
@@ -214,7 +224,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
         .to_owned();
     for d in [&host_dir, &joiner_dir] {
         let (ok, said) = vox(d, &["id"], "");
-        assert!(ok, "vox id: {said}");
+        assert!(ok, "PRODUCT (staging): vox id: {said}");
     }
     let mut host = Proc::spawn(
         "host",
@@ -225,7 +235,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
             .strip_prefix(label)
-            .unwrap()
+            .expect("APPARATUS: a line matched by its label strips it")
             .trim()
             .to_owned()
     };
@@ -250,7 +260,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
         ],
         &format!("{passphrase}\n"),
     );
-    assert!(ok, "CANNOT MEASURE: the join failed: {said}");
+    assert!(ok, "PRODUCT (staging): the join failed: {said}");
 
     // The peers vanish without a word — no close frames, as when a machine loses power.
     let _ = anchor.child.kill();
@@ -264,8 +274,8 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     let sent = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()
-        .expect("send SIGTERM");
-    assert!(sent.success(), "SIGTERM could not be sent");
+        .expect("APPARATUS: send SIGTERM");
+    assert!(sent.success(), "APPARATUS: SIGTERM could not be sent");
     let deadline = started + Duration::from_secs(90);
     while alive(pid) && daemon.child.try_wait().ok().flatten().is_none() {
         if Instant::now() > deadline {
@@ -275,17 +285,21 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     }
     let took = started.elapsed();
     let exited = daemon.child.try_wait().ok().flatten();
-    let said = daemon.err.lock().unwrap().join("\n");
+    let said = daemon
+        .err
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .join("\n");
     eprintln!("[shutdown] SIGTERM -> exit in {took:?}; exit={exited:?}");
     assert!(
         exited.is_some() && took < STOP_WITHIN,
-        "a daemon must stop within {STOP_WITHIN:?} of SIGTERM; it took {took:?} (exited: \
+        "PRODUCT: a daemon must stop within {STOP_WITHIN:?} of SIGTERM; it took {took:?} (exited: \
          {exited:?}). stdout {:#?}\nstderr:\n{said}",
         daemon.stdout()
     );
     assert!(
         daemon.stdout().iter().any(|l| l.contains("shutting down")),
-        "it must say it is shutting down"
+        "PRODUCT: it must say it is shutting down"
     );
 
     // The profile is free the moment the daemon has exited: a one-shot verb that opens it
@@ -294,14 +308,14 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     eprintln!("[shutdown] `vox trust list` right after the exit: opened={opened}");
     assert!(
         opened,
-        "the profile must be free the moment the daemon has exited; `vox trust list` said: \
+        "PRODUCT: the profile must be free the moment the daemon has exited; `vox trust list` said: \
          {said_after}"
     );
 
     // Nothing left behind: every process this test started is gone.
     let pids = [anchor.child.id(), host.child.id(), pid];
     let remaining = pids.iter().filter(|p| alive(**p)).count();
-    assert_eq!(remaining, 0, "processes still running: {pids:?}");
+    assert_eq!(remaining, 0, "PRODUCT: processes still running: {pids:?}");
     eprintln!("[shutdown] {remaining} processes remain");
 }
 
@@ -465,7 +479,7 @@ fn attempt(
     while !rb.texts(cb).iter().any(|t| t.contains(&offered)) {
         assert!(
             t0.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: Bob never read the offer"
+            "PRODUCT (staging): Bob never read the offer"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -506,7 +520,7 @@ fn attempt(
         }
         assert!(
             t1.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: Bob's `vox status` never listed the tunnel to {tag}"
+            "PRODUCT (staging): Bob's `vox status` never listed the tunnel to {tag}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -575,8 +589,8 @@ fn a_stop_waits_out_last_bytes_within_its_patience() {
         .find_map(|n| attempt(root, n, &[], WAITED))
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: none of {ATTEMPTS} attempts left a finished tunnel's tail \
-                 unacknowledged at the stop"
+                "PRODUCT (staging): in none of {ATTEMPTS} attempts did vox leave a finished tunnel's tail \
+                 unacknowledged at the stop (each attempt's own line says which step it missed)"
             )
         });
     let gave_up = said.lines().find(|l| l.contains(GAVE_UP));
@@ -609,7 +623,7 @@ fn a_stop_past_its_patience_says_it_did_not_finish() {
         .find_map(|n| attempt(root, n, &[(PATIENCE_KNOB, ms.as_str())], SHORT_PATIENCE))
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: none of {ATTEMPTS} attempts left a finished tunnel's tail \
+                "PRODUCT (staging): in none of {ATTEMPTS} attempts did vox leave a finished tunnel's tail \
                  unacknowledged long enough to outlast a {SHORT_PATIENCE:?} patience"
             )
         });

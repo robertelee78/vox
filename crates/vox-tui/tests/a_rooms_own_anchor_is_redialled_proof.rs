@@ -28,7 +28,7 @@
 //! member has vouched for it, and the only other member is paused.) Then the host resumes and
 //! the echo is checked.
 //!
-//! **Asserted:** the forward process has no configured anchor (else CANNOT MEASURE); the path is
+//! **Asserted:** the forward process has no configured anchor (else PRODUCT (staging)); the path is
 //! relayed (the guest's `still relayed`); before the restart the anchor held both members'
 //! records (else PRODUCT (staging)); after the restart the echo carries again within
 //! [`BACK_WITHIN`]; the forward said the connection to its anchor was gone; and the restarted
@@ -37,13 +37,14 @@
 //! **Which side a red is on.** A red that names the product begins `PRODUCT:` and quotes what
 //! vox said; a step of the setup the product did not do (a join, an echo before the restart, a
 //! record the anchor never held) begins `PRODUCT (staging):`; a precondition that was not met (an
-//! anchors file, the store's place) begins `CANNOT MEASURE:`; a fault of this proof's own (a signal that did not take,
+//! anchors file, the store's place) begins `PRODUCT (staging):`; a fault of this proof's own (a signal that did not take,
 //! a `vox` that cannot be started) begins `APPARATUS:`. The host's pause is confirmed, not
 //! assumed: `ps` must show it stopped after SIGSTOP and running after SIGCONT, or a host that was
 //! never paused could restore its own record and pass the republish claim for it. The two bounds
 //! are read against an **apparatus clock** on the same timeline: how long this machine takes to
-//! start a `vox --version`, and the republish poll's slowest turn. A bound missed while the
-//! apparatus was over [`APPARATUS_BUDGET`] is CANNOT MEASURE; otherwise it is the product's.
+//! start `/usr/bin/true` (a process that is not vox, so a slow vox reads as the product's), and
+//! the republish poll's slowest turn. A bound missed while the
+//! apparatus was over [`APPARATUS_BUDGET`] is APPARATUS (runner stalled); otherwise it is the product's.
 //!
 //! **Mutations that must turn it red:**
 //! - Redial only the configured set (`kept_anchors` in `actor.rs` returns `self.anchors` alone,
@@ -64,11 +65,10 @@ mod world;
 #[path = "support/relay.rs"]
 mod relay;
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use relay::{RelayWorld, Split};
-use world::{args, round_trip, vox_once, VoxProc};
+use world::{args, round_trip, VoxProc};
 
 /// How long after the forward starts the anchor is stopped.
 const KILL_AFTER: Duration = Duration::from_secs(4);
@@ -102,7 +102,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     let anchors_file = w.guest_dir.join("cfg").join("anchors");
     assert!(
         !anchors_file.exists(),
-        "CANNOT MEASURE: the guest has an anchors file ({}), so its anchor would be configured",
+        "PRODUCT (staging): the guest has an anchors file ({}), so its anchor would be configured",
         anchors_file.display()
     );
     let pass_file = w.passphrase_file();
@@ -137,7 +137,10 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
         "PRODUCT (staging): no echo through the forward before the anchor went: {first:?}\n{}",
-        w.fwd.as_mut().unwrap().transcript()
+        w.fwd
+            .as_mut()
+            .expect("APPARATUS: a process the proof started")
+            .transcript()
     );
     w.expect_still_relayed();
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
@@ -191,7 +194,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     let store = anchor_dir.join("default").join("store.redb");
     assert!(
         std::fs::remove_file(&store).is_ok(),
-        "CANNOT MEASURE: the anchor's store is not at {}",
+        "PRODUCT (staging): the anchor's store is not at {}",
         store.display()
     );
     std::thread::sleep(DOWN);
@@ -219,7 +222,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
         slowest_turn = slowest_turn.max(turn.elapsed().saturating_sub(Duration::from_millis(200)));
         turn = Instant::now();
     };
-    let apparatus = slowest_turn.max(apparatus_spawn(&w.guest_dir));
+    let apparatus = slowest_turn.max(apparatus_spawn());
     println!(
         "[proof] with the host paused, the restarted anchor holds the host's record \
          ({host_held}) again, put there by the guest: {republished:?} after its return (bound \
@@ -229,7 +232,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     if republished.is_none() {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
              republish was timed, so a missed {REPUBLISHED_WITHIN:?} may be this machine's"
         );
         panic!(
@@ -255,7 +258,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     }
     let said = w.fwd.as_mut().map(|f| f.transcript()).unwrap_or_default();
     let saw_it_go = said.lines().any(|l| l.contains(GONE));
-    let apparatus = apparatus_spawn(&w.guest_dir);
+    let apparatus = apparatus_spawn();
     println!(
         "[proof] the forward carried again {carried:?} after the anchor was back, {tries} echo \
          tries (bound {BACK_WITHIN:?}, apparatus {apparatus:?}); it said its room's anchor went: \
@@ -274,7 +277,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     if carried >= BACK_WITHIN {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
              forward carried again only {carried:?} after its anchor's return"
         );
         panic!(
@@ -316,14 +319,21 @@ fn signal_and_confirm(pid: &str, sig: &str) {
     }
 }
 
-/// The apparatus clock: how long this machine takes, now, to start a `vox` that does nothing
-/// (`vox --version`, against the profile at `dir`). A stalled runner stalls this too.
-fn apparatus_spawn(dir: &Path) -> Duration {
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
     let t = Instant::now();
-    let (ok, out, err) = vox_once(dir, &args(&["--version"]));
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
         ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {out}{err}"
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }

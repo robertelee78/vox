@@ -35,7 +35,7 @@
 //!
 //!    Carol's join must have gone direct, by its own word: her daemon's `join got in` line says
 //!    which path the join rode (`<member>: direct` or `<member>: relayed`, V210-124), and a
-//!    relayed one is CANNOT MEASURE. (This read the anchor's count of circuits, which also counts
+//!    relayed one is `PRODUCT (staging)`, since a direct path exists. (This read the anchor's count of circuits, which also counts
 //!    circuits a ladder raced and never used, and alice's own: a join that went direct read as
 //!    relayed.) A stranger's join relayed from 127.0.0.1 is keyed by that same address, so it
 //!    changes nothing measured here.
@@ -44,7 +44,7 @@
 //!    every joiner IPv4, so neither a dial nor a hole punch reaches her on any OS). The sixteen
 //!    stranger identities are relayed from 127.0.0.1, carol from the LAN address. Carol's join
 //!    must say it was relayed, and the anchor must have carried a circuit for each stranger
-//!    identity and carol at once, else CANNOT MEASURE.
+//!    identity and carol at once, else `PRODUCT (staging)`.
 //!    Only the origin the relay says tells carol from the flood: a relayed join's circuit address
 //!    is made up per circuit and says nothing.
 //!
@@ -53,16 +53,16 @@
 //!    relayed from one host weigh the same, and carol is refused as one more of them would be.
 //! 5. `a_join_ended_for_another_is_told_the_member_is_busy`: one stranger identity holds all
 //!    sixteen slots with joins that grind for 45s; carol's join makes alice end one of them
-//!    (`ended …` on alice's stderr, else CANNOT MEASURE). Every join of the stranger's that alice
+//!    (`ended …` on alice's stderr, else `PRODUCT (staging)`). Every join of the stranger's that alice
 //!    ended must say the member is busy answering other joins, and none may say the passphrase is
 //!    wrong. An ended joiner reads that once its own grind is done, which is why the grind is
 //!    bounded here and not an hour.
 //! 6. `joins_that_did_their_work_and_went_quiet_give_their_slots_back`: the stranger's sixteen
 //!    joins each **do their proof of work** and then go quiet (`VOX_TEST_STALL_AFTER_SOLVE_MS`, the
 //!    product's test-only knob beside `VOX_TEST_SOLVE_AT_LEAST_MS`, inert when unset; its daemon
-//!    says `solved, now silent` for each, and all sixteen must, else CANNOT MEASURE). A hold that
+//!    says `solved, now silent` for each, and all sixteen must, else `PRODUCT (staging)`). A hold that
 //!    has done its work is never ended for a newcomer, so carol's first try must be turned away
-//!    as busy (else CANNOT MEASURE) and alice must end nothing; carol tries again every second, as
+//!    as busy (else `PRODUCT (staging)`) and alice must end nothing; carol tries again every second, as
 //!    a person told to would. Her first try not turned away must come within 36s of the first hold
 //!    doing its work, so the hold must be given back at all. The arithmetic is at `ADMIT_BOUND`.
 //! 7. `joins_that_did_their_work_and_send_each_frame_just_in_time_give_their_slots_back`: as 6,
@@ -73,8 +73,8 @@
 //!
 //! **The precondition**, before carol joins, read from alice's own stderr: the cap was reached
 //! with only the stranger's joins in flight — alice refused one of them (`already answering 16
-//! joins`) or ended one for another (`ended …`). Not seen within [`FILL_PATIENCE`] is CANNOT
-//! MEASURE, never green.
+//! joins`) or ended one for another (`ended …`). Not seen within [`FILL_PATIENCE`] is `PRODUCT
+//! (staging)`, never green.
 //!
 //! **What is asserted.** Carol's one `vox room join` of a room the stranger is also joining, while
 //! every slot is held and the stranger keeps arriving, succeeds within [`JOIN_BOUND`] — hard-coded,
@@ -89,7 +89,7 @@
 //! member is busy answering other joins, and none may say the room passphrase is wrong: that is
 //! what a bare refusal said, and it sent a person looking for a typo. So that some certainly are,
 //! the stranger goes on joining after carol's join until alice has turned it away three more
-//! times; not within 120s is CANNOT MEASURE.
+//! times; not within 120s is `PRODUCT (staging)`.
 //!
 //! **The mutations that must turn it red.**
 //! - `JoinSlots::take` refusing every newcomer once the cap is reached (first come, first served,
@@ -119,7 +119,8 @@ mod watchdog;
 mod test_knobs;
 
 /// **Every red names its kind** (decider rule 1). A verdict on the product says `PRODUCT:` and
-/// quotes what the product said; a staging, precondition or harness failure says `APPARATUS`.
+/// quotes what the product said; a vox step that stages the proof and fails says
+/// `PRODUCT (staging)`; only the proof's own machinery failing says `APPARATUS`.
 /// Anything else that panics — an `unwrap` or `expect` on spawning a process, a file, a thread — is
 /// this proof's own failure, and this hook says so before its message.
 fn label_reds() {
@@ -260,8 +261,8 @@ impl Who {
             pass: tmp.join(format!("{name}.pass")),
             stranger: name.starts_with("stranger"),
         };
-        std::fs::create_dir_all(&w.cfg).unwrap();
-        std::fs::write(&w.pass, IDENTITY).unwrap();
+        std::fs::create_dir_all(&w.cfg).expect("APPARATUS: create a staging directory");
+        std::fs::write(&w.pass, IDENTITY).expect("APPARATUS: write a staging file");
         w
     }
 
@@ -288,12 +289,13 @@ impl Who {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         if let Some(text) = input {
-            let mut pipe = child.stdin.take().unwrap();
-            pipe.write_all(text.as_bytes()).unwrap();
+            let mut pipe = child.stdin.take().expect("APPARATUS: a piped stdio handle");
+            pipe.write_all(text.as_bytes())
+                .expect("PRODUCT (staging): vox exited without reading its stdin");
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child.wait_with_output().expect("APPARATUS: vox ran");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -310,7 +312,7 @@ impl Who {
                     .create(true)
                     .append(true)
                     .open(p)
-                    .unwrap(),
+                    .expect("APPARATUS: open a log file"),
             ),
             None => Stdio::null(),
         };
@@ -328,9 +330,10 @@ impl Who {
             .stdout(to())
             .stderr(to())
             .spawn()
-            .expect("spawn vox room join");
-        let mut pipe = child.stdin.take().unwrap();
-        pipe.write_all(ROOM_PASS.as_bytes()).unwrap();
+            .expect("APPARATUS: spawn vox room join");
+        let mut pipe = child.stdin.take().expect("APPARATUS: a piped stdio handle");
+        pipe.write_all(ROOM_PASS.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(pipe);
         Proc(child)
     }
@@ -345,16 +348,18 @@ impl Who {
             .env("VOX_CONFIG_DIR", &self.cfg)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(err).unwrap()));
+            .stderr(Stdio::from(
+                std::fs::File::create(err).expect("APPARATUS: create a staging file"),
+            ));
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let proc = Proc(cmd.spawn().expect("spawn vox daemon"));
+        let proc = Proc(cmd.spawn().expect("APPARATUS: spawn vox daemon"));
         let started = Instant::now();
         while !self.vox(&["room", "list"], None).0 {
             assert!(
                 started.elapsed() < START_PATIENCE,
-                "APPARATUS, CANNOT MEASURE: a daemon never answered; its stderr:\n{}",
+                "PRODUCT (staging): a daemon never answered; its stderr:\n{}",
                 std::fs::read_to_string(err).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(500));
@@ -385,7 +390,7 @@ enum Layout {
     /// (Linux routes a loopback-bound socket to the machine's own LAN address; that is why the
     /// joiners differ from alice in family, not merely in address). The anchor sees the strangers
     /// at 127.0.0.1 and carol at the LAN address: two sources. No sudo; no LAN IPv4 address is
-    /// CANNOT MEASURE. Each joiner's own `vox status --json` must show it asked for a circuit.
+    /// `APPARATUS (precondition not met)`. Each joiner's own `vox status --json` must show it asked for a circuit.
     Relayed,
 }
 
@@ -432,10 +437,12 @@ fn stage(
             ])
             .env("VOX_DATA_DIR", &anchor_who.data)
             .env("VOX_CONFIG_DIR", &anchor_who.cfg)
-            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create(&out).expect("APPARATUS: create a staging file"),
+            ))
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: spawn vox node"),
     );
     let started = Instant::now();
     let (fp, port) = loop {
@@ -450,7 +457,7 @@ fn stage(
         }
         assert!(
             started.elapsed() < START_PATIENCE,
-            "APPARATUS, CANNOT MEASURE: the anchor never printed its spec"
+            "PRODUCT (staging): the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(250));
     };
@@ -471,7 +478,7 @@ fn stage(
         Layout::TwoAddresses => {
             let port = std::net::UdpSocket::bind("[::]:0")
                 .and_then(|s| s.local_addr())
-                .expect("a free port")
+                .expect("APPARATUS: a free port")
                 .port();
             (
                 format!("[::]:{port}"),
@@ -490,7 +497,7 @@ fn stage(
         Layout::Relayed => match (lan, &lan_spec) {
             (Some(ip), Some(spec)) => (format!("{ip}:0"), spec),
             _ => panic!(
-                "APPARATUS, CANNOT MEASURE: this machine has no LAN IPv4 address to put carol on"
+                "APPARATUS (precondition not met): this machine has no LAN IPv4 address to put carol on"
             ),
         },
     };
@@ -505,8 +512,8 @@ fn stage(
                 .map(|&w| sc.spawn(move || w.vox(&["id"], None)))
                 .collect();
             for id in ids {
-                let (ok, out, err) = id.join().unwrap();
-                assert!(ok, "APPARATUS, CANNOT MEASURE: vox id failed: {out}{err}");
+                let (ok, out, err) = id.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                assert!(ok, "PRODUCT (staging): vox id failed: {out}{err}");
             }
         });
     }
@@ -536,7 +543,10 @@ fn stage(
                     })
                 })
                 .collect();
-            running.into_iter().map(|d| d.join().unwrap()).collect()
+            running
+                .into_iter()
+                .map(|d| d.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                .collect()
         });
         daemons.extend(started);
     }
@@ -549,17 +559,14 @@ fn stage(
             &["room", "create", "--passphrase-file", "-", "--name", &name],
             Some(ROOM_PASS),
         );
-        assert!(
-            ok,
-            "APPARATUS, CANNOT MEASURE: room create failed: {out}{err}"
-        );
+        assert!(ok, "PRODUCT (staging): room create failed: {out}{err}");
         let list = alice.vox(&["room", "list"], None).1;
         let id = list
             .lines()
             .find(|l| l.split_whitespace().any(|w| w == name))
             .and_then(|l| l.split_whitespace().next())
             .unwrap_or_else(|| {
-                panic!("APPARATUS, CANNOT MEASURE: room {name} not in `vox room list`: {list}")
+                panic!("PRODUCT (staging): room {name} not in `vox room list`: {list}")
             })
             .to_owned();
         let link = alice
@@ -569,7 +576,7 @@ fn stage(
             .to_owned();
         assert!(
             !link.is_empty(),
-            "APPARATUS, CANNOT MEASURE: no invite link for room {name}"
+            "PRODUCT (staging): no invite link for room {name}"
         );
         links.push(link);
     }
@@ -655,7 +662,7 @@ fn circuits_asked(who: &Who) -> u64 {
 /// direct in [`Layout::TwoAddresses`] (else the address dimension is not what was measured),
 /// relayed in [`Layout::Relayed`]. And in [`Layout::Relayed`], the anchor, the only relay here,
 /// must have carried a circuit for every stranger identity and carol at once, since every one of
-/// their joins is held open while carol joins. `Err` is the red, `PRODUCT:` or CANNOT MEASURE,
+/// their joins is held open while carol joins. `Err` is the red, `PRODUCT:` or `PRODUCT (staging):`,
 /// returned rather than raised so the caller can stop the stranger first.
 ///
 /// **In [`Layout::Relayed`] a join that got in and does not say `relayed` is the product's red**
@@ -686,7 +693,7 @@ fn paths(s: &Staged, case: &str, got_in: bool) -> Result<(), String> {
     match s.layout {
         Layout::TwoAddresses if !got_in => Ok(()),
         Layout::TwoAddresses if !direct => Err(format!(
-            "APPARATUS, CANNOT MEASURE: {case}: carol's join got in but did not say it went \
+            "PRODUCT (staging): {case}: carol's join got in but did not say it went \
              direct, so it was not her address that was measured: {carol_said:?}"
         )),
         Layout::Relayed if !got_in => Ok(()),
@@ -696,7 +703,7 @@ fn paths(s: &Staged, case: &str, got_in: bool) -> Result<(), String> {
              {max} circuit(s) at once): {carol_said:?}"
         )),
         Layout::Relayed if max < want => Err(format!(
-            "APPARATUS, CANNOT MEASURE: {case}: the anchor carried at most {max} circuit(s) at once, not one \
+            "PRODUCT (staging): {case}: the anchor carried at most {max} circuit(s) at once, not one \
              for each of the {} stranger identities and carol ({want}): not every join was relayed",
             s.strangers.len()
         )),
@@ -763,7 +770,9 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                 // Still running: holding a slot, or still being turned away. Either way it is
                 // kept, and what it said is read at the end.
                 if join.0.try_wait().ok().flatten().is_none() {
-                    kept.lock().unwrap().push(join);
+                    kept.lock()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
+                        .push(join);
                 } else if carol_done.load(Ordering::SeqCst)
                     && std::fs::read_to_string(&said)
                         .unwrap_or_default()
@@ -771,7 +780,10 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                 {
                     turned_after.fetch_add(1, Ordering::SeqCst);
                 }
-                said_to.lock().unwrap().push(said);
+                said_to
+                    .lock()
+                    .expect("APPARATUS: a lock the proof holds was poisoned")
+                    .push(said);
                 std::thread::sleep(CHURN_PAUSE);
             }
         });
@@ -786,7 +798,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                 done.store(true, Ordering::SeqCst);
                 let (_, _, text) = alice_counts(s);
                 panic!(
-                    "APPARATUS, CANNOT MEASURE: the stranger's {} joins never filled alice's {SLOTS} slots \
+                    "PRODUCT (staging): the stranger's {} joins never filled alice's {SLOTS} slots \
                      in {}s; alice's stderr:\n{text}",
                     holds.len(),
                     FILL_PATIENCE.as_secs()
@@ -834,7 +846,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
             if probing.elapsed() >= PROBE_PATIENCE {
                 done.store(true, Ordering::SeqCst);
                 panic!(
-                    "APPARATUS, CANNOT MEASURE: {case}: alice turned the stranger away {} times in {}s after \
+                    "PRODUCT (staging): {case}: alice turned the stranger away {} times in {}s after \
                      carol's join, not {PROBES}",
                     turned_after.load(Ordering::SeqCst),
                     PROBE_PATIENCE.as_secs()
@@ -881,7 +893,9 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
     // after a grace, so a refusal that took longer than `ARRIVAL` to be reported is counted too;
     // a join that is still holding a slot has said nothing. Only a refusal by alice herself is
     // counted: a join this daemon would not start (the room already being joined) never reached her.
-    let said_to = said_to.into_inner().unwrap();
+    let said_to = said_to
+        .into_inner()
+        .expect("APPARATUS: a lock the proof holds was poisoned");
     std::thread::sleep(TOLD_GRACE);
     let turned_away: Vec<String> = said_to
         .iter()
@@ -904,7 +918,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
     );
     assert!(
         !turned_away.is_empty(),
-        "APPARATUS, CANNOT MEASURE: {case}: none of the stranger's joins was turned away by alice"
+        "PRODUCT (staging): {case}: none of the stranger's joins was turned away by alice"
     );
     assert!(
         busy == turned_away.len(),
@@ -914,7 +928,9 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
         turned_away.join("\n---\n")
     );
     held.clear();
-    kept.lock().unwrap().clear();
+    kept.lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .clear();
     eprintln!(
         "[proof] {} {case}: 1/1 got in; {busy}/{} turned away at the cap were told why",
         profile(),
@@ -927,7 +943,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
 fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Rooms 0–15 are held; 16 and 17 are two more the stranger keeps arriving for.
     let s = stage(tmp.path(), SLOTS + 2, 1, Layout::OneAddress, &never());
     let holds: Vec<(usize, usize)> = (0..SLOTS).map(|room| (0, room)).collect();
@@ -939,7 +955,7 @@ fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
 fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Four identities hold four rooms each; rooms 4 and 5 are two more the first keeps arriving
     // for.
     let s = stage(tmp.path(), 6, 4, Layout::OneAddress, &never());
@@ -954,7 +970,7 @@ fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
 fn one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Sixteen identities on 127.0.0.1 hold one slot each, of room 0, so by identity every hold
     // weighs what carol's does: only the address tells them apart. Carol joins from ::1. Rooms 1
     // and 2 are the ones the first stranger keeps arriving for.
@@ -968,7 +984,7 @@ fn one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out() {
 fn a_relayed_flood_from_one_host_does_not_keep_a_relayed_joiner_from_another_out() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Sixteen stranger identities, every one of their joins relayed by the anchor from one host,
     // hold one slot each of room 0; carol's join is relayed by the same anchor from another
     // origin. Only the origin the relay says tells her from the flood.
@@ -992,7 +1008,7 @@ const ENDED_TELL_PATIENCE: Duration = Duration::from_secs(180);
 fn a_join_ended_for_another_is_told_the_member_is_busy() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let s = stage(
         tmp.path(),
         SLOTS + 1,
@@ -1037,7 +1053,7 @@ fn a_join_ended_for_another_is_told_the_member_is_busy() {
     );
     assert!(
         ended >= 1,
-        "APPARATUS, CANNOT MEASURE: carol's join ended none of the stranger's joins (refused {refused}), so \
+        "PRODUCT (staging): carol's join ended none of the stranger's joins (refused {refused}), so \
          its {SLOTS} were not all in flight; alice's stderr:\n{text}"
     );
     assert!(
@@ -1053,7 +1069,7 @@ fn a_join_ended_for_another_is_told_the_member_is_busy() {
     {
         assert!(
             waiting.elapsed() < ENDED_TELL_PATIENCE,
-            "APPARATUS, CANNOT MEASURE: the stranger's joins had not all ended {}s after carol's",
+            "PRODUCT (staging): the stranger's joins had not all ended {}s after carol's",
             ENDED_TELL_PATIENCE.as_secs()
         );
         std::thread::sleep(Duration::from_millis(500));
@@ -1116,7 +1132,7 @@ const ADMIT_BOUND: Duration = Duration::from_secs(36);
 /// 80), so the floor, not the solve, decides when each finishes.
 const STALL_GRIND_MS: u64 = 60_000;
 /// At most this far apart may the sixteen holds do their work, or the first is given back
-/// (at [`ADMISSION_PATIENCE`]) before carol can try while all of them hold: CANNOT MEASURE.
+/// (at [`ADMISSION_PATIENCE`]) before carol can try while all of them hold: `PRODUCT (staging)`.
 const WORKED_SPREAD: Duration = Duration::from_secs(10);
 /// The drip case's wait before each frame the stranger still owes after its work: inside the
 /// per-frame bound (30s) each time, and 50s in all, far past the admission patience (20s).
@@ -1131,7 +1147,7 @@ const RETRY_PAUSE: Duration = Duration::from_secs(1);
 fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let s = stage(
         tmp.path(),
         SLOTS + 1,
@@ -1161,7 +1177,7 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
         }
         assert!(
             filling.elapsed() < FILL_PATIENCE,
-            "APPARATUS, CANNOT MEASURE: {case}: only {} of the stranger's {SLOTS} joins did their work in {}s",
+            "PRODUCT (staging): {case}: only {} of the stranger's {SLOTS} joins did their work in {}s",
             worked(),
             FILL_PATIENCE.as_secs()
         );
@@ -1171,7 +1187,7 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
     let spread = first_worked.elapsed();
     assert!(
         spread < WORKED_SPREAD,
-        "APPARATUS, CANNOT MEASURE: {case}: the stranger's joins did their work {:.1}s apart, past {}s: the \
+        "PRODUCT (staging): {case}: the stranger's joins did their work {:.1}s apart, past {}s: the \
          first would be given back before carol could try while all of them hold",
         spread.as_secs_f64(),
         WORKED_SPREAD.as_secs()
@@ -1214,7 +1230,7 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
         let turned_away = said.contains("busy answering other joins");
         if tries == 1 && !turned_away {
             panic!(
-                "APPARATUS, CANNOT MEASURE: {case}: carol's first try was not turned away as busy, so the \
+                "PRODUCT (staging): {case}: carol's first try was not turned away as busy, so the \
                  stranger's holds did not hold every slot: {said}"
             );
         }

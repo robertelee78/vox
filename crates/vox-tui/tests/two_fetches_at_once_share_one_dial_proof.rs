@@ -404,7 +404,14 @@ fn two_fetches_at_once_share_one_dial() {
         assert!(ok, "PRODUCT (staging): trusting {name} failed: {err}");
     }
     let (ok, _, err) = alice.vox_with(
-        &["room", "create", "--passphrase-file", "-", "--name", "mission"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
         ROOM_PASS,
     );
     assert!(ok, "PRODUCT (staging): `vox room create` failed: {err}");
@@ -425,7 +432,15 @@ fn two_fetches_at_once_share_one_dial() {
     // One join, no retry: a join that fails is a defect in joining, which is not what this proves,
     // and retrying would hide it.
     let (ok, out, err) = bob.vox_with(
-        &["room", "join", "--passphrase-file", "-", &link, "--name", "mission"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
         ROOM_PASS,
     );
     assert!(

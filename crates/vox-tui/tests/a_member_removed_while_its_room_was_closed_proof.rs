@@ -19,8 +19,8 @@
 //! Alice posts until bob reads her. Bob's daemon stops and his real `vox tui` opens C, selects
 //! carol, types `:consent grant`, posts `BOB-AFTER-GRANT` from the composer and keeps the TUI's node
 //! up 20 s to deliver it, and `:close`s C (`tests/pty/tui_close_room.py`). Bob's daemon
-//! starts with C closed (`[closed]`), bob removes alice from his ring, and his daemon restarts with
-//! C's passphrase, which opens C.
+//! starts with C closed (`[closed]`, or `PRODUCT (staging)`), bob removes alice from his ring, and
+//! his daemon restarts with C's passphrase, which opens C.
 //!
 //! **Asserted:**
 //! - (a) alice posts after the removal, and 20 s later bob renders **0** of those posts;

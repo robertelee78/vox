@@ -19,7 +19,7 @@
 //! **Which side a red is on.** A verb that starts anyway, says the wrong cause, or blames
 //! another program for an address the machine does not have is `PRODUCT:`, quoting what it
 //! said. This machine having `192.0.2.1` on an interface (so the second arm cannot be staged) is
-//! `CANNOT MEASURE:`. A fault of this proof's own is `APPARATUS:`.
+//! `APPARATUS (precondition not met):`. A fault of this proof's own is `APPARATUS:`.
 //!
 //! Mutation: `vox daemon`'s old blanket message ("something else already holds that UDP port")
 //! for every bind fault → red on the second arm, as PRODUCT.
@@ -112,7 +112,7 @@ fn a_bind_failure_names_its_real_cause() {
     let here = UdpSocket::bind((NOT_HERE, 0));
     assert!(
         here.is_err(),
-        "CANNOT MEASURE: this machine has {NOT_HERE} on an interface, so no address it lacks \
+        "APPARATUS (precondition not met): this machine has {NOT_HERE} on an interface, so no address it lacks \
          can be staged"
     );
 

@@ -302,7 +302,7 @@ pub fn publication(events: &[Event], target: &Path) -> Option<Publication> {
         e.ret == 0 && matches!(&e.call, Call::Rename { to, .. } if norm(to) == target)
     })?;
     let Call::Rename { from, .. } = &rename.call else {
-        unreachable!()
+        unreachable!("APPARATUS: the event found is a rename")
     };
     let from = norm(from);
     let dir = target.parent().map(Path::to_path_buf).unwrap_or_default();

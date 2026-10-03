@@ -19,11 +19,11 @@
 //! its own grind (inert when unset), standing in for a slow device. The forward is closed when the
 //! join starts and opened 10s in, so a direct path appears while the guest is still grinding.
 //!
-//! **Observed, never assumed** (CANNOT MEASURE otherwise): the host reports its *relayed*
+//! **Observed, never assumed** (PRODUCT (staging) otherwise): the host reports its *relayed*
 //! connection to the guest displaced at least 75s before the grind ends — its 60s grace and the
 //! tick that closes it fit inside the grind — and the forward carried datagrams to the host. A run
 //! in which that path closed mid-grind and the join still got in was not measuring it (the join had
-//! gone direct), and is CANNOT MEASURE.
+//! gone direct), and is PRODUCT (staging).
 //!
 //! **Asserted:** the guest's `vox connect` joins, and the host reports no join that did not
 //! complete.
@@ -90,27 +90,29 @@ fn profile() -> &'static str {
 fn a_join_outlives_its_displaced_path() {
     test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_SOLVE_AT_LEAST_MS"]);
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, host_dir, guest_dir) = (
         tmp.path().join("anchor"),
         tmp.path().join("host"),
         tmp.path().join("guest"),
     );
     for d in [&anchor_dir, &host_dir, &guest_dir] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let mut anchor = relay::Anchor::start(&anchor_dir);
     let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id (guest): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
     let (ok, _, err) = vox_once(&host_dir, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id (host): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (host): {err}");
     let (ok, out, err) = vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
     );
-    assert!(ok, "CANNOT MEASURE: trust add: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
 
-    let host_addr: SocketAddr = format!("127.0.0.1:{}", free_v4_udp_port()).parse().unwrap();
+    let host_addr: SocketAddr = format!("127.0.0.1:{}", free_v4_udp_port())
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
     let forward = PortForward::start(host_addr, false);
     let advertise = forward.public.to_string();
     let mut host = VoxProc::spawn_env(
@@ -158,7 +160,7 @@ fn a_join_outlives_its_displaced_path() {
     while anchor.circuits(Duration::from_secs(1)) == 0 {
         assert!(
             t0.elapsed() < RELAYED_WITHIN,
-            "CANNOT MEASURE: the guest never reached the host through the anchor's circuit\n\
+            "PRODUCT (staging): the guest never reached the host through the anchor's circuit\n\
              guest:\n{}",
             guest.transcript()
         );
@@ -166,12 +168,16 @@ fn a_join_outlives_its_displaced_path() {
     let relayed_at = t0.elapsed();
     forward.open();
     let status = loop {
-        if let Some(status) = guest.child.try_wait().unwrap() {
+        if let Some(status) = guest
+            .child
+            .try_wait()
+            .expect("APPARATUS: poll a child process")
+        {
             break status;
         }
         assert!(
             t0.elapsed() < JOIN_WITHIN,
-            "the guest's join had not ended after {JOIN_WITHIN:?}\nguest:\n{}\nhost:\n{}",
+            "PRODUCT: the guest's join had not ended after {JOIN_WITHIN:?}\nguest:\n{}\nhost:\n{}",
             guest.transcript(),
             host.transcript()
         );
@@ -236,7 +242,7 @@ fn a_join_outlives_its_displaced_path() {
     assert!(
         displaced_at.is_some_and(|d| d + GRACE_AND_TICK <= Duration::from_millis(GRIND_MS))
             && forward.to_host() > 0,
-        "CANNOT MEASURE: the host's relayed path to the guest was not displaced early enough for \
+        "PRODUCT (staging): the host's relayed path to the guest was not displaced early enough for \
          its grace to end mid-grind (displaced {displaced}, grind {}s, forward to host {} B)\n\
          host:\n{host_said}\nguest:\n{guest_said}",
         GRIND_MS / 1000,
@@ -244,24 +250,24 @@ fn a_join_outlives_its_displaced_path() {
     );
     assert!(
         !(status.success() && closed_under_the_join),
-        "CANNOT MEASURE: the displaced relayed path was closed mid-grind and the join got in anyway, \
+        "PRODUCT (staging): the displaced relayed path was closed mid-grind and the join got in anyway, \
          so the join was not on it\nhost:\n{host_said}"
     );
     assert!(
         status.success(),
-        "a join whose path was displaced mid-grind failed after {:.1}s\nguest:\n{guest_said}\n\
+        "PRODUCT: a join whose path was displaced mid-grind failed after {:.1}s\nguest:\n{guest_said}\n\
          host (the refusing side's own report):\n{host_said}",
         took.as_secs_f64()
     );
     assert!(
         took >= Duration::from_millis(GRIND_MS),
-        "CANNOT MEASURE: the join took {:.1}s, under the {}s grind floor",
+        "PRODUCT (staging): the join took {:.1}s, under the {}s grind floor",
         took.as_secs_f64(),
         GRIND_MS / 1000
     );
     assert!(
         !host_said.contains("a join did not complete"),
-        "the host reported a join that did not complete although the guest got in:\n{host_said}"
+        "PRODUCT: the host reported a join that did not complete although the guest got in:\n{host_said}"
     );
     eprintln!(
         "[proof] {} displaced-path join: 1/1 got in after its path was displaced, {:.1}s",
