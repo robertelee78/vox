@@ -535,6 +535,10 @@ pub struct NodeConfig {
     /// (`--serve trusted`, the anchor profile's `vox trust` list). Ignored unless
     /// [`NodeConfig::anchor_logs`] is on.
     pub serve_only: Option<BTreeSet<Digest32>>,
+    /// Called once if opening the profile waits more than a second for another vox holding it
+    /// (V210-100): before the node exists, so it cannot be an event. A CLI verb prints its words
+    /// on stderr; `None` says nothing.
+    pub on_profile_wait: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -568,6 +572,7 @@ impl NodeConfig {
             headless: None,
             anchor_logs: false,
             serve_only: None,
+            on_profile_wait: None,
         }
     }
 
@@ -576,6 +581,13 @@ impl NodeConfig {
     #[must_use]
     pub fn serve_only(mut self, creators: BTreeSet<Digest32>) -> Self {
         self.serve_only = Some(creators);
+        self
+    }
+
+    /// Say this (once) if opening the profile has to wait for another vox holding it.
+    #[must_use]
+    pub fn on_profile_wait(mut self, notice: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_profile_wait = Some(Arc::new(notice));
         self
     }
 
@@ -3552,13 +3564,19 @@ impl Node {
             headless,
             anchor_logs,
             serve_only,
+            on_profile_wait,
         } = cfg;
+        let profile_wait = move || {
+            if let Some(notice) = &on_profile_wait {
+                notice();
+            }
+        };
         // A headless node networks as its key file and holds no room, so it never opens the
         // profile's vault — which a `vox node --serve trusted` profile has, to keep its trust
         // list. Opening it here held the store the anchor's own logs need, and the anchor
         // refused to start: "another vox already has this profile open".
         let profile = if headless.is_none() && Profile::exists(&paths) {
-            Some(Profile::open(paths.clone())?)
+            Some(Profile::open_noting(paths.clone(), &profile_wait)?)
         } else {
             None
         };
@@ -3673,9 +3691,16 @@ impl Node {
         let mut node = node;
         if node.headless.is_some() {
             if node.anchor_logs {
-                node.anchor_store = Some(Arc::new(crate::node::store::Store::open(
-                    &node.paths.store_file(),
-                )?));
+                // The profile's lock first, kept as long as the node runs (V210-100): this
+                // opens the profile's store, as every other vox on the profile does.
+                let lock = crate::node::profile::lock_profile(&node.paths, &profile_wait)?;
+                let store_file = node.paths.store_file();
+                node.anchor_store = Some(Arc::new(
+                    crate::node::profile::open_letting_go(|| {
+                        crate::node::store::Store::open(&store_file)
+                    })?
+                    .keep_lock(lock),
+                ));
             }
             node.start_network()?;
             node.reopen_anchored()?;
@@ -4107,11 +4132,7 @@ impl Node {
         let Some(profile) = self.profile.as_mut() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        let events = self.event_tx.clone();
-        let waiting = move || {
-            let _ = events.send(NodeEvent::WaitingForProfile);
-        };
-        match profile.unlock_noting(passphrase, &waiting) {
+        match profile.unlock(passphrase) {
             Ok(()) => {
                 let now = self.now();
                 if let Err(e) = self.load_prekeys(now) {

@@ -34,17 +34,19 @@
 //! - **the profile was migrated exactly once**: every process runs with
 //!   `VOX_TEST_REWRITE_DELAY_MS` (0 when nothing is staged), which makes each one that migrates
 //!   say so, and the trial counts those lines;
-//! - every run that failed names another vox holding the profile — never an internal error.
+//! - every run that failed names another vox holding the profile — never an internal error;
+//! - **in the natural arm, none of the 20 two-at-once starts refuses either process**: every vox
+//!   takes the profile's lock before it opens the store, so the second waits for the first;
+//! - the same for a profile this build made (no migration): 20 pairs of `vox trust add` started at
+//!   the same instant, neither refused, both names listed.
 //!
 //! A lone unlock of a copy is the control: it must pass the same row checks, or nothing here
 //! would mean anything.
 //!
-//! Mutations that must turn it red: the profile lock released before the store's rename (or not
-//! taken at all): in the staged arm the second process migrates the old file and renames it over
-//! the first one's, and the first one's `trust add` is gone. A waiter that does not read the vault
-//! again under the lock: it migrates a second time (harmlessly, but a trial counts 2).
-//! `Error::ProfileBusy` reported as an internal fault again: the natural arm's refusals are
-//! unnamed.
+//! Mutations that must turn it red: the store opened before the profile's lock is taken, or the
+//! lock released before the store is closed: of two started together, one is refused. The profile lock not held across the migration: in the staged
+//! arm the second process migrates the old file and renames it over the first one's, and the
+//! first one's `trust add` is gone (or the profile is migrated twice).
 
 #![cfg(unix)]
 
@@ -84,9 +86,10 @@ const REPLACE_PAUSE_MS: &str = "8000";
 /// How long a second process that migrates too waits before its own rewrite.
 const REWRITE_DELAY_MS: &str = "12000";
 /// What a refusal says when another vox holds the profile (the CLI's words, and the fault's).
-const NAMED: [&str; 2] = [
+const NAMED: [&str; 3] = [
     "a vox is already running for this profile",
-    "another vox holds this profile open",
+    "another vox is still using this profile",
+    "run this again once that one is done",
 ];
 /// What the knobs print when their moment is reached.
 const AT_REPLACE: &str = "the store is released, not yet replaced";
@@ -541,6 +544,41 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
         staged.judge(&format!("staged {i}"), &data, &template, &runs);
     }
 
+    // ---- 3. this build's own profile: two `trust add`s started at the same instant -------------
+    // Not a migration: the claim that neither of two commands started together is refused holds
+    // for every profile, and verification of c5 found it broken on a fresh one too.
+    let own = dir("own-template");
+    ok(&new, &own, &["id"], None);
+    let (mut own_both, mut own_refused, mut own_lost) = (0, Vec::new(), Vec::new());
+    for i in 0..TRIALS {
+        let data = dir(&format!("own-{i}"));
+        copy_tree(&own, &data);
+        let a = trust_add(&data, "x", &x_fp, &[]);
+        let b = trust_add(&data, "y", &y_fp, &[]);
+        let runs = [finish(a, "x"), finish(b, "y")];
+        for r in runs.iter().filter(|r| !r.exited_ok) {
+            own_refused.push(format!("own {i} `trust add {}`: {}", r.name, r.said.trim()));
+        }
+        let names = trusted_names(&data);
+        for r in runs.iter().filter(|r| r.exited_ok) {
+            if !names.contains(r.name) {
+                own_lost.push(format!(
+                    "own {i}: `trust add {}` exited 0, and `trust list` shows {names:?}",
+                    r.name
+                ));
+            }
+        }
+        if runs.iter().all(|r| r.exited_ok) {
+            own_both += 1;
+        }
+    }
+    println!(
+        "[proof] own profile: {TRIALS} trials x 2 started together: both exited 0 {own_both}; \
+         refused {}; `trust add`s that exited 0 and are gone {}",
+        own_refused.len(),
+        own_lost.len()
+    );
+
     for (arm, t) in [("natural", &nat), ("staged", &staged)] {
         println!(
             "[proof] {arm}: {} trials x 2: both exited 0 {}, one {}, none {}; refused naming \
@@ -564,6 +602,29 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     }
     println!("[proof] staged: the first process reached the released store in {reached}/{STAGED}");
 
+    // **Two started together both run** (V210-100): each takes the profile's lock before it
+    // opens the store, so the second waits for the first instead of being refused.
+    assert!(
+        nat.refused_named == 0 && nat.one_ok == 0,
+        "PRODUCT: of {} two-at-once starts, {} ended with one of the two refused (\"a vox is \
+         already running for this profile\"), {} refusals in all — two vox started together \
+         must both run, the second after the first",
+        nat.trials,
+        nat.one_ok,
+        nat.refused_named
+    );
+    assert!(
+        own_refused.is_empty(),
+        "PRODUCT: of {TRIALS} pairs of `vox trust add` started together on this build's own \
+         profile, {} commands were refused — two vox started together must both run, the second \
+         after the first: {:#?}",
+        own_refused.len(),
+        own_refused
+    );
+    assert!(
+        own_lost.is_empty(),
+        "PRODUCT: a `vox trust add` exited 0 and its row is gone: {own_lost:#?}"
+    );
     for t in [&nat, &staged] {
         assert!(
             t.lost_adds.is_empty(),

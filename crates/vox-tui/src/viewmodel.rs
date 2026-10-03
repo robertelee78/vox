@@ -314,7 +314,7 @@ impl UiError {
                 "another vox created this profile's identity at the same time; nothing was created here — restart vox tui to unlock it"
             }
             UiError::ProfileBusy => {
-                "another vox holds this profile open — stop it, then try again"
+                "another vox holds this profile open — try again once it is done"
             }
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",

@@ -892,7 +892,7 @@ impl Fault {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
             }
             Fault::ProfileBusy => {
-                "another vox holds this profile open, and only one at a time may write it\n       stop that one to run this, or use the `vox room …` verbs, which ask a running node"
+                "another vox holds this profile open, and only one at a time may write it\n       run this again once that one is done; a `vox daemon` or `vox tui` holds it until stopped, and the `vox room …` verbs ask it instead"
             }
             Fault::IdentityFileUnwritable => {
                 "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
@@ -1097,11 +1097,12 @@ impl std::fmt::Display for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeEvent {
-    /// Creating or unlocking the identity has waited more than a second for another vox that
-    /// holds this profile's lock (it is creating the identity, or migrating a v0.2.9 profile, or
-    /// it is stopped while doing so). Sent once per wait; the command goes on when the lock is
-    /// free. Each front end says it in its own place: the CLI on stderr, the TUI in its status
-    /// line (V210-100).
+    /// Creating the identity has waited more than a second for another vox that holds this
+    /// profile's lock (it is creating the identity, or holds the profile, or is stopped while
+    /// doing so). Sent once per wait; the command goes on when the lock is free. Each front end
+    /// says it in its own place: the CLI on stderr, the TUI in its status line (V210-100). A wait
+    /// to open an existing profile comes before the node exists, and is said through
+    /// [`NodeConfig::on_profile_wait`](crate::node::actor::NodeConfig::on_profile_wait).
     WaitingForProfile,
     /// A new rendered entry in a channel.
     NewEntry {
