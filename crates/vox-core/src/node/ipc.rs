@@ -316,17 +316,16 @@ const T_SERVICES_REQ: u64 = 18;
 const T_AGREE: u64 = 123;
 /// [`Frame::Agreement`] (V210-168).
 const T_AGREEMENT: u64 = 1201;
-// A room's lifecycle (V030-08): forget, end, admins and the creator's idle end; a leave is
-// `T_LEAVE`. Not gated on the identity passphrase: tearing down a room the work is done in is
-// an agent's call to make.
-const T_FORGET: u64 = 31;
+// A room's lifecycle (V030-08): end, admins and the creator's idle end; a leave is `T_LEAVE`.
+// Not gated on the identity passphrase: tearing down a room the work is done in is an agent's
+// call to make. 31 was `vox room forget`, removed (the decider, 2026-10-03): reserved.
 const T_END: u64 = 32;
 const T_IDLE_END: u64 = 33;
 const T_SET_ADMIN: u64 = 34;
 const T_ADMINS: u64 = 35;
-/// `NodeEvent::RoomQuiet` and `NodeEvent::RoomForgotten` (V030-08). Additive.
-const T_ROOM_QUIET: u64 = 2440;
-const T_ROOM_FORGOTTEN: u64 = 2441;
+/// `NodeEvent::RoomEnded` and `NodeEvent::RoomRemoved` (V030-08). Additive.
+const T_ROOM_ENDED: u64 = 2440;
+const T_ROOM_REMOVED: u64 = 2441;
 
 /// What a client sends.
 ///
@@ -459,8 +458,8 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
-    /// Leave a room (V210-164, V030-08): append this identity's signed leave. The room stays here,
-    /// quiet and readable, until it is forgotten; the leave is passed on in the background.
+    /// Leave a room (V210-164): the node says so in the room, and deletes it once another
+    /// member has that. Answers [`Frame::Ok`] once it is deleted.
     Leave {
         /// The room.
         channel_id: Digest32,
@@ -488,11 +487,6 @@ pub enum Request {
         ttl: u64,
         /// The identity passphrase, proving this is the operator and not an agent.
         identity_passphrase: String,
-    },
-    /// Forget a room (V030-08): answered once everything this node held of it is deleted.
-    Forget {
-        /// The room.
-        channel_id: Digest32,
     },
     /// End a room for everyone (V030-08); its creator only.
     End {
@@ -767,9 +761,6 @@ impl Request {
             }
             Request::Admins { channel_id } => {
                 e.array(2).uint(T_ADMINS).bytes(channel_id);
-            }
-            Request::Forget { channel_id } => {
-                e.array(2).uint(T_FORGET).bytes(channel_id);
             }
             Request::End { channel_id } => {
                 e.array(2).uint(T_END).bytes(channel_id);
@@ -1146,14 +1137,14 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
             }
-            (T_LEAVE | T_FORGET | T_END, 2) => {
+            (T_LEAVE | T_END, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(match tag {
-                    T_LEAVE => Request::Leave { channel_id },
-                    T_FORGET => Request::Forget { channel_id },
-                    _ => Request::End { channel_id },
+                Ok(if tag == T_LEAVE {
+                    Request::Leave { channel_id }
+                } else {
+                    Request::End { channel_id }
                 })
             }
             (T_SET_ADMIN, 4) => {
@@ -1593,19 +1584,19 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .uint(*node)
                 .uint(*room);
         }
-        NodeEvent::RoomQuiet {
+        NodeEvent::RoomEnded {
             channel_id,
             handed,
             members,
         } => {
             e.array(4)
-                .uint(T_ROOM_QUIET)
+                .uint(T_ROOM_ENDED)
                 .bytes(channel_id)
                 .uint(*handed as u64)
                 .uint(*members as u64);
         }
-        NodeEvent::RoomForgotten { channel_id } => {
-            e.array(2).uint(T_ROOM_FORGOTTEN).bytes(channel_id);
+        NodeEvent::RoomRemoved { channel_id } => {
+            e.array(2).uint(T_ROOM_REMOVED).bytes(channel_id);
         }
         NodeEvent::HandshakesQueued {
             waited,
@@ -2045,7 +2036,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedIpc("ipc room not remembered why"))?
                 .to_owned(),
         },
-        (T_ROOM_QUIET, 4) => NodeEvent::RoomQuiet {
+        (T_ROOM_ENDED, 4) => NodeEvent::RoomEnded {
             channel_id: digest(d)?,
             handed: usize::try_from(
                 d.uint()
@@ -2058,7 +2049,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             )
             .unwrap_or(usize::MAX),
         },
-        (T_ROOM_FORGOTTEN, 2) => NodeEvent::RoomForgotten {
+        (T_ROOM_REMOVED, 2) => NodeEvent::RoomRemoved {
             channel_id: digest(d)?,
         },
         (T_HANDSHAKES_QUEUED, 6) => {
@@ -3421,52 +3412,6 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             )
             .await
-        }
-        Request::Forget { channel_id } => {
-            // Subscribe before asking: a room still held is left first and forgotten once the
-            // leave is passed on, which the node says as an event.
-            let mut events = handle.subscribe();
-            let held = handle
-                .view()
-                .channels
-                .iter()
-                .any(|c| c.channel_id == channel_id && c.open);
-            match handle
-                .apply(crate::node::api::NodeCommand::ForgetRoom { channel_id })
-                .await
-            {
-                crate::node::api::Outcome::Done => {}
-                other => {
-                    return Frame::Error {
-                        reason: other.to_string(),
-                    }
-                }
-            }
-            if !held {
-                return Frame::Ok;
-            }
-            // Past the node's own wind-down bound, with margin: the node always ends it.
-            match tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                loop {
-                    match events.next().await {
-                        Some(EventStreamItem::Event(NodeEvent::RoomForgotten {
-                            channel_id: c,
-                        })) if c == channel_id => return true,
-                        Some(_) => {}
-                        None => return false,
-                    }
-                }
-            })
-            .await
-            {
-                Ok(true) => Frame::Ok,
-                Ok(false) => Frame::Error {
-                    reason: "the node stopped before it forgot the room".into(),
-                },
-                Err(_) => Frame::Error {
-                    reason: "the node left the room but has not forgotten it yet".into(),
-                },
-            }
         }
         Request::Invite { channel_id } => {
             // Subscribe before asking: the link arrives as an event, and one emitted

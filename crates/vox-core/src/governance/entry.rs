@@ -40,6 +40,7 @@ use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::genesis::Genesis;
 use crate::governance::lifecycle::RoomLifecycle;
 use crate::governance::policy::PolicyUpdate;
+use crate::governance::presence::Presence;
 use crate::governance::share::ServiceShare;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
@@ -65,12 +66,14 @@ pub enum GovBody {
     /// A policy-update (tag `0x0006`, body kind = policy-update): the room's retention.
     /// The rotation kind under the same tag is reserved and refused (V030-32).
     PolicyUpdate(Box<PolicyUpdate>),
-    /// A room-lifecycle fact (tag `0x0019`): a member leaving or coming back, the creator (or
-    /// an admin) ending the room, or the creator's idle end (V030-08).
+    /// A room-lifecycle fact (tag `0x0019`): the creator (or an admin) ending the room, or the
+    /// creator's idle end (V030-08).
     Lifecycle(Box<RoomLifecycle>),
     /// A member's own statement that it shares a named service, or no longer does (tag
     /// `0x0018`).
     ServiceShare(Box<ServiceShare>),
+    /// A member's own statement that it has left the room, or is back (tag `0x0015`).
+    Presence(Box<Presence>),
 }
 
 impl GovBody {
@@ -98,6 +101,7 @@ impl GovBody {
             StructTag::RoomLifecycle => Ok(GovBody::Lifecycle(Box::new(RoomLifecycle::from_wire(
                 bytes,
             )?))),
+            StructTag::Presence => Ok(GovBody::Presence(Box::new(Presence::from_wire(bytes)?))),
             StructTag::ServiceShare => Ok(GovBody::ServiceShare(Box::new(
                 ServiceShare::from_wire(bytes)?,
             ))),
@@ -121,6 +125,7 @@ impl GovBody {
             GovBody::PolicyUpdate(p) => (p.body.channel_id, p.body.epoch),
             GovBody::Lifecycle(l) => (l.body.channel_id, l.body.epoch),
             GovBody::ServiceShare(s) => (s.body.channel_id, s.body.epoch),
+            GovBody::Presence(p) => (p.body.channel_id, p.body.epoch),
         }
     }
 
@@ -137,6 +142,7 @@ impl GovBody {
             GovBody::PolicyUpdate(p) => p.body.issuer_id,
             GovBody::Lifecycle(l) => l.body.issuer_id,
             GovBody::ServiceShare(s) => s.body.author_id,
+            GovBody::Presence(p) => p.body.author_id,
         }
     }
 }

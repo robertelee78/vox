@@ -2961,7 +2961,7 @@ impl ChannelState {
     /// starts at generation 0, and the other members still hold this identity's old key under
     /// that number. They refuse a second key for a generation they hold, so nothing it sent would
     /// ever read. Its feed, once synced, says what it used: each message's header names its
-    /// generation, a revocation the one it moved to, and nothing else names one.
+    /// generation, a revocation the one it moved to, and a presence statement the one it was on.
     pub fn catch_up_generation(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
         let me = self.me();
         let Some(feed) = self.dag.feed(&me).filter(|f| !f.is_empty()) else {
@@ -2978,6 +2978,7 @@ impl ChannelState {
                     .ok()
                     .map(|m| m.header.chain_id),
                 Ok(EntryKind::Governance) => match GovBody::parse_framed(payload) {
+                    Ok(GovBody::Presence(p)) => Some(p.body.chain_id),
                     Ok(GovBody::ConsentRevocation(r)) => Some(r.body.new_chain_id),
                     _ => None,
                 },
@@ -5513,13 +5514,11 @@ impl ChannelState {
                 "this identity is not an author of the channel",
             ));
         }
-        // An ended room takes no new message, and a member that left says nothing more
-        // (V030-08). The actor says which to the person; this is the backstop.
+        // An ended room takes no new message (V030-08). The actor says so to the person; this
+        // is the backstop. A post while a leave waits to be heard is allowed, and undoes the
+        // leave (V210-164).
         if self.ended(now_millis).is_some() {
             return Err(Error::Profile("this room has ended"));
-        }
-        if self.has_left(&me) {
-            return Err(Error::Profile("this identity has left the room"));
         }
         let (now_millis, skipped) = self.stamp_after_held(now_millis);
         let content = Content::text(now_millis, text)?;
@@ -5709,18 +5708,19 @@ impl ChannelState {
     }
 
     /// The room's members, in fingerprint order: its admitted authors, less every one that has
-    /// left (V030-08). A member that left stays an author — its entries are still the room's
+    /// left (V210-164). A member that left stays an author — its entries are still the room's
     /// history — but it is nobody this node syncs with, delivers to or dials.
     #[must_use]
     pub fn members(&self) -> Vec<Digest32> {
+        let left = self.left();
         self.authors
             .keys()
-            .filter(|a| !self.has_left(a))
+            .filter(|a| !left.contains(*a))
             .copied()
             .collect()
     }
 
-    /// Whether `fingerprint` is a member: an admitted author that has not left (V030-08).
+    /// Whether `fingerprint` is a member: an admitted author that has not left.
     #[must_use]
     pub fn is_member(&self, fingerprint: &Digest32) -> bool {
         self.is_author(fingerprint) && !self.has_left(fingerprint)
@@ -5729,26 +5729,73 @@ impl ChannelState {
     /// The members' keys (see [`Self::members`]), in fingerprint order.
     #[must_use]
     pub fn member_keys(&self) -> Vec<CompositePublicKey> {
+        let left = self.left();
         self.authors
             .iter()
-            .filter(|(a, _)| !self.has_left(a))
+            .filter(|(a, _)| !left.contains(*a))
             .map(|(_, k)| k.clone())
             .collect()
     }
 
-    /// Whether `who` has left this room, by its own signed leave (V030-08).
+    /// Whether `author` has left the room: the last entry this node holds of its feed is its
+    /// own statement that it left (V210-164), and this node has not let it back in since
+    /// ([`Self::readmit`]). Anything it authored after one — it joined again — puts it back.
     #[must_use]
-    pub fn has_left(&self, who: &Digest32) -> bool {
-        self.evaluator.lifecycle().departed.contains_key(who) && !self.readmitted.contains(who)
+    pub fn has_left(&self, author: &Digest32) -> bool {
+        self.said_left(author) && !self.readmitted.contains(author)
+    }
+
+    /// Whether `author`'s feed, as this node holds it, ends in its statement that it left.
+    fn said_left(&self, author: &Digest32) -> bool {
+        let Some(head) = self.dag.feed(author).map(|f| f.max_seq()) else {
+            return false;
+        };
+        self.gov_entries.iter().any(|g| {
+            g.author_id == *author
+                && g.seq == head
+                && matches!(&g.body, GovBody::Presence(p) if p.body.author_id == *author && !p.body.here)
+        })
+    }
+
+    /// Every author that has left the room ([`Self::has_left`]), in one pass over the log's
+    /// governance entries: the roster is read on every view.
+    fn left(&self) -> BTreeSet<Digest32> {
+        self.gov_entries
+            .iter()
+            .filter(|g| {
+                matches!(&g.body, GovBody::Presence(p) if p.body.author_id == g.author_id && !p.body.here)
+                    && self.dag.feed(&g.author_id).map(|f| f.max_seq()) == Some(g.seq)
+                    && !self.readmitted.contains(&g.author_id)
+            })
+            .map(|g| g.author_id)
+            .collect()
     }
 
     /// Let `who`, which left, back in on this node: it just proved the room's passphrase in a
-    /// join this node answered (V030-08). It is a member here until its own return reaches the
-    /// others through this node.
+    /// join this node answered. It is a member here until its own statement that it is back
+    /// reaches the others through this node.
     pub fn readmit(&mut self, who: Digest32) {
-        if self.evaluator.lifecycle().departed.contains_key(&who) {
+        if self.said_left(&who) {
             self.readmitted.insert(who);
         }
+    }
+
+    /// Write that this identity has left the room (`here` = false) or is back in it, unless its
+    /// feed already says so (V210-164). Returns whether an entry was written.
+    pub fn say_presence(&mut self, profile: &Profile, here: bool, now_secs: u64) -> Result<bool> {
+        let me = profile.signer()?.fingerprint();
+        if self.said_left(&me) != here {
+            return Ok(false);
+        }
+        let statement = crate::governance::presence::Presence::build(
+            profile.signer()?,
+            &self.channel_id,
+            self.epoch,
+            here,
+            self.sender.chain_id(),
+        )?;
+        self.append_governance(profile, &statement.to_wire(), now_secs)?;
+        Ok(true)
     }
 
     /// Whether this node may write in the room: see `settled`.
@@ -5765,28 +5812,6 @@ impl ChannelState {
         }
         store.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?;
         self.settled = true;
-        Ok(true)
-    }
-
-    /// Say this identity, which had left, is back (V030-08): it joined again. Nothing to say
-    /// when it had not left.
-    pub fn say_returned(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
-        let signer = profile.signer()?;
-        if !self
-            .evaluator
-            .lifecycle()
-            .departed
-            .contains_key(&signer.fingerprint())
-        {
-            return Ok(false);
-        }
-        let fact = crate::governance::lifecycle::RoomLifecycle::build(
-            signer,
-            &self.channel_id,
-            self.epoch,
-            crate::governance::lifecycle::LifecycleKind::Return,
-        )?;
-        self.append_governance(profile, &fact.to_wire(), now_secs)?;
         Ok(true)
     }
 
@@ -5811,22 +5836,6 @@ impl ChannelState {
     #[must_use]
     pub fn idle_end(&self) -> Option<u64> {
         self.evaluator.lifecycle().idle_end_secs
-    }
-
-    /// Leave the room (V030-08): append this identity's signed leave. The other members stop
-    /// syncing with it and delivering to it once they hold it. Leaving twice is refused.
-    pub fn leave(&mut self, profile: &Profile, now_secs: u64) -> Result<Digest32> {
-        let signer = profile.signer()?;
-        if self.has_left(&signer.fingerprint()) {
-            return Err(Error::Profile("this identity has already left the room"));
-        }
-        let fact = crate::governance::lifecycle::RoomLifecycle::build(
-            signer,
-            &self.channel_id,
-            self.epoch,
-            crate::governance::lifecycle::LifecycleKind::Leave,
-        )?;
-        self.append_governance(profile, &fact.to_wire(), now_secs)
     }
 
     /// End the room for everyone (V030-08). Only its creator, or an admin the creator delegated,

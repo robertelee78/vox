@@ -209,11 +209,27 @@ Decided 2026-09-25: build checkpoints now (M23.6).
 
 ### Leaving and ending a room (decider, 2026-10-03)
 
-- **RL-8.1. Leave.** `vox room leave` MUST post the node's presence statement (`0x0015`) and MUST
-  delete the room from the node once another member has that statement (V210-164). *Built.*
-- **RL-8.2. End.** The room's creator, or an admin it delegated (ADR-007 G-5), MAY end the room. A room
-  that is ended MUST be deleted automatically on every member's node. *Decided, not built* (V030-08,
-  #244).
+- **RL-8.1. Leave.** `vox room leave` MUST post the node's presence statement (`0x0015`, `here` =
+  false), take the node's records off boards with a signed member withdraw (`0x001A`), and MUST
+  delete the room from the node — every stored row and its key, the store rewritten so none of the
+  deleted bytes stay — once a sync session has carried the statement to another member (V210-164).
+  A room held alone MUST go at once.
+- **RL-8.1a.** If no member can be told within 30 s the leave MUST say so (`LeaveNotHeard`), and the
+  node MUST keep the room and go on leaving, across a restart, until one is told. Anything the node
+  writes in the room meanwhile undoes the leave (`LeaveUndone`).
+- **RL-8.1b.** A member whose feed ends in its statement that it left MUST be left out of every other
+  member's roster, sync and key delivery. Joining again is an ordinary join: once synced, the node
+  moves to a sender generation above any its feed shows and says it is back (`here` = true), which
+  starts its consents over.
+- **RL-8.2. End.** The room's creator, or an admin it delegated (ADR-007 G-5), MAY end the room (a
+  room-lifecycle fact `0x0019`, kind end); the creator MAY choose an idle end at creation (kind idle
+  end), and the room then ends once nothing is said in it for that long. A node holding an ended
+  room MUST take no new message in it, MUST pass the end on to each member at its next sync (for at
+  most 60 s for a member it cannot reach), and MUST then delete the room as RL-8.1 does. The
+  ender's node MUST take the whole room off boards (`0x001A`, room scope); a board MUST take that
+  only from the creator or an admin on the creator's signed roster (`0x001B`), and MUST answer a
+  later join of the room as ended. Lifecycle kind codes 1 and 4 (a leave and a return, before this
+  ruling) are reserved and MUST be refused.
 - **RL-8.3.** There MUST NOT be a `vox room forget`: leaving and ending are the only ways a room
   leaves a node.
 

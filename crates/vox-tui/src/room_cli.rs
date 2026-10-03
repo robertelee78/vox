@@ -3940,37 +3940,40 @@ pub async fn print_identity(paths: &Paths) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Find a room by prefix among every room this node holds, closed ones too.
-async fn any_room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
-    let ids: Vec<Digest32> = rooms_of(client)
-        .await?
-        .into_iter()
-        .map(|(id, _, _, _)| id)
-        .collect();
-    if ids.is_empty() {
-        return Err(AppError::Usage("this node holds no rooms".into()));
-    }
-    resolve_prefix(prefix, &ids)
-}
-
-/// `vox room leave` — leave a room (V030-08).
+/// `vox room leave` — leave a room (V210-164; the decider, 2026-10-03: "leave deletes it").
+///
+/// The node writes its departure into the room and answers once another member has it; then
+/// the room is gone from this node, and so are the read cursors agent sessions kept for it here
+/// (the node deletes those with the room).
+/// The other members stop listing this identity in the room's roster. Joining again later is an
+/// ordinary join.
 ///
 /// # Errors
-/// An unreachable node, an unknown or closed room, or a room this identity already left.
+/// If the node cannot be reached, the room is unknown or closed, or no other member could be
+/// told in time (the node then leaves as soon as one can be).
 pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
+    let name = rooms_of(&mut client)
+        .await?
+        .into_iter()
+        .find(|(id, _, _, _)| *id == channel_id)
+        .map(|(_, name, _, _)| name)
+        .unwrap_or_default();
+    let which = if name.is_empty() {
+        format!("room {}", b32_encode(&channel_id))
+    } else {
+        format!("room {name:?} ({})", b32_encode(&channel_id))
+    };
     match client.request(&Request::Leave { channel_id }).await {
         Ok(Frame::Ok) => {
-            println!("vox: left {}", short(&channel_id));
-            println!(
-                "     the other members stop syncing with this node once they have it; this node \
-                 passes it on, then goes quiet in the room"
-            );
-            println!("     what was said stays readable here until `vox room forget`");
+            println!("vox: left {which}");
+            println!("     its other members see that you left; this node no longer holds it");
             Ok(())
         }
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot leave: {reason}"))),
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("{which} was not left: {reason}")))
+        }
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
@@ -3988,8 +3991,8 @@ pub async fn end(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(Frame::Ok) => {
             println!("vox: ended {} for everyone", short(&channel_id));
             println!(
-                "     every member's node takes no new message in it once it has this; what was \
-                 said stays readable until each forgets the room"
+                "     every member's node takes no new message in it once it has this, passes the end \
+                 on, and deletes the room"
             );
             Ok(())
         }
@@ -3997,67 +4000,6 @@ pub async fn end(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
-}
-
-/// `vox room forget` — delete everything this node holds of a room (V030-08), and the read
-/// cursors agent sessions kept for it here.
-///
-/// # Errors
-/// An unreachable node, an unknown room, or a closed room this identity has not left.
-pub async fn forget(paths: &Paths, room: &str) -> Result<(), AppError> {
-    let mut client = attach(paths).await?;
-    let channel_id = any_room_of(&mut client, room).await?;
-    let name = rooms_of(&mut client)
-        .await?
-        .into_iter()
-        .find(|(id, _, _, _)| *id == channel_id)
-        .map(|(_, name, _, _)| name)
-        .unwrap_or_default();
-    match client.request(&Request::Forget { channel_id }).await {
-        Ok(Frame::Ok) => {
-            let cursors = forget_cursors(paths, &channel_id, &name);
-            println!("vox: forgot {}", short(&channel_id));
-            println!(
-                "     nothing of it is left on this node{}",
-                if cursors > 0 {
-                    format!(", and {cursors} read cursor(s) kept for it were deleted")
-                } else {
-                    String::new()
-                }
-            );
-            Ok(())
-        }
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot forget: {reason}"))),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
-    }
-}
-
-/// Delete the read cursors (and held-claim records) agent sessions kept for a room: each is
-/// filed under the room as the session named it — its id, a prefix of it of 8 characters or
-/// more, or its local name. Returns how many went.
-fn forget_cursors(paths: &Paths, channel_id: &Digest32, name: &str) -> usize {
-    let id = b32_encode(channel_id);
-    let names_it = |file: &str| -> bool {
-        let Some((room, _session)) = file.split_once('-') else {
-            return false;
-        };
-        (room.len() >= 8 && id.starts_with(room))
-            || (!name.is_empty() && file.starts_with(&format!("{name}-")))
-    };
-    let mut gone = 0usize;
-    for dir in [paths.cursor_dir(), paths.cursor_dir().join("held")] {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let file = e.file_name().to_string_lossy().into_owned();
-            if e.path().is_file() && names_it(&file) && std::fs::remove_file(e.path()).is_ok() {
-                gone += 1;
-            }
-        }
-    }
-    gone
 }
 
 /// `vox room admin add|remove|list` — a room's admins (V030-08).
