@@ -18,9 +18,14 @@
 //! then read; and a head that never ends, written on and on, read once the endpoint has answered.
 //!
 //! **What is asserted.** For each scrape, a complete response: the status line `HTTP/1.1 200`, a `Content-Length`,
-//! and exactly that many bytes of body, which carries `vox_up`. A reset, a short body or no status
-//! line is `PRODUCT:`. Not being able to start the daemon or reach the address it named is
-//! `CANNOT MEASURE`.
+//! and exactly that many bytes of body, which carries `vox_up` and the node's health,
+//! `vox_unhealthy <n>` (PRD-001 R38). A reset, a short body or no status line is `PRODUCT:`.
+//!
+//! **And the health it serves is the node's** (R38). One more scrape, whole: its `vox_unhealthy`
+//! is the number of lines `vox status --json` flags under `unhealthy`, read from the same node.
+//!
+//! vox failing to start, or not answering at the address it named, is `PRODUCT (staging)`: these
+//! are vox's own steps.
 //!
 //! **Why a file of its own.** No other proof scrapes the metrics endpoint: the proof that came
 //! with it was deleted with the non-product tests (V29-17), and the user journeys left drive
@@ -63,7 +68,7 @@ fn a_scrape_whose_request_arrives_in_pieces_gets_the_whole_response() {
     let data = tmp.path().join("alice");
     world::mkdir(&data.join("cfg"));
     let (ok, _, err) = vox_once(&data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE (staging): vox id failed: {err}");
+    assert!(ok, "PRODUCT (staging): vox id failed: {err}");
     let pass = tmp.path().join("alice.pass");
     std::fs::write(&pass, world::IDENTITY).expect("APPARATUS: write the passphrase file");
 
@@ -144,9 +149,36 @@ fn a_scrape_whose_request_arrives_in_pieces_gets_the_whole_response() {
     pad.join().expect("APPARATUS: the writer thread");
     reds.extend(judge("a head that never ends", read, &got));
 
+    // ---- the health it serves is the node's own: a whole scrape against `vox status --json` ----
+    let mut sock = connect(&addr);
+    let sent = sock.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let mut got = Vec::new();
+    let read = sent.and_then(|()| sock.read_to_end(&mut got));
+    reds.extend(judge("a whole request", read, &got));
+    let served = unhealthy_served(&got);
+    let (ok, out, err) = vox_once(&data, &args(&["status", "--json"]));
+    assert!(
+        ok,
+        "PRODUCT: `vox status --json` failed on the running node: {err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` printed no JSON ({e}): {out}"));
+    let flagged = status["unhealthy"].as_array().map(Vec::len);
+    println!(
+        "[proof] health: the endpoint serves vox_unhealthy {served:?}; `vox status --json` flags \
+         {flagged:?}"
+    );
+    if served.is_none() || served != flagged.map(|n| n as u64) {
+        reds.push(format!(
+            "  health: the endpoint serves vox_unhealthy {served:?}, but `vox status --json` \
+             flags {flagged:?} unhealthy lines"
+        ));
+    }
+
     assert!(
         reds.is_empty(),
-        "PRODUCT: every scrape must get the whole metrics response, with no reset:\n{}",
+        "PRODUCT: every scrape must get the whole metrics response, with the node's health and no \
+         reset:\n{}",
         reds.join("\n")
     );
 }
@@ -156,7 +188,7 @@ fn a_scrape_whose_request_arrives_in_pieces_gets_the_whole_response() {
 /// failure.
 fn connect(addr: &str) -> std::net::TcpStream {
     let sock = std::net::TcpStream::connect(addr).unwrap_or_else(|e| {
-        panic!("CANNOT MEASURE (staging): the address the daemon named, {addr}, refused: {e}")
+        panic!("PRODUCT (staging): the address the daemon named, {addr}, refused: {e}")
     });
     sock.set_nodelay(true).expect("APPARATUS: TCP_NODELAY");
     sock.set_read_timeout(Some(READ_PATIENCE))
@@ -165,8 +197,8 @@ fn connect(addr: &str) -> std::net::TcpStream {
 }
 
 /// Whether `got`, which the scrape `case` read with `read`, is the whole response: the status line
-/// `HTTP/1.1 200`, a `Content-Length`, exactly that many bytes of body carrying `vox_up`, and a
-/// read that ended cleanly. `Some` names what was wrong.
+/// `HTTP/1.1 200`, a `Content-Length`, exactly that many bytes of body carrying `vox_up` and a
+/// `vox_unhealthy` value, and a read that ended cleanly. `Some` names what was wrong.
 fn judge(case: &str, read: std::io::Result<usize>, got: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(got).into_owned();
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
@@ -174,11 +206,14 @@ fn judge(case: &str, read: std::io::Result<usize>, got: &[u8]) -> Option<String>
         .lines()
         .find_map(|l| l.strip_prefix("Content-Length: "))
         .and_then(|n| n.trim().parse::<usize>().ok());
-    let complete =
-        head.starts_with("HTTP/1.1 200") && length == Some(body.len()) && body.contains("vox_up");
+    let health = unhealthy_served(got);
+    let complete = head.starts_with("HTTP/1.1 200")
+        && length == Some(body.len())
+        && body.contains("vox_up")
+        && health.is_some();
     println!(
         "[proof] {case}: read {:?}, {} bytes, status line {:?}, Content-Length {length:?}, body {} \
-         bytes, vox_up {}",
+         bytes, vox_up {}, vox_unhealthy {health:?}",
         read.as_ref().map(|_| ()).map_err(std::io::Error::kind),
         got.len(),
         head.lines().next().unwrap_or(""),
@@ -192,4 +227,12 @@ fn judge(case: &str, read: std::io::Result<usize>, got: &[u8]) -> Option<String>
             text.chars().take(300).collect::<String>()
         )
     })
+}
+
+/// The value of the `vox_unhealthy` gauge in a scraped response, if it carries one.
+fn unhealthy_served(got: &[u8]) -> Option<u64> {
+    String::from_utf8_lossy(got)
+        .lines()
+        .find_map(|l| l.strip_prefix("vox_unhealthy "))
+        .and_then(|v| v.trim().parse().ok())
 }
