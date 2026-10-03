@@ -50,9 +50,8 @@ pub const EXIT_CONFLICT: u8 = 4;
 /// These are the *same* values the drain hook receives as the session id, which is
 /// what lets it recognise this session's own messages (ADR-021 §7).
 ///
-/// **Not `VOX_AGENT_NAME`.** That is the name a session is *addressed* by, and it is
-/// set in harness settings shared by every session of the harness — using it as the
-/// owner would make two sessions one owner again, the defect ADR-021 F3 names.
+/// **A session is not an address.** Messages are addressed to nodes (V210-161); the session
+/// says which of a node's agent sessions spoke, and owns what it claims (ADR-021 F3).
 ///
 /// **A session that is not one line of at most [`MAX_NAME`] bytes names nothing**
 /// (V210-123): the session is the `from` of every post, and other agents' drains, boards
@@ -505,7 +504,7 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
     for p in table.mismatched() {
         msg.push_str(&format!(
             "\n  worker {} session {} runs vox {}; required {}",
-            crate::ident::author_id(&p.author),
+            crate::ident::name_of(&p.author),
             if p.session.is_empty() {
                 "(none)".to_owned()
             } else {
@@ -530,9 +529,9 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
 pub struct Draft {
     /// The envelope type.
     pub kind: String,
-    /// Addressees, by petname.
+    /// Addressees: members' whole fingerprints, base32.
     pub to: Vec<String>,
-    /// Whether it may interrupt an addressed session.
+    /// Whether it may interrupt the agents of the nodes addressed.
     pub urgent: bool,
     /// Reply-to entry.
     pub re: Option<String>,

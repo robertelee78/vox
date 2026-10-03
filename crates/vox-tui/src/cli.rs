@@ -453,8 +453,44 @@ fn trust_over_socket(sub: &TrustCmd) -> bool {
     rt.block_on(crate::room_cli::node_is_running(&paths))
 }
 
+/// The name `vox trust add` files an identity under (V210-162): `--name`, or asked for on a
+/// terminal. With neither it is refused at once: every identity under one default name could
+/// not be told apart, nor addressed.
+fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
+    use std::io::{BufRead as _, IsTerminal as _, Write as _};
+    if let Some(n) = a.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        return Ok(n.to_owned());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(crate::app::AppError::Usage(
+            "name it: vox trust add <fingerprint> --name <your name for it>".into(),
+        ));
+    }
+    let mut err = std::io::stderr();
+    let _ = write!(err, "Your name for {}: ", a.fingerprint.trim());
+    let _ = err.flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    match line.trim() {
+        "" => Err(crate::app::AppError::Usage(
+            "no name given; nothing was trusted".into(),
+        )),
+        n => Ok(n.to_owned()),
+    }
+}
+
 /// Run a trust verb against the node that is already holding this profile.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
+    let name = match &sub {
+        TrustCmd::Add(a) => match trust_name(a) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => String::new(),
+    };
     let (profile, pass, pass_file) = match &sub {
         TrustCmd::List(a) => (
             a.profile.clone(),
@@ -502,7 +538,7 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             TrustCmd::List(_) => crate::room_cli::trust_list(&paths, &identity).await,
             TrustCmd::Add(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_add(&paths, target, &a.name, &identity).await
+                crate::room_cli::trust_add(&paths, target, &name, &identity).await
             }
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
@@ -765,8 +801,8 @@ pub struct HandoffArgs {
     pub room: String,
     /// What is being handed off.
     pub resource: String,
-    /// The recipient: a room member's fingerprint, or a unique prefix of one as
-    /// `vox room roster` prints it. Resolved here, once, so every node agrees.
+    /// The recipient: your name for a room member (`vox trust list`), or its fingerprint or a
+    /// unique prefix of one as `vox room roster` prints it. Resolved here, once, so every node agrees.
     #[arg(long)]
     pub to: String,
     /// Reserve it for one exact session of the recipient, rather than any.
@@ -892,9 +928,8 @@ pub struct AgentPluginArgs {
 pub struct AgentHookArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// The room to drain, or a unique prefix. Falls back to `VOX_ROOM`, which is
-    /// usually the easier place to put it since a hook's arguments are fixed at
-    /// install time while its environment is not.
+    /// Drain only this room (its id, or a unique prefix). Without it the hook drains every
+    /// room the node holds, each under its own heading.
     #[arg(long)]
     pub room: Option<String>,
     /// Output shape: `auto` (default), `claude`, or `text`.
@@ -959,10 +994,11 @@ pub struct RoomPostArgs {
     /// starts nothing: an attempt becomes active on `--type working`.
     #[arg(long)]
     pub attempt: Option<String>,
-    /// Address a session by petname; repeat for several.
+    /// Address a member of the room: your name for it (`vox trust list`) or its fingerprint
+    /// (`vox room roster`). Repeat for several. A name that is no member is refused.
     #[arg(long)]
     pub to: Vec<String>,
-    /// May interrupt an addressed session mid-turn.
+    /// May interrupt the addressed members' agents mid-turn.
     #[arg(long)]
     pub urgent: bool,
     /// The entry hash this replies to.
@@ -1214,10 +1250,11 @@ pub struct TrustAddArgs {
     /// The identity to trust, as `vox id` prints it (base32, or a unique prefix of one
     /// this node already knows).
     pub fingerprint: String,
-    /// What this node will call it. Local to this machine; nothing is registered and no
-    /// other node ever sees it.
-    #[arg(long, default_value = "peer")]
-    pub name: String,
+    /// Your name for it: how Vox shows its messages to you, and how you address it
+    /// (`--to`). Local to this machine; no other node ever sees it. Asked for when not given
+    /// and there is a terminal.
+    #[arg(long)]
+    pub name: Option<String>,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
     /// machine, and lands in the shell's history besides. It is still accepted by the
@@ -1951,10 +1988,9 @@ pub fn run() -> ExitCode {
                 );
                 eprintln!(
                     "vox: merge that into ~/.claude/settings.json (user scope, so a session \
-                     opened in any repository drains its room), and install the skill beside \
-                     it: vox agent skill > ~/.claude/skills/vox-agent-comms/SKILL.md\n     Set \
-                     VOX_ROOM in the session's environment, or pass --room to the hook, so it \
-                     knows which room to drain."
+                     opened in any repository hears its rooms), and install the skill beside \
+                     it: vox agent skill > ~/.claude/skills/vox-agent-comms/SKILL.md\n     The hook \
+                     drains every room the node holds."
                 );
                 ExitCode::SUCCESS
             }
@@ -1968,8 +2004,7 @@ pub fn run() -> ExitCode {
                     "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
                      — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
                      an async hook's output is observed and discarded, so the room would \
-                     drain into nothing.\n     Set VOX_ROOM in the session's environment, or \
-                     pass --room to the hook."
+                     drain into nothing.\n     The hook drains every room the node holds."
                 );
                 ExitCode::SUCCESS
             }
@@ -2097,12 +2132,19 @@ pub fn run() -> ExitCode {
         ),
         Cmd::Trust(TrustCmd::Add(args)) => {
             let a = args.clone();
+            let name = match trust_name(&a) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             run_new_room_verb(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
-                    crate::tunnel_cli::trust_add(&node, &a.fingerprint, &a.name).await
+                    crate::tunnel_cli::trust_add(&node, &a.fingerprint, &name).await
                 },
             )
         }

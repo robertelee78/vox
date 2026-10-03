@@ -391,9 +391,10 @@ pub enum Request {
         /// The identity passphrase.
         identity_passphrase: String,
     },
-    /// Read the trust keyring. Requires the identity passphrase.
+    /// Read the trust keyring: who this node trusts and the name it gave each. A read, so the
+    /// node checks no passphrase.
     TrustList {
-        /// The identity passphrase.
+        /// Carried on the wire and not checked.
         identity_passphrase: String,
         /// The last fingerprint of the previous page, or `None` for the first.
         after: Option<Digest32>,
@@ -2143,16 +2144,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
-        Request::TrustList {
-            identity_passphrase,
-            after,
-        } => match verify_operator(handle, identity_passphrase).await {
-            Err(f) => f,
-            Ok(()) => Frame::Trusted {
-                entries: page(handle.view().trusted, after, |(id, petname)| {
-                    (*id, petname.len())
-                }),
-            },
+        // **A read, so no passphrase** (V210-162, V210-165): the names this node gave its
+        // members are how every surface on this account names an author, the agent drain
+        // included, and the OS account is the boundary. Only a change to the keyring is gated.
+        Request::TrustList { after, .. } => Frame::Trusted {
+            entries: page(handle.view().trusted, after, |(id, petname)| {
+                (*id, petname.len())
+            }),
         },
         Request::Post { channel_id, text } => {
             match handle
