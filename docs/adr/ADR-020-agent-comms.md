@@ -3,7 +3,10 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: Accepted. Built on integrate/v0.3.0, except where a requirement says **Not built**
-or **Planned**. The code is `crates/vox-agentcomms` (envelope, claims, operation ids, version
+or **Planned**. **Decided 2026-10-03, not built (#397, ADR-026):** the account's one daemon hosts
+every node, an agent's hooks act only as their `--node`, and the control socket moves to
+`.daemon/vox.sock` (2.1, 6.10, 6.11, 7.4, 7.6–7.8, 8.5, 11.5 and §12 say how); until it is built,
+each profile runs its own daemon and socket. The code is `crates/vox-agentcomms` (envelope, claims, operation ids, version
 gate), `crates/vox-tui/src/{agent_hook,wake,room_cli,coord,app,codex_trust}.rs` (the drain hook,
 the wake, the `vox room` and `vox agent` verbs, `vox daemon`), `crates/vox-tui/assets/agent-skill.md`
 (the skill) and `crates/vox-core/src/node/{ipc,trust,status}.rs` (the control socket, the trust
@@ -56,7 +59,10 @@ caps are the only loop guards that provably terminate.
 
 - **2.1** An agent's Vox identity MUST correspond to one `(host, harness)` pair, for example
   `claude-code@mbp`, holding one durable key. Its node is hosted by the system's daemon (§12,
-  ADR-016).
+  ADR-016). *Decided, not built (ADR-026 N-6):* the skill pack's setup creates the agent's node
+  (`vox node create <harness>-<host>`) and installs its hooks as `vox agent hook --node <name>`; a
+  hook MUST act only as that node, and MUST refuse without `--node`, never falling back to another
+  node.
 - **2.2** A session (one Claude Code, Codex or OpenCode conversation) MUST NOT hold its own key.
   It announces itself with a signed `hello` and is a record in the room. The participating verbs
   post that `hello` when the session has not announced (ADR-021 §5).
@@ -251,9 +257,11 @@ they are not a defence against one that lies.
 - **6.10** Idle comes from the harness: Claude Code's `Stop` hook records idle and `SessionEnd`
   removes the registration, both through `vox agent hook`, printing nothing; `UserPromptSubmit`
   records busy. A session busy for `agent_busy_idle` (10 minutes) with no hook activity MUST count
-  as idle.
+  as idle. *Decided, not built (ADR-026 L-2, L-3):* a hook that finds no daemon starts one and
+  attaches its node implicitly; `SessionEnd` that unregisters the node's last session detaches a
+  node that was attached implicitly, atomically with the unregister.
 - **6.11** `agent_wake_hold`, `agent_busy_idle` and `agent_reply_nudges` are settings in the
-  profile's settings file. A value that does not parse, an empty schedule or a zero MUST be refused,
+  profile's settings file (under ADR-026, the node's `config`). A value that does not parse, an empty schedule or a zero MUST be refused,
   said on the daemon's stderr (again every ten minutes while it stands), and the default used.
 - **6.12 (V210-169, M19.12).** Vox MUST NOT send `turn/start` or `turn/steer` to Codex: its
   app-server keeps a quit session's thread loaded, so a wake could start a model turn nobody is in. A
@@ -280,8 +288,13 @@ they are not a defence against one that lies.
   `0600`, carrying length-delimited canonical CBOR frames, one task per connection (M19.1b). Its
   only authentication is the file mode: it MUST NOT be described as a security boundary (the OS
   account is the boundary). A request that changes the trust keyring MUST be gated as 3.1 says.
+  *Decided, not built (ADR-026 C-1–C-3):* one socket per account, `<data root>/.daemon/vox.sock`,
+  peer-uid checked and never admitting uid 0; every request names its node or resolves it (named,
+  else the only attached node, else refuse).
 - **7.5** A cursor belongs to the reader of the log (§4, ADR-021 §7), not to the event transport.
 - **7.6** The protocol MUST be versioned (`PROTOCOL_VERSION`, now 8) and grow by additive requests.
+  *Decided, not built (ADR-026 C-4):* version 9 adds the node to every request, daemon requests and
+  daemon events (attach, detach, lock, unlock).
   The app API (`AppListen`, `AppAccept`, `AppOpen`; ADR-022 M22.5) rides the same socket.
 - **7.7 (PRD-001 R35, R38).** The socket MUST answer a status request (tag 2301) with the node's
   report as JSON: rooms with each member's last-seen and last-sync time and the room's last
@@ -290,13 +303,16 @@ they are not a defence against one that lies.
   completed sync in 10 minutes; a trusted member that was connected and no longer is). `vox status`
   prints it (`--json` verbatim). `vox daemon --metrics <addr>` serves it as Prometheus text and MUST
   refuse a non-loopback address. The report cannot say whether a room has an always-on member, nor
-  whether a direct path was dialled or hole-punched, and it MUST say so.
+  whether a direct path was dialled or hole-punched, and it MUST say so. *Decided, not built
+  (ADR-026):* the report is per node, metrics carry a `node=` label, and the daemon has its own
+  status (attached nodes, port, mapping).
 - **7.8 (PRD-001 R37).** A running `vox daemon` MUST check its status every 5 s and raise a desktop
   notification when an unhealthy condition starts and when it clears, never again while it holds,
   keyed by a stable condition key (`peer-unreachable:<room>:<peer>`, `room-stale:<room>`); the
   stale-sync rule counts from the node's start for a room not yet synced. Delivery:
   `VOX_NOTIFY_COMMAND <title> <body>` when set, else `osascript` on macOS, `notify-send` on Linux
-  when installed, and always a line on stderr. `notify = off` in the profile's `config` turns it off.
+  when installed, and always a line on stderr. `notify = off` in the profile's `config` turns it off
+  (under ADR-026, per node, for each attached node).
   The `osascript` and `notify-send` paths are exercised by no proof, since no test can see a
   desktop. Phone push is out of scope.
 
@@ -321,7 +337,8 @@ they are not a defence against one that lies.
   hook`; then only `--room`, `--session`, `--profile` (plain values) and `--format`; no shell
   metacharacter. `--data-dir`/`--config-dir` MUST be refused. Another tool's entry, and an entry
   tampered into anything else, MUST be left untrusted. Not proved: that a trusted hook then fires in
-  a live Codex turn (#169).
+  a live Codex turn (#169). *Decided, not built (ADR-026):* `--node` replaces `--profile` in this
+  grammar, and is required.
 
 ### 9. Flood and loop control
 
@@ -366,8 +383,8 @@ they are not a defence against one that lies.
   is usable. A transfer that stalls (30 s per read), sends more than announced, or does not match
   MUST leave nothing behind.
 - **11.5 (PRD-001 R18, D4).** Where the file lands is the receiver's decision. `vox room get` MUST
-  write to `--out`, else `--dir`, else the profile's `downloads` file, else `downloads = <dir>` in
-  its `config`, else `~/Downloads`, under the announced name reduced to its last component (leading
+  write to `--out`, else `--dir`, else the profile's `downloads` file (under ADR-026, the node's
+  `config`), else `downloads = <dir>` in its `config`, else `~/Downloads`, under the announced name reduced to its last component (leading
   dots and characters a filesystem treats specially removed). It MUST NOT overwrite anything: a
   taken name gets ` (1)`, ` (2)` …, and an existing `--out` is refused. Bytes go to a hidden `.part`
   file and are linked into place only after the hash and size match.
@@ -387,6 +404,10 @@ they are not a defence against one that lies.
   passphrase once at start, holds the profile's rooms, binds §7's socket and runs until stopped
   (M19.5c). It MUST NOT lock on SIGHUP; SIGHUP stops it cleanly (ADR-016 NR-15). It is the node
   `vox room` and `vox agent hook` attach to.
+- **12.2** *Decided, not built (ADR-026):* `vox daemon` is the account's one daemon, not a node. It
+  takes no passphrase at start; nodes attach to it (by hand, implicitly from a request or a hook, or
+  from its `--keep` list) and all run concurrently. `vox room` and `vox agent hook` are its clients
+  and act as the node they name. 12.1 is replaced when this is built.
 
 ### Non-goals
 
