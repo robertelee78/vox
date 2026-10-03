@@ -1647,19 +1647,22 @@ pub fn run_live(
         ))?
         .attached;
     let node = tui_node(&account, node.as_deref(), &attached)?;
-    let core = DaemonCore::new(rt.handle().clone(), account, node, anchors)?;
+    let stop = tokio_util::sync::CancellationToken::new();
+    let core = DaemonCore::new(rt.handle().clone(), account, node, anchors, stop.clone())?;
     let io = CrosstermIo::new();
     #[cfg(unix)]
     {
         // **SIGTERM and SIGHUP stop the TUI as `q` does** (V210-93, ADR-026 S-4): the terminal is
         // restored and the connections to the daemon close. The node is the daemon's: it is left
         // as it is, attached for as long as anything holds it. Left to their defaults these killed
-        // the process with the terminal left raw.
+        // the process with the terminal left raw. A wait on the daemon is given up at once (the
+        // TUI waited out an attach before it stopped: 9.5 s, measured).
         for kind in [
             tokio::signal::unix::SignalKind::terminate(),
             tokio::signal::unix::SignalKind::hangup(),
         ] {
-            let stop = io.stop_flag();
+            let flag = io.stop_flag();
+            let stop = stop.clone();
             let signal = {
                 let _in_rt = rt.enter();
                 tokio::signal::unix::signal(kind)
@@ -1667,7 +1670,8 @@ pub fn run_live(
             if let Ok(mut signal) = signal {
                 rt.spawn(async move {
                     if signal.recv().await.is_some() {
-                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        stop.cancel();
                     }
                 });
             }

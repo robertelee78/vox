@@ -110,6 +110,9 @@ pub struct DaemonCore {
     timeline: Option<Timeline>,
     /// Why the TUI cannot go on: the daemon stopped.
     ended: Option<String>,
+    /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
+    /// then, so a stop is never held behind an answer (ADR-026 S-4).
+    stop: tokio_util::sync::CancellationToken,
 }
 
 /// The room on screen's rows, in the room's order, and what they were projected as.
@@ -158,6 +161,20 @@ pub fn short_id(id: &Digest32) -> String {
     s
 }
 
+/// Wait for `work` on `rt`, unless `stop` is cancelled first: `None` then.
+fn until_stopped<F: std::future::Future>(
+    rt: &tokio::runtime::Handle,
+    stop: &tokio_util::sync::CancellationToken,
+    work: F,
+) -> Option<F::Output> {
+    rt.block_on(async {
+        tokio::select! {
+            out = work => Some(out),
+            () = stop.cancelled() => None,
+        }
+    })
+}
+
 /// Why a request to the daemon did not get the node's answer.
 enum Lost {
     /// The node detached (L-3): it is not retried, and the TUI asks for it again.
@@ -177,6 +194,7 @@ impl DaemonCore {
         account: Account,
         node: NodeName,
         anchors: Vec<String>,
+        stop: tokio_util::sync::CancellationToken,
     ) -> Result<Self, crate::app::AppError> {
         let (tx, rx) = mpsc::channel();
         let socket = account.socket();
@@ -232,6 +250,7 @@ impl DaemonCore {
             notice: None,
             timeline: None,
             ended: None,
+            stop,
         };
         if core.attached.iter().any(|n| n == core.node.as_str()) {
             // Attached already: it took its passphrase when it attached, and is used as it is.
@@ -267,7 +286,7 @@ impl DaemonCore {
             attach: AttachMode::No,
             ..using(None)
         };
-        let opened = self.rt.block_on(async {
+        let opened = until_stopped(&self.rt, &self.stop, async {
             let client = match IpcClient::open_node(&socket, first).await {
                 Ok(Ok(c)) => c,
                 Ok(Err(refusal)) => return Ok(Err(refusal)),
@@ -300,6 +319,9 @@ impl DaemonCore {
                 events: task,
             }))
         });
+        let Some(opened) = opened else {
+            return CommandStatus::Said("stopping".into());
+        };
         match opened {
             Ok(Ok(conn)) => {
                 self.conn = Some(conn);
@@ -358,6 +380,9 @@ impl DaemonCore {
             if let Ok(done) = tick {
                 break done;
             }
+            if self.stop.is_cancelled() {
+                return CommandStatus::Said("stopping".into());
+            }
         };
         match made {
             Ok(Ok(())) => self.attach(Some(pass)),
@@ -382,7 +407,10 @@ impl DaemonCore {
         let Some(conn) = self.conn.as_mut() else {
             return Err(Lost::Detached);
         };
-        match self.rt.block_on(conn.client.request(request)) {
+        let Some(answer) = until_stopped(&self.rt, &self.stop, conn.client.request(request)) else {
+            return Err(Lost::Gone("stopping".into()));
+        };
+        match answer {
             Ok(Frame::NodeDetached { .. }) => {
                 self.detached();
                 Err(Lost::Detached)
@@ -563,7 +591,10 @@ impl DaemonCore {
         let Some(conn) = self.conn.as_mut() else {
             return;
         };
-        match self.rt.block_on(conn.client.exchange(&body)) {
+        let Some(answer) = until_stopped(&self.rt, &self.stop, conn.client.exchange(&body)) else {
+            return;
+        };
+        match answer {
             Ok(reply) => match NodeSnapshot::from_bytes(&reply) {
                 Ok(Some(s)) => self.snapshot = s,
                 Ok(None) => match Frame::from_bytes(&reply) {
@@ -602,7 +633,10 @@ impl DaemonCore {
         let Some(conn) = self.conn.as_mut() else {
             return;
         };
-        let read = self.rt.block_on(conn.client.read_rows(cid, since));
+        let Some(read) = until_stopped(&self.rt, &self.stop, conn.client.read_rows(cid, since))
+        else {
+            return;
+        };
         let rows = match read {
             Ok(Frame::Rows { rows }) => rows,
             Ok(Frame::NodeDetached { .. }) => return self.detached(),
@@ -1016,10 +1050,13 @@ impl CoreHandle for DaemonCore {
                 let Some(conn) = self.conn.as_mut() else {
                     return CommandStatus::Failed(UiError::NotAttached);
                 };
-                match self.rt.block_on(vox_core::node::status::request_close_on(
-                    &mut conn.client,
-                    &which,
-                )) {
+                match until_stopped(
+                    &self.rt,
+                    &self.stop,
+                    vox_core::node::status::request_close_on(&mut conn.client, &which),
+                )
+                .unwrap_or(Err(vox_core::error::Error::MalformedIpc("stopping")))
+                {
                     Ok((0, _)) => CommandStatus::Failed(UiError::NoSuchTunnel),
                     Ok(_) => {
                         self.asked = None;
