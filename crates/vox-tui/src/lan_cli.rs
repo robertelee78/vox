@@ -630,3 +630,18 @@ mod mac {
         Ok(())
     }
 }
+
+/// `vox lan up <room>` as a client of the daemon (ADR-026 S-5).
+///
+/// # Errors
+/// Always, until the daemon carries the LAN.
+pub async fn up_held(
+    paths: &vox_core::node::paths::Paths,
+    args: &crate::cli::LanUpArgs,
+    waiting: &crate::tunnel_cli::Waiting,
+) -> Result<(), AppError> {
+    let _ = (paths, args, waiting);
+    Err(AppError::Usage(
+        "vox lan up is not carried by the vox daemon yet (ADR-026 S-5)".into(),
+    ))
+}

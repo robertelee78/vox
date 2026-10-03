@@ -16,138 +16,25 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use vox_core::nat::bootstrap::BootstrapSet;
-use vox_core::node::link::{merge_anchor_spec, merge_anchors_file};
-use vox_core::node::paths::{Paths, DEFAULT_PROFILE};
+use vox_core::node::paths::Paths;
 
 use crate::app::{run_live, run_node, AppError};
 
-/// Profile selection shared by the interactive commands.
-#[derive(Args, Debug, Clone)]
-pub struct ProfileArgs {
-    /// Profile name (one identity per profile).
-    #[arg(long, env = "VOX_PROFILE", default_value = DEFAULT_PROFILE)]
-    pub profile: String,
-    /// Data directory root (holds `<profile>/vault.cbor` and `store.redb`).
-    #[arg(long, env = "VOX_DATA_DIR")]
-    pub data_dir: Option<PathBuf>,
-    /// Config directory.
-    #[arg(long, env = "VOX_CONFIG_DIR")]
-    pub config_dir: Option<PathBuf>,
-    /// Address to bind for peer connections (`ip:port`; port 0 picks one).
-    ///
-    /// This is only where the socket binds. What the node *advertises* is worked out
-    /// separately by the ADR-012 ladder — its routable address, a gateway-mapped
-    /// address when one can be had, and loopback — so the wildcard default is correct
-    /// and needs no configuration.
-    #[arg(long, env = "VOX_LISTEN", default_value = DEFAULT_LISTEN)]
-    pub listen: SocketAddr,
-    /// Optional. An anchor bridges hosts that cannot otherwise reach each other, typically
-    /// both behind NAT; peers that can reach each other directly need none. Given as
-    /// `<fingerprint>@<multiaddr>` (repeatable; `VOX_ANCHORS` takes a comma-separated list).
-    #[arg(long = "anchor", env = "VOX_ANCHORS", value_delimiter = ',')]
-    pub anchors: Vec<String>,
-}
+pub use crate::client::NodeArgs;
 
-impl ProfileArgs {
-    /// Resolve (and create) the profile paths.
-    pub fn paths(&self) -> vox_core::error::Result<Paths> {
-        Paths::resolve(
-            &self.profile,
-            self.data_dir.as_deref(),
-            self.config_dir.as_deref(),
-        )
-    }
-
-    /// The configured anchors, parsed and merged by identity.
-    ///
-    /// **An anchors file that names no usable anchor stops nothing** (V210-107). Each skipped
-    /// line is said, then that the file names none, and the verb carries on with what is usable
-    /// (perhaps nothing): an anchor only bridges hosts that cannot otherwise reach each other
-    /// (ADR-012), so a peer this node can reach directly needs none, and a verb that does need
-    /// one fails where it needs it, saying what it tried. V210-75 refused such a file for every
-    /// verb that starts a node, which stopped `vox connect` to a directly reachable host.
-    ///
-    /// # Errors
-    /// A malformed `--anchor`, or a profile path that cannot be resolved.
-    pub fn anchor_set(&self) -> vox_core::error::Result<BootstrapSet> {
-        let (set, unusable) = self.anchor_set_lenient()?;
-        if let Some(e) = unusable {
-            eprintln!("vox: {e}; carrying on with no anchor");
-        }
-        Ok(set)
-    }
-
-    /// [`Self::anchor_set`], with the note that the anchors file names no usable anchor returned
-    /// rather than said, for `vox node`, which words it as an anchor running with none of its own.
-    pub fn anchor_set_lenient(
-        &self,
-    ) -> vox_core::error::Result<(BootstrapSet, Option<vox_core::error::Error>)> {
-        let mut set = BootstrapSet::new();
-        // The profile's anchors file first, then `--anchor` on top (ADR-017 decision 7,
-        // M17.4). Both merge into one set rather than one replacing the other: an anchor
-        // is additive — more introducers is strictly better reachability — and a person
-        // who adds one on the command line almost never means "and forget the one I
-        // configured". `vox node` writes its own spec into that file, so a client on the
-        // same machine as its anchor needs no flag at all, which was the whole point.
-        // A line that cannot be used is skipped and said, and the others still count (V210-75).
-        let file = self.paths()?.anchors_file();
-        let skipped = merge_anchors_file(&mut set, &file)?;
-        for line in &skipped {
-            eprintln!("vox: {line}");
-        }
-        // **A file that names nothing usable is not an empty file** (V210-75): with no
-        // `--anchor` either, the verb starts with no anchor at all, and says so.
-        let unusable = (set.is_empty()
-            && !skipped.is_empty()
-            && self.anchors.iter().all(|a| a.trim().is_empty()))
-        .then(|| vox_core::error::Error::AnchorsFileUnusable {
-            path: file.display().to_string(),
-            skipped: skipped.len(),
-        });
-        for spec in &self.anchors {
-            if spec.trim().is_empty() {
-                continue;
-            }
-            merge_anchor_spec(&mut set, spec)?;
-        }
-        Ok((set, unusable))
-    }
-}
-
-/// The room args of whichever `service` subcommand this is.
-fn sub_room(sub: &ServiceCmd) -> RoomArgs {
-    match sub {
-        ServiceCmd::Add(a) => a.room.clone(),
-        ServiceCmd::Remove(r) => r.room.clone(),
-        ServiceCmd::List(r) => r.room_args(),
-    }
-}
-
-/// The shape every one-shot tunnel verb shares: resolve the profile, collect the two
-/// passphrases, open the room, run the verb, report.
+/// Run a verb that holds a session on the daemon (ADR-026 L-7): `serve`, `connect`, `up`,
+/// `forward`.
 ///
-/// With `opens` false the verb opens no room (`vox service list`, V210-149): it asks for no
-/// room passphrase, and the room is one the unlocked profile holds open, or none.
-fn run_tunnel_verb<F, Fut>(room: RoomArgs, opens: bool, body: F) -> ExitCode
+/// **The whole run races every stop signal, from before the first prompt** (V210-108): the
+/// passphrase prompts run on a blocking thread inside `work`. A server's stop (`vox serve`) is its
+/// normal end and exits 0, as a service manager expects of a service it stopped; any other verb
+/// stopped before it finished exits 128 + the signal's number, saying what it waited for
+/// (V210-85). Stopping the client leaves the node as the daemon has it: the hold this verb took
+/// goes with its connection (L-3), and nothing here has a node to shut down.
+fn run_session<Fut>(waiting: std::sync::Arc<crate::tunnel_cli::Waiting>, work: Fut) -> ExitCode
 where
-    F: FnOnce(vox_core::node::actor::NodeHandle, vox_core::hash::Digest32) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
 {
-    let paths = match room.profile.paths() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let anchors = match room.profile.anchor_set() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -159,242 +46,21 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let listen = room.profile.listen;
     let (outcome, stopped) = rt.block_on(async move {
-        // **The race starts before the first prompt** (V210-108), as `run_new_room_verb_with`'s
-        // does. The prompts ran before the handler was taken, so a SIGTERM or SIGHUP while
-        // `vox up` or `vox forward` waited for a passphrase took the default action: it died
-        // saying nothing, and left the terminal it was reading in raw mode, without echo. They
-        // run on a blocking thread now, inside the race, and the same listener then races the
-        // room's opening and the verb itself, so no signal falls between two listeners.
+        // Taken here, before the work is first polled, so before its first prompt.
         let stop = crate::app::stop_requested("vox");
-        tokio::pin!(stop);
-        let asking = tokio::task::spawn_blocking(move || {
-            // **Not `passphrase_or_prompt`.** Removing clap's `env` from the flag — so a flag
-            // could be refused while the variable still worked — left this caller reading the
-            // flag only, and the flag is now always `None`. So `VOX_IDENTITY_PASSPHRASE` stopped
-            // working for every tunnel verb (`service`, `forward`, `up`) and they answered
-            // `Failed(WrongPassphrase)`, which sends a person to check a passphrase that was never
-            // read. One helper reads the flag, the file, the variable and the prompt, in that
-            // order; every caller uses it.
-            let identity = crate::tunnel_cli::identity_passphrase_for(
-                &paths,
-                room.identity_passphrase.clone(),
-                room.identity_passphrase_file.clone(),
-            )?;
-            let room_pp = if opens {
-                Some(crate::tunnel_cli::room_passphrase_for(
-                    room.passphrase.as_ref(),
-                    room.passphrase_file.as_deref(),
-                )?)
-            } else {
-                None
-            };
-            Ok::<_, crate::app::AppError>(crate::tunnel_cli::RoomTarget {
-                paths,
-                listen,
-                anchors,
-                identity_passphrase: identity,
-                room: room.room.clone(),
-                room_passphrase: room_pp,
-            })
-        });
-        let target = tokio::select! {
-            asked = asking => match asked {
-                Ok(Ok(target)) => target,
-                Ok(Err(e)) => return (Err(e), false),
-                Err(e) => {
-                    return (
-                        Err(crate::app::AppError::Usage(format!("asking for a passphrase: {e}"))),
-                        false,
-                    )
-                }
-            },
-            signal = &mut stop => return (Err(crate::app::AppError::stopped_by(signal)), true),
-        };
-        (
-            crate::tunnel_cli::with_room(target, stop, body).await,
-            false,
-        )
-    });
-    if stopped {
-        // A prompt stopped part-way leaves the terminal in raw mode: no echo, no line editing, in
-        // the shell it hands back to.
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-    let code = match outcome {
-        Ok(()) => ExitCode::SUCCESS,
-        // Its own code (a stopped client verb exits 128 + the signal's number, V210-108), and
-        // written without panicking: after a hangup stderr can be a terminal that is gone.
-        Err(e) => {
-            use std::io::Write as _;
-            let _ = writeln!(io::stderr(), "vox: {e}");
-            e.exit_code()
-        }
-    };
-    // Not a wait for the prompt it abandoned: dropping the runtime waits for its blocking
-    // threads, and one is still reading the terminal.
-    if stopped {
-        rt.shutdown_background();
-    }
-    code
-}
-
-/// The profile's control socket path, or `None` having said why there is none.
-fn socket_of(profile: &ProfileArgs) -> Option<std::path::PathBuf> {
-    match profile.paths() {
-        Ok(p) => Some(p.socket_file()),
-        Err(e) => {
-            eprintln!("vox: {e}");
-            None
-        }
-    }
-}
-
-/// The shape the room-*making* verbs share (`vox serve`, `vox connect`): resolve the
-/// profile, unlock the identity — creating it on first use — and run the verb.
-///
-/// Unlike [`run_tunnel_verb`] these do not open an existing room: `serve` is about to
-/// create one and `connect` is about to join one, so neither has a room id or a room
-/// passphrase to collect up front.
-fn run_new_room_verb<F, Fut>(
-    profile: ProfileArgs,
-    identity_passphrase: Option<String>,
-    identity_passphrase_file: Option<std::path::PathBuf>,
-    body: F,
-) -> ExitCode
-where
-    F: FnOnce(vox_core::node::actor::NodeHandle, BootstrapSet) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
-{
-    run_new_room_verb_with(
-        profile,
-        identity_passphrase,
-        identity_passphrase_file,
-        None,
-        || Ok(()),
-        move |node, anchors, ()| body(node, anchors),
-    )
-}
-
-/// [`run_new_room_verb`] for a verb that says what it was waiting for when a signal stops it
-/// (`vox connect`, V210-85): with `waiting`, the whole run races
-/// [`crate::app::stop_requested`], and a stop ends with
-/// [`crate::tunnel_cli::Waiting::stopped_by`]. `ask` collects what the verb needs from the person
-/// before the identity is unlocked — `connect`'s room passphrase — and its answer is handed to
-/// `body`.
-///
-/// **The race starts before the first prompt.** The prompts ran before the handler was taken, so a
-/// connect stopped while it waited at one — reading a passphrase from a pipe, or a terminal closed
-/// under it — still died on the signal and said nothing. They run on a blocking thread now, inside
-/// the race.
-fn run_new_room_verb_with<A, T, F, Fut>(
-    profile: ProfileArgs,
-    identity_passphrase: Option<String>,
-    identity_passphrase_file: Option<std::path::PathBuf>,
-    waiting: Option<std::sync::Arc<crate::tunnel_cli::Waiting>>,
-    ask: A,
-    body: F,
-) -> ExitCode
-where
-    A: FnOnce() -> Result<T, crate::app::AppError> + Send + 'static,
-    T: Send + 'static,
-    F: FnOnce(vox_core::node::actor::NodeHandle, BootstrapSet, T) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
-{
-    let paths = match profile.paths() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let anchors = match profile.anchor_set() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("vox: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let listen = profile.listen;
-    let anchors_for_body = anchors.clone();
-    let unlocking = waiting.clone();
-    // The node, once there is one, for a stop to shut down: see below.
-    let opened: std::sync::Arc<std::sync::Mutex<Option<vox_core::node::actor::NodeHandle>>> =
-        std::sync::Arc::default();
-    let opening = std::sync::Arc::clone(&opened);
-    let work = async move {
-        let asking = unlocking.clone();
-        let paths_for_asking = paths.clone();
-        let (asked, identity) = tokio::task::spawn_blocking(move || {
-            let asked = ask()?;
-            if let Some(w) = &asking {
-                w.on("this profile's identity passphrase");
+        tokio::select! {
+            signal = stop => {
+                let why = if waiting.serves() {
+                    crate::app::say(format_args!("vox: stopped by {}", signal.name()));
+                    crate::app::say(format_args!("vox: stopping"));
+                    Ok(())
+                } else {
+                    Err(waiting.stopped_by(signal))
+                };
+                (why, true)
             }
-            let identity = crate::tunnel_cli::identity_passphrase_for(
-                &paths_for_asking,
-                identity_passphrase,
-                identity_passphrase_file,
-            )?;
-            Ok::<_, crate::app::AppError>((asked, identity))
-        })
-        .await
-        .map_err(|e| crate::app::AppError::Usage(format!("asking for a passphrase: {e}")))??;
-        if let Some(w) = &unlocking {
-            w.on("this profile's identity to unlock");
-        }
-        let node = crate::tunnel_cli::open_profile(paths, listen, anchors, &identity).await?;
-        if let Ok(mut slot) = opening.lock() {
-            *slot = Some(node.clone());
-        }
-        body(node, anchors_for_body, asked).await
-    };
-    let (outcome, stopped) = rt.block_on(async move {
-        match waiting {
-            None => (work.await, false),
-            Some(waiting) => {
-                // Taken here, before the work is first polled, so before its first prompt.
-                let stop = crate::app::stop_requested("vox");
-                tokio::select! {
-                    signal = stop => {
-                        // **A server's stop is its normal end** (V210-108): `vox serve` says so and
-                        // exits 0, as a service manager expects of a service it stopped. A client
-                        // verb that did not finish exits 128 + the signal's number, saying why.
-                        let why = if waiting.serves() {
-                            crate::app::say(format_args!("vox: stopped by {}", signal.name()));
-                            crate::app::say(format_args!("vox: stopping"));
-                            Ok(())
-                        } else {
-                            Err(waiting.stopped_by(signal))
-                        };
-                        // **Its peers are told it went** (V210-85). Stopped mid-join, it left its
-                        // connections to the anchor and the host unclosed, and both counted it as
-                        // connected until their idle timeout. A shutdown closes each with a
-                        // reason; bounded, because what it abandoned must not hold the exit.
-                        let node = opened.lock().ok().and_then(|n| n.clone());
-                        if let Some(node) = node {
-                            let _ = tokio::time::timeout(
-                                STOP_CLOSE_PATIENCE,
-                                node.apply(vox_core::node::api::NodeCommand::Shutdown),
-                            )
-                            .await;
-                        }
-                        (why, true)
-                    }
-                    done = work => (done, false),
-                }
-            }
+            done = work => (done, false),
         }
     });
     if stopped {
@@ -413,32 +79,19 @@ where
         }
     };
     // **A stop is not a wait for the work it abandoned.** Dropping the runtime waits for its
-    // blocking threads, and one of them can be the join's proof of work: measured, a stopped
-    // `vox connect` printed why at once and then stayed alive past 15 s in a debug build,
-    // until the solve it no longer wanted finished. A prompt still reading is another. Nothing it
-    // was doing is kept either way — the store commits atomically, and survives a kill as it must.
+    // blocking threads, and one can still be reading the terminal.
     if stopped {
         rt.shutdown_background();
     }
     code
 }
 
-/// How long a stopped `vox connect` waits for its node to close its connections before it exits
-/// anyway. The closes go out first thing in a shutdown; the rest of it is not worth waiting for.
-const STOP_CLOSE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Whether a node is already serving this profile.
-fn node_answers(profile: &ProfileArgs) -> bool {
-    let Ok(paths) = profile.paths() else {
-        return false;
-    };
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return false;
-    };
-    rt.block_on(crate::room_cli::node_is_running(&paths))
+/// The identity passphrase sources a held verb was given.
+fn pass(
+    flag: Option<String>,
+    file: Option<std::path::PathBuf>,
+) -> crate::client::Pass {
+    crate::client::Pass { flag, file }
 }
 
 /// The service label a person's spec names: `53/udp` is `udp/53` (ADR-022 decision 6), and
@@ -470,26 +123,6 @@ where
             ExitCode::FAILURE
         }
     }
-}
-
-/// Whether a node is already serving this profile, so a trust verb should ask it.
-fn trust_over_socket(sub: &TrustCmd) -> bool {
-    let profile = match sub {
-        TrustCmd::List(a) => &a.profile,
-        TrustCmd::Add(a) => &a.profile,
-        TrustCmd::Remove(a) => &a.profile,
-        TrustCmd::Rename(a) => &a.profile,
-    };
-    let Ok(paths) = profile.paths() else {
-        return false;
-    };
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return false;
-    };
-    rt.block_on(crate::room_cli::node_is_running(&paths))
 }
 
 /// The name `vox trust add` files an identity under (V210-162): `--name`, or asked for on a
@@ -677,7 +310,7 @@ enum AppCmd {
 #[derive(Args, Debug, Clone)]
 pub struct AppListenArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// The label to listen for, `name/vN`.
@@ -688,7 +321,7 @@ pub struct AppListenArgs {
 #[derive(Args, Debug, Clone)]
 pub struct AppOpenArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// The member to open to (fingerprint, or a unique prefix).
@@ -739,7 +372,7 @@ enum RoomCmd {
     /// ```
     Ping(RoomPingArgs),
     /// List the rooms this node holds.
-    List(ProfileArgs),
+    List(NodeArgs),
     /// Take a unit of work, so no other agent starts it (ADR-020 §5).
     ///
     /// The room is the record of who holds what. Holding an item is not progress: the
@@ -843,7 +476,7 @@ enum RoomCmd {
 #[derive(Args, Debug, Clone)]
 pub struct JoinRoomArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The `vox://` address you were given.
     pub link: String,
     /// A local name for the room. Never leaves this device.
@@ -859,7 +492,7 @@ pub struct JoinRoomArgs {
 #[derive(Args, Debug, Clone)]
 pub struct CreateRoomArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// A local name for the room. Never leaves this device.
     #[arg(long, default_value = "room")]
     pub name: String,
@@ -877,7 +510,7 @@ pub struct CreateRoomArgs {
 #[derive(Args, Debug, Clone)]
 pub struct AdminArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// `add`, `remove` or `list`.
     pub action: String,
     /// The room's id, or a unique prefix of it.
@@ -890,7 +523,7 @@ pub struct AdminArgs {
 #[derive(Args, Debug, Clone)]
 pub struct RetentionArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`.
@@ -907,7 +540,7 @@ pub struct RetentionArgs {
 #[derive(Args, Debug, Clone)]
 pub struct SendFileArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// The file to offer.
@@ -918,7 +551,7 @@ pub struct SendFileArgs {
 #[derive(Args, Debug, Clone)]
 pub struct GetFileArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// The file's name, or a prefix of its SHA-256, or its service tag.
@@ -936,7 +569,7 @@ pub struct GetFileArgs {
 #[derive(Args, Debug, Clone)]
 pub struct DaemonArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// Read the passphrases from this file, for a service manager that prefers one: the
     /// identity passphrase on the first line, then any room lines. Without it the identity
     /// passphrase is taken from `VOX_IDENTITY_PASSPHRASE`, else asked for at the terminal,
@@ -965,7 +598,7 @@ pub enum TunnelCmd {
 #[derive(Args, Debug, Clone)]
 pub struct TunnelCloseArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The member whose tunnels to close: their id as `vox status` prints it, or the start of it.
     #[arg(required_unless_present = "id")]
     pub member: Option<String>,
@@ -980,7 +613,7 @@ pub struct TunnelCloseArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ShareArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// The file or folder to share. A folder is served as one tar.
@@ -997,7 +630,7 @@ pub struct ShareArgs {
 #[derive(Args, Debug, Clone)]
 pub struct StatusArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// Print the node's report as JSON, for machines.
     #[arg(long)]
     pub json: bool,
@@ -1035,7 +668,7 @@ impl CoordArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ClaimArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// What is being claimed — a file, a milestone, a crate, whatever the room
@@ -1056,7 +689,7 @@ pub struct ClaimArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ResourceArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// The resource.
@@ -1069,7 +702,7 @@ pub struct ResourceArgs {
 #[derive(Args, Debug, Clone)]
 pub struct HandoffArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// What is being handed off.
@@ -1092,7 +725,7 @@ pub struct HandoffArgs {
 #[derive(Args, Debug, Clone)]
 pub struct RoomBoardArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// Print one `vox.room.board/1` JSON object.
@@ -1107,7 +740,7 @@ pub struct RoomBoardArgs {
 #[derive(Args, Debug, Clone)]
 pub struct RoomTailArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// Start after this entry hash — the full 52 characters — rather than at the
@@ -1207,7 +840,7 @@ enum AgentCmd {
 #[derive(Args, Debug, Clone)]
 pub struct AgentDoctorArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room to check, or a unique prefix. Falls back to `VOX_ROOM`, then to the node's only
     /// room.
     #[arg(long)]
@@ -1221,7 +854,7 @@ pub struct AgentDoctorArgs {
 #[derive(Args, Debug, Clone)]
 pub struct RoomPingArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// The member to ask: this node's name for it, or its fingerprint.
@@ -1286,7 +919,7 @@ pub struct AgentPluginArgs {
 #[derive(Args, Debug, Clone)]
 pub struct AgentHookArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// Drain only this room (its id, or a unique prefix). Without it the hook drains every
     /// room the node holds, each under its own heading.
     #[arg(long)]
@@ -1317,7 +950,7 @@ pub struct AgentHookArgs {
 #[derive(Args, Debug, Clone)]
 pub struct RoomRefArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
 }
@@ -1326,7 +959,7 @@ pub struct RoomRefArgs {
 #[derive(Args, Debug, Clone)]
 pub struct RoomPostArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// The message. Omit it, or pass `-`, to read from stdin.
@@ -1370,7 +1003,7 @@ pub struct RoomPostArgs {
 #[derive(Args, Debug, Clone)]
 pub struct RoomReadArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// Return only what arrived after this entry hash, in the order it arrived — the
@@ -1401,7 +1034,7 @@ pub struct RoomReadArgs {
 #[derive(Args, Debug, Clone)]
 pub struct RoomArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// **Refused**, like `--identity-passphrase`: a command line is readable by every
@@ -1437,7 +1070,7 @@ pub struct RoomArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ServiceListArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
     /// **Refused**, as for every verb: a command line is readable by every process on the
@@ -1448,20 +1081,6 @@ pub struct ServiceListArgs {
     /// Read the identity passphrase from this file (first line).
     #[arg(long)]
     pub identity_passphrase_file: Option<std::path::PathBuf>,
-}
-
-impl ServiceListArgs {
-    /// As [`RoomArgs`], with no room passphrase.
-    fn room_args(&self) -> RoomArgs {
-        RoomArgs {
-            profile: self.profile.clone(),
-            room: self.room.clone(),
-            passphrase: None,
-            passphrase_file: None,
-            identity_passphrase: self.identity_passphrase.clone(),
-            identity_passphrase_file: self.identity_passphrase_file.clone(),
-        }
-    }
 }
 
 /// `vox service add`
@@ -1489,7 +1108,7 @@ pub struct ServiceRemoveArgs {
 #[derive(Args, Debug, Clone)]
 pub struct IdentityArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
     /// machine, and lands in the shell's history besides. It is still accepted by the
@@ -1514,11 +1133,134 @@ pub enum Serve {
     Trusted,
 }
 
-/// `vox node`
+/// The account a `vox node` subcommand acts on.
 #[derive(Args, Debug, Clone)]
-pub struct NodeArgs {
+pub struct AccountArgs {
+    /// Data directory root (holds `nodes/<name>/` and the daemon's `.daemon/`).
+    #[arg(long, env = "VOX_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+    /// Config directory.
+    #[arg(long, env = "VOX_CONFIG_DIR")]
+    pub config_dir: Option<PathBuf>,
+    /// Address the daemon binds when this command starts it (ADR-026 D-3).
+    #[arg(long, env = "VOX_LISTEN", default_value = crate::client::DEFAULT_LISTEN)]
+    pub listen: SocketAddr,
+    /// Anchors a node is attached with (`<fingerprint>@<multiaddr>`, repeatable).
+    #[arg(long = "anchor", env = "VOX_ANCHORS", value_delimiter = ',')]
+    pub anchors: Vec<String>,
+}
+
+impl AccountArgs {
+    /// As the node flags every verb takes, naming no node.
+    fn as_node_args(&self) -> NodeArgs {
+        NodeArgs {
+            node: None,
+            data_dir: self.data_dir.clone(),
+            config_dir: self.config_dir.clone(),
+            listen: self.listen,
+            anchors: self.anchors.clone(),
+        }
+    }
+}
+
+/// `vox node create|attach|detach|list` (ADR-026 §3).
+#[derive(Subcommand, Debug, Clone)]
+pub enum NodeCmd {
+    /// Make a new node: an identity with its own rooms, trust and services. Its files are
+    /// written here; nothing is attached until it is used or `vox node attach`ed. The
+    /// passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or is asked twice;
+    /// an empty one is allowed.
+    Create {
+        /// The node's name: letters a-z, digits, '.', '_' and '-'.
+        name: String,
+        /// Read the new identity's passphrase from this file (first line; `-` reads stdin).
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Attach a node to the daemon by hand (starting the daemon if none runs). It runs in full
+    /// until `vox node detach` or the daemon stops. `--keep` attaches it again whenever the
+    /// daemon starts, with its passphrase from `--passphrase-file`.
+    Attach {
+        /// The node.
+        name: String,
+        /// Attach it again whenever the daemon starts.
+        #[arg(long)]
+        keep: bool,
+        /// Read the identity passphrase from this file (first line). With `--keep`, the daemon
+        /// reads it from there at each start.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Detach a node: its connections close and its keys are wiped from memory.
+    Detach {
+        /// The node.
+        name: String,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Every node in this data root, with whether it is attached.
+    List {
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+}
+
+/// Run a `vox node` subcommand.
+fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
+    let outcome = match cmd {
+        NodeCmd::Create {
+            name,
+            passphrase_file,
+            account,
+        } => crate::client::node_create(&account.as_node_args(), &name, passphrase_file),
+        NodeCmd::Attach {
+            name,
+            keep,
+            passphrase_file,
+            account,
+        } => block_on_client(async move {
+            crate::client::node_attach(&account.as_node_args(), &name, keep, passphrase_file).await
+        }),
+        NodeCmd::Detach { name, account } => block_on_client(async move {
+            crate::client::node_detach(&account.as_node_args(), &name).await
+        }),
+        NodeCmd::List { account } => block_on_client(async move {
+            crate::client::node_list(&account.as_node_args()).await
+        }),
+    };
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vox node: {e}");
+            e.exit_code()
+        }
+    }
+}
+
+/// Run a client's work on a small runtime of its own.
+fn block_on_client<Fut>(work: Fut) -> Result<(), AppError>
+where
+    Fut: std::future::Future<Output = Result<(), AppError>>,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(work)
+}
+
+/// `vox node` (the anchor) and its subcommands.
+#[derive(Args, Debug, Clone)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct AnchorArgs {
+    /// `vox node create|attach|detach|list`; without one, `vox node` runs the anchor.
+    #[command(subcommand)]
+    pub cmd: Option<NodeCmd>,
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// Which rooms this anchor serves: `anyone` (the default) serves any room published to
     /// it; `trusted` serves only rooms made by someone in this profile's `vox trust` list.
     /// `trusted` needs this profile's identity passphrase to read that list, and reads it once
@@ -1558,7 +1300,7 @@ fn anchor_paths(paths: Paths) -> vox_core::error::Result<Paths> {
     paths.account().node_paths(&anchor)
 }
 
-impl NodeArgs {
+impl AnchorArgs {
     /// The `--serve` choice: the flag (or `VOX_SERVE`), else the config directory's `serve`
     /// file, else `anyone`. A `serve` file that says anything else is refused, not guessed at.
     fn serve(&self, paths: &Paths) -> Result<Serve, AppError> {
@@ -1663,7 +1405,7 @@ enum TrustCmd {
 #[derive(Args, Debug, Clone)]
 pub struct TrustRenameArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The trusted identity (base32, or a unique prefix).
     pub fingerprint: String,
     /// Its new name.
@@ -1680,7 +1422,7 @@ pub struct TrustRenameArgs {
 #[derive(Args, Debug, Clone)]
 pub struct TrustAddArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The identity to trust, as `vox id` prints it (base32, or a unique prefix of one
     /// this node already knows).
     pub fingerprint: String,
@@ -1713,7 +1455,7 @@ pub struct TrustAddArgs {
 #[derive(Args, Debug, Clone)]
 pub struct TrustRemoveArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The identity to stop trusting.
     pub fingerprint: String,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
@@ -1735,23 +1477,26 @@ pub struct TrustRemoveArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ForwardArgs {
     #[command(flatten)]
-    pub room: RoomArgs,
-    /// The member sharing the service (its fingerprint, or a unique prefix). When the room
-    /// is given as a service's address, `<service>.<node>.<room>.vox`, the local port or
-    /// address to listen on instead.
-    pub host: Option<String>,
-    /// The service to reach, by the name its sharer gave it. Not given with an address.
-    pub tag: Option<String>,
-    /// Where to listen locally; port 0 picks one.
-    #[arg(default_value = "127.0.0.1:0")]
-    pub local: SocketAddr,
+    pub profile: NodeArgs,
+    /// The service's address: `<service>.<node>.<room>.vox` (`vox service list <room>` shows
+    /// each one).
+    pub address: String,
+    /// Where to listen locally: a port on loopback, or `ip:port`; port 0 picks one.
+    pub local: Option<String>,
+    /// **Refused.** Use `--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line), for attaching this node when
+    /// it is not attached.
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox serve`
 #[derive(Args, Debug, Clone)]
 pub struct ServeArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The services to share, each named: `<name>=<port>` (TCP), `<name>=<port>/tcp` or
     /// `<name>=<port>/udp`. A member reaches each as `<name>.<node>.<room>.vox`, and only that
     /// way; a bare port is refused. The first creates the room; `vox serve ssh=22 dns=53/udp`
@@ -1783,7 +1528,7 @@ pub struct ServeArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ConnectArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// The `vox://…` address you were given.
     pub address: String,
     /// **Refused**, like `--identity-passphrase`: a command line is readable by every
@@ -1822,7 +1567,7 @@ pub struct ConnectArgs {
 #[derive(Args, Debug, Clone)]
 pub struct UpArgs {
     #[command(flatten)]
-    pub profile: ProfileArgs,
+    pub profile: NodeArgs,
     /// One room to open and carry, with its passphrase. Omitted, the proxy runs inside
     /// the node already holding this profile (`vox daemon`) and carries every room it
     /// holds: `ssh nas.family.vox` for any node you trust, in any room (PRD-001 R20).
@@ -1846,10 +1591,7 @@ pub struct UpArgs {
     pub bind: SocketAddr,
 }
 
-/// The default bind address: every interface, kernel-chosen port. The bound address
-/// is not what peers are told to dial (see [`ProfileArgs::listen`]), so binding
-/// broadly is right.
-const DEFAULT_LISTEN: &str = "0.0.0.0:0";
+use crate::client::DEFAULT_LISTEN;
 
 /// Vox Lux — serverless, end-to-end-encrypted terminal client.
 #[derive(Parser)]
@@ -1864,7 +1606,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the interactive terminal client (the default).
-    Tui(ProfileArgs),
+    Tui(NodeArgs),
     /// Run a headless node: the always-on anchor that serves the board, coordinates
     /// hole punches and carries circuits for your rooms. Needed only when your hosts are
     /// both behind NAT and cannot reach each other directly. It holds no room and can
@@ -1872,7 +1614,7 @@ enum Cmd {
     /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
     ///
     /// Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
-    Node(NodeArgs),
+    Node(AnchorArgs),
     /// Run this profile's node without a terminal, so agent sessions can attach
     /// (ADR-020 §12).
     ///
@@ -2045,8 +1787,8 @@ enum Cmd {
 #[must_use]
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    let default_tui = Cmd::Tui(ProfileArgs {
-        profile: DEFAULT_PROFILE.to_owned(),
+    let default_tui = Cmd::Tui(NodeArgs {
+        node: std::env::var("VOX_NODE").ok(),
         data_dir: std::env::var_os("VOX_DATA_DIR").map(PathBuf::from),
         config_dir: std::env::var_os("VOX_CONFIG_DIR").map(PathBuf::from),
         listen: DEFAULT_LISTEN
@@ -2058,7 +1800,7 @@ pub fn run() -> ExitCode {
     });
     match cli.command.unwrap_or(default_tui) {
         Cmd::Tui(args) => {
-            let paths = match args.paths() {
+            let paths = match args.paths_creating() {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("vox: {e}");
@@ -2080,9 +1822,13 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        Cmd::Node(AnchorArgs {
+            cmd: Some(cmd),
+            ..
+        }) => run_node_cmd(cmd),
         Cmd::Node(node_args) => {
             let args = &node_args.profile;
-            let paths = match args.paths() {
+            let paths = match args.paths_creating() {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("vox node: {e}");
@@ -2124,48 +1870,57 @@ pub fn run() -> ExitCode {
             }
         }
         Cmd::Serve(args) => {
-            let Some(socket) = socket_of(&args.profile) else {
-                return ExitCode::FAILURE;
+            let paths = match args.profile.paths_creating() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
             };
-            let a = args.clone();
-            // Raced against every stop signal from before the identity is unlocked (V210-108).
-            run_new_room_verb_with(
-                args.profile.clone(),
-                args.identity_passphrase.clone(),
-                args.identity_passphrase_file.clone(),
-                Some(crate::tunnel_cli::Waiting::server()),
-                || Ok(()),
-                move |node, _anchors, ()| async move {
-                    // Only the verbs that keep running serve the socket: `vox id` and the trust
-                    // verbs share this path and are done in a moment (V210-83, #263).
-                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
-                    crate::tunnel_cli::serve(&node, &a.name, &a.ports, a.at).await
-                },
-            )
+            let waiting = crate::tunnel_cli::Waiting::server();
+            let steps = std::sync::Arc::clone(&waiting);
+            run_session(waiting, async move {
+                crate::tunnel_cli::serve(
+                    &paths,
+                    &args.profile,
+                    pass(args.identity_passphrase, args.identity_passphrase_file),
+                    &args.name,
+                    &args.ports,
+                    args.at,
+                    &steps,
+                )
+                .await
+            })
         }
         Cmd::Connect(args) => {
-            let Some(socket) = socket_of(&args.profile) else {
-                return ExitCode::FAILURE;
+            let paths = match args.profile.paths_creating() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
             };
-            let a = args.clone();
             let waiting = crate::tunnel_cli::Waiting::new("the room was not joined");
             let steps = std::sync::Arc::clone(&waiting);
-            let asking = std::sync::Arc::clone(&waiting);
-            let (given, file) = (args.passphrase.clone(), args.passphrase_file.clone());
-            run_new_room_verb_with(
-                args.profile.clone(),
-                args.identity_passphrase.clone(),
-                args.identity_passphrase_file.clone(),
-                Some(waiting),
-                move || {
-                    asking.on("the room passphrase");
+            run_session(waiting, async move {
+                steps.on("the room passphrase");
+                let (given, file) = (args.passphrase.clone(), args.passphrase_file.clone());
+                let room_pp = tokio::task::spawn_blocking(move || {
                     crate::tunnel_cli::room_passphrase_for(given.as_ref(), file.as_deref())
-                },
-                move |node, _anchors, room_pp| async move {
-                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
-                    crate::tunnel_cli::connect(&node, &a.address, &a.name, &room_pp, &steps).await
-                },
-            )
+                })
+                .await
+                .map_err(|e| AppError::Usage(format!("asking for a passphrase: {e}")))??;
+                crate::tunnel_cli::connect(
+                    &paths,
+                    &args.profile,
+                    pass(args.identity_passphrase, args.identity_passphrase_file),
+                    &args.address,
+                    &args.name,
+                    &room_pp,
+                    &steps,
+                )
+                .await
+            })
         }
         Cmd::Room(sub) => {
             // These attach to a running node rather than starting one, so they need
@@ -2408,8 +2163,13 @@ pub fn run() -> ExitCode {
             })
         }
         Cmd::Tunnel(TunnelCmd::Close(args)) => {
-            let paths = match args.profile.paths() {
-                Ok(p) => p,
+            let at = match args
+                .profile
+                .paths()
+                .map_err(AppError::from)
+                .and_then(|p| crate::client::one_shot(&p))
+            {
+                Ok(at) => at,
                 Err(e) => {
                     eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
@@ -2430,10 +2190,9 @@ pub fn run() -> ExitCode {
                 member: args.member.clone(),
                 service: args.service.clone(),
             };
-            match rt.block_on(vox_core::node::status::request_close(
-                &paths.socket_file(),
-                &which,
-            )) {
+            // Only this node's own tunnels: the daemon answers it as the node the `Use` names
+            // (ADR-026 P-1, §10.4).
+            match rt.block_on(vox_core::node::status::request_close(&at, &which)) {
                 Ok((0, refused)) if !refused.is_empty() => {
                     eprintln!("vox: {refused}");
                     ExitCode::FAILURE
@@ -2450,7 +2209,7 @@ pub fn run() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("vox: no running node answered: {e}");
+                    eprintln!("vox: {}", crate::client::said(&at, e));
                     ExitCode::FAILURE
                 }
             }
@@ -2748,120 +2507,70 @@ pub fn run() -> ExitCode {
         // profile is not ours to open while a daemon holds it, and stopping the daemon to add a
         // service, then starting it again with every room's passphrase, is not something a person
         // should have to do. The daemon holds the room open already, so no passphrase is asked.
-        Cmd::Service(ServiceCmd::Add(a)) if node_answers(&a.room.profile) => {
-            let paths = match a.room.profile.paths() {
+        // **Asked of the daemon, as the node** (ADR-026 S-3): a service is kept by the node, so it
+        // is offered again whenever the node attaches (V030-06), and the room it is offered in is
+        // one the node holds open. Nothing here opens a room or asks for a passphrase.
+        Cmd::Service(sub) => {
+            let profile = match &sub {
+                ServiceCmd::Add(a) => &a.room.profile,
+                ServiceCmd::Remove(r) => &r.room.profile,
+                ServiceCmd::List(r) => &r.profile,
+            };
+            let paths = match profile.paths() {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match rt.block_on(crate::room_cli::service_add(
-                &paths,
-                &a.room.room,
-                &label_of(&a.tag),
-                a.local,
-            )) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        // Ask the running node when there is one, like `vox trust`: the profile is not ours to
-        // open while it runs, and a running host is the case R22 is about.
-        Cmd::Service(ServiceCmd::Remove(r)) if node_answers(&r.room.profile) => {
-            let paths = match r.room.profile.paths() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match rt.block_on(crate::room_cli::service_remove(
-                &paths,
-                &r.room.room,
-                &label_of(&r.tag),
-            )) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        // Ask the running node when there is one, as `add` and `remove` do (V030-24): the
-        // profile is not ours to open while a daemon holds it.
-        Cmd::Service(ServiceCmd::List(r)) if node_answers(&r.profile) => {
-            let paths = match r.profile.paths() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match rt.block_on(crate::room_cli::service_list(&paths, &r.room)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Cmd::Service(sub) => run_tunnel_verb(
-            sub_room(&sub),
-            !matches!(sub, ServiceCmd::List(_)),
-            move |node, cid| {
-                let sub = sub.clone();
-                async move {
-                    match &sub {
-                        ServiceCmd::Add(a) => {
-                            crate::tunnel_cli::service_add(&node, cid, &label_of(&a.tag), a.local)
-                                .await
-                        }
-                        ServiceCmd::Remove(r) => {
-                            crate::tunnel_cli::service_remove(&node, cid, &label_of(&r.tag)).await
-                        }
-                        ServiceCmd::List(_) => crate::tunnel_cli::service_list(&node, cid).await,
+            run_attached(async move {
+                match &sub {
+                    ServiceCmd::Add(a) => {
+                        crate::room_cli::service_add(
+                            &paths,
+                            &a.room.room,
+                            &label_of(&a.tag),
+                            a.local,
+                        )
+                        .await
                     }
+                    ServiceCmd::Remove(r) => {
+                        crate::room_cli::service_remove(&paths, &r.room.room, &label_of(&r.tag))
+                            .await
+                    }
+                    ServiceCmd::List(r) => crate::room_cli::service_list(&paths, &r.room).await,
                 }
-            },
-        ),
-        // Ask the running node when there is one: a fingerprint is public, the hello
-        // already carries it, and needing the profile to yourself to read your own name
-        // was the most gratuitous case of the busy-profile problem.
-        Cmd::Id(args) if node_answers(&args.profile) => {
+            })
+        }
+        // **The fingerprint is read, never served by a node of this verb's own** (ADR-026 S-3):
+        // from the daemon when the node is attached, else from the node's files, which hold it
+        // in the clear. A node with no identity has one made here first (C-5).
+        Cmd::Id(args) => {
+            let paths = match args.profile.paths_creating() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match crate::room_cli::print_identity(
+                &paths,
+                args.identity_passphrase.clone(),
+                args.identity_passphrase_file.clone(),
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // **Always asked of the daemon, as the node** (ADR-026 S-3): a read needs no passphrase,
+        // and a change needs it only once 30 minutes have passed since it was last entered, when
+        // this asks for it (V210-159, N-2). Whoever runs as this user is this user; the socket's
+        // owner check is the boundary.
+        Cmd::Trust(sub) => run_trust_over_socket(sub),
+        Cmd::Up(args) => {
             let paths = match args.profile.paths() {
                 Ok(p) => p,
                 Err(e) => {
@@ -2869,186 +2578,70 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-            else {
-                eprintln!("vox: could not start a runtime");
-                return ExitCode::FAILURE;
-            };
-            match rt.block_on(crate::room_cli::print_identity(&paths)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    ExitCode::FAILURE
+            let waiting = crate::tunnel_cli::Waiting::server();
+            let steps = std::sync::Arc::clone(&waiting);
+            run_session(waiting, async move {
+                if args.passphrase.is_some() {
+                    return Err(AppError::Usage(format!(
+                        "--passphrase is refused: a command line is readable by every process on \
+                         this machine. {}",
+                        crate::tunnel_cli::GIVE_ROOM_PASSPHRASE
+                    )));
                 }
-            }
-        }
-        Cmd::Id(args) => run_new_room_verb(
-            args.profile.clone(),
-            args.identity_passphrase.clone(),
-            args.identity_passphrase_file.clone(),
-            move |node, _anchors| async move {
-                let Some(id) = node.view().identity else {
-                    return Err(crate::app::AppError::Usage(
-                        "this profile has no identity yet".into(),
-                    ));
-                };
-                // The whole fingerprint, alone on the line, so it pipes and pastes without
-                // editing. A person is about to send this to someone who will type it into
-                // `vox trust add`.
-                println!("{}", vox_core::node::link::b32_encode(&id.fingerprint));
-                Ok(())
-            },
-        ),
-        // **Ask the running node when there is one.** These three used to spawn a node of
-        // their own, which redb refuses while a `vox daemon` holds the profile — so the
-        // one command a person cannot skip, deciding who may read them, was unavailable
-        // exactly when they were setting up agent comms. Over the socket the node decides:
-        // a read needs no passphrase, and a change needs it only once 30 minutes have
-        // passed since it was last entered, when this asks for it (V210-159). Whoever runs
-        // as this user is this user; the socket's file mode is the boundary.
-        Cmd::Trust(sub) if trust_over_socket(&sub) => run_trust_over_socket(sub),
-        // With no node running the keyring is read from the store, sealed under the identity, so
-        // this one read needs the passphrase. Said as that, with the way to read it without one.
-        Cmd::Trust(TrustCmd::List(args))
-            if args.identity_passphrase.is_none()
-                && args.identity_passphrase_file.is_none()
-                && std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none()
-                && !std::io::IsTerminal::is_terminal(&io::stdin()) =>
-        {
-            eprintln!(
-                "vox: no node is running, and reading the keyring without one needs the identity \
-                 passphrase: it is sealed under it. There is no terminal to ask at.\n\
-                 \x20      Start `vox daemon`, and `vox trust list` needs none.\n\
-                 \x20      {}",
-                crate::tunnel_cli::GIVE_IDENTITY_PASSPHRASE
-            );
-            ExitCode::FAILURE
-        }
-        Cmd::Trust(TrustCmd::List(args)) => run_new_room_verb(
-            args.profile.clone(),
-            args.identity_passphrase.clone(),
-            args.identity_passphrase_file.clone(),
-            move |node, _anchors| async move {
-                let trusted = node.view().trusted;
-                if trusted.is_empty() {
-                    println!("vox: this node trusts nobody yet.");
-                    println!("     ask them for `vox id` and run `vox trust add <fingerprint>`");
-                    return Ok(());
-                }
-                for (fp, petname) in trusted {
-                    println!("{}  {petname}", vox_core::node::link::b32_encode(&fp));
-                }
-                Ok(())
-            },
-        ),
-        Cmd::Trust(TrustCmd::Add(args)) => {
-            let a = args.clone();
-            let name = match trust_name(&a) {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            run_new_room_verb(
-                args.profile.clone(),
-                args.identity_passphrase.clone(),
-                args.identity_passphrase_file.clone(),
-                move |node, _anchors| async move {
-                    crate::tunnel_cli::trust_add(&node, &a.fingerprint, &name, a.history == "full")
-                        .await
-                },
-            )
-        }
-        Cmd::Trust(TrustCmd::Rename(args)) => {
-            let a = args.clone();
-            run_new_room_verb(
-                args.profile.clone(),
-                args.identity_passphrase.clone(),
-                args.identity_passphrase_file.clone(),
-                move |node, _anchors| async move {
-                    crate::tunnel_cli::trust_rename(&node, &a.fingerprint, &a.name).await
-                },
-            )
-        }
-        Cmd::Trust(TrustCmd::Remove(args)) => {
-            let a = args.clone();
-            run_new_room_verb(
-                args.profile.clone(),
-                args.identity_passphrase.clone(),
-                args.identity_passphrase_file.clone(),
-                move |node, _anchors| async move {
-                    crate::tunnel_cli::trust_remove(&node, &a.fingerprint).await
-                },
-            )
-        }
-        Cmd::Up(args) => {
-            let bind = args.bind;
-            let Some(room) = args.room.clone() else {
-                // Every room, from the node already running this profile.
-                let paths = match args.profile.paths() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("vox: {e}");
-                        return ExitCode::FAILURE;
+                let room_pp = match &args.passphrase_file {
+                    Some(f) => {
+                        let text = crate::tunnel_cli::passphrase_file_text(f)?;
+                        Some(text.lines().next().unwrap_or_default().to_owned())
                     }
+                    None => None,
                 };
-                return run_attached(async move { crate::tunnel_cli::up_all(&paths, bind).await });
-            };
-            let room = RoomArgs {
-                profile: args.profile.clone(),
-                room,
-                passphrase: args.passphrase.clone(),
-                passphrase_file: args.passphrase_file.clone(),
-                identity_passphrase: args.identity_passphrase.clone(),
-                identity_passphrase_file: args.identity_passphrase_file.clone(),
-            };
-            run_tunnel_verb(room, true, move |node, cid| async move {
-                crate::tunnel_cli::up(&node, cid, bind).await
+                let room = args
+                    .room
+                    .as_deref()
+                    .map(|r| (r, room_pp.as_deref()));
+                crate::tunnel_cli::up(
+                    &paths,
+                    &args.profile,
+                    pass(args.identity_passphrase, args.identity_passphrase_file),
+                    room,
+                    args.bind,
+                    &steps,
+                )
+                .await
             })
         }
+        // One shape: a service's address, `vox forward <service>.<node>.<room>.vox [<local>]`
+        // (V030-25), resolved and carried by the daemon as this node. The three-word form,
+        // `vox forward <room> <member> <service>`, is gone with the in-process node it needed.
         Cmd::Forward(args) => {
-            // Two shapes. `vox forward <room> <host> <service> [local]`, and a service's address,
-            // `vox forward <service>.<node>.<room>.vox [<local>]` (V030-25), resolved by the node
-            // already holding the profile, which carries the forward.
-            let room = args.room.clone();
-            let name = room.room.trim().to_ascii_lowercase();
-            if name.ends_with(".vox") {
-                let paths = match room.profile.paths() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("vox: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                if args.tag.is_some() {
-                    eprintln!(
-                        "vox: a service's address names the service already: \
-                         vox forward <service>.<node>.<room>.vox [<local>]"
-                    );
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
                 }
-                let local = args
-                    .host
-                    .clone()
-                    .unwrap_or_else(|| "127.0.0.1:0".to_owned());
-                return run_attached(async move {
-                    crate::tunnel_cli::forward_named(&paths, &name, &local).await
-                });
-            }
-            let (Some(host), Some(tag)) = (args.host.clone(), args.tag.clone()) else {
+            };
+            let name = args.address.trim().to_ascii_lowercase();
+            if !name.ends_with(".vox") {
                 eprintln!(
-                    "vox: name the member and the service: vox forward <room> <member> <service> \
-                     [<local>], or vox forward <service>.<node>.<room>.vox [<local>]"
+                    "vox: forward a service by its address: vox forward \
+                     <service>.<node>.<room>.vox [<local>]  (`vox service list <room>` shows each)"
                 );
                 return ExitCode::FAILURE;
-            };
-            let local = args.local;
-            run_tunnel_verb(room, true, move |node, cid| async move {
-                crate::tunnel_cli::forward(&node, cid, &host, &tag, local).await
+            }
+            let local = args.local.clone().unwrap_or_else(|| "127.0.0.1:0".to_owned());
+            let waiting = crate::tunnel_cli::Waiting::server();
+            let steps = std::sync::Arc::clone(&waiting);
+            run_session(waiting, async move {
+                crate::tunnel_cli::forward_named(
+                    &paths,
+                    &args.profile,
+                    pass(args.identity_passphrase, args.identity_passphrase_file),
+                    &name,
+                    &local,
+                    &steps,
+                )
+                .await
             })
         }
         Cmd::Lan(LanCmd::Helper(a)) => match crate::lan_cli::run_helper(&a.socket) {
@@ -3059,33 +2652,22 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::Lan(LanCmd::Up(a)) => {
-            // Asked before the profile is touched: without a helper nothing here can work,
-            // and a refusal should leave nothing behind — not even a profile directory.
+            // Asked before the node is touched: without a helper nothing here can work, and a
+            // refusal should leave nothing behind.
             if !crate::lan_cli::helper_reachable(&a.helper_socket) {
                 eprintln!("vox: {}", crate::lan_cli::no_helper(&a.helper_socket));
                 return ExitCode::FAILURE;
             }
-            let (socket, stats) = (a.helper_socket.clone(), a.stats_file.clone());
-            let allow = a.allow.iter().copied().collect();
-            let metrics = a.metrics;
-            let node_name = a.room.profile.profile.clone();
-            run_tunnel_verb(a.room.clone(), true, move |node, cid| async move {
-                // A running LAN answers as a `vox daemon` does (V030-04, #236): its control
-                // socket is served by the tunnel verbs' path, and its metrics here.
-                if let Some(addr) = metrics {
-                    let listener = vox_core::node::status::bind_metrics(addr)
-                        .await
-                        .map_err(|e| crate::app::AppError::Usage(e.to_string()))?;
-                    let bound = listener.local_addr()?;
-                    tokio::spawn(vox_core::node::status::serve_metrics(
-                        listener,
-                        node_name,
-                        node.clone(),
-                    ));
-                    println!("vox lan: metrics http://{bound}/metrics");
+            let paths = match a.room.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
                 }
-                crate::lan_cli::up(&node, cid, socket, stats, allow).await
-            })
+            };
+            let waiting = crate::tunnel_cli::Waiting::server();
+            let steps = std::sync::Arc::clone(&waiting);
+            run_session(waiting, async move { crate::lan_cli::up_held(&paths, &a, &steps).await })
         }
         Cmd::ShellSetup { remove } => crate::shell::run(remove),
         Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {
