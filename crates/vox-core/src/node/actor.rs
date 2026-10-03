@@ -10872,6 +10872,12 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
+        // Loopback only, refused **before the bind and before `Done`** (V210-152). `up::serve`
+        // refuses it too, but on its own task after this has answered: a non-loopback `--bind`
+        // printed "vox up on 0.0.0.0:…" and the ssh hint while nothing was listening.
+        if !bind.ip().is_loopback() {
+            return Outcome::Failed(Fault::NotLoopback);
+        }
         // Bound **once**, and the live listener is handed to `up::serve` (M17.16). This
         // used to bind, read the port, drop the listener and let `serve` re-bind it, which
         // announced an address over a window where nothing was listening — a person who
