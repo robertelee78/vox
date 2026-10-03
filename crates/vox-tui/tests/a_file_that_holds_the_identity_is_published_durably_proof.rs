@@ -21,6 +21,13 @@
 //! 4. A vault write that fails leaves the old vault in place and readable, and the next unlock
 //!    completes the migration.
 //!
+//! **What is read in this process, and why.** Every claim is made by the shipped binary; the test
+//! only reads what it left on disk. The vault's format version is read with
+//! `IdentityVault::from_canonical_slice`, a pure decode of the file's header: no `vox` command
+//! reports which version a vault is, and the migration's completion is that version. Whether the
+//! old vault still opens is the binary's to show — `vox trust list` naming the trusted member once
+//! the obstacle is gone — never an unlock in this process.
+//!
 //! Mutations: the temporary file not flushed, the directory not flushed, or the file created at
 //! the umask's mode and `chmod`ed after, each breaks 1–3.
 
@@ -195,12 +202,9 @@ fn a_file_that_holds_the_identity_is_published_durably() {
             vault_of(&erin).display()
         )
     }) == before;
-    let opens = IdentityVault::from_canonical_slice(&before)
-        .and_then(|v| v.unlock_signer(IDENTITY.as_bytes()))
-        .is_ok();
     println!(
         "[proof] a vault write that cannot happen: the unlock succeeded = {wrote}; the v1 vault \
-         kept byte for byte = {kept}; it still opens = {opens}"
+         kept byte for byte = {kept}"
     );
     assert!(
         !wrote,
@@ -208,9 +212,8 @@ fn a_file_that_holds_the_identity_is_published_durably() {
          temporary file's path occupied: {out}{err}"
     );
     assert!(
-        kept && opens,
-        "PRODUCT: a failed vault write lost or changed the old vault (kept byte for byte = \
-         {kept}, still opens = {opens}): {out}{err}"
+        kept,
+        "PRODUCT: a failed vault write lost or changed the old vault: {out}{err}"
     );
     std::fs::remove_dir_all(node_dir(&erin, DEFAULT_NODE).join("vault.tmp"))
         .expect("APPARATUS: remove the blocking directory from where the migration moved it");
@@ -222,6 +225,8 @@ fn a_file_that_holds_the_identity_is_published_durably() {
         }
         std::thread::sleep(Duration::from_millis(250));
     };
+    // The old vault still opens, shown by the binary: this unlock reads it, migrates it, and
+    // lists the member trusted under v0.2.9.
     println!(
         "[proof] with the obstacle gone: vault v{}, `trust list` names frank = {}",
         vault_version(&vault_of(&erin)),

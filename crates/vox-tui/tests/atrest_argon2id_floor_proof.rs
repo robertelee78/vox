@@ -25,6 +25,11 @@
 //! production profile (`Argon2Profile::default()`); it lives inside the encrypted store and is
 //! not reachable from outside without vox-core, so it is not separately measured here.
 //!
+//! **What is computed in this process, and why.** The key derivation and the AEAD open are done
+//! here with the `argon2`, `hkdf` and `aes-gcm` crates and the ADR's numbers, **not** vox-core: a
+//! pure measurement of the file the binary wrote, which no `vox` command can report (vox reads
+//! its own vault with its own parameters, so it would open whatever it sealed).
+//!
 //! **Mutation that must turn it red.** Lower `Argon2Profile::PRODUCTION` in
 //! `vox-core/src/atrest/sek.rs` (e.g. `m_cost_kib: 128 * 1024`, removing the compile-time
 //! floor assertion that would otherwise refuse to build it). The binary then seals the vault
