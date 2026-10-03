@@ -22,7 +22,7 @@
 //! 1. `22.nas.family.vox` reaches bob and `22.laptop.family.vox` reaches carol — the member the
 //!    name names, not the room's creator.
 //! 2. `22.laptop.work.vox` reaches carol through the second room, under its own name.
-//! 3. An unknown room, an unknown node, and an ambiguous node name are refused, each with
+//! 3. An unknown room and an unknown node are refused, and an alias already in use is refused, each with
 //!    a sentence saying which.
 //! 4. A node that is no longer trusted has no name.
 //!
@@ -533,10 +533,9 @@ fn a_local_name_reaches_the_node_it_names() {
     let unknown_node = alice.forward("22.ghost.family.vox");
     let not_there = alice.forward("22.nas.work.vox");
     let named = alice.forward("22.laptop.family.vox");
-    // Two trusted nodes called `nas` in family: ambiguous.
+    // An alias names one node: calling carol `nas` too is refused, and `nas` stays bob's.
     let rename = vox(&alice.dir, &["trust", "rename", &carol.fp, "nas"], None);
-    let ambiguous = alice.forward("22.nas.family.vox");
-    let ambiguous_socks = who_answers(proxy, "22.nas.family.vox");
+    let still_bob = who_answers(proxy, "22.nas.family.vox");
     // (4): untrusting carol takes her name away.
     let untrust = vox(&alice.dir, &["trust", "remove", &carol.fp], None);
     let untrusted = alice.forward("22.nas.family.vox");
@@ -546,7 +545,7 @@ fn a_local_name_reaches_the_node_it_names() {
     eprintln!(
         "reached: {reached:?}\nunknown room: {unknown_room:?}\nunknown node: {unknown_node:?}\n\
          nas in work: {not_there:?}\nforward laptop.family: {:?}\nrename: {rename:?}\n\
-         ambiguous: {ambiguous:?} / socks {ambiguous_socks:?}\nuntrust: {untrust:?}\n\
+         after the rename: {still_bob:?}\nuntrust: {untrust:?}\n\
          after untrusting carol: forward nas.family {untrusted:?}, socks nas.family \
          {now_bob:?}, laptop.work {untrusted_laptop:?}",
         named.0,
@@ -601,15 +600,14 @@ fn a_local_name_reaches_the_node_it_names() {
         !not_there.0 && not_there.1.contains("not a member of `work`"),
         "PRODUCT: a node not in the room is refused, saying so: {not_there:?}"
     );
-    assert!(rename.0, "PRODUCT: the rename must succeed: {rename:?}");
     assert!(
-        !ambiguous.0 && ambiguous.1.contains("names 2 nodes you trust in `family`"),
-        "PRODUCT: an ambiguous name is refused, saying so: {ambiguous:?}"
+        !rename.0 && rename.2.contains("is already your name for"),
+        "PRODUCT: a second node cannot be given an alias already in use: {rename:?}"
     );
     assert_eq!(
-        ambiguous_socks,
-        Err(2),
-        "PRODUCT: the proxy refuses an ambiguous name"
+        still_bob,
+        Ok("bob".into()),
+        "PRODUCT: after the refused rename, 22.nas.family.vox is still bob's"
     );
     assert!(untrust.0, "PRODUCT: the untrust must succeed: {untrust:?}");
     assert!(
