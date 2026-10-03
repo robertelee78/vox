@@ -28,7 +28,8 @@
 //! **Asserted:** every post that overlapped the open, from its start to the room being open,
 //! answered within [`BOUND`], V210-08's bound for a post on loopback. The bound is asserted
 //! **before** the preconditions, so a post over it is red whatever else the run shows.
-//! A post that failed is a `PRODUCT` red too. Preconditions, or `APPARATUS`: the open took at least
+//! A post that failed is a `PRODUCT` red too, and a vox step of the staging that failed is
+//! `PRODUCT (staging)`. Preconditions this proof does not control are `APPARATUS`: the open took at least
 //! [`MIN_OPEN`] (else there was nothing to wait for), and at least [`MIN_DURING`] posts overlapped
 //! it.
 //!
@@ -148,7 +149,7 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
     while !vox(dir, &["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "APPARATUS (precondition not met): {tag}'s daemon never answered: {}",
+            "PRODUCT (staging): {tag}'s daemon never answered: {}",
             std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -163,17 +164,12 @@ fn create(dir: &Path, name: &str) -> String {
         &["room", "create", "--name", name],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(
-        ok,
-        "APPARATUS (precondition not met): vox room create {name}: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox room create {name}: {err}");
     let (_, list, _) = vox(dir, &["room", "list"], None);
     list.lines()
         .find(|l| l.split_whitespace().any(|w| w == name))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| {
-            panic!("APPARATUS (precondition not met): {name} not in room list: {list}")
-        })
+        .unwrap_or_else(|| panic!("PRODUCT (staging): {name} not in room list: {list}"))
         .to_owned()
 }
 
@@ -185,10 +181,16 @@ fn drive(script: &str, args: &[&str], tag: &str) -> String {
         "[proof] {tag}: the TUI driver took {:?}; last stage {:?}",
         out.took, out.stage
     );
+    // The driver prints `<tag> RED: PRODUCT…` or `HUNG at` when `vox tui` failed: the product's,
+    // at staging. Anything else that stops it is the driver's own machinery.
+    let side = if said.contains("RED: PRODUCT") || said.contains("HUNG at") {
+        "PRODUCT (staging)"
+    } else {
+        "APPARATUS"
+    };
     assert!(
         out.has_verdict(tag) && out.code == Some(0),
-        "APPARATUS (precondition not met): the {tag} TUI driver gave no verdict, or failed (exit {:?}, stage {:?}): \
-         {said}",
+        "{side}: the {tag} TUI driver gave no verdict, or failed (exit {:?}, stage {:?}): {said}",
         out.code,
         out.stage
     );
@@ -204,7 +206,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
     let alice = tmp.path().join("alice");
     std::fs::create_dir_all(alice.join("cfg")).expect("APPARATUS: create a staging directory");
     let (ok, _, err) = vox(&alice, &["id"], None);
-    assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
     let cfg = alice.join("cfg").to_string_lossy().into_owned();
     let data = alice.to_string_lossy().into_owned();
 
@@ -218,7 +220,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
             &["room", "post", &bravo, &format!("seed {i}")],
             None,
         );
-        assert!(ok, "APPARATUS (precondition not met): seed post {i}: {err}");
+        assert!(ok, "PRODUCT (staging): seed post {i}: {err}");
     }
     println!(
         "[proof] {SEED} posts seeded into bravo in {:?}",
@@ -235,7 +237,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
     );
     assert!(
         said.contains("close the TUI said done to :close"),
-        "APPARATUS (precondition not met): the TUI did not close bravo: {said}"
+        "PRODUCT (staging): the TUI did not close bravo: {said}"
     );
 
     // ---- 3. room A, while B stays closed ---------------------------------------------------
@@ -245,7 +247,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
     let bravo_line = list.lines().find(|l| l.contains(&bravo)).unwrap_or("");
     assert!(
         bravo_line.contains("[closed]"),
-        "APPARATUS (precondition not met): bravo is not closed before the TUI opens it: {list}"
+        "PRODUCT (staging): bravo is not closed before the TUI opens it: {list}"
     );
     drop(second);
 

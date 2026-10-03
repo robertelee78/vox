@@ -230,13 +230,16 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
             "the driver is still running".to_owned()
         };
         // The driver typed the identity passphrase and watched the status line for 60 s: a TUI
-        // that never said "unlocked" is the product's. Anything else (pyte missing, a hung
-        // driver) is the apparatus's.
+        // that never said "unlocked" is the product's. Otherwise the driver's own words decide
+        // the side (`driver_side`).
         assert!(
             !said.contains("the TUI never unlocked"),
             "PRODUCT (staging): bob's TUI never unlocked with his identity passphrase; {said}"
         );
-        panic!("PRODUCT (staging): bob's TUI driver never got as far as the unlock; {said}");
+        panic!(
+            "{}: bob's TUI driver never got as far as the unlock; {said}",
+            driver_side(&said)
+        );
     }
 
     // ---- a join that cannot finish yet, and a lock while it runs --------------------------
@@ -281,14 +284,17 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
             "the driver is still running".to_owned()
         };
         // A TUI that was typed `:lock` and never showed LOCKED did not take the lock: the
-        // product's (a node whose actor a join holds cannot answer it). A driver that never got
-        // to `:lock`, or hung, is the apparatus's.
+        // product's (a node whose actor a join holds cannot answer it). Otherwise the driver's
+        // own words decide the side (`driver_side`).
         assert!(
             !said.contains("the TUI never showed LOCKED after :lock"),
             "PRODUCT: bob typed `:lock` while his join was in flight, and his TUI never showed \
              LOCKED; {said}"
         );
-        panic!("PRODUCT (staging): bob's TUI driver never typed `:lock` to completion; {said}");
+        panic!(
+            "{}: bob's TUI driver never typed `:lock` to completion; {said}",
+            driver_side(&said)
+        );
     }
 
     // ---- what the join came to ------------------------------------------------------------
@@ -395,4 +401,17 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
         );
     }
     drop(alice_daemon);
+}
+
+/// Which side a TUI driver that stopped early is on, from what it said. The driver prints
+/// `<tag> RED: PRODUCT…` or `HUNG at <stage>` when `vox tui` failed or stopped answering: the
+/// product's, at staging. `<tag> APPARATUS` (pyte missing, a cue it could not read), a driver
+/// thread that panicked, a driver still running, or one that said nothing it should have: the
+/// apparatus's.
+fn driver_side(said: &str) -> &'static str {
+    if said.contains("RED: PRODUCT") || said.contains("HUNG at") {
+        "PRODUCT (staging)"
+    } else {
+        "APPARATUS"
+    }
 }

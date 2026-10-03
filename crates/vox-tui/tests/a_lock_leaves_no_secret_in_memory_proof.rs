@@ -378,12 +378,17 @@ impl Tui {
         }
     }
 
-    fn pid(&self) -> u32 {
-        assert!(
-            cue(&self.cues.join("pid"), Duration::from_secs(60)),
-            "PRODUCT (staging): {}'s TUI never started",
-            self.tag
-        );
+    fn pid(&mut self) -> u32 {
+        if !cue(&self.cues.join("pid"), Duration::from_secs(60)) {
+            // The driver writes the pid cue once `vox tui` is up; what it said decides the side.
+            std::fs::write(self.cues.join("stop"), b"").staged();
+            let said = self.said();
+            panic!(
+                "{}: {}'s TUI never started; {said}",
+                driver_side(&said),
+                self.tag
+            );
+        }
         std::fs::read_to_string(self.cues.join("pid"))
             .staged()
             .trim()
@@ -397,11 +402,21 @@ impl Tui {
         }
         // What the TUI showed instead: the driver prints its screen when stopped early.
         std::fs::write(self.cues.join("stop"), b"").staged();
-        let driven = self.driver.take().staged().join().staged();
+        let said = self.said();
         panic!(
-            "PRODUCT (staging): {}'s TUI never unlocked; its driver said:\n{}",
-            self.tag, driven.stdout
+            "{}: {}'s TUI never unlocked; {said}",
+            driver_side(&said),
+            self.tag
         );
+    }
+
+    /// What the driver said when it stopped, or why it could not say.
+    fn said(&mut self) -> String {
+        match self.driver.take().map(std::thread::JoinHandle::join) {
+            Some(Ok(d)) => format!("its driver exited {:?} saying:\n{}", d.code, d.stdout),
+            Some(Err(_)) => "the TUI driver thread panicked".to_owned(),
+            None => "its driver was already collected".to_owned(),
+        }
     }
 
     /// Lock the TUI — `:lock` typed, or with `hup` a SIGHUP — and wait until it shows itself
@@ -660,7 +675,7 @@ fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
         tmp.path().join("scan"),
         &[("room", &roompass), ("identity", &identity)],
     );
-    let tui = Tui::start(
+    let mut tui = Tui::start(
         &bob,
         &identity,
         tmp.path().join("cues2"),
@@ -853,4 +868,16 @@ fn a_typed_lock_leaves_no_piece_of_the_identity_passphrase() {
     let after = scanner.scan();
     tui.stop();
     judge("idle", &before, &before, &after, took);
+}
+
+/// Which side a TUI driver that stopped early is on, from what it said. The driver prints
+/// `<tag> RED: PRODUCT…` or `HUNG at <stage>` when `vox tui` failed or stopped answering: the
+/// product's, at staging. `<tag> APPARATUS` (pyte missing, a cue it could not read), a driver
+/// thread that panicked, or one that said nothing it should have: the apparatus's.
+fn driver_side(said: &str) -> &'static str {
+    if said.contains("RED: PRODUCT") || said.contains("HUNG at") {
+        "PRODUCT (staging)"
+    } else {
+        "APPARATUS"
+    }
 }
