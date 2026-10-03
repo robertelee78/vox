@@ -2410,10 +2410,16 @@ async fn verify_operator(
     }
 }
 
-/// [`verify_operator`] for a passphrase that was given; nothing to check for one that was not
-/// (the empty string), and the node's keyring window decides.
+/// [`verify_operator`] for a passphrase that was given; for none (the empty string), the node's
+/// keyring window decides.
+///
+/// **The empty string is also a passphrase** (V030-36): an identity may have none. So an empty
+/// one is checked too, and a match counts as the passphrase entered, opening the window; a
+/// mismatch is "none given", not a wrong passphrase. Without that, an identity with no
+/// passphrase could never change its keyring once the window had passed.
 async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
     if passphrase.is_empty() {
+        let _ = verify_operator(handle, passphrase).await;
         return Ok(());
     }
     verify_operator(handle, passphrase).await

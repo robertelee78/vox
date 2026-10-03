@@ -3225,15 +3225,12 @@ fn room_passphrase(
             )));
         }
         let first = crate::tunnel_cli::prompt_passphrase("room passphrase")?;
-        if first.is_empty() {
-            return Err(AppError::Usage(format!("no {what} was given")));
-        }
         if confirm && crate::tunnel_cli::prompt_passphrase("again")? != first {
             return Err(AppError::Usage(
                 "the two passphrases differ; nothing was done".into(),
             ));
         }
-        return Ok(first);
+        return Ok(crate::tunnel_cli::encouraged(first, "room"));
     };
     let buf = crate::tunnel_cli::passphrase_file_text(path)?;
     let p = buf
@@ -3241,20 +3238,10 @@ fn room_passphrase(
         .unwrap_or(&buf)
         .strip_suffix('\r')
         .unwrap_or_else(|| buf.strip_suffix('\n').unwrap_or(&buf));
-    if p.is_empty() {
-        // The caller's phrase is a noun phrase ("the room's passphrase", "a passphrase
-        // for the new room"), so it reads as "expected <phrase>" and never as "no a
-        // passphrase", which is what "no {what}" produced.
-        return Err(AppError::Usage(format!(
-            "expected {what} in {}, and it is empty",
-            if path == std::path::Path::new("-") {
-                "stdin".to_owned()
-            } else {
-                path.display().to_string()
-            }
-        )));
-    }
-    Ok(p.to_owned())
+    // **An empty file or stdin gives an empty passphrase on purpose** (V030-36, decider
+    // 2026-10-02: "technically optional"). It said "expected … and it is empty" and stopped. No
+    // `--passphrase-file` at all is still not one: that asks, or fails without a terminal.
+    Ok(crate::tunnel_cli::encouraged(p, "room").to_owned())
 }
 
 /// `vox room join` — join a room over a running node (ADR-020 §12).

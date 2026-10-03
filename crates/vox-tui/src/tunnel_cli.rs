@@ -64,15 +64,6 @@ pub fn passphrase_file_text(
     Ok(text)
 }
 
-/// Where a passphrase file's text came from, for the message when it holds none.
-fn source_name(path: &std::path::Path) -> String {
-    if path == std::path::Path::new("-") {
-        "stdin".to_owned()
-    } else {
-        path.display().to_string()
-    }
-}
-
 /// How to give the identity passphrase without a terminal, for every message that needs one.
 pub const GIVE_IDENTITY_PASSPHRASE: &str =
     "Use --identity-passphrase-file <path> (`-` reads stdin), or VOX_IDENTITY_PASSPHRASE.";
@@ -99,23 +90,18 @@ pub fn identity_passphrase_given(
                 .into(),
         ));
     }
+    // **An empty passphrase is a passphrase** (V030-36, decider 2026-10-02: "technically
+    // optional"). An empty file, or the variable set to nothing, gives none on purpose, which is
+    // not the same as giving no source at all: that still asks, or fails without a terminal.
     if let Some(path) = file {
         let text = passphrase_file_text(&path)?;
         let first = text.lines().next().unwrap_or_default();
-        if first.is_empty() {
-            return Err(AppError::Usage(format!(
-                "{} is empty; an identity passphrase cannot be",
-                source_name(&path)
-            )));
-        }
-        return Ok(Some(first.to_owned()));
+        return Ok(Some(encouraged(first.to_owned(), "identity")));
     }
     // Read the variable here rather than through clap's `env`, because clap merges a flag
     // and its variable into one value and the whole point is to tell them apart.
     if let Ok(p) = std::env::var("VOX_IDENTITY_PASSPHRASE") {
-        if !p.is_empty() {
-            return Ok(Some(p));
-        }
+        return Ok(Some(encouraged(p, "identity")));
     }
     Ok(None)
 }
@@ -131,11 +117,10 @@ pub fn ask_identity_passphrase() -> Result<String, AppError> {
              \x20      {GIVE_IDENTITY_PASSPHRASE}"
         )));
     }
-    let p = prompt_passphrase("identity passphrase")?;
-    if p.is_empty() {
-        return Err(AppError::Usage("no identity passphrase was given".into()));
-    }
-    Ok(p)
+    Ok(encouraged(
+        prompt_passphrase("identity passphrase")?,
+        "identity",
+    ))
 }
 
 /// Collect the identity passphrase, asking for confirmation when the profile has no
@@ -166,18 +151,13 @@ pub fn identity_passphrase_for(
     }
     println!("vox: this profile has no identity yet; creating one.");
     let first = prompt_passphrase("new identity passphrase")?;
-    if first.is_empty() {
-        return Err(AppError::Usage(
-            "an empty identity passphrase; nothing was created".into(),
-        ));
-    }
     let again = prompt_passphrase("again")?;
     if first != again {
         return Err(AppError::Usage(
             "the two passphrases differ; nothing was created".into(),
         ));
     }
-    Ok(first)
+    Ok(encouraged(first, "identity"))
 }
 
 /// Spawn a node and make its identity usable: unlock an existing one, or create one on
@@ -1514,16 +1494,11 @@ pub fn room_passphrase_for(
                 .into(),
         ));
     }
+    // An empty file gives an empty passphrase on purpose (V030-36); no source at all still asks.
     if let Some(path) = file {
         let text = passphrase_file_text(path)?;
         let first = text.lines().next().unwrap_or_default();
-        if first.is_empty() {
-            return Err(AppError::Usage(format!(
-                "{} is empty; a room passphrase cannot be",
-                source_name(path)
-            )));
-        }
-        return Ok(first.to_owned());
+        return Ok(encouraged(first.to_owned(), "room"));
     }
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Err(AppError::Usage(format!(
@@ -1531,7 +1506,19 @@ pub fn room_passphrase_for(
              \x20      {GIVE_ROOM_PASSPHRASE}"
         )));
     }
-    prompt_passphrase("room passphrase")
+    Ok(encouraged(prompt_passphrase("room passphrase")?, "room"))
+}
+
+/// `passphrase`, after one line on stderr encouraging one when it is empty (V030-36).
+///
+/// **An empty passphrase is accepted, not refused** (decider 2026-10-02: "passphrase is a good
+/// idea, but is technically optional"). The node takes one; a client may only encourage. `what`
+/// is `identity` or `room`.
+pub fn encouraged<S: AsRef<str>>(passphrase: S, what: &str) -> S {
+    if passphrase.as_ref().is_empty() {
+        eprintln!("vox: no {what} passphrase; going on without one. A passphrase is encouraged.");
+    }
+    passphrase
 }
 
 /// How to give a room passphrase without a terminal.

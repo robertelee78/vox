@@ -1189,12 +1189,12 @@ enum Asked<T> {
     Stopped(StopSignal),
 }
 
-/// `VOX_IDENTITY_PASSPHRASE`, when set and not empty: how an agent's harness gives a daemon its
-/// identity passphrase (V210-159, decider 2026-10-02, option A).
+/// `VOX_IDENTITY_PASSPHRASE`, when set: how an agent's harness gives a daemon its identity
+/// passphrase (V210-159, decider 2026-10-02, option A). Set to nothing, it gives none on purpose
+/// (V030-36).
 fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
     std::env::var("VOX_IDENTITY_PASSPHRASE")
         .ok()
-        .filter(|p| !p.is_empty())
         .map(zeroize::Zeroizing::new)
 }
 
@@ -1213,12 +1213,21 @@ fn daemon_passphrases(
         return Ok(Asked::Got((identity, Vec::new())));
     } else if io::IsTerminal::is_terminal(&io::stdin()) {
         return Ok(match ask_without_echo(rt, stop, "identity passphrase") {
-            Asked::Got(identity) => Asked::Got((nonempty_identity(identity?)?, Vec::new())),
+            Asked::Got(identity) => match identity? {
+                Some(identity) => Asked::Got((encouraged(identity), Vec::new())),
+                None => {
+                    return Err(AppError::Usage(format!(
+                        "{NO_IDENTITY_PASSPHRASE} The terminal's input ended before one was \
+                         typed."
+                    )))
+                }
+            },
             Asked::Stopped(signal) => Asked::Stopped(signal),
         });
     } else {
         match read_piped_stdin(rt, stop) {
-            Asked::Got(raw) => raw?,
+            // Nothing at all on stdin is no passphrase given; an empty line is an empty one.
+            Asked::Got(raw) => given_on_stdin(raw?)?,
             Asked::Stopped(signal) => return Ok(Asked::Stopped(signal)),
         }
     };
@@ -1252,21 +1261,35 @@ fn daemon_passphrases(
         .map(|l| l.trim_end_matches('\r').to_owned())
         .filter(|l| !l.is_empty())
         .collect();
-    Ok(Asked::Got((nonempty_identity(identity)?, rooms)))
+    Ok(Asked::Got((encouraged(identity), rooms)))
 }
 
-/// `identity`, or the reason an empty one cannot unlock anything.
-fn nonempty_identity(
-    identity: zeroize::Zeroizing<String>,
-) -> Result<zeroize::Zeroizing<String>, AppError> {
-    if identity.is_empty() {
-        return Err(AppError::Usage(
-            "no identity passphrase. Type it at the terminal, pipe it in (`echo … | vox \
-             daemon`), set VOX_IDENTITY_PASSPHRASE, or pass --passphrase-file."
-                .into(),
-        ));
+/// `identity`, after one line encouraging a passphrase when it is empty.
+///
+/// **An empty identity passphrase is accepted** (V030-36, decider 2026-10-02: "passphrase is a
+/// good idea, but is technically optional"). It was refused here, so an identity made with none
+/// could never be served by a daemon.
+fn encouraged(identity: zeroize::Zeroizing<String>) -> zeroize::Zeroizing<String> {
+    crate::tunnel_cli::encouraged(identity.as_str(), "identity");
+    identity
+}
+
+/// What to say when nothing at all was given for the identity passphrase.
+const NO_IDENTITY_PASSPHRASE: &str =
+    "no identity passphrase. Type it at the terminal (Enter alone \
+     gives none), pipe it in (`echo … | vox daemon`; an empty line gives none), set \
+     VOX_IDENTITY_PASSPHRASE, or pass --passphrase-file.";
+
+/// Stdin that is not a terminal, read to its end: refused when it held nothing at all. A harness
+/// that closes stdin without writing has given nothing, and an identity whose passphrase that is
+/// not would only fail later as a wrong one; an empty line is how to give none.
+fn given_on_stdin(raw: zeroize::Zeroizing<String>) -> Result<zeroize::Zeroizing<String>, AppError> {
+    if raw.is_empty() {
+        return Err(AppError::Usage(format!(
+            "{NO_IDENTITY_PASSPHRASE} Stdin ended with nothing on it."
+        )));
     }
-    Ok(identity)
+    Ok(raw)
 }
 
 /// How long `vox daemon` reads a stdin that is not a terminal before it says what it is waiting
@@ -1319,13 +1342,13 @@ fn read_piped_stdin(
 /// loaded machine.
 const HANGUP_GRACE: Duration = Duration::from_secs(1);
 
-/// One line typed at the terminal, without echo, racing `stop`. A stop leaves the terminal as it
-/// was: echo comes back whichever ends the wait.
+/// One line typed at the terminal, without echo, racing `stop`; `None` when its input ended with
+/// none. A stop leaves the terminal as it was: echo comes back whichever ends the wait.
 fn ask_without_echo(
     rt: &tokio::runtime::Runtime,
     stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = StopSignal>>>,
     prompt: &str,
-) -> Asked<Result<zeroize::Zeroizing<String>, AppError>> {
+) -> Asked<Result<Option<zeroize::Zeroizing<String>>, AppError>> {
     let _ = write!(io::stderr(), "{prompt}: ");
     let _ = io::stderr().flush();
     let quiet = no_echo::EchoOff::new();
@@ -1336,8 +1359,10 @@ fn ask_without_echo(
             signal = &mut *stop => return Asked::Stopped(signal),
         };
         let read = match read {
-            Ok(Ok(Some(line))) => return Asked::Got(Ok(line)),
-            Ok(Ok(None)) => Ok(zeroize::Zeroizing::new(String::new())),
+            Ok(Ok(Some(line))) => return Asked::Got(Ok(Some(line))),
+            // End of input, not an empty line: nothing was typed, which is not an empty
+            // passphrase (V030-36).
+            Ok(Ok(None)) => Ok(None),
             Ok(Err(e)) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
             Err(e) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
         };
@@ -1743,7 +1768,8 @@ pub fn run_daemon(
                 "passphrase for a closed room ({shut} closed; Enter to start without them)"
             );
             let line = match ask_without_echo(&rt, &mut stop, &prompt) {
-                Asked::Got(line) => line?,
+                // End of input starts it without them, as Enter does.
+                Asked::Got(line) => line?.unwrap_or_default(),
                 Asked::Stopped(signal) => {
                     return stopped_while_starting(rt, Some(&node), signal);
                 }
