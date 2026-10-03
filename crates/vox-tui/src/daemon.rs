@@ -160,8 +160,6 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             anchor_specs: args.profile.anchors.clone(),
             listen: args.profile.listen.to_string(),
             patience: shutdown_patience(),
-            // Every client speaks to the account socket (#406): no node serves one of its own.
-            node_sockets: false,
         },
     );
     // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
