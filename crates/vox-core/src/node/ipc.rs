@@ -266,6 +266,9 @@ const T_PING: u64 = 17;
 const T_STRUCTURED: u64 = 120;
 const T_FIND: u64 = 121;
 const T_COUNT_REQ: u64 = 122;
+// V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
+// far from the others, like V210-120's.
+const T_LEAVE: u64 = 164;
 /// [`Frame::Count`] (V210-120), in the frame and event tag space, far from the others.
 const T_COUNT: u64 = 1200;
 
@@ -372,6 +375,12 @@ pub enum Request {
     /// credential: it names the room and where to look, carries no passphrase, and
     /// since M17.6 joining with it grants nothing at all.
     Invite {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Leave a room (V210-164): the node says so in the room, and removes it once another
+    /// member has that. Answers [`Frame::Ok`] once it is removed.
+    Leave {
         /// The room.
         channel_id: Digest32,
     },
@@ -563,6 +572,9 @@ impl Request {
             }
             Request::Invite { channel_id } => {
                 e.array(2).uint(T_INVITE).bytes(channel_id);
+            }
+            Request::Leave { channel_id } => {
+                e.array(2).uint(T_LEAVE).bytes(channel_id);
             }
             Request::Trust {
                 target,
@@ -829,6 +841,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
+            }
+            (T_LEAVE, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Leave { channel_id })
             }
             _ => Err(Error::UnknownIpcRequest),
         }
@@ -2155,14 +2173,30 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             },
         },
         Request::Post { channel_id, text } => {
-            match handle
-                .apply(crate::node::api::NodeCommand::SendText { channel_id, text })
-                .await
-            {
-                crate::node::api::Outcome::Done => Frame::Ok,
-                other => Frame::Error {
-                    reason: other.to_string(),
-                },
+            // A room just joined is written to once its first sync with another member has ended
+            // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
+            // that rather than failing.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match handle
+                    .apply(crate::node::api::NodeCommand::SendText {
+                        channel_id,
+                        text: text.clone(),
+                    })
+                    .await
+                {
+                    crate::node::api::Outcome::Done => break Frame::Ok,
+                    crate::node::api::Outcome::Failed(crate::node::api::Fault::RoomNotSynced)
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    other => {
+                        break Frame::Error {
+                            reason: other.to_string(),
+                        }
+                    }
+                }
             }
         }
         Request::Read {
@@ -2511,6 +2545,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 local_name,
                 passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
             })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
+        Request::Leave { channel_id } => match handle
+            .apply(crate::node::api::NodeCommand::LeaveChannel { channel_id })
             .await
         {
             crate::node::api::Outcome::Done => Frame::Ok,

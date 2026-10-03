@@ -10,13 +10,12 @@
 //! - **No passphrase anywhere.** There is nothing to unlock — the node holds the
 //!   identity. An agent session never sees a secret, which is what makes it safe
 //!   to hand these verbs to model-authored code.
-//! - **No room is created or joined here.** These verbs speak in a room; putting
-//!   the node in one is the operator's act.
+//! - **Rooms come and go here too.** `join` and `create` take the room passphrase on
+//!   stdin, never argv, and `leave` takes none.
 //!
-//! The socket answers a deliberately narrow request set and these verbs are
-//! exactly it (`post`, `read`, `tail`, `roster`, `list`). There is no verb here
-//! that creates an identity, unlocks, revokes, or edits the trust keyring —
-//! `vox trust` is an operator surface and is not part of this module.
+//! The socket answers a deliberately narrow request set. There is no verb here that
+//! creates an identity, unlocks, revokes, or edits the trust keyring — `vox trust` is
+//! an operator surface and is not part of this module.
 
 use std::io::Read as _;
 use std::io::Write as _;
@@ -2710,6 +2709,53 @@ pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot create: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox room leave` — leave a room (V210-164).
+///
+/// The node writes its departure into the room and answers once another member has it; then
+/// the room is gone from this node. The other members stop listing this identity in the
+/// room's roster.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown or closed, or no other member could be
+/// told in time (the node then leaves as soon as one can be).
+pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let rooms = rooms_of(&mut client).await?;
+    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
+    if ids.is_empty() {
+        return Err(AppError::Usage("this node holds no rooms".into()));
+    }
+    let channel_id = resolve_prefix(room, &ids)?;
+    let name = rooms
+        .iter()
+        .find(|(r, _, _)| *r == channel_id)
+        .map(|(_, n, _)| n.clone())
+        .unwrap_or_default();
+    let which = if name.is_empty() {
+        format!("room {}", b32_encode(&channel_id))
+    } else {
+        format!("room {name:?} ({})", b32_encode(&channel_id))
+    };
+    if rooms.iter().any(|(r, _, open)| *r == channel_id && !open) {
+        return Err(AppError::Usage(format!(
+            "{which} is closed on this node, and leaving is said in the room\n       open it \
+             first: in `vox tui`, or a line with its passphrase to `vox daemon`"
+        )));
+    }
+    match client.request(&Request::Leave { channel_id }).await {
+        Ok(Frame::Ok) => {
+            println!("vox: left {which}");
+            println!("     its other members see that you left; this node no longer holds it");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("{which} was not left: {reason}")))
+        }
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }

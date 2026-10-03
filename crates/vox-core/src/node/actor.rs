@@ -261,6 +261,11 @@ const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
 /// the address names has to take the room before this node says it has not.
 const ADDRESS_PATIENCE: Duration = Node::BOARD_PATIENCE;
 
+/// How long `vox room leave` waits for another member to take this node's departure (V210-164).
+/// Past it the person is told, and the node keeps the room until one does: removed first, the
+/// room would take the only copy of the departure with it, and nobody would ever learn of it.
+const LEAVE_PATIENCE: Duration = Duration::from_secs(30);
+
 /// How long a join waits before asking its boards again for a room none of them holds yet
 /// (V210-143): a host publishes its room within a second of starting, and retries a failed dial to
 /// its anchor after one.
@@ -375,6 +380,7 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::Revoke { .. } => "revoking a member",
         NodeCommand::Serve { .. } => "publishing a service",
         NodeCommand::Up { .. } => "bringing the proxy up",
+        NodeCommand::LeaveChannel { .. } => "leaving a room",
         NodeCommand::Forward { .. } => "opening a forward",
         NodeCommand::Unlock { .. } => "unlocking the identity",
         _ => "a client command",
@@ -406,6 +412,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::StaleGraceOver { .. } => "naming a refusal no republish cured",
         NetEvent::PublishRetry { .. } => "retrying a publish round that failed",
         NetEvent::AddressWaitOver { .. } => "withholding an address no board holds the room for",
+        NetEvent::LeaveWaitOver { .. } => "answering a leave nobody took",
         NetEvent::AnchorNoteDue { .. } => "saying which anchors never took a room",
         NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
@@ -955,6 +962,14 @@ enum NetEvent {
         /// our address each taken (or refused only as older than what it holds). What an address
         /// naming this board waits for (V210-96).
         holds_room: bool,
+    },
+    /// A leave begun at `serial` (see `Node::begin_leave`) has waited [`LEAVE_PATIENCE`] and no
+    /// other member has taken the departure: it is answered, and goes on waiting.
+    LeaveWaitOver {
+        /// The room.
+        channel_id: Digest32,
+        /// Which wait this ends.
+        serial: u64,
     },
     /// An address waited on since `serial` (see `Node::begin_invite`) has waited
     /// [`ADDRESS_PATIENCE`]: withheld, with its cause, if its room is still on no board it names.
@@ -3381,6 +3396,12 @@ pub struct Node {
     address_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, u64)>,
     /// The serial of the last address wait begun.
     address_serial: u64,
+    /// Leaves waiting for another member to take the departure (V210-164): the room, the room's
+    /// generation once the departure was written, the reply while someone waits for one, and the
+    /// wait's serial.
+    leave_waiters: Vec<(Digest32, u64, Option<oneshot::Sender<Outcome>>, u64)>,
+    /// The serial of the last leave begun.
+    leave_serial: u64,
     /// `(room, anchor)` pairs an address was handed out naming before that anchor held the room,
     /// with the address's serial: said when the anchor takes it, or when [`ADDRESS_PATIENCE`]
     /// passes without (`NetEvent::AnchorNoteDue`) (V210-96).
@@ -3645,6 +3666,8 @@ impl Node {
             publish_trouble: BTreeMap::new(),
             address_waiters: Vec::new(),
             address_serial: 0,
+            leave_waiters: Vec::new(),
+            leave_serial: 0,
             anchor_owed: BTreeMap::new(),
             member_dialed_at: BTreeMap::new(),
             pending_consents: Vec::new(),
@@ -3811,6 +3834,15 @@ impl Node {
                         self.begin_join_channel(link, local_name, passphrase, reply).await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
+                        continue;
+                    }
+                    // **A leave is answered once another member has the departure** (V210-164):
+                    // see `begin_leave`.
+                    if let NodeCommand::LeaveChannel { channel_id } = command {
+                        self.begin_leave(channel_id, reply).await;
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        self.schedule().await;
                         continue;
                     }
                     // **An address is answered once its room can be joined through it** (V210-96):
@@ -4069,6 +4101,9 @@ impl Node {
             // before it gets here.
             NodeCommand::Forward { .. } => {
                 unreachable!("NodeCommand::Forward is answered by begin_forward")
+            }
+            NodeCommand::LeaveChannel { .. } => {
+                unreachable!("NodeCommand::LeaveChannel is answered by begin_leave")
             }
             NodeCommand::StopForward { local } => {
                 // Dropping the forward aborts its listener; connections already
@@ -5328,6 +5363,7 @@ impl Node {
                     self.channels
                         .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
                     self.mark_decisions_on_open(&channel_id).await;
+                    self.resume_leave(&channel_id).await;
                     self.act_on_removals_while_closed(&channel_id).await;
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
@@ -6062,6 +6098,18 @@ impl Node {
             NetEvent::AddressWaitOver { channel_id, serial } => {
                 self.withhold_address(channel_id, serial).await;
             }
+            NetEvent::LeaveWaitOver { channel_id, serial } => {
+                // Answered, and still leaving: the room goes once a member has the departure.
+                if let Some((_, _, reply, _)) = self
+                    .leave_waiters
+                    .iter_mut()
+                    .find(|(r, _, _, s)| *r == channel_id && *s == serial)
+                {
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(Outcome::Failed(Fault::LeaveNotHeard));
+                    }
+                }
+            }
             NetEvent::AnchorNoteDue { channel_id, serial } => {
                 self.say_anchors_that_never_took(channel_id, serial);
             }
@@ -6149,6 +6197,12 @@ impl Node {
                 report,
             } => {
                 let current = self.file_session(channel_id, peer, token, &report);
+                // A session that sent this node's HAVE from at least the generation its departure
+                // was written at, and ended cleanly, handed that peer the departure (V210-164).
+                let heard = report.out.gen_have.filter(|_| report.fail.is_none());
+                if report.fail.is_none() && report.out.complete {
+                    self.settle_room(&channel_id).await;
+                }
                 if current {
                     if let Some(fail) = &report.fail {
                         // Said, with its reason (PRD-001 R36), so a failure that does not resolve
@@ -6230,6 +6284,9 @@ impl Node {
                             rendered: o.rendered as u64,
                         });
                     }
+                }
+                if let Some(sent) = heard {
+                    self.finish_leave_if_heard(channel_id, sent).await;
                 }
             }
             NetEvent::Stream { conn, inbound } => {
@@ -7329,6 +7386,11 @@ impl Node {
                 // "no such room" (V210-78); an explicit consent waits for a sync with it.
                 return Outcome::Failed(Fault::NotAdmitted);
             }
+            // The grant is written to the log, which a room just joined waits for (V210-164):
+            // checked before the key goes, not after.
+            if !channel.is_settled() {
+                return Outcome::Failed(Fault::RoomNotSynced);
+            }
             // **Consent is dated by the decision, not the delivery** (V210-45), in the
             // profile's logical consent order, never by a clock. Every generation minted after
             // the decision goes whole; the one live at the decision goes from where it stood
@@ -7475,7 +7537,8 @@ impl Node {
     /// `no reachable peer`, at 0, 3, 6 and 10s after the room opened, and succeeded from 15s. So a
     /// sync with that member is started, since that is what fetches its records, and the consent
     /// is retried when the session with that member is done. `NotAdmitted` waits the same way:
-    /// the same sync is what admits it.
+    /// the same sync is what admits it. So does `RoomNotSynced`: that sync settles a room just
+    /// joined (V210-164).
     async fn settle_consent(
         &mut self,
         channel_id: Digest32,
@@ -7487,7 +7550,7 @@ impl Node {
         const MAX_CONSENT_ATTEMPTS: u8 = 3;
         if !matches!(
             outcome,
-            Outcome::Failed(Fault::Unreachable | Fault::NotAdmitted)
+            Outcome::Failed(Fault::Unreachable | Fault::NotAdmitted | Fault::RoomNotSynced)
         ) || attempts >= MAX_CONSENT_ATTEMPTS
         {
             let _ = reply.send(outcome);
@@ -8849,6 +8912,18 @@ impl Node {
             (None, Some(state)) => SessionTarget::Anchored(state),
             (None, None) => return false,
         };
+        // **Not with a member that left** (V210-164): it holds no room to sync, and refused every
+        // session for it. Its port is marked served; a member that joins again syncs from its own
+        // side, and is synced with again once it says it is back.
+        if let SessionTarget::Channel(shared) = &target {
+            if shared.lock().await.has_left(&peer) {
+                if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
+                    port.req_done = port.req_gen;
+                    port.done_gen = port.gen.load(std::sync::atomic::Ordering::Relaxed);
+                }
+                return false;
+            }
+        }
         // An anchor's authors come from its own board, which is local: cheap, and it has to happen
         // before the session so the anchor can verify what arrives.
         if matches!(target, SessionTarget::Anchored(_)) {
@@ -9116,9 +9191,13 @@ impl Node {
         let key = (channel_id, peer);
         let attempt = self.ports.get_mut(&key).and_then(|p| p.take(token));
         let Some(attempt) = attempt else {
-            crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
-                c.stale += 1
-            });
+            // A session of a room this node has since left is not counted: its counts went
+            // with the room (V210-164).
+            if self.current_room(&channel_id).is_some() {
+                crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
+                    c.stale += 1
+                });
+            }
             return false;
         };
         let o = &report.out;
@@ -10269,6 +10348,12 @@ impl Node {
         for (_, reply, _) in std::mem::take(&mut self.address_waiters) {
             let _ = reply.send(Outcome::Failed(Fault::Locked));
         }
+        // A room still leaving resumes when it is held again (`resume_leave`).
+        for (_, _, reply, _) in std::mem::take(&mut self.leave_waiters) {
+            if let Some(reply) = reply {
+                let _ = reply.send(Outcome::Failed(Fault::Locked));
+            }
+        }
         // The unlock they wait on did happen; what it reopened is locked again with the rest.
         for reply in std::mem::take(&mut self.unlock_waiters) {
             let _ = reply.send(Outcome::Done);
@@ -10740,6 +10825,7 @@ impl Node {
         self.channels
             .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         self.mark_decisions_on_open(&channel_id).await;
+        self.resume_leave(&channel_id).await;
         self.act_on_removals_while_closed(&channel_id).await;
         self.adopt_channel_anchors(&channel_id, None).await;
         self.refresh_network_view().await;
@@ -10789,6 +10875,223 @@ impl Node {
             }
             None => Outcome::Failed(Fault::ChannelNotOpen),
         }
+    }
+
+    /// Leave a room (V210-164): write this identity's departure into it, push it to the room's
+    /// other members, and answer once one of them has it — then the room is removed from this
+    /// node ([`Self::finish_leave_if_heard`]). Waiting is what makes the leave seen: a room
+    /// removed first would take the only copy of the departure with it.
+    async fn begin_leave(&mut self, channel_id: Digest32, reply: oneshot::Sender<Outcome>) {
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            let held = self
+                .profile
+                .as_ref()
+                .and_then(|p| p.store().channels().ok())
+                .is_some_and(|c| c.contains(&channel_id));
+            let _ = reply.send(Outcome::Failed(if held {
+                Fault::ChannelNotOpen
+            } else {
+                Fault::UnknownChannel
+            }));
+            return;
+        };
+        if self.net.is_none() {
+            let _ = reply.send(Outcome::Failed(Fault::NotNetworked));
+            return;
+        }
+        let now = self.now();
+        let written = {
+            let Some(profile) = self.profile.as_ref() else {
+                let _ = reply.send(Outcome::Failed(Fault::Locked));
+                return;
+            };
+            let mut ch = shared.lock().await;
+            ch.say_presence(profile, false, now).map(|_| {
+                (
+                    ch.generation().load(std::sync::atomic::Ordering::Relaxed),
+                    ch.members().is_empty(),
+                )
+            })
+        };
+        let (gen, alone) = match written {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
+            }
+        };
+        // Nobody else is in the room: there is nobody to tell.
+        if alone {
+            let _ = reply.send(self.remove_left_room(&channel_id).await);
+            return;
+        }
+        self.wait_for_leave(channel_id, gen, Some(reply)).await;
+    }
+
+    /// Push a written departure to the room's members, and remove the room once one has it.
+    async fn wait_for_leave(
+        &mut self,
+        channel_id: Digest32,
+        gen: u64,
+        reply: Option<oneshot::Sender<Outcome>>,
+    ) {
+        self.note_local_append(&channel_id);
+        let _ = self.sync_channel(&channel_id).await;
+        self.leave_serial += 1;
+        let serial = self.leave_serial;
+        self.leave_waiters.push((channel_id, gen, reply, serial));
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(LEAVE_PATIENCE).await;
+            let _ = tx
+                .send(NetEvent::LeaveWaitOver { channel_id, serial })
+                .await;
+        });
+    }
+
+    /// A room held again whose own feed ends in this identity's departure was being left when
+    /// the node stopped or locked, before any member had it (V210-164): go on leaving it.
+    async fn resume_leave(&mut self, channel_id: &Digest32) {
+        if self
+            .leave_waiters
+            .iter()
+            .any(|(r, _, _, _)| r == channel_id)
+        {
+            return;
+        }
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let gen = {
+            let ch = shared.lock().await;
+            // A room joined and not yet synced is one this node came back to: it says so once
+            // settled (`settle_room`), however its feed ended before.
+            if !ch.is_settled() || !ch.has_left(&ch.me()) {
+                return;
+            }
+            ch.generation().load(std::sync::atomic::Ordering::Relaxed)
+        };
+        self.wait_for_leave(*channel_id, gen, None).await;
+    }
+
+    /// A sync of `channel_id` with another member ended cleanly: a room joined here now holds its
+    /// own feed as the room does, and may be written to (V210-164). A feed that already holds
+    /// entries means this identity was in the room before: it moves to a sender generation the
+    /// others do not hold yet, and, if its feed ends in its departure, says it is back, so the
+    /// other members list it again before it says anything else.
+    async fn settle_room(&mut self, channel_id: &Digest32) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let leaving = self
+            .leave_waiters
+            .iter()
+            .any(|(r, _, _, _)| r == channel_id);
+        let now = self.now();
+        let back = {
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let mut ch = shared.lock().await;
+            if !matches!(ch.settle(profile.store()), Ok(true)) || leaving {
+                return;
+            }
+            ch.catch_up_generation(profile, now)
+                .and_then(|_| ch.say_presence(profile, true, now))
+        };
+        match back {
+            Ok(true) => self.note_local_append(channel_id),
+            Ok(false) => {}
+            Err(e) => {
+                let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                    reason: format!(
+                        "joined room {} again, but could not start a new sender key in it: {e}",
+                        crate::node::network::short_id(*channel_id)
+                    ),
+                });
+            }
+        }
+    }
+
+    /// A sync session of `channel_id` ended cleanly having sent this node's HAVE at generation
+    /// `sent`: a leave whose departure was written at or before it has been heard, and the room
+    /// is removed.
+    async fn finish_leave_if_heard(&mut self, channel_id: Digest32, sent: u64) {
+        let (heard, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
+            .into_iter()
+            .partition(|(r, gen, _, _)| *r == channel_id && *gen <= sent);
+        self.leave_waiters = waiting;
+        if heard.is_empty() {
+            return;
+        }
+        // Written in the room since — it posted, or said it is back — and so not leaving.
+        let still_left = match self.channels.get(&channel_id) {
+            Some(shared) => {
+                let ch = shared.lock().await;
+                ch.has_left(&ch.me())
+            }
+            None => false,
+        };
+        let outcome = if still_left {
+            self.remove_left_room(&channel_id).await
+        } else {
+            Outcome::Failed(Fault::LeaveUndone)
+        };
+        for reply in heard.into_iter().filter_map(|(_, _, reply, _)| reply) {
+            let _ = reply.send(outcome);
+        }
+    }
+
+    /// Remove a room this node has left: close it, stop syncing it, and delete everything the
+    /// store holds for it as a member (V210-164).
+    async fn remove_left_room(&mut self, channel_id: &Digest32) -> Outcome {
+        let closed = self.close_channel(channel_id).await;
+        if closed != Outcome::Done {
+            return closed;
+        }
+        let ports: Vec<(Digest32, Digest32)> = self
+            .ports
+            .keys()
+            .filter(|(r, _)| r == channel_id)
+            .copied()
+            .collect();
+        for (room, peer) in ports {
+            self.drop_port(&room, &peer);
+        }
+        crate::node::status::SyncBook::forget_room(&self.sync_book, channel_id);
+        self.sched_rooms.remove(channel_id);
+        self.discover_rooms.remove(channel_id);
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::Locked);
+        };
+        let deleted = profile.store().batch().and_then(|mut b| {
+            b.delete_room(channel_id)?;
+            b.commit()
+        });
+        if let Err(e) = deleted {
+            return Outcome::Failed(fault_of(&e));
+        }
+        // What was kept for the room beside the keyring goes with it: the sender keys owed to its
+        // members, and the members owed a new key.
+        let Ok(signer) = profile.signer() else {
+            return Outcome::Failed(Fault::Locked);
+        };
+        if self.consent_keys.forget_room(channel_id) {
+            if let Err(e) = self.consent_keys.save(profile.store(), signer) {
+                return Outcome::Failed(fault_of(&e));
+            }
+        }
+        if let Ok(mut locks) =
+            crate::node::pending_lock::PendingLocks::load(profile.store(), signer)
+        {
+            if locks.clear_room(channel_id) {
+                if let Err(e) = locks.save(profile.store(), signer) {
+                    return Outcome::Failed(fault_of(&e));
+                }
+            }
+        }
+        self.refresh_network_view().await;
+        Outcome::Done
     }
 
     /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). The `bind:`
@@ -11607,6 +11910,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::LadderExhausted(_) => Fault::Unreachable,
         Error::LocalBind { cause, .. } => Fault::of_bind(*cause),
         Error::TunnelLimit(_) => Fault::TunnelLimit,
+        Error::RoomNotSynced => Fault::RoomNotSynced,
         Error::Profile("no identity in this profile") => Fault::NoIdentity,
         Error::Profile("identity already exists in this profile") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
