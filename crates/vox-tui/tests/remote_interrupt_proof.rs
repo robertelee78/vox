@@ -1002,7 +1002,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let entries: serde_json::Value =
         serde_json::from_str(&printed.stdout).unwrap_or(serde_json::Value::Null);
     let runs_hook = |event: &str| {
-        entries["hooks"][event][0]["hooks"][0]["command"] == "vox agent hook"
+        entries["hooks"][event][0]["hooks"][0]["command"] == "vox agent hook --node default"
             && entries["hooks"][event][0]["hooks"][0]["type"] == "command"
     };
     println!(

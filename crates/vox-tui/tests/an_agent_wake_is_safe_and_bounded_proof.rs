@@ -515,7 +515,8 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     let own_woken = !own_c.is_empty()
         && own_c
             .iter()
-            .all(|c| c.contains("urgent message addressed to you from you in room"));
+            // One notice may count one or more of the three posts, as the sweep finds them.
+            .all(|c| c.contains("addressed to you from you in room"));
     let own_quiet = quiet.is_empty();
     let own_leak = own.iter().any(|f| f.contains("OWN-"));
     println!(

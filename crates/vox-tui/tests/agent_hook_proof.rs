@@ -242,7 +242,8 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
 
-    // (6) with nothing running at all, the hook still exits 0.
+    // (6) with nothing running at all, the hook still exits 0. It starts the daemon (ADR-020
+    // 6.10), which has no node `default` here.
     let (ok, out, _) = hook(
         &data,
         &cfg,
@@ -265,7 +266,7 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         .unwrap_or_default();
     assert!(
         context.starts_with("Vox could not read your rooms this turn: ")
-            && context.contains("no node is running")
+            && context.contains("there is no node default")
             && context.trim_end().lines().count() == 1,
         "PRODUCT: when it cannot read, it must say so to the agent in one line naming why; it \
          printed {out:?}"
