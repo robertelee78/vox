@@ -109,11 +109,16 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     if let Some(s) = stdin {
-        child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
+        child
+            .stdin
+            .take()
+            .expect("APPARATUS: a piped stdio handle")
+            .write_all(s.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
     }
-    let out = child.wait_with_output().expect("vox finished");
+    let out = child.wait_with_output().expect("APPARATUS: vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -156,7 +161,9 @@ fn daemon(exe: &Path, name: &str, data: &Path, spec: &str, pass_file: &Path) -> 
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
         &[],
     );
@@ -167,7 +174,7 @@ fn daemon(exe: &Path, name: &str, data: &Path, spec: &str, pass_file: &Path) -> 
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 /// Create a room on `host`'s daemon, have `guest` join it, and return the room's id.
@@ -183,7 +190,7 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
         .lines()
         .find(|l| l.contains(name))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): room not listed: {list}"))
         .to_owned();
     let link = ok(exe, host, &["room", "invite", &room], None);
     ok(
@@ -203,14 +210,19 @@ fn profile_dir(data: &Path) -> PathBuf {
 
 /// Copy a stopped profile's data directory (its files; a daemon's leftover socket is not one).
 fn copy_tree(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap().filter_map(Result::ok) {
-        let ty = e.file_type().unwrap();
+    std::fs::create_dir_all(to).expect("APPARATUS: create a staging directory");
+    for e in std::fs::read_dir(from)
+        .expect("APPARATUS: list a directory")
+        .filter_map(Result::ok)
+    {
+        let ty = e
+            .file_type()
+            .expect("APPARATUS: read a staging file's type");
         let dest = to.join(e.file_name());
         if ty.is_dir() {
             copy_tree(&e.path(), &dest);
         } else if ty.is_file() {
-            std::fs::copy(e.path(), &dest).unwrap();
+            std::fs::copy(e.path(), &dest).expect("APPARATUS: copy the v0.2.9 profile");
         }
     }
 }
@@ -224,27 +236,39 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// redb would repair on open is not changed by reading it.
 fn row_keys(data: &Path) -> BTreeSet<String> {
     let copy = data.with_extension("rows.redb");
-    std::fs::copy(profile_dir(data).join("store.redb"), &copy).unwrap();
-    let db = redb::Database::open(&copy).expect("open a copy of the stopped store");
-    let r = db.begin_read().unwrap();
+    std::fs::copy(profile_dir(data).join("store.redb"), &copy)
+        .expect("PRODUCT (staging): the profile has no store.redb to read");
+    let db = redb::Database::open(&copy).expect("APPARATUS: open a copy of the stopped store");
+    let r = db
+        .begin_read()
+        .expect("PRODUCT: vox's stopped store cannot be read");
     let mut keys = BTreeSet::new();
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     if let Ok(t) = r.open_table(SEGMENTS) {
-        for item in t.iter().unwrap() {
-            let (k, _) = item.unwrap();
+        for item in t
+            .iter()
+            .expect("PRODUCT: a table of vox's stopped store cannot be read")
+        {
+            let (k, _) = item.expect("PRODUCT: a row of vox's stopped store cannot be read");
             let (c, kind, id) = k.value();
             keys.insert(format!("segments/{}/{kind}/{id}", hex(&c)));
         }
     }
     if let Ok(t) = r.open_table(SEK_WRAPS) {
-        for item in t.iter().unwrap() {
-            let (k, _) = item.unwrap();
+        for item in t
+            .iter()
+            .expect("PRODUCT: a table of vox's stopped store cannot be read")
+        {
+            let (k, _) = item.expect("PRODUCT: a row of vox's stopped store cannot be read");
             keys.insert(format!("sek_wraps/{}", hex(&k.value())));
         }
     }
     if let Ok(t) = r.open_table(META) {
-        for item in t.iter().unwrap() {
-            let (k, _) = item.unwrap();
+        for item in t
+            .iter()
+            .expect("PRODUCT: a table of vox's stopped store cannot be read")
+        {
+            let (k, _) = item.expect("PRODUCT: a row of vox's stopped store cannot be read");
             keys.insert(format!("meta/{}", k.value()));
         }
     }
@@ -252,14 +276,17 @@ fn row_keys(data: &Path) -> BTreeSet<String> {
 }
 
 fn vault_version(data: &Path) -> u64 {
-    let bytes = std::fs::read(profile_dir(data).join("vault.cbor")).unwrap();
-    IdentityVault::from_canonical_slice(&bytes).unwrap().version
+    let bytes = std::fs::read(profile_dir(data).join("vault.cbor"))
+        .expect("PRODUCT (staging): the profile has no vault.cbor");
+    IdentityVault::from_canonical_slice(&bytes)
+        .expect("PRODUCT: the vault vox wrote does not parse")
+        .version
 }
 
 /// Files a migration must not leave behind: its rewrite's new file, or a store moved aside.
 fn leftovers(data: &Path) -> Vec<String> {
     std::fs::read_dir(profile_dir(data))
-        .unwrap()
+        .expect("APPARATUS: list a directory")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains(".rewrite") || n.contains("orphaned"))
@@ -306,7 +333,7 @@ fn trust_add(data: &Path, who: &'static str, fp: &str, env: &[(&str, &str)]) -> 
 }
 
 fn finish(mut p: VoxProc, name: &'static str) -> Ran {
-    let status = p.child.wait().expect("wait for vox");
+    let status = p.child.wait().expect("APPARATUS: wait for vox");
     // The reader threads end when the pipes close; give them a moment to hand over the rest.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut said = String::new();
@@ -412,14 +439,14 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     } else {
         600
     }));
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write a staging file");
     let new = PathBuf::from(VOX);
 
     // ---- a profile written by v0.2.9: a trusted member, and a room with a post ---------------
@@ -567,28 +594,32 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     for t in [&nat, &staged] {
         assert!(
             t.lost_adds.is_empty(),
-            "a `vox trust add` exited 0 and its row is gone: {:#?}",
+            "PRODUCT: a `vox trust add` exited 0 and its row is gone: {:#?}",
             t.lost_adds
         );
         assert!(
             t.lost_rows.is_empty(),
-            "rows v0.2.9 wrote are gone from the store: {:#?}",
+            "PRODUCT: rows v0.2.9 wrote are gone from the store: {:#?}",
             t.lost_rows
         );
-        assert_eq!(t.dave_gone, 0, "the member v0.2.9 trusted is gone");
+        assert_eq!(t.dave_gone, 0, "PRODUCT: the member v0.2.9 trusted is gone");
         assert!(
             t.unnamed.is_empty(),
-            "a refused unlock did not name another vox holding the profile: {:#?}",
+            "PRODUCT: a refused unlock did not name another vox holding the profile: {:#?}",
             t.unnamed
         );
         assert_eq!(
             t.not_v2, 0,
-            "a profile that was unlocked is still a v1 vault"
+            "PRODUCT: a profile that was unlocked is still a v1 vault"
         );
-        assert!(t.left.is_empty(), "files left behind: {:?}", t.left);
+        assert!(
+            t.left.is_empty(),
+            "PRODUCT: files left behind: {:?}",
+            t.left
+        );
         assert_eq!(
             t.none_ok, 0,
-            "both unlocks were refused, so the profile could be opened by neither"
+            "PRODUCT: both unlocks were refused, so the profile could be opened by neither"
         );
         assert!(
             t.not_once.is_empty(),

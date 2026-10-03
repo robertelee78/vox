@@ -45,7 +45,7 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
     match out.code {
         Some(0) => assert!(
             said.contains("cargo PASS"),
-            "exit 0 without a PASS line: {said}"
+            "APPARATUS: the driver exited 0 without a PASS line: {said}"
         ),
         Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
         _ if !out.has_verdict("cargo") => panic!(
@@ -58,6 +58,10 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
         ),
         Some(1) if said.contains("did not return within") => {
             panic!("PRODUCT: a `vox` verb ran past the product's own bound for it: {said}")
+        }
+        // A `vox` step before the members pane failed: the driver quotes what `vox` said.
+        Some(1) if said.contains("cargo PRODUCT:") => {
+            panic!("PRODUCT: a `vox` step before the TUI's members pane failed: {said}")
         }
         Some(1) if said.contains("cargo RED") => panic!(
             "PRODUCT: the TUI must name alice \"alice\" and carol by 26 characters + \"(not in \

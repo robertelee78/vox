@@ -107,9 +107,9 @@ struct Out {
 impl Profile {
     fn new(tmp: &Path, name: &str, skew: Option<String>, pool: Option<u64>) -> Self {
         let dir = tmp.join(name);
-        std::fs::create_dir_all(dir.join("cfg")).unwrap();
+        std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: create a staging directory");
         let pass = tmp.join(format!("{name}.pass"));
-        std::fs::write(&pass, format!("{IDENTITY}\n")).unwrap();
+        std::fs::write(&pass, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
         Self {
             name: name.to_owned(),
             dir,
@@ -143,12 +143,14 @@ impl Profile {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("{}: spawn vox: {e}", self.name));
-        let mut input = child.stdin.take().unwrap();
+        let mut input = child.stdin.take().expect("APPARATUS: a piped stdio handle");
         if let Some(s) = stdin {
             let _ = writeln!(input, "{s}");
         }
         drop(input);
-        let out = child.wait_with_output().unwrap();
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: wait for a child process");
         Out {
             ok: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -162,7 +164,10 @@ impl Profile {
         if let Some(s) = &self.skew {
             c.env("VOX_TEST_CLOCK_SKEW_MS", s);
         }
-        let out = c.stdin(Stdio::null()).output().expect("run vox id");
+        let out = c
+            .stdin(Stdio::null())
+            .output()
+            .expect("APPARATUS: run vox id");
         assert!(
             out.status.success(),
             "{}: vox id: {}{}",
@@ -179,16 +184,20 @@ impl Profile {
             args.extend(["--anchor", a]);
         }
         args.push("--passphrase-file");
-        let pass = self.pass.to_str().unwrap();
+        let pass = self
+            .pass
+            .to_str()
+            .expect("APPARATUS: a path that is not UTF-8");
         args.push(pass);
-        let err = std::fs::File::create(self.dir.join("daemon.err")).unwrap();
+        let err = std::fs::File::create(self.dir.join("daemon.err"))
+            .expect("APPARATUS: create a staging file");
         let p = Proc(
             self.command(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(err))
                 .spawn()
-                .expect("spawn vox daemon"),
+                .expect("APPARATUS: spawn vox daemon"),
         );
         let deadline = Instant::now() + Duration::from_secs(120);
         while !self.vox(&["room", "list"], None).ok {
@@ -206,17 +215,25 @@ impl Profile {
     /// A new room's invite link: `vox room create`, then `vox room invite` by its id.
     fn room(&self, name: &str) -> String {
         let o = self.vox(&["room", "create", "--name", name], Some(ROOM_PASS));
-        assert!(o.ok, "room create {name}: {}{}", o.stdout, o.stderr);
+        assert!(
+            o.ok,
+            "PRODUCT: room create {name}: {}{}",
+            o.stdout, o.stderr
+        );
         let o = self.vox(&["room", "list"], None);
         let id = o
             .stdout
             .lines()
             .find(|l| l.split_whitespace().nth(1) == Some(name))
             .and_then(|l| l.split_whitespace().next())
-            .unwrap_or_else(|| panic!("room {name} not in `vox room list`: {}", o.stdout))
+            .unwrap_or_else(|| panic!("PRODUCT: room {name} not in `vox room list`: {}", o.stdout))
             .to_owned();
         let o = self.vox(&["room", "invite", &id], None);
-        assert!(o.ok, "room invite {name}: {}{}", o.stdout, o.stderr);
+        assert!(
+            o.ok,
+            "PRODUCT: room invite {name}: {}{}",
+            o.stdout, o.stderr
+        );
         o.stdout.trim().to_owned()
     }
 
@@ -227,14 +244,14 @@ impl Profile {
             let o = self.vox(&["status", "--json"], None);
             if o.ok {
                 let v: serde_json::Value = serde_json::from_str(&o.stdout)
-                    .unwrap_or_else(|e| panic!("vox status --json: {e}: {}", o.stdout));
+                    .unwrap_or_else(|e| panic!("PRODUCT: vox status --json: {e}: {}", o.stdout));
                 if !v["prekeys"].is_null() {
                     return v["prekeys"].clone();
                 }
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: {}'s `vox status --json` never named its prekey ring: {}{}",
+                "PRODUCT (staging): {}'s `vox status --json` never named its prekey ring: {}{}",
                 self.name,
                 o.stdout,
                 o.stderr
@@ -246,13 +263,13 @@ impl Profile {
 
 fn n(v: &serde_json::Value, k: &str) -> u64 {
     v[k].as_u64()
-        .unwrap_or_else(|| panic!("prekeys.{k} is not a count: {v}"))
+        .unwrap_or_else(|| panic!("PRODUCT: prekeys.{k} is not a count: {v}"))
 }
 
 /// A `vox node` anchor, and its `--anchor` spec.
 fn anchor(tmp: &Path) -> (Proc, String) {
     let anchor_dir = tmp.join("anchor");
-    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: create a staging directory");
     let anchor_out = tmp.join("anchor.out");
     let p = Proc(
         Command::new(VOX)
@@ -261,10 +278,12 @@ fn anchor(tmp: &Path) -> (Proc, String) {
             .env("VOX_CONFIG_DIR", anchor_dir.join("cfg"))
             .env_remove("VOX_TEST_CLOCK_SKEW_MS")
             .env_remove("VOX_TEST_ONE_TIME_PREKEYS")
-            .stdout(Stdio::from(std::fs::File::create(&anchor_out).unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create(&anchor_out).expect("APPARATUS: create a staging file"),
+            ))
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: spawn vox node"),
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -277,7 +296,7 @@ fn anchor(tmp: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "PRODUCT: the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -289,7 +308,7 @@ fn signal(pid: u32, sig: &str) {
         .args([&format!("-{sig}"), &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill -{sig} {pid}");
+    assert!(ok, "APPARATUS: kill -{sig} {pid}");
 }
 
 #[test]
@@ -297,7 +316,7 @@ fn signal(pid: u32, sig: &str) {
 fn a_running_node_rotates_its_signed_prekey() {
     test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // The ring is made at `vox id`, on this clock: its signed prekey falls due LEAD seconds on,
     // on the true clock the daemon keeps.
     let behind_ms = (SEVEN_DAYS - LEAD) * 1000;
@@ -343,7 +362,7 @@ fn a_session_started_before_a_rotation_completes_after_it() {
     // A join per attempt; 14 unlocks: the guest's `vox id` and daemon, and per attempt the host's
     // `vox id`, daemon and room.
     watchdog::arm_for_setup(WINDOW_TRIES as u32, 2 + 3 * WINDOW_TRIES as u32);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (_anchor, spec) = anchor(tmp.path());
     let guest = Profile::new(tmp.path(), "guest", None, None);
     guest.id();
@@ -364,7 +383,9 @@ fn a_session_started_before_a_rotation_completes_after_it() {
         let _host_daemon = host.daemon(Some(&spec));
         let link = host.room(&format!("w{attempt}"));
         let before = host.prekeys();
-        let start = due.checked_sub(JOIN_BEFORE_DUE).unwrap();
+        let start = due.checked_sub(JOIN_BEFORE_DUE).expect(
+            "CANNOT MEASURE: the ring falls due sooner than a join can be staged before it",
+        );
         assert!(
             n(&before, "rotated") == 0 && Instant::now() < start,
             "CANNOT MEASURE: attempt {attempt}: the host was not ready {JOIN_BEFORE_DUE:?} before \
@@ -381,14 +402,15 @@ fn a_session_started_before_a_rotation_completes_after_it() {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .expect("spawn vox room join");
+                .expect("APPARATUS: spawn vox room join");
             move || {
                 use std::io::Write as _;
                 let mut cmd = cmd;
-                let mut input = cmd.stdin.take().unwrap();
+                let mut input = cmd.stdin.take().expect("APPARATUS: a piped stdio handle");
                 let _ = writeln!(input, "{ROOM_PASS}");
                 drop(input);
-                cmd.wait_with_output().unwrap()
+                cmd.wait_with_output()
+                    .expect("APPARATUS: wait for a child process")
             }
         });
         // Later into the join each attempt, so one of them stops it after the host's offer.
@@ -404,7 +426,9 @@ fn a_session_started_before_a_rotation_completes_after_it() {
             std::thread::sleep(Duration::from_millis(200));
         };
         signal(guest_pid, "CONT");
-        let out = joining.join().unwrap();
+        let out = joining
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
         std::thread::sleep(Duration::from_secs(2));
         let after = host.prekeys();
         let (ok, said) = (
@@ -452,7 +476,7 @@ fn sessions_get_one_time_prekeys_past_the_whole_pool() {
     test_knobs::require(&["VOX_TEST_ONE_TIME_PREKEYS"]);
     // JOINS joins; 16 unlocks: two `vox id`s, two daemon starts, and a room created per join.
     watchdog::arm_for_setup(JOINS as u32, 16);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (_anchor, spec) = anchor(tmp.path());
     let host = Profile::new(tmp.path(), "host", None, Some(POOL));
     let guest = Profile::new(tmp.path(), "guest", None, None);
@@ -486,7 +510,10 @@ fn sessions_get_one_time_prekeys_past_the_whole_pool() {
             }
             o.ok
         });
-        assert!(joined, "CANNOT MEASURE: the guest could not join room {i}");
+        assert!(
+            joined,
+            "PRODUCT (staging): the guest could not join room {i}"
+        );
         let p = host.prekeys();
         least = least.min(n(&p, "one_time"));
         eprintln!(
@@ -511,10 +538,10 @@ fn sessions_get_one_time_prekeys_past_the_whole_pool() {
     );
     assert!(
         least > 0 && n(&last, "one_time") > 0,
-        "the host must never run out of one-time prekeys to offer (fewest {least}): {last}"
+        "PRODUCT: the host must never run out of one-time prekeys to offer (fewest {least}): {last}"
     );
     assert!(
         n(&last, "refilled") > 0,
-        "the running host must have refilled its pool: {last}"
+        "PRODUCT: the running host must have refilled its pool: {last}"
     );
 }

@@ -321,7 +321,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     while !vox(&data, &cfg, &["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: the daemon never answered; its stderr: {:?}",
+            "PRODUCT (staging): the daemon never answered; its stderr: {:?}",
             std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));

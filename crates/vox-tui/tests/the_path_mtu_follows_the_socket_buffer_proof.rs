@@ -237,7 +237,7 @@ fn staged_for(log: &std::path::Path, pid: u32, name: &str) {
 
 #[cfg(not(target_os = "macos"))]
 fn staged_for(_log: &std::path::Path, _pid: u32, _name: &str) {
-    unreachable!("the staged arm runs only on a Mac");
+    unreachable!("APPARATUS: the staged arm runs only on a Mac");
 }
 
 #[test]

@@ -111,16 +111,16 @@ impl Member {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         if let Some(text) = stdin {
             child
                 .stdin
                 .take()
-                .unwrap()
+                .expect("APPARATUS: a piped stdio handle")
                 .write_all(text.as_bytes())
-                .unwrap();
+                .expect("PRODUCT (staging): vox exited without reading its stdin");
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child.wait_with_output().expect("APPARATUS: vox ran");
         let r = (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -150,7 +150,9 @@ impl Member {
                 "--name",
                 other.name,
                 "--identity-passphrase-file",
-                self.pass.to_str().unwrap(),
+                self.pass
+                    .to_str()
+                    .expect("APPARATUS: a path that is not UTF-8"),
             ],
             None,
         );
@@ -160,9 +162,9 @@ impl Member {
 
 fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
     let data = tmp.join(name);
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: create a staging directory");
     let pass = tmp.join(format!("{name}.pass"));
-    std::fs::write(&pass, ID_PASS).unwrap();
+    std::fs::write(&pass, ID_PASS).expect("APPARATUS: write a staging file");
     let mut m = Member {
         name,
         data,
@@ -171,7 +173,13 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         daemon: None,
     };
     let (ok, out, err) = m.vox(
-        &["id", "--identity-passphrase-file", m.pass.to_str().unwrap()],
+        &[
+            "id",
+            "--identity-passphrase-file",
+            m.pass
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
+        ],
         None,
     );
     assert!(ok, "{name}: vox id: {err}");
@@ -184,7 +192,8 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
 /// Start `m`'s `vox daemon` (stderr to `<name>.<tag>.err`) and wait until it answers.
 fn start_daemon(m: &mut Member, tmp: &Path, anchor: &str, tag: &str) {
     let name = m.name;
-    let err = std::fs::File::create(tmp.join(format!("{name}.{tag}.err"))).unwrap();
+    let err = std::fs::File::create(tmp.join(format!("{name}.{tag}.err")))
+        .expect("APPARATUS: create a staging file");
     let child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
@@ -196,13 +205,13 @@ fn start_daemon(m: &mut Member, tmp: &Path, anchor: &str, tag: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: spawn vox daemon");
     m.daemon = Some(Proc(child));
     let deadline = Instant::now() + Duration::from_secs(90);
     while !m.vox(&["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: {name}'s daemon never answered"
+            "PRODUCT (staging): {name}'s daemon never answered"
         );
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -210,17 +219,19 @@ fn start_daemon(m: &mut Member, tmp: &Path, anchor: &str, tag: &str) {
 
 fn anchor(tmp: &Path) -> (Proc, String) {
     let dir = tmp.join("anchor");
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: create a staging directory");
     let out = tmp.join("anchor.out");
     let p = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
-            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create(&out).expect("APPARATUS: create a staging file"),
+            ))
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: spawn vox node"),
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -233,7 +244,7 @@ fn anchor(tmp: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: the anchor never printed its spec"
+            "PRODUCT (staging): the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -277,7 +288,11 @@ fn join(m: &Member, link: &str, name: &str) {
         }
         ok
     });
-    assert!(joined, "CANNOT MEASURE: {} could not join {name}", m.name);
+    assert!(
+        joined,
+        "PRODUCT (staging): {} could not join {name}",
+        m.name
+    );
 }
 
 fn until(what: &str, within: Duration, ok: impl Fn() -> bool) -> bool {
@@ -298,7 +313,7 @@ fn make_room(alice: &Member, name: &str) -> (String, String) {
         &["room", "create", "--name", name],
         Some(&format!("{ROOM_PASS}\n")),
     );
-    assert!(ok, "room create {name}: {e}");
+    assert!(ok, "PRODUCT (staging): room create {name}: {e}");
     let listed = alice.vox(&["room", "list"], None).1;
     let room = listed
         .lines()
@@ -307,7 +322,7 @@ fn make_room(alice: &Member, name: &str) -> (String, String) {
         .unwrap_or_else(|| panic!("{name} in `vox room list`: {listed}"))
         .to_owned();
     let (ok, link, e) = alice.vox(&["room", "invite", &room], None);
-    assert!(ok, "invite {name}: {e}");
+    assert!(ok, "PRODUCT (staging): invite {name}: {e}");
     let link = link.trim().to_owned();
     assert!(
         link.contains(&format!("r={}", alice.fp)),
@@ -325,7 +340,7 @@ fn count(text: &str, tag: &str) -> usize {
 #[ignore = "an anchor and three daemons with production Argon2id; CI runs it in release"]
 fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (_anchor, spec) = anchor(tmp.path());
     let alice = member(tmp.path(), "alice", &spec);
     let bob = member(tmp.path(), "bob", &spec);
@@ -359,14 +374,14 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
         let final_line = format!("BOB-FINAL-IN-{name}");
         let (ok, _, e) = bob.vox(&["room", "post", room, &final_line], None);
-        assert!(ok, "bob posts: {e}");
+        assert!(ok, "PRODUCT: bob posts: {e}");
         assert!(
             until(
                 &format!("carol renders {final_line}"),
                 Duration::from_secs(60),
                 || { carol.reads(room, &final_line) }
             ),
-            "CANNOT MEASURE: carol never rendered bob's final post in room {name}"
+            "PRODUCT (staging): carol never rendered bob's final post in room {name}"
         );
         let ca = posts_until_read(
             &carol,
@@ -383,7 +398,11 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         eprintln!(
             "[proof] room {name}: carol rendered bob after {bc:?} posts; alice rendered carol after {ca:?} posts"
         );
-        alice_read_bob.push((name, room.clone(), bc.unwrap() + 1));
+        alice_read_bob.push((
+            name,
+            room.clone(),
+            bc.expect("APPARATUS: checked above") + 1,
+        ));
     }
 
     std::thread::sleep(Duration::from_secs(10));
@@ -441,16 +460,16 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
         let final_line = format!("A118-FINAL-IN-{name}");
         let (ok, _, e) = alice.vox(&["room", "post", room, &final_line], None);
-        assert!(ok, "alice posts: {e}");
+        assert!(ok, "PRODUCT (staging): alice posts: {e}");
         assert!(
             until(
                 &format!("carol renders {final_line}"),
                 Duration::from_secs(60),
                 || carol.reads(room, &final_line)
             ),
-            "CANNOT MEASURE: carol never rendered alice's final post in room {name}"
+            "PRODUCT (staging): carol never rendered alice's final post in room {name}"
         );
-        alice_posted.push((name, room.clone(), ac.unwrap()));
+        alice_posted.push((name, room.clone(), ac.expect("APPARATUS: checked above")));
     }
     std::thread::sleep(Duration::from_secs(10));
     let mut read_untrusted = 0;
@@ -496,16 +515,19 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
             "remove",
             &carol.fp,
             "--identity-passphrase-file",
-            alice.pass.to_str().unwrap(),
+            alice
+                .pass
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ],
         None,
     );
-    assert!(ok, "alice removes carol: {o}{e}");
+    assert!(ok, "PRODUCT: alice removes carol: {o}{e}");
     // The rotation happened: a post made now is not readable to carol, who held the old key.
     for (name, room, _) in &alice_posted {
         let line = format!("A118-WHILE-CAROL-REMOVED-IN-{name}");
         let (ok, _, e) = alice.vox(&["room", "post", room, &line], None);
-        assert!(ok, "alice posts: {e}");
+        assert!(ok, "PRODUCT (staging): alice posts: {e}");
     }
     std::thread::sleep(Duration::from_secs(10));
     for (name, room, _) in &alice_posted {
@@ -519,7 +541,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     for (name, room, _) in &alice_posted {
         let line = format!("A118-AFTER-ROTATION-IN-{name}");
         let (ok, _, e) = alice.vox(&["room", "post", room, &line], None);
-        assert!(ok, "alice posts: {e}");
+        assert!(ok, "PRODUCT (staging): alice posts: {e}");
         assert!(
             until(
                 &format!("carol renders {line}"),
@@ -538,7 +560,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         let n = count(&dave.vox(&["room", "read", room], None).1, "A118-");
         assert_eq!(
             n, 0,
-            "dave renders {n} of alice's posts in room {name} before he trusts her"
+            "PRODUCT: dave renders {n} of alice's posts in room {name} before he trusts her"
         );
     }
     dave.trust(&alice);
@@ -591,7 +613,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         let (ok, seen, e) = bob.vox(&["room", "read", room], None);
         assert!(
             ok && seen.contains(&format!("CAROL-TO-BOB-IN-{name}")),
-            "CANNOT MEASURE: bob's read of room {name} after trusting alice did not succeed: {e}"
+            "PRODUCT (staging): bob's read of room {name} after trusting alice did not succeed: {e}"
         );
         let n = count(&seen, "A118-");
         assert_eq!(
