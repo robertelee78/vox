@@ -14,7 +14,8 @@
 //!
 //! 1. `vox room join` with the wrong room passphrase → the member refused, and the likely cause
 //!    is the passphrase;
-//! 2. `vox room join` of a room already held → it is already held;
+//! 2. `vox room join` of a room already held → not a failure: it says the room is already held,
+//!    reaches a member at the address, and keeps it as where the host is now (V210-167);
 //! 3. `vox daemon --listen` on a UDP port something else holds → that port, in use;
 //! 4. `vox up --bind` on a TCP port something else holds → that address, in use — promptly;
 //! 5. `vox forward` onto a local port something else holds → that address, in use — promptly,
@@ -361,7 +362,15 @@ fn every_common_failure_names_its_cause() {
     // ---- (1) join with the wrong room passphrase ----
     let (ok, said, _) = vox(
         &joiner_dir,
-        &["room", "join", &address, "--name", "svc"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc",
+        ],
         "not the passphrase\n",
         join_quick,
     );
@@ -375,7 +384,15 @@ fn every_common_failure_names_its_cause() {
     // ---- (2) join a room already held ----
     let (ok, said, _) = vox(
         &joiner_dir,
-        &["room", "join", &address, "--name", "svc"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc",
+        ],
         &format!("{passphrase}\n"),
         join_quick,
     );
@@ -385,12 +402,27 @@ fn every_common_failure_names_its_cause() {
     );
     let (ok, said, _) = vox(
         &joiner_dir,
-        &["room", "join", &address, "--name", "svc-again"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc-again",
+        ],
         &format!("{passphrase}\n"),
         join_quick,
     );
-    assert!(!ok, "joining a room already held must fail");
-    assert_says("join, already held", &said, &["already holds that room"]);
+    assert!(
+        ok,
+        "joining a room already held must take the address as the host's: {said}"
+    );
+    assert_says(
+        "join, already held",
+        &said,
+        &["already holds", "a member answered at the address"],
+    );
 
     // ---- (6) stop trusting someone never trusted, over the daemon's socket ----
     let (ok, said, _) = vox(&joiner_dir, &["trust", "remove", &host_fp], "", quick);

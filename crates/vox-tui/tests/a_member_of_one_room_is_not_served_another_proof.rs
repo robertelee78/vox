@@ -104,7 +104,11 @@ fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) -> V
 /// Create room `name` on the running daemon at `data`, post `POSTS` messages, and return its
 /// full id (from the invite link) and the link.
 fn room_with_posts(data: &Path, name: &str, pass: &str) -> (String, String) {
-    let (ok, out, err) = vox_in(data, &["room", "create", "--name", name], pass);
+    let (ok, out, err) = vox_in(
+        data,
+        &["room", "create", "--passphrase-file", "-", "--name", name],
+        pass,
+    );
     assert!(ok, "vox room create {name}: {out}{err}");
     let (ok, list, err) = vox_once(data, &args(&["room", "list"]));
     assert!(ok, "vox room list: {err}");
@@ -176,7 +180,15 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
     let xavier = daemon("xavier", &xavier_dir, free_port(), &spec, &idpass);
     let (ok, out, err) = vox_in(
         &xavier_dir,
-        &["room", "join", &a_link, "--name", "alpha"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &a_link,
+            "--name",
+            "alpha",
+        ],
         "alpha passphrase",
     );
     assert!(ok, "xavier joins alpha: {out}{err}");

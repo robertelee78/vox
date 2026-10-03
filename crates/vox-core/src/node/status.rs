@@ -339,6 +339,13 @@ impl SyncBook {
         f(b.ports.entry((room, peer)).or_default());
     }
 
+    /// Forget every count kept for `room`: this node left it (V210-164).
+    pub fn forget_room(book: &SharedSyncBook, room: &Digest32) {
+        let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        b.ports.retain(|(r, _), _| r != room);
+        b.set_aside.remove(room);
+    }
+
     /// Count one scheduled renewal of a room's own records (V210-68).
     pub fn note_renewal(book: &SharedSyncBook) {
         book.lock().unwrap_or_else(PoisonError::into_inner).renewals += 1;

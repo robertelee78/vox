@@ -219,7 +219,10 @@ impl Member {
 
     /// Create the room `name` on this member's node, and the link to it.
     fn create(&self, name: &str) -> (String, String) {
-        let (ok, _, err) = self.vox(&["room", "create", "--name", name], Some(ROOM_PASS));
+        let (ok, _, err) = self.vox(
+            &["room", "create", "--passphrase-file", "-", "--name", name],
+            Some(ROOM_PASS),
+        );
         assert!(
             ok,
             "PRODUCT (staging): {} `vox room create` {name}: {err}",
@@ -240,7 +243,18 @@ impl Member {
     fn join(&self, link: &str, name: &str) {
         let mut last = String::new();
         for attempt in 1..=6 {
-            let (ok, _, err) = self.vox(&["room", "join", link, "--name", name], Some(ROOM_PASS));
+            let (ok, _, err) = self.vox(
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    link,
+                    "--name",
+                    name,
+                ],
+                Some(ROOM_PASS),
+            );
             if ok {
                 eprintln!("[receipt] {} joined {name} on attempt {attempt}", self.name);
                 return;

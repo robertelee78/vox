@@ -347,7 +347,15 @@ fn a_cli_failure_tells_the_truth() {
         "vox room join (wrong passphrase)",
         vox(
             &joiner_dir,
-            &["room", "join", &address, "--name", "svc"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &address,
+                "--name",
+                "svc",
+            ],
             "not the passphrase\n",
             join_within,
         ),
@@ -379,7 +387,15 @@ fn a_cli_failure_tells_the_truth() {
         "vox room join",
         vox(
             &joiner_dir,
-            &["room", "join", &address, "--name", "svc"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &address,
+                "--name",
+                "svc",
+            ],
             &format!("{passphrase}\n"),
             join_within,
         ),
@@ -435,7 +451,15 @@ fn a_cli_failure_tells_the_truth() {
     let mut join = Proc::spawn(
         "late join",
         &late_dir,
-        &["room", "join", &address, "--name", "svc"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc",
+        ],
         &format!("{passphrase}\n"),
     );
     std::thread::sleep(Duration::from_secs(1));
@@ -523,7 +547,15 @@ fn a_cli_failure_tells_the_truth() {
     let mut join = Proc::spawn(
         "gone join",
         &gone_dir,
-        &["room", "join", &address, "--name", "svc"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc",
+        ],
         &format!("{passphrase}\n"),
     );
     std::thread::sleep(Duration::from_secs(1));

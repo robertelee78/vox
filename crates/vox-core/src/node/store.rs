@@ -639,6 +639,50 @@ impl Batch<'_> {
         Ok(existed)
     }
 
+    /// Queue the removal of everything this node holds **as a member** of `channel`: its SEK
+    /// wrap and every segment sealed under that SEK (V210-164). An anchor's copy of the room
+    /// (`AnchorLog`, `AnchorMeta`) is a separate role and stays. Returns how many rows went.
+    pub fn delete_room(&mut self, channel: &Digest32) -> Result<usize> {
+        let mut removed = 0usize;
+        {
+            let mut t = self
+                .txn
+                .open_table(SEGMENTS)
+                .map_err(storage("open segments"))?;
+            for kind in [
+                SegmentKind::LogDb,
+                SegmentKind::PlaintextCache,
+                SegmentKind::Index,
+                SegmentKind::KeyMaterial,
+            ] {
+                let lo: SegmentKey = (*channel, kind_code(kind), 0);
+                let hi: SegmentKey = (*channel, kind_code(kind), u64::MAX);
+                let keys: Vec<SegmentKey> = t
+                    .range(lo..=hi)
+                    .map_err(storage("range segments"))?
+                    .map(|item| item.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(storage("iterate segments"))?;
+                for key in keys {
+                    t.remove(key).map_err(storage("delete segment"))?;
+                    removed += 1;
+                }
+            }
+        }
+        let mut wraps = self
+            .txn
+            .open_table(SEK_WRAPS)
+            .map_err(storage("open sek_wraps"))?;
+        if wraps
+            .remove(*channel)
+            .map_err(storage("delete sek wrap"))?
+            .is_some()
+        {
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     /// Queue a public metadata write (see [`Store::put_meta`]).
     pub fn put_meta(&mut self, name: &str, value: &[u8]) -> Result<()> {
         let mut meta = self.txn.open_table(META).map_err(storage("open meta"))?;

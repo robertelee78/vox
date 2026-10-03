@@ -173,7 +173,7 @@ fn a_sync_that_did_not_complete_says_why() {
 
     let (ok, out, err) = vox_in(
         &alice_dir,
-        &["room", "create", "--name", "pair"],
+        &["room", "create", "--passphrase-file", "-", "--name", "pair"],
         "room pass",
     );
     assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
@@ -191,7 +191,15 @@ fn a_sync_that_did_not_complete_says_why() {
     assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
-        &["room", "join", link.trim(), "--name", "pair"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "pair",
+        ],
         "room pass",
     );
     assert!(ok, "PRODUCT (staging): bob's `vox room join`: {out}{err}");

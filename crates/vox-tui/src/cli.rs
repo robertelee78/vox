@@ -460,8 +460,44 @@ fn trust_over_socket(sub: &TrustCmd) -> bool {
     rt.block_on(crate::room_cli::node_is_running(&paths))
 }
 
+/// The name `vox trust add` files an identity under (V210-162): `--name`, or asked for on a
+/// terminal. With neither it is refused at once: every identity under one default name could
+/// not be told apart, nor addressed.
+fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
+    use std::io::{BufRead as _, IsTerminal as _, Write as _};
+    if let Some(n) = a.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        return Ok(n.to_owned());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(crate::app::AppError::Usage(
+            "name it: vox trust add <fingerprint> --name <your name for it>".into(),
+        ));
+    }
+    let mut err = std::io::stderr();
+    let _ = write!(err, "Your name for {}: ", a.fingerprint.trim());
+    let _ = err.flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    match line.trim() {
+        "" => Err(crate::app::AppError::Usage(
+            "no name given; nothing was trusted".into(),
+        )),
+        n => Ok(n.to_owned()),
+    }
+}
+
 /// Run a trust verb against the node that is already holding this profile.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
+    let name = match &sub {
+        TrustCmd::Add(a) => match trust_name(a) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => String::new(),
+    };
     let (profile, pass, pass_file) = match &sub {
         TrustCmd::List(a) => (
             a.profile.clone(),
@@ -486,7 +522,9 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let identity = match crate::tunnel_cli::identity_passphrase_for(&paths, pass, pass_file) {
+    // Only what the command line gave. A read needs none, and a change asks for it only when
+    // the node says it is needed (V210-159, V210-165).
+    let given = match crate::tunnel_cli::identity_passphrase_given(pass, pass_file) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("vox: {e}");
@@ -506,14 +544,14 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
     };
     let outcome = rt.block_on(async move {
         match sub {
-            TrustCmd::List(_) => crate::room_cli::trust_list(&paths, &identity).await,
+            TrustCmd::List(_) => crate::room_cli::trust_list(&paths).await,
             TrustCmd::Add(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_add(&paths, target, &a.name, &identity).await
+                crate::room_cli::trust_add(&paths, target, &name, given).await
             }
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_remove(&paths, target, &identity).await
+                crate::room_cli::trust_remove(&paths, target, given).await
             }
         }
     });
@@ -607,11 +645,11 @@ enum RoomCmd {
     Send(SendFileArgs),
     /// Join a room from a `vox://` address, over a running node (ADR-020 §12).
     ///
-    /// The passphrase is read from **stdin**, never argv, which anything that can
-    /// run `ps` would see:
+    /// The passphrase is asked for at the terminal, or read from `--passphrase-file`
+    /// (`-` reads stdin); never argv, which anything that can run `ps` would see:
     ///
     /// ```text
-    /// echo 'the room passphrase' | vox room join vox://… --name mission
+    /// echo 'the room passphrase' | vox room join --passphrase-file - vox://… --name mission
     /// ```
     ///
     /// This is what makes agent comms usable on a host with no terminal: `vox
@@ -619,8 +657,14 @@ enum RoomCmd {
     /// onto it. Joining grants nothing — whether anyone can read you is their
     /// decision, made with `vox trust`.
     Join(JoinRoomArgs),
-    /// Create a room on a running node. Passphrase on stdin.
+    /// Create a room on a running node. Passphrase at the terminal, or from
+    /// `--passphrase-file` (`-` reads stdin).
     Create(CreateRoomArgs),
+    /// Leave a room: the other members are told, then the room is removed from this node.
+    ///
+    /// Waits up to 30 s for another member to take the news. If none can be told by then, it
+    /// says so, and the node leaves as soon as one can. Joining again later works.
+    Leave(RoomRefArgs),
     /// Print a room's address, for someone else to `vox room join` with.
     ///
     /// The address is rendezvous information, not a credential — no passphrase,
@@ -645,6 +689,10 @@ pub struct JoinRoomArgs {
     /// A local name for the room. Never leaves this device.
     #[arg(long, default_value = "room")]
     pub name: String,
+    /// Read the room passphrase from this file; `-` reads it from stdin. Without it, it is
+    /// asked for at the terminal, and with no terminal the command fails at once.
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 /// `vox room create`
@@ -655,6 +703,10 @@ pub struct CreateRoomArgs {
     /// A local name for the room. Never leaves this device.
     #[arg(long, default_value = "room")]
     pub name: String,
+    /// Read the new room's passphrase from this file; `-` reads it from stdin. Without it, it
+    /// is asked for twice at the terminal, and with no terminal the command fails at once.
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 /// `vox room send`
@@ -701,8 +753,10 @@ pub struct StatusArgs {
 pub struct DaemonArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// Read the passphrase from this file instead of stdin, for a service manager
-    /// that prefers one. The file should contain the passphrase and nothing else.
+    /// Read the passphrases from this file, for a service manager that prefers one: the
+    /// identity passphrase on the first line, then any room lines. Without it the identity
+    /// passphrase is taken from `VOX_IDENTITY_PASSPHRASE`, else asked for at the terminal,
+    /// else read from stdin.
     #[arg(long)]
     pub passphrase_file: Option<PathBuf>,
 }
@@ -778,8 +832,8 @@ pub struct HandoffArgs {
     pub room: String,
     /// What is being handed off.
     pub resource: String,
-    /// The recipient: a room member's fingerprint, or a unique prefix of one as
-    /// `vox room roster` prints it. Resolved here, once, so every node agrees.
+    /// The recipient: your name for a room member (`vox trust list`), or its fingerprint or a
+    /// unique prefix of one as `vox room roster` prints it. Resolved here, once, so every node agrees.
     #[arg(long)]
     pub to: String,
     /// Reserve it for one exact session of the recipient, rather than any.
@@ -942,9 +996,8 @@ pub struct AgentPluginArgs {
 pub struct AgentHookArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// The room to drain, or a unique prefix. Falls back to `VOX_ROOM`, which is
-    /// usually the easier place to put it since a hook's arguments are fixed at
-    /// install time while its environment is not.
+    /// Drain only this room (its id, or a unique prefix). Without it the hook drains every
+    /// room the node holds, each under its own heading.
     #[arg(long)]
     pub room: Option<String>,
     /// Output shape: `auto` (default), `claude`, or `text`.
@@ -1010,10 +1063,11 @@ pub struct RoomPostArgs {
     /// It records nothing: attempts are recorded on the GitHub issue through awa.
     #[arg(long)]
     pub attempt: Option<String>,
-    /// Address a session by petname; repeat for several.
+    /// Address a member of the room: your name for it (`vox trust list`) or its fingerprint
+    /// (`vox room roster`). Repeat for several. A name that is no member is refused.
     #[arg(long)]
     pub to: Vec<String>,
-    /// May interrupt an addressed session mid-turn.
+    /// May interrupt the addressed members' agents mid-turn.
     #[arg(long)]
     pub urgent: bool,
     /// The entry hash this replies to.
@@ -1296,10 +1350,11 @@ pub struct TrustAddArgs {
     /// The identity to trust, as `vox id` prints it (base32, or a unique prefix of one
     /// this node already knows).
     pub fingerprint: String,
-    /// What this node will call it. Local to this machine; nothing is registered and no
-    /// other node ever sees it.
-    #[arg(long, default_value = "peer")]
-    pub name: String,
+    /// Your name for it: how Vox shows its messages to you, and how you address it
+    /// (`--to`). Local to this machine; no other node ever sees it. Asked for when not given
+    /// and there is a terminal.
+    #[arg(long)]
+    pub name: Option<String>,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
     /// machine, and lands in the shell's history besides. It is still accepted by the
@@ -1466,8 +1521,9 @@ enum Cmd {
     /// third shape — an unlocked node holding this profile's rooms, serving the
     /// socket, with nothing attached to a tty.
     ///
-    /// The passphrase is read from **stdin**, deliberately not from the
-    /// environment, which is readable by anything running as the same user:
+    /// At a terminal it asks for the identity passphrase, without echo, and serves once
+    /// it is typed. Otherwise it takes it from `VOX_IDENTITY_PASSPHRASE`, or
+    /// `--passphrase-file`, or stdin:
     ///
     /// ```text
     /// echo 'my passphrase' | vox daemon
@@ -1512,7 +1568,8 @@ enum Cmd {
     /// `vox grant` are withdrawn with the model that needed them (M17.7).
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// Speak in a room over a **running** node (ADR-020) — the agent-comms verbs.
+    /// Join, create or leave a room, and speak in it, over a **running** node (ADR-020) —
+    /// the agent-comms verbs.
     ///
     /// For agents on one repository, the room settles who does what: an agent claims
     /// work there, asks there who is on what, and answers there, briefly, when asked
@@ -1522,8 +1579,9 @@ enum Cmd {
     ///
     /// Unlike every other verb, these do not start a node: they attach to the
     /// control socket of one that is already running and already unlocked, which
-    /// is how several agent sessions share one identity per machine. Only `create`
-    /// and `join` take a passphrase, and they read it from stdin.
+    /// is how several agent sessions share one identity per machine. None of them
+    /// takes the identity passphrase; `join` and `create` take the room passphrase at a
+    /// terminal, or from stdin with `--passphrase-file -`.
     #[command(subcommand)]
     Room(RoomCmd),
     /// Wire an agent session into a room (ADR-020) — Claude Code, Codex and OpenCode.
@@ -1734,6 +1792,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Join(a) => &a.profile,
                 RoomCmd::Create(a) => &a.profile,
                 RoomCmd::Invite(a) => &a.profile,
+                RoomCmd::Leave(a) => &a.profile,
             };
             let paths = match profile.paths() {
                 Ok(p) => p,
@@ -1846,9 +1905,21 @@ pub fn run() -> ExitCode {
                         RoomCmd::Send(a) => {
                             crate::room_cli::send_file(&paths, &a.room, &a.path).await
                         }
-                        RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
-                        RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
+                        RoomCmd::Join(a) => {
+                            crate::room_cli::join(
+                                &paths,
+                                &a.link,
+                                &a.name,
+                                a.passphrase_file.as_deref(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Create(a) => {
+                            crate::room_cli::create(&paths, &a.name, a.passphrase_file.as_deref())
+                                .await
+                        }
                         RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
+                        RoomCmd::Leave(a) => crate::room_cli::leave(&paths, &a.room).await,
                         RoomCmd::Get(a) => {
                             crate::room_cli::get_file(
                                 &paths,
@@ -2068,10 +2139,8 @@ pub fn run() -> ExitCode {
                 );
                 eprintln!(
                     "vox: merge that into ~/.claude/settings.json (user scope, so a session \
-                     opened in any repository drains its room), and install the skill beside \
-                     it: {}\n     Set \
-                     VOX_ROOM in the session's environment, or pass --room to the hook, so it \
-                     knows which room to drain.",
+                     opened in any repository hears its rooms), and install the skill beside \
+                     it: {}\n     The hook drains every room the node holds.",
                     skill_install("claude", skill_dir("claude").unwrap_or_default())
                 );
                 ExitCode::SUCCESS
@@ -2087,8 +2156,8 @@ pub fn run() -> ExitCode {
                     "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
                      — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
                      an async hook's output is observed and discarded, so the room would \
-                     drain into nothing.\n     Set VOX_ROOM in the session's environment, or \
-                     pass --room to the hook.\n     Install the skill beside it: {}",
+                     drain into nothing.\n     The hook drains every room the node holds.\n     \
+                     Install the skill beside it: {}",
                     skill_install("codex", skill_dir("codex").unwrap_or_default())
                 );
                 ExitCode::SUCCESS
@@ -2223,10 +2292,28 @@ pub fn run() -> ExitCode {
         // **Ask the running node when there is one.** These three used to spawn a node of
         // their own, which redb refuses while a `vox daemon` holds the profile — so the
         // one command a person cannot skip, deciding who may read them, was unavailable
-        // exactly when they were setting up agent comms. Over the socket the request
-        // carries the identity passphrase and the node checks it, so an agent session
-        // that can reach the socket still cannot edit the keyring (ADR-020 §7).
+        // exactly when they were setting up agent comms. Over the socket the node decides:
+        // a read needs no passphrase, and a change needs it only once 30 minutes have
+        // passed since it was last entered, when this asks for it (V210-159). Whoever runs
+        // as this user is this user; the socket's file mode is the boundary.
         Cmd::Trust(sub) if trust_over_socket(&sub) => run_trust_over_socket(sub),
+        // With no node running the keyring is read from the store, sealed under the identity, so
+        // this one read needs the passphrase. Said as that, with the way to read it without one.
+        Cmd::Trust(TrustCmd::List(args))
+            if args.identity_passphrase.is_none()
+                && args.identity_passphrase_file.is_none()
+                && std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none_or(|p| p.is_empty())
+                && !std::io::IsTerminal::is_terminal(&io::stdin()) =>
+        {
+            eprintln!(
+                "vox: no node is running, and reading the keyring without one needs the identity \
+                 passphrase: it is sealed under it. There is no terminal to ask at.\n\
+                 \x20      Start `vox daemon`, and `vox trust list` needs none.\n\
+                 \x20      {}",
+                crate::tunnel_cli::GIVE_IDENTITY_PASSPHRASE
+            );
+            ExitCode::FAILURE
+        }
         Cmd::Trust(TrustCmd::List(args)) => run_new_room_verb(
             args.profile.clone(),
             args.identity_passphrase.clone(),
@@ -2246,12 +2333,19 @@ pub fn run() -> ExitCode {
         ),
         Cmd::Trust(TrustCmd::Add(args)) => {
             let a = args.clone();
+            let name = match trust_name(&a) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             run_new_room_verb(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
-                    crate::tunnel_cli::trust_add(&node, &a.fingerprint, &a.name).await
+                    crate::tunnel_cli::trust_add(&node, &a.fingerprint, &name).await
                 },
             )
         }

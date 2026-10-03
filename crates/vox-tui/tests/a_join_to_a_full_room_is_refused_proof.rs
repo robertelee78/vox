@@ -132,7 +132,18 @@ fn a_join_to_a_full_room_is_refused() {
     // ---- one more: refused, and told why ------------------------------------------------------
     let late = Member::new(root, "late");
     let _late_d = late.daemon(Some(&spec));
-    let (ok, out, err) = late.vox(&["room", "join", &link, "--name", "full"], Some(ROOM_PASS));
+    let (ok, out, err) = late.vox(
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "full",
+        ],
+        Some(ROOM_PASS),
+    );
     let said = format!("{out}{err}");
     println!("[proof] the join to the full room exited ok={ok} and said:\n{said}");
     assert!(
@@ -183,7 +194,15 @@ fn a_join_a_member_cannot_admit_says_why() {
     let joiner = Member::new(root, "joiner");
     let _joiner_d = joiner.daemon(Some(&spec));
     let (ok, out, err) = joiner.vox(
-        &["room", "join", &link, "--name", "locked"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "locked",
+        ],
         Some(ROOM_PASS),
     );
     let said = format!("{out}{err}");
@@ -278,13 +297,29 @@ fn joins_answered_at_once_by_two_members_converge() {
         });
         let hx = s.spawn(|| {
             x.vox(
-                &["room", "join", &host_link, "--name", "race"],
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    &host_link,
+                    "--name",
+                    "race",
+                ],
                 Some(ROOM_PASS),
             )
         });
         let hy = s.spawn(|| {
             y.vox(
-                &["room", "join", &bob_link, "--name", "race"],
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    &bob_link,
+                    "--name",
+                    "race",
+                ],
                 Some(ROOM_PASS),
             )
         });

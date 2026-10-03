@@ -189,7 +189,7 @@ fn a_post_answers_promptly_while_a_peer_posts() {
 
     let (ok, out, err) = vox_in(
         &alice_dir,
-        &["room", "create", "--name", "busy"],
+        &["room", "create", "--passphrase-file", "-", "--name", "busy"],
         "room pass",
     );
     assert!(ok, "vox room create: {out}{err}");
@@ -205,7 +205,15 @@ fn a_post_answers_promptly_while_a_peer_posts() {
     assert!(ok, "vox room invite: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
-        &["room", "join", link.trim(), "--name", "busy"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "busy",
+        ],
         "room pass",
     );
     assert!(ok, "bob joins: {out}{err}");

@@ -121,12 +121,12 @@ try:
     for w in daemons:
         if not until(lambda: run(w, "room", "list").returncode == 0, 60): apparatus(f"{w} daemon")
     stage("room create, invite, join, trust")
-    if run("alice", "room", "create", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
+    if run("alice", "room", "create", "--passphrase-file", "-", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
     room = run("alice", "room", "list").stdout.split()[0]
     link = run("alice", "room", "invite", room).stdout.strip()
     # Bob and Carol join at once, as two people given the link might: so the budget holds two
     # joins' worth of JOIN_SECS in a row (theirs, then Dave's), not three.
-    joins = {w: subprocess.Popen([VOX, "room", "join", link, "--name", "m"], env=env(w),
+    joins = {w: subprocess.Popen([VOX, "room", "join", "--passphrase-file", "-", link, "--name", "m"], env=env(w),
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True) for w in ("bob", "carol")}
     PROCS.extend(joins.values())

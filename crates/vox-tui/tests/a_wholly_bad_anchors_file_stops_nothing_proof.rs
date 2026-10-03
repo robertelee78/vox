@@ -321,7 +321,14 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     );
     let (ok, _, err) = vox_in(
         &alice,
-        &["room", "create", "--name", "shared"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "shared",
+        ],
         &format!("{ROOMPASS}\n"),
     );
     assert!(

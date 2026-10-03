@@ -161,7 +161,7 @@ fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
     attached(&alice, "alice");
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "CANNOT MEASURE: vox room create: {err}");

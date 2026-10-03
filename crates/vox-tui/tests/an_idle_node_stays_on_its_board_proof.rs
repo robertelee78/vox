@@ -311,7 +311,14 @@ fn idle_then_join(churn: bool) {
     let _bob = daemon("bob", &bob_dir, &anchors, &idpass, &ttl_s);
     let (ok, out, err) = vox_in(
         &alice_dir,
-        &["room", "create", "--name", "quiet"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "quiet",
+        ],
         "room pass",
     );
     assert!(ok, "vox room create: {out}{err}");
@@ -328,7 +335,15 @@ fn idle_then_join(churn: bool) {
     let link = link.trim().to_owned();
     let (ok, out, err) = vox_in(
         &bob_dir,
-        &["room", "join", &link, "--name", "quiet"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "quiet",
+        ],
         "room pass",
     );
     assert!(ok, "bob joins: {out}{err}");
@@ -426,7 +441,15 @@ fn idle_then_join(churn: bool) {
     let t = Instant::now();
     let (joined, out, err) = vox_in(
         &carol_dir,
-        &["room", "join", &anchor_only, "--name", "quiet"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &anchor_only,
+            "--name",
+            "quiet",
+        ],
         "room pass",
     );
     let took = t.elapsed();

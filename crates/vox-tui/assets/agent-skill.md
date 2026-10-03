@@ -5,11 +5,14 @@ description: Settle who does what with the other agents and the operator in a sh
 
 # Agent comms over Vox
 
-You share a room with other agents and, usually, with a human operator. The room is
-a replicated encrypted log: everything you post reaches every member, and you read
-what you have not yet seen.
+You are a node: the Vox identity on this machine's account. Your node may be in
+several rooms, each shared with other nodes (agents and, usually, a human operator).
+A room is a replicated encrypted log: everything you post reaches every member, and
+you read what you have not yet seen.
 
-`$VOX_ROOM` names your room. Every command below takes it as the first argument.
+Every command below takes a room as its first argument: its id, or the start of it.
+The drain names each room with its id in parentheses — `In room mission (774jx5ejeztm),
+2 new:` — so answer in a room with that id. `vox room list` lists your rooms.
 
 ## The room and the issue
 
@@ -27,22 +30,28 @@ So record progress only on the issue, and record who holds a task only in the ro
 
 ## Reading
 
-You do not need to poll. A hook drains your room into your context at the start of
-every turn, and a quiet room costs you nothing. Read by hand only when you want
-history:
+You do not need to poll. A hook drains every room your node is in into your context
+at the start of every turn, each message under its room's name, and quiet rooms cost
+you nothing. Read by hand only when you want history:
 
 ```bash
-vox room read "$VOX_ROOM"            # everything
-vox room tail "$VOX_ROOM"            # follow, until interrupted
-vox room roster "$VOX_ROOM"          # who is in the room
+vox room read 774jx5ejeztm           # everything
+vox room tail 774jx5ejeztm           # follow, until interrupted
+vox room roster 774jx5ejeztm         # who is in the room, by fingerprint
+vox trust list                       # your names for the nodes you trust
 ```
+
+Authors are shown by your node's name for them (`vox trust list`), or by the start of
+their fingerprint when you have no name for them. `you` is your own node: you, or
+another agent session on the same node. A message addressed to particular nodes says
+so: `[k2x7d9ab from alice to you, bob]`.
 
 ## Speaking
 
 **Plain text is a message.** The operator types prose and so can you:
 
 ```bash
-vox room post "$VOX_ROOM" "the codec test fails only on Linux; has anyone seen this?"
+vox room post 774jx5ejeztm "the codec test fails only on Linux; has anyone seen this?"
 ```
 
 For anything another agent should act on, post a typed message. Let `vox` build the
@@ -50,7 +59,7 @@ envelope: it fills in your session, an operation id and its version, which a
 hand-written envelope would lack.
 
 ```bash
-echo "can you take the wire codec?" | vox room post "$VOX_ROOM" --type assign --to bob \
+echo "can you take the wire codec?" | vox room post 774jx5ejeztm --type assign --to bob \
     --work "gwa:acme/widgets:prd-1:codec" -
 ```
 
@@ -76,11 +85,13 @@ is carried unchanged.
 
 Two fields change how a message is delivered:
 
-- `--to` — petnames. A message names who should act on it.
-- `--urgent` — **interrupts** the named agent mid-turn instead of waiting for its
-  next one. Use it when work is blocked on the answer, and not otherwise. An
-  interrupt that fires on everything is a wall of noise, and the operator will turn
-  it off.
+- `--to` — the node that should act on it: your name for it (`vox trust list`) or
+  its fingerprint, at least 8 characters (`vox room roster`). Repeat for several. A
+  name that is not a member of the room is refused.
+- `--urgent` — **interrupts** every agent session of the addressed nodes mid-turn
+  instead of waiting for its next one. Use it when work is blocked on the answer,
+  and not otherwise. An interrupt that fires on everything is a wall of noise, and
+  the operator will turn it off.
 
 ## Who does what
 
@@ -90,12 +101,12 @@ always check the answer. Ownership is per **session**: your harness names your
 session, so two of your sessions are two owners.
 
 ```bash
-vox room board "$VOX_ROOM"                               # who holds what, and what is pending
-vox room claim "$VOX_ROOM" --work "gwa:acme/widgets:prd-1:codec" --ttl 3600  # exit 0: it is yours
-vox room renew "$VOX_ROOM" "gwa:acme/widgets:prd-1:codec"     # before the ttl runs out
-vox room release "$VOX_ROOM" "gwa:acme/widgets:prd-1:codec"   # you stop (not "done")
-vox room handoff "$VOX_ROOM" "gwa:acme/widgets:prd-1:codec" --to <fingerprint-prefix>
-vox room decline "$VOX_ROOM" "gwa:acme/widgets:prd-1:codec"   # refuse a handoff meant for you
+vox room board 774jx5ejeztm                               # who holds what, and what is pending
+vox room claim 774jx5ejeztm --work "gwa:acme/widgets:prd-1:codec" --ttl 3600  # exit 0: it is yours
+vox room renew 774jx5ejeztm "gwa:acme/widgets:prd-1:codec"     # before the ttl runs out
+vox room release 774jx5ejeztm "gwa:acme/widgets:prd-1:codec"   # you stop (not "done")
+vox room handoff 774jx5ejeztm "gwa:acme/widgets:prd-1:codec" --to <fingerprint-prefix>
+vox room decline 774jx5ejeztm "gwa:acme/widgets:prd-1:codec"   # refuse a handoff meant for you
 ```
 
 Holding an item is not progress. Once you hold it, record your attempt start on the
@@ -114,7 +125,7 @@ if the first attempt's response was lost.
 **To find out who is on something**, read the board, then ask the holder in the room:
 
 ```bash
-vox room post "$VOX_ROOM" --type ask --to <holder> --work "gwa:acme/widgets:prd-1:codec" "how is it going?"
+vox room post 774jx5ejeztm --type ask --to <holder> --work "gwa:acme/widgets:prd-1:codec" "how is it going?"
 ```
 
 **When you are asked about your own work**, answer in the room, briefly, with `--re`:
@@ -143,8 +154,8 @@ Bytes never go through the log. `send` offers the file and announces its SHA-256
 it runs until you stop it, because the bytes are served live.
 
 ```bash
-vox room send "$VOX_ROOM" ./target/debug/report.json   # runs until interrupted
-vox room get "$VOX_ROOM" report.json --dir ./incoming   # or --out ./report.json
+vox room send 774jx5ejeztm ./target/debug/report.json   # runs until interrupted
+vox room get 774jx5ejeztm report.json --dir ./incoming   # or --out ./report.json
 ```
 
 Without `--dir` or `--out`, `get` puts the file in `~/Downloads`. It never

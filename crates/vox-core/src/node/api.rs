@@ -585,6 +585,12 @@ pub enum NodeCommand {
         /// The channelID.
         channel_id: Digest32,
     },
+    /// Leave an open room (V210-164): say so in the room, and once another member has it,
+    /// remove the room from this node.
+    LeaveChannel {
+        /// The channelID.
+        channel_id: Digest32,
+    },
     /// Author a text message in an open channel.
     SendText {
         /// The channelID.
@@ -749,6 +755,10 @@ pub enum Fault {
     ChannelNotOpen,
     /// An input exceeded its bound (name or text length).
     TooLong,
+    /// A trust add or remove needs the identity passphrase again: it was last entered more than
+    /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) ago (V210-159). Not
+    /// [`Fault::WrongPassphrase`]: none was given, and the client asks for it and tries again.
+    PassphraseNeeded,
     /// The trust keyring already holds its maximum number of identities
     /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too
     /// long, and "longer than this field allows" sent them looking at the petname.
@@ -845,6 +855,15 @@ pub enum Fault {
     BindFailed,
     /// A join named a room this profile already holds.
     AlreadyMember,
+    /// A room this node joined has not synced with another member yet, so nothing is written
+    /// to it (V210-164).
+    RoomNotSynced,
+    /// A leave was written, but no other member of the room took it within the wait: the room
+    /// is held until one does (V210-164).
+    LeaveNotHeard,
+    /// A leave was overtaken: this node wrote in the room after it, so it is in the room again
+    /// (V210-164).
+    LeaveUndone,
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
     NotAServiceRoom,
@@ -870,6 +889,8 @@ impl Fault {
     const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
     // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
     const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
+    // `Fault::PassphraseNeeded`'s explanation names the window in words.
+    const _KEYRING_WINDOW_NAMED: () = assert!(crate::node::actor::KEYRING_WINDOW_SECS == 30 * 60);
 
     /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
     /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,
@@ -886,6 +907,9 @@ impl Fault {
                 "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
             }
             Fault::WrongPassphrase => "the passphrase is wrong",
+            Fault::PassphraseNeeded => {
+                "changing who you trust needs your identity passphrase again: it was last entered more than 30 minutes ago\n       give it, and the change is made: `vox trust` asks at a terminal, or takes --identity-passphrase-file or VOX_IDENTITY_PASSPHRASE"
+            }
             Fault::UnknownChannel => {
                 "no such room in this profile\n       `vox room list` shows the rooms it holds"
             }
@@ -961,6 +985,15 @@ impl Fault {
             Fault::AlreadyMember => {
                 "this profile already holds that room — there is nothing to join\n       `vox room list` shows it; open it with its passphrase if it is closed"
             }
+            Fault::RoomNotSynced => {
+                "this room was joined and has not yet synced with another member, so nothing can be written to it\n       try again once a member is reachable"
+            }
+            Fault::LeaveNotHeard => {
+                "no other member of the room could be told within 30s, so this node still holds it\n       it leaves as soon as one can be told, and the members see it then"
+            }
+            Fault::LeaveUndone => {
+                "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
+            }
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
             }
@@ -1020,6 +1053,7 @@ fault_names!(
     IdentityExists,
     Locked,
     WrongPassphrase,
+    PassphraseNeeded,
     UnknownChannel,
     ChannelNotOpen,
     TooLong,
@@ -1047,6 +1081,9 @@ fault_names!(
     AddressNotHere,
     BindFailed,
     AlreadyMember,
+    RoomNotSynced,
+    LeaveNotHeard,
+    LeaveUndone,
     NotAServiceRoom,
     NotOffered,
     NoSuchForward,
@@ -1255,6 +1292,13 @@ pub enum NodeEvent {
     ConnectionNote {
         /// The peer the connection is to.
         peer: Digest32,
+        /// What happened, for the operator.
+        note: String,
+    },
+    /// Something about this node itself an operator should know (V210-167): that its usual port
+    /// was taken and it listens on another this run, or that a member was found on this computer
+    /// or the local network.
+    NodeNote {
         /// What happened, for the operator.
         note: String,
     },

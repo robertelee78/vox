@@ -10,13 +10,12 @@
 //! - **No passphrase anywhere.** There is nothing to unlock — the node holds the
 //!   identity. An agent session never sees a secret, which is what makes it safe
 //!   to hand these verbs to model-authored code.
-//! - **No room is created or joined here.** These verbs speak in a room; putting
-//!   the node in one is the operator's act.
+//! - **Rooms come and go here too.** `join` and `create` take the room passphrase on
+//!   stdin, never argv, and `leave` takes none.
 //!
-//! The socket answers a deliberately narrow request set and these verbs are
-//! exactly it (`post`, `read`, `tail`, `roster`, `list`). There is no verb here
-//! that creates an identity, unlocks, revokes, or edits the trust keyring —
-//! `vox trust` is an operator surface and is not part of this module.
+//! The socket answers a deliberately narrow request set. There is no verb here that
+//! creates an identity, unlocks, revokes, or edits the trust keyring — `vox trust` is
+//! an operator surface and is not part of this module.
 
 use std::io::Read as _;
 use std::io::Write as _;
@@ -57,7 +56,7 @@ async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
     // Each way an attach fails needs a different remedy, so each gets its own sentence
     // (#191): they were one, "nothing answered — the node may have stopped", which is true
     // only of a stale socket, and the actual error was thrown away.
-    IpcClient::open(&sock).await.map_err(|e| {
+    let mut client = IpcClient::open(&sock).await.map_err(|e| {
         let at = sock.display();
         AppError::Usage(match e {
             Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
@@ -74,7 +73,10 @@ async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
                  have stopped without cleaning up. Starting a node again replaces it."
             ),
         })
-    })
+    })?;
+    // Every author this command prints is named as this node names it (V210-162).
+    crate::ident::load_names(&mut client).await;
+    Ok(client)
 }
 
 /// Ask the node for its rooms, as `(id, local name, open)`.
@@ -269,9 +271,9 @@ pub struct PostOpts {
     pub work: Option<String>,
     /// The attempt, carried in `data.attempt`; defaults to this session's claim.
     pub attempt: Option<String>,
-    /// Addressees, by petname.
+    /// Addressees: the poster's names for members, or their fingerprints.
     pub to: Vec<String>,
-    /// May interrupt an addressed session.
+    /// May interrupt the agents of the nodes addressed.
     pub urgent: bool,
     /// Reply-to entry hash.
     pub re: Option<String>,
@@ -296,6 +298,43 @@ impl PostOpts {
             || self.coord.op.is_some()
             || self.coord.json
     }
+}
+
+/// A room's members, as the node holds them.
+async fn members_of(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<Vec<Digest32>, AppError> {
+    match client.request(&Request::Roster { channel_id }).await {
+        Ok(Frame::Members { members }) => Ok(members),
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `--to`, as the envelope carries it (V210-161): each word resolved by the poster, once, to a
+/// member's whole fingerprint, so every reader resolves it to the same node. A word that names
+/// no member is refused, saying why.
+async fn addressees(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    words: &[String],
+) -> Result<Vec<String>, AppError> {
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+    let members = members_of(client, channel_id).await?;
+    let mut to: Vec<String> = Vec::new();
+    for w in words {
+        let fp = crate::ident::resolve_member(w, &members, crate::ident::names())
+            .map_err(|e| AppError::Usage(format!("refusing --to: {e}")))?;
+        let fp = b32_encode(&fp);
+        if !to.contains(&fp) {
+            to.push(fp);
+        }
+    }
+    Ok(to)
 }
 
 /// `vox room post` — append a message.
@@ -330,6 +369,24 @@ pub async fn post_cmd(
             return Err(AppError::Usage(format!("refusing to post it: {e}")));
         }
         if let Ok(env) = Envelope::parse(&body) {
+            // **A raw envelope addresses members by fingerprint** (V210-161), as `--to` writes
+            // them: a name in `to` would read as addressed to nobody on every node.
+            if !env.to.is_empty() {
+                let (mut client, cid, _) = open_room(paths, room).await?;
+                let members = members_of(&mut client, cid).await?;
+                if let Some(bad) = env
+                    .to
+                    .iter()
+                    .find(|t| !crate::ident::recipient(t).is_some_and(|fp| members.contains(&fp)))
+                {
+                    return Err(AppError::Usage(format!(
+                        "refusing to post it: `to` names {:?}, which is not a member's whole \
+                         fingerprint as `vox room roster` prints it. Use --to, which takes your \
+                         name for a member or its fingerprint",
+                        vox_agentcomms::envelope::shown(bad, vox_agentcomms::envelope::SHOWN_NAME)
+                    )));
+                }
+            }
             if claim::is_claim_protocol(&env) {
                 return Err(AppError::Usage(format!(
                     "refusing a raw `{}`: claim-protocol operations need a session, an \
@@ -445,6 +502,7 @@ pub async fn post_cmd(
         None => coord::new_op()?,
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
+    let to = addressees(&mut client, cid, &opts.to).await?;
     let snap = if work.is_some() {
         coord::participate(&mut client, cid, &room_key, &session).await?
     } else {
@@ -527,7 +585,7 @@ pub async fn post_cmd(
     };
     let draft = Draft {
         kind,
-        to: opts.to.clone(),
+        to,
         urgent: opts.urgent,
         re: re.clone(),
         thread: opts.thread.clone(),
@@ -588,29 +646,23 @@ pub async fn post_cmd(
     Ok(())
 }
 
-/// Messages addressed to this session that its drain has not delivered yet: past its
-/// drain cursor, not its own, naming it in `to` — by `VOX_AGENT_NAME`, the name it is
-/// addressed by, or by its session id. The one just posted is excluded.
+/// Messages addressed to this node that this session's drain has not delivered yet: past its
+/// drain cursor, not its own, naming this node in `to` (V210-161). The one just posted is
+/// excluded.
 fn unread_addressed(
     session: &str,
     posting: &coord::Posting,
     after_cursor: &[vox_core::node::api::MessageRow],
 ) -> Vec<(String, String, String, String)> {
     let snap = &posting.after;
-    let names: Vec<String> = std::iter::once(session.to_owned())
-        .chain(
-            std::env::var("VOX_AGENT_NAME")
-                .ok()
-                .filter(|n| !n.trim().is_empty()),
-        )
-        .collect();
+    let me = b32_encode(&snap.me);
     after_cursor
         .iter()
         .filter(|r| r.entry_hash != posting.entry_hash)
         .filter_map(|r| {
             let env = Envelope::parse(&r.text).ok()?;
             let own = r.author == snap.me && env.from == session;
-            (!own && names.iter().any(|n| env.is_addressed_to(n))).then(|| {
+            (!own && env.is_addressed_to(&me)).then(|| {
                 // Every field is the author's, and this lands on the reporting agent's stderr: each
                 // is shown on one line and cut (V210-123). The body's first line ends at any
                 // character a reader breaks a line at, not only `\n`.
@@ -619,7 +671,7 @@ fn unread_addressed(
                 let first = first.split(breaks_lines).next().unwrap_or("");
                 (
                     claim::b32(&r.entry_hash),
-                    shown(&env.from, SHOWN_NAME),
+                    crate::ident::name_of(&r.author),
                     shown(&env.kind, SHOWN_NAME),
                     shown(first, 160),
                 )
@@ -729,7 +781,8 @@ fn after_cursor(
     }
 }
 
-/// One row as `vox room read` and `tail` print it: `<entry-hash> <author-prefix> <text>`.
+/// One row as `vox room read` and `tail` print it: `<entry-hash> <author> <text>`, the author
+/// by this node's name for it, or its fingerprint when it has none (V210-162).
 ///
 /// **No message can forge a row** (PRD-001 R19). A row starts at the beginning of a line,
 /// so a message carrying a newline followed by `<hash> <author> …` would otherwise print a
@@ -754,14 +807,14 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
     format!(
         "{} {} {}",
         id(&r.entry_hash),
-        crate::ident::author_id(&r.author),
+        crate::ident::name_of(&r.author),
         text
     )
 }
 
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
 ///
-/// Each line is `<entry-hash> <author-prefix> <text>`; with `--json`, one
+/// Each line is `<entry-hash> <author> <text>`; with `--json`, one
 /// `vox.room.row/1` object per line. The entry hash **is** the cursor.
 ///
 /// # Errors
@@ -790,14 +843,13 @@ pub async fn read(
         };
         let held_back = equivocations_in(paths, &channel_id).await;
         let mut out = std::io::stdout().lock();
-        // **A member held back for equivocating is said first** (V210-63), by the same short id
-        // the rows below use: the keyring's names need the identity passphrase, which reading a
-        // room does not ask for. `vox status --json` carries the same, in full, for agents.
+        // **A member held back for equivocating is said first** (V210-63), named as the rows
+        // below name it. `vox status --json` carries the same, in full, for agents.
         for (author, seq) in &held_back {
             let _ = writeln!(
                 out,
                 "! {}",
-                crate::ident::equivocation_notice(&crate::ident::author_id(author), *seq)
+                crate::ident::equivocation_notice(&crate::ident::name_of(author), *seq)
             );
         }
         for r in &rows {
@@ -1355,7 +1407,7 @@ fn report(
 fn who(o: &Owner) -> String {
     format!(
         "{}/{}",
-        crate::ident::author_id(&o.author),
+        crate::ident::name_of(&o.author),
         session_name(&o.session)
     )
 }
@@ -1446,7 +1498,7 @@ pub async fn claim_resource(
             false,
             format!(
                 "{resource} is reserved by a handoff for {}{} — you did not get it",
-                &crate::ident::author_id(to_fp),
+                &crate::ident::name_of(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{}", session_name(s)))
@@ -1586,18 +1638,9 @@ pub async fn handoff_resource(
     // to different owners on different nodes (ADR-021 F2).
     let to_fp = {
         let (mut client, cid, _) = open_room(paths, room).await?;
-        let members = match client.request(&Request::Roster { channel_id: cid }).await {
-            Ok(Frame::Members { members }) => members,
-            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-            Err(e) => return Err(AppError::Usage(e.to_string())),
-        };
-        resolve_prefix(to, &members).map_err(|e| {
-            AppError::Usage(format!(
-                "--to names a room member by fingerprint (a unique prefix of one in \
-                 `vox room roster`): {e}"
-            ))
-        })?
+        let members = members_of(&mut client, cid).await?;
+        crate::ident::resolve_member(to, &members, crate::ident::names())
+            .map_err(|e| AppError::Usage(format!("refusing --to: {e}")))?
     };
     let ttl = ttl_secs.unwrap_or(claim::DEFAULT_HANDOFF_TTL_SECS);
     if ttl == 0 {
@@ -1608,7 +1651,8 @@ pub async fn handoff_resource(
     let mut data = serde_json::Map::new();
     data.insert("resource".into(), resource.into());
     data.insert("to_fp".into(), claim::b32(&to_fp).into());
-    data.insert("to".into(), to.into());
+    // The fingerprint, not the word typed: a name is the poster's own and means nothing elsewhere.
+    data.insert("to".into(), claim::b32(&to_fp).into());
     data.insert("ttl_secs".into(), ttl.into());
     if let Some(s) = to_session.filter(|s| !s.is_empty()) {
         data.insert("to_session".into(), s.into());
@@ -1619,7 +1663,7 @@ pub async fn handoff_resource(
         opts,
         claim::HANDOFF,
         data,
-        format!("handing {resource} to {}", crate::ident::author_id(&to_fp)),
+        format!("handing {resource} to {}", crate::ident::name_of(&to_fp)),
     )
     .await?;
     let (ok, said) = match (&done.outcome, done.posting.after.fold.resources.get(resource)) {
@@ -1627,7 +1671,7 @@ pub async fn handoff_resource(
             true,
             format!(
                 "{resource} is reserved for {}{} until {}; it completes when that session claims it",
-                &crate::ident::author_id(&to_fp),
+                &crate::ident::name_of(&to_fp),
                 to_session.map(|s| format!("/{}", session_name(s))).unwrap_or_default(),
                 millis_as_time(*deadline_millis)
             ),
@@ -1879,7 +1923,7 @@ pub async fn board(
                 "{}\tpending handoff from {} to {}{}{} (lapses in {}s)",
                 name(resource),
                 who(from),
-                &crate::ident::author_id(to_fp),
+                &crate::ident::name_of(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{}", session_name(s)))
@@ -2306,7 +2350,7 @@ pub async fn get_file(
     for o in live {
         use std::fmt::Write as _;
         let short = &o.sha256[..o.sha256.len().min(16)];
-        let who = crate::ident::author_id(&o.author);
+        let who = crate::ident::name_of(&o.author);
         if o.sha256 == newest.sha256 {
             let _ = write!(
                 said,
@@ -2661,14 +2705,38 @@ async fn receive(bound: &str, mut file: std::fs::File, offer: &Offer) -> Result<
     Ok(total)
 }
 
-/// Read a passphrase from stdin, stripping exactly one trailing newline.
+/// A room passphrase from `--passphrase-file` (`-` reads stdin), stripping exactly one trailing
+/// newline; else asked for at the terminal, twice when `confirm`.
 ///
-/// Stdin rather than an argument: argv is visible to anything that can run `ps`.
-fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(|e| AppError::Usage(format!("reading {what} on stdin: {e}")))?;
+/// Never an argument: argv is visible to anything that can run `ps`. **Never stdin unasked**
+/// (V210-165): this read stdin to its end whenever there was no `--passphrase-file`, and an
+/// agent's harness leaves stdin open and writes nothing, so the command waited for ever, saying
+/// nothing. Without a terminal and without the flag it fails at once, saying how to give it.
+fn room_passphrase(
+    file: Option<&std::path::Path>,
+    what: &str,
+    confirm: bool,
+) -> Result<String, AppError> {
+    let Some(path) = file else {
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return Err(AppError::Usage(format!(
+                "this needs {what}, and there is no terminal to ask at.\n\
+                 \x20      {}",
+                crate::tunnel_cli::GIVE_ROOM_PASSPHRASE
+            )));
+        }
+        let first = crate::tunnel_cli::prompt_passphrase("room passphrase")?;
+        if first.is_empty() {
+            return Err(AppError::Usage(format!("no {what} was given")));
+        }
+        if confirm && crate::tunnel_cli::prompt_passphrase("again")? != first {
+            return Err(AppError::Usage(
+                "the two passphrases differ; nothing was done".into(),
+            ));
+        }
+        return Ok(first);
+    };
+    let buf = crate::tunnel_cli::passphrase_file_text(path)?;
     let p = buf
         .strip_suffix('\n')
         .unwrap_or(&buf)
@@ -2676,10 +2744,15 @@ fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
         .unwrap_or_else(|| buf.strip_suffix('\n').unwrap_or(&buf));
     if p.is_empty() {
         // The caller's phrase is a noun phrase ("the room's passphrase", "a passphrase
-        // for the new room"), so it reads as "expected <phrase> on stdin" and never as
-        // "no a passphrase", which is what "no {what}" produced.
+        // for the new room"), so it reads as "expected <phrase>" and never as "no a
+        // passphrase", which is what "no {what}" produced.
         return Err(AppError::Usage(format!(
-            "expected {what} on stdin — pipe it in, e.g. `echo … | vox room join …`"
+            "expected {what} in {}, and it is empty",
+            if path == std::path::Path::new("-") {
+                "stdin".to_owned()
+            } else {
+                path.display().to_string()
+            }
         )));
     }
     Ok(p.to_owned())
@@ -2696,9 +2769,62 @@ fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
 /// If the node cannot be reached, or the join is refused — and the refusal is
 /// reported as the node gave it, because `Unreachable` and a wrong passphrase need
 /// completely different responses from whoever holds the link.
-pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), AppError> {
-    let passphrase = passphrase_from_stdin("the room's passphrase")?;
+pub async fn join(
+    paths: &Paths,
+    link: &str,
+    local_name: &str,
+    passphrase_file: Option<&std::path::Path>,
+) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
+    // A room this node holds open is not joined again: its address is taken as where the room's
+    // host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
+    // is used.
+    let held = match vox_core::node::link::InviteLink::parse(link) {
+        Ok(parsed) => rooms_of(&mut client)
+            .await?
+            .into_iter()
+            .find(|(id, _, open)| *id == parsed.channel_id && *open)
+            .map(|(id, name, _)| {
+                if name.is_empty() {
+                    b32_encode(&id)
+                } else {
+                    name
+                }
+            }),
+        Err(_) => None,
+    };
+    if let Some(name) = held {
+        return match client
+            .request(&Request::Join {
+                link: link.to_owned(),
+                local_name: local_name.to_owned(),
+                passphrase: String::new(),
+            })
+            .await
+        {
+            Ok(Frame::Ok) => {
+                println!(
+                    "vox: this node already holds {name}; a member answered at the address \
+                     given, so it is kept as where the room's host is now"
+                );
+                Ok(())
+            }
+            Ok(Frame::Error { reason }) if reason.starts_with("Failed(Unreachable)") => {
+                Err(AppError::Usage(format!(
+                    "this node already holds {name}, and nobody answered at the address given; \
+                     nothing was changed{}",
+                    crate::tunnel_cli::join_detail(&reason)
+                )))
+            }
+            Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+                "this node already holds {name}; nothing was changed{}",
+                crate::tunnel_cli::join_detail(&reason)
+            ))),
+            Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => Err(AppError::Usage(e.to_string())),
+        };
+    }
+    let passphrase = room_passphrase(passphrase_file, "the room's passphrase", false)?;
     match client
         .request(&Request::Join {
             link: link.to_owned(),
@@ -2733,8 +2859,12 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
 ///
 /// # Errors
 /// If the node cannot be reached or the create is refused.
-pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
-    let passphrase = passphrase_from_stdin("a passphrase for the new room")?;
+pub async fn create(
+    paths: &Paths,
+    local_name: &str,
+    passphrase_file: Option<&std::path::Path>,
+) -> Result<(), AppError> {
+    let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
     let mut client = attach(paths).await?;
     match client
         .request(&Request::Create {
@@ -2749,6 +2879,53 @@ pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot create: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox room leave` — leave a room (V210-164).
+///
+/// The node writes its departure into the room and answers once another member has it; then
+/// the room is gone from this node. The other members stop listing this identity in the
+/// room's roster.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown or closed, or no other member could be
+/// told in time (the node then leaves as soon as one can be).
+pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let rooms = rooms_of(&mut client).await?;
+    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
+    if ids.is_empty() {
+        return Err(AppError::Usage("this node holds no rooms".into()));
+    }
+    let channel_id = resolve_prefix(room, &ids)?;
+    let name = rooms
+        .iter()
+        .find(|(r, _, _)| *r == channel_id)
+        .map(|(_, n, _)| n.clone())
+        .unwrap_or_default();
+    let which = if name.is_empty() {
+        format!("room {}", b32_encode(&channel_id))
+    } else {
+        format!("room {name:?} ({})", b32_encode(&channel_id))
+    };
+    if rooms.iter().any(|(r, _, open)| *r == channel_id && !open) {
+        return Err(AppError::Usage(format!(
+            "{which} is closed on this node, and leaving is said in the room\n       open it \
+             first: in `vox tui`, or a line with its passphrase to `vox daemon`"
+        )));
+    }
+    match client.request(&Request::Leave { channel_id }).await {
+        Ok(Frame::Ok) => {
+            println!("vox: left {which}");
+            println!("     its other members see that you left; this node no longer holds it");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("{which} was not left: {reason}")))
+        }
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
@@ -2794,25 +2971,52 @@ pub async fn node_is_running(paths: &Paths) -> bool {
     sock.exists() && IpcClient::open(&sock).await.is_ok()
 }
 
+/// Send a keyring change, giving the identity passphrase only when the node says it needs it
+/// (V210-159): within 30 minutes of its last entry none is needed. `given` is what the command line
+/// gave (`--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`); it is sent at once, and a right
+/// one starts the window again. With none given and the window passed, it is asked for at the
+/// terminal and the change sent again; with no terminal, the node's reason is the answer.
+async fn keyring_change(
+    client: &mut IpcClient,
+    given: Option<String>,
+    request: impl Fn(String) -> Request,
+) -> Result<Frame, AppError> {
+    let asked = given.is_none();
+    let reply = client
+        .request(&request(given.unwrap_or_default()))
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let needed = vox_core::node::api::Fault::PassphraseNeeded.explain();
+    match reply {
+        Frame::Error { reason }
+            if asked && reason == needed && std::io::IsTerminal::is_terminal(&std::io::stdin()) =>
+        {
+            eprintln!("vox: {}", reason.lines().next().unwrap_or_default());
+            let passphrase = crate::tunnel_cli::ask_identity_passphrase()?;
+            client
+                .request(&request(passphrase))
+                .await
+                .map_err(|e| AppError::Usage(e.to_string()))
+        }
+        other => Ok(other),
+    }
+}
+
 /// `vox trust add`, asked of the running node instead of a second one.
-///
-/// The keyring is the one thing an agent session must not be able to change (ADR-020 §7),
-/// so the request carries the identity passphrase and the node checks it before doing
-/// anything. That is what makes this safe to put on a socket an agent can reach.
 pub async fn trust_add(
     paths: &Paths,
     target: Digest32,
     petname: &str,
-    identity_passphrase: &str,
+    given: Option<String>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client
-        .request(&Request::Trust {
-            target,
-            petname: petname.to_owned(),
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
+    crate::ident::check_new_name(crate::ident::names(), &target, petname)?;
+    match keyring_change(&mut client, given, |identity_passphrase| Request::Trust {
+        target,
+        petname: petname.to_owned(),
+        identity_passphrase,
+    })
+    .await
     {
         Ok(Frame::Ok) => {
             println!(
@@ -2827,7 +3031,7 @@ pub async fn trust_add(
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
+        Err(e) => Err(e),
     }
 }
 
@@ -2835,15 +3039,14 @@ pub async fn trust_add(
 pub async fn trust_remove(
     paths: &Paths,
     target: Digest32,
-    identity_passphrase: &str,
+    given: Option<String>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client
-        .request(&Request::Untrust {
-            target,
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
+    match keyring_change(&mut client, given, |identity_passphrase| Request::Untrust {
+        target,
+        identity_passphrase,
+    })
+    .await
     {
         Ok(Frame::Ok) => {
             println!(
@@ -2855,14 +3058,14 @@ pub async fn trust_remove(
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
+        Err(e) => Err(e),
     }
 }
 
-/// `vox trust list`, asked of the running node.
-pub async fn trust_list(paths: &Paths, identity_passphrase: &str) -> Result<(), AppError> {
+/// `vox trust list`, asked of the running node: a read, so no passphrase (V210-165).
+pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client.trusted(identity_passphrase).await {
+    match client.trusted("").await {
         Ok(Frame::Trusted { entries }) => {
             if entries.is_empty() {
                 println!("no trusted identities");

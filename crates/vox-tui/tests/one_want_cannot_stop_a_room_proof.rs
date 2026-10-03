@@ -290,7 +290,7 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
 
     let (ok, out, err) = vox_in(
         &victim_dir,
-        &["room", "create", "--name", "team"],
+        &["room", "create", "--passphrase-file", "-", "--name", "team"],
         ROOM_PASS,
     );
     assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
@@ -325,7 +325,15 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
     // refusal is fixed (V210-43), so nothing known excuses one.
     let (ok, out, err) = vox_in(
         &mallory_dir,
-        &["room", "join", &link, "--name", "team"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "team",
+        ],
         ROOM_PASS,
     );
     assert!(

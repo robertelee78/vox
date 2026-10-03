@@ -4,7 +4,7 @@
 # Rust clients over it. Crates are added to `members` as milestones land.
 [workspace]
 resolver = "2"
-members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms"]
+members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms", "crates/vox-text"]
 # Test apparatus only (V210-55, #242): built on its own by the proofs that need it, never a member,
 # never linked into vox.
 exclude = ["crates/vox-test-interpose"]
@@ -92,7 +92,7 @@ quinn-proto = { version = "0.11", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Socket options quinn does not set: the UDP buffer sizes (R41). Already in the tree through
 # tokio and quinn-udp; named here so the node can ask for buffers a burst fits in.
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 # quinn-udp's batched `sendmsg_x`/`recvmsg_x` on Apple platforms (PRD-001 R41): one syscall per
 # batch rather than per packet, measured +18% on a 1452-byte path. It calls a private Apple API;
 # the decider accepted the App Store risk for iOS too (2026-09-25). A no-op elsewhere.

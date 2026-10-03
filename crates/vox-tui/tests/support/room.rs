@@ -36,7 +36,7 @@ pub const TIMEOUT: Duration = Duration::from_secs(60);
 const DAEMON_START_PATIENCE: Duration = Duration::from_secs(240);
 
 const ID_PASS: &str = "identity passphrase";
-const ROOM_PASS: &str = "channel passphrase";
+pub const ROOM_PASS: &str = "channel passphrase";
 
 /// Everything a harness might have put in this process's environment that would
 /// silently name a session. **This test process may itself be running inside Claude
@@ -500,7 +500,14 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
     first
         .vox_in(
             None,
-            &["room", "create", "--name", "mission"],
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "mission",
+            ],
             Some(ROOM_PASS),
         )
         .expect_ok("`vox room create`");
@@ -526,7 +533,15 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         let t = Instant::now();
         let o = w.vox_in(
             None,
-            &["room", "join", &link, "--name", "mission"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &link,
+                "--name",
+                "mission",
+            ],
             Some(ROOM_PASS),
         );
         assert!(

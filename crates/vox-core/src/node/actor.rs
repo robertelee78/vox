@@ -115,6 +115,15 @@ const TICK: Duration = Duration::from_secs(1);
 /// dial to one member it cannot currently reach. See `reach_member`.
 const MEMBER_REDIAL_SECS: u64 = 30;
 
+/// How often a node holding a room with a member it is not connected to says where it listens on
+/// this computer and the local network (`node::nearby`).
+const NEARBY_EVERY_SECS: u64 = 30;
+/// How soon after it holds a room it did not — what a node that just started does — a node says
+/// so, if a member of it is still not connected by then.
+const NEARBY_FIRST_SECS: u64 = 3;
+/// How soon a member heard on `node::nearby` may be dialled for it again.
+const NEARBY_REDIAL_SECS: u64 = 5;
+
 /// How long relayed connections' closes get to leave through their circuits before the circuits'
 /// carrier connections are closed too (see `stop_network`). The frame only has to be handed to the
 /// circuit's stream, which happens on the endpoint driver's next turn.
@@ -263,6 +272,11 @@ const ANCHOR_PUBLISH_PATIENCE: Duration = Duration::from_secs(5);
 /// the address names has to take the room before this node says it has not.
 const ADDRESS_PATIENCE: Duration = Node::BOARD_PATIENCE;
 
+/// How long `vox room leave` waits for another member to take this node's departure (V210-164).
+/// Past it the person is told, and the node keeps the room until one does: removed first, the
+/// room would take the only copy of the departure with it, and nobody would ever learn of it.
+const LEAVE_PATIENCE: Duration = Duration::from_secs(30);
+
 /// How long a join waits before asking its boards again for a room none of them holds yet
 /// (V210-143): a host publishes its room within a second of starting, and retries a failed dial to
 /// its anchor after one.
@@ -375,6 +389,7 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::Sync { .. } => "syncing",
         NodeCommand::Serve { .. } => "publishing a service",
         NodeCommand::Up { .. } => "bringing the proxy up",
+        NodeCommand::LeaveChannel { .. } => "leaving a room",
         NodeCommand::Forward { .. } => "opening a forward",
         NodeCommand::Unlock { .. } => "unlocking the identity",
         _ => "a client command",
@@ -406,6 +421,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::StaleGraceOver { .. } => "naming a refusal no republish cured",
         NetEvent::PublishRetry { .. } => "retrying a publish round that failed",
         NetEvent::AddressWaitOver { .. } => "withholding an address no board holds the room for",
+        NetEvent::LeaveWaitOver { .. } => "answering a leave nobody took",
         NetEvent::AnchorNoteDue { .. } => "saying which anchors never took a room",
         NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
@@ -415,6 +431,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Dialed { .. } => "adopting a connection a join dialled",
         NetEvent::JoinerDone { .. } => "finishing a join",
         NetEvent::ForwardDialed { .. } => "binding a forward whose dial landed",
+        NetEvent::Heard { .. } => "dialling a member heard nearby",
+        NetEvent::AddressReached { .. } => "keeping a room address whose host answered",
         NetEvent::Reopened { .. } => "holding a room that reopened",
         NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
@@ -716,14 +734,15 @@ fn anchor_close_reason(
             {
                 Some(crate::wire::WireError::ShuttingDown) => "the anchor stopped".to_owned(),
                 Some(code) => format!("the anchor closed it: {code}"),
-                None => e.to_string(),
+                // What the anchor wrote, never as it wrote it (V210-154).
+                None => crate::transport::quic::closed_text(e),
             }
         }
         quinn::ConnectionError::LocallyClosed => match closed_here {
             Some(code) => format!("closed here: {code}"),
             None => "closed here".to_owned(),
         },
-        other => other.to_string(),
+        other => crate::transport::quic::closed_text(other),
     }
 }
 
@@ -776,6 +795,26 @@ async fn run_session_worker(
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
+    /// A held room's address was given again and a member it names answered there (V210-167):
+    /// keep what it names as the room's, dial its anchors, and answer the join.
+    AddressReached {
+        /// The room.
+        room: Digest32,
+        /// Every node the address names but this one.
+        named: BootstrapSet,
+        /// The members that answered there.
+        answered: Vec<Digest32>,
+        /// The join's answer.
+        reply: oneshot::Sender<Outcome>,
+    },
+    /// A node on this computer or the local network said where it listens, naming members by
+    /// `node::nearby::entry` (V210-167).
+    Heard {
+        /// The address it was heard from.
+        from: std::net::IpAddr,
+        /// The members it named, and their ports.
+        entries: Vec<crate::node::nearby::Entry>,
+    },
     /// The ladder's publish side finished: this node now knows what to advertise, and
     /// which mappings a gateway granted (each of which will need renewing).
     AddressesDiscovered {
@@ -967,6 +1006,14 @@ enum NetEvent {
         /// our address each taken (or refused only as older than what it holds). What an address
         /// naming this board waits for (V210-96).
         holds_room: bool,
+    },
+    /// A leave begun at `serial` (see `Node::begin_leave`) has waited [`LEAVE_PATIENCE`] and no
+    /// other member has taken the departure: it is answered, and goes on waiting.
+    LeaveWaitOver {
+        /// The room.
+        channel_id: Digest32,
+        /// Which wait this ends.
+        serial: u64,
     },
     /// An address waited on since `serial` (see `Node::begin_invite`) has waited
     /// [`ADDRESS_PATIENCE`]: withheld, with its cause, if its room is still on no board it names.
@@ -1874,6 +1921,29 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
         let _ = tx.send(NetEvent::Stopped { net: gone }).await;
     });
 }
+
+/// How long, in seconds, the identity passphrase stays good for a keyring change once it has been
+/// entered (V210-159, decider 2026-10-02). Posting and reading go on while the node runs; only a
+/// trust add or remove past this needs the passphrase again, whichever client asks.
+pub const KEYRING_WINDOW_SECS: u64 = 30 * 60;
+
+/// [`KEYRING_WINDOW_SECS`], or [`TEST_KEYRING_WINDOW_ENV`]'s seconds in a `test-knobs` build.
+fn keyring_window() -> u64 {
+    #[cfg(feature = "test-knobs")]
+    if let Some(secs) = std::env::var(TEST_KEYRING_WINDOW_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+    {
+        return secs;
+    }
+    KEYRING_WINDOW_SECS
+}
+
+/// **For proofs only.** The keyring window in seconds instead of 30 minutes, so a proof can see a
+/// keyring change refused once it has passed. Nothing a person runs sets it. Not compiled in
+/// without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_KEYRING_WINDOW_ENV: &str = "VOX_TEST_KEYRING_WINDOW_SECS";
 
 /// **For proofs only.** When set, the accept loop waits this many milliseconds between stopping
 /// and saying so (`NetEvent::Stopped`), which stands for an actor queue that is full or a task that
@@ -3353,6 +3423,11 @@ pub struct Node {
     join_slots: Arc<std::sync::Mutex<crate::node::joinslots::JoinSlots>>,
     /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
     verify_slots: Arc<tokio::sync::Semaphore>,
+    /// When the identity passphrase was last entered, in this node's clock's seconds: at
+    /// creation, at unlock, or at a later check that passed. Zero while locked. A keyring change
+    /// is refused once [`keyring_window`] has passed since (V210-159). Shared, because a check
+    /// passes on a blocking thread.
+    passphrase_entered_at: Arc<std::sync::atomic::AtomicU64>,
     /// The join exchanges running right now, both sides of them, the room creations sealing
     /// their key (V210-76), and the identity-passphrase checks (V210-94).
     ///
@@ -3431,12 +3506,30 @@ pub struct Node {
     address_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, u64)>,
     /// The serial of the last address wait begun.
     address_serial: u64,
+    /// Leaves waiting for another member to take the departure (V210-164): the room, the room's
+    /// generation once the departure was written, the reply while someone waits for one, and the
+    /// wait's serial.
+    leave_waiters: Vec<(Digest32, u64, Option<oneshot::Sender<Outcome>>, u64)>,
+    /// The serial of the last leave begun.
+    leave_serial: u64,
     /// `(room, anchor)` pairs an address was handed out naming before that anchor held the room,
     /// with the address's serial: said when the anchor takes it, or when [`ADDRESS_PATIENCE`]
     /// passes without (`NetEvent::AnchorNoteDue`) (V210-96).
     anchor_owed: BTreeMap<(Digest32, Digest32), u64>,
     /// When a background dial to each member was last started: see `reach_member`.
     member_dialed_at: BTreeMap<Digest32, u64>,
+    /// Where this node says it listens on this computer and the local network, and hears others
+    /// say so (V210-167; `node::nearby`). `None` for an anchor, or when the group cannot be
+    /// joined.
+    nearby: Option<Arc<crate::node::nearby::Nearby>>,
+    /// The task hearing `nearby`, aborted when the network stops.
+    nearby_task: Option<tokio::task::AbortHandle>,
+    /// When this node next says where it listens, while a member is not connected.
+    nearby_due: u64,
+    /// How many rooms were held when it last said so: a room held since is said at once.
+    nearby_rooms: usize,
+    /// When each member heard on `nearby` was last dialled for it.
+    nearby_dialed: BTreeMap<Digest32, u64>,
     /// Each room's view summary and detail as this node's own latest write left them, taken under the room's lock
     /// by the write itself. `view_of` uses it when a session holds the room, so a person always sees
     /// their own post in what they read straight after, however long that session holds on. A room's
@@ -3670,6 +3763,7 @@ impl Node {
             publish_refusal_first_seen: BTreeMap::new(),
             join_slots: crate::node::joinslots::JoinSlots::new(JOINS_IN_FLIGHT),
             verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
+            passphrase_entered_at: Arc::default(),
             join_tasks: tokio::task::JoinSet::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
@@ -3695,8 +3789,15 @@ impl Node {
             publish_trouble: BTreeMap::new(),
             address_waiters: Vec::new(),
             address_serial: 0,
+            leave_waiters: Vec::new(),
+            leave_serial: 0,
             anchor_owed: BTreeMap::new(),
             member_dialed_at: BTreeMap::new(),
+            nearby: None,
+            nearby_task: None,
+            nearby_due: 0,
+            nearby_rooms: 0,
+            nearby_dialed: BTreeMap::new(),
             fresh_details: BTreeMap::new(),
             key_backoff: BTreeMap::new(),
             redeliver_now: false,
@@ -3869,6 +3970,15 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
+                    // **A leave is answered once another member has the departure** (V210-164):
+                    // see `begin_leave`.
+                    if let NodeCommand::LeaveChannel { channel_id } = command {
+                        self.begin_leave(channel_id, reply).await;
+                        self.note_if_stalled(name, started);
+                        self.publish().await;
+                        self.schedule().await;
+                        continue;
+                    }
                     // **An address is answered once its room can be joined through it** (V210-96):
                     // see `begin_invite`.
                     if let NodeCommand::Invite { channel_id } = command {
@@ -3946,6 +4056,7 @@ impl Node {
                         self.refresh_network_view().await;
                     }
                     self.redial_anchors_if_due();
+                    self.say_where_if_due().await;
                     // A rotation's re-keys go out as the remaining consenters become
                     // reachable, which is why they are retried here and not only at
                     // the moment of rotation (M18.1).
@@ -4048,7 +4159,13 @@ impl Node {
             NodeCommand::VerifyPassphrase { passphrase } => match self.profile.as_ref() {
                 None => Outcome::Failed(Fault::NoIdentity),
                 Some(profile) => match profile.verify_passphrase(&passphrase) {
-                    Ok(()) => Outcome::Done,
+                    Ok(()) => {
+                        // An entry of it on a locked node starts no window: the unlock does.
+                        if profile.is_unlocked() {
+                            self.note_passphrase_entered();
+                        }
+                        Outcome::Done
+                    }
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 },
             },
@@ -4067,6 +4184,14 @@ impl Node {
             NodeCommand::JoinChannel { .. } => {
                 debug_assert!(false, "JoinChannel is answered by begin_join_channel");
                 Outcome::Failed(Fault::Internal)
+            }
+            // Only an unlocked node asks for the passphrase again. One with no identity or a
+            // locked one falls through, and says that: a passphrase would not make the change.
+            NodeCommand::Trust { .. } | NodeCommand::Untrust { .. }
+                if self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                    && !self.passphrase_entered_recently() =>
+            {
+                Outcome::Failed(Fault::PassphraseNeeded)
             }
             NodeCommand::Trust {
                 fingerprint,
@@ -4093,6 +4218,9 @@ impl Node {
             // before it gets here.
             NodeCommand::Forward { .. } => {
                 unreachable!("NodeCommand::Forward is answered by begin_forward")
+            }
+            NodeCommand::LeaveChannel { .. } => {
+                unreachable!("NodeCommand::LeaveChannel is answered by begin_leave")
             }
             NodeCommand::StopForward { local } => {
                 // Dropping the forward aborts its listener; connections already
@@ -4142,6 +4270,23 @@ impl Node {
         (self.clock)()
     }
 
+    /// The identity passphrase was just entered, and proved: a keyring change is allowed for
+    /// [`keyring_window`] from now (V210-159).
+    fn note_passphrase_entered(&self) {
+        self.passphrase_entered_at
+            .store(self.now().max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the identity passphrase was entered within [`keyring_window`]. Never, while
+    /// locked. A clock that went backwards counts as recent: the passphrase was entered, and the
+    /// window is kept by the next change of the clock forward, not by a wrong reading.
+    fn passphrase_entered_recently(&self) -> bool {
+        let at = self
+            .passphrase_entered_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        at != 0 && self.now().saturating_sub(at) <= keyring_window()
+    }
+
     fn create_identity(&mut self, passphrase: &Secret) -> Outcome {
         if self.profile.is_some() {
             return Outcome::Failed(Fault::IdentityExists);
@@ -4154,6 +4299,7 @@ impl Node {
         match Profile::create_noting(self.paths.clone(), passphrase, now, self.argon2, &waiting) {
             Ok(p) => {
                 self.profile = Some(p);
+                self.note_passphrase_entered();
                 // A fresh identity gets its prekey ring immediately: without it the
                 // node has nothing to publish and cannot answer PQXDH.
                 if let Err(e) = self.load_prekeys(now) {
@@ -4190,6 +4336,7 @@ impl Node {
                     drop(self.lock_all().await);
                     return Outcome::Failed(fault_of(&e));
                 }
+                self.note_passphrase_entered();
                 let _ = self.event_tx.send(NodeEvent::Unlocked);
                 self.reopen_remembered().await;
                 Outcome::Done
@@ -4209,27 +4356,14 @@ impl Node {
             return Ok(());
         }
         // The identity to network as: the unlocked vault's, or the headless one.
-        let endpoint = Arc::new(match (self.headless.as_ref(), self.profile.as_ref()) {
-            (Some(signer), _) => match bind {
-                Bind::Addr(addr) => crate::transport::quic::VoxEndpoint::bind(&**signer, *addr)?,
-                Bind::Socket(socket) => crate::transport::quic::VoxEndpoint::bind_abstract(
-                    &**signer,
-                    Arc::clone(socket),
-                )?,
-            },
-            (None, Some(profile)) => match bind {
-                Bind::Addr(addr) => {
-                    crate::transport::quic::VoxEndpoint::bind(profile.signer()?, *addr)?
-                }
-                Bind::Socket(socket) => crate::transport::quic::VoxEndpoint::bind_abstract(
-                    profile.signer()?,
-                    Arc::clone(socket),
-                )?,
-            },
+        let (endpoint, moved) = match (self.headless.as_ref(), self.profile.as_ref()) {
+            (Some(signer), _) => self.bind_endpoint(&**signer, bind)?,
+            (None, Some(profile)) => self.bind_endpoint(profile.signer()?, bind)?,
             (None, None) => {
                 return Err(crate::error::Error::Profile("no identity in this profile"))
             }
-        });
+        };
+        let endpoint = Arc::new(endpoint);
         let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
         // narrows that to rooms its operator's trust list created (V210-70).
@@ -4304,12 +4438,115 @@ impl Node {
             let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
         });
         spawn_accept_loop(net, self.net_tx.clone());
+        // Members on this computer or the local network are found by what they say there, an
+        // anchor holds no room and has nobody to find. Without the group, a node is found only
+        // where its records say, as before.
+        if self.headless.is_none() {
+            if let Ok(nearby) = crate::node::nearby::Nearby::open() {
+                let nearby = Arc::new(nearby);
+                let (hear, tx) = (Arc::clone(&nearby), self.net_tx.clone());
+                let task = tokio::spawn(async move {
+                    while let Ok((from, entries)) = hear.hear().await {
+                        // Dropped when the actor is behind: the next one is said within
+                        // `NEARBY_EVERY_SECS`.
+                        let _ = tx.try_send(NetEvent::Heard { from, entries });
+                    }
+                });
+                self.nearby = Some(nearby);
+                self.nearby_task = Some(task.abort_handle());
+                self.nearby_rooms = 0;
+            }
+        }
+        // Who finds a node whose port moved depends on whether it says where it listens nearby,
+        // so the note waits until that is known.
+        if let Some(moved) = moved {
+            let who = if self.nearby.is_some() {
+                "members on this computer or the local network find it here, others through an \
+                 anchor or when it reaches them"
+            } else if self.headless.is_some() {
+                "anyone given its old address needs the new one"
+            } else {
+                "members find it only through an anchor or when it reaches them"
+            };
+            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                note: format!("{moved}; {who}"),
+            });
+        }
         Ok(())
+    }
+
+    /// Bind the endpoint as `signer`.
+    ///
+    /// **A node keeps its port** (V210-167). Asked for port 0, it bound a new random port on every
+    /// start, and a member finds another only at the address its board record last gave: with no
+    /// anchor to carry a new record, two members that both restarted dialled each other's dead
+    /// ports for ever. So the port a node first binds is written to the profile ([`PORT_FILE`])
+    /// and bound again on every start. If another program holds it now, the node binds another
+    /// for this run, and the second value is what to say about it; the file keeps the first,
+    /// which the next start tries again. A port given explicitly is bound as given and not
+    /// recorded.
+    ///
+    /// [`PORT_FILE`]: crate::node::paths::PORT_FILE
+    fn bind_endpoint<S: crate::identity::composite::RootSigner>(
+        &self,
+        signer: &S,
+        bind: &Bind,
+    ) -> crate::error::Result<(crate::transport::quic::VoxEndpoint, Option<String>)> {
+        use crate::transport::quic::VoxEndpoint;
+        let addr = match bind {
+            Bind::Addr(addr) => *addr,
+            Bind::Socket(socket) => {
+                return Ok((
+                    VoxEndpoint::bind_abstract(signer, Arc::clone(socket))?,
+                    None,
+                ))
+            }
+        };
+        if addr.port() != 0 {
+            return Ok((VoxEndpoint::bind(signer, addr)?, None));
+        }
+        let file = self.paths.port_file();
+        let kept = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|t| t.trim().parse::<u16>().ok())
+            .filter(|p| *p != 0);
+        let Some(port) = kept else {
+            let endpoint = VoxEndpoint::bind(signer, addr)?;
+            if let Ok(at) = endpoint.local_addr() {
+                let _ = crate::node::paths::write_private_file(
+                    &file,
+                    format!("{}\n", at.port()).as_bytes(),
+                );
+            }
+            return Ok((endpoint, None));
+        };
+        let why = match VoxEndpoint::bind(signer, std::net::SocketAddr::new(addr.ip(), port)) {
+            Ok(endpoint) => return Ok((endpoint, None)),
+            Err(crate::error::Error::LocalBind {
+                cause: crate::error::BindCause::InUse,
+                ..
+            }) => "another program holds it".to_owned(),
+            Err(e) => e.to_string(),
+        };
+        let endpoint = VoxEndpoint::bind(signer, addr)?;
+        let now = endpoint
+            .local_addr()
+            .map_or_else(|_| "another".to_owned(), |a| a.port().to_string());
+        Ok((
+            endpoint,
+            Some(format!(
+                "this node's port {port} is not free ({why}), so it listens on port {now} this run"
+            )),
+        ))
     }
 
     /// Tear the network down: close every connection and the endpoint, so a locked
     /// node presents no network identity at all.
     async fn stop_network(&mut self) {
+        if let Some(task) = self.nearby_task.take() {
+            task.abort();
+        }
+        self.nearby = None;
         if let Some(net) = self.net.take() {
             // **A finished tunnel's last bytes first.** A close drops what the peer has not yet
             // acknowledged, so a node stopped right after a reply was finished cut it short at
@@ -5329,6 +5566,15 @@ impl Node {
     /// [`Self::handle_net`], unboxed: see [`Boxed`].
     async fn handle_net_unboxed(&mut self, event: NetEvent) {
         match event {
+            NetEvent::Heard { from, entries } => self.heard_nearby(from, &entries).await,
+            NetEvent::AddressReached {
+                room,
+                named,
+                answered,
+                reply,
+            } => {
+                self.keep_room_address(room, &named, &answered, reply).await;
+            }
             NetEvent::Reopened {
                 channel_id,
                 channel,
@@ -5348,6 +5594,7 @@ impl Node {
                     self.channels
                         .insert(channel_id, Arc::new(tokio::sync::Mutex::new(*channel)));
                     self.mark_decisions_on_open(&channel_id).await;
+                    self.resume_leave(&channel_id).await;
                     self.act_on_removals_while_closed(&channel_id).await;
                     self.adopt_channel_anchors(&channel_id, None).await;
                     self.refresh_network_view().await;
@@ -6087,6 +6334,18 @@ impl Node {
             NetEvent::AddressWaitOver { channel_id, serial } => {
                 self.withhold_address(channel_id, serial).await;
             }
+            NetEvent::LeaveWaitOver { channel_id, serial } => {
+                // Answered, and still leaving: the room goes once a member has the departure.
+                if let Some((_, _, reply, _)) = self
+                    .leave_waiters
+                    .iter_mut()
+                    .find(|(r, _, _, s)| *r == channel_id && *s == serial)
+                {
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(Outcome::Failed(Fault::LeaveNotHeard));
+                    }
+                }
+            }
             NetEvent::AnchorNoteDue { channel_id, serial } => {
                 self.say_anchors_that_never_took(channel_id, serial);
             }
@@ -6174,6 +6433,12 @@ impl Node {
                 report,
             } => {
                 let current = self.file_session(channel_id, peer, token, &report);
+                // A session that sent this node's HAVE from at least the generation its departure
+                // was written at, and ended cleanly, handed that peer the departure (V210-164).
+                let heard = report.out.gen_have.filter(|_| report.fail.is_none());
+                if report.fail.is_none() && report.out.complete {
+                    self.settle_room(&channel_id).await;
+                }
                 if current {
                     if let Some(fail) = &report.fail {
                         // Said, with its reason (PRD-001 R36), so a failure that does not resolve
@@ -6247,6 +6512,9 @@ impl Node {
                             rendered: o.rendered as u64,
                         });
                     }
+                }
+                if let Some(sent) = heard {
+                    self.finish_leave_if_heard(channel_id, sent).await;
                 }
             }
             NetEvent::Stream { conn, inbound } => {
@@ -7074,7 +7342,7 @@ impl Node {
             return;
         };
         if self.channels.contains_key(&parsed.channel_id) {
-            let _ = reply.send(Outcome::Failed(Fault::AlreadyMember));
+            self.reach_by_address(&parsed, net, reply).await;
             return;
         }
         let Some(profile) = self.profile.as_ref() else {
@@ -7181,6 +7449,156 @@ impl Node {
                 })
                 .await;
         });
+    }
+
+    /// A room's address given for a room this node already holds: **the address is where its host
+    /// is now** (V210-167). It was refused ("already holds that room"), so a member whose host
+    /// had moved had no way to say where it went. The members it names are dialled there, even
+    /// when a connection to one is held elsewhere; the members that answer there, and the anchors
+    /// it names, are kept as the room's (`keep_room_address`), so the next start dials them there
+    /// too. An address nobody answers at changes nothing: a stale
+    /// one from chat history must not overwrite where the room's members really are. `Done` once
+    /// a member answered; `Unreachable` (said with why) when none did; `BadLink` when the address
+    /// names no other member of the room, which is so when this node is its host.
+    async fn reach_by_address(
+        &mut self,
+        parsed: &crate::node::link::InviteLink,
+        net: Arc<NodeNet>,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let room = parsed.channel_id;
+        let me = net.local_id();
+        let mut named = BootstrapSet::new();
+        for a in parsed.anchors.iter().filter(|a| a.id != me) {
+            let _ = named.add(a.clone());
+        }
+        let mut members: Vec<(Digest32, Vec<std::net::SocketAddr>)> = Vec::new();
+        if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
+            let channel = shared.lock().await;
+            for n in named.nodes() {
+                if channel.is_author(&n.id) {
+                    members.push((n.id, n.endpoints.direct_candidates()));
+                }
+            }
+        }
+        if members.is_empty() {
+            let why = if parsed.anchors.iter().any(|a| a.id == me) {
+                "the address names this node as the room's host, and no other member, so there \
+                 is nobody to reach"
+            } else {
+                "the address names no member of this room, so there is nobody to reach"
+            };
+            let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                reason: why.to_owned(),
+            });
+            let _ = reply.send(Outcome::Failed(Fault::BadLink));
+            return;
+        }
+        let tx = self.net_tx.clone();
+        let events = self.event_tx.clone();
+        tokio::spawn(async move {
+            let mut dials = tokio::task::JoinSet::new();
+            for (peer, candidates) in members {
+                let net = Arc::clone(&net);
+                dials.spawn(async move {
+                    // Not `connect_to`: it hands back a connection held on another port or
+                    // through a relay without dialling, and that says nothing about this
+                    // address.
+                    let got = net.manager().answers_at(peer, &candidates).await;
+                    (peer, candidates, got)
+                });
+            }
+            let mut answered: Vec<Digest32> = Vec::new();
+            let mut missed: Vec<String> = Vec::new();
+            while let Some(Ok((peer, candidates, got))) = dials.join_next().await {
+                match got {
+                    Ok(conn) => {
+                        answered.push(peer);
+                        let endpoints = crate::nat::multiaddr::EndpointList::new(
+                            candidates.into_iter().map(Into::into).collect(),
+                        )
+                        .unwrap_or_default();
+                        let _ = tx
+                            .send(NetEvent::Dialed {
+                                conn,
+                                endpoints,
+                                board: false,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        missed.push(format!("{} — {e}", crate::node::network::short_id(peer)));
+                    }
+                }
+            }
+            if answered.is_empty() {
+                let _ = events.send(NodeEvent::JoinFailed {
+                    reason: format!("nobody answered at that address: {}", missed.join("; ")),
+                });
+                let _ = reply.send(Outcome::Failed(Fault::Unreachable));
+            } else {
+                let _ = tx
+                    .send(NetEvent::AddressReached {
+                        room,
+                        named,
+                        answered,
+                        reply,
+                    })
+                    .await;
+            }
+        });
+    }
+
+    /// A held room's address that a member answered at: keep, as the room's, the members that
+    /// answered there and the anchors it names, dial those anchors, and answer the join `Done`
+    /// (V210-167). A member it names that did not answer keeps the address this node had for it:
+    /// only an answer shows a member is where the address says.
+    async fn keep_room_address(
+        &mut self,
+        room: Digest32,
+        named: &BootstrapSet,
+        answered: &[Digest32],
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let mut anchors: Vec<(Digest32, Vec<std::net::SocketAddr>)> = Vec::new();
+        if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
+            let mut channel = shared.lock().await;
+            let mut kept = BootstrapSet::new();
+            for n in named.nodes() {
+                if answered.contains(&n.id) || !channel.is_author(&n.id) {
+                    let _ = kept.add(n.clone());
+                }
+            }
+            if let Some(profile) = self.profile.as_ref() {
+                let _ = channel.add_anchors(profile.store(), &kept);
+            }
+            let mut own = BootstrapSet::new();
+            for n in channel.anchors().nodes() {
+                if !channel.is_author(&n.id) {
+                    let _ = own.add(n.clone());
+                }
+            }
+            self.room_anchors.insert(room, own);
+            for n in named.nodes() {
+                if !channel.is_author(&n.id) {
+                    anchors.push((n.id, n.endpoints.direct_candidates()));
+                }
+            }
+        }
+        if let Some(net) = self.net.clone() {
+            for (id, candidates) in anchors {
+                self.anchor_ids.insert(id);
+                self.dial_anchor(&net, id, candidates);
+            }
+        }
+        let _ = self.event_tx.send(NodeEvent::NodeNote {
+            note: format!(
+                "room {}: a member answered at the address given, which is kept as the room's \
+                 from now on",
+                crate::node::network::short_id(room)
+            ),
+        });
+        let _ = reply.send(Outcome::Done);
     }
 
     /// Everything after the join exchange: make the room from the sealed key, record how this
@@ -7361,6 +7779,11 @@ impl Node {
                 // it and cannot know we are releasing to the right party. Said as that, not as
                 // "no such room" (V210-78); an explicit consent waits for a sync with it.
                 return Outcome::Failed(Fault::NotAdmitted);
+            }
+            // The grant is written to the log, which a room just joined waits for (V210-164):
+            // checked before the key goes, not after.
+            if !channel.is_settled() {
+                return Outcome::Failed(Fault::RoomNotSynced);
             }
             // **Consent is dated by the decision, not the delivery** (V210-45), in the
             // profile's logical consent order, never by a clock. Every generation minted after
@@ -8780,6 +9203,18 @@ impl Node {
             (None, Some(state)) => SessionTarget::Anchored(state),
             (None, None) => return false,
         };
+        // **Not with a member that left** (V210-164): it holds no room to sync, and refused every
+        // session for it. Its port is marked served; a member that joins again syncs from its own
+        // side, and is synced with again once it says it is back.
+        if let SessionTarget::Channel(shared) = &target {
+            if shared.lock().await.has_left(&peer) {
+                if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
+                    port.req_done = port.req_gen;
+                    port.done_gen = port.gen.load(std::sync::atomic::Ordering::Relaxed);
+                }
+                return false;
+            }
+        }
         // An anchor's authors come from its own board, which is local: cheap, and it has to happen
         // before the session so the anchor can verify what arrives.
         if matches!(target, SessionTarget::Anchored(_)) {
@@ -9048,9 +9483,13 @@ impl Node {
         let key = (channel_id, peer);
         let attempt = self.ports.get_mut(&key).and_then(|p| p.take(token));
         let Some(attempt) = attempt else {
-            crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
-                c.stale += 1
-            });
+            // A session of a room this node has since left is not counted: its counts went
+            // with the room (V210-164).
+            if self.current_room(&channel_id).is_some() {
+                crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
+                    c.stale += 1
+                });
+            }
             return false;
         };
         let o = &report.out;
@@ -9794,6 +10233,117 @@ impl Node {
         None
     }
 
+    /// Say where this node listens on this computer and the local network (`node::nearby`):
+    /// [`NEARBY_FIRST_SECS`] after it holds a room it did not, then every [`NEARBY_EVERY_SECS`],
+    /// each time only if a member of a room it holds is not connected.
+    async fn say_where_if_due(&mut self) {
+        let (Some(nearby), Some(net)) = (self.nearby.clone(), self.net.clone()) else {
+            return;
+        };
+        let now = self.now();
+        let rooms = self.channels.len();
+        if rooms > self.nearby_rooms {
+            // The dials a newly held room makes from what it knows get their moment first.
+            self.nearby_rooms = rooms;
+            self.nearby_due = now + NEARBY_FIRST_SECS;
+            return;
+        }
+        self.nearby_rooms = rooms;
+        if now < self.nearby_due {
+            return;
+        }
+        self.nearby_due = now + NEARBY_EVERY_SECS;
+        let me = net.local_id();
+        let Ok(at) = net.manager().endpoint().local_addr() else {
+            return;
+        };
+        let mut entries = Vec::with_capacity(rooms);
+        let mut missing = false;
+        for (room, channel) in &self.channels {
+            entries.push(crate::node::nearby::entry(room, &me, at.port(), now));
+            if !missing {
+                missing = channel
+                    .lock()
+                    .await
+                    .members()
+                    .iter()
+                    .any(|m| *m != me && net.manager().existing(m).is_none());
+            }
+        }
+        if missing {
+            nearby.say(&entries);
+        }
+    }
+
+    /// A node at `from` named `entries`: dial every member of a held room it names that this node
+    /// is not connected to, at the port it gave (`node::nearby`). The dial is authenticated as
+    /// that member, so a datagram that lies costs one failed dial.
+    async fn heard_nearby(
+        &mut self,
+        from: std::net::IpAddr,
+        entries: &[crate::node::nearby::Entry],
+    ) {
+        let Some(net) = self.net.clone() else {
+            return;
+        };
+        let me = net.local_id();
+        let now = self.now();
+        let mut found: BTreeMap<Digest32, u16> = BTreeMap::new();
+        for (room, channel) in &self.channels {
+            for m in channel.lock().await.members() {
+                if m == me || found.contains_key(&m) || net.manager().existing(&m).is_some() {
+                    continue;
+                }
+                if let Some(port) = crate::node::nearby::port_of(entries, room, &m, now) {
+                    found.insert(m, port);
+                }
+            }
+        }
+        for (peer, port) in found {
+            if self
+                .nearby_dialed
+                .get(&peer)
+                .is_some_and(|t| now.saturating_sub(*t) < NEARBY_REDIAL_SECS)
+            {
+                continue;
+            }
+            self.nearby_dialed.insert(peer, now);
+            let at = std::net::SocketAddr::new(from, port);
+            let candidates = crate::node::nearby::dial_at(at);
+            let Ok(endpoints) = crate::nat::multiaddr::EndpointList::new(
+                candidates.iter().copied().map(Into::into).collect(),
+            ) else {
+                continue;
+            };
+            net.manager().note(
+                peer,
+                format!("heard on this computer or the local network at {at}; dialling it there"),
+            );
+            let (net, tx) = (Arc::clone(&net), self.net_tx.clone());
+            tokio::spawn(async move {
+                match net.manager().connect_to(peer, &candidates).await {
+                    Ok(conn) => {
+                        let _ = tx
+                            .send(NetEvent::Dialed {
+                                conn,
+                                endpoints,
+                                board: false,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(NetEvent::ReachFailed {
+                                peer,
+                                why: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            });
+        }
+    }
+
     /// Reach `peer` for a room's sync (ADR-025 D2, #246): one dial at a time per peer, off the
     /// actor, reporting `Dialed` (a new connection, which clears the port's backoff) or
     /// `ReachFailed` (which backs it off). Unlike [`Self::reach_member`] it keeps no spacing of its
@@ -10180,6 +10730,8 @@ impl Node {
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         let was_unlocked = self.profile.as_ref().is_some_and(Profile::is_unlocked);
+        self.passphrase_entered_at
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
@@ -10209,6 +10761,12 @@ impl Node {
         self.anchor_owed.clear();
         for (_, reply, _) in std::mem::take(&mut self.address_waiters) {
             let _ = reply.send(Outcome::Failed(Fault::Locked));
+        }
+        // A room still leaving resumes when it is held again (`resume_leave`).
+        for (_, _, reply, _) in std::mem::take(&mut self.leave_waiters) {
+            if let Some(reply) = reply {
+                let _ = reply.send(Outcome::Failed(Fault::Locked));
+            }
         }
         // The unlock they wait on did happen; what it reopened is locked again with the rest.
         for reply in std::mem::take(&mut self.unlock_waiters) {
@@ -10355,6 +10913,15 @@ impl Node {
             return;
         };
         let verifier = profile.passphrase_verifier();
+        // What the window stood at when the check began. A right passphrase restarts it only if
+        // nothing changed it meanwhile: a lock sets it to zero, and a check passing after that
+        // must not start a window on a locked node. While locked it is already zero, so nothing
+        // is recorded then either.
+        let (entered_at, clock) = (
+            Arc::clone(&self.passphrase_entered_at),
+            Arc::clone(&self.clock),
+        );
+        let entered_before = entered_at.load(std::sync::atomic::Ordering::Relaxed);
         let slots = Arc::clone(&self.verify_slots);
         let secret_work = Arc::clone(&self.secret_work);
         // Waiting for a slot happens here, off the actor; the check itself on a blocking
@@ -10373,7 +10940,17 @@ impl Node {
             let outcome = secret_blocking(&secret_work, move || {
                 let _slot = slot;
                 match verifier.verify(&passphrase) {
-                    Ok(()) => Outcome::Done,
+                    Ok(()) => {
+                        if entered_before != 0 {
+                            let _ = entered_at.compare_exchange(
+                                entered_before,
+                                clock().max(1),
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        Outcome::Done
+                    }
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 }
             })
@@ -10681,6 +11258,7 @@ impl Node {
         self.channels
             .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         self.mark_decisions_on_open(&channel_id).await;
+        self.resume_leave(&channel_id).await;
         self.act_on_removals_while_closed(&channel_id).await;
         self.adopt_channel_anchors(&channel_id, None).await;
         self.refresh_network_view().await;
@@ -10730,6 +11308,223 @@ impl Node {
             }
             None => Outcome::Failed(Fault::ChannelNotOpen),
         }
+    }
+
+    /// Leave a room (V210-164): write this identity's departure into it, push it to the room's
+    /// other members, and answer once one of them has it — then the room is removed from this
+    /// node ([`Self::finish_leave_if_heard`]). Waiting is what makes the leave seen: a room
+    /// removed first would take the only copy of the departure with it.
+    async fn begin_leave(&mut self, channel_id: Digest32, reply: oneshot::Sender<Outcome>) {
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            let held = self
+                .profile
+                .as_ref()
+                .and_then(|p| p.store().channels().ok())
+                .is_some_and(|c| c.contains(&channel_id));
+            let _ = reply.send(Outcome::Failed(if held {
+                Fault::ChannelNotOpen
+            } else {
+                Fault::UnknownChannel
+            }));
+            return;
+        };
+        if self.net.is_none() {
+            let _ = reply.send(Outcome::Failed(Fault::NotNetworked));
+            return;
+        }
+        let now = self.now();
+        let written = {
+            let Some(profile) = self.profile.as_ref() else {
+                let _ = reply.send(Outcome::Failed(Fault::Locked));
+                return;
+            };
+            let mut ch = shared.lock().await;
+            ch.say_presence(profile, false, now).map(|_| {
+                (
+                    ch.generation().load(std::sync::atomic::Ordering::Relaxed),
+                    ch.members().is_empty(),
+                )
+            })
+        };
+        let (gen, alone) = match written {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
+            }
+        };
+        // Nobody else is in the room: there is nobody to tell.
+        if alone {
+            let _ = reply.send(self.remove_left_room(&channel_id).await);
+            return;
+        }
+        self.wait_for_leave(channel_id, gen, Some(reply)).await;
+    }
+
+    /// Push a written departure to the room's members, and remove the room once one has it.
+    async fn wait_for_leave(
+        &mut self,
+        channel_id: Digest32,
+        gen: u64,
+        reply: Option<oneshot::Sender<Outcome>>,
+    ) {
+        self.note_local_append(&channel_id);
+        let _ = self.sync_channel(&channel_id).await;
+        self.leave_serial += 1;
+        let serial = self.leave_serial;
+        self.leave_waiters.push((channel_id, gen, reply, serial));
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(LEAVE_PATIENCE).await;
+            let _ = tx
+                .send(NetEvent::LeaveWaitOver { channel_id, serial })
+                .await;
+        });
+    }
+
+    /// A room held again whose own feed ends in this identity's departure was being left when
+    /// the node stopped or locked, before any member had it (V210-164): go on leaving it.
+    async fn resume_leave(&mut self, channel_id: &Digest32) {
+        if self
+            .leave_waiters
+            .iter()
+            .any(|(r, _, _, _)| r == channel_id)
+        {
+            return;
+        }
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let gen = {
+            let ch = shared.lock().await;
+            // A room joined and not yet synced is one this node came back to: it says so once
+            // settled (`settle_room`), however its feed ended before.
+            if !ch.is_settled() || !ch.has_left(&ch.me()) {
+                return;
+            }
+            ch.generation().load(std::sync::atomic::Ordering::Relaxed)
+        };
+        self.wait_for_leave(*channel_id, gen, None).await;
+    }
+
+    /// A sync of `channel_id` with another member ended cleanly: a room joined here now holds its
+    /// own feed as the room does, and may be written to (V210-164). A feed that already holds
+    /// entries means this identity was in the room before: it moves to a sender generation the
+    /// others do not hold yet, and, if its feed ends in its departure, says it is back, so the
+    /// other members list it again before it says anything else.
+    async fn settle_room(&mut self, channel_id: &Digest32) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let leaving = self
+            .leave_waiters
+            .iter()
+            .any(|(r, _, _, _)| r == channel_id);
+        let now = self.now();
+        let back = {
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let mut ch = shared.lock().await;
+            if !matches!(ch.settle(profile.store()), Ok(true)) || leaving {
+                return;
+            }
+            ch.catch_up_generation(profile, now)
+                .and_then(|_| ch.say_presence(profile, true, now))
+        };
+        match back {
+            Ok(true) => self.note_local_append(channel_id),
+            Ok(false) => {}
+            Err(e) => {
+                let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                    reason: format!(
+                        "joined room {} again, but could not start a new sender key in it: {e}",
+                        crate::node::network::short_id(*channel_id)
+                    ),
+                });
+            }
+        }
+    }
+
+    /// A sync session of `channel_id` ended cleanly having sent this node's HAVE at generation
+    /// `sent`: a leave whose departure was written at or before it has been heard, and the room
+    /// is removed.
+    async fn finish_leave_if_heard(&mut self, channel_id: Digest32, sent: u64) {
+        let (heard, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
+            .into_iter()
+            .partition(|(r, gen, _, _)| *r == channel_id && *gen <= sent);
+        self.leave_waiters = waiting;
+        if heard.is_empty() {
+            return;
+        }
+        // Written in the room since — it posted, or said it is back — and so not leaving.
+        let still_left = match self.channels.get(&channel_id) {
+            Some(shared) => {
+                let ch = shared.lock().await;
+                ch.has_left(&ch.me())
+            }
+            None => false,
+        };
+        let outcome = if still_left {
+            self.remove_left_room(&channel_id).await
+        } else {
+            Outcome::Failed(Fault::LeaveUndone)
+        };
+        for reply in heard.into_iter().filter_map(|(_, _, reply, _)| reply) {
+            let _ = reply.send(outcome);
+        }
+    }
+
+    /// Remove a room this node has left: close it, stop syncing it, and delete everything the
+    /// store holds for it as a member (V210-164).
+    async fn remove_left_room(&mut self, channel_id: &Digest32) -> Outcome {
+        let closed = self.close_channel(channel_id).await;
+        if closed != Outcome::Done {
+            return closed;
+        }
+        let ports: Vec<(Digest32, Digest32)> = self
+            .ports
+            .keys()
+            .filter(|(r, _)| r == channel_id)
+            .copied()
+            .collect();
+        for (room, peer) in ports {
+            self.drop_port(&room, &peer);
+        }
+        crate::node::status::SyncBook::forget_room(&self.sync_book, channel_id);
+        self.sched_rooms.remove(channel_id);
+        self.discover_rooms.remove(channel_id);
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::Locked);
+        };
+        let deleted = profile.store().batch().and_then(|mut b| {
+            b.delete_room(channel_id)?;
+            b.commit()
+        });
+        if let Err(e) = deleted {
+            return Outcome::Failed(fault_of(&e));
+        }
+        // What was kept for the room beside the keyring goes with it: the sender keys owed to its
+        // members, and the members owed a new key.
+        let Ok(signer) = profile.signer() else {
+            return Outcome::Failed(Fault::Locked);
+        };
+        if self.consent_keys.forget_room(channel_id) {
+            if let Err(e) = self.consent_keys.save(profile.store(), signer) {
+                return Outcome::Failed(fault_of(&e));
+            }
+        }
+        if let Ok(mut locks) =
+            crate::node::pending_lock::PendingLocks::load(profile.store(), signer)
+        {
+            if locks.clear_room(channel_id) {
+                if let Err(e) = locks.save(profile.store(), signer) {
+                    return Outcome::Failed(fault_of(&e));
+                }
+            }
+        }
+        self.refresh_network_view().await;
+        Outcome::Done
     }
 
     /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). The `bind:`
@@ -10813,6 +11608,12 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
+        // Loopback only, refused **before the bind and before `Done`** (V210-152). `up::serve`
+        // refuses it too, but on its own task after this has answered: a non-loopback `--bind`
+        // printed "vox up on 0.0.0.0:…" and the ssh hint while nothing was listening.
+        if !bind.ip().is_loopback() {
+            return Outcome::Failed(Fault::NotLoopback);
+        }
         // Bound **once**, and the live listener is handed to `up::serve` (M17.16). This
         // used to bind, read the port, drop the listener and let `serve` re-bind it, which
         // announced an address over a window where nothing was listening — a person who
@@ -11596,6 +12397,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::LadderExhausted(_) => Fault::Unreachable,
         Error::LocalBind { cause, .. } => Fault::of_bind(*cause),
         Error::TunnelLimit(_) => Fault::TunnelLimit,
+        Error::RoomNotSynced => Fault::RoomNotSynced,
         Error::Profile("no identity in this profile") => Fault::NoIdentity,
         Error::Profile("identity already exists in this profile") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,

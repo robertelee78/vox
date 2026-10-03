@@ -557,7 +557,7 @@ fn a_lock_waits_for_a_room_seal_and_leaves_no_passphrase() {
     let before = scanner.scan();
     let mut create = start(
         &bob,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         &identity,
         Some(&format!("{roompass}\n")),
     );
@@ -571,7 +571,14 @@ fn a_lock_waits_for_a_room_seal_and_leaves_no_passphrase() {
     let probe_at = Instant::now();
     let mut probe = start(
         &bob,
-        &["room", "create", "--name", "probe"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "probe",
+        ],
         &identity,
         Some("a probe passphrase\n"),
     );
@@ -640,7 +647,7 @@ fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
         tui.unlocked();
         let mut create = start(
             &bob,
-            &["room", "create", "--name", "r"],
+            &["room", "create", "--passphrase-file", "-", "--name", "r"],
             &identity,
             Some(&format!("{roompass}\n")),
         );
@@ -743,7 +750,7 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     }
     let mut create = start(
         &alice,
-        &["room", "create", "--name", "team"],
+        &["room", "create", "--passphrase-file", "-", "--name", "team"],
         &alice_id,
         Some(&format!("{roompass}\n")),
     );
@@ -780,7 +787,15 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     let before = scanner.scan();
     let mut join = start(
         &bob,
-        &["room", "join", &link, "--name", "team"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "team",
+        ],
         &identity,
         Some(&format!("{roompass}\n")),
     );
@@ -793,7 +808,14 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     let probe_at = Instant::now();
     let mut probe = start(
         &bob,
-        &["room", "create", "--name", "probe"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "probe",
+        ],
         &identity,
         Some("a probe passphrase\n"),
     );

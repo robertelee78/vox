@@ -68,7 +68,9 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
-rustix.workspace = true
+# `vox daemon` asks for its passphrase with echo off and the terminal otherwise as it was
+# (V210-153): `termios`.
+rustix = { workspace = true, features = ["termios"] }
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
 

@@ -104,6 +104,13 @@ impl PendingConsents {
         self.entries.len() != before
     }
 
+    /// This node left `channel_id`: forget every pending consent in it (V210-164).
+    pub fn forget_room(&mut self, channel_id: &Digest32) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|(room, _), _| room != channel_id);
+        self.entries.len() != before
+    }
+
     /// Canonical CBOR body: `[version, [[room, member, skdm], ..]]`. It holds every SKDM, so it
     /// is zeroized when dropped.
     #[must_use]

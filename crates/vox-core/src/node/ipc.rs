@@ -184,6 +184,8 @@ const T_PUBLISH_REFUSED: u64 = 1717;
 const T_PUBLISH_CURED: u64 = 2091;
 /// `NodeEvent::ConnectionNote` (#229's diagnostics). Additive, beside `T_PUBLISH_CURED`.
 const T_CONNECTION_NOTE: u64 = 2092;
+/// `NodeEvent::NodeNote` (V210-167). Additive, away from the tags beside it.
+const T_NODE_NOTE: u64 = 2392;
 /// `NodeEvent::HandshakesQueued` (V210-86). Additive, away from the tags beside it.
 const T_HANDSHAKES_QUEUED: u64 = 2186;
 /// `NodeEvent::AddressWithheld` (V210-96). Additive, away from the sequential range and the tags
@@ -252,9 +254,10 @@ const T_INVITE: u64 = 13;
 // A person setting up two agents hit "Database already open. Cannot acquire lock." on the
 // one command they could not skip.
 //
-// So the door opens only for someone who can prove they hold the identity passphrase,
-// which the operator does and the agent does not. The socket's file mode is still the
-// outer boundary; this is the inner one.
+// So the keyring is reachable here. The socket's file mode is the boundary: whoever runs as
+// this user is this user. A change needs the identity passphrase once 30 minutes have passed
+// since it was last entered, which the node decides for every client alike (V210-159); a read
+// needs none (V210-165).
 const T_TRUST: u64 = 14;
 const T_UNTRUST: u64 = 15;
 const T_TRUST_LIST: u64 = 16;
@@ -268,6 +271,9 @@ const T_PING: u64 = 17;
 const T_STRUCTURED: u64 = 120;
 const T_FIND: u64 = 121;
 const T_COUNT_REQ: u64 = 122;
+// V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
+// far from the others, like V210-120's.
+const T_LEAVE: u64 = 164;
 /// [`Frame::Count`] (V210-120), in the frame and event tag space, far from the others.
 const T_COUNT: u64 = 1200;
 // The services a room offers (V030-24): `vox service list` with a daemon running. `add` and
@@ -387,25 +393,34 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
-    /// Add an identity to the trust keyring. Requires the identity passphrase.
+    /// Leave a room (V210-164): the node says so in the room, and removes it once another
+    /// member has that. Answers [`Frame::Ok`] once it is removed.
+    Leave {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Add an identity to the trust keyring. Needs the identity passphrase once more than
+    /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) have passed since it was
+    /// last entered (V210-159).
     Trust {
         /// Who to trust, as a full fingerprint.
         target: Digest32,
         /// The petname to file it under.
         petname: String,
-        /// The identity passphrase, proving this is the operator and not an agent.
+        /// The identity passphrase, or empty for none: within the window none is needed.
         identity_passphrase: String,
     },
-    /// Remove an identity from the trust keyring. Requires the identity passphrase.
+    /// Remove an identity from the trust keyring. Needs the passphrase as [`Request::Trust`] does.
     Untrust {
         /// Who to stop trusting.
         target: Digest32,
-        /// The identity passphrase.
+        /// The identity passphrase, or empty for none.
         identity_passphrase: String,
     },
-    /// Read the trust keyring. Requires the identity passphrase.
+    /// Read the trust keyring: who this node trusts and the name it gave each. A read, so the
+    /// node checks no passphrase.
     TrustList {
-        /// The identity passphrase.
+        /// Carried on the wire and not checked.
         identity_passphrase: String,
         /// The last fingerprint of the previous page, or `None` for the first.
         after: Option<Digest32>,
@@ -578,6 +593,9 @@ impl Request {
             }
             Request::Invite { channel_id } => {
                 e.array(2).uint(T_INVITE).bytes(channel_id);
+            }
+            Request::Leave { channel_id } => {
+                e.array(2).uint(T_LEAVE).bytes(channel_id);
             }
             Request::Trust {
                 target,
@@ -850,6 +868,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
+            }
+            (T_LEAVE, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Leave { channel_id })
             }
             _ => Err(Error::UnknownIpcRequest),
         }
@@ -1160,6 +1184,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         }
         NodeEvent::ConnectionNote { peer, note } => {
             e.array(3).uint(T_CONNECTION_NOTE).bytes(peer).text(note);
+        }
+        NodeEvent::NodeNote { note } => {
+            e.array(2).uint(T_NODE_NOTE).text(note);
         }
         NodeEvent::HandshakesQueued {
             waited,
@@ -1545,6 +1572,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             note: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc connection note"))?
+                .to_owned(),
+        },
+        (T_NODE_NOTE, 2) => NodeEvent::NodeNote {
+            note: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc node note"))?
                 .to_owned(),
         },
         (T_PUBLISH_CURED, 3) => NodeEvent::PublishCured {
@@ -2066,14 +2099,8 @@ async fn serve_requests(
     }
 }
 
-/// Prove the caller holds the identity passphrase, or say why not.
-///
-/// ADR-020 §7 keeps trust-keyring edits off this socket, on the grounds that an agent
-/// session runs model-authored code and the socket is reachable by anything running as
-/// the user. That reasoning is kept; this is the exception that does not weaken it. The
-/// operator knows the identity passphrase and an agent does not, so requiring it here
-/// lets the person who owns the profile use their own daemon without handing the agent
-/// the ability to decide who may read them.
+/// Prove the caller holds the identity passphrase, or say why not. A right one is an entry of it,
+/// so the node's keyring window starts again (V210-159).
 async fn verify_operator(
     handle: &NodeHandle,
     passphrase: String,
@@ -2099,6 +2126,15 @@ async fn verify_operator(
             reason: other.to_string(),
         }),
     }
+}
+
+/// [`verify_operator`] for a passphrase that was given; nothing to check for one that was not
+/// (the empty string), and the node's keyring window decides.
+async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
+    if passphrase.is_empty() {
+        return Ok(());
+    }
+    verify_operator(handle, passphrase).await
 }
 
 /// One page of a collection reply: entries in id order, strictly after `after`, at most
@@ -2156,14 +2192,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        // The keyring, gated on the identity passphrase. The check is first and the
-        // command is only issued if it passes, so a caller who cannot prove they are the
-        // operator changes nothing and learns nothing.
+        // A keyring change (V210-159). A passphrase given is checked first, and the command is
+        // only issued if it passes; a right one is also an entry of it, so the window starts
+        // again. None given is the empty string, and the node then allows the change only
+        // within its window since the passphrase was last entered, and otherwise refuses it
+        // with `Fault::PassphraseNeeded`, which the client answers by asking for it.
         Request::Trust {
             target,
             petname,
             identity_passphrase,
-        } => match verify_operator(handle, identity_passphrase).await {
+        } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
                 .apply(crate::node::api::NodeCommand::Trust {
@@ -2181,7 +2219,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::Untrust {
             target,
             identity_passphrase,
-        } => match verify_operator(handle, identity_passphrase).await {
+        } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
                 .apply(crate::node::api::NodeCommand::Untrust {
@@ -2195,26 +2233,39 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
-        Request::TrustList {
-            identity_passphrase,
-            after,
-        } => match verify_operator(handle, identity_passphrase).await {
-            Err(f) => f,
-            Ok(()) => Frame::Trusted {
-                entries: page(handle.view().trusted, after, |(id, petname)| {
-                    (*id, petname.len())
-                }),
-            },
+        // **A read, so no passphrase** (V210-162, V210-165): the names this node gave its
+        // members are how every surface on this account names an author, the agent drain
+        // included, and the OS account is the boundary. Only a change to the keyring is gated.
+        Request::TrustList { after, .. } => Frame::Trusted {
+            entries: page(handle.view().trusted, after, |(id, petname)| {
+                (*id, petname.len())
+            }),
         },
         Request::Post { channel_id, text } => {
-            match handle
-                .apply(crate::node::api::NodeCommand::SendText { channel_id, text })
-                .await
-            {
-                crate::node::api::Outcome::Done => Frame::Ok,
-                other => Frame::Error {
-                    reason: other.to_string(),
-                },
+            // A room just joined is written to once its first sync with another member has ended
+            // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
+            // that rather than failing.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match handle
+                    .apply(crate::node::api::NodeCommand::SendText {
+                        channel_id,
+                        text: text.clone(),
+                    })
+                    .await
+                {
+                    crate::node::api::Outcome::Done => break Frame::Ok,
+                    crate::node::api::Outcome::Failed(crate::node::api::Fault::RoomNotSynced)
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    other => {
+                        break Frame::Error {
+                            reason: other.to_string(),
+                        }
+                    }
+                }
             }
         }
         Request::Read {
@@ -2578,6 +2629,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 local_name,
                 passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
             })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
+        Request::Leave { channel_id } => match handle
+            .apply(crate::node::api::NodeCommand::LeaveChannel { channel_id })
             .await
         {
             crate::node::api::Outcome::Done => Frame::Ok,

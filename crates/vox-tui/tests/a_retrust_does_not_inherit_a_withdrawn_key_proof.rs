@@ -195,7 +195,7 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
     }
     let (ok, _, err) = vox(
         alice_dir,
-        &["room", "create", "--name", "late"],
+        &["room", "create", "--passphrase-file", "-", "--name", "late"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): room create failed: {err}");
@@ -210,7 +210,15 @@ fn a_retrust_does_not_inherit_a_withdrawn_key() {
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,
-            &["room", "join", link.trim(), "--name", "late"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "late",
+            ],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "PRODUCT (staging): a join failed: {err}");

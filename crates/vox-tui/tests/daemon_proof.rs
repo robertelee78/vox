@@ -335,7 +335,14 @@ fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
     let (ok, _, err) = vox_in(
         data,
         cfg,
-        &["room", "create", "--name", "mission"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): `vox room create` failed: {err}");

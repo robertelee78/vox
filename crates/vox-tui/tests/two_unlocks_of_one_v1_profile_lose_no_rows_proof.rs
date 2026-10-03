@@ -178,7 +178,7 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
     ok(
         exe,
         host,
-        &["room", "create", "--name", name],
+        &["room", "create", "--passphrase-file", "-", "--name", name],
         Some("room pass"),
     );
     let list = ok(exe, host, &["room", "list"], None);
@@ -192,7 +192,15 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
     ok(
         exe,
         guest,
-        &["room", "join", link.trim(), "--name", name],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            name,
+        ],
         Some("room pass"),
     );
     room

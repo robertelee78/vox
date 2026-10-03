@@ -381,7 +381,19 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let (room, link) = create_room(&victim_dir, "team", ROOM_PASS);
     for (name, dir) in [("bravo", &bravo_dir), ("charlie", &charlie_dir)] {
         let d = daemon(name, dir, free_port(), &spec, &pass_file);
-        let (ok, out, err) = vox_in(dir, &["room", "join", &link, "--name", "team"], ROOM_PASS);
+        let (ok, out, err) = vox_in(
+            dir,
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &link,
+                "--name",
+                "team",
+            ],
+            ROOM_PASS,
+        );
         assert!(
             ok,
             "PRODUCT (staging): {name} could not join the room: {out}{err}"

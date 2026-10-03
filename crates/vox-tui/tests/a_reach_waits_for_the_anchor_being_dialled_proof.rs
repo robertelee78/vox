@@ -18,10 +18,20 @@
 //! was connected. Neither: its anchor answered first, nothing was staged, `CANNOT MEASURE`. Then the
 //! claim: it reached the host on its **first attempt**, carried an echo, and never said "no peer is
 //! connected to carry a circuit". The path is asserted relayed (the forward's `still relayed`).
+//! And the time: once the anchor answered, the circuit was asked at once — under [`ASK_WITHIN`] into
+//! the reach, by the forward's own "asking … for a circuit N ms into the reach" — not after the
+//! direct head start, since there was no direct rung to give it to.
 //!
-//! **The mutation that must turn it red:** delete the wait for a dial under way in
+//! **Why no 150 ms bound here.** Every datagram to the anchor is held [`ANCHOR_DELAY`], so the
+//! anchor handshake and the circuit alone take several hundred ms. V210-57's 150 ms restart bound
+//! is proved by its own proof, `a_first_relayed_connection_is_under_two_seconds_proof`, as a caller;
+//! this proof shows the two costs the product controls are gone: the forward's 500 ms retry, and
+//! the head start sat out with nothing direct to wait for.
+//!
+//! **The mutations that must turn it red, as PRODUCT:** delete the wait for a dial under way in
 //! `NodeNet::reach_ladder` — the first attempt fails with nobody to carry it, and the forward reaches
-//! the host on its second: red, as PRODUCT.
+//! the host on its second; or make a circuit with no direct rung sit out the head start
+//! (`direct_failed` starting `false`) — the circuit is asked about 500 ms into the reach.
 
 #![cfg(unix)]
 
@@ -50,6 +60,9 @@ use world::round_trip;
 /// How long the port forward holds each datagram from the guest to the anchor: long enough that
 /// the forward's anchor handshake is still under way when its first reach begins.
 const ANCHOR_DELAY: Duration = Duration::from_millis(100);
+/// How soon, once the anchor answered, a reach with no direct rung must ask it for a circuit. The
+/// head start it must not sit out is 500 ms; a prompt ask is a few ms.
+const ASK_WITHIN: u128 = 50;
 /// What a reach says when it fails for want of a helper.
 const NOBODY: &str = "no peer is connected to carry a circuit";
 
@@ -127,5 +140,29 @@ fn a_forward_whose_anchor_is_still_being_dialled_reaches_on_its_first_attempt() 
         "PRODUCT: the forward's first reach found nobody to carry its circuit while its anchor was \
          still being dialled, and failed (\"{NOBODY}\") instead of waiting for it: {reached}\n\
          forward:\n{said}"
+    );
+    let asked = said
+        .lines()
+        .find_map(|l| {
+            let rest = l.split(" for a circuit ").nth(1)?;
+            let ms = rest.split(" ms into the reach").next()?;
+            ms.trim().parse::<u128>().ok().map(|ms| (ms, l.to_owned()))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: the forward reached the host relayed but never said when it asked for its \
+                 circuit.\nforward:\n{said}"
+            )
+        });
+    eprintln!(
+        "[proof] the circuit was asked {} ms into the reach",
+        asked.0
+    );
+    assert!(
+        asked.0 <= ASK_WITHIN,
+        "PRODUCT: with no direct rung, the reach sat out the direct head start before asking the \
+         anchor for its circuit ({} ms, over {ASK_WITHIN} ms): {}\nforward:\n{said}",
+        asked.0,
+        asked.1
     );
 }
