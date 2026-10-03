@@ -63,7 +63,7 @@ The persistence engine is **redb**; member prekey bundles are a **new rendezvous
   - start the creator's first sender chain;
   - append the genesis and the creator's governance entries;
   - publish the room's records (NR-23).
-- **NR-17.** Opening a room MUST require the unlocked identity **and** the room passphrase. A node MUST retain a room's passphrase while the room is open, because answering a join needs it (ADR-005).
+- **NR-17.** Opening a room MUST require the unlocked identity **and** the room passphrase, which MAY be empty (ADR-005 J-2). A node MUST retain a room's passphrase while the room is open, because answering a join needs it (ADR-005).
 - **NR-17a.** A room's local name MUST live only in its sealed manifest, so a closed room is listed by id only.
 - **NR-17b.** A text message's body MUST NOT exceed `MAX_TEXT_LEN` (64 KiB).
 - **NR-17c.** An entry MUST be classified before it is stored: a struct-tagged governance frame is governance, a `vox/group-msg/v1` sender-key message is content, and anything else MUST be refused (`classify_payload`).

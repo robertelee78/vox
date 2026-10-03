@@ -225,7 +225,7 @@ connection, bound to the TLS session by its exporter.
     - The rate limit MUST be 8 `ASK`s per second per source IP address, with a burst of 16. An `ASK`
       over the limit MUST get the refusal (requirement 32).
     - Pre-identity connections MUST share the accept gate's cap of 64 handshakes in flight
-      (`HANDSHAKES_IN_FLIGHT`, requirement 20) and MUST time out after 5 s.
+      (`HANDSHAKES_IN_FLIGHT` = 64, ADR-017 14.1) and MUST time out after 5 s.
     - A node's long-term key signs once per accepted connection. A detaching node's signer MUST be
       unregistered from the exchange before its keys are wiped (ADR-026 L-3).
 35. **After the exchange.** The listener MUST apply admission (trust, join gate; ADR-016) as the

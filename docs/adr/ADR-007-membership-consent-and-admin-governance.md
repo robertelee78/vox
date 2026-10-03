@@ -4,7 +4,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status:** accepted. Built in `crates/vox-core/src/governance/` (M6), `node::channel`, `node::trust` and
 `node::actor` (ADR-016 M14.5, ADR-017 M17.6, M17.14, M18.1, ADR-020 M19.2), except:
-- The strict member cap (G-22) is not built: V030-30 (#366).
+- Admission once every online member agrees (G-22) is not built: V030-30 (#366). The cap itself is built.
 - G-10's golden-vector suite does not exist on this tree, and the known gaps listed at the end are open.
 
 **Date:** 2026-06-19
