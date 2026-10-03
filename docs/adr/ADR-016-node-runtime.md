@@ -2,7 +2,7 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: accepted. M13, M14, M15, M15.1–M15.2c and M18.1 are built in `crates/vox-core/src/node/` and proven through the shipped `vox` binary in `crates/vox-tui/tests/`. Requirements marked **planned** are not built; §"Open defects and limits" lists what is known wrong or missing.
+**Status**: accepted. M13, M14, M15, M15.1–M15.2c and M18.1 are built in `crates/vox-core/src/node/` and proven through the shipped `vox` binary in `crates/vox-tui/tests/`. Requirements marked **planned** are not built; §"Open defects and limits" lists what is known wrong or missing. **Decided 2026-10-03, not built (#397):** the daemon/node split of ADR-026, which amends NR-P2, NR-3, NR-4, NR-10, NR-11, NR-13, NR-15 and NR-45 as each says; until it is built the code does what those requirements say first.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: runtime, node, integration, persistence, rendezvous, sync, headless
 
@@ -17,7 +17,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 ### Principles
 
 - **NR-P1.** No native code enters the tree (ADR-001 #10, Rust-maximal).
-- **NR-P2.** A headless node MUST NOT be remote-controlled. `vox node` serves no control socket.
+- **NR-P2.** A headless node MUST NOT be remote-controlled. `vox node` serves no control socket. *Decided, not built (ADR-026):* an anchor is a daemon with one headless node in the anchor role; the daemon's control socket serves the account's own clients only (ADR-026 C-1), and the headless node accepts no command that needs a secret.
 
 ### The `Node`
 
@@ -27,8 +27,8 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
   - network tasks hand it parsed, verified wire structures, and the actor makes every admission, acceptance and consent decision.
 
   `NodeView`, `NodeEvent` and `Outcome`/`Fault` MUST carry no keys, SKDMs, SEKs or `self_seed`. `Outcome` and `Fault` MUST be closed `Copy` types with no free text. A passphrase MUST enter as a zeroizing `Secret`.
-- **NR-3.** The client MUST embed the node in its own process: the TUI runs it in-process (ADR-015), and the macOS client is to (ADR-014).
-- **NR-4.** `vox node`, the headless node, MUST be constructed without a vault (`NodeConfig::headless`). It has a transport identity in a `0600` file of two seeds, rebuilt identically at every start so peers keep pinning it, and no profile, SEK, sender keys or pairwise sessions. The absence MUST be structural: the secret-bearing fields are `Option`s the headless constructor leaves `None`. A headless node MUST NOT be able to decrypt (ADR-015 requirement 1.2).
+- **NR-3.** The client MUST embed the node in its own process: the TUI runs it in-process (ADR-015), and the macOS client is to (ADR-014). *Decided, not built (ADR-026 S-3, S-4):* no client or verb hosts a node; nodes run in the account's one daemon, and the TUI and CLI are its clients. (The macOS app's embedding is ADR-014's question.)
+- **NR-4.** `vox node`, the headless node, MUST be constructed without a vault (`NodeConfig::headless`). It has a transport identity in a `0600` file of two seeds, rebuilt identically at every start so peers keep pinning it, and no profile, SEK, sender keys or pairwise sessions. The absence MUST be structural: the secret-bearing fields are `Option`s the headless constructor leaves `None`. A headless node MUST NOT be able to decrypt (ADR-015 requirement 1.2). *Decided, not built (ADR-026 N-5, F-3):* the headless node is attached to a daemon in the anchor role, its key lives in `nodes/<name>/node-identity.key`, and the TLS leaf no longer carries its identity (ADR-011 requirement 27).
 - **NR-5.** Commands MUST be processed in order, each answered on its own `oneshot`.
 - **NR-5a.** The actor MUST tick once a second (`TICK`). "Within one tick" in this ADR means within that second.
 
@@ -41,17 +41,17 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
   - A newer or unreadable schema MUST be `Error::Storage`, never a panic.
 - **NR-8.** A log append, its plaintext row and its chain-state advance MUST commit in one write transaction. A dropped batch writes nothing. A failed commit MUST poison the room until it is reopened, because reusing a sender-key iteration for different plaintext is key/nonce reuse.
 - **NR-9.** On open, the node MUST rebuild a room's DAG from its log segments through `Dag::accept`, because the store is a cache of verified entries and is never trusted as such. It MUST accept a cache row only if its entry is in the DAG.
-- **NR-10.** Paths MUST follow ADR-015 requirement 12.1 and its precedence: explicit, then `VOX_DATA_DIR`/`VOX_CONFIG_DIR`, then `XDG_*`, then the platform default. Data lives in `<data>/vox/<profile>/`. Files MUST be `0600` and directories `0700` (Unix). A profile name MUST be a single path component.
-- **NR-11.** A profile holds one identity, and a second create MUST be refused. An existing profile MUST open locked. Unlock MUST refuse a vault whose identity disagrees with the store's recorded fingerprint.
+- **NR-10.** Paths MUST follow ADR-015 requirement 12.1 and its precedence: explicit, then `VOX_DATA_DIR`/`VOX_CONFIG_DIR`, then `XDG_*`, then the platform default. Data lives in `<data>/vox/<profile>/`. Files MUST be `0600` and directories `0700` (Unix). A profile name MUST be a single path component. *Decided, not built (ADR-026 F-1–F-3):* a node lives in `<data root>/nodes/<name>/` with its own config, the daemon in `<data root>/.daemon/`, and existing profiles migrate on the new daemon's first start.
+- **NR-11.** A profile holds one identity (under ADR-026, a node directory holds one), and a second create MUST be refused. An existing profile MUST open locked. Unlock MUST refuse a vault whose identity disagrees with the store's recorded fingerprint.
 - **NR-12. Planned.** The node is to reclaim space with `redb` compaction after pruning. `Profile::compact_store` exists, but nothing calls it.
 
 ### App-lock and signals
 
-- **NR-13.** `Lock` MUST drop every SEK, the signer, the prekey ring and the pairwise and sender state, and close the network. A lock MUST be answered once it has settled (V210-94). The actor MUST keep answering other commands while it settles.
+- **NR-13.** `Lock` MUST drop every SEK, the signer, the prekey ring and the pairwise and sender state, and close the network. *Decided, not built (ADR-026 D-5):* a lock closes only that node's connections; the daemon's endpoint and the other nodes stay up. A lock MUST be answered once it has settled (V210-94). The actor MUST keep answering other commands while it settles.
 - **NR-13a.** Dropping the last `NodeHandle` MUST lock the node exactly as `Lock` does, then end the actor.
 - **NR-13b.** The TUI MUST lock after `IDLE_LOCK_SECS` (5 minutes) without input (ADR-015).
 - **NR-14 (M15.2c).** A headless node MUST refuse `Lock`.
-- **NR-15.** `vox daemon`, `vox node` and every long-running verb MUST stop cleanly on SIGINT, SIGTERM, SIGHUP and SIGQUIT (V210-108).
+- **NR-15.** `vox daemon`, `vox node` and every long-running verb MUST stop cleanly on SIGINT, SIGTERM, SIGHUP and SIGQUIT (V210-108). *Decided, not built (ADR-026 S-1, L-7):* the daemon stops every node cleanly on those signals, and a foreground client whose daemon stops exits non-zero, saying so.
 
 ### Channel lifecycle
 
@@ -193,7 +193,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 
 ### The anchor
 
-- **NR-45 (M15.2b, ADR-023 decision 6).** An anchor MUST NOT keep pages of a room it is not a member of. It serves the board (genesis, address and bundle records) and bridges hosts that cannot otherwise reach each other (ADR-012). Segment kind codes `AnchorLog=6` and `AnchorMeta=7` stay reserved and MUST NOT be reused.
+- **NR-45 (M15.2b, ADR-023 decision 6).** An anchor MUST NOT keep pages of a room it is not a member of. It serves the board (genesis, address and bundle records) and bridges hosts that cannot otherwise reach each other (ADR-012). Segment kind codes `AnchorLog=6` and `AnchorMeta=7` stay reserved and MUST NOT be reused. *Decided, not built (ADR-026 N-5, ADR-012 N-45):* the anchor is a daemon with one headless node attached in the anchor role; the daemon executes relay and board service, governed per node.
   - After a restart, an anchor MUST republish the records on its board.
 - **NR-45a.** `vox node` MUST print the `<fingerprint>@<multiaddr>` a client gives as `--anchor`. `NodeView::anchoring` MUST report only the rooms it serves and how many members it knows of each.
 - **NR-46 (R45, M23.5).** An anchor started on a store written by an older release MUST delete the room pages it kept (`Store::delete_retired_anchor_pages`), with no migration and no copy kept. Proof: `crates/vox-tui/tests/an_upgraded_anchor_drops_the_pages_it_kept_proof.rs`.
@@ -246,7 +246,7 @@ Fixed since the old text, with evidence:
 
 ## Related ADRs
 
-Depends on ADR-001, ADR-002, ADR-003, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012, ADR-013, ADR-015, ADR-025. Enables ADR-014, ADR-017, ADR-020, ADR-023.
+Depends on ADR-001, ADR-002, ADR-003, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012, ADR-013, ADR-015, ADR-025. Amended by ADR-026 (the daemon and its nodes). Enables ADR-014, ADR-017, ADR-020, ADR-023.
 
 ## Engineering Mantra
 
