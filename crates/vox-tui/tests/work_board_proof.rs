@@ -120,9 +120,10 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
         !ok,
         "PRODUCT: a losing claim must fail, not succeed quietly: stdout={out:?}"
     );
+    // Bob names alice by his own name for her, the one `vox trust add --name` gave (V210-162).
     assert!(
-        err.contains("is held by") && err.contains(&alice_short),
-        "PRODUCT: the loser must be told who holds it: {err:?}"
+        err.contains(&format!("is held by {}/", alice.name)),
+        "PRODUCT: the loser must be told who holds it, by its name for them: {err:?}"
     );
 
     // ---- (3) the board agrees from both sides, and each knows its own ----

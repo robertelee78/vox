@@ -90,13 +90,15 @@ fn of_two_claims_made_at_once_exactly_one_is_told_it_holds_the_item() {
             outs[w]
         );
         let told = &outs[l].stderr;
-        let winner_id: String = winner.b32().chars().take(26).collect();
+        // The loser names the winner by its own name for it, the one `vox trust add --name`
+        // gave (V210-162), not by a fingerprint.
+        let winner_id = format!("went to {}/", winner.name);
         assert!(
             outs[l].code == Some(1)
                 && told.contains(&winner_id)
                 && told.contains("you did not get it"),
-            "PRODUCT: the losing claim ({}) must exit 1 naming the winner {} ({winner_id}) at once: \
-             {:?}",
+            "PRODUCT: the losing claim ({}) must exit 1 naming the winner {} ({winner_id:?}) at \
+             once: {:?}",
             loser.name,
             winner.name,
             outs[l]
