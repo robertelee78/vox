@@ -513,11 +513,31 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
             .unwrap_or_else(|e| panic!("PRODUCT: nothing came back through the forward: {e}"));
         line
     };
-    let (three_ok, three_out, three_err) = vox(
+    // Spawned, not waited for: a form that is accepted forwards until stopped, so it is judged by
+    // whether it exits refused within a bound, and by what it said.
+    let mut three = VoxProc::spawn(
+        "bob three-word forward",
         &bob_dir,
-        &["forward", &room, &alice_fp, "nas-ssh", "127.0.0.1:0"],
-        None,
+        &args(&["forward", &room, &alice_fp, "nas-ssh", "127.0.0.1:0"]),
     );
+    let three_deadline = Instant::now() + Duration::from_secs(15);
+    let three_status = loop {
+        match three.child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if Instant::now() < three_deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => break None,
+            Err(e) => panic!("APPARATUS: wait for the three-word forward: {e}"),
+        }
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let three_said = three.transcript();
+    let three_ok = three_status.is_none_or(|st| st.success())
+        || three_said.contains("vox: forwarding")
+        || three_said.contains('→');
+    let (three_out, three_err) = (three_said, String::new());
+    drop(three);
     eprintln!(
         "forward by address: {bound_line:?} answered {forwarded:?}\nthree-word forward: \
          ok={three_ok} {three_out}{three_err}"
