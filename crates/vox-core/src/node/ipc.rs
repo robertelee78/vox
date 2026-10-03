@@ -2412,6 +2412,7 @@ pub const ACTOR_WITHIN: std::time::Duration = std::time::Duration::from_secs(60)
 /// (V210-83). A node that is merely slow at this request answers both, and is waited for.
 async fn while_answering<T>(
     path: &Path,
+    using: Option<&crate::node::paths::NodeName>,
     exchange: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::pin!(exchange);
@@ -2422,15 +2423,45 @@ async fn while_answering<T>(
             out = &mut exchange => return out,
             alive = async {
                 tokio::time::sleep(ANSWER_WITHIN).await;
-                still_answering(path).await
+                still_answering(path, using).await
             } => alive?,
         }
     }
 }
 
 /// Whether the node at `path` greets a new connection and its actor answers a ping, or why not.
-async fn still_answering(path: &Path) -> Result<()> {
-    let mut probe = match IpcClient::open(path).await {
+///
+/// On the daemon's account socket (`using`, ADR-026 C-2) the probe opens with a `Use` of the same
+/// node that never attaches it: a node-level hello is not what a daemon greets with, so a probe
+/// that expected one failed every request that waited past [`ANSWER_WITHIN`] — a join, from the
+/// TUI — as "not a hello".
+async fn still_answering(path: &Path, using: Option<&crate::node::paths::NodeName>) -> Result<()> {
+    let opened = match using {
+        Some(node) => match IpcClient::open_node(
+            path,
+            crate::node::daemonipc::UseNode {
+                node: node.clone(),
+                attach: crate::node::daemonipc::AttachMode::No,
+                passphrase: None,
+                anchors: Vec::new(),
+            },
+        )
+        .await
+        {
+            Ok(Ok(c)) => Ok(c),
+            // The node went while the request waited: that is the answer, said as the daemon
+            // says it.
+            Ok(Err(refusal)) => {
+                return Err(Error::Path {
+                    op: "ask the daemon",
+                    detail: refusal.to_string(),
+                })
+            }
+            Err(e) => Err(e),
+        },
+        None => IpcClient::open(path).await,
+    };
+    let mut probe = match opened {
         Ok(c) => c,
         Err(Error::Ipc(IpcHandshake::Silent { secs })) => {
             return Err(Error::Ipc(IpcHandshake::StoppedAnswering { secs }))
@@ -2712,6 +2743,12 @@ async fn serve_requests(
         // PRD-001 R35: `vox status`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
             crate::node::status::serve(&mut stream, handle).await?;
+            continue;
+        }
+        // ADR-026 C-7: what a client that draws the node's rooms needs, the TUI first. Answered,
+        // and the connection serves on.
+        if crate::node::snapshot::is_request(&body) {
+            write_frame(&mut stream, &crate::node::snapshot::answer(handle)).await?;
             continue;
         }
         // V030-11: `vox tunnel close`. The live tunnels are kept in this process, so it is
@@ -3844,6 +3881,9 @@ async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
 pub struct IpcClient {
     stream: UnixStream,
     me: Option<Digest32>,
+    /// The node this connection acts as on the daemon's account socket (ADR-026 C-2), or `None`
+    /// on a node's own socket.
+    using: Option<crate::node::paths::NodeName>,
     /// Where the node listens, so a request that waits can check it is still answering.
     path: PathBuf,
 }
@@ -3945,9 +3985,10 @@ impl IpcClient {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         match DaemonFrame::from_bytes(&answer)? {
-            DaemonFrame::Using { me, .. } => Ok(Ok(Self {
+            DaemonFrame::Using { node, me } => Ok(Ok(Self {
                 stream,
                 me,
+                using: Some(node),
                 path: path.to_owned(),
             })),
             DaemonFrame::Refused(r) => Ok(Err(r)),
@@ -3987,6 +4028,7 @@ impl IpcClient {
         Ok(Self {
             stream,
             me,
+            using: None,
             path: path.to_owned(),
         })
     }
@@ -4004,7 +4046,12 @@ impl IpcClient {
     /// whether it is still greeting and its actor still taking commands ([`ACTOR_WITHIN`]), and
     /// the request fails, naming which, once it is not.
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
-        let Self { stream, path, .. } = self;
+        let Self {
+            stream,
+            path,
+            using,
+            ..
+        } = self;
         let exchange = async {
             // Wiped once sent: it may carry a passphrase (V210-94).
             if let Err(e) = write_frame(stream, &zeroize::Zeroizing::new(req.to_bytes())).await {
@@ -4015,7 +4062,32 @@ impl IpcClient {
             };
             Frame::from_bytes(&body)
         };
-        while_answering(path, exchange).await
+        while_answering(path, using.as_ref(), exchange).await
+    }
+
+    /// Send one request body this module has no [`Request`] for — a status, a tunnel close, a
+    /// snapshot ([`crate::node::snapshot`]) — and return the one reply body, bounded as
+    /// [`IpcClient::request`] is.
+    ///
+    /// # Errors
+    /// If the node cannot be reached, or hangs up before it answers.
+    pub async fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>> {
+        let Self {
+            stream,
+            path,
+            using,
+            ..
+        } = self;
+        let exchange = async {
+            if let Err(e) = write_frame(stream, body).await {
+                return Err(named(path, e).await);
+            }
+            match read_frame(stream).await? {
+                Some(reply) => Ok(reply),
+                None => Err(hung_up(path).await),
+            }
+        };
+        while_answering(path, using.as_ref(), exchange).await
     }
 
     /// Every row after `since`, however many replies that takes — as one
