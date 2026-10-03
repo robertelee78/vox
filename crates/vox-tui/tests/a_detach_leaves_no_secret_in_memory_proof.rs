@@ -420,10 +420,10 @@ impl Account {
         }
     }
 
-    /// Whether `vox node list` says bob is attached.
-    fn bob_attached(&self) -> bool {
+    /// Whether `vox node list` says bob is detached: not attached, attaching or detaching.
+    fn bob_detached(&self) -> bool {
         let (ok, said) = run(&self.dir, "keeper", &["node", "list"]);
-        ok && said.lines().any(|l| l.starts_with("bob attached"))
+        ok && said.lines().any(|l| l.starts_with("bob detached"))
     }
 
     /// Start `vox node detach bob`.
@@ -788,12 +788,12 @@ fn a_tui_gone_mid_attach_leaves_no_passphrase_once_its_node_detaches() {
     judge("reopen", "daemon", &before, &during, &after, took);
 }
 
-/// Wait until `vox node list` says bob is not attached, within [`SHOWS_UP`] plus the held delay:
+/// Wait until `vox node list` says bob is detached, within [`SHOWS_UP`] plus the held delay:
 /// how long that took. `PRODUCT` if it never does — the TUI was his node's last holder (L-3).
 fn wait_detached(account: &Account, after: &str) -> Duration {
     let t0 = Instant::now();
     let bound = SHOWS_UP + Duration::from_millis(DELAY_MS.parse().staged());
-    while account.bob_attached() {
+    while !account.bob_detached() {
         assert!(
             t0.elapsed() < bound,
             "PRODUCT: bob's node was still attached {bound:?} after {after}; the TUI was its last \
