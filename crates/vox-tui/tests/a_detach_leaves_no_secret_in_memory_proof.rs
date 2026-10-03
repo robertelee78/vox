@@ -26,7 +26,7 @@
 //! scan sees it at all), detach bob's node, and scan again once the detach is done.
 //!
 //! - **seal:** `vox room create`, the room passphrase; detached with `vox node detach bob`;
-//! - **check:** `vox trust list`, which sends the identity passphrase for the node to check;
+//! - **check:** `vox trust add`, which sends the identity passphrase for the node to check;
 //! - **reopen:** bob's TUI attaches a node with a remembered room, and is stopped with SIGHUP while
 //!   that room reopens: the TUI was the node's last holder, so the node detaches once its attach is
 //!   done (L-3); the room passphrase;
@@ -347,11 +347,14 @@ impl Scanner {
 struct Account {
     dir: PathBuf,
     identity: String,
+    /// `keeper`'s fingerprint, as `vox node create` printed it: someone for bob to trust.
+    keeper: String,
 }
 
 impl Account {
     fn new(dir: PathBuf, identity: &str) -> Self {
         std::fs::create_dir_all(dir.join("cfg")).staged();
+        let mut keeper = String::new();
         for (node, pass) in [("keeper", ""), ("bob", identity)] {
             let file = dir.join(format!("{node}.pass"));
             std::fs::write(&file, format!("{pass}\n")).staged();
@@ -372,10 +375,22 @@ impl Account {
                 ok,
                 "PRODUCT (staging): `vox node create {node}` made no node to stage with: {said}"
             );
+            if node == "keeper" {
+                keeper = said
+                    .split_whitespace()
+                    .find(|w| w.len() == 52)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "PRODUCT (staging): `vox node create` printed no fingerprint: {said}"
+                        )
+                    })
+                    .to_owned();
+            }
         }
         Self {
             dir,
             identity: identity.to_owned(),
+            keeper,
         }
     }
 
@@ -506,10 +521,15 @@ impl Tui {
         );
     }
 
-    /// Submit the passphrase typed at the attach prompt, and wait until the node shows attached.
-    fn attached(&mut self) {
+    /// Submit the passphrase typed at the attach prompt.
+    fn submit(&mut self) {
         self.typed();
         std::fs::write(self.cues.join("submit"), b"").staged();
+    }
+
+    /// Submit the passphrase typed at the attach prompt, and wait until the node shows attached.
+    fn attached(&mut self) {
+        self.submit();
         if cue(&self.cues.join("attached"), Duration::from_secs(120)) {
             return;
         }
@@ -693,19 +713,24 @@ fn a_detach_waits_for_a_passphrase_check_and_leaves_no_passphrase() {
     let before = scanner.scan();
     let pass_file = tmp.path().join("idp");
     std::fs::write(&pass_file, format!("{identity}\n")).staged();
+    // A keyring change sends the identity passphrase for the node to check (V210-159); a read
+    // sends none (V210-165).
     let mut check = start(
         &account.dir,
         "bob",
         &[
             "trust",
-            "list",
+            "add",
+            &account.keeper,
+            "--name",
+            "keeper",
             "--identity-passphrase-file",
             pass_file.to_str().staged(),
         ],
         None,
     );
     let during = scanner.until_more("identity", before.of("identity"));
-    still_running(&mut check, "vox trust list");
+    still_running(&mut check, "vox trust add");
     let asked = Instant::now();
     let took = detached(account.detach_bob(), asked);
     let after = scanner.scan();
@@ -748,7 +773,9 @@ fn a_tui_gone_mid_attach_leaves_no_passphrase_once_its_node_detaches() {
     let _daemon = account.daemon(&daemon_env(&scanner.dir, true));
     let mut tui = Tui::start(&account, tmp.path().join("cues2"), "bob2", &[]);
     tui.started();
+    tui.typed();
     let before = scanner.scan();
+    tui.submit();
     let during = scanner.until_more("room", before.of("room"));
     assert!(
         !tui.cues.join("attached").exists(),
