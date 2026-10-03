@@ -167,7 +167,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
   - Records MUST be republished when discovery completes.
   - Mappings MUST be renewed at half the shortest granted lifetime.
   - A mapping a router grants only permanently MUST NOT be renewed, and MUST be deleted when the network stops.
-  - `--listen` MUST default to the wildcard.
+  - `--listen` MUST default to the wildcard. *Decided, not built (ADR-026 D-3):* the daemon owns the listen address; `--listen` on a client verb sets it only when that command starts the daemon, and a client warns when a running daemon listens elsewhere.
 - **NR-38.** Configured anchors (`--anchor <fp>@<multiaddr>`, repeatable, or `VOX_ANCHORS`, comma-separated) MUST be dialled pinned when the network starts, adopted as `Anchor`, and given every open room's records.
   - Anchors MUST be redialled from the tick (`ANCHOR_REDIAL_SECS`).
   - The anchors a room was joined through MUST be persisted with the room (`SEG_ANCHORS` = 4).

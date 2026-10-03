@@ -290,12 +290,12 @@ they are not a defence against one that lies.
   only authentication is the file mode: it MUST NOT be described as a security boundary (the OS
   account is the boundary). A request that changes the trust keyring MUST be gated as 3.1 says.
   *Decided, not built (ADR-026 C-1–C-3):* one socket per account, `<data root>/.daemon/vox.sock`,
-  peer-uid checked and never admitting uid 0; every request names its node or resolves it (named,
-  else the only attached node, else refuse).
+  peer-uid checked and never admitting uid 0. A client names its node once per connection with an
+  opening `Use { node }` frame, resolved as ADR-026 C-3 says.
 - **7.5** A cursor belongs to the reader of the log (§4, ADR-021 §7), not to the event transport.
 - **7.6** The protocol MUST be versioned (`PROTOCOL_VERSION`, now 8) and grow by additive requests.
-  *Decided, not built (ADR-026 C-4):* version 9 adds the node to every request, daemon requests and
-  daemon events (attach, detach). There is no lock or unlock (ADR-026 N-2).
+  *Decided, not built (ADR-026 C-2, C-4):* version 9 adds the per-connection `Use { node }` frame,
+  daemon requests and daemon events (attach, detach). There is no lock or unlock (ADR-026 N-2).
   The app API (`AppListen`, `AppAccept`, `AppOpen`; ADR-022 M22.5) rides the same socket.
 - **7.7 (PRD-001 R35, R38).** The socket MUST answer a status request (tag 2301) with the node's
   report as JSON: rooms with each member's last-seen and last-sync time and the room's last

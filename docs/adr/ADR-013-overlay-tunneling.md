@@ -35,7 +35,9 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
 ### Interface models
 
 - **T-1. Per-stream forward and SOCKS, primary.**
-  - A node MUST offer `vox forward`, which forwards one local port to one member's service, and
+  - A node MUST offer `vox forward`, which forwards one local port to one member's service named by
+    its `service.node.room.vox` address only (ADR-017 12.11; the separate room, member and service
+    arguments are to be removed), and
     `vox up`, a SOCKS5 proxy that resolves `.vox` names (ADR-017 decision 5). Only
     `service.node.room.vox` connects; `node.room.vox` and `room.vox` resolve to nothing (ADR-017).
   - Both MUST work without privilege.
@@ -181,7 +183,9 @@ proven when the decider runs `sudo scripts/family-lan-proof.sh`. Linux is not bu
     `sudo` (`getpeereid`), and accepts only a host in `100.64.0.0/10` and one in `fd00::/8`. It
     creates, addresses and routes the `utun`, and hands the descriptor to `vox lan up` (`SCM_RIGHTS`).
     It MUST keep nothing, open no profile and touch no network. Under ADR-026 it stays its own root
-    process and never uses the account's control socket, which does not admit uid 0 (ADR-026 S-5).
+    process and never uses the account's control socket, which does not admit uid 0. The daemon, as
+    the same uid, asks the helper for the device and runs the LAN; the user-side `vox lan up` is a
+    daemon client holding a session (ADR-026 S-5, L-7).
   - `vox lan up` MUST run as the person.
   - One `sudo vox lan up` that drops privileges MUST NOT be used: macOS keeps root's supplementary
     groups unless `setgroups` runs, and no safe binding offers it.
