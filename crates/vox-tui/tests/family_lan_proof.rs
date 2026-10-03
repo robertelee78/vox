@@ -922,7 +922,8 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
     let scraped = scrape(&at);
     let refused = scraped
         .lines()
-        .find_map(|l| l.strip_prefix("vox_app_streams_refused_total "))
+        // Labelled with the node it counts for (ADR-026 P-1): alice's profile, `default`.
+        .find_map(|l| l.strip_prefix("vox_app_streams_refused_total{node=\"default\"} "))
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or_else(|| {
             panic!("PRODUCT: alice's metrics at {at} have no vox_app_streams_refused_total:\n{scraped}")

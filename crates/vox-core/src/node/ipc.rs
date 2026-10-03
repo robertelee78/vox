@@ -69,7 +69,12 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// (`SyncFailed`, `RoomNotRemembered`) are additive tags.
 ///
 /// 8: a row says whether its body is **not received yet** (V030-10, [`MessageRow::owed`]).
-pub const PROTOCOL_VERSION: u64 = 8;
+///
+/// 9: one daemon serves every node of a data root on one socket (ADR-026 §4). A connection opens
+/// with the daemon's hello and the client's `Use` or daemon request
+/// ([`crate::node::daemonipc`]); a request in flight when its node detaches is answered
+/// [`Frame::NodeDetached`].
+pub const PROTOCOL_VERSION: u64 = 9;
 
 /// Largest frame accepted in either direction.
 ///
@@ -305,6 +310,9 @@ const T_COUNT_REQ: u64 = 122;
 // V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
 // far from the others, like V210-120's.
 const T_LEAVE: u64 = 164;
+/// ADR-026 C-7: open and close a room over the socket (protocol 9).
+const T_OPEN_ROOM: u64 = 4400;
+const T_CLOSE_ROOM: u64 = 4401;
 /// [`Frame::Count`] (V210-120), in the frame and event tag space, far from the others.
 const T_COUNT: u64 = 1200;
 // The services a room offers (V030-24): `vox service list` with a daemon running. `add` and
@@ -455,6 +463,19 @@ pub enum Request {
     /// credential: it names the room and where to look, carries no passphrase, and
     /// since M17.6 joining with it grants nothing at all.
     Invite {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Open a closed room with its passphrase (ADR-026 C-7): what the TUI, as a client of the
+    /// daemon, does when a person types a room's passphrase.
+    OpenRoom {
+        /// The room.
+        channel_id: Digest32,
+        /// The room's passphrase.
+        passphrase: String,
+    },
+    /// Close an open room, wiping its key (ADR-026 C-7).
+    CloseRoom {
         /// The room.
         channel_id: Digest32,
     },
@@ -744,6 +765,18 @@ impl Request {
             }
             Request::Invite { channel_id } => {
                 e.array(2).uint(T_INVITE).bytes(channel_id);
+            }
+            Request::OpenRoom {
+                channel_id,
+                passphrase,
+            } => {
+                e.array(3)
+                    .uint(T_OPEN_ROOM)
+                    .bytes(channel_id)
+                    .text(passphrase);
+            }
+            Request::CloseRoom { channel_id } => {
+                e.array(2).uint(T_CLOSE_ROOM).bytes(channel_id);
             }
             Request::Leave { channel_id } => {
                 e.array(2).uint(T_LEAVE).bytes(channel_id);
@@ -1137,6 +1170,22 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
             }
+            (T_OPEN_ROOM, 3) => {
+                let channel_id = digest(&mut d)?;
+                let mut passphrase = secret_text(&mut d, "ipc open room passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::OpenRoom {
+                    channel_id,
+                    passphrase: std::mem::take(&mut *passphrase),
+                })
+            }
+            (T_CLOSE_ROOM, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::CloseRoom { channel_id })
+            }
             (T_LEAVE | T_END, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
@@ -1211,6 +1260,13 @@ pub enum Frame {
     },
     /// A node event.
     Event(NodeEvent),
+    /// The node this connection acts as detached while a request was in flight, or before it was
+    /// made (ADR-026 L-3). Distinct from [`Frame::Error`]: it says the request was not done
+    /// because the node is gone, and a client MUST NOT attach the node again to retry it.
+    NodeDetached {
+        /// The node.
+        node: crate::node::daemonipc::NodeName,
+    },
     /// A request succeeded and carries nothing further.
     Ok,
     /// A request failed. The reason is for a person to read, not to branch on.
@@ -1320,6 +1376,11 @@ impl Frame {
                 e.array(2).uint(T_LAGGED).uint(*missed);
             }
             Frame::Event(ev) => encode_event(&mut e, ev),
+            Frame::NodeDetached { node } => {
+                e.array(2)
+                    .uint(crate::node::daemonipc::T_NODE_DETACHED)
+                    .text(node.as_str());
+            }
             Frame::Ok => {
                 e.array(1).uint(T_OK);
             }
@@ -1751,6 +1812,15 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 )
             };
             return Ok(Frame::Hello { protocol, me });
+        }
+        (crate::node::daemonipc::T_NODE_DETACHED, 2) => {
+            let node = d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc node detached"))?;
+            return Ok(Frame::NodeDetached {
+                node: crate::node::daemonipc::NodeName::parse(node)
+                    .map_err(|_| Error::MalformedIpc("ipc node detached name"))?,
+            });
         }
         (T_LAGGED, 2) => {
             return Ok(Frame::Lagged {
@@ -3362,6 +3432,26 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
+        Request::OpenRoom {
+            channel_id,
+            passphrase,
+        } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::OpenChannel {
+                    channel_id,
+                    passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+                },
+            )
+            .await
+        }
+        Request::CloseRoom { channel_id } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::CloseChannel { channel_id },
+            )
+            .await
+        }
         Request::Leave { channel_id } => {
             plain(
                 handle,
@@ -3619,6 +3709,35 @@ impl IpcClient {
     #[must_use]
     pub fn me(&self) -> Option<Digest32> {
         self.me
+    }
+
+    /// Connect to the daemon's socket at `path` and act as the node `using.node` (ADR-026 C-2):
+    /// read the daemon's hello, send the `Use`, and read its answer. `Ok(Err(refusal))` is the
+    /// daemon's answer, not a failure to reach it: a node not attached for a one-shot verb, a
+    /// wrong passphrase.
+    ///
+    /// # Errors
+    /// As [`crate::node::daemonipc::DaemonClient::open`], or if the daemon answers the `Use`
+    /// with anything but `Using` or `Refused`.
+    pub async fn open_node(
+        path: &Path,
+        using: crate::node::daemonipc::UseNode,
+    ) -> Result<std::result::Result<Self, crate::node::daemonipc::Refusal>> {
+        use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
+        let DaemonClient { mut stream, .. } = DaemonClient::open(path).await?;
+        write_frame(&mut stream, &Opening::Use(using).to_bytes()).await?;
+        let Some(answer) = read_frame(&mut stream).await? else {
+            return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
+        };
+        match DaemonFrame::from_bytes(&answer)? {
+            DaemonFrame::Using { me, .. } => Ok(Ok(Self {
+                stream,
+                me,
+                path: path.to_owned(),
+            })),
+            DaemonFrame::Refused(r) => Ok(Err(r)),
+            _ => Err(Error::Ipc(IpcHandshake::NotHello)),
+        }
     }
 
     /// Connect and check the protocol version, without subscribing.

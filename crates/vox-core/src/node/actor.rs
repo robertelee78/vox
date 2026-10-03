@@ -4024,6 +4024,38 @@ fn forget_consent_key(
     Ok(())
 }
 
+/// How a node's actor task ended (ADR-026 L-6), read from the handle
+/// [`Node::spawn_supervised`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorEnd {
+    /// It stopped on its own: `Shutdown`, or every handle to it dropped.
+    Stopped,
+    /// It panicked; the panic's message, when it carried one.
+    Panicked(String),
+    /// Its task was cancelled: the runtime is shutting down.
+    Cancelled,
+}
+
+impl ActorEnd {
+    /// Wait for `actor` to end, and say how.
+    pub async fn of(actor: tokio::task::JoinHandle<()>) -> Self {
+        match actor.await {
+            Ok(()) => Self::Stopped,
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                Self::Panicked(
+                    payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                        .unwrap_or_else(|| "(no message)".to_owned()),
+                )
+            }
+            Err(_) => Self::Cancelled,
+        }
+    }
+}
+
 impl Node {
     /// Spawn the node for `paths` on the current tokio runtime with the system
     /// clock and the production Argon2id profile. An existing identity is
@@ -4078,8 +4110,23 @@ impl Node {
     }
 
     /// Spawn the node with a full [`NodeConfig`]: the one constructor every other
-    /// one is a shorthand for.
+    /// one is a shorthand for. The actor's task is not watched; a host that must notice its
+    /// node's end uses [`Node::spawn_supervised`].
     pub fn spawn_config(paths: Paths, cfg: NodeConfig) -> crate::error::Result<NodeHandle> {
+        Self::spawn_supervised(paths, cfg).map(|(handle, _actor)| handle)
+    }
+
+    /// [`Node::spawn_config`], also returning the actor's task (ADR-026 L-6).
+    ///
+    /// **A node's panic must not vanish.** The actor runs as its own task; tokio catches a panic
+    /// in it and, with the handle dropped, nobody hears of it: every later request fails with the
+    /// node's queue closed and nothing says why. The host awaits this handle, and a
+    /// `JoinError::is_panic` there is that node's end, to report and detach. The task ends with
+    /// `Ok(())` when the actor stops on its own (`Shutdown`, or every handle dropped).
+    pub fn spawn_supervised(
+        paths: Paths,
+        cfg: NodeConfig,
+    ) -> crate::error::Result<(NodeHandle, tokio::task::JoinHandle<()>)> {
         let NodeConfig {
             clock,
             millis_clock,
@@ -4302,8 +4349,8 @@ impl Node {
             node.start_network()?;
         }
         node.publish_initial();
-        tokio::spawn(node.run(cmd_rx, net_rx));
-        Ok(NodeHandle {
+        let actor = tokio::spawn(node.run(cmd_rx, net_rx));
+        let handle = NodeHandle {
             cmd_tx,
             view_rx,
             event_tx: handle_event_tx,
@@ -4312,7 +4359,8 @@ impl Node {
             status_tx,
             net_tx: handle_net_tx,
             sync_book,
-        })
+        };
+        Ok((handle, actor))
     }
 
     async fn run(
@@ -4676,7 +4724,11 @@ impl Node {
                 channel_id,
                 idle_secs,
             } => self.choose_idle_end(&channel_id, idle_secs).await,
-            NodeCommand::SendText { channel_id, text } => self.send_text(&channel_id, &text).await,
+            NodeCommand::SendText { channel_id, text } => {
+                #[cfg(feature = "test-knobs")]
+                test_panic_on_text(&text);
+                self.send_text(&channel_id, &text).await
+            }
             NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
             // Answered through `begin_join_channel`, which the run loop calls instead of this; a
             // join reaching here would have to be answered inline, which is the stall that
@@ -14231,6 +14283,27 @@ fn note_event(note: crate::node::tunnel::TunnelNote) -> NodeEvent {
     match note {
         crate::node::tunnel::TunnelNote::Refused(reason) => NodeEvent::ProxyRefused { reason },
         crate::node::tunnel::TunnelNote::Closed(reason) => NodeEvent::TunnelClosed { reason },
+    }
+}
+
+/// **For proofs only.** A marker: a message posted through this node whose text contains it
+/// makes the node's actor panic as it takes the post, which stands for a bug in one node
+/// (ADR-026 L-6). The panic-isolation proof uses it to show the host hears of the panic and every
+/// other node keeps running. Nothing a person runs sets it; unset or empty, nothing changes. Not
+/// compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_PANIC_ON_TEXT_ENV: &str = "VOX_TEST_PANIC_ON_TEXT";
+
+#[cfg(feature = "test-knobs")]
+fn test_panic_on_text(text: &str) {
+    if let Some(marker) = std::env::var(TEST_PANIC_ON_TEXT_ENV)
+        .ok()
+        .filter(|m| !m.is_empty())
+    {
+        assert!(
+            !text.contains(&marker),
+            "{TEST_PANIC_ON_TEXT_ENV}: the posted text holds the marker {marker:?}"
+        );
     }
 }
 

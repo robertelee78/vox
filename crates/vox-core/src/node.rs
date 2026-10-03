@@ -33,6 +33,7 @@ pub mod circuitstream;
 pub mod consent_order;
 pub mod content;
 pub mod coordstream;
+pub mod daemonipc;
 pub mod headless;
 pub mod ipc;
 pub mod joinslots;
