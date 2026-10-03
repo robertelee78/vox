@@ -26,6 +26,11 @@ use std::time::{Duration, Instant};
 
 use vox_core::node::paths::Paths;
 
+#[path = "layout.rs"]
+mod layout;
+#[allow(unused_imports)] // not every includer uses every item
+pub use layout::{node_dir, reap_daemon, DEFAULT_NODE};
+
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -141,6 +146,14 @@ pub struct Worker {
     daemon: Option<Proc>,
     /// The anchor its daemon was started with, so it can be started again the same way.
     anchor: String,
+}
+
+impl Drop for Worker {
+    /// The safety net: a daemon still holding this worker's data root is stopped by its pid
+    /// ([`reap_daemon`]) before its own process handle goes.
+    fn drop(&mut self) {
+        reap_daemon(&self.data);
+    }
 }
 
 impl Worker {

@@ -20,6 +20,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[path = "layout.rs"]
+mod layout;
+#[allow(unused_imports)] // not every includer uses every item
+pub use layout::{daemon_lock, find_named, node_dir, reap_daemon, Reaper, DEFAULT_NODE};
+
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const IDENTITY: &str = "identity passphrase";
 /// Generous: production Argon2id derivations and a real PoW happen inside it.
@@ -651,6 +656,9 @@ pub const ACCEPT_WINDOW: Duration = Duration::from_secs(35);
 
 /// One host, one anchor, one guest who has joined the host's `vox serve` room.
 pub struct World {
+    /// The safety net, first so it drops first: a daemon any of the world's data roots still
+    /// holds is stopped by its pid ([`reap_daemon`]) before the processes and the temp dir go.
+    pub reaper: Reaper,
     pub tmp: tempfile::TempDir,
     /// The anchor, held for the world's lifetime: it must outlive everything that reaches
     /// through it. Its status lines say how many circuits it carries.
@@ -793,6 +801,11 @@ impl World {
             "passphrase",
         );
         let mut w = Self {
+            reaper: Reaper(vec![
+                host_dir.clone(),
+                guest_dir.clone(),
+                tmp.path().join("anchor"),
+            ]),
             tmp,
             anchor,
             host_anchor,

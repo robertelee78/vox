@@ -233,8 +233,19 @@ struct Disk {
 }
 
 impl Disk {
+    /// The default node as this build keeps it, `<data>/nodes/default/` (ADR-026 §7).
     fn of(data: &Path) -> Self {
-        let profile = data.join("default");
+        Self::in_dir(&world::node_dir(data, world::DEFAULT_NODE))
+    }
+
+    /// The default profile as v0.2.9 left it, `<data>/default/`: this build's first run moves it
+    /// to [`Disk::of`]'s place (ADR-026 F-3), so a "before" is read here and an "after" there —
+    /// an "after" read here would find nothing and read clean.
+    fn old(data: &Path) -> Self {
+        Self::in_dir(&data.join(world::DEFAULT_NODE))
+    }
+
+    fn in_dir(profile: &Path) -> Self {
         Self {
             vault_file: profile.join("vault.cbor"),
             store_file: profile.join("store.redb"),
@@ -569,10 +580,10 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         );
         room
     };
-    let disk = Disk::of(&carol);
-    let before = present(&disk);
-    let (theirs_before, _) = who_opens(&disk);
-    let version_before = disk.vault().version;
+    let staged = Disk::old(&carol);
+    let before = present(&staged);
+    let (theirs_before, _) = who_opens(&staged);
+    let version_before = staged.vault().version;
     println!("[proof] v0.2.9 profile: vault v{version_before}; blobs {before:?}; the attacker opens {theirs_before:?}");
     assert_eq!(
         version_before, 1,
@@ -596,15 +607,16 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         });
         (m.len(), m.ino())
     };
-    let facts_before = file_facts(&disk);
-    let old_seals = fingerprints_of(&blobs(&disk));
-    let before_scan = occurrences(&disk, &old_seals);
+    let facts_before = file_facts(&staged);
+    let old_seals = fingerprints_of(&blobs(&staged));
+    let before_scan = occurrences(&staged, &old_seals);
     assert!(
         before_scan.iter().all(|n| *n >= 1),
         "APPARATUS, CANNOT MEASURE: the raw scan does not find {PREVIOUS}'s seals in its own store: {before_scan:?}"
     );
 
     let listed = ok(&new, &carol, &["trust", "list"], None);
+    let disk = Disk::of(&carol);
     // Scanned **at once**: the moment after the migrating unlock is when an adversary could take
     // the disk, and later writes (the daemon started below) reuse freed pages and would hide old
     // seals a rewrite-less migration leaves behind. Measured later, a store that was never
@@ -715,7 +727,7 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         let (_node, spec) = anchor(&old, &dir("old-anchor-2"));
         let _erin_d = daemon(&old, "erin (v0.2.9)", &erin, &spec, &idpass);
     }
-    let small = Disk::of(&erin);
+    let small = Disk::old(&erin);
     let small_before = file_facts(&small);
     let small_old = fingerprints_of(&blobs(&small));
     let small_scan_before = occurrences(&small, &small_old);
@@ -726,6 +738,7 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         small_old.len()
     );
     ok(&new, &erin, &["trust", "list"], None);
+    let small = Disk::of(&erin);
     let small_scan_after = occurrences(&small, &small_old);
     let small_live = occurrences(&small, &fingerprints_of(&blobs(&small)));
     println!(
@@ -770,7 +783,7 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         let (_node, spec) = anchor(&old, &dir("old-anchor-3"));
         let _gina_d = daemon(&old, "gina (v0.2.9)", &gina, &spec, &idpass);
     }
-    let blocked = Disk::of(&gina);
+    let blocked = Disk::old(&gina);
     let gina_old = fingerprints_of(&blobs(&blocked));
     let mut squatter = blocked.store_file.clone().into_os_string();
     squatter.push(".rewrite");
@@ -783,6 +796,13 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     .expect("APPARATUS: staging the obstacle");
     let inode_before = file_facts(&blocked).1;
     let (migrated, out, err) = vox_with(&new, &gina, &["trust", "list"], None);
+    // This build's first run moved the profile, obstacle and all, into `nodes/`.
+    let blocked = Disk::of(&gina);
+    let squatter = {
+        let mut p = blocked.store_file.clone().into_os_string();
+        p.push(".rewrite");
+        PathBuf::from(p)
+    };
     let (inode_after, version) = (file_facts(&blocked).1, blocked.vault().version);
     println!(
         "[proof] the rewrite's new file cannot be created: the migrating unlock succeeded = \

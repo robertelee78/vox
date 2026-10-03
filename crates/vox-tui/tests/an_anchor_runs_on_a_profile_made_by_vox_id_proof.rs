@@ -149,7 +149,7 @@ fn an_anchor_runs_and_serves_on_a_profile_made_by_vox_id() {
         ok,
         "PRODUCT (staging): `vox id` in the anchor's profile failed: {err}"
     );
-    let vault = anchor_dir.join("default").join("vault.cbor");
+    let vault = world::node_dir(&anchor_dir, world::DEFAULT_NODE).join("vault.cbor");
     assert!(
         vault.is_file(),
         "PRODUCT (staging): `vox id` printed {fp:?} but left no vault at {}",

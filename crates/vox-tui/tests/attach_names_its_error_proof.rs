@@ -32,6 +32,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::io::Write as _;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -57,10 +60,11 @@ fn room_list(dir: &Path) -> (bool, String) {
     )
 }
 
-/// A fresh profile directory and where its control socket goes.
+/// A fresh data root and where its default node's control socket goes
+/// (`<data>/nodes/default/node.sock`).
 fn profile() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
-    let sock_dir = tmp.path().join("d").join("default");
+    let sock_dir = layout::node_dir(&tmp.path().join("d"), layout::DEFAULT_NODE);
     std::fs::create_dir_all(&sock_dir).expect("APPARATUS: create a staging directory");
     std::fs::create_dir_all(tmp.path().join("c")).expect("APPARATUS: create a staging directory");
     let sock = sock_dir.join("node.sock");

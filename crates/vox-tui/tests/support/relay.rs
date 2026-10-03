@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::world::{
-    address_in, after_label, args, echo_service, fingerprint, mkdir, room_pass_file, tempdir, utf8,
-    vox_once, VoxProc, IDENTITY,
+    address_in, after_label, args, echo_service, fingerprint, mkdir, reap_daemon, room_pass_file,
+    tempdir, utf8, vox_once, VoxProc, IDENTITY,
 };
 
 /// Whether host and guest are split by address family.
@@ -311,6 +311,20 @@ pub struct RelayWorld {
     pub address: String,
     pub passphrase: String,
     pub service: String,
+}
+
+impl Drop for RelayWorld {
+    /// The safety net: a daemon any of the world's data roots still holds is stopped by its pid
+    /// ([`reap_daemon`]) before the processes and the temp dir go.
+    fn drop(&mut self) {
+        for d in [
+            &self.host_dir,
+            &self.guest_dir,
+            &self.tmp.path().join("anchor"),
+        ] {
+            reap_daemon(d);
+        }
+    }
 }
 
 impl RelayWorld {

@@ -58,6 +58,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -403,7 +406,7 @@ fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others
 
     // ---- the attacker's snapshot of bob's own key state, then a post in each room it must be
     // able to open ----
-    let bob_store = bob.data.join("default").join("store.redb");
+    let bob_store = layout::node_dir(&bob.data, layout::DEFAULT_NODE).join("store.redb");
     let snapshot = tmp.path().join("bob-snapshot.redb");
     let bob_pid = bob
         .daemon

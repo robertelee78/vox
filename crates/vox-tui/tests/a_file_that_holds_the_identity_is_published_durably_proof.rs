@@ -46,7 +46,7 @@ use vox_core::atrest::vault::IdentityVault;
 
 use previous_release::previous_release;
 use syscalls::{assert_the_recorder_saw_vox, interposer, parse, published_durably, recorded};
-use world::{args, VoxProc, IDENTITY, VOX};
+use world::{args, node_dir, VoxProc, DEFAULT_NODE, IDENTITY, VOX};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -73,13 +73,19 @@ fn ok(exe: &Path, data: &Path, argv: &[&str]) -> String {
     out
 }
 
+/// The default node's vault where this build keeps it (`<data>/nodes/default/`).
 fn vault_of(data: &Path) -> PathBuf {
-    data.join("default/vault.cbor")
+    node_dir(data, DEFAULT_NODE).join("vault.cbor")
 }
 
-fn vault_version(data: &Path) -> u64 {
-    let path = vault_of(data);
-    let bytes = std::fs::read(&path)
+/// The vault where v0.2.9 keeps it (`<data>/default/`), before this build's first run moves the
+/// profile into `nodes/` (ADR-026 F-3).
+fn old_vault_of(data: &Path) -> PathBuf {
+    data.join(DEFAULT_NODE).join("vault.cbor")
+}
+
+fn vault_version(path: &Path) -> u64 {
+    let bytes = std::fs::read(path)
         .unwrap_or_else(|e| panic!("APPARATUS: could not read {}: {e}", path.display()));
     IdentityVault::from_canonical_slice(&bytes)
         .unwrap_or_else(|e| panic!("PRODUCT: vox left {} undecodable: {e:?}", path.display()))
@@ -122,13 +128,13 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     ok(&old, &carol, &["id"]);
     ok(&old, &carol, &["trust", "add", &dave_fp, "--name", "dave"]);
     assert_eq!(
-        vault_version(&carol),
+        vault_version(&old_vault_of(&carol)),
         1,
         "APPARATUS (precondition not met): v0.2.9 wrote no version-1 vault"
     );
     let (migrated, out, err, events) = recorded(&new, &carol, &["trust", "list"], None, IDENTITY);
     assert!(
-        migrated && out.contains("dave") && vault_version(&carol) == 2,
+        migrated && out.contains("dave") && vault_version(&vault_of(&carol)) == 2,
         "PRODUCT (staging): the v0.2.9 profile did not migrate: {out}{err}"
     );
     let migration = published_durably(&events, &vault_of(&carol));
@@ -161,7 +167,10 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     }
     let events = parse(&std::fs::read_to_string(&log).unwrap_or_default());
     assert_the_recorder_saw_vox(&events, "a headless `vox node`");
-    let headless = published_durably(&events, &node.join("default/node-identity.key"));
+    let headless = published_durably(
+        &events,
+        &node_dir(&node, DEFAULT_NODE).join("node-identity.key"),
+    );
     verdict("a headless node's node-identity.key", &headless);
 
     // ---- 4. a vault write that fails leaves the old vault --------------------------------------
@@ -169,9 +178,10 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     let frank_fp = ok(&old, &frank, &["id"]).trim().to_owned();
     ok(&old, &erin, &["id"]);
     ok(&old, &erin, &["trust", "add", &frank_fp, "--name", "frank"]);
-    let before = std::fs::read(vault_of(&erin)).expect("APPARATUS: read erin's v0.2.9 vault");
-    // A directory where the temporary file must be created: the write cannot happen.
-    let blocker = erin.join("default/vault.tmp");
+    let before = std::fs::read(old_vault_of(&erin)).expect("APPARATUS: read erin's v0.2.9 vault");
+    // A directory where the temporary file must be created: the write cannot happen. Staged in
+    // v0.2.9's profile directory; this build's first run moves it, blocker and all, into `nodes/`.
+    let blocker = erin.join(DEFAULT_NODE).join("vault.tmp");
     std::fs::create_dir(&blocker).expect("APPARATUS: create the blocking directory");
     std::fs::write(
         blocker.join("keep"),
@@ -179,8 +189,12 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     )
     .expect("APPARATUS: fill the blocking directory");
     let (wrote, out, err) = vox_with(&new, &erin, &["trust", "list"]);
-    let kept =
-        std::fs::read(vault_of(&erin)).expect("APPARATUS: read erin's vault again") == before;
+    let kept = std::fs::read(vault_of(&erin)).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT: after this build's first run erin's vault is not at {}: {e}: {out}{err}",
+            vault_of(&erin).display()
+        )
+    }) == before;
     let opens = IdentityVault::from_canonical_slice(&before)
         .and_then(|v| v.unlock_signer(IDENTITY.as_bytes()))
         .is_ok();
@@ -198,7 +212,8 @@ fn a_file_that_holds_the_identity_is_published_durably() {
         "PRODUCT: a failed vault write lost or changed the old vault (kept byte for byte = \
          {kept}, still opens = {opens}): {out}{err}"
     );
-    std::fs::remove_dir_all(&blocker).expect("APPARATUS: remove the blocking directory");
+    std::fs::remove_dir_all(node_dir(&erin, DEFAULT_NODE).join("vault.tmp"))
+        .expect("APPARATUS: remove the blocking directory from where the migration moved it");
     let deadline = Instant::now() + TIMEOUT;
     let listed = loop {
         let (good, out, _) = vox_with(&new, &erin, &["trust", "list"]);
@@ -209,11 +224,11 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     };
     println!(
         "[proof] with the obstacle gone: vault v{}, `trust list` names frank = {}",
-        vault_version(&erin),
+        vault_version(&vault_of(&erin)),
         listed.contains("frank")
     );
     assert!(
-        vault_version(&erin) == 2 && listed.contains("frank"),
+        vault_version(&vault_of(&erin)) == 2 && listed.contains("frank"),
         "PRODUCT: the migration did not complete once the vault could be written: {listed}"
     );
 

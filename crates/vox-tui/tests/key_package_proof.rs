@@ -53,6 +53,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -502,7 +505,8 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
     // **Nothing at rest** (R34, ADR-023 proof 6): what a person sees in the anchor's data
     // directory. An anchor that kept a copy of the room kept it in a store file, the one place a
     // node keeps anything for a room; this build's anchor keeps none.
-    let store = anchor_dir.join("default").join("store.redb");
+    // Anywhere under its data root, not only where this build keeps a node's store.
+    let stores = layout::find_named(&anchor_dir, "store.redb");
     // **Relayed, not kept** (R11): the anchor says how many circuits it carries. A circuit is the
     // relay's in-flight datagrams, which decision 6 leaves an anchor; it is printed, not asserted.
     // What R11 and R34 take from an anchor is the room kept at rest, which the store file is.
@@ -524,16 +528,13 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
         sent.len()
     );
     eprintln!(
-        "[R11/R34] the anchor, a member of nothing: a store file at {}: {}; the most circuits it \
-         said it carried (relay, in flight): {carried}",
-        store.display(),
-        store.exists()
+        "[R11/R34] the anchor, a member of nothing: store files under its data root: \
+         {stores:?}; the most circuits it said it carried (relay, in flight): {carried}"
     );
     assert!(
-        !store.exists(),
+        stores.is_empty(),
         "PRODUCT: an anchor that is not a member of a room must store nothing for it (ADR-023 \
-         decision 6, PRD-001 R34): its data directory holds a store file, {}",
-        store.display()
+         decision 6, PRD-001 R34): its data directory holds a store file, {stores:?}"
     );
     assert_eq!(
         got,

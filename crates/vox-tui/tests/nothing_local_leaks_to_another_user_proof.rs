@@ -64,6 +64,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -1060,7 +1063,11 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
     let p = Profile::new(&tmp.path().join("a".repeat(90)), &t_env);
     let q = Profile::new(&tmp.path().join("b".repeat(90)), &t_env);
     assert!(
-        p.data.join("default").join("node.sock").as_os_str().len() > 104,
+        layout::node_dir(&p.data, layout::DEFAULT_NODE)
+            .join("node.sock")
+            .as_os_str()
+            .len()
+            > 104,
         "APPARATUS, CANNOT MEASURE: the proof's profile path is short enough for the natural \
          socket"
     );

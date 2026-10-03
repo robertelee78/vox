@@ -45,6 +45,9 @@ mod watchdog;
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -200,14 +203,15 @@ fn ranges(seen: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
     out
 }
 
-/// The profile's `store.redb`, under `<data>/<profile>/`.
+/// The default node's `store.redb`, under `<data>/nodes/default/`.
 fn store_file(dir: &Path) -> PathBuf {
-    std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot list the profile dir {dir:?}: {e}"))
-        .filter_map(Result::ok)
-        .map(|e| e.path().join("store.redb"))
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| panic!("PRODUCT (staging): no <profile>/store.redb under {dir:?}"))
+    let p = layout::node_dir(dir, layout::DEFAULT_NODE).join("store.redb");
+    assert!(
+        p.is_file(),
+        "PRODUCT (staging): no store at {}",
+        p.display()
+    );
+    p
 }
 
 /// The attack: delete the counter's row from a stopped node's store. Returns the rows the `meta`

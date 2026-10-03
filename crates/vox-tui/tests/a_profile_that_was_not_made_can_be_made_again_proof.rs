@@ -50,6 +50,9 @@ mod watchdog;
 #[path = "support/syscalls.rs"]
 mod syscalls;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -89,9 +92,9 @@ impl Profile {
         Self { data, pass }
     }
 
-    /// Where `vox` keeps the default profile's files.
+    /// Where `vox` keeps the default node's files (`<data>/nodes/default/`).
     fn dir(&self) -> PathBuf {
-        self.data.join("default")
+        layout::node_dir(&self.data, layout::DEFAULT_NODE)
     }
 
     fn command(&self, args: &[&str]) -> Command {

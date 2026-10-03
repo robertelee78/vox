@@ -34,6 +34,9 @@ mod previous_release;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -273,8 +276,8 @@ fn an_anchor_upgraded_from_a_release_that_kept_room_pages_deletes_them() {
     da.stop();
     db.stop();
     old_anchor.stop();
-    // The store file, where an anchor kept what it kept; the path a person would look in.
-    let store = n.join("default").join("store.redb");
+    // The store file, where the previous release's anchor kept what it kept (`<data>/default/`).
+    let store = n.join(layout::DEFAULT_NODE).join("store.redb");
     println!(
         "[proof] under {PREVIOUS}, the anchor's store file {} exists: {}",
         store.display(),
@@ -289,14 +292,29 @@ fn an_anchor_upgraded_from_a_release_that_kept_room_pages_deletes_them() {
     // ---- this build's anchor on the same data directory ----
     let (new_anchor, _) = anchor(Path::new(VOX), "the upgraded anchor", &n, "PRODUCT");
     new_anchor.stop();
+    // **Deleted, not moved.** This build's first run moves the old profile into
+    // `nodes/default/` (ADR-026 F-3), so the old path is empty whether or not the store was
+    // deleted: the path it was moved to must be empty too, and so must the whole data root.
+    let moved = layout::node_dir(&n, layout::DEFAULT_NODE).join("store.redb");
+    let anywhere = layout::find_named(&n, "store.redb");
     println!(
-        "[proof] after this build's `vox node` ran on it, the store file exists: {}",
-        store.exists()
+        "[proof] after this build's `vox node` ran on it: the old store path exists: {}; the \
+         migrated path {} exists: {}; store files anywhere under the data root: {anywhere:?}",
+        store.exists(),
+        moved.display(),
+        moved.exists()
     );
     assert!(
-        !store.exists(),
+        layout::node_dir(&n, layout::DEFAULT_NODE)
+            .join("node-identity.key")
+            .is_file(),
+        "PRODUCT (staging): this build's anchor said its spec, yet its identity is not at {} — \
+         the migration did not move the profile, so where its store went is not measured",
+        layout::node_dir(&n, layout::DEFAULT_NODE).display()
+    );
+    assert!(
+        !store.exists() && !moved.exists() && anywhere.is_empty(),
         "PRODUCT: an anchor upgraded from {PREVIOUS} must delete its store file (ADR-023 decision \
-         6; the decider, #95): {} is still there",
-        store.display()
+         6; the decider, #95), not keep or move it: still there: {anywhere:?}"
     );
 }
