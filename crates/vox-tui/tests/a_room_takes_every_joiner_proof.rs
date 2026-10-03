@@ -278,7 +278,7 @@ fn every_joiner_of_a_three_hundred_member_room_gets_in() {
         .collect();
     assert!(
         failed.is_empty() && staged == MEMBERS,
-        "{} of {MEMBERS} joins failed as the room grew ({} {}), the first at m{:03}:\n{}",
+        "PRODUCT: {} of {MEMBERS} joins failed as the room grew ({} {}), the first at m{:03}:\n{}",
         failed.len(),
         profile(),
         if last.ok {

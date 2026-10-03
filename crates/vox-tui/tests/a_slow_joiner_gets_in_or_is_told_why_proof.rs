@@ -298,7 +298,7 @@ fn a_joiner_slower_than_the_old_patience_gets_in() {
     );
     assert!(
         ok,
-        "a joiner grinding {}s — past the old {OLD_PATIENCE_SECS}s, inside {PATIENCE_SECS}s — was \
+        "PRODUCT: a joiner grinding {}s — past the old {OLD_PATIENCE_SECS}s, inside {PATIENCE_SECS}s — was \
          refused after {:.1}s\n  bob: {out}{err}\n  alice's own report:\n{alice_said}",
         SLOW_GRIND_MS / 1000,
         took.as_secs_f64()

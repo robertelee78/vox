@@ -491,7 +491,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
     }
     assert!(
         never == 0 && over_any == 0 && over_punched == 0,
-        "R42 punch: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
+        "PRODUCT: R42 punch: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
          first answers took longer (slowest {any_max:?}); {over_punched} of {SAMPLES} reached the \
          punched path at or past it (slowest {punched_max:?}), {never} never within {GIVE_UP:?}"
     );

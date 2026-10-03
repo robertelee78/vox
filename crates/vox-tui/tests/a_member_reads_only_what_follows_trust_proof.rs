@@ -404,7 +404,7 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
             b_post.last().copied()
         ),
         (950, Some(1_101), Some(2_050)),
-        "arm B: bob must read all 950 posts alice made after trusting him, 1101-2050, however the \
+        "PRODUCT: arm B: bob must read all 950 posts alice made after trusting him, 1101-2050, however the \
          generations fall; he read {:?}",
         ranges(b_post.iter().copied())
     );

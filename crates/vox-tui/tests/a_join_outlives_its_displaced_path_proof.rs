@@ -255,7 +255,7 @@ fn a_join_outlives_its_displaced_path() {
     );
     assert!(
         status.success(),
-        "a join whose path was displaced mid-grind failed after {:.1}s\nguest:\n{guest_said}\n\
+        "PRODUCT: a join whose path was displaced mid-grind failed after {:.1}s\nguest:\n{guest_said}\n\
          host (the refusing side's own report):\n{host_said}",
         took.as_secs_f64()
     );

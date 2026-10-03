@@ -211,5 +211,5 @@ fn a_tui_waiting_for_the_profile_keeps_its_screen() {
         &["unlocked", "done", "another vox holds this profile open"],
     ));
 
-    assert!(red.is_empty(), "{red:#?}");
+    assert!(red.is_empty(), "PRODUCT: {red:#?}");
 }

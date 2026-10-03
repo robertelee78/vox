@@ -144,7 +144,7 @@ fn attached(dir: &std::path::Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "{tag}'s daemon never answered: {last}\nits stderr: {}",
+        "PRODUCT (staging): {tag}'s daemon never answered: {last}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
     );
 }
@@ -249,7 +249,7 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
         let (ok, _, err) = vox(&alice, &["room", "post", &room, &format!("post {i}")], None);
         assert!(
             ok,
-            "post {i} of {POSTS} was refused after {} succeeded: {err} — one author may post \
+            "PRODUCT: post {i} of {POSTS} was refused after {} succeeded: {err} — one author may post \
              without limit (PRD-001 R1/R3)",
             i - 1
         );
@@ -279,7 +279,7 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     );
     assert!(
         listed.contains("long") && !listed.contains("[closed]"),
-        "the room with {POSTS} posts from one author did not reopen after a restart: \
+        "PRODUCT: the room with {POSTS} posts from one author did not reopen after a restart: \
          {listed:?} — PRD-001 D1\nalice's daemon said: {}",
         std::fs::read_to_string(alice.join("daemon-second.err")).unwrap_or_default()
     );
@@ -334,7 +334,7 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     );
     assert!(
         caught_up,
-        "a newcomer's log must catch up with the whole history, of any size (PRD-001 R1): bob \
+        "PRODUCT: a newcomer's log must catch up with the whole history, of any size (PRD-001 R1): bob \
          never rendered {after_join:?}, which his log can accept only after all {POSTS} of \
          alice's earlier posts, within {took:?}\nbob's daemon said: {}",
         std::fs::read_to_string(bob.join("daemon-bob.err")).unwrap_or_default()

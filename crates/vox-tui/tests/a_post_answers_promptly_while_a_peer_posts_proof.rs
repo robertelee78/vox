@@ -132,7 +132,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -387,7 +387,7 @@ fn a_post_answers_promptly_while_a_peer_posts() {
     for (who, (rounds, news)) in [("alice", alice_pub), ("bob", bob_pub)] {
         assert!(
             rounds <= QUIET_ROUNDS && news <= QUIET_ROUNDS,
-            "{who}'s node published {rounds} rounds and passed on {news} records as news while \
+            "PRODUCT: {who}'s node published {rounds} rounds and passed on {news} records as news while \
              two members only posted: nothing about who they are or where they are changed, so \
              there was nothing to republish (#179). Each round signs on the actor a post queues \
              behind"
@@ -395,7 +395,7 @@ fn a_post_answers_promptly_while_a_peer_posts() {
     }
     assert!(
         p95 <= P95_BOUND && max <= MAX_BOUND,
-        "`vox room post` waited on another member's traffic: p95 {}ms (bound {}ms), max {}ms \
+        "PRODUCT: `vox room post` waited on another member's traffic: p95 {}ms (bound {}ms), max {}ms \
          (bound {}ms). A post must not queue behind a sync applying a peer's messages (V210-08)",
         p95.as_millis(),
         P95_BOUND.as_millis(),

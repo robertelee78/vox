@@ -86,7 +86,7 @@ fn post(w: &Worker, r: &str, session: &str, body: &str) {
         &["room", "post", r, "--type", "status", "-"],
         Some(body),
     );
-    assert!(o.ok, "{o:?}");
+    assert!(o.ok, "PRODUCT (staging): {o:?}");
 }
 
 #[test]
@@ -316,7 +316,7 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
     let session = mine["envelope"]["from"].as_str().unwrap_or("").to_owned();
     assert!(
         session.starts_with("ses"),
-        "the model's post must carry OpenCode's own session id as `from` (the plugin's \
+        "PRODUCT: the model's post must carry OpenCode's own session id as `from` (the plugin's \
          shell.env names it), not {session:?}: {mine}"
     );
 

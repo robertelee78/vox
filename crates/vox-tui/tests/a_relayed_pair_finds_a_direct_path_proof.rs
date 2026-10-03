@@ -213,7 +213,7 @@ fn a_relayed_pair_finds_a_direct_path_once_one_becomes_possible() {
     }
     let Some((t2, line)) = second else {
         panic!(
-            "NOT RETRIED: {TRIED_AGAIN_WITHIN:?} after its first attempt found no direct path, the \
+            "PRODUCT: NOT RETRIED: {TRIED_AGAIN_WITHIN:?} after its first attempt found no direct path, the \
              relayed pair has not tried again — a pair that starts relayed stays relayed.\nup:\n{}",
             up.transcript()
         );
@@ -255,7 +255,7 @@ fn a_relayed_pair_finds_a_direct_path_once_one_becomes_possible() {
     );
     let Some(took) = upgraded else {
         panic!(
-            "NOT UPGRADED: {UPGRADED_WITHIN:?} after a direct path became possible, every request \
+            "PRODUCT: NOT UPGRADED: {UPGRADED_WITHIN:?} after a direct path became possible, every request \
              still rode the anchor's circuit ({requests} tried) — nothing found the direct path.\n\
              up:\n{}",
             up.transcript()

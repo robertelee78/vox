@@ -345,7 +345,7 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
     let over_direct = direct.iter().filter(|d| **d >= TARGET).count();
     assert!(
         never == 0 && over_direct == 0 && over_any == 0,
-        "R42 open: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
+        "PRODUCT: R42 open: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
          first answers took longer (slowest {any_max:?}); {over_direct} of {SAMPLES} reached the \
          direct path at or past it (slowest {direct_max:?}), {never} never within {GIVE_UP:?}"
     );

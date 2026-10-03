@@ -225,5 +225,5 @@ fn a_vox_waiting_for_the_profile_says_so() {
         &["trust", "add", &y_fp, "--name", "y"],
     ));
 
-    assert!(red.is_empty(), "{red:#?}");
+    assert!(red.is_empty(), "PRODUCT: {red:#?}");
 }

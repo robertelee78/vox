@@ -819,7 +819,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
 
     assert!(
         failures.is_empty(),
-        "{} claim(s) failed:\n- {}",
+        "PRODUCT: {} claim(s) failed:\n- {}",
         failures.len(),
         failures.join("\n- ")
     );

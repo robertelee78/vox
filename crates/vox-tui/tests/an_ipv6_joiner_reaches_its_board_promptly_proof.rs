@@ -134,7 +134,7 @@ fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
     );
     assert!(
         Duration::from_secs_f64(board) < BOARD_WITHIN,
-        "an IPv6-only joiner took {board:.2}s to reach a board it could reach at once — the \
+        "PRODUCT: an IPv6-only joiner took {board:.2}s to reach a board it could reach at once — the \
          address's IPv4 routes were dialled one by one, each to its timeout, before its own IPv6 \
          anchor: {said}"
     );
@@ -245,7 +245,7 @@ fn a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seco
     );
     assert!(
         Duration::from_secs_f64(board) < BOARD_WITHIN,
-        "a joiner took {board:.2}s to reach its own live board, because the address's gone boards \
+        "PRODUCT: a joiner took {board:.2}s to reach its own live board, because the address's gone boards \
          were dialled one after another, each to its timeout: {said}"
     );
     drop(own_anchor);

@@ -135,7 +135,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, ttl: &str) -> V
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 /// A node's publish counters at one instant (`vox status --json`): its renewals, its rounds, and
@@ -457,7 +457,7 @@ fn idle_then_join(churn: bool) {
     );
     assert!(
         joined,
-        "a node idle for {LIFETIMES} record lifetimes was not findable on its anchor's board: \
+        "PRODUCT: a node idle for {LIFETIMES} record lifetimes was not findable on its anchor's board: \
          {out}{err}"
     );
     let steps = steps.unwrap_or_else(|| {
@@ -465,7 +465,7 @@ fn idle_then_join(churn: bool) {
     });
     assert!(
         !steps.contains("address poll"),
-        "after {LIFETIMES} idle lifetimes the anchor's board no longer held a member's address: \
+        "PRODUCT: after {LIFETIMES} idle lifetimes the anchor's board no longer held a member's address: \
          carol's join had to wait for one — {steps}"
     );
     // One renewal per room per half-lifetime, however many boards it reaches: two a lifetime,
@@ -474,7 +474,7 @@ fn idle_then_join(churn: bool) {
     let (least, most) = (2 * LIFETIMES - 1, 2 * LIFETIMES + 1);
     assert!(
         (least..=most).contains(&renewed),
-        "alice's node renewed its records {renewed} times over {LIFETIMES} idle lifetimes; \
+        "PRODUCT: alice's node renewed its records {renewed} times over {LIFETIMES} idle lifetimes; \
          expected {least}..={most}"
     );
     // **Every round has a cause, and each cause is bounded by the design** (V210-68). While
@@ -496,12 +496,12 @@ fn idle_then_join(churn: bool) {
         .collect();
     assert!(
         unasked.is_empty(),
-        "alice's node published while idle for causes the idle room did not ask for: \
+        "PRODUCT: alice's node published while idle for causes the idle room did not ask for: \
          {unasked:?} (all: {causes:?})"
     );
     assert!(
         (renewed..=renewed * anchors_n).contains(&(count("renewal") + folded("renewal"))),
-        "alice's renewal rounds {} (and {} renewal asks folded into another round) are not one \
+        "PRODUCT: alice's renewal rounds {} (and {} renewal asks folded into another round) are not one \
          to {anchors_n} per renewal ({renewed} renewals)",
         count("renewal"),
         folded("renewal")
@@ -513,7 +513,7 @@ fn idle_then_join(churn: bool) {
     );
     assert!(
         count("board_news") <= bob_renewed * anchors_n,
-        "alice passed on {} rounds of news while bob renewed only {bob_renewed} time(s) \
+        "PRODUCT: alice passed on {} rounds of news while bob renewed only {bob_renewed} time(s) \
          ({anchors_n} anchor(s))",
         count("board_news")
     );

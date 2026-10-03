@@ -149,13 +149,13 @@ fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {
     );
     assert_eq!(
         over_circuit, 0,
-        "a request rode the circuit after the direct path took over — the displaced path was still \
+        "PRODUCT: a request rode the circuit after the direct path took over — the displaced path was still \
          in use, so letting it go is not what is being measured"
     );
     assert_eq!(
         n,
         0,
-        "NOT LET GO: the anchor still carries {n} circuit(s) {took:?} after the direct path took over, \
+        "PRODUCT: NOT LET GO: the anchor still carries {n} circuit(s) {took:?} after the direct path took over, \
          past the 60 s grace — a pair that went direct keeps its relay for good.\nanchor:\n{}",
         w.anchor.proc.transcript()
     );

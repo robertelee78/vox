@@ -82,7 +82,7 @@ fn post_then_read(w: &Worker, r: &str, tag: &str) -> Duration {
         }
         assert!(
             started.elapsed() < Duration::from_secs(30),
-            "{tag} never became readable on its own node"
+            "PRODUCT (staging): {tag} never became readable on its own node"
         );
     }
 }
@@ -228,7 +228,7 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
     let (_, flood_max) = stats("flood  post → readable", &flood_posts);
     assert!(
         peak.saturating_sub(base_rss) <= FLOOD_HEADROOM,
-        "the flood raised the daemon's resident memory by {} MiB, past {} MiB: checks are \
+        "PRODUCT: the flood raised the daemon's resident memory by {} MiB, past {} MiB: checks are \
          not bounded",
         peak.saturating_sub(base_rss) >> 20,
         FLOOD_HEADROOM >> 20
@@ -246,7 +246,7 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
     );
     assert!(
         loaded_median <= quiet_median + MEDIAN_SLACK,
-        "concurrent trust checks raised the median from {quiet_median:?} to {loaded_median:?} \
+        "PRODUCT: concurrent trust checks raised the median from {quiet_median:?} to {loaded_median:?} \
          (slack {MEDIAN_SLACK:?})"
     );
 }
