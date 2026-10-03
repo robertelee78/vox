@@ -284,3 +284,181 @@ async fn a_connection_that_never_asks_reaches_no_node() {
     );
     presence.close().await;
 }
+
+/// Join two circuit ports: what each endpoint sends to its port's address arrives at the other's.
+fn pump(mut a: crate::transport::mux::CircuitPort, mut b: crate::transport::mux::CircuitPort) {
+    let (mut a_out, mut b_out) = (
+        a.take_outbound().expect("APPARATUS: outbound"),
+        b.take_outbound().expect("APPARATUS: outbound"),
+    );
+    let (a_in, b_in) = (a.inlet(), b.inlet());
+    tokio::spawn(async move {
+        let _hold = (a, b);
+        loop {
+            tokio::select! {
+                d = a_out.recv() => match d { Some(d) => b_in.deliver(d), None => break },
+                d = b_out.recv() => match d { Some(d) => a_in.deliver(d), None => break },
+            }
+        }
+    });
+}
+
+/// **A circuit is answered only by the node it was attached for** (ADR-026 P-1, `serves_on`):
+/// over A's circuit, C reaches A; an `ASK` for B, attached to the same presence, gets the one
+/// refusal. Mutant: `serves_on` answering for any node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "in-process proof over loopback UDP; run on demand"]
+async fn an_ask_for_another_node_over_a_circuit_is_refused() {
+    let presence = NetPresence::bind(loopback()).expect("APPARATUS: bind the presence");
+    let (sa, sb) = (signer(), signer());
+    let (ida, idb) = (sa.fingerprint(), sb.fingerprint());
+    let mut a = presence.attach(sa).expect("PRODUCT: attach A");
+    let mut b = presence.attach(sb).expect("PRODUCT: attach B");
+    let c = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind C");
+    let idc = c.local_id();
+
+    // One circuit between C and A, as a relay carries it: A's end is A's alone.
+    let at_a = a
+        .endpoint
+        .attach_circuit(&idc, None)
+        .expect("APPARATUS: A's circuit end");
+    let at_c = c
+        .attach_circuit(&ida, None)
+        .expect("APPARATUS: C's circuit end");
+    let to_a = at_c.addr();
+    pump(at_a, at_c);
+
+    let via = c
+        .connect(to_a, ida, 0)
+        .await
+        .unwrap_or_else(|e| panic!("PRODUCT: C could not reach A over A's circuit: {e}"));
+    assert!(
+        via.via_circuit(),
+        "APPARATUS: the dial did not run over the circuit"
+    );
+    assert!(
+        next_in(&mut a, Duration::from_secs(3)).await.is_some(),
+        "PRODUCT: A was handed nothing for a dial over its own circuit"
+    );
+
+    let err = c
+        .connect(to_a, idb, 0)
+        .await
+        .err()
+        .expect("PRODUCT: B answered over A's circuit")
+        .to_string();
+    assert!(
+        err.contains("answers as"),
+        "PRODUCT: the refusal said {err:?}"
+    );
+    assert!(
+        next_in(&mut b, Duration::from_millis(300)).await.is_none(),
+        "PRODUCT: B was handed a connection that came over A's circuit"
+    );
+    presence.close().await;
+}
+
+/// **One presence, one discovery, one cache** (ADR-026 D-3, ADR-012 N-43): two nodes attaching
+/// start no discovery of their own — the presence's one is what both advertise — and what a peer
+/// reported to one node is the presence's observed address for both; forgetting one node's
+/// reporter keeps the other's. Mutant: a discovery per attach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "in-process proof over loopback UDP; run on demand"]
+async fn one_presence_discovers_once_and_keeps_one_observed_cache() {
+    let presence = NetPresence::bind(loopback()).expect("APPARATUS: bind the presence");
+    let mut advertised = presence.advertised();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        advertised.wait_for(Option::is_some),
+    )
+    .await
+    .expect("PRODUCT: the presence composed no addresses within 20 s")
+    .expect("APPARATUS: watch");
+    let (sa, sb) = (signer(), signer());
+    let (ida, idb) = (sa.fingerprint(), sb.fingerprint());
+    let _a = presence.attach(sa).expect("PRODUCT: attach A");
+    let _b = presence.attach(sb).expect("PRODUCT: attach B");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        presence.discoveries(),
+        1,
+        "PRODUCT: two attaches ran discoveries of their own: {} in all",
+        presence.discoveries()
+    );
+
+    let (r1, r2) = (signer().fingerprint(), signer().fingerprint());
+    let seen: crate::nat::multiaddr::Multiaddr =
+        std::net::SocketAddr::from(([198, 51, 100, 7], 4242)).into();
+    presence.note_observed(ida, r1, seen);
+    presence.note_observed(idb, r2, seen);
+    assert_eq!(
+        presence.observed_addr(),
+        Some(seen),
+        "PRODUCT: the reports were not kept"
+    );
+    presence.forget_observed(&ida, &r1);
+    assert_eq!(
+        presence.observed_addr(),
+        Some(seen),
+        "PRODUCT: forgetting A's reporter forgot B's too"
+    );
+    presence.close().await;
+}
+
+/// **A panicked node is evicted alone** (ADR-026 L-6, D-5): its registration and every
+/// connection it had close; another node's connection on the presence keeps carrying bytes.
+/// Mutants: evict leaves the connections open; evict closes every node's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "in-process proof over loopback UDP; run on demand"]
+async fn an_evicted_node_loses_only_its_own_connections() {
+    let presence = NetPresence::bind(loopback()).expect("APPARATUS: bind the presence");
+    let at = presence.shared().local_addr().expect("APPARATUS: addr");
+    let (sa, sb) = (signer(), signer());
+    let (ida, idb) = (sa.fingerprint(), sb.fingerprint());
+    let mut a = presence.attach(sa).expect("PRODUCT: attach A");
+    let mut b = presence.attach(sb).expect("PRODUCT: attach B");
+    let c = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind C");
+    let ca = c.connect(at, ida, 0).await.expect("PRODUCT: C to A");
+    let _a_side = next_in(&mut a, Duration::from_secs(3))
+        .await
+        .expect("PRODUCT: A handed nothing");
+    let cb = c.connect(at, idb, 0).await.expect("PRODUCT: C to B");
+    let b_side = next_in(&mut b, Duration::from_secs(3))
+        .await
+        .expect("PRODUCT: B handed nothing");
+    echo(&b_side);
+    presence.evict(&ida);
+    let closed = tokio::time::timeout(Duration::from_secs(3), ca.quinn().closed()).await;
+    assert!(
+        closed.is_ok(),
+        "PRODUCT: the evicted node's connection was left open"
+    );
+    assert!(
+        !presence.shared().registered().contains(&ida),
+        "PRODUCT: the evicted node is still answered for"
+    );
+    for i in 0..3u8 {
+        assert!(
+            round_trip(&cb, &[b'e', i]).await,
+            "PRODUCT: B's connection stopped carrying bytes when A was evicted (round {i})"
+        );
+    }
+    presence.close().await;
+}
+
+/// **One nearby group per presence** (ADR-012 N-44): every node asking gets the same group.
+/// Mutant: a group opened per node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "in-process proof over loopback UDP; run on demand"]
+async fn every_node_on_a_presence_shares_its_one_nearby_group() {
+    let presence = NetPresence::bind(loopback()).expect("APPARATUS: bind the presence");
+    let Some((first, _)) = presence.nearby() else {
+        panic!("CANNOT MEASURE: the nearby group cannot be opened on this machine");
+    };
+    let (second, _) = presence.nearby().expect("PRODUCT: the group went away");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "PRODUCT: a second node got a nearby group of its own"
+    );
+    presence.close().await;
+}

@@ -163,6 +163,8 @@ fn the_skill_and_the_drain_say_the_room_settles_who_and_the_issue_records_progre
         &[
             "agent",
             "hook",
+            "--node",
+            "default",
             "--room",
             r,
             "--format",

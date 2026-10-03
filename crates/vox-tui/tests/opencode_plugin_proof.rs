@@ -521,7 +521,12 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     //
     // This is not a workaround for a defect in the plugin. It reproduces the state
     // every real project is in by its second turn.
-    let (ok, plugin, err) = vox(&data, &cfg, &["agent", "plugin", "opencode"], None);
+    let (ok, plugin, err) = vox(
+        &data,
+        &cfg,
+        &["agent", "plugin", "opencode", "--node", "default"],
+        None,
+    );
     assert!(
         ok && plugin.contains("vox agent hook"),
         "PRODUCT: `vox agent plugin opencode` did not print the plugin: {err}"

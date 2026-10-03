@@ -126,7 +126,7 @@ impl Drop for AppServer {
 }
 
 /// Whether `command` is exactly Vox's drain hook: bare `vox`, or the absolute path of
-/// **this** `vox` (`this_exe`, canonicalised), then `agent hook`, then only `--room`,
+/// **this** `vox` (`this_exe`, canonicalised), then `agent hook`, then only `--node`, `--room`,
 /// `--session`, `--profile` (plain values) and `--format` — and nothing a shell would
 /// interpret.
 ///
@@ -158,7 +158,7 @@ pub fn is_vox_hook(command: &str, this_exe: Option<&std::path::Path>) -> bool {
         return false;
     }
     flags.chunks(2).all(|pair| match pair {
-        ["--room" | "--session" | "--profile", v] => plain(v),
+        ["--room" | "--session" | "--profile" | "--node", v] => plain(v),
         ["--format", v] => matches!(*v, "auto" | "claude" | "text"),
         _ => false,
     })

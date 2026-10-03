@@ -2858,6 +2858,31 @@ pub trait Dispatch: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = crate::node::daemonipc::DaemonFrame> + Send;
     /// A new subscription to the daemon's events.
     fn events(&self) -> tokio::sync::broadcast::Receiver<crate::node::daemonipc::DaemonEvent>;
+    /// Where the socket counts its open connections, if the daemon wants them counted (an
+    /// auto-started daemon exits once it has no node and no connection, ADR-026 L-8).
+    fn connections(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+        None
+    }
+}
+
+/// One counted connection: counted while it lives.
+struct Counted(Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>);
+
+impl Counted {
+    fn new(n: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>) -> Self {
+        if let Some(n) = &n {
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self(n)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        if let Some(n) = &self.0 {
+            n.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// Bind the account's one control socket at `path` (ADR-026 C-1): mode `0600`, every peer checked
@@ -2883,8 +2908,10 @@ pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> 
                 continue;
             }
             let dispatch = std::sync::Arc::clone(&dispatch);
+            let counted = Counted::new(dispatch.connections());
             tokio::spawn(async move {
                 let _ = serve_account(stream, dispatch).await;
+                drop(counted);
             });
         }
     });
@@ -4072,6 +4099,16 @@ impl IpcClient {
             })),
             DaemonFrame::Refused(r) => Ok(Err(r)),
             _ => Err(Error::Ipc(IpcHandshake::NotHello)),
+        }
+    }
+
+    /// Wait until the daemon ends this connection: it closed it, or said the node detached
+    /// (ADR-026 L-7). Only for a connection held without requests in flight.
+    pub async fn closed(&mut self) {
+        while let Ok(Some(body)) = read_frame(&mut self.stream).await {
+            if matches!(Frame::from_bytes(&body), Ok(Frame::NodeDetached { .. })) {
+                return;
+            }
         }
     }
 

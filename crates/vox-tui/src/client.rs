@@ -265,8 +265,7 @@ pub fn said(at: &NodeSocket, e: Error) -> AppError {
 /// Make sure the account's daemon is running (ADR-026 S-2), starting it with `listen` and
 /// `anchors` when none answers, and waiting for it within its bound.
 ///
-/// **The one place a client starts the daemon.** Until the daemon's own start lands (#405), a
-/// daemon that is not running is said, with how to start one.
+/// **The one place a client starts the daemon** (`vox daemon --detach`'s start, #405).
 ///
 /// # Errors
 /// If no daemon answers and none could be started.
@@ -275,14 +274,9 @@ pub async fn ensure_daemon(
     listen: SocketAddr,
     anchors: &[String],
 ) -> Result<(), AppError> {
-    let _ = (listen, anchors);
-    if DaemonClient::open(&account.socket()).await.is_ok() {
-        return Ok(());
-    }
-    Err(AppError::Usage(format!(
-        "no vox daemon is running for {}; start one: vox daemon",
-        account.data_root.display()
-    )))
+    crate::daemon_client::ensure_daemon(account, listen, anchors)
+        .await
+        .map(|_| ())
 }
 
 /// Warn when `--listen` asked for an address the running daemon does not listen on (ADR-026

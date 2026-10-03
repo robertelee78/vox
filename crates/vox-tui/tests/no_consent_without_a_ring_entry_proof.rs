@@ -507,7 +507,9 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         let n = count(&seen, "A118-");
         // What an agent of bob's is woken with: the drain hook, as a harness runs it.
         let (ok, drained, e) = bob.vox(
-            &["agent", "hook", "--room", room, "--format", "text"],
+            &[
+                "agent", "hook", "--node", "default", "--room", room, "--format", "text",
+            ],
             Some("{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"untrusted\"}"),
         );
         assert!(

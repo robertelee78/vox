@@ -24,6 +24,8 @@ pub mod cli;
 pub mod client;
 pub mod codex_trust;
 pub mod coord;
+pub mod daemon;
+pub mod daemon_client;
 pub mod doctor;
 pub mod host;
 pub mod ident;

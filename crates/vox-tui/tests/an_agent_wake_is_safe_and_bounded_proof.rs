@@ -181,6 +181,8 @@ fn drain(w: &Worker, r: &str, session: &str) -> String {
         &[
             "agent",
             "hook",
+            "--node",
+            "default",
             "--room",
             r,
             "--format",
@@ -304,7 +306,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
             ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
             ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
         ],
-        &["agent", "hook", "--room", r],
+        &["agent", "hook", "--node", "default", "--room", r],
         Some(r#"{"session_id":"session-bob","hook_event_name":"UserPromptSubmit"}"#),
     );
     // A session that has ended: its socket file is left behind, and nothing listens on it.
@@ -317,7 +319,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
             ("CLAUDE_CODE_MESSAGING_SOCKET", dead_s.as_str()),
             ("CLAUDE_CODE_MESSAGING_TOKEN", "dead-token"),
         ],
-        &["agent", "hook", "--room", r],
+        &["agent", "hook", "--node", "default", "--room", r],
         Some(r#"{"session_id":"session-dead","hook_event_name":"UserPromptSubmit"}"#),
     );
     assert_eq!(
@@ -343,7 +345,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         let o = hook(
             bob,
             &bob_env,
-            &["agent", "hook", "--room", r],
+            &["agent", "hook", "--node", "default", "--room", r],
             Some(
                 &serde_json::json!({"session_id": "session-bob",
                     "hook_event_name": "UserPromptSubmit", "prompt": prompt})
@@ -480,7 +482,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
             ("CLAUDE_CODE_MESSAGING_SOCKET", sock2_s.as_str()),
             ("CLAUDE_CODE_MESSAGING_TOKEN", "s2-token"),
         ],
-        &["agent", "hook", "--room", r],
+        &["agent", "hook", "--node", "default", "--room", r],
         Some(r#"{"session_id":"bob-s2","hook_event_name":"UserPromptSubmit"}"#),
     );
     assert_eq!(
@@ -513,7 +515,8 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     let own_woken = !own_c.is_empty()
         && own_c
             .iter()
-            .all(|c| c.contains("urgent message addressed to you from you in room"));
+            // One notice may count one or more of the three posts, as the sweep finds them.
+            .all(|c| c.contains("addressed to you from you in room"));
     let own_quiet = quiet.is_empty();
     let own_leak = own.iter().any(|f| f.contains("OWN-"));
     println!(
@@ -675,7 +678,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
                 ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
                 ("CLAUDE_CODE_MESSAGING_TOKEN", "ping-token"),
             ],
-            &["agent", "hook", "--room", r],
+            &["agent", "hook", "--node", "default", "--room", r],
             Some(&format!(
                 r#"{{"session_id":"{session}","hook_event_name":"UserPromptSubmit"}}"#
             )),
@@ -697,7 +700,9 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
                 ("CLAUDE_CODE_MESSAGING_SOCKET", ping_socks[i].as_str()),
                 ("CLAUDE_CODE_MESSAGING_TOKEN", "ping-token"),
             ],
-            &["agent", "hook", "--room", r, "--format", "text"],
+            &[
+                "agent", "hook", "--node", "default", "--room", r, "--format", "text",
+            ],
             Some(&format!(
                 r#"{{"session_id":"{}","hook_event_name":"UserPromptSubmit"}}"#,
                 ["ping-a", "ping-b"][i]
@@ -1156,7 +1161,7 @@ fn live(
     }
     // Vox's plugin, installed as a person installs it: it is what registers the session with
     // bob's daemon, and what relays the wake into it.
-    let plugin = bob.vox(None, &["agent", "plugin", "opencode"]);
+    let plugin = bob.vox(None, &["agent", "plugin", "opencode", "--node", "default"]);
     assert!(
         plugin.ok && plugin.stdout.contains("vox agent hook"),
         "PRODUCT (staging): vox agent plugin opencode: {plugin:?}"

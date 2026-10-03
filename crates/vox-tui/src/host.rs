@@ -63,6 +63,10 @@ pub struct Defaults {
     pub listen: String,
     /// How long a node's stop may take before it is left (the daemon's shutdown patience).
     pub patience: Duration,
+    /// Also serve each attached node's own control socket (`nodes/<name>/node.sock`), as the
+    /// clients before ADR-026's account socket expect. **Interim**: removed once every client
+    /// speaks to the account socket (#406, ADR-026 C-1 says per-node sockets MUST NOT exist).
+    pub node_sockets: bool,
 }
 
 /// The daemon's router. Cheap to clone; every clone is the same router.
@@ -81,6 +85,10 @@ struct Inner {
     stopping: AtomicBool,
     next_generation: AtomicU64,
     stop_asked: tokio::sync::Notify,
+    /// A node's stop that did not finish within the patience: the daemon's stop then says so.
+    unfinished_stop: AtomicBool,
+    /// Open connections to the account socket.
+    connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// One node's place in its life (L-1). A node with no slot is detached.
@@ -113,6 +121,8 @@ struct Attached {
     /// Turned `true` when its actor has ended, however.
     ended: watch::Receiver<bool>,
     fingerprint: Option<Digest32>,
+    /// The node's own control socket, while [`Defaults::node_sockets`] says to serve one.
+    _node_socket: Option<vox_core::node::ipc::IpcServer>,
 }
 
 /// How a node is wanted, and so how its attach counts.
@@ -217,6 +227,8 @@ impl Router {
                 stopping: AtomicBool::new(false),
                 next_generation: AtomicU64::new(1),
                 stop_asked: tokio::sync::Notify::new(),
+                unfinished_stop: AtomicBool::new(false),
+                connections: Arc::default(),
             }),
         }
     }
@@ -418,8 +430,24 @@ impl Router {
         }
     }
 
-    /// Detach every node, the daemon stopping (S-1): nothing attaches after this.
-    pub async fn stop_all(&self) {
+    /// The attached node `node`'s handle.
+    #[must_use]
+    pub fn handle_of(&self, node: &NodeName) -> Option<NodeHandle> {
+        match lock(&self.inner.slots).get(node) {
+            Some(Slot::Attached(a)) => Some(a.handle.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the daemon has no node in any state and no client connected (L-8).
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        lock(&self.inner.slots).is_empty() && self.inner.connections.load(Ordering::SeqCst) == 0
+    }
+
+    /// Detach every node, the daemon stopping (S-1): nothing attaches after this. Whether every
+    /// node's stop finished within the patience.
+    pub async fn stop_all(&self) -> bool {
         self.inner.stopping.store(true, Ordering::SeqCst);
         let names: Vec<NodeName> = lock(&self.inner.slots).keys().cloned().collect();
         let mut all = tokio::task::JoinSet::new();
@@ -433,6 +461,7 @@ impl Router {
             );
         }
         while all.join_next().await.is_some() {}
+        !self.inner.unfinished_stop.load(Ordering::SeqCst)
     }
 
     /// Attach every node the attach file keeps (L-4), each in the background: a client that asks
@@ -530,6 +559,14 @@ impl Router {
                                 .nodes_attached
                                 .fetch_add(1, Ordering::Relaxed);
                             let _ = tx.send(Some(Ok(())));
+                            eprintln!(
+                                "vox daemon: node {node} attached{}",
+                                if granted.info.implicit {
+                                    " (implicitly)"
+                                } else {
+                                    ""
+                                }
+                            );
                             let _ = self.inner.events.send(DaemonEvent::Attached {
                                 node: node.clone(),
                                 fingerprint,
@@ -609,10 +646,17 @@ impl Router {
             let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
         }
         let started = std::time::Instant::now();
+        let bind = (self.inner.defaults.bind)(node);
+        let bind_addr = match &bind {
+            Some(Bind::Addr(a)) => Some(*a),
+            _ => None,
+        };
         let (handle, actor) = loop {
-            let mut cfg = NodeConfig::new().anchors(set.clone());
-            if let Some(bind) = (self.inner.defaults.bind)(node) {
-                cfg = cfg.bind(bind);
+            let mut cfg = NodeConfig::new()
+                .anchors(set.clone())
+                .on_profile_wait(crate::tunnel_cli::say_waiting);
+            if let Some(bind) = &bind {
+                cfg = cfg.bind(bind.clone());
             }
             let p = paths.clone();
             let spawned = tokio::task::spawn_blocking(move || Node::spawn_supervised(p, cfg))
@@ -661,11 +705,26 @@ impl Router {
         )
         .await;
         if !outcome.is_done() {
+            let outcome_text = outcome.to_string();
             let refusal = match outcome {
                 Outcome::Failed(Fault::NoIdentity) => Refusal::NoIdentity { node: node.clone() },
                 Outcome::Failed(Fault::WrongPassphrase) => {
                     Refusal::WrongPassphrase { node: node.clone() }
                 }
+                // Unlocking brings the node onto the network, so a bind that fails fails here; it
+                // is named with the operating system's words (V210-134).
+                Outcome::Failed(fault) if fault.is_bind() => match bind_addr {
+                    Some(addr) => failed(format!(
+                        "cannot listen on {addr}: {}",
+                        crate::tunnel_cli::bind_failure(
+                            addr,
+                            crate::tunnel_cli::Socket::Udp,
+                            fault
+                        )
+                        .unwrap_or_default()
+                    )),
+                    None => failed(format!("could not unlock its identity: {outcome_text}")),
+                },
                 other => failed(format!("could not unlock its identity: {other}")),
             };
             stop_actor(&handle, ended.clone(), self.inner.defaults.patience).await;
@@ -684,6 +743,17 @@ impl Router {
             self.inner.defaults.anchor_specs.clone(),
         );
         let fingerprint = handle.view().identity.map(|i| i.fingerprint);
+        let node_socket = if self.inner.defaults.node_sockets {
+            match vox_core::node::ipc::bind(handle.clone(), &paths) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    stop_actor(&handle, ended.clone(), self.inner.defaults.patience).await;
+                    return Err(failed(format!("control socket: {e}")));
+                }
+            }
+        } else {
+            None
+        };
         Ok(Box::new(Attached {
             handle,
             paths,
@@ -696,6 +766,7 @@ impl Router {
             detached: watch::channel(false).0,
             ended,
             fingerprint,
+            _node_socket: node_socket,
         }))
     }
 
@@ -726,10 +797,21 @@ impl Router {
         cause: DetachCause,
     ) {
         let _ = a.detached.send(true);
+        // A panicked actor never ran its own stop (ADR-026 L-6): the presence takes the node off
+        // the exchange and closes its connections, and only its own (D-5).
+        if matches!(cause, DetachCause::Panicked(_)) {
+            if let (Some(fp), Some(Bind::Shared(presence))) =
+                (a.fingerprint, (self.inner.defaults.bind)(&node))
+            {
+                presence.evict(&fp);
+            }
+        }
         if let Some(tasks) = a.tasks.take() {
             tasks.stop().await;
         }
-        stop_actor(&a.handle, a.ended.clone(), self.inner.defaults.patience).await;
+        if !stop_actor(&a.handle, a.ended.clone(), self.inner.defaults.patience).await {
+            self.inner.unfinished_stop.store(true, Ordering::SeqCst);
+        }
         let forget_keep = matches!(cause, DetachCause::Requested) && a.keep.is_some();
         drop(a);
         lock(&self.inner.slots).remove(&node);
@@ -815,14 +897,19 @@ enum Step {
 
 /// Stop a node's actor within `patience`, and wait (within it) for its task to end, so its store
 /// and its directory lock are let go before its slot is freed.
-async fn stop_actor(handle: &NodeHandle, mut ended: watch::Receiver<bool>, patience: Duration) {
-    let _ = tokio::time::timeout(patience, async {
+async fn stop_actor(
+    handle: &NodeHandle,
+    mut ended: watch::Receiver<bool>,
+    patience: Duration,
+) -> bool {
+    tokio::time::timeout(patience, async {
         if !*ended.borrow() {
             let _ = handle.apply(NodeCommand::Shutdown).await;
         }
         let _ = ended.wait_for(|e| *e).await;
     })
-    .await;
+    .await
+    .is_ok()
 }
 
 fn cause_words(cause: &DetachCause) -> String {
@@ -987,6 +1074,10 @@ impl Dispatch for Router {
     fn events(&self) -> broadcast::Receiver<DaemonEvent> {
         self.inner.events.subscribe()
     }
+
+    fn connections(&self) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+        Some(Arc::clone(&self.inner.connections))
+    }
 }
 
 /// The router's lifecycle, in one process (ADR-026 §10 proofs 5 and 6, as far as they hold without
@@ -1043,6 +1134,7 @@ mod tests {
                 anchor_specs: Vec::new(),
                 listen: String::new(),
                 patience: Duration::from_secs(5),
+                node_sockets: false,
             },
         )
     }

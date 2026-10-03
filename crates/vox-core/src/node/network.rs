@@ -49,7 +49,7 @@ use crate::nat::service::{
     MembershipOracle, RecordKinds, RecordSet, RendezvousClient, RendezvousService,
 };
 use crate::nat::store::RendezvousStore;
-use crate::node::circuitstream::{self, CircuitLedger};
+use crate::node::circuitstream;
 use crate::node::coordstream;
 use crate::node::joinstream::{run_initiator, run_responder, JoinOutcome, ResponderConfig};
 use crate::node::net::{accept_authorized, ConnectionManager, PeerClass, PeerPolicy};
@@ -372,18 +372,11 @@ pub enum Inbound {
 /// The node's network surface.
 pub struct NodeNet {
     manager: Arc<ConnectionManager>,
-    /// The endpoints this node advertises, composed by the ADR-012 ladder's publish
-    /// side rather than taken from the bound socket — a node that binds the wildcard
-    /// has no single bound address to publish, and a node behind NAT needs its
-    /// *mapped* address. Refreshed by [`NodeNet::refresh_advertised`].
-    advertised: Mutex<Option<EndpointList>>,
-    /// What each connected peer reports as this node's source address (ADR-012 rung
-    /// 3's "observed address"). Kept per reporter, never published in a record: it is
-    /// what this node offers a peer to dial during a punch, and a lying peer should
-    /// cost a failed punch rather than a poisoned address record.
-    observed: Mutex<BTreeMap<Digest32, Multiaddr>>,
-    /// What this node is relaying for others (ADR-012 rung 4), so the caps hold.
-    circuits: Arc<CircuitLedger>,
+    /// The presence this node is on (ADR-026 D-3): what it advertises — composed by the ADR-012
+    /// ladder's publish side once for the presence, since every node on it publishes the same
+    /// ip:port (N-46) — the reflexive addresses peers report, and the one relay ledger, whose caps
+    /// hold across every node on it (N-45).
+    presence: Arc<crate::node::presence::NetPresence>,
     /// The peers a [`NodeNet::reach`] is under way to, each with what its waiters are woken by.
     /// **One ladder per peer at a time.** Two at once each raced a circuit through the same
     /// relay, and the far end keeps one circuit per peer: attaching the second closed the
@@ -455,7 +448,11 @@ impl NodeNet {
     /// Build the surface over a bound endpoint. The board it serves is fresh
     /// in-memory state (an anchor that persists a board is M15).
     #[must_use]
-    pub fn new(endpoint: Arc<VoxEndpoint>, clock: Clock) -> Self {
+    pub fn new(
+        endpoint: Arc<VoxEndpoint>,
+        presence: Arc<crate::node::presence::NetPresence>,
+        clock: Clock,
+    ) -> Self {
         let membership = SharedMembership::new();
         let service = RendezvousService::new(
             Arc::new(Mutex::new(RendezvousStore::new())),
@@ -464,9 +461,7 @@ impl NodeNet {
         );
         Self {
             manager: Arc::new(ConnectionManager::new(endpoint, Arc::clone(&clock))),
-            advertised: Mutex::new(None),
-            observed: Mutex::new(BTreeMap::new()),
-            circuits: Arc::new(CircuitLedger::default()),
+            presence,
             reaching: Mutex::new(HashMap::new()),
             status: Mutex::new(None),
             service,
@@ -556,7 +551,7 @@ impl NodeNet {
         if let Some(list) = test_advertise() {
             return Ok(list);
         }
-        if let Some(list) = lock(&self.advertised).clone() {
+        if let Some(list) = self.presence.advertised_now() {
             return Ok(list);
         }
         // Before the ladder has run there is nothing discovered to report, and the **bind**
@@ -581,24 +576,10 @@ impl NodeNet {
         EndpointList::new(vec![crate::nat::multiaddr::Multiaddr::from(addr)])
     }
 
-    /// Run the ladder's publish side and cache what this node should advertise: its
-    /// routable addresses (both families, IPv6 first), a gateway-mapped address when
-    /// one can be had, and loopback. Returns every port mapping or IPv6 pinhole a
-    /// gateway granted, so the caller can renew them before they expire.
-    ///
-    /// Best-effort by design: a node with no dialable address is not broken. It still
-    /// reaches peers outbound and is reached through the ladder's later rungs, which
-    /// is the ordinary case for a client inside a private network.
-    pub async fn refresh_advertised(
-        &self,
-        leased: &[crate::nat::portmap::PortMapping],
-    ) -> Vec<crate::nat::portmap::PortMapping> {
-        let Ok(bound) = self.manager.endpoint().local_addr() else {
-            return Vec::new();
-        };
-        let (list, mappings) = crate::nat::reachability::advertise_endpoints(bound, leased).await;
-        *lock(&self.advertised) = Some(list);
-        mappings
+    /// The presence this node is on.
+    #[must_use]
+    pub fn presence(&self) -> &Arc<crate::node::presence::NetPresence> {
+        &self.presence
     }
 
     fn now(&self) -> u64 {
@@ -889,7 +870,7 @@ impl NodeNet {
                     send,
                     recv,
                     move |p| manager.existing(p),
-                    &self.circuits,
+                    self.presence.ledger(),
                     self.manager.endpoint(),
                 )
                 .await?;
@@ -912,7 +893,7 @@ impl NodeNet {
     /// How many circuits this node is relaying for others right now.
     #[must_use]
     pub fn relaying(&self) -> usize {
-        self.circuits.carrying()
+        self.presence.ledger().carrying()
     }
 
     /// Ask `peer` what source address it sees for this node and remember the answer
@@ -923,7 +904,7 @@ impl NodeNet {
             .existing(&peer)
             .ok_or(Error::Unreachable("no connection to ask"))?;
         let addr = coordstream::ask_observed(&conn).await?;
-        lock(&self.observed).insert(peer, addr);
+        self.presence.note_observed(self.local_id(), peer, addr);
         Ok(addr)
     }
 
@@ -933,17 +914,7 @@ impl NodeNet {
     /// work — it fails honestly rather than silently dialling the wrong port.
     #[must_use]
     pub fn observed_addr(&self) -> Option<Multiaddr> {
-        // A handful of reporters at most, so a scan beats keeping an ordered index
-        // (`Multiaddr` is deliberately not `Ord` — its ordering is preference, not
-        // value).
-        let mut tally: Vec<(Multiaddr, usize)> = Vec::new();
-        for addr in lock(&self.observed).values() {
-            match tally.iter_mut().find(|(a, _)| a == addr) {
-                Some((_, n)) => *n += 1,
-                None => tally.push((*addr, 1)),
-            }
-        }
-        tally.into_iter().max_by_key(|(_, n)| *n).map(|(a, _)| a)
+        self.presence.observed_addr()
     }
 
     /// The agreed observed address, asking `coordinator` if no peer has reported one
@@ -957,7 +928,7 @@ impl NodeNet {
 
     /// Forget what a peer reported (its connection is gone).
     pub fn forget_observed(&self, peer: &Digest32) {
-        lock(&self.observed).remove(peer);
+        self.presence.forget_observed(&self.local_id(), peer);
     }
 
     /// Discard every cached reflexive address, so the next punch asks again.
@@ -973,7 +944,7 @@ impl NodeNet {
     /// assumption that conditions have changed. tailscale re-STUNs on a timer and on link
     /// change for the same reason (`magicsock.go`'s `periodicReSTUN`).
     pub fn refresh_observed(&self) {
-        lock(&self.observed).clear();
+        self.presence.refresh_observed();
     }
 
     /// Reach `peer` by whatever rung lands **first** (M15.1b, relay-first / upgrade-

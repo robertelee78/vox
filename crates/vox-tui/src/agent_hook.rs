@@ -1061,6 +1061,7 @@ fn emit(format: Format, raw_input: &str, event: &str, context: &str) {
 /// holds** (V210-163): an agent is its node, and hears what its node hears.
 pub async fn run(
     paths: &Paths,
+    daemon: &Daemon,
     room_arg: Option<&str>,
     format: Format,
     session: Option<&str>,
@@ -1089,13 +1090,17 @@ pub async fn run(
             return Ok(());
         }
         "SessionEnd" => {
-            crate::wake::end(paths, &input.session_id);
+            daemon.session_end(paths, &input.session_id).await;
             return Ok(());
         }
         _ => {}
     }
 
-    if let Err(e) = drain(paths, room_arg, &input, &raw, format).await {
+    let drained = match daemon.register(&input).await {
+        Ok(()) => drain(paths, room_arg, &input, &raw, format).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = drained {
         // Report and carry on: a hook must never break the turn it rides on. **But say so to
         // the agent too, in one line** (V210-163): on stderr alone, an agent whose node was down
         // heard nothing and could not tell that from a quiet room.
@@ -1111,6 +1116,72 @@ pub async fn run(
         );
     }
     Ok(())
+}
+
+/// The daemon a hook speaks to, and the node it acts as (ADR-020 6.10, ADR-026 L-2, L-3).
+pub struct Daemon {
+    /// The account whose daemon it is.
+    pub account: vox_core::node::paths::Account,
+    /// The hook's `--node`.
+    pub node: vox_core::node::paths::NodeName,
+    /// Where a daemon this hook starts listens.
+    pub listen: std::net::SocketAddr,
+    /// The anchors a daemon this hook starts, or the node it attaches, is given.
+    pub anchors: Vec<String>,
+}
+
+impl Daemon {
+    /// Register this turn's session in the daemon, starting the daemon if none runs: the session
+    /// then holds the hook's node, which the daemon attaches if it is not attached, with the
+    /// identity passphrase from `VOX_IDENTITY_PASSPHRASE` (resolved here, never by the daemon,
+    /// ADR-026 C-6). How the harness can wake the session is read from this process's
+    /// environment, which is the harness's, and stored by the daemon.
+    async fn register(&self, input: &HookInput) -> Result<(), AppError> {
+        use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+        crate::daemon_client::ensure_daemon(&self.account, self.listen, &self.anchors).await?;
+        let record = crate::wake::Session::from_env(&input.session_id, input.codex);
+        let record = serde_json::to_string(&record)
+            .map_err(|e| AppError::Usage(format!("the session's record: {e}")))?;
+        let mut d = DaemonClient::open(&self.account.socket())
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?;
+        let passphrase = std::env::var("VOX_IDENTITY_PASSPHRASE")
+            .ok()
+            .map(zeroize::Zeroizing::new);
+        match d
+            .request(DaemonRequest::SessionRegister {
+                node: self.node.clone(),
+                session: input.session_id.clone(),
+                record,
+                passphrase,
+                anchors: self.anchors.clone(),
+            })
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
+        {
+            DaemonFrame::Attached(_) => Ok(()),
+            DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string())),
+            other => Err(AppError::Usage(format!("unexpected answer: {other:?}"))),
+        }
+    }
+
+    /// `SessionEnd`: the daemon unregisters the session, and detaches the node if that was its
+    /// last holder, in one decision (L-3). With no daemon running there is nothing it holds, and
+    /// the record is removed here.
+    async fn session_end(&self, paths: &Paths, session: &str) {
+        use vox_core::node::daemonipc::{DaemonClient, DaemonRequest};
+        match DaemonClient::open(&self.account.socket()).await {
+            Ok(mut d) => {
+                let _ = d
+                    .request(DaemonRequest::SessionEnd {
+                        node: self.node.clone(),
+                        session: session.to_owned(),
+                    })
+                    .await;
+            }
+            Err(_) => crate::wake::end(paths, session),
+        }
+    }
 }
 
 /// An error's text on one line, for the one line the agent is told.
@@ -1224,15 +1295,9 @@ async fn drain(
     raw_input: &str,
     format: Format,
 ) -> Result<(), AppError> {
-    let sock = paths.socket_file();
-    if !sock.exists() {
-        return Err(AppError::Usage(
-            "no node is running for this profile, so there is nothing to read".into(),
-        ));
-    }
-    let mut client = IpcClient::open(&sock)
-        .await
-        .map_err(|e| AppError::Usage(e.to_string()))?;
+    // Over the account socket as this node, which the session's registration attached (ADR-026
+    // C-1, N-6): never attaching anything itself.
+    let mut client = crate::client::open(&crate::client::one_shot(paths)?).await?;
     let me = client.me();
     if me.is_none() {
         return Err(AppError::Usage(
@@ -1255,12 +1320,6 @@ async fn drain(
         }
         None => rooms,
     };
-
-    // Record how this session can be woken, while we are here and know both the
-    // session id and what the harness put in our environment (ADR-020 §6). It is a
-    // side effect of the drain rather than a step an operator configures, and the
-    // next turn rewrites it, so a stale entry corrects itself.
-    crate::wake::register(paths, &input.session_id, input.codex);
 
     let mut drains = Vec::new();
     // **One room that cannot be read does not silence the others** (V210-163): it is named,
