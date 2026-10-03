@@ -439,7 +439,7 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
             check(
                 &mut failures,
                 at.is_some_and(|s| s <= WITHIN.as_secs_f64())
-                    && text.contains("1 urgent message addressed to your node from alice")
+                    && text.contains("1 urgent message addressed to you from alice")
                     && auth_ok,
                 format!(
                     "PRODUCT (1) round {n}: {who} must be woken within {} s of alice's post, by a \
