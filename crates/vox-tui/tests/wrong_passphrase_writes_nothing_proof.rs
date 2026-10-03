@@ -209,12 +209,14 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
         refused += 1;
         eprintln!("[{name}] refused; store.redb byte-identical, mtime unchanged");
     }
-    // `vox daemon` reads its passphrase on stdin rather than from the environment.
+    // `vox daemon` is given the wrong passphrase where it reads one with no terminal: from
+    // VOX_IDENTITY_PASSPHRASE (v0.2.10: it never reads stdin unasked). Given the right one there
+    // and the wrong one on stdin, it unlocked and ran until the watchdog.
     let (ok, said) = vox(
         &dir,
-        IDPASS,
+        "not the passphrase",
         &["daemon", "--listen", "127.0.0.1:0"],
-        "not the passphrase\n",
+        "",
     );
     assert!(
         !ok,
@@ -242,6 +244,7 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", &dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
         .env_remove("VOX_ROOM")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -250,13 +253,8 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
         ))
         .spawn()
         .expect("APPARATUS: could not spawn `vox daemon`");
-    let mut pipe = daemon
-        .stdin
-        .take()
-        .expect("APPARATUS: the daemon's stdin was not piped");
-    pipe.write_all(format!("{IDPASS}\n").as_bytes())
-        .expect("PRODUCT (staging): vox exited without reading its stdin (could not write the daemon's passphrase to its stdin)");
-    drop(pipe);
+    // Its passphrase is in its environment; stdin stays open and unread, as under a supervisor.
+    let _stdin = daemon.stdin.take();
     // Read its stdout on a thread, so a daemon that stays up and silent is bounded by the
     // deadline here, not by the watchdog.
     let out = daemon

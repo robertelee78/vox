@@ -352,6 +352,8 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
     // C first, and consent to it confirmed before anything is posted: C must be able to read
     // what it carries here, which is how this setup knows C has it.
     ok(&k.a, &["trust", "add", &k.fps[2], "--name", "c"], "");
+    // Trust runs one way (V210-161): C reads A only once it trusts A too.
+    ok(&k.c, &["trust", "add", &k.fps[0], "--name", "a"], "");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         ok(&k.a, &["room", "post", &k.room, "r11-warm-up"], "");
@@ -646,6 +648,8 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
     let a = Daemon::start("a", &k.a);
     join(&k.a);
     ok(&k.a, &["trust", "add", &k.fps[2], "--name", "c"], "");
+    // Trust runs one way (V210-161): C reads A only once it trusts A too.
+    ok(&k.c, &["trust", "add", &k.fps[0], "--name", "a"], "");
     let warmed = |dir: &std::path::Path, tag: &str| {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {

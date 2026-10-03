@@ -461,15 +461,18 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         );
     }
 
-    // `vox room read` says it, by the short id its rows use.
+    // `vox room read` says it, naming the member as its rows do: by the reader's own name for it,
+    // or by 26 characters of its fingerprint when the reader has none (V210-162).
     let short = |f: &str| f.chars().take(26).collect::<String>();
     for (who, d) in [("bob", &bob_dir), ("carol", &carol_dir)] {
         let (_, r, _) = vox_once(d, &args(&["room", "read", &room]));
         for (name, f) in [("eve", &eve_fp), ("frank", &frank_fp)] {
             let said = r.lines().any(|l| {
-                l.starts_with("! ")
-                    && l.contains(&short(f))
-                    && l.contains("signed two different messages at the same place")
+                let Some(rest) = l.strip_prefix("! ") else {
+                    return false;
+                };
+                (rest.starts_with(&format!("{name} ")) || rest.starts_with(&short(f)))
+                    && rest.contains("signed two different messages at the same place")
             });
             assert!(
                 said,

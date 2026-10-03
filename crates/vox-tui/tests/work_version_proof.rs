@@ -82,7 +82,13 @@ fn refused_naming(o: &Out, who: &Worker, what: &str) {
         Some(3),
         "PRODUCT: a version refusal must exit 3: {o:?}"
     );
-    for needle in [&who.b32()[..12], what, &format!("required {VERSION}")] {
+    // The reader (alice, always) names the worker by her own name for it, the one `vox trust
+    // add --name` gave (V210-162), not by a fingerprint prefix.
+    for needle in [
+        &format!("worker {} session", who.name),
+        what,
+        &format!("required {VERSION}"),
+    ] {
         assert!(
             o.stderr.contains(needle),
             "PRODUCT: the refusal must name {needle:?}: {}",
@@ -211,7 +217,8 @@ fn a_worker_on_another_version_is_refused_by_name() {
         ],
     );
     assert!(
-        hook.stdout.contains("work coordination refused") && hook.stdout.contains(&bob.b32()[..12]),
+        hook.stdout.contains("work coordination refused")
+            && hook.stdout.contains(&format!("worker {} session", bob.name)),
         "PRODUCT: the drain hook must say it plainly: {hook:?}"
     );
 

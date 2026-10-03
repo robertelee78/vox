@@ -27,9 +27,11 @@
 //! 6. **the same rows logged in different orders fold to the same board.** Each node logs
 //!    its own post when it is made and a peer's when it arrives, so two claims of one item
 //!    made while the nodes cannot reach each other sit in opposite local orders: bob's
-//!    daemon is stopped (SIGSTOP) while alice claims, alice's and the anchor's (it holds
-//!    the room's entries too) while bob claims, then all resume. The earlier claim must
-//!    hold on both nodes. Precondition (else APPARATUS, CANNOT MEASURE): `room read
+//!    daemon is down while alice claims, then alice's and the anchor's (it holds the room's
+//!    entries too) are stopped (SIGSTOP) while bob's restarts and bob claims, then all
+//!    resume. Each claim is posted and
+//!    told it is not agreed yet, since the other member cannot be reached (V210-168). The
+//!    earlier claim must hold on both nodes. Precondition (else APPARATUS, CANNOT MEASURE): `room read
 //!    --json` shows the two claims in different orders on the two nodes — without that,
 //!    a fold in local order and the canonical fold give the same board.
 //!
@@ -153,9 +155,10 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         .build()
         .expect("APPARATUS: could not build the test's tokio runtime");
     let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temp dir");
-    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let mut room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
-    let r = room.id.as_str();
+    let room_id = room.id.clone();
+    let r = room_id.as_str();
     let (a_fp, b_fp) = (alice.b32(), bob.b32());
     let b_prefix = &b_fp[..16];
 
@@ -387,25 +390,34 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     }
 
     // ---- (6) the same claims, logged in opposite orders, fold to one board ----
+    // Bob's daemon is **down**, not frozen, while alice claims: since a claim asks every member
+    // to agree (V210-168), alice sends it to bob at once, and a frozen bob found it waiting in
+    // his socket when he resumed and logged it before his own, so both orders were the same.
     let alice_d = alice
         .daemon_pid()
         .expect("APPARATUS: the harness has no pid for alice's daemon");
-    let bob_d = bob
-        .daemon_pid()
-        .expect("APPARATUS: the harness has no pid for bob's daemon");
     let anchor_d = room.anchor_pid();
-    signal(bob_d, "-STOP", "bob's daemon");
+    room.stop(1);
+    let alice = &room.workers[0];
     let first = alice.vox(Some("a1"), &["room", "claim", r, "h-order"]);
     // The anchor holds the room's entries too, and would serve bob alice's claim.
     signal(alice_d, "-STOP", "alice's daemon");
     signal(anchor_d, "-STOP", "the anchor");
-    signal(bob_d, "-CONT", "bob's daemon");
+    room.restart(1);
+    let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let second = bob.vox(Some("b1"), &["room", "claim", r, "h-order"]);
     signal(alice_d, "-CONT", "alice's daemon");
     signal(anchor_d, "-CONT", "the anchor");
+    // Bob is stopped, so alice's claim cannot be agreed: it is posted, and she is told it is not
+    // sure to be hers rather than "you hold" (V210-168: a member who cannot be reached is said,
+    // never answered as success). Posted is what this case needs: the fold below orders it.
     assert!(
-        first.ok && first.stdout.contains("you hold h-order"),
-        "PRODUCT: alice/a1 claimed h-order first, with nobody else claiming it: {first:?}"
+        first.code == Some(5)
+            && first.stderr.contains("h-order is not agreed yet")
+            && first.stderr.contains("could not be reached")
+            && first.stderr.contains("Your claim is posted"),
+        "PRODUCT: alice/a1's claim of h-order, made while bob's daemon was stopped, must be posted \
+         and answered \"not agreed yet\" (exit 5) naming the member it could not reach: {first:?}"
     );
     let orders: Vec<Vec<(String, String, u64)>> = [alice, bob]
         .iter()

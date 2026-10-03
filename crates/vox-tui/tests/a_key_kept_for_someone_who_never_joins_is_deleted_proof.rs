@@ -193,13 +193,15 @@ fn readings_over(dir: &Path, secs: u64) -> Vec<Option<u64>> {
 fn a_key_kept_for_someone_who_never_joins_is_deleted_after_thirty_days() {
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap();
-    let (alice, _) = identity(tmp.path(), "alice");
+    let (alice, alice_fp) = identity(tmp.path(), "alice");
     let (bob, bob_fp) = identity(tmp.path(), "bob");
     // Dave is an identity and nothing more: no daemon, never joins.
     let (_dave, dave_fp) = identity(tmp.path(), "dave");
     // Trusted before the room exists: every generation of it is dave's to be released.
     trust(&alice, &dave_fp, "dave");
     trust(&alice, &bob_fp, "bob");
+    // Trust runs one way (V210-161): bob reads alice only once he trusts alice too.
+    trust(&bob, &alice_fp, "alice");
 
     let a = daemon(&alice, "alice", 0);
     let _b = daemon(&bob, "bob", 0);
