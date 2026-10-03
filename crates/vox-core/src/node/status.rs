@@ -132,6 +132,8 @@ pub struct PeerStatus {
     pub rtt_ms: u64,
     /// This connection's datagram counters.
     pub datagrams: DatagramStats,
+    /// The TLS key-exchange group its handshake negotiated, as rustls observed it (V030-33).
+    pub tls_group: u16,
 }
 
 /// A local port forwarded to a member's service (the dial side): a door, which carries a tunnel
@@ -174,6 +176,8 @@ pub struct StatusReport {
     pub datagrams: DatagramStats,
     /// The app layer's counters.
     pub app: AppStats,
+    /// Every live UDP flow, hosted or dialled, with its own counters (ADR-022 6.9, V030-34).
+    pub udp_flows: Vec<crate::tunnel::udp::FlowInfo>,
     /// What needs looking at.
     pub unhealthy: Vec<Unhealthy>,
 }
@@ -296,11 +300,12 @@ impl StatusReport {
         let _ = write!(j, "\"rooms\":[{}],", list(rooms));
         let peers = self.peers.iter().map(|p| {
             format!(
-                "{{\"id\":{},\"path\":{},\"relay\":{},\"rtt_ms\":{},\"datagrams\":{}}}",
+                "{{\"id\":{},\"path\":{},\"relay\":{},\"rtt_ms\":{},\"tls_group\":{},\"datagrams\":{}}}",
                 q(&b32_encode(&p.id)),
                 q(p.path),
                 p.relay.map_or("null".into(), |d| q(&b32_encode(&d))),
                 p.rtt_ms,
+                q(&format!("{:?}", rustls::NamedGroup::from(p.tls_group))),
                 dgram_json(&p.datagrams)
             )
         });
@@ -331,6 +336,21 @@ impl StatusReport {
             a.refused_locally,
             a.withdrawn
         );
+        // **Each UDP flow apart** (ADR-022 6.9, V030-34): the summed datagram counters above
+        // cannot say which flow lost what, and a flow's own counts are what a person checks
+        // against the packets their program sent.
+        let flows = self.udp_flows.iter().map(|f| {
+            format!(
+                "{{\"peer\":{},\"service\":{},\"to\":{},\"from\":{},\"dropped\":{},\"idle_ms\":{}}}",
+                q(&b32_encode(&f.peer)),
+                q(&f.label),
+                f.to_peer,
+                f.from_peer,
+                f.dropped,
+                u64::try_from(f.idle.as_millis()).unwrap_or(u64::MAX)
+            )
+        });
+        let _ = write!(j, "\"udp_flows\":[{}],", list(flows));
         let _ = write!(
             j,
             "\"unhealthy\":[{}]",
@@ -448,6 +468,46 @@ impl StatusReport {
             "Local forwards to members' services.",
             vec![(String::new(), self.forwards.len() as u64)],
         );
+        gauge(
+            "vox_udp_flows",
+            "Live UDP flows, hosted or dialled.",
+            vec![(String::new(), self.udp_flows.len() as u64)],
+        );
+        // Per flow (ADR-022 6.9, V030-34). Counters of a live flow: a flow that ends leaves the
+        // listing, as a tunnel does.
+        let flow_labels = |f: &crate::tunnel::udp::FlowInfo| {
+            format!(
+                "{{peer=\"{}\",service=\"{}\"}}",
+                b32_encode(&f.peer),
+                f.label
+            )
+        };
+        for (name, help, read) in [
+            (
+                "vox_udp_flow_to_peer",
+                "Packets this UDP flow put on its tunnel toward the peer.",
+                (|f: &crate::tunnel::udp::FlowInfo| f.to_peer) as fn(&_) -> u64,
+            ),
+            (
+                "vox_udp_flow_from_peer",
+                "Packets this UDP flow delivered from the peer to the local UDP side.",
+                |f| f.from_peer,
+            ),
+            (
+                "vox_udp_flow_dropped",
+                "Packets this UDP flow dropped because the local socket or its queue was full.",
+                |f| f.dropped,
+            ),
+        ] {
+            gauge(
+                name,
+                help,
+                self.udp_flows
+                    .iter()
+                    .map(|f| (flow_labels(f), read(f)))
+                    .collect(),
+            );
+        }
         gauge(
             "vox_unhealthy",
             "Lines `vox status` flags as needing attention.",
