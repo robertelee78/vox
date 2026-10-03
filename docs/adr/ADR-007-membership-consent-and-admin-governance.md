@@ -45,8 +45,8 @@ only room governance is who sets the room's retention. This builds on identity (
   certificate MUST carry `policy` only, never `admin` (#319). The creator or an admin MAY end the room
   for everyone (`vox room end`, a room-lifecycle fact `0x0019`); every member's node then deletes it
   (ADR-023 RL-8.2).
-- **G-6.** The only governance act MUST be setting the room's retention (the policy-update `ttl`), and
-  only the creator or an admin it delegated MAY do it. The capabilities are `admin` and `policy`; every
+- **G-6.** The only governance acts MUST be setting the room's retention (the policy-update `ttl`) and
+  ending the room (G-5), and only the creator or an admin it delegated MAY do either. The capabilities are `admin` and `policy`; every
   other capability token (`delegate`, `invite`, `passphrase-rotate`, `#role`, `bind:`, `dial:`) MUST be
   refused as unknown. Policy updates beyond retention, passphrase rotation, invite modes and the
   capability lattice are removed (#380; `bind:`/`dial:` under #94, see Status).

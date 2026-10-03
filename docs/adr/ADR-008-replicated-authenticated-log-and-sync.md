@@ -16,8 +16,8 @@ obligation (LS-20) is unmet.
 Vox carries asynchronous and interactive messaging over one replicated, authenticated message store
 (ADR-001). The store has to replicate ciphertext a node cannot decrypt without rendering it, keep
 integrity and causal order, let retention drop bodies (ADR-010, ADR-023), and carry governance state
-consistently under partition. The decider asked for something "blockchain-like", but for the right
-primitive, not a consensus blockchain. Messaging needs per-feed integrity and a causal merge, which a
+consistently under partition. The integrity wanted is blockchain-like, from the right primitive, not a
+consensus blockchain. Messaging needs per-feed integrity and a causal merge, which a
 CRDT-style DAG gives with strong eventual consistency and availability under partition, with no
 consensus (shown for the Matrix Event Graph, arXiv 2011.06488). That result assumes
 honest-but-unreliable replicas. Resistance to adversarial authors (equivocation, Sybil, withholding)
@@ -136,7 +136,7 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
   | `0x0007` | rendezvous-record | `vox/rendezvous-record/v1` | ADR-012 |
   | `0x0008` | pre-join-record | `vox/pre-join-record/v1` | ADR-012 |
   | `0x0009` | tls-identity-extension | `vox/tls-identity-extension/v1` | ADR-011 |
-  | `0x000A` | chunk-manifest | `vox/chunk-manifest/v1` | ADR-014 |
+  | `0x000A` | chunk-manifest | `vox/chunk-manifest/v1` | ADR-020 §11.1 (reserved, not implemented) |
   | `0x000B` | dgka-setup (removed) | `vox/dgka-setup/v1` | ADR-009 |
   | `0x000C` | self-channel-entry | `vox/self-channel-entry/v1` | ADR-008 |
   | `0x000D` | genesis-record | `vox/genesis/v1` | ADR-007 |
@@ -225,7 +225,7 @@ PRD-001 R5.
   - keep the proof durably, and re-verify it when the room opens (`SEG_FORKS`,
     `Dag::restore_fork`);
   - surface it in `vox status --json` (`equivocations`), in `vox room read`, and in the TUI's notice
-    line, in the decider's wording: "<name> signed two different messages at the same place in this
+    line, in these words: "<name> signed two different messages at the same place in this
     room (their message <seq>). Their later messages are held back."
   - record the proof as a room entry. *Status:* planned; no entry type exists.
 
@@ -340,21 +340,6 @@ ADR-023 decision 3 (M23.6).
 - The self-channel has no runtime (LS-43).
 - No golden vectors or interop bytes exist (LS-20).
 - The drain bound is 30 s plus one frame timeout (LS-30).
-
-Fixed since the old text, with evidence:
-- A fork below the remote's head surfaced only as a `prev_hash` failure: b38b2502 (V210-63, #252),
-  proof `an_equivocation_is_detected_and_said_proof`.
-- Fork proofs lived only in memory: kept in `SEG_FORKS` and restored on open (b38b2502).
-- Every transport failure was reported as `0x01`: `0x09` (58d95706, M15.2c).
-- A session held the room's lock across network waits: 3f95b576.
-- The first entry from an unadmitted author killed the session: it is counted and skipped
-  (d635846e, ADR-025).
-- Governance entries received by sync got the content fork remedy (`kind_for` defaulted to
-  `Content`): closed in M14.6 by `ChannelAuthors`; since deniable mode was removed (b0f82185, R43)
-  every entry gets the attributable remedy.
-- The authenticator type sat outside the signed skeleton and `algo_ids[0]` was pinned to the
-  composite ID even for deniable entries: deniable mode is removed (b0f82185), and type `2` is
-  refused.
 
 ## Consequences
 
