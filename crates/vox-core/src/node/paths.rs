@@ -113,10 +113,9 @@ impl NodeName {
         if folded.is_empty() || folded.len() > NODE_NAME_MAX {
             return bad(format!("must be 1 to {NODE_NAME_MAX} bytes long"));
         }
-        if let Some(c) = folded
-            .chars()
-            .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')))
-        {
+        if let Some(c) = folded.chars().find(|c| {
+            !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        }) {
             return bad(format!(
                 "holds {c:?}; a node name is letters a-z, digits, '.', '_' and '-'"
             ));
@@ -622,7 +621,8 @@ pub fn socket_path_in(dir: &Path, file: &str) -> PathBuf {
 /// own path is too long (the migration removes a stale one).
 #[must_use]
 pub(crate) fn fallback_socket_for(dir: &Path) -> PathBuf {
-    let digest = crate::hash::domain_hash("vox/control-socket/v1", dir.as_os_str().as_encoded_bytes());
+    let digest =
+        crate::hash::domain_hash("vox/control-socket/v1", dir.as_os_str().as_encoded_bytes());
     let mut name = String::new();
     for byte in &digest[..8] {
         use std::fmt::Write as _;

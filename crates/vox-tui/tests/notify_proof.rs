@@ -7,9 +7,10 @@
 //! `vox room create`, `vox room invite` and `vox room join`. What the proof reads is what a
 //! person can read: `vox status --json`, and what the daemon prints.
 //!
-//! alice's daemon runs with `VOX_NOTIFY_COMMAND` pointed at a script that appends each
-//! notification to a file, so what is counted is the shipped binary's own decision to
-//! notify. Kill bob: exactly one "unreachable" notification. Leave him dead for three
+//! alice's node is set (`notify-command` in its own `config/config`, ADR-026 F-2) to hand
+//! each notification to a script that appends it to a file, so what is counted is the
+//! shipped binary's own decision to notify. Kill bob: exactly one "unreachable"
+//! notification. Leave him dead for three
 //! minutes: still exactly one. Start him again: exactly one "recovered".
 //!
 //! The anchor's proof stages the other condition R37 names, an anchor that cannot be reached,
@@ -357,7 +358,19 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
         bob_port,
         bob_id,
         pass_file,
-    } = scene(&tmp, &[("VOX_NOTIFY_COMMAND", script)], |_| {});
+    } = scene(&tmp, &[], |alice_dir| {
+        // A setting of alice's node (ADR-026 F-2, #399), not of her daemon's environment: its
+        // own `config/config`, which a node of several on one daemon keeps to itself.
+        let own = Paths::resolve("default", Some(alice_dir), Some(&alice_dir.join("cfg")))
+            .expect("APPARATUS: alice's node paths")
+            .own_config_path("config")
+            .expect("APPARATUS: alice's node config directory");
+        std::fs::write(
+            own,
+            format!("# set by the proof\nnotify-command = {script}\n"),
+        )
+        .expect("APPARATUS: write alice's node config");
+    });
     let bob_short: String = bob_id.chars().take(12).collect();
 
     // Two checks' worth, so a notification for a healthy state would have fired by now.

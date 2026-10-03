@@ -13504,9 +13504,12 @@ impl Node {
             let own = (ttl != room).then_some(ttl);
             // Written to the node's own file (ADR-026 F-2), seeded from the account's when the
             // node has none, so the other rooms' lines it was reading are kept.
-            let written = self.paths.own_config_path(crate::node::paths::RETENTION_FILE).and_then(
-                |file| crate::node::retention::RetentionConfig::write_room(&file, channel_id, own),
-            );
+            let written = self
+                .paths
+                .own_config_path(crate::node::paths::RETENTION_FILE)
+                .and_then(|file| {
+                    crate::node::retention::RetentionConfig::write_room(&file, channel_id, own)
+                });
             if written.is_err() {
                 return Outcome::Failed(Fault::Storage);
             }

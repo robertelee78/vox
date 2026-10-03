@@ -15,7 +15,7 @@
 //! file and a `node.sock` as a release from v0.2.10 leaves them (v0.2.9 wrote neither; the port is
 //! one this proof found free).
 //!
-//! **What is asserted**, each as a person sees it (`PRODUCT:` otherwise):
+//! **What is asserted**, each as a person sees it (`PRODUCT:` otherwise), the layout last:
 //! - the first command of this build (`vox id`) moves every profile under `nodes/`: `default`,
 //!   `anchor`, `both`, and `both`'s anchor key into `both-anchor`; nothing is left where it was,
 //!   the stale `node.sock` is gone, and `.daemon/port` holds `default`'s port;
@@ -88,7 +88,8 @@ impl Proc {
             .unwrap_or_else(|e| panic!("APPARATUS: spawn {name}: {e}"));
         let out = Arc::new(Mutex::new(Vec::new()));
         for pipe in [
-            Box::new(child.stdout.take().expect("APPARATUS: stdout")) as Box<dyn std::io::Read + Send>,
+            Box::new(child.stdout.take().expect("APPARATUS: stdout"))
+                as Box<dyn std::io::Read + Send>,
             Box::new(child.stderr.take().expect("APPARATUS: stderr")),
         ] {
             let lines = Arc::clone(&out);
@@ -146,7 +147,14 @@ impl Drop for Proc {
 
 /// A one-shot verb that must succeed (a red labelled `side` otherwise): its stdout, and its
 /// stderr.
-fn ok(side: &str, exe: &Path, root: &Root, profile: &str, argv: &[&str], stdin: &str) -> (String, String) {
+fn ok(
+    side: &str,
+    exe: &Path,
+    root: &Root,
+    profile: &str,
+    argv: &[&str],
+    stdin: &str,
+) -> (String, String) {
     let mut child = cmd(exe, root, profile, argv)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -186,9 +194,13 @@ fn fingerprint(side: &str, exe: &Path, root: &Root, profile: &str) -> String {
 /// The identity a `vox node` says it runs as.
 fn anchor_fingerprint(side: &str, exe: &Path, root: &Root, profile: &str) -> String {
     let mut n = Proc::start(exe, root, profile, &["node", "--listen", "127.0.0.1:0"]);
-    let line = n.wait_for(side, "its identity", |l| l.starts_with("vox node: identity "));
+    let line = n.wait_for(side, "its identity", |l| {
+        l.starts_with("vox node: identity ")
+    });
     n.stop();
-    line.trim_start_matches("vox node: identity ").trim().to_owned()
+    line.trim_start_matches("vox node: identity ")
+        .trim()
+        .to_owned()
 }
 
 fn free_udp_port() -> u16 {
@@ -224,11 +236,26 @@ fn profiles_of_the_previous_release_become_nodes_keeping_identity_rooms_and_sett
         &old,
         &root,
         "default",
-        &["daemon", "--listen", "127.0.0.1:0", "--passphrase-file", &pass],
+        &[
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            &pass,
+        ],
     );
-    d.wait_for(stage, "its control socket", |l| l.contains("control socket"));
+    d.wait_for(stage, "its control socket", |l| {
+        l.contains("control socket")
+    });
     // v0.2.9 reads a piped room passphrase unasked.
-    ok(stage, &old, &root, "default", &["room", "create", "--name", "r"], &format!("{ROOMPASS}\n"));
+    ok(
+        stage,
+        &old,
+        &root,
+        "default",
+        &["room", "create", "--name", "r"],
+        &format!("{ROOMPASS}\n"),
+    );
     let room = ok(stage, &old, &root, "default", &["room", "list"], "")
         .0
         .split_whitespace()
@@ -247,7 +274,10 @@ fn profiles_of_the_previous_release_become_nodes_keeping_identity_rooms_and_sett
     }
     std::thread::sleep(Duration::from_millis(500));
     b.stop();
-    assert!(key.is_file(), "{stage}: {PREVIOUS}'s `vox node` wrote no key in `both`");
+    assert!(
+        key.is_file(),
+        "{stage}: {PREVIOUS}'s `vox node` wrote no key in `both`"
+    );
     // Which identity that key is, as the previous release says, from a copy of the key alone.
     let probe = Root {
         data: tmp.path().join("probe"),
@@ -265,7 +295,10 @@ fn profiles_of_the_previous_release_become_nodes_keeping_identity_rooms_and_sett
         .expect("APPARATUS: write a stale socket file");
     std::fs::write(root.cfg.join("config"), "notify = off\n").expect("APPARATUS: write settings");
     for p in ["default", "anchor", "both"] {
-        assert!(root.data.join(p).is_dir(), "{stage}: {PREVIOUS} made no profile {p}");
+        assert!(
+            root.data.join(p).is_dir(),
+            "{stage}: {PREVIOUS} made no profile {p}"
+        );
     }
     println!(
         "[proof] {PREVIOUS} wrote default {fp_default} (room {room}), anchor {fp_anchor}, both \
@@ -276,7 +309,62 @@ fn profiles_of_the_previous_release_become_nodes_keeping_identity_rooms_and_sett
     let (said, moved) = ok("PRODUCT", new, &root, "default", &["id"], "");
     println!("[proof] this build's first `vox id` said:\n{moved}");
     let got = said.lines().next().unwrap_or_default().trim().to_owned();
-    assert_eq!(got, fp_default, "PRODUCT: default's fingerprint changed across the move");
+    assert_eq!(
+        got, fp_default,
+        "PRODUCT: default's fingerprint changed across the move"
+    );
+    assert_eq!(
+        fingerprint("PRODUCT", new, &root, "both"),
+        fp_both,
+        "PRODUCT: both's vault fingerprint changed across the move"
+    );
+
+    // ---- its rooms and the account's settings ----
+    let mut d = Proc::start(
+        new,
+        &root,
+        "default",
+        &[
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            &pass,
+        ],
+    );
+    d.wait_for("PRODUCT", "its control socket", |l| {
+        l.contains("control socket")
+    });
+    let rooms = ok("PRODUCT", new, &root, "default", &["room", "list"], "").0;
+    let notify = d.wait_for("PRODUCT", "that notifications are off", |l| {
+        l.contains("notifications off")
+    });
+    d.stop();
+    println!("[proof] this build's daemon lists:\n{rooms}\nand says: {notify}");
+    assert!(
+        rooms.contains(&room),
+        "PRODUCT: the room {PREVIOUS} made ({room}) is not listed after the move:\n{rooms}"
+    );
+    assert!(
+        notify.contains(&root.cfg.join("config").display().to_string()),
+        "PRODUCT: the node, with no settings file of its own, must read the account's: {notify}"
+    );
+
+    // ---- the anchors ----
+    let now_anchor = anchor_fingerprint("PRODUCT", new, &root, "anchor");
+    let now_both_anchor = anchor_fingerprint("PRODUCT", new, &root, "both-anchor");
+    println!("[proof] this build's anchors: anchor {now_anchor}, both-anchor {now_both_anchor}");
+    assert_eq!(
+        now_anchor, fp_anchor,
+        "PRODUCT: the anchor's fingerprint changed across the move — its --anchor spec no \
+         longer names it"
+    );
+    assert_eq!(
+        now_both_anchor, fp_both_anchor,
+        "PRODUCT: both's anchor key, split into both-anchor, is another identity"
+    );
+
+    // ---- where everything now is ----
     let nodes = root.data.join("nodes");
     for (node, file) in [
         ("default", "vault.cbor"),
@@ -305,54 +393,12 @@ fn profiles_of_the_previous_release_become_nodes_keeping_identity_rooms_and_sett
             listing(&root.data)
         );
     }
-    let daemon_port = std::fs::read_to_string(root.data.join(".daemon").join("port"))
-        .unwrap_or_default();
+    let daemon_port =
+        std::fs::read_to_string(root.data.join(".daemon").join("port")).unwrap_or_default();
     assert_eq!(
         daemon_port.trim(),
         port.to_string(),
         "PRODUCT: .daemon/port must hold the port default bound ({port})"
-    );
-    assert_eq!(
-        fingerprint("PRODUCT", new, &root, "both"),
-        fp_both,
-        "PRODUCT: both's vault fingerprint changed across the move"
-    );
-
-    // ---- its rooms and the account's settings ----
-    let mut d = Proc::start(
-        new,
-        &root,
-        "default",
-        &["daemon", "--listen", "127.0.0.1:0", "--passphrase-file", &pass],
-    );
-    d.wait_for("PRODUCT", "its control socket", |l| l.contains("control socket"));
-    let rooms = ok("PRODUCT", new, &root, "default", &["room", "list"], "").0;
-    let notify = d.wait_for("PRODUCT", "that notifications are off", |l| {
-        l.contains("notifications off")
-    });
-    d.stop();
-    println!("[proof] this build's daemon lists:\n{rooms}\nand says: {notify}");
-    assert!(
-        rooms.contains(&room),
-        "PRODUCT: the room {PREVIOUS} made ({room}) is not listed after the move:\n{rooms}"
-    );
-    assert!(
-        notify.contains(&root.cfg.join("config").display().to_string()),
-        "PRODUCT: the node, with no settings file of its own, must read the account's: {notify}"
-    );
-
-    // ---- the anchors ----
-    let now_anchor = anchor_fingerprint("PRODUCT", new, &root, "anchor");
-    let now_both_anchor = anchor_fingerprint("PRODUCT", new, &root, "both-anchor");
-    println!("[proof] this build's anchors: anchor {now_anchor}, both-anchor {now_both_anchor}");
-    assert_eq!(
-        now_anchor, fp_anchor,
-        "PRODUCT: the anchor's fingerprint changed across the move — its --anchor spec no \
-         longer names it"
-    );
-    assert_eq!(
-        now_both_anchor, fp_both_anchor,
-        "PRODUCT: both's anchor key, split into both-anchor, is another identity"
     );
 }
 

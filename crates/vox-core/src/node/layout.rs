@@ -143,18 +143,17 @@ pub fn migrate_held(account: &Account, starting: Option<&NodeName>) -> Result<Mi
     for (dir, name) in plan {
         // Held across the rename, so no vox of this build opens it half-way.
         let _held = refuse_if_held(&dir)?;
-        for stale in [dir.join(SOCKET_FILE), dir.join(PORT_FILE), fallback_socket_for(&dir)] {
+        for stale in [
+            dir.join(SOCKET_FILE),
+            dir.join(PORT_FILE),
+            fallback_socket_for(&dir),
+        ] {
             remove_if_there(&stale)?;
         }
         create_private_dir(&account.nodes_dir())?;
         let to = account.node_dir(&name);
-        std::fs::rename(&dir, &to).map_err(|e| {
-            refuse(format!(
-                "moving {} to {}: {e}",
-                dir.display(),
-                to.display()
-            ))
-        })?;
+        std::fs::rename(&dir, &to)
+            .map_err(|e| refuse(format!("moving {} to {}: {e}", dir.display(), to.display())))?;
         sync_dir(&to)?;
         eprintln!(
             "vox: moved {} to {} (from v0.3.0 each node lives under {NODES_DIR}/)",
