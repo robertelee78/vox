@@ -228,7 +228,8 @@ fn an_anchor_upgraded_from_a_release_that_kept_room_pages_deletes_them() {
     ok(
         &old,
         &a,
-        &["room", "create", "--passphrase-file", "-", "--name", "r"],
+        // v0.2.9 reads a piped passphrase unasked and has no `--passphrase-file` here.
+        &["room", "create", "--name", "r"],
         &format!("{ROOMPASS}\n"),
     );
     let room = ok(&old, &a, &["room", "list"], "")
@@ -246,15 +247,7 @@ fn an_anchor_upgraded_from_a_release_that_kept_room_pages_deletes_them() {
     ok(
         &old,
         &b,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "r",
-        ],
+        &["room", "join", &link, "--name", "r"],
         &format!("{ROOMPASS}\n"),
     );
     ok(&old, &a, &["trust", "add", &b_fp, "--name", "b"], "");
