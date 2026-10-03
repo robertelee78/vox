@@ -401,12 +401,10 @@ pub enum Error {
     /// The room is at its cap (`MAX_AUTHORS`, as the answering member counts it), so the member that
     /// answered the join could not admit the joiner, and refused it. Before this the refusal was
     /// dropped and the joiner was told it was in: it exited 0, a member of nothing.
-    #[error("the room is full: {members} members, cap {cap}")]
+    #[error("the room is full: {members} members")]
     RoomFull {
-        /// How many members the room holds.
+        /// How many members the refusing member holds for the room.
         members: u64,
-        /// The room's cap, as the refusing member enforces it.
-        cap: u64,
     },
 
     /// The member answering a join accepted the passphrase, and then could not admit the joiner:

@@ -1967,7 +1967,6 @@ impl ChannelState {
         if self.authors.len() >= limit {
             return Err(Error::RoomFull {
                 members: self.authors.len() as u64,
-                cap: max_authors() as u64,
             });
         }
         self.authors.insert(fingerprint, key.clone());

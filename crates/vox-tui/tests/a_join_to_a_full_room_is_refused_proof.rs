@@ -15,9 +15,8 @@
 //!
 //! **Asserted:** one more person's `vox room join`, asked once,
 //! - exits non-zero (`PRODUCT:` if it says it joined);
-//! - says the room is full with the cap in force, in its headline ("the room is full: it has
-//!   [`CAP`] members, and a room takes [`CAP`]") and in its detail ("… [`CAP`] members, cap
-//!   [`CAP`]");
+//! - says the room is full, with the count the refusing member gave ("the room is full: [`CAP`]
+//!   members"), and that the newcomer was not admitted; it promises no cap;
 //! - leaves the room out of that person's `vox room list`;
 //! - and the host's `vox room roster` still lists exactly [`CAP`], the newcomer not among them.
 //!
@@ -48,7 +47,7 @@
 //! first to answer), each held by `VOX_TEST_ADMISSION_GATE` (test-knobs only) at its admission
 //! until both members are about to admit, then let go together. Asserted: every newcomer told it joined is on **both** members' rosters
 //! within [`CONVERGE_WITHIN`] — no split — and a member that admitted one past the cap says so
-//! ("admitted past the room's cap"). If only one newcomer got in, and every member refused the
+//! ("… past its cap of 3, now 4 members"). If only one newcomer got in, and every member refused the
 //! other as full, the joins did not race: CANNOT MEASURE.
 //!
 //! **Mutations that must turn it red:** the admission's result dropped again (in
@@ -81,6 +80,8 @@ const CONVERGE_WITHIN: std::time::Duration = std::time::Duration::from_secs(90);
 const GATE: &str = "VOX_TEST_ADMISSION_GATE";
 /// The knob that fails every joiner's admission on the member answering it.
 const FAILS: &str = "VOX_TEST_ADMISSION_FAILS";
+/// What a member logs when it admits a member past the room's cap ([`CAP`] = 3).
+const PAST_CAP: &str = "past its cap of 3, now 4 members: another member admitted it";
 
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
@@ -138,11 +139,11 @@ fn a_join_to_a_full_room_is_refused() {
         !ok,
         "PRODUCT: a join to a room already holding {CAP} members (its cap) exited 0:\n{said}"
     );
-    // The headline states the cap in force, and the detail the count the member gave: both are
-    // CAP here, never the shipped 1,024 a constant would say.
+    // The count the refusing member gave (CAP here, never the shipped 1,024 a constant would say),
+    // and that the newcomer was not admitted. No cap is promised (decider, plan 21874119).
     for want in [
-        format!("the room is full: it has {CAP} members, and a room takes {CAP}"),
-        format!("the room is full: {CAP} members, cap {CAP}"),
+        format!("the room is full: {CAP} members"),
+        "the room is full, so you were not admitted".to_owned(),
     ] {
         assert!(
             said.contains(&want),
@@ -380,13 +381,13 @@ fn joins_answered_at_once_by_two_members_converge() {
     let t1 = std::time::Instant::now();
     let said = loop {
         let said: String = [&_host_d, &_bob_d].iter().map(|d| d.transcript()).collect();
-        if said.contains("admitted past the room's cap") || t1.elapsed() > CONVERGE_WITHIN {
+        if said.contains(PAST_CAP) || t1.elapsed() > CONVERGE_WITHIN {
             break said;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     };
     assert!(
-        said.contains("admitted past the room's cap"),
+        said.contains(PAST_CAP),
         "PRODUCT: the room went past its cap of {CAP} and neither member's log says so:\n{said}"
     );
 }

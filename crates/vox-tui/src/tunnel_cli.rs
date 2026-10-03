@@ -1060,59 +1060,8 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
 /// it tried as the room's host or an anchor (`Joiner::boards_tried`), so the advice follows it: a
 /// host that did not answer is the host, an anchor is named only when one was tried, and a board
 /// that answered and then closed is not called unreachable.
-pub(crate) fn join_advice_after(
-    fault: Option<Fault>,
-    said: &str,
-) -> std::borrow::Cow<'static, str> {
+pub(crate) fn join_advice_after(fault: Option<Fault>, said: &str) -> &'static str {
     let reached = said.contains(": exchange: ") || said.contains(": exchange (incl. solve) ");
-    match fault {
-        Some(Fault::RoomFull) => room_full_advice(said).into(),
-        other => join_advice_after_static(other, said, reached).into(),
-    }
-}
-
-/// `RoomFull`'s advice, with the cap **in force**: the count and cap the member that refused the
-/// join gave ("the room is full: N members, cap C"), never a constant this side assumes — a test
-/// build's lowered cap and the shipped 1,024 are both stated as they are. Without them, no number.
-/// It promises nothing about how far past the cap joins at the same moment can take a room.
-fn room_full_advice(said: &str) -> String {
-    fn number_after(said: &str, label: &str) -> Option<u64> {
-        let at = said.find(label)? + label.len();
-        let digits: String = said[at..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        digits.parse().ok()
-    }
-    let members = number_after(said, "the room is full: ");
-    let cap = said
-        .find("the room is full: ")
-        .and_then(|at| number_after(&said[at..], " members, cap "));
-    let head = match (members, cap) {
-        (Some(n), Some(c)) => format!(
-            "the room is full: it has {} members, and a room takes {}",
-            thousands(n),
-            thousands(c)
-        ),
-        _ => "the room is full".to_owned(),
-    };
-    format!("{head}\n       your passphrase was accepted; nobody else can join this room")
-}
-
-/// `n` with a comma between each three digits, as the house style writes a count (1,024).
-fn thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-fn join_advice_after_static(fault: Option<Fault>, said: &str, reached: bool) -> &'static str {
     match fault {
         Some(Fault::Unreachable) if reached => {
             "a member was reached, but did not answer the join exchange in time\n       your passphrase was never checked — this is not a verdict on it\n       the member may have gone offline part-way, or be too busy to answer; try again while it is online"

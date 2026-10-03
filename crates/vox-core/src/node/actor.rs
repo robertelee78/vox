@@ -11616,9 +11616,9 @@ async fn admit_board_records(
                             net.manager().note(
                                 key.fingerprint(),
                                 format!(
-                                    "admitted past the room's cap of {cap} (now {members} members): \
-                                     another member admitted it, at the same moment as this node's \
-                                     own last place"
+                                    "admitted to room {} past its cap of {cap}, now {members} \
+                                     members: another member admitted it",
+                                    crate::node::network::short_id(channel.channel_id())
                                 ),
                             );
                         }
