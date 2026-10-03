@@ -583,8 +583,8 @@ fn board_unreachable_advice(said: &str) -> &'static str {
 
 /// What to tell a person whose join failed, chosen by the fault the node reported.
 ///
-/// Shared by `vox connect` (which runs its own node) and `vox room join` (which asks a running
-/// daemon over its socket). The second printed the bare `Outcome` — `cannot join:
+/// Shared by `vox connect` (which holds its node on the daemon while it joins) and `vox room
+/// join` (which asks as a node already attached). The second printed the bare `Outcome` — `cannot join:
 /// Failed(Refused)` — for a wrong passphrase, until the real-binary proof that replaced
 /// `node_m14_gate` typed a wrong passphrase and read what came back. One function, so the two
 /// verbs cannot drift apart again.
@@ -815,8 +815,8 @@ pub fn parse_fingerprint(fingerprint: &str) -> Result<Digest32, AppError> {
     b32_decode(fingerprint, "trust fingerprint").map_err(|_| {
         AppError::Usage(format!(
             "{fingerprint:?} is not a whole fingerprint. Paste the 52-character one that \
-             `vox id` prints on their machine — a prefix is only resolved when this \
-             command starts its own node, and a node is already running for this profile."
+             `vox id` prints on their machine: a prefix could name the wrong identity, and \
+             trusting the wrong one is the mistake this is here to prevent."
         ))
     })
 }

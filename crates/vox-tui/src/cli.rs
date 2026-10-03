@@ -5,10 +5,10 @@
 //! Releases and `vox shell-setup` puts it on `PATH` with completion (ADR-015
 //! §"Install and update"); `vox completions <shell>` and `vox man` emit shell
 //! completions and a man page (built from the same clap model, so they never
-//! drift from the real flags). [`run`] is the single entry the binary calls. The TUI always runs an embedded node over a
-//! profile (ADR-016 M13): `--profile`, `--data-dir`, `--config-dir` select it
-//! (ADR-015 precedence: flags > env > defaults; env `VOX_DATA_DIR` /
-//! `VOX_CONFIG_DIR`, then XDG).
+//! drift from the real flags). [`run`] is the single entry the binary calls. Every verb is a
+//! client of the account's daemon (ADR-026 S-3): `--node` names the node it acts as, and
+//! `--data-dir`, `--config-dir` the account (ADR-015 precedence: flags > env > defaults; env
+//! `VOX_NODE`, `VOX_DATA_DIR`, `VOX_CONFIG_DIR`, then XDG).
 
 use std::io;
 use std::net::SocketAddr;
@@ -1677,11 +1677,11 @@ enum Cmd {
     /// Progress and its proofs (attempt starts, candidates, verdicts, delivery) are
     /// recorded on the GitHub issue through awa; `--work` carries awa's work key.
     ///
-    /// Unlike every other verb, these do not start a node: they attach to the
-    /// control socket of one that is already running and already unlocked, which
-    /// is how several agent sessions share one identity per machine. None of them
-    /// takes the identity passphrase; `join` and `create` take the room passphrase at a
-    /// terminal, or from stdin with `--passphrase-file -`.
+    /// These never attach a node: they ask the vox daemon as a node that is already
+    /// attached (`vox node attach`, or a verb or agent session holding it), which is how
+    /// several agent sessions share one identity per machine. None of them takes the
+    /// identity passphrase; `join` and `create` take the room passphrase at a terminal, or
+    /// from stdin with `--passphrase-file -`.
     #[command(subcommand)]
     Room(RoomCmd),
     /// Open or accept an app stream to a program on another member's node (ADR-022).

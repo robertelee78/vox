@@ -14,7 +14,6 @@
 //! - **Identity creation** stays in the client (C-5): `vox serve`, `vox connect`, `vox id` and
 //!   `vox node create` write a new node's files here, then attach it.
 
-use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -211,39 +210,8 @@ pub fn resolve_node(
 }
 
 /// The nodes the account's daemon has attached, from its hello; none when no daemon answers.
-///
-/// Read with a plain blocking connection, so it serves a verb before its runtime starts. Nothing
-/// is sent: the hello names no secret, and a socket that is not this user's is not read.
 fn attached_now(account: &Account) -> Vec<NodeName> {
-    use std::os::unix::net::UnixStream;
-    let path = account.socket();
-    if vox_core::node::paths::check_socket_owner(&path).is_err() {
-        return Vec::new();
-    }
-    let Ok(mut s) = UnixStream::connect(&path) else {
-        return Vec::new();
-    };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut len = [0u8; 4];
-    if s.read_exact(&mut len).is_err() {
-        return Vec::new();
-    }
-    let len = u32::from_be_bytes(len) as usize;
-    if len > vox_core::node::ipc::MAX_FRAME {
-        return Vec::new();
-    }
-    let mut body = vec![0u8; len];
-    if s.read_exact(&mut body).is_err() {
-        return Vec::new();
-    }
-    match DaemonFrame::from_bytes(&body) {
-        Ok(DaemonFrame::Hello { attached, .. }) => attached
-            .into_iter()
-            .filter(|n| n.state == NodeState::Attached)
-            .map(|n| n.name)
-            .collect(),
-        _ => Vec::new(),
-    }
+    vox_core::node::daemonipc::attached_nodes(&account.socket(), Duration::from_secs(2))
 }
 
 /// The node a node's paths are of: the name of its directory.

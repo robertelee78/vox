@@ -1,9 +1,9 @@
-//! ADR-020 §8 — `vox room`: the agent-facing verbs, over a **running** node.
+//! ADR-020 §8 — `vox room`: the agent-facing verbs, over an **attached** node.
 //!
-//! Every other `vox` verb spawns a node of its own. These do not, and that is the
-//! point: agent comms puts several agent sessions on one harness node (ADR-020
-//! §2, one identity per `(host, harness)`), so these connect to the control
-//! socket of a node that is already running and already unlocked.
+//! These are one-shot clients of the vox daemon (ADR-026 L-2): they never attach a node, and
+//! ask as one that is already attached. That is the point: agent comms puts several agent
+//! sessions on one harness node (ADR-020 §2, one identity per `(host, harness)`), so these
+//! reach the daemon's socket as that node, already running and already unlocked.
 //!
 //! Two consequences fall out of that, both intended:
 //!

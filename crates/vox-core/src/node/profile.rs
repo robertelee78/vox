@@ -469,8 +469,26 @@ pub fn lock_profile(paths: &Paths, waiting: LockWaitNotice<'_>) -> Result<std::f
         &paths.profile_dir,
         "lock the profile to open it",
         waiting,
-        &|| holder_serves(&socket).then_some(Error::ProfileBusy),
+        &|| (holder_serves(&socket) || attached_on_daemon(paths)).then_some(Error::ProfileBusy),
     )
+}
+
+/// Whether the account's daemon has this node attached (ADR-026): it holds the node for as long
+/// as it stays attached, so a wait for its lock would be a wait until `vox node detach`.
+fn attached_on_daemon(paths: &Paths) -> bool {
+    let Some(name) = paths
+        .profile_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| crate::node::paths::NodeName::parse(n).ok())
+    else {
+        return false;
+    };
+    crate::node::daemonipc::attached_nodes(
+        &paths.account().socket(),
+        std::time::Duration::from_millis(500),
+    )
+    .contains(&name)
 }
 
 /// How long a vox that holds the profile's lock waits for a store that is still open elsewhere.
