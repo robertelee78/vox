@@ -20,7 +20,7 @@ use vox_core::node::daemonipc::{
     AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, Refusal, UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, Request};
-use vox_core::node::paths::{Account, NodeName, DEFAULT_PROFILE};
+use vox_core::node::paths::{Account, NodeName};
 use zeroize::Zeroizing;
 
 use crate::app::{
