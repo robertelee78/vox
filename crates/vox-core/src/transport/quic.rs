@@ -404,7 +404,11 @@ fn bind_udp(addr: SocketAddr) -> Result<std::net::UdpSocket> {
                     addr,
                     cause: crate::error::BindCause::Other,
                     reason: format!(
-                        "IPv4 traffic to this machine's own address on port {port} never reached                          this node, though traffic to 127.0.0.1 did ({missed}). Either this                          machine's firewall blocks incoming traffic to this vox (on macOS: System                          Settings › Network › Firewall › Options, allow {}), or another program                          holds port {port} on that address",
+                        "IPv4 traffic to this machine's own address on port {port} never reached \
+                         this node, though traffic to 127.0.0.1 did ({missed}). Either this \
+                         machine's firewall blocks incoming traffic to this vox (on macOS: System \
+                         Settings › Network › Firewall › Options, allow {}), or another program \
+                         holds port {port} on that address",
                         std::env::current_exe()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|_| "vox".to_owned())
