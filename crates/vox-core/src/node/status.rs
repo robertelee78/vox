@@ -286,6 +286,10 @@ pub struct SyncBook {
     prekeys: Option<PrekeyCounts>,
     /// Each open room's stored entries set aside when it opened (V210-74), as `author#seq: why`.
     set_aside: BTreeMap<Digest32, Vec<String>>,
+    /// The node's connections, read when a status is asked for, so each peer's row can say which
+    /// connection this node holds for it (V29-15, #50): two ends that name different ones are
+    /// using connections the other has retired. Weak: the book outlives no network.
+    connections: Option<std::sync::Weak<crate::node::net::ConnectionManager>>,
 }
 
 /// What the prekey ring holds, and what keeping it up has done since the node started.
@@ -310,6 +314,14 @@ pub struct PrekeyCounts {
 pub type SharedSyncBook = Arc<Mutex<SyncBook>>;
 
 impl SyncBook {
+    /// Read, at each status request, which connection `manager` holds for each peer.
+    pub fn read_connections_from(
+        &mut self,
+        manager: &std::sync::Arc<crate::node::net::ConnectionManager>,
+    ) {
+        self.connections = Some(std::sync::Arc::downgrade(manager));
+    }
+
     /// A new shared, empty book.
     #[must_use]
     pub fn shared() -> SharedSyncBook {
@@ -394,6 +406,23 @@ impl SyncBook {
     /// (`(room, author, position)`, V210-63).
     #[must_use]
     pub fn to_json(book: &SharedSyncBook, equivocations: &[(Digest32, Digest32, u64)]) -> String {
+        // Read before the book is held: the manager takes a lock of its own.
+        let held: BTreeMap<Digest32, (String, crate::node::net::PathClass)> = {
+            let manager = book
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .connections
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            manager
+                .map(|m| {
+                    m.held_connections()
+                        .into_iter()
+                        .map(|(peer, tag, path)| (peer, (tag, path)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let b = book.lock().unwrap_or_else(PoisonError::into_inner);
         let mut s = String::from("{\"sync\":[");
         for (i, ((room, peer), c)) in b.ports.iter().enumerate() {
@@ -442,15 +471,32 @@ impl SyncBook {
         // Ladders from this book; circuits counted where every outbound circuit is asked for
         // (`circuitstream::connect_through`). Every peer either names, in one row.
         let circuits = crate::node::circuitstream::outbound_circuits();
-        let peers: std::collections::BTreeSet<&Digest32> =
-            b.ladders.keys().chain(circuits.keys()).collect();
+        let peers: std::collections::BTreeSet<&Digest32> = b
+            .ladders
+            .keys()
+            .chain(circuits.keys())
+            .chain(held.keys())
+            .collect();
         for (i, peer) in peers.into_iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
+            // The connection held for the peer, by the tag both ends' notes use, and its path.
+            let (connection, path) = held.get(peer).map_or_else(
+                || ("null".to_owned(), "null".to_owned()),
+                |(tag, path)| {
+                    let path = match path {
+                        crate::node::net::PathClass::Direct => "direct",
+                        crate::node::net::PathClass::Relayed => "relayed",
+                        crate::node::net::PathClass::Severed => "severed",
+                    };
+                    (json_string(tag), json_string(path))
+                },
+            );
             let _ = write!(
                 s,
-                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{}}}",
+                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{},\"connection\":{connection},\
+                 \"path\":{path}}}",
                 b32_encode(peer),
                 b.ladders.get(peer).copied().unwrap_or(0),
                 circuits.get(peer).copied().unwrap_or(0)
