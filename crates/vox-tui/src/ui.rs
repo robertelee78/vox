@@ -126,11 +126,10 @@ fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiSta
             ))
         })
         .collect();
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Channels (Enter: open · : command)"),
-    );
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+        "node {} · Channels (Enter: open · : command)",
+        vm.node
+    )));
     frame.render_widget(list, area);
 }
 
@@ -409,12 +408,17 @@ fn pane_block(title: &str, focus: bool) -> Block<'_> {
 }
 
 fn render_status_bar(frame: &mut Frame, area: Rect, vm: &ViewModel) {
-    let lock = if vm.locking {
-        "locking… waiting for work that holds a secret to finish"
-    } else if vm.locked {
-        "LOCKED"
+    // Which node's rooms are on screen, and every node the daemon has attached (ADR-015 9.1,
+    // ADR-026 S-4). There is no locked state: a node is attached, or waits for its passphrase.
+    let node = if vm.attached {
+        format!("node {}", vm.node)
     } else {
-        "unlocked"
+        format!("node {} (not attached)", vm.node)
+    };
+    let lock = if vm.nodes.is_empty() {
+        format!("{node}  ·  attached: none")
+    } else {
+        format!("{node}  ·  attached: {}", vm.nodes.join(", "))
     };
     let mlock = if vm.mlock_active {
         String::new()
@@ -439,7 +443,7 @@ fn render_hint_bar(frame: &mut Frame, area: Rect, ui: &UiState, vm: &ViewModel) 
     }
     let hint = match ui.screen {
         Screen::ChannelList => {
-            " ↑/↓ select · Enter open · t tunnels · :new <name> · :join · :unlock · :lock · Ctrl-C quit"
+            " ↑/↓ select · Enter open · t tunnels · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
         }
         Screen::Channel => {
             " Tab switch pane · Enter send · PgUp/PgDn scroll · :invite · : command · Esc back"

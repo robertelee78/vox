@@ -132,7 +132,10 @@ impl NodeSnapshot {
             digests(&mut e, &o.consented);
             e.array(o.shares.len());
             for s in &o.shares {
-                e.array(3).bytes(&s.host).text(&s.name).uint(u64::from(s.udp));
+                e.array(3)
+                    .bytes(&s.host)
+                    .text(&s.name)
+                    .uint(u64::from(s.udp));
             }
             e.array(o.equivocations.len());
             for (author, seq) in &o.equivocations {
@@ -246,7 +249,10 @@ impl NodeSnapshot {
             tunnels.push(LiveTunnel {
                 id: d.uint().map_err(bad("ipc snapshot tunnel id"))?,
                 peer: digest(&mut d)?,
-                service: d.text().map_err(bad("ipc snapshot tunnel service"))?.to_owned(),
+                service: d
+                    .text()
+                    .map_err(bad("ipc snapshot tunnel service"))?
+                    .to_owned(),
                 outbound: d.uint().map_err(bad("ipc snapshot tunnel way"))? != 0,
                 opened: d.uint().map_err(bad("ipc snapshot tunnel opened"))?,
                 last_moved: d.uint().map_err(bad("ipc snapshot tunnel moved"))?,
@@ -259,7 +265,10 @@ impl NodeSnapshot {
                 owner: digest(&mut d)?,
                 id: d.uint().map_err(bad("ipc snapshot closed id"))?,
                 peer: digest(&mut d)?,
-                service: d.text().map_err(bad("ipc snapshot closed service"))?.to_owned(),
+                service: d
+                    .text()
+                    .map_err(bad("ipc snapshot closed service"))?
+                    .to_owned(),
                 outbound: d.uint().map_err(bad("ipc snapshot closed way"))? != 0,
                 opened: d.uint().map_err(bad("ipc snapshot closed opened"))?,
                 closed: d.uint().map_err(bad("ipc snapshot closed at"))?,

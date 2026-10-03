@@ -2058,21 +2058,22 @@ pub fn run() -> ExitCode {
     });
     match cli.command.unwrap_or(default_tui) {
         Cmd::Tui(args) => {
-            let paths = match args.paths() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let anchors = match args.anchor_set() {
+            // The TUI is a client of the account's daemon (ADR-026 S-4): it names a node, and the
+            // daemon holds it. A node named neither by flag nor environment is resolved by C-3.
+            let account = match vox_core::node::paths::Account::of(
+                args.data_dir.as_deref(),
+                args.config_dir.as_deref(),
+            ) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            match run_live(paths, args.listen, anchors) {
+            let named = (args.profile != DEFAULT_PROFILE
+                || std::env::var_os("VOX_PROFILE").is_some())
+            .then(|| args.profile.clone());
+            match run_live(account, named, args.listen, args.anchors.clone()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox: {e}");
