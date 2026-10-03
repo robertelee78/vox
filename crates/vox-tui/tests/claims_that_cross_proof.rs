@@ -121,6 +121,8 @@ fn of_two_claims_made_at_once_exactly_one_is_told_it_holds_the_item() {
             &[
                 "agent",
                 "hook",
+                "--node",
+                "default",
                 "--room",
                 r,
                 "--format",

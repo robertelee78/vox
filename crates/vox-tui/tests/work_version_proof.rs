@@ -208,6 +208,8 @@ fn a_worker_on_another_version_is_refused_by_name() {
         &[
             "agent",
             "hook",
+            "--node",
+            "default",
             "--room",
             r,
             "--format",

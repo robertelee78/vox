@@ -71,7 +71,9 @@ fn model() -> String {
 fn drain(w: &Worker, r: &str, session: &str) -> String {
     let o = w.vox_in(
         None,
-        &["agent", "hook", "--room", r, "--format", "text"],
+        &[
+            "agent", "hook", "--node", "default", "--room", r, "--format", "text",
+        ],
         Some(&format!(
             "{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"{session}\"}}"
         )),

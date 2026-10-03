@@ -289,7 +289,9 @@ fn hook_turns(data: &Path, room: &str, session: &str) -> Vec<Duration> {
         .map(|_| {
             let (ok, took, _, err) = vox(
                 data,
-                &["agent", "hook", "--room", room, "--format", "text"],
+                &[
+                    "agent", "hook", "--node", "default", "--room", room, "--format", "text",
+                ],
                 &input,
             );
             assert!(ok, "PRODUCT: `vox agent hook` failed in room {room}: {err}");

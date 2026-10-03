@@ -234,7 +234,12 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
         .next()
         .unwrap_or_else(|| panic!("PRODUCT (staging): the new room is not in `vox room list`"))
         .to_owned();
-    let (ok, plugin, err) = vox(&data, &cfg, &["agent", "plugin", "opencode"], "");
+    let (ok, plugin, err) = vox(
+        &data,
+        &cfg,
+        &["agent", "plugin", "opencode", "--node", "default"],
+        "",
+    );
     assert!(ok, "PRODUCT (staging): vox agent plugin opencode: {err}");
     let plugin_path = tmp.path().join("vox.mjs");
     std::fs::write(&plugin_path, plugin).expect("APPARATUS: install the plugin");
