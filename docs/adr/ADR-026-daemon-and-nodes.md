@@ -24,8 +24,9 @@ network presence from the start: there is no interim design with one socket per 
 
 ### 1. The daemon
 
-- **D-1.** There MUST be at most one daemon per OS account and data root. It MUST hold an exclusive
-  lock on `<data root>/.daemon/lock` for its whole life; a second daemon that cannot take the lock
+- **D-1.** There MUST be at most one daemon per data root. Two data roots under one OS account
+  (`VOX_DATA_DIR`) MAY each run their own daemon; each has its own lock, socket, port and nodes. A
+  daemon MUST hold an exclusive lock on `<data root>/.daemon/lock` for its whole life; a second daemon that cannot take the lock
   MUST exit, saying a daemon is already running. A second `vox daemon` invocation that names a node
   MUST hand that node to the running daemon (attach, §3) instead.
 - **D-2.** The daemon MUST NOT be a node. It holds no identity key, takes no part in any room and
@@ -38,7 +39,8 @@ network presence from the start: there is no interim design with one socket per 
   - the observed (reflexive) address cache and LAN discovery (nearby);
   - the inbound handshake gate and the identity exchange's pre-identity gate (ADR-011);
   - the execution of relay circuits and of board (rendezvous) service (ADR-012). Each is governed per
-    node: a node relays for, and serves the board of, its own rooms' members (PRD-001 R33);
+    node: a node relays for, and serves the board of, its own rooms' members (PRD-001 R33). Relay and
+    board limits MUST apply per daemon, since it is one presence (ADR-012 N-45);
   - the control socket (§4), metrics, signal handling, the async runtime and node lifecycle (§3).
 - **D-4.** Each unlocked node MUST publish its own address record (ADR-012). Every node of one daemon
   publishes the same ip:port.
@@ -50,6 +52,9 @@ network presence from the start: there is no interim design with one socket per 
 
 - **N-1.** A node MUST be an identity with its own: composite long-term key (a vault, or a headless
   key for an anchor), store, trust keyring, rooms, services, sessions, cursors and config (§7).
+- **N-1a. Names.** A node's name MUST be one path component of 1–64 bytes from `[a-z0-9._-]`, MUST NOT
+  start with `.`, and MUST be case-folded to lower case before use. `.daemon` and `nodes` are
+  reserved and MUST be refused.
 - **N-2.** An attached node MUST be either locked or unlocked. Only an unlocked node MAY take part in
   the network: dial, accept, sync, serve, relay or publish.
 - **N-3.** All attached nodes MUST run concurrently: each syncs, receives, serves and wakes its agents
@@ -109,6 +114,8 @@ network presence from the start: there is no interim design with one socket per 
 - **C-3. Resolution.** A node request MUST resolve its node as: the node it names (`--node <name>` or
   `VOX_NODE`); else, if exactly one node is attached, that node; else refuse, listing the attached
   nodes. `--profile` MUST be replaced by `--node`, with no alias.
+  **Open (decider):** what a request resolved to an attached but locked node gets (refused, or a
+  passphrase prompt in the client).
 - **C-4.** The control protocol MUST be IPC version 9. `Hello` MUST report the daemon's version and
   the attached nodes. The daemon MUST emit events for attach, detach, lock and unlock.
 - **C-5.** The socket's vocabulary MUST stay narrow: no identity creation, `Revoke` or passphrase
@@ -126,11 +133,14 @@ network presence from the start: there is no interim design with one socket per 
   every node cleanly and then the daemon.
 - **S-2. Auto-start.** A client, an agent's hook included, that finds no daemon MUST start
   `vox daemon --detach`, writing its stderr to `<data root>/.daemon/log` from its first line, and MUST
-  wait for the socket for a bounded time, then fail saying why. Concurrent starts MUST end with exactly
+  wait up to 15 s for the socket. After that it MUST fail, saying the daemon did not start and naming
+  the log's path. Concurrent starts MUST end with exactly
   one daemon (D-1).
 - **S-3.** No verb MUST host its own node: `serve`, `connect`, `up`, `forward`, `service`, `trust` and
   every other verb MUST be clients of the daemon.
 - **S-4. TUI.** The TUI MUST be a client of the daemon (ADR-015); it MUST NOT embed a node.
+  **Open (decider):** whether the macOS app (ADR-014 7.1, which requires it to embed the node) is
+  also a daemon client.
 - **S-5. `vox lan up`.** The user-side `vox lan up` MUST be a daemon client. Only `sudo vox lan helper`
   runs as root; it MUST serve its interface over its own socket owned by `SUDO_UID`, never the account
   socket.
