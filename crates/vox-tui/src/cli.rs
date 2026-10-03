@@ -116,17 +116,20 @@ impl ProfileArgs {
 }
 
 /// The room args of whichever `service` subcommand this is.
-fn sub_room(sub: &ServiceCmd) -> &RoomArgs {
+fn sub_room(sub: &ServiceCmd) -> RoomArgs {
     match sub {
-        ServiceCmd::Add(a) => &a.room,
-        ServiceCmd::Remove(r) => &r.room,
-        ServiceCmd::List(r) => r,
+        ServiceCmd::Add(a) => a.room.clone(),
+        ServiceCmd::Remove(r) => r.room.clone(),
+        ServiceCmd::List(r) => r.room_args(),
     }
 }
 
 /// The shape every one-shot tunnel verb shares: resolve the profile, collect the two
 /// passphrases, open the room, run the verb, report.
-fn run_tunnel_verb<F, Fut>(room: RoomArgs, body: F) -> ExitCode
+///
+/// With `opens` false the verb opens no room (`vox service list`, V210-149): it asks for no
+/// room passphrase, and the room is one the unlocked profile holds open, or none.
+fn run_tunnel_verb<F, Fut>(room: RoomArgs, opens: bool, body: F) -> ExitCode
 where
     F: FnOnce(vox_core::node::actor::NodeHandle, vox_core::hash::Digest32) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
@@ -179,10 +182,14 @@ where
                 room.identity_passphrase.clone(),
                 room.identity_passphrase_file.clone(),
             )?;
-            let room_pp = crate::tunnel_cli::room_passphrase_for(
-                room.passphrase.as_ref(),
-                room.passphrase_file.as_deref(),
-            )?;
+            let room_pp = if opens {
+                Some(crate::tunnel_cli::room_passphrase_for(
+                    room.passphrase.as_ref(),
+                    room.passphrase_file.as_deref(),
+                )?)
+            } else {
+                None
+            };
             Ok::<_, crate::app::AppError>(crate::tunnel_cli::RoomTarget {
                 paths,
                 listen,
@@ -527,7 +534,10 @@ enum ServiceCmd {
     /// Stop offering a service.
     Remove(ServiceRemoveArgs),
     /// List the services offered in a room.
-    List(RoomArgs),
+    ///
+    /// Only a room this profile holds open. Listing opens no room, so it asks for no room
+    /// passphrase, and a room you closed stays closed.
+    List(ServiceListArgs),
 }
 
 /// `vox room` — the agent-comms verbs, over a running node.
@@ -1033,6 +1043,37 @@ pub struct RoomArgs {
     /// give it: a file has an owner and a mode, where a command line has neither.
     #[arg(long)]
     pub identity_passphrase_file: Option<std::path::PathBuf>,
+}
+
+/// `vox service list`: a room's args without its passphrase, which listing never uses (V210-149).
+#[derive(Args, Debug, Clone)]
+pub struct ServiceListArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// **Refused**, as for every verb: a command line is readable by every process on the
+    /// machine while it runs. Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`,
+    /// or let it prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line).
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
+}
+
+impl ServiceListArgs {
+    /// As [`RoomArgs`], with no room passphrase.
+    fn room_args(&self) -> RoomArgs {
+        RoomArgs {
+            profile: self.profile.clone(),
+            room: self.room.clone(),
+            passphrase: None,
+            passphrase_file: None,
+            identity_passphrase: self.identity_passphrase.clone(),
+            identity_passphrase_file: self.identity_passphrase_file.clone(),
+        }
+    }
 }
 
 /// `vox service add`
@@ -2010,23 +2051,52 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
-            let sub = sub.clone();
-            async move {
-                match &sub {
-                    ServiceCmd::Add(a) => {
-                        crate::tunnel_cli::service_add(&node, cid, &a.tag, a.local).await
-                    }
-                    ServiceCmd::Remove(r) => {
-                        crate::tunnel_cli::service_remove(&node, cid, &r.tag).await
-                    }
-                    ServiceCmd::List(_) => {
-                        crate::tunnel_cli::service_list(&node, cid);
-                        Ok(())
-                    }
+        // Ask the running node when there is one, as `add` and `remove` do (V030-24): the
+        // profile is not ours to open while a daemon holds it.
+        Cmd::Service(ServiceCmd::List(r)) if node_answers(&r.profile) => {
+            let paths = match r.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(crate::room_cli::service_list(&paths, &r.room)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
                 }
             }
-        }),
+        }
+        Cmd::Service(sub) => run_tunnel_verb(
+            sub_room(&sub),
+            !matches!(sub, ServiceCmd::List(_)),
+            move |node, cid| {
+                let sub = sub.clone();
+                async move {
+                    match &sub {
+                        ServiceCmd::Add(a) => {
+                            crate::tunnel_cli::service_add(&node, cid, &a.tag, a.local).await
+                        }
+                        ServiceCmd::Remove(r) => {
+                            crate::tunnel_cli::service_remove(&node, cid, &r.tag).await
+                        }
+                        ServiceCmd::List(_) => crate::tunnel_cli::service_list(&node, cid).await,
+                    }
+                }
+            },
+        ),
         // Ask the running node when there is one: a fingerprint is public, the hello
         // already carries it, and needing the profile to yourself to read your own name
         // was the most gratuitous case of the busy-profile problem.
@@ -2119,13 +2189,13 @@ pub fn run() -> ExitCode {
         }
         Cmd::Up(args) => {
             let bind = args.bind;
-            run_tunnel_verb(args.room.clone(), move |node, cid| async move {
+            run_tunnel_verb(args.room.clone(), true, move |node, cid| async move {
                 crate::tunnel_cli::up(&node, cid, bind).await
             })
         }
         Cmd::Forward(args) => {
             let a = args.clone();
-            run_tunnel_verb(args.room.clone(), move |node, cid| async move {
+            run_tunnel_verb(args.room.clone(), true, move |node, cid| async move {
                 crate::tunnel_cli::forward(&node, cid, &a.host, &a.tag, a.local).await
             })
         }
