@@ -236,7 +236,8 @@ try:
     for _ in range((POSTS + 10) // 10):
         tui.key("\x1b[5~", 0.2)  # PageUp, well past the oldest line
     if not tui.until(lambda: first_shown() == 1, 5, 0.2):
-        apparatus(f"PageUp past the top did not show m-001 first (first shown: {first_shown()})")
+        product(f"bob's `vox tui`: PageUp past the top did not show m-001 first within 5 s "
+                f"(first shown: {first_shown()})")
     tui.key("\x1b[6~", 0)  # PageDown, once
     tui.until(lambda: first_shown() == 11, 3, 0.2)
     moved = first_shown()
@@ -261,8 +262,8 @@ try:
     alice_ok = tui.until(lambda: "consented" in (label_of("alice")[0] or ""), 60, 1)
     if label_of("carol")[0] is None: product("bob's node listed carol, and his `vox tui` members pane does not show her:\n" + "\n".join(pane()))
     if not alice_ok:
-        apparatus("bob's pane never showed alice consented, so a 'not consented' for carol shows "
-                  "nothing: " + repr(label_of("alice")[0]))
+        product("bob trusts alice, and his `vox tui` members pane never showed her consented "
+                "within 60 s: " + repr(label_of("alice")[0]))
     carol_label = label_of("carol")[0]
     claim("consent", "consented" not in carol_label,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
@@ -272,7 +273,7 @@ try:
         if label_of("carol")[1]:
             break
         tui.key("\x1b[B", 0.5)  # Down
-    if not label_of("carol")[1]: apparatus("could not put the marker on carol:\n" + "\n".join(pane()))
+    if not label_of("carol")[1]: product("eight Downs in bob's `vox tui` members pane never put the marker on carol:\n" + "\n".join(pane()))
 
     stage("verify")
     tui.key(":verify\r", 2)
@@ -318,7 +319,7 @@ try:
     stage("revoke")
     # Carol is still selected, and is not the pane's first member (Dave sorts in above her).
     tui.key("\t", 0.5)  # composer -> members
-    if not label_of("carol")[1]: apparatus("the marker left carol before :consent revoke:\n" + "\n".join(pane()))
+    if not label_of("carol")[1]: product("bob's `vox tui` moved the marker off carol, whom he selected, before :consent revoke:\n" + "\n".join(pane()))
     first = next((r.strip("│ ▶") for r in pane() if r.strip("│ ") and "Members" not in r), "")
     tui.key(":consent revoke\r", 3)
     back = tui.until(lambda: "in-only" in (label_of("carol")[0] or ""), 30, 1)
@@ -332,7 +333,7 @@ try:
         tui.key("\t", 0.5)  # timeline -> composer
         tui.key("b-after-revoke\r", 1)
         if not until(lambda: "b-after-revoke" in run("alice", "room", "read", room, "--limit", "500").stdout, 60, 1):
-            apparatus("alice never read bob's post after the revoke, so carol not reading it shows nothing")
+            product("alice, still consented to, never read bob's post after the revoke within 60 s")
         time.sleep(10)
         leaked = "b-after-revoke" in run("carol", "room", "read", room, "--limit", "500").stdout
     claim("revoke", panes_ok and leaked is False,

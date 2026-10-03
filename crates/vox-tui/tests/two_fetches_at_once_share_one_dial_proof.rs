@@ -192,7 +192,7 @@ impl Agent {
             .take()
             .expect("APPARATUS: the child's stdin was not piped")
             .write_all(stdin.as_bytes())
-            .unwrap_or_else(|e| panic!("APPARATUS: could not write vox's stdin: {e}"));
+            .unwrap_or_else(|e| panic!("PRODUCT (staging): vox exited without reading its stdin (could not write vox's stdin): {e}"));
         let out = child
             .wait_with_output()
             .unwrap_or_else(|e| panic!("APPARATUS: could not wait for vox: {e}"));
@@ -526,7 +526,7 @@ fn two_fetches_at_once_share_one_dial() {
         }
         assert!(
             ladders >= 1,
-            "CANNOT MEASURE: cycle {cycle} ran no ladder to alice, so nothing dialled her: {json}"
+            "APPARATUS, CANNOT MEASURE: cycle {cycle} ran no ladder to alice, so nothing dialled her: {json}"
         );
         if ladders != 1 {
             extra.push(format!("cycle {cycle}: {ladders} ladders"));
@@ -541,7 +541,8 @@ fn two_fetches_at_once_share_one_dial() {
     eprintln!("[proof] the anchor reports {carried} circuit(s) carried");
     assert!(
         carried > 0,
-        "CANNOT MEASURE: the anchor carried no circuit, so the path was not relayed"
+        "APPARATUS, CANNOT MEASURE: the anchor carried no circuit, so the proof's relayed path \
+         was not staged"
     );
     assert!(
         left_listening.is_empty(),
@@ -571,7 +572,7 @@ fn two_fetches_at_once_share_one_dial() {
     );
     assert!(
         unmeasured.is_empty(),
-        "CANNOT MEASURE: a fetch passed {FETCH_WITHIN:?} only by what the runner stalled during \
+        "APPARATUS, CANNOT MEASURE: a fetch passed {FETCH_WITHIN:?} only by what the runner stalled during \
          it: {unmeasured:?}"
     );
 }
@@ -585,12 +586,12 @@ fn tcp_listeners(pid: u32) -> Vec<String> {
     let seen = Command::new("lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-F", "p"])
         .output()
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: could not run lsof: {e}"));
+        .unwrap_or_else(|e| panic!("APPARATUS, CANNOT MEASURE: could not run lsof: {e}"));
     assert!(
         String::from_utf8_lossy(&seen.stdout)
             .lines()
             .any(|l| l == format!("p{pid}")),
-        "CANNOT MEASURE: lsof cannot see bob's daemon (pid {pid}), so it cannot say what it \
+        "APPARATUS, CANNOT MEASURE: lsof cannot see bob's daemon (pid {pid}), so it cannot say what it \
          listens on: exit {:?}: {}",
         seen.status.code(),
         String::from_utf8_lossy(&seen.stderr)
@@ -608,12 +609,12 @@ fn tcp_listeners(pid: u32) -> Vec<String> {
             "n",
         ])
         .output()
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: could not run lsof: {e}"));
+        .unwrap_or_else(|e| panic!("APPARATUS, CANNOT MEASURE: could not run lsof: {e}"));
     // 0: listeners listed; 1 with nothing on stderr: none. Anything else is lsof failing.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.code() == Some(0) || (out.status.code() == Some(1) && stderr.trim().is_empty()),
-        "CANNOT MEASURE: lsof failed listing bob's daemon's TCP listeners: exit {:?}: {stderr}",
+        "APPARATUS, CANNOT MEASURE: lsof failed listing bob's daemon's TCP listeners: exit {:?}: {stderr}",
         out.status.code()
     );
     String::from_utf8_lossy(&out.stdout)

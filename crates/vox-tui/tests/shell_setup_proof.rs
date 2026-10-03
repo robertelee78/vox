@@ -153,7 +153,7 @@ fn shell_runs(shell: &Path, home: &Path) -> Result<(), String> {
     match in_shell(shell, home, "print -r -- ready 2>/dev/null || echo ready") {
         (out, _, true) if out.ends_with("ready") => Ok(()),
         (out, err, ok) => Err(format!(
-            "CANNOT MEASURE: {} -i -c did not answer before shell-setup (ok={ok}, out={out:?}, \
+            "APPARATUS, CANNOT MEASURE: {} -i -c did not answer before shell-setup (ok={ok}, out={out:?}, \
              err={err:?})",
             shell.display()
         )),
@@ -401,7 +401,7 @@ fn shell_setup_gives_a_new_shell_vox_on_path_and_working_completion() {
     );
     assert!(
         unproven.is_empty(),
-        "CANNOT MEASURE: {} claim(s) unproven — install the shell, or name it in \
+        "APPARATUS, CANNOT MEASURE: {} claim(s) unproven — install the shell, or name it in \
          VOX_PROOF_ALLOW_UNPROVEN to accept the gap deliberately:\n{}",
         unproven.len(),
         unproven

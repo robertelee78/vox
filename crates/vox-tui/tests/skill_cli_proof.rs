@@ -169,7 +169,7 @@ fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
     let (cmds, bare) = extract(&skill);
     assert!(
         cmds.len() >= 10,
-        "CANNOT MEASURE: the extractor found {} of at least 10 commands in the skill, so this \
+        "APPARATUS, CANNOT MEASURE: the extractor found {} of at least 10 commands in the skill, so this \
          gate would prove nothing: {cmds:?}\nthe skill:\n{skill}",
         cmds.len()
     );
@@ -218,7 +218,7 @@ fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
     // command falls back to every verb the skill names.
     assert!(
         bare.len() >= 5,
-        "CANNOT MEASURE: the extractor found {} of at least 5 bare flags in the skill, so \
+        "APPARATUS, CANNOT MEASURE: the extractor found {} of at least 5 bare flags in the skill, so \
          this half would prove nothing: {bare:?}",
         bare.len()
     );

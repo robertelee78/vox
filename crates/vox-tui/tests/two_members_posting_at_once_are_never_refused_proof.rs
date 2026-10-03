@@ -103,7 +103,7 @@ impl Member {
                 .take()
                 .expect("APPARATUS: the child's stdin was not piped")
                 .write_all(s.as_bytes())
-                .unwrap_or_else(|e| panic!("APPARATUS: could not write vox's stdin: {e}"));
+                .unwrap_or_else(|e| panic!("PRODUCT (staging): vox exited without reading its stdin (could not write vox's stdin): {e}"));
         }
         let out = child
             .wait_with_output()
@@ -593,7 +593,7 @@ fn two_members_posting_at_once_are_never_refused() {
     );
     assert!(
         unmeasured.is_empty(),
-        "CANNOT MEASURE: a crossing's window straddled {BOUND:?} only through the poll gap or a \
+        "APPARATUS, CANNOT MEASURE: a crossing's window straddled {BOUND:?} only through the poll gap or a \
          runner stall: {unmeasured:?}"
     );
     drop(daemons);

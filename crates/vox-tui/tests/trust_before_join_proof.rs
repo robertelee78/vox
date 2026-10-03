@@ -87,7 +87,7 @@ impl Member {
                 .write_all(s.as_bytes())
                 .unwrap_or_else(|e| {
                     panic!(
-                        "APPARATUS: could not write `vox {}`'s stdin: {e}",
+                        "PRODUCT (staging): vox exited without reading its stdin (could not write `vox {}`'s stdin): {e}",
                         args.join(" ")
                     )
                 });

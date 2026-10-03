@@ -353,7 +353,7 @@ fn removing_a_service_cuts_its_live_sessions_within_a_second() {
         // Half the bound away from the clock: the runner, not `vox`, may have spent the second.
         assert!(
             stall <= bound / 2,
-            "CANNOT MEASURE: the runner stalled {stall:?} on the proof's timeline while a \
+            "APPARATUS, CANNOT MEASURE: the runner stalled {stall:?} on the proof's timeline while a \
              {bound:?} bound was timed (the cut came at {elapsed:?})"
         );
         panic!(

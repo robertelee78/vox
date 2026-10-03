@@ -467,7 +467,7 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     }
     assert!(
         which("opencode").is_some(),
-        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH"
+        "APPARATUS, CANNOT MEASURE: the rehearsal needs `opencode` on PATH"
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

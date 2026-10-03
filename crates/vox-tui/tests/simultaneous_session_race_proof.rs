@@ -255,7 +255,7 @@ fn race(lose_hellos: bool) {
             &["trust", "add", &fps[0], "--name", "alice"],
             None,
         );
-        assert!(ok, "{name} trusts alice: {err}");
+        assert!(ok, "PRODUCT (staging): {name} trusts alice: {err}");
     }
     let (ok, _, err) = vox(
         alice_dir,
@@ -294,8 +294,8 @@ fn race(lose_hellos: bool) {
     std::thread::sleep(Duration::from_secs(3));
     assert!(
         !reads(bob_dir, &room, "CAROL-BEFORE"),
-        "CANNOT MEASURE: bob already reads carol before either trusts the other, so this \
-         run's keys did not come from the exchange it means to race"
+        "PRODUCT: bob reads carol's post before either trusts the other; a node must read only \
+         members its owner trusted"
     );
 
     // ---- the race: both open their sessions while the relay between them is frozen ----
@@ -366,7 +366,7 @@ fn race(lose_hellos: bool) {
     if lose_hellos {
         assert!(
             bob_lost == 1 && carol_lost == 1,
-            "CANNOT MEASURE: the knob did not lose one hello at each end (bob {bob_lost}, carol \
+            "APPARATUS, CANNOT MEASURE: the test knob {LOSE_HELLOS} did not lose one hello at each end (bob {bob_lost}, carol \
              {carol_lost}), so this run did not force the split"
         );
     } else {
@@ -390,7 +390,7 @@ fn race(lose_hellos: bool) {
     };
     assert!(
         bob_reads_carol && carol_reads_bob,
-        "two members who opened their sessions at once did not converge: bob reads carol = \
+        "PRODUCT: two members who opened their sessions at once did not converge: bob reads carol = \
          {bob_reads_carol}, carol reads bob = {carol_reads_bob}\n--- bob's daemon:\n{}\n--- \
          carol's daemon:\n{}",
         record(&bob),

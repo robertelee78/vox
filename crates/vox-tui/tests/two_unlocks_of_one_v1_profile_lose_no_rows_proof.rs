@@ -128,7 +128,13 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
 
 fn ok(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> String {
     let (good, out, err) = vox_with(exe, data, argv, stdin);
-    assert!(good, "CANNOT MEASURE: vox {argv:?} failed: {out}{err}");
+    // This build failing a step is the product's; the previous release failing one is not.
+    let side = if exe == Path::new(VOX) {
+        "PRODUCT (staging)"
+    } else {
+        "APPARATUS, CANNOT MEASURE: the previous release"
+    };
+    assert!(good, "{side}: vox {argv:?} failed: {out}{err}");
     out
 }
 
@@ -481,7 +487,8 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     assert_eq!(
         vault_version(&carol),
         1,
-        "CANNOT MEASURE: {PREVIOUS} did not write a version-1 vault"
+        "APPARATUS, CANNOT MEASURE: the previous release {PREVIOUS} did not write a version-1 \
+         vault"
     );
     let template = row_keys(&carol);
     let room_rows = template
@@ -494,7 +501,7 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     );
     assert!(
         room_rows >= 3,
-        "CANNOT MEASURE: {PREVIOUS}'s store holds only {room_rows} room rows: {template:?}"
+        "APPARATUS, CANNOT MEASURE: the previous release {PREVIOUS}'s store holds only {room_rows} room rows: {template:?}"
     );
     // The identities the trials trust: made by this build, once.
     let (erin, frank) = (dir("erin"), dir("frank"));
@@ -513,17 +520,21 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
             && ctl.lost_rows.is_empty()
             && ctl.not_v2 == 0
             && ctl.left.is_empty()
-            && ctl.dave_gone == 0
-            && ctl.not_once.is_empty(),
-        "CANNOT MEASURE: a lone unlock of the copy already fails the checks (or its migration is \
-         not counted): adds lost {:?}, rows lost {:?}, not v2 {}, left {:?}, dave gone {}, \
-         unnamed {:?}, migrations {:?}",
+            && ctl.dave_gone == 0,
+        "PRODUCT: one unlock of a {PREVIOUS} profile, with nothing racing it, already loses \
+         something: adds lost {:?}, rows lost {:?}, not v2 {}, left {:?}, dave gone {}, \
+         unnamed {:?}",
         ctl.lost_adds,
         ctl.lost_rows,
         ctl.not_v2,
         ctl.left,
         ctl.dave_gone,
-        ctl.unnamed,
+        ctl.unnamed
+    );
+    assert!(
+        ctl.not_once.is_empty(),
+        "APPARATUS, CANNOT MEASURE (test knob): the lone unlock's migration was not counted by \
+         its {AT_REWRITE:?} notice, so no trial's count means anything: {:?}",
         ctl.not_once
     );
 
@@ -623,7 +634,7 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
         );
         assert!(
             t.not_once.is_empty(),
-            "a profile was not migrated exactly once — a vox that waited for the lock migrated \
+            "PRODUCT: a profile was not migrated exactly once — a vox that waited for the lock migrated \
              it again: {:#?}",
             t.not_once
         );

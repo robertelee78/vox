@@ -142,7 +142,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 fn row(who: &str, i: usize) -> String {
@@ -168,7 +168,7 @@ fn rows_read(data: &Path, room: &str, who: &str) -> usize {
 fn post_all(data: &Path, room: &str, who: &str) {
     for i in 0..POSTS {
         let (ok, out, err) = vox_in(data, &["room", "post", room, "-"], &row(who, i));
-        assert!(ok, "{who} post {i}: {out}{err}");
+        assert!(ok, "PRODUCT (staging): {who}'s post {i}: {out}{err}");
     }
 }
 
@@ -244,7 +244,7 @@ fn two_backlogs_that_meet_both_cross() {
             &["room", "join", link.trim(), "--name", "big"],
             "room pass",
         );
-        assert!(ok, "{name} joins: {out}{err}");
+        assert!(ok, "PRODUCT (staging): {name}'s join: {out}{err}");
     }
 
     // Everyone reads everyone's latest hello before anything large moves (step 1).
@@ -263,7 +263,7 @@ fn two_backlogs_that_meet_both_cross() {
                     &format!("hello from {name} r{round}"),
                 ]),
             );
-            assert!(ok, "{name} posts: {err}");
+            assert!(ok, "PRODUCT (staging): {name}'s post: {err}");
         }
         let round_ends = Instant::now() + HELLO_ROUND;
         while Instant::now() < round_ends {
@@ -290,8 +290,8 @@ fn two_backlogs_that_meet_both_cross() {
                     eprintln!("---- {name}'s daemon ----\n{}", p.transcript());
                 }
                 panic!(
-                    "CANNOT MEASURE: after {SETUP:?} ({round} rounds of hellos) the members still \
-                     do not all read each other: {missing:?}"
+                    "PRODUCT (staging): after {SETUP:?} ({round} rounds of hellos) three members \
+                     who trust each other still do not all read each other: {missing:?}"
                 );
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -319,7 +319,8 @@ fn two_backlogs_that_meet_both_cross() {
     println!("[proof] carol reads {carol_has}/{POSTS} of alice's rows");
     assert!(
         carol_has >= POSTS,
-        "CANNOT MEASURE: carol read only {carol_has}/{POSTS} of alice's rows, so she holds no backlog for bob"
+        "PRODUCT (staging): carol, online, read only {carol_has}/{POSTS} of alice's rows within \
+         10 s of alice posting them"
     );
 
     // ---- 3. alice and the anchor stop; carol frozen; bob, alone, writes his backlog -----------
@@ -341,7 +342,8 @@ fn two_backlogs_that_meet_both_cross() {
     let early = rows_read(&bob_dir, &room, "A");
     assert!(
         early < POSTS,
-        "CANNOT MEASURE: bob already reads all of alice's rows ({early}) before carol returns"
+        "APPARATUS, CANNOT MEASURE: bob's freeze did not hold; he already reads all of alice's \
+         rows ({early}) before carol returns"
     );
 
     // ---- 4. carol comes back: two backlogs meet ----------------------------------------------
@@ -385,7 +387,7 @@ fn two_backlogs_that_meet_both_cross() {
     }
     assert!(
         bob_has >= POSTS && carol_has_b >= POSTS,
-        "two backlogs did not cross within {CONVERGE:?}: bob reads {bob_has}/{POSTS} of alice's rows, \
+        "PRODUCT: two backlogs did not cross within {CONVERGE:?}: bob reads {bob_has}/{POSTS} of alice's rows, \
          carol reads {carol_has_b}/{POSTS} of bob's"
     );
 }

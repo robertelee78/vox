@@ -191,7 +191,7 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
         }
         assert!(
             seen < expires,
-            "CANNOT MEASURE: the {TTL_SECS} s ttl claim had lapsed ({} ms past its expiry) \
+            "APPARATUS, CANNOT MEASURE: the {TTL_SECS} s ttl claim had lapsed ({} ms past its expiry) \
              before it reached bob's board, so whether a live ttl claim binds was never \
              tested; last board: {b:?}",
             seen - expires
@@ -211,7 +211,7 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
             expires - done
         );
         panic!(
-            "CANNOT MEASURE: bob's claim finished {} ms after the {TTL_SECS} s ttl lapsed, \
+            "APPARATUS, CANNOT MEASURE: bob's claim finished {} ms after the {TTL_SECS} s ttl lapsed, \
              so whether a live ttl claim binds was never tested: ok={ok} stderr={err:?}",
             done - expires
         );

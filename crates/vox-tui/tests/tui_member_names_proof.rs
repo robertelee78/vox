@@ -40,14 +40,14 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
     );
     // Every red names whose it is. The driver exits 1 only on a product verdict: the members pane
     // drawn wrong, or a `vox` verb past the product's own bound for it. Everything else is the
-    // apparatus: exit 2 (`pyte` missing, staging not achieved, the driver past its budget, a `vox
-    // tui` it could not reap), or a driver stopped from outside before it gave a verdict.
+    // apparatus: exit 2 (`pyte` missing, the driver past its budget, a `vox tui` it could not
+    // reap), or a driver stopped from outside before it gave a verdict.
     match out.code {
         Some(0) => assert!(
             said.contains("cargo PASS"),
             "APPARATUS: the driver exited 0 without a PASS line: {said}"
         ),
-        Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
+        Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
         _ if !out.has_verdict("cargo") => panic!(
             "CANNOT MEASURE: APPARATUS: the TUI driver gave no verdict after {:?} at stage {:?} \
              (exit {:?}): stopped from outside at the wrapper's 1290 s bound, by its faulthandler \

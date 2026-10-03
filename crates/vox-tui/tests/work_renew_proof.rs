@@ -87,7 +87,7 @@ fn claim(w: &Worker, session: &str, r: &str, res: &str, ttl: u64) -> (String, u6
             let took = now_ms() - t0;
             assert!(
                 took < ttl * 1_000,
-                "CANNOT MEASURE: the {ttl} s claim of {res} took {took} ms, so it may have \
+                "APPARATUS, CANNOT MEASURE: the {ttl} s claim of {res} took {took} ms, so it may have \
                  lapsed before vox answered: {o:?}"
             );
             panic!("PRODUCT: a --ttl claim must report its acquisition and expiry: {o:?}");
@@ -148,7 +148,7 @@ fn a_renewal_extends_exactly_one_acquisition() {
             kept_was - done
         );
         panic!(
-            "CANNOT MEASURE: the renewal finished {} ms after the {TTL} s claim lapsed, so \
+            "APPARATUS, CANNOT MEASURE: the renewal finished {} ms after the {TTL} s claim lapsed, so \
              whether a renewal extends a live claim was never tested: {o:?}",
             done - kept_was
         );
@@ -174,7 +174,7 @@ fn a_renewal_extends_exactly_one_acquisition() {
                 kept_until - read
             );
             panic!(
-                "CANNOT MEASURE: {}: the board was read {} ms after even the renewed expiry, \
+                "APPARATUS, CANNOT MEASURE: {}: the board was read {} ms after even the renewed expiry, \
                  so whether a renewal outlives the original TTL was never tested: {b}",
                 w.name,
                 read - kept_until
@@ -251,7 +251,7 @@ fn a_renewal_extends_exactly_one_acquisition() {
                 before - read
             );
             panic!(
-                "CANNOT MEASURE: {}: the board was read {} ms after `again`'s {AGAIN_TTL} s \
+                "APPARATUS, CANNOT MEASURE: {}: the board was read {} ms after `again`'s {AGAIN_TTL} s \
                  TTL ran out, so whether a stale renewal extends it was never tested: {b}",
                 w.name,
                 read - before

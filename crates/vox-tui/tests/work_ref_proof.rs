@@ -361,10 +361,13 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
     rt.block_on(post_raw(alice, room.cid, &text));
     let retried = rows_of_op("op-f20-retried");
     assert!(
-        retried.len() == 2
-            && retried[0]["entry_hash"] == first_failed.as_str()
-            && retried[1]["op"]["status"] == "duplicate",
-        "APPARATUS (staging not achieved): not one `failed` and its later duplicate: {retried:?}"
+        retried.len() == 2 && retried[0]["entry_hash"] == first_failed.as_str(),
+        "APPARATUS: the proof's raw copy of the `failed` did not land after it: {retried:?}"
+    );
+    assert!(
+        retried[1]["op"]["status"] == "duplicate",
+        "PRODUCT: `room read --json` does not mark a later copy of a `failed` under the same op \
+         a duplicate: {retried:?}"
     );
     let next = post(
         alice,
@@ -424,8 +427,13 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
     rt.block_on(post_raw(alice, room.cid, &racing.to_text()));
     let voided = rows_of_op("op-f20-void");
     assert!(
-        voided.len() == 2 && voided.iter().all(|x| x["op"]["status"] == "conflict"),
-        "APPARATUS (staging not achieved): not two conflicting `failed` under one op: {voided:?}"
+        voided.len() == 2,
+        "APPARATUS: the proof's raw racing `failed` did not land beside the first: {voided:?}"
+    );
+    assert!(
+        voided.iter().all(|x| x["op"]["status"] == "conflict"),
+        "PRODUCT: `room read --json` does not mark two different `failed` under one op a \
+         conflict: {voided:?}"
     );
     let after_void = post(
         alice,

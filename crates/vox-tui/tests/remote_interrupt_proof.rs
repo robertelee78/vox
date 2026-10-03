@@ -271,7 +271,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         let daemon = std::fs::read_to_string(&err_path).unwrap_or_default();
         assert!(
             !stalled(stall, Duration::from_secs(20)),
-            "CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 20 s window, so \
+            "APPARATUS, CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 20 s window, so \
              a missing wake cannot be judged; received {woken:?}; bob's daemon stderr:\n{daemon}"
         );
         panic!(
@@ -417,7 +417,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         let daemon = std::fs::read_to_string(&err_path).unwrap_or_default();
         assert!(
             !stalled(stall, Duration::from_secs(45)),
-            "CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 45 s window, so \
+            "APPARATUS, CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 45 s window, so \
              a missing wake cannot be judged; received: {got}; bob's daemon stderr:\n{daemon}"
         );
         panic!(

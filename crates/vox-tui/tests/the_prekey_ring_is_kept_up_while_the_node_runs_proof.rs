@@ -142,7 +142,7 @@ impl Profile {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("{}: spawn vox: {e}", self.name));
+            .unwrap_or_else(|e| panic!("APPARATUS: {}: spawn vox: {e}", self.name));
         let mut input = child.stdin.take().expect("APPARATUS: a piped stdio handle");
         if let Some(s) = stdin {
             let _ = writeln!(input, "{s}");
@@ -170,7 +170,7 @@ impl Profile {
             .expect("APPARATUS: run vox id");
         assert!(
             out.status.success(),
-            "{}: vox id: {}{}",
+            "PRODUCT (staging): {}'s `vox id` failed: {}{}",
             self.name,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
@@ -203,7 +203,7 @@ impl Profile {
         while !self.vox(&["room", "list"], None).ok {
             assert!(
                 Instant::now() < deadline,
-                "{}'s daemon never answered: {}",
+                "PRODUCT (staging): {}'s daemon never answered `vox room list` within 120 s: {}",
                 self.name,
                 std::fs::read_to_string(self.dir.join("daemon.err")).unwrap_or_default()
             );
@@ -331,7 +331,8 @@ fn a_running_node_rotates_its_signed_prekey() {
     );
     assert!(
         n(&before, "signed_prekey") == 1 && n(&before, "rotated") == 0,
-        "CANNOT MEASURE: the signed prekey rotated before the daemon ran ({:.1}s after the ring \
+        "APPARATUS, CANNOT MEASURE: the proof's lead was too short; the signed prekey rotated \
+         before the daemon ran ({:.1}s after the ring \
          was made, {LEAD}s lead): {before}",
         made.elapsed().as_secs_f64()
     );
@@ -350,7 +351,7 @@ fn a_running_node_rotates_its_signed_prekey() {
     assert_eq!(
         (n(&after, "signed_prekey"), n(&after, "rotated")),
         (2, 1),
-        "the running daemon must rotate its signed prekey once its seven days are up \
+        "PRODUCT: the running daemon must rotate its signed prekey once its seven days are up \
          (within {ROTATE_WITHIN:?} of answering): {after}"
     );
 }
@@ -384,11 +385,12 @@ fn a_session_started_before_a_rotation_completes_after_it() {
         let link = host.room(&format!("w{attempt}"));
         let before = host.prekeys();
         let start = due.checked_sub(JOIN_BEFORE_DUE).expect(
-            "CANNOT MEASURE: the ring falls due sooner than a join can be staged before it",
+            "APPARATUS, CANNOT MEASURE: the proof's ring falls due sooner than a join can be \
+             staged before it",
         );
         assert!(
             n(&before, "rotated") == 0 && Instant::now() < start,
-            "CANNOT MEASURE: attempt {attempt}: the host was not ready {JOIN_BEFORE_DUE:?} before \
+            "APPARATUS, CANNOT MEASURE (timing): attempt {attempt}: the host was not ready {JOIN_BEFORE_DUE:?} before \
              its rotation ({:.1}s after `vox id`, {WINDOW_LEAD}s lead): {before}",
             made.elapsed().as_secs_f64()
         );
@@ -447,11 +449,12 @@ fn a_session_started_before_a_rotation_completes_after_it() {
         );
         assert!(
             n(&rotated, "rotated") == 1,
-            "CANNOT MEASURE: attempt {attempt}: the host never rotated: {rotated}"
+            "PRODUCT (staging): attempt {attempt}: the running host never rotated its signed \
+             prekey within 20 s of it falling due: {rotated}"
         );
         assert!(
             ok,
-            "a join the host offered its signed prekey for before it rotated must complete after \
+            "PRODUCT: a join the host offered its signed prekey for before it rotated must complete after \
              the rotation (attempt {attempt}): {} — the host: {after}",
             said.trim()
         );
@@ -466,7 +469,7 @@ fn a_session_started_before_a_rotation_completes_after_it() {
         }
     }
     panic!(
-        "CANNOT MEASURE: in {WINDOW_TRIES} attempts no join had the host's offer before it rotated"
+        "APPARATUS, CANNOT MEASURE (timing): in {WINDOW_TRIES} attempts no join had the host's offer before it rotated"
     );
 }
 
@@ -488,7 +491,7 @@ fn sessions_get_one_time_prekeys_past_the_whole_pool() {
     eprintln!("[proof] the host's ring at the start: {first}");
     assert!(
         n(&first, "one_time") == POOL && n(&first, "consumed") == 0,
-        "CANNOT MEASURE: the host's ring did not start with a pool of {POOL} and nothing used \
+        "APPARATUS, CANNOT MEASURE (test knob): the host's ring did not start with a pool of {POOL} and nothing used \
          (is VOX_TEST_ONE_TIME_PREKEYS honoured?): {first}"
     );
 
@@ -532,7 +535,7 @@ fn sessions_get_one_time_prekeys_past_the_whole_pool() {
     );
     assert!(
         n(&last, "consumed") > POOL,
-        "{JOINS} sessions must each get a one-time prekey, past the whole first pool of {POOL}: \
+        "PRODUCT: {JOINS} sessions must each get a one-time prekey, past the whole first pool of {POOL}: \
          the host used {} ({last})",
         n(&last, "consumed")
     );

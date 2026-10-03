@@ -156,7 +156,11 @@ impl Member {
             ],
             None,
         );
-        assert!(ok, "{} trusts {}: {o}{e}", self.name, other.name);
+        assert!(
+            ok,
+            "PRODUCT (staging): {}'s `vox trust add` of {} failed: {o}{e}",
+            self.name, other.name
+        );
     }
 }
 
@@ -182,9 +186,13 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         ],
         None,
     );
-    assert!(ok, "{name}: vox id: {err}");
+    assert!(ok, "PRODUCT (staging): {name}'s `vox id` failed: {err}");
     m.fp = out.trim().to_owned();
-    assert_eq!(m.fp.len(), 52, "{name}: a fingerprint from vox id");
+    assert_eq!(
+        m.fp.len(),
+        52,
+        "PRODUCT (staging): {name}'s `vox id` printed no fingerprint: {out}"
+    );
     start_daemon(&mut m, tmp, anchor, "daemon");
     m
 }
@@ -264,7 +272,11 @@ fn posts_until_read(
     while Instant::now() < deadline {
         n += 1;
         let (ok, _, e) = author.vox(&["room", "post", room, &format!("{tag} {n}")], None);
-        assert!(ok, "{} posts: {e}", author.name);
+        assert!(
+            ok,
+            "PRODUCT (staging): {}'s `vox room post` failed: {e}",
+            author.name
+        );
         std::thread::sleep(Duration::from_secs(1));
         if reader.reads(room, &format!("{tag} ")) {
             return Some(n);
@@ -319,15 +331,18 @@ fn make_room(alice: &Member, name: &str) -> (String, String) {
         .lines()
         .find(|l| l.split_whitespace().nth(1) == Some(name))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("{name} in `vox room list`: {listed}"))
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): alice's `vox room list` does not show {name}: {listed}")
+        })
         .to_owned();
     let (ok, link, e) = alice.vox(&["room", "invite", &room], None);
     assert!(ok, "PRODUCT (staging): invite {name}: {e}");
     let link = link.trim().to_owned();
     assert!(
         link.contains(&format!("r={}", alice.fp)),
-        "CANNOT MEASURE: the link for {name} does not pin alice, so she is not provably the \
-         member that answers the joins: {link}"
+        "APPARATUS (the proof's premise): the link for {name} does not pin alice, so she is not \
+         provably the member that answers the joins; the proof must find another way to stage \
+         this: {link}"
     );
     (room, link)
 }
@@ -369,8 +384,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         let bc = posts_until_read(&bob, &carol, room, &tag, Duration::from_secs(120));
         assert!(
             bc.is_some(),
-            "CANNOT MEASURE: in room {name}, carol (in bob's ring) never rendered bob, so bob's \
-             node releasing nothing to alice would prove nothing"
+            "PRODUCT (staging): in room {name}, carol (in bob's ring, and trusting him) never \
+             rendered a post of bob's within 120 s"
         );
         let final_line = format!("BOB-FINAL-IN-{name}");
         let (ok, _, e) = bob.vox(&["room", "post", room, &final_line], None);
@@ -392,8 +407,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
         assert!(
             ca.is_some(),
-            "CANNOT MEASURE: alice never rendered carol in room {name}, so alice is not provably \
-             receiving the room"
+            "PRODUCT (staging): in room {name}, alice (in carol's ring, and trusting her) never \
+             rendered a post of carol's within 120 s"
         );
         eprintln!(
             "[proof] room {name}: carol rendered bob after {bc:?} posts; alice rendered carol after {ca:?} posts"
@@ -414,8 +429,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         let control = format!("CAROL-TO-ALICE-IN-{name}");
         assert!(
             ok && seen.contains(&control),
-            "CANNOT MEASURE: alice's final read of room {name} did not succeed with her earlier \
-             {control} in it (ok={ok}), so 0 of bob's posts would prove nothing: {e}"
+            "PRODUCT (staging): alice's `vox room read` of room {name} failed or lost her earlier \
+             {control} (ok={ok}): {e}"
         );
         let n = count(&seen, "BOB-");
         leaked += n;
@@ -423,7 +438,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     }
     assert_eq!(
         leaked, 0,
-        "alice renders {leaked} of bob's posts, but bob never put her in his ring: joining (she \
+        "PRODUCT: alice renders {leaked} of bob's posts, but bob never put her in his ring: joining (she \
          answered both joins) or room membership released his key"
     );
 
@@ -443,8 +458,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
         assert!(
             cb.is_some(),
-            "CANNOT MEASURE: bob never rendered carol in room {name}, so bob is not provably \
-             receiving the room"
+            "PRODUCT (staging): in room {name}, bob (in carol's ring, and trusting her) never \
+             rendered a post of carol's within 120 s"
         );
         let ac = posts_until_read(
             &alice,
@@ -455,8 +470,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
         assert!(
             ac.is_some(),
-            "CANNOT MEASURE: carol never rendered alice in room {name}, so alice's posts are not \
-             provably going out"
+            "PRODUCT (staging): in room {name}, carol (in alice's ring, and trusting her) never \
+             rendered a post of alice's within 120 s"
         );
         let final_line = format!("A118-FINAL-IN-{name}");
         let (ok, _, e) = alice.vox(&["room", "post", room, &final_line], None);
@@ -478,8 +493,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         let control = format!("CAROL-TO-BOB-IN-{name}");
         assert!(
             ok && seen.contains(&control),
-            "CANNOT MEASURE: bob's read of room {name} did not succeed with his earlier {control} \
-             in it (ok={ok}), so 0 of alice's posts would prove nothing: {e}"
+            "PRODUCT (staging): bob's `vox room read` of room {name} failed or lost his earlier \
+             {control} (ok={ok}): {e}"
         );
         let n = count(&seen, "A118-");
         // What an agent of bob's is woken with: the drain hook, as a harness runs it.
@@ -489,8 +504,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
         assert!(
             ok && drained.contains(&control),
-            "CANNOT MEASURE: bob's drain of room {name} did not show his earlier {control} \
-             (ok={ok}), so no text of alice's in it would prove nothing: {e}"
+            "PRODUCT (staging): bob's `vox agent hook` drain of room {name} failed or did not \
+             show his earlier {control} (ok={ok}): {e}"
         );
         let d = count(&drained, "A118-");
         read_untrusted += n + d;
@@ -501,7 +516,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     }
     assert_eq!(
         read_untrusted, 0,
-        "bob reads {read_untrusted} of alice's posts (his read and his drain), but he never put \
+        "PRODUCT: bob reads {read_untrusted} of alice's posts (his read and his drain), but he never put \
          her in his ring: his node took the key she released to him"
     );
 
@@ -533,8 +548,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     for (name, room, _) in &alice_posted {
         assert!(
             !carol.reads(room, &format!("A118-WHILE-CAROL-REMOVED-IN-{name}")),
-            "CANNOT MEASURE: carol still reads alice after alice removed her, so alice's key did \
-             not change in room {name} and no generation is retired"
+            "PRODUCT: carol still reads alice's new post 10 s after alice removed her from her \
+             ring, so removing her did not change alice's key in room {name}"
         );
     }
     alice.trust(&carol);
@@ -548,8 +563,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
                 Duration::from_secs(120),
                 || carol.reads(room, &line)
             ),
-            "CANNOT MEASURE: carol never rendered alice's post after the rotation in room {name}, \
-             so alice's new generation is not provably out"
+            "PRODUCT (staging): alice trusted carol again, and within 120 s carol never rendered \
+             alice's post made after the rotation in room {name}"
         );
     }
 
@@ -584,7 +599,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         let seen = dave.vox(&["room", "read", room], None).1;
         assert!(
             all,
-            "dave trusted alice while she was online, yet within 120 s he renders {} of her {} \
+            "PRODUCT: dave trusted alice while she was online, yet within 120 s he renders {} of her {} \
              posts in room {name} (missing: {:?}): a generation retired before his trust was \
              never offered again",
             count(&seen, "A118-"),
@@ -618,7 +633,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         let n = count(&seen, "A118-");
         assert_eq!(
             n, 0,
-            "bob renders {n} of alice's posts in room {name} with her offline, the moment he \
+            "PRODUCT: bob renders {n} of alice's posts in room {name} with her offline, the moment he \
              trusted her: his node held her key while it did not trust her"
         );
     }
@@ -647,7 +662,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         let seen = bob.vox(&["room", "read", room], None).1;
         assert!(
             all,
-            "bob trusted alice, yet within 120 s of her return he renders {} of her {} posts in \
+            "PRODUCT: bob trusted alice, yet within 120 s of her return he renders {} of her {} posts in \
              room {name} (missing: {:?}): a key refused while untrusted, or one retired since, was \
              never taken once trusted",
             count(&seen, "A118-"),

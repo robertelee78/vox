@@ -375,7 +375,7 @@ fn dispose(title: &str, claims: &[Claim], receipts: &BTreeMap<String, String>, a
     );
     assert!(
         unproven.is_empty(),
-        "CANNOT MEASURE: {} claim(s) unproven — close the gap, or name it in \
+        "APPARATUS, CANNOT MEASURE: {} claim(s) unproven — close the gap, or name it in \
          VOX_PROOF_ALLOW_UNPROVEN to accept it deliberately:\n{}",
         unproven.len(),
         list(&unproven)

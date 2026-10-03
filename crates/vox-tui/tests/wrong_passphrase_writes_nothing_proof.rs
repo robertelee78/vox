@@ -52,7 +52,7 @@ fn vox(dir: &std::path::Path, pass: &str, args: &[&str], stdin: &str) -> (bool, 
         .expect("APPARATUS: the child's stdin was not piped");
     pipe.write_all(stdin.as_bytes()).unwrap_or_else(|e| {
         panic!(
-            "APPARATUS: could not write `vox {}`'s stdin: {e}",
+            "PRODUCT (staging): vox exited without reading its stdin (could not write `vox {}`'s stdin): {e}",
             args.join(" ")
         )
     });
@@ -255,7 +255,7 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
         .take()
         .expect("APPARATUS: the daemon's stdin was not piped");
     pipe.write_all(format!("{IDPASS}\n").as_bytes())
-        .expect("APPARATUS: could not write the daemon's passphrase to its stdin");
+        .expect("PRODUCT (staging): vox exited without reading its stdin (could not write the daemon's passphrase to its stdin)");
     drop(pipe);
     // Read its stdout on a thread, so a daemon that stays up and silent is bounded by the
     // deadline here, not by the watchdog.

@@ -98,7 +98,7 @@ fn within_patience(side: &str, what: &str, ok: bool, took: Duration, said: &str)
     assert!(
         // A verb that failed before its cap answered: that is the product's, whatever the clock.
         apparatus <= APPARATUS_BUDGET || (!ok && took < PATIENCE * 6),
-        "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
+        "APPARATUS, CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
          {APPARATUS_BUDGET:?}) right after {what} took {took:?}, so the runner, not the node, may \
          be slow. It said: {said}"
     );

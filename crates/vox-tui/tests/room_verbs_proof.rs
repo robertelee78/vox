@@ -124,7 +124,7 @@ fn vox(
             .as_mut()
             .expect("APPARATUS: the piped stdin was not opened")
             .write_all(text.as_bytes())
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot write vox {args:?}'s stdin: {e}"));
+            .unwrap_or_else(|e| panic!("PRODUCT (staging): vox exited without reading its stdin (cannot write vox {args:?}'s stdin): {e}"));
     }
     let out = child
         .wait_with_output()

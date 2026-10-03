@@ -144,7 +144,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
                 "APPARATUS: the driver said PASS without all 14 claims ok: {said}"
             );
         }
-        Some(2) => panic!("CANNOT MEASURE: the TUI proof's apparatus failed: {said}"),
+        Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
         _ if !out.has_verdict("truth") => panic!(
             "APPARATUS: the TUI proof's driver ended with no verdict — an uncaught exception, \
              its faulthandler backstop, or a stop from outside — at stage {:?} (exit {:?}; its \
@@ -162,7 +162,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             // runner itself stood still: the stall clock says which.
             assert!(
                 stall <= STALL_BUDGET,
-                "CANNOT MEASURE: the runner stalled {stall:?} during the driver's {:?}, which \
+                "APPARATUS, CANNOT MEASURE: the runner stalled {stall:?} during the driver's {:?}, which \
                  ran past its budget at stage {stage:?} (exit {:?}): {said}",
                 out.took,
                 out.code

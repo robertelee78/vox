@@ -54,7 +54,7 @@ fn triple() -> &'static str {
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("macos", "x86_64") => "x86_64-apple-darwin",
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        other => panic!("CANNOT MEASURE: no published vox for {other:?}"),
+        other => panic!("APPARATUS, CANNOT MEASURE: no published vox for {other:?}"),
     }
 }
 
@@ -174,7 +174,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let Some(old) = published_vox() else {
         assert!(
             allow_unproven("published-release"),
-            "CANNOT MEASURE: the published v{PUBLISHED} binary could not be fetched, so the \
+            "APPARATUS, CANNOT MEASURE: the published v{PUBLISHED} binary could not be fetched, so the \
              missing-stamp case cannot be measured. Set \
              VOX_PROOF_ALLOW_UNPROVEN=published-release to accept that gap deliberately."
         );
@@ -217,7 +217,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
     );
     assert!(
         o.ok,
-        "CANNOT MEASURE: the published v{PUBLISHED} binary's claim failed, so the missing-stamp \
+        "APPARATUS, CANNOT MEASURE: the published v{PUBLISHED} binary's claim failed, so the missing-stamp \
          case was never staged: {o:?}"
     );
     until(
@@ -235,7 +235,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
     assert_eq!(
         claims_by(alice, alice, r),
         0,
-        "CANNOT MEASURE: precondition: alice has never claimed"
+        "PRODUCT: alice has never claimed, and `vox room read --json` shows a claim by her"
     );
     let o = alice.vox(Some("a1"), &["room", "claim", r, "new-work"]);
     refused_naming(&o, bob, "no version");

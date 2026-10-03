@@ -257,7 +257,7 @@ fn opencode_turn(
     // so every verdict after it would read as the plugin's. Say so, with the provider's words.
     if let Some(line) = oc_sandbox::provider_failure(&said) {
         panic!(
-            "CANNOT MEASURE: the model provider refused the turn ({}): {line}",
+            "APPARATUS, CANNOT MEASURE: the model provider refused the turn ({}): {line}",
             model()
         );
     }
@@ -278,7 +278,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     }
     assert!(
         which("opencode").is_some(),
-        "CANNOT MEASURE: opencode is not installed, so nothing here can be tested against a real \
+        "APPARATUS, CANNOT MEASURE: opencode is not installed, so nothing here can be tested against a real \
          harness"
     );
 
@@ -500,7 +500,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     );
     assert!(
         !without.contains(&codeword),
-        "CANNOT MEASURE: `--pure` disables external plugins, so the codeword must be \
+        "APPARATUS, CANNOT MEASURE: `--pure` disables external plugins, so the codeword must be \
          unreachable; it still appears, so this run is not measuring the plugin. Got: {without:?}"
     );
 
@@ -544,7 +544,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             panic!(
                 "{}{}",
                 if loaded {
-                    "CANNOT MEASURE: the plugin loaded, but OpenCode never fired `chat.message` \
+                    "APPARATUS, CANNOT MEASURE: the plugin loaded, but OpenCode never fired `chat.message` \
                      in three warm-up turns, so the plugin's seam could not be exercised"
                 } else {
                     "PRODUCT: OpenCode never loaded the plugin `vox agent plugin opencode` \
@@ -574,7 +574,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     if said_of("chat.message: injected").is_some() {
         assert!(
             has_codeword,
-            "CANNOT MEASURE: the plugin injected the room, and the model did not repeat it. \
+            "APPARATUS, CANNOT MEASURE: the plugin injected the room, and the model did not repeat it. \
              Expected {codeword:?} in the model's answer, got: {answer:?}{}",
             plugin_diag("with plugin")
         );
@@ -597,7 +597,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         // No `chat.message` on this turn (or one with no session): OpenCode never asked the
         // plugin, so the product was not exercised.
         panic!(
-            "CANNOT MEASURE: OpenCode never called the plugin's chat.message on this turn ({}){}",
+            "APPARATUS, CANNOT MEASURE: OpenCode never called the plugin's chat.message on this turn ({}){}",
             if hooked.is_empty() {
                 "no chat.message line".to_owned()
             } else {
@@ -689,7 +689,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         };
         if given == "never" || count("woken") == "(none)" {
             panic!(
-                "CANNOT MEASURE: the turn the wake started never answered, so what the model was \
+                "APPARATUS, CANNOT MEASURE: the turn the wake started never answered, so what the model was \
                  given could not be read: {said}"
             );
         }
@@ -719,10 +719,10 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         Some(0) => {}
         Some(2) => panic!("CANNOT MEASURE: the hand-opened session's apparatus failed: {said}"),
         _ if out.has_verdict("wake") => {
-            panic!("CANNOT MEASURE: the hand-opened session's driver hung or went red: {said}")
+            panic!("APPARATUS, CANNOT MEASURE: the hand-opened session's driver hung or went red: {said}")
         }
         _ => panic!(
-            "CANNOT MEASURE: the hand-opened session's driver was stopped before it gave a \
+            "APPARATUS, CANNOT MEASURE: the hand-opened session's driver was stopped before it gave a \
              verdict, at stage {:?} (exit {:?}; its stack is above): {said}",
             out.stage.as_deref().unwrap_or("(before its first stage)"),
             out.code

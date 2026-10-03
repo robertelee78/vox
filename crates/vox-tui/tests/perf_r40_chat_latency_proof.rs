@@ -346,7 +346,7 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
     let over = end_to_end.iter().filter(|d| **d >= target).count();
     assert!(
         max < target,
-        "R40 (direct): {over} of {SAMPLES} messages took {target:?} or longer end to end; the \
+        "PRODUCT: R40 (direct): {over} of {SAMPLES} messages took {target:?} or longer end to end; the \
          slowest took {max:?}"
     );
 

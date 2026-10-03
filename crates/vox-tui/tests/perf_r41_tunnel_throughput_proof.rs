@@ -646,7 +646,7 @@ impl Proc {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!(
-            "{}: never printed {what}. It said:\n{}",
+            "PRODUCT (staging): {} never printed {what} within 120 s. It said:\n{}",
             self.name,
             self.said().join("\n")
         );
@@ -936,8 +936,11 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
-        !circuit_lines(&anchor).last().is_some_and(|l| carried_line(l)),
-        "CANNOT MEASURE a direct path: the anchor still carried a circuit 120 s after the forward came up"
+        !circuit_lines(&anchor)
+            .last()
+            .is_some_and(|l| carried_line(l)),
+        "PRODUCT (staging): two hosts on one loopback found no direct path; the anchor still \
+         carried their circuit 120 s after the forward came up"
     );
 
     // Unshaped first: the raw-efficiency figure. The tunnel still crosses the emulator here, so this
@@ -1124,7 +1127,7 @@ fn measure(
         let crossed = carried.load(std::sync::atomic::Ordering::Relaxed) - before;
         if crossed < BYTES {
             return Err(format!(
-                "CANNOT MEASURE {link:?}: only {crossed} of the tunnel's {BYTES} bytes crossed the emulated link"
+                "CANNOT MEASURE {link:?} (APPARATUS): only {crossed} of the tunnel's {BYTES} bytes crossed the emulated link"
             ));
         }
         r.push(transfer(raw, done));
