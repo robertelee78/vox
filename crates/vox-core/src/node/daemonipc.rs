@@ -27,62 +27,7 @@ use crate::hash::Digest32;
 
 // ---- names -------------------------------------------------------------------------------------
 
-/// A node's name (ADR-026 N-1a): one path component of 1–64 bytes from `[a-z0-9._-]`, case-folded
-/// to lower case, not starting with `.`, and neither `.daemon` nor `nodes`.
-///
-/// Held here until the layout work's `paths::NodeName` lands; this one then becomes a re-export of
-/// it, so the wire never sees a name that the layout would refuse.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeName(String);
-
-impl NodeName {
-    /// The longest name, in bytes.
-    pub const MAX: usize = 64;
-
-    /// Parse `s`, case-folding it, or say why it is not a node's name.
-    ///
-    /// # Errors
-    /// If it is empty, longer than [`NodeName::MAX`], has a byte outside `[a-z0-9._-]` after
-    /// folding, starts with `.`, or is a reserved name.
-    pub fn parse(s: &str) -> Result<Self> {
-        let folded = s.to_ascii_lowercase();
-        let why = if folded.is_empty() {
-            Some("is empty")
-        } else if folded.len() > Self::MAX {
-            Some("is longer than 64 bytes")
-        } else if folded.starts_with('.') {
-            Some("starts with '.'")
-        } else if folded == "nodes" {
-            Some("is reserved")
-        } else if !folded
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
-        {
-            Some("may use only a-z, 0-9, '.', '_' and '-'")
-        } else {
-            None
-        };
-        match why {
-            Some(why) => Err(Error::Path {
-                op: "node name",
-                detail: format!("{s:?} {why}"),
-            }),
-            None => Ok(Self(folded)),
-        }
-    }
-
-    /// The name.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for NodeName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+pub use crate::node::paths::NodeName;
 
 // ---- tags --------------------------------------------------------------------------------------
 
@@ -110,6 +55,7 @@ const T_REQ_STATUS: u64 = 4105;
 const T_REQ_METRICS: u64 = 4106;
 const T_REQ_SUBSCRIBE: u64 = 4107;
 const T_REQ_STOP: u64 = 4108;
+const T_REQ_SESSION_REGISTER: u64 = 4109;
 
 // Events.
 const T_EV_ATTACHED: u64 = 4200;
@@ -240,6 +186,23 @@ pub enum DaemonRequest {
         node: NodeName,
         /// The harness's session id.
         session: String,
+    },
+    /// Register (or refresh) an agent session of `node` (ADR-020 6.10, ADR-026 D-3): the session
+    /// becomes a holder of its node, which is attached implicitly first if it is not attached
+    /// (L-2), with `passphrase` and `anchors` as a `Use` would. Answered [`DaemonFrame::Attached`]
+    /// or [`DaemonFrame::Refused`].
+    SessionRegister {
+        /// The node.
+        node: NodeName,
+        /// The harness's session id.
+        session: String,
+        /// The session's record as the client built it from its harness's environment (the
+        /// daemon stores it; the client's environment is never the daemon's).
+        record: String,
+        /// The identity passphrase, for an attach this may cause.
+        passphrase: Option<Zeroizing<String>>,
+        /// Anchor specs the node is attached with, if this attaches it.
+        anchors: Vec<String>,
     },
     /// The daemon's own status: answered [`DaemonFrame::Status`].
     Status,
@@ -696,6 +659,21 @@ impl Opening {
                         .text(node.as_str())
                         .text(session);
                 }
+                DaemonRequest::SessionRegister {
+                    node,
+                    session,
+                    record,
+                    passphrase,
+                    anchors,
+                } => {
+                    e.array(6)
+                        .uint(T_REQ_SESSION_REGISTER)
+                        .text(node.as_str())
+                        .text(session)
+                        .text(record);
+                    put_secret(&mut e, passphrase.as_ref());
+                    put_texts(&mut e, anchors);
+                }
                 DaemonRequest::Status => {
                     e.array(1).uint(T_REQ_STATUS);
                 }
@@ -774,6 +752,13 @@ impl Opening {
             (T_REQ_SESSION_END, 3) => Opening::Daemon(DaemonRequest::SessionEnd {
                 node: name(&mut d, "ipc session end node")?,
                 session: text(&mut d, "ipc session end session")?,
+            }),
+            (T_REQ_SESSION_REGISTER, 6) => Opening::Daemon(DaemonRequest::SessionRegister {
+                node: name(&mut d, "ipc session register node")?,
+                session: text(&mut d, "ipc session register session")?,
+                record: text(&mut d, "ipc session register record")?,
+                passphrase: secret(&mut d, "ipc session register passphrase")?,
+                anchors: texts(&mut d, "ipc session register anchors")?,
             }),
             (T_REQ_STATUS, 1) => Opening::Daemon(DaemonRequest::Status),
             (T_REQ_METRICS, 1) => Opening::Daemon(DaemonRequest::Metrics),
@@ -1051,7 +1036,7 @@ mod tests {
         ] {
             assert!(NodeName::parse(bad).is_err(), "{bad:?} was taken");
         }
-        assert!(NodeName::parse(&"x".repeat(64)).is_ok());
+        assert!(NodeName::parse(&"x".repeat(crate::node::paths::NODE_NAME_MAX)).is_ok());
     }
 
     fn info(name: &str, state: NodeState) -> NodeInfo {
@@ -1112,6 +1097,13 @@ mod tests {
             Opening::Daemon(DaemonRequest::SessionEnd {
                 node: n("alice"),
                 session: "s-1".into(),
+            }),
+            Opening::Daemon(DaemonRequest::SessionRegister {
+                node: n("alice"),
+                session: "s-1".into(),
+                record: "{}".into(),
+                passphrase: Some(Zeroizing::new("pw".into())),
+                anchors: vec!["a".into()],
             }),
             Opening::Daemon(DaemonRequest::Status),
             Opening::Daemon(DaemonRequest::Metrics),

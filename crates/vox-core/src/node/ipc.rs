@@ -2470,40 +2470,7 @@ async fn still_answering(path: &Path) -> Result<()> {
 ///
 /// [`prepare_socket_dir`]: crate::node::paths::prepare_socket_dir
 pub fn bind_at(handle: NodeHandle, path: PathBuf) -> Result<IpcServer> {
-    crate::node::paths::prepare_socket_dir(&path)?;
-    // Never longer than `path`, so it fits wherever `path` does.
-    let staging = path.with_extension("new");
-    for stale in [&staging, &path] {
-        if std::fs::symlink_metadata(stale).is_ok() {
-            std::fs::remove_file(stale).map_err(|e| Error::Path {
-                op: "unlink stale control socket",
-                detail: format!("{}: {e}", stale.display()),
-            })?;
-        }
-    }
-    let listener = UnixListener::bind(&staging).map_err(|e| Error::Path {
-        op: "bind control socket",
-        detail: format!("{}: {e}", staging.display()),
-    })?;
-    let placed = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| Error::Path {
-                op: "chmod control socket",
-                detail: format!("{}: {e}", staging.display()),
-            })
-            .and_then(|()| {
-                std::fs::rename(&staging, &path).map_err(|e| Error::Path {
-                    op: "place control socket",
-                    detail: format!("{}: {e}", path.display()),
-                })
-            })
-    };
-    if let Err(e) = placed {
-        let _ = std::fs::remove_file(&staging);
-        return Err(e);
-    }
-
+    let listener = place_socket(&path)?;
     let me = crate::node::paths::my_uid();
     let task = tokio::spawn(async move {
         loop {
@@ -2536,6 +2503,45 @@ pub fn bind_at(handle: NodeHandle, path: PathBuf) -> Result<IpcServer> {
     });
 
     Ok(IpcServer { path, task })
+}
+
+/// Place a listening socket at `path`, `0600`, by binding a staging name and renaming it into
+/// place, so no client ever finds the socket with a wider mode.
+fn place_socket(path: &Path) -> Result<UnixListener> {
+    crate::node::paths::prepare_socket_dir(path)?;
+    // Never longer than `path`, so it fits wherever `path` does.
+    let staging = path.with_extension("new");
+    for stale in [staging.as_path(), path] {
+        if std::fs::symlink_metadata(stale).is_ok() {
+            std::fs::remove_file(stale).map_err(|e| Error::Path {
+                op: "unlink stale control socket",
+                detail: format!("{}: {e}", stale.display()),
+            })?;
+        }
+    }
+    let listener = UnixListener::bind(&staging).map_err(|e| Error::Path {
+        op: "bind control socket",
+        detail: format!("{}: {e}", staging.display()),
+    })?;
+    let placed = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::Path {
+                op: "chmod control socket",
+                detail: format!("{}: {e}", staging.display()),
+            })
+            .and_then(|()| {
+                std::fs::rename(&staging, path).map_err(|e| Error::Path {
+                    op: "place control socket",
+                    detail: format!("{}: {e}", path.display()),
+                })
+            })
+    };
+    if let Err(e) = placed {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
+    Ok(listener)
 }
 
 /// Bind the control socket at this profile's conventional path.
@@ -2620,19 +2626,9 @@ enum Intent {
 }
 
 /// One client, until it goes, and then whatever it left open is withdrawn.
-async fn serve_client(stream: UnixStream, handle: NodeHandle) {
+async fn serve_client(mut stream: UnixStream, handle: NodeHandle) {
     let mut held = Held::default();
-    let _ = serve_requests(stream, &handle, &mut held).await;
-    held.release(&handle).await;
-}
-
-/// Greet, serve requests, and stream once subscribed, until either side stops.
-async fn serve_requests(
-    mut stream: UnixStream,
-    handle: &NodeHandle,
-    held: &mut Held,
-) -> Result<()> {
-    write_frame(
+    let greeted = write_frame(
         &mut stream,
         &Frame::Hello {
             protocol: PROTOCOL_VERSION,
@@ -2640,12 +2636,60 @@ async fn serve_requests(
         }
         .to_bytes(),
     )
-    .await?;
+    .await;
+    if greeted.is_ok() {
+        let _ = serve_requests(stream, &handle, &mut held, None).await;
+    }
+    held.release(&handle).await;
+}
 
+/// Wait until `detached` says the node detached (ADR-026 L-3); for ever when there is none to
+/// watch, or its sender is gone without saying so.
+async fn node_detached(detached: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match detached {
+        Some(rx) => {
+            if rx.wait_for(|d| *d).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Serve requests, and stream once subscribed, until either side stops — or until the node
+/// detaches (`detached`, ADR-026 L-3): a request in flight then, or the next one, is answered
+/// [`Frame::NodeDetached`] and the connection ends, so a client holding a session sees its node
+/// go and is never left on a dead one (L-7).
+async fn serve_requests(
+    mut stream: UnixStream,
+    handle: &NodeHandle,
+    held: &mut Held,
+    mut detached: Option<(
+        crate::node::paths::NodeName,
+        tokio::sync::watch::Receiver<bool>,
+    )>,
+) -> Result<()> {
+    let (node, mut watch) = match detached.take() {
+        Some((node, rx)) => (Some(node), Some(rx)),
+        None => (None, None),
+    };
+    let gone = |node: &Option<crate::node::paths::NodeName>| {
+        node.clone()
+            .map(|node| Frame::NodeDetached { node }.to_bytes())
+    };
     // Serve requests until the client hangs up, or until it subscribes — which is
     // terminal, because from then on the connection is a one-way stream.
     loop {
-        let Some(body) = read_frame(&mut stream).await? else {
+        let next = tokio::select! {
+            next = read_frame(&mut stream) => next?,
+            () = node_detached(&mut watch) => {
+                if let Some(b) = gone(&node) {
+                    let _ = write_frame(&mut stream, &b).await;
+                }
+                return Ok(());
+            }
+        };
+        let Some(body) = next else {
             return Ok(());
         };
         // **Wiped as soon as it is decoded** (V210-94): a request can carry a room or identity
@@ -2656,7 +2700,11 @@ async fn serve_requests(
         let body = zeroize::Zeroizing::new(body);
         // PRD-001 R20: resolving a `.vox` name serves on; `vox up` holds the connection.
         if let Some(req) = crate::node::nameipc::NameRequest::parse(&body) {
-            if crate::node::nameipc::serve(&mut stream, handle, req).await? {
+            let served = tokio::select! {
+                served = crate::node::nameipc::serve(&mut stream, handle, req) => served?,
+                () = node_detached(&mut watch) => false,
+            };
+            if served {
                 continue;
             }
             return Ok(());
@@ -2682,7 +2730,10 @@ async fn serve_requests(
         // the rest of its life (ADR-022 decision 7, `node::appipc`).
         if let Some(app) = crate::node::appipc::AppRequest::parse(&body) {
             return match app {
-                Ok(app) => crate::node::appipc::serve(stream, handle.clone(), app).await,
+                Ok(app) => tokio::select! {
+                    r = crate::node::appipc::serve(stream, handle.clone(), app) => r,
+                    () = node_detached(&mut watch) => Ok(()),
+                },
                 Err(e) => {
                     write_frame(
                         &mut stream,
@@ -2719,13 +2770,173 @@ async fn serve_requests(
             // request and the first read is missed.
             let events = handle.subscribe();
             write_frame(&mut stream, &Frame::Ok.to_bytes()).await?;
-            return pump(stream, events).await;
+            return tokio::select! {
+                r = pump(stream, events) => r,
+                () = node_detached(&mut watch) => Ok(()),
+            };
         }
         let intent = Held::intent(&request);
-        let reply = serve_request(handle, request).await;
+        let reply = tokio::select! {
+            reply = serve_request(handle, request) => reply,
+            () = node_detached(&mut watch) => {
+                if let Some(b) = gone(&node) {
+                    let _ = write_frame(&mut stream, &b).await;
+                }
+                return Ok(());
+            }
+        };
         held.note(intent, &reply);
         write_frame(&mut stream, &reply.to_bytes()).await?;
     }
+}
+
+// ---- the account socket (ADR-026 §4) ---------------------------------------------------------
+
+/// A connection's right to act as one attached node, as the daemon's router grants it for a
+/// `Use` (ADR-026 C-2).
+pub struct Lease {
+    /// The node.
+    pub node: crate::node::paths::NodeName,
+    /// Its handle.
+    pub handle: NodeHandle,
+    /// Turns `true` when the node detaches (L-3).
+    pub detached: tokio::sync::watch::Receiver<bool>,
+    /// What the connection holds of the node (L-3, L-7): dropped when the connection ends, after
+    /// what it opened is withdrawn, which may detach a node attached implicitly.
+    pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+/// What the account socket asks of the daemon: implemented by its router.
+pub trait Dispatch: Send + Sync + 'static {
+    /// The hello every connection is greeted with ([`crate::node::daemonipc::DaemonFrame::Hello`]).
+    fn hello(&self) -> crate::node::daemonipc::DaemonFrame;
+    /// Grant a `Use`, or refuse it.
+    fn use_node(
+        &self,
+        using: crate::node::daemonipc::UseNode,
+    ) -> impl std::future::Future<Output = std::result::Result<Lease, crate::node::daemonipc::Refusal>>
+           + Send;
+    /// Answer a daemon request (not `Subscribe`, which the socket serves from [`Dispatch::events`]).
+    fn daemon(
+        &self,
+        request: crate::node::daemonipc::DaemonRequest,
+    ) -> impl std::future::Future<Output = crate::node::daemonipc::DaemonFrame> + Send;
+    /// A new subscription to the daemon's events.
+    fn events(&self) -> tokio::sync::broadcast::Receiver<crate::node::daemonipc::DaemonEvent>;
+}
+
+/// Bind the account's one control socket at `path` (ADR-026 C-1): mode `0600`, every peer checked
+/// as this user and never uid 0, each connection served by `dispatch`.
+///
+/// # Errors
+/// If the socket cannot be placed.
+pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> Result<IpcServer> {
+    let listener = place_socket(&path)?;
+    let me = crate::node::paths::my_uid();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                // Transient, as in [`bind_at`].
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            };
+            if !admitted(stream.peer_cred().ok().map(|c| c.uid()), me) {
+                continue;
+            }
+            let dispatch = std::sync::Arc::clone(&dispatch);
+            tokio::spawn(async move {
+                let _ = serve_account(stream, dispatch).await;
+            });
+        }
+    });
+    Ok(IpcServer { path, task })
+}
+
+/// Whether a peer of uid `peer` may use the account socket of a daemon running as `me`: only the
+/// same user, and **never root** (ADR-026 C-1, S-5), even a daemon run as root.
+fn admitted(peer: Option<u32>, me: u32) -> bool {
+    peer.is_some_and(|p| p == me && p != 0)
+}
+
+/// One connection to the account socket: the daemon's hello, the client's opening, then the
+/// node's requests or the daemon's answer.
+async fn serve_account<D: Dispatch>(
+    mut stream: UnixStream,
+    dispatch: std::sync::Arc<D>,
+) -> Result<()> {
+    use crate::node::daemonipc::{DaemonFrame, DaemonRequest, Opening};
+    write_frame(&mut stream, &dispatch.hello().to_bytes()).await?;
+    let Some(body) = read_frame(&mut stream).await? else {
+        return Ok(());
+    };
+    // Wiped once decoded: an opening can carry passphrases (C-6).
+    let body = zeroize::Zeroizing::new(body);
+    let opening = Opening::from_bytes(&body);
+    drop(body);
+    match opening {
+        Err(e) => {
+            write_frame(
+                &mut stream,
+                &Frame::Error {
+                    reason: e.to_string(),
+                }
+                .to_bytes(),
+            )
+            .await
+        }
+        Ok(Opening::Use(using)) => match dispatch.use_node(using).await {
+            Err(refusal) => {
+                write_frame(&mut stream, &DaemonFrame::Refused(refusal).to_bytes()).await
+            }
+            Ok(lease) => serve_node(stream, lease).await,
+        },
+        Ok(Opening::Daemon(DaemonRequest::Subscribe)) => {
+            let mut events = dispatch.events();
+            write_frame(&mut stream, &DaemonFrame::Ok.to_bytes()).await?;
+            loop {
+                match events.recv().await {
+                    Ok(ev) => {
+                        write_frame(&mut stream, &DaemonFrame::Event(ev).to_bytes()).await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+        }
+        Ok(Opening::Daemon(request)) => {
+            let answer = dispatch.daemon(request).await;
+            write_frame(&mut stream, &answer.to_bytes()).await
+        }
+    }
+}
+
+/// Serve a granted `Use`: say `Using`, then the node's requests until the client goes or the node
+/// detaches; then withdraw what the connection opened and let go of the node.
+///
+/// # Errors
+/// If the `Using` cannot be written.
+pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
+    let Lease {
+        node,
+        handle,
+        detached,
+        hold,
+    } = lease;
+    let using = crate::node::daemonipc::DaemonFrame::Using {
+        node: node.clone(),
+        me: handle.view().identity.map(|i| i.fingerprint),
+    };
+    let wrote = write_frame(&mut stream, &using.to_bytes()).await;
+    let mut held = Held::default();
+    if wrote.is_ok() {
+        let _ = serve_requests(stream, &handle, &mut held, Some((node, detached.clone()))).await;
+    }
+    // A detached node has nothing left to withdraw from: its actor has stopped.
+    if !*detached.borrow() {
+        held.release(&handle).await;
+    }
+    drop(hold);
+    wrote
 }
 
 /// Apply `command` and answer `Ok`, or the outcome as an error.
