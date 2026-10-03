@@ -1851,7 +1851,7 @@ pub fn run() -> ExitCode {
         Cmd::Node(AnchorArgs { cmd: Some(cmd), .. }) => run_node_cmd(cmd),
         Cmd::Node(node_args) => {
             let args = &node_args.profile;
-            let paths = match args.paths_creating() {
+            let paths = match crate::client::anchor_paths_of(args) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("vox node: {e}");

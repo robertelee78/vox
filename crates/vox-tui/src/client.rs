@@ -203,6 +203,36 @@ pub fn resolve_node(
     }
 }
 
+/// The node `vox node` runs as an anchor (ADR-026 N-5, C-3 for an anchor): the one named; else the
+/// only headless node on disk, the one an earlier `vox node` made; else the only node on disk
+/// (whose anchor key is then `<name>-anchor`, beside a vault); else `default` on an empty data
+/// root, made here; else a refusal listing them.
+///
+/// # Errors
+/// As [`resolve_node`], or the node's paths cannot be made.
+pub fn anchor_paths_of(args: &NodeArgs) -> vox_core::error::Result<Paths> {
+    let account = args.account()?;
+    let headless: Vec<NodeName> = account
+        .nodes_on_disk()
+        .into_iter()
+        .filter(|n| {
+            let dir = account.node_dir(n);
+            !dir.join(vox_core::node::paths::VAULT_FILE).is_file()
+                && dir.join(vox_core::node::headless::IDENTITY_FILE).is_file()
+        })
+        .collect();
+    let name = match (args.node.as_deref().map(str::trim), headless.as_slice()) {
+        (Some(n), _) if !n.is_empty() => NodeName::parse(n)?,
+        (_, [only]) => only.clone(),
+        _ => resolve_node(None, &account, true)?,
+    };
+    Paths::resolve(
+        name.as_str(),
+        args.data_dir.as_deref(),
+        args.config_dir.as_deref(),
+    )
+}
+
 /// The nodes the account's daemon has attached, from its hello; none when no daemon answers.
 fn attached_now(account: &Account) -> Vec<NodeName> {
     vox_core::node::daemonipc::attached_nodes(&account.socket(), Duration::from_secs(2))
