@@ -1155,6 +1155,11 @@ fn read_piped_stdin(
     })
 }
 
+/// How long a prompt whose terminal ended waits for the stop signal that a closed terminal sends.
+/// The kernel sends SIGHUP as it ends the read, so it lands within milliseconds; a second covers a
+/// loaded machine.
+const HANGUP_GRACE: Duration = Duration::from_secs(1);
+
 /// One line typed at the terminal, without echo, racing `stop`. A stop leaves the terminal as it
 /// was: echo comes back whichever ends the wait.
 fn ask_without_echo(
@@ -1167,13 +1172,24 @@ fn ask_without_echo(
     let quiet = no_echo::EchoOff::new();
     let asked = rt.block_on(async {
         let reading = tokio::task::spawn_blocking(no_echo::read_line);
+        let read = tokio::select! {
+            read = reading => read,
+            signal = &mut *stop => return Asked::Stopped(signal),
+        };
+        let read = match read {
+            Ok(Ok(Some(line))) => return Asked::Got(Ok(line)),
+            Ok(Ok(None)) => Ok(zeroize::Zeroizing::new(String::new())),
+            Ok(Err(e)) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
+            Err(e) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
+        };
+        // **The terminal ended: closed, most likely, and its SIGHUP is on its way** (V210-153).
+        // Closing the terminal ends the read and sends the hangup at the same moment, and the
+        // read nearly always reaches here first: 11 of 13 real hangups then exited 1 with "no
+        // identity passphrase" instead of stopping cleanly. So the stop gets a moment to land.
+        // Only a Ctrl-D typed at the prompt, which no signal follows, waits it out.
         tokio::select! {
-            read = reading => Asked::Got(match read {
-                Ok(Ok(line)) => Ok(line),
-                Ok(Err(e)) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
-                Err(e) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
-            }),
             signal = &mut *stop => Asked::Stopped(signal),
+            () = tokio::time::sleep(HANGUP_GRACE) => Asked::Got(read),
         }
     });
     drop(quiet);
@@ -1250,8 +1266,9 @@ mod no_echo {
 
     /// One line from stdin, a byte at a time from the descriptor itself, past std's buffer, so
     /// nothing past it is taken from the terminal and no copy is left behind (V210-94); into a
-    /// buffer wiped on drop. End of input ends it too.
-    pub(super) fn read_line() -> io::Result<zeroize::Zeroizing<String>> {
+    /// buffer wiped on drop. `None` when the input ended before a newline: a Ctrl-D, or a
+    /// terminal that closed; what came before it is wiped, never taken as a line.
+    pub(super) fn read_line() -> io::Result<Option<zeroize::Zeroizing<String>>> {
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
         let mut b = [0u8; 1];
         loop {
@@ -1260,7 +1277,10 @@ mod no_echo {
             #[cfg(not(unix))]
             let read = std::io::Read::read(&mut io::stdin(), &mut b);
             match read {
-                Ok(0) => break,
+                Ok(0) => {
+                    zeroize::Zeroize::zeroize(&mut b);
+                    return Ok(None);
+                }
                 Ok(_) if b[0] == b'\n' => break,
                 Ok(_) => bytes.push(b[0]),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -1272,7 +1292,7 @@ mod no_echo {
             bytes.pop();
         }
         String::from_utf8(std::mem::take(&mut *bytes))
-            .map(zeroize::Zeroizing::new)
+            .map(|line| Some(zeroize::Zeroizing::new(line)))
             .map_err(|e| {
                 let mut v = e.into_bytes();
                 zeroize::Zeroize::zeroize(&mut v);

@@ -13,8 +13,14 @@
 //! saying nothing: closing the terminal killed it uncleanly, against the ruling that SIGHUP is
 //! always a clean stop (decider, 2026-09-30).
 //!
+//! [`closing_the_terminal_before_a_daemon_serves_is_a_clean_stop`]: closing the terminal itself at
+//! the prompt, a real hangup, is a clean stop too. The read ends at the moment the SIGHUP is sent,
+//! and the empty line won: 11 of 13 closes exited 1 with "no identity passphrase".
+//!
 //! Mutations: the end-of-input wait restored for a terminal — red, PRODUCT (it never serves); the
-//! signal handler installed after the wait — red, PRODUCT (killed by the signal).
+//! signal handler installed after the wait — red, PRODUCT (killed by the signal); no wait for the
+//! hangup's signal once the terminal's input ends — red, PRODUCT (exit 1, "no identity
+//! passphrase").
 //!
 //! ## No command waits silently for input it cannot get (V210-165)
 //! [`no_command_waits_for_input_it_cannot_get`]: with stdin open, nothing written to it and no
@@ -87,46 +93,67 @@ struct OnTerminal {
     shown: Arc<Mutex<Vec<u8>>>,
 }
 
+/// `vox daemon` on a new pty as its controlling terminal, as a shell gives it; what it writes goes
+/// to `output` if given, else to the pty. Returns it and the pty's controlling side.
+fn daemon_on_a_pty(dir: &Path, output: Option<&Path>) -> (Child, std::fs::File) {
+    use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
+    let apparatus = |what: &str, e: &dyn std::fmt::Debug| -> ! {
+        panic!("CANNOT MEASURE: setting up the pty: {what}: {e:?}")
+    };
+    let controller =
+        openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap_or_else(|e| apparatus("openpt", &e));
+    // Not inherited by the daemon or by any other child: a daemon holding its own terminal's
+    // controlling side open never sees that terminal close.
+    rustix::io::fcntl_setfd(&controller, rustix::io::FdFlags::CLOEXEC)
+        .unwrap_or_else(|e| apparatus("close-on-exec on the pty", &e));
+    grantpt(&controller).unwrap_or_else(|e| apparatus("grantpt", &e));
+    unlockpt(&controller).unwrap_or_else(|e| apparatus("unlockpt", &e));
+    let name = ptsname(&controller, Vec::new()).unwrap_or_else(|e| apparatus("ptsname", &e));
+    let name = name
+        .to_str()
+        .unwrap_or_else(|e| apparatus("the pty's name", &e))
+        .to_owned();
+    let open = || -> OwnedFd {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+            .unwrap_or_else(|e| apparatus("open the pty", &e))
+            .into()
+    };
+    let mut cmd = vox_cmd(dir, &["daemon", "--listen", "127.0.0.1:0"]);
+    cmd.stdin(Stdio::from(open()));
+    if let Some(output) = output {
+        let file = std::fs::File::create(output)
+            .unwrap_or_else(|e| apparatus("create the output file", &e));
+        let again = file
+            .try_clone()
+            .unwrap_or_else(|e| apparatus("the output file", &e));
+        cmd.stdout(Stdio::from(file)).stderr(Stdio::from(again));
+    } else {
+        cmd.stdout(Stdio::from(open())).stderr(Stdio::from(open()));
+    }
+    // Its own session, with the pty as its controlling terminal, as a shell gives it.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            rustix::process::setsid()?;
+            // Descriptor 0, the pty: no allocation between fork and exec.
+            rustix::process::ioctl_tiocsctty(std::os::fd::BorrowedFd::borrow_raw(0))?;
+            Ok(())
+        });
+    }
+    let child = cmd
+        .spawn()
+        .unwrap_or_else(|e| apparatus("spawn vox daemon on the pty", &e));
+    (child, std::fs::File::from(controller))
+}
+
 impl OnTerminal {
     fn start(dir: &Path) -> Self {
-        use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
         let apparatus = |what: &str, e: &dyn std::fmt::Debug| -> ! {
             panic!("CANNOT MEASURE: setting up the pty: {what}: {e:?}")
         };
-        let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)
-            .unwrap_or_else(|e| apparatus("openpt", &e));
-        grantpt(&controller).unwrap_or_else(|e| apparatus("grantpt", &e));
-        unlockpt(&controller).unwrap_or_else(|e| apparatus("unlockpt", &e));
-        let name = ptsname(&controller, Vec::new()).unwrap_or_else(|e| apparatus("ptsname", &e));
-        let name = name
-            .to_str()
-            .unwrap_or_else(|e| apparatus("the pty's name", &e))
-            .to_owned();
-        let open = || -> OwnedFd {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&name)
-                .unwrap_or_else(|e| apparatus("open the pty", &e))
-                .into()
-        };
-        let mut cmd = vox_cmd(dir, &["daemon", "--listen", "127.0.0.1:0"]);
-        cmd.stdin(Stdio::from(open()))
-            .stdout(Stdio::from(open()))
-            .stderr(Stdio::from(open()));
-        // Its own session, with the pty as its controlling terminal, as a shell gives it.
-        unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
-                rustix::process::setsid()?;
-                // Descriptor 0, the pty: no allocation between fork and exec.
-                rustix::process::ioctl_tiocsctty(std::os::fd::BorrowedFd::borrow_raw(0))?;
-                Ok(())
-            });
-        }
-        let child = cmd
-            .spawn()
-            .unwrap_or_else(|e| apparatus("spawn vox daemon on the pty", &e));
-        let mut screen = std::fs::File::from(controller);
+        let (child, mut screen) = daemon_on_a_pty(dir, None);
         let keys = screen
             .try_clone()
             .unwrap_or_else(|e| apparatus("the pty, to type on", &e));
@@ -286,6 +313,62 @@ fn a_stop_before_a_daemon_serves_is_clean() {
         reds.is_empty(),
         "PRODUCT: a stop while `vox daemon` waited for its passphrase was not a clean stop \
          (\"stopped by SIG<x>\", status 0, echo back on):\n{}",
+        reds.join("\n")
+    );
+}
+
+/// How many times the terminal is closed at the prompt. The defect was a race the end of input
+/// won 11 times in 13, so five closes all lose it to the defect only rarely.
+const HANGUPS: usize = 5;
+
+#[test]
+fn closing_the_terminal_before_a_daemon_serves_is_a_clean_stop() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let (dir, _) = profile(tmp.path(), "alice");
+    let mut reds = Vec::new();
+    for run in 0..HANGUPS {
+        // What it says goes to a file: the terminal it would say it on is the one being closed.
+        let out = tmp.path().join(format!("hangup-{run}.out"));
+        let (mut child, terminal) = daemon_on_a_pty(&dir, Some(&out));
+        let said = || std::fs::read_to_string(&out).unwrap_or_default();
+        let deadline = Instant::now() + STOPS_WITHIN;
+        while !said().contains("identity passphrase:") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            said().contains("identity passphrase:"),
+            "PRODUCT: `vox daemon` on a terminal did not ask for the identity passphrase. It \
+             said:\n{}",
+            said()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        // The person closes the terminal: its controlling side goes, and the session's hangup
+        // with it.
+        drop(terminal);
+        let deadline = Instant::now() + STOPS_WITHIN;
+        let status = loop {
+            if let Some(s) = child.try_wait().expect("APPARATUS: wait") {
+                break Some(s);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let said = said();
+        eprintln!("terminal closed at the prompt, run {run}: status {status:?}; said {said:?}");
+        if !(status.is_some_and(|s| s.code() == Some(0)) && said.contains("stopped by SIGHUP")) {
+            reds.push(format!("run {run}: status {status:?}; it said:\n{said}"));
+        }
+    }
+    assert!(
+        reds.is_empty(),
+        "PRODUCT: closing the terminal while `vox daemon` waited for its passphrase was not a \
+         clean stop (\"stopped by SIGHUP\", status 0) in {} of {HANGUPS} runs:\n{}",
+        reds.len(),
         reds.join("\n")
     );
 }
