@@ -15,6 +15,10 @@
 //!   relay is C, and C's lists at least one circuit it carries. Not within [`RELAY_WITHIN`] is
 //!   `PRODUCT:`.
 //! - What A posts, B reads.
+//! - A `vox` step that fails while the scene is set (a verb, a daemon that never serves its
+//!   socket or says its identity, C listing no room or no invitation) is the product failing:
+//!   `PRODUCT (staging):`. Only C finding no free port is `CANNOT MEASURE`; this test's own
+//!   spawns, pipes and files are `APPARATUS:`.
 //!
 //! **Why a file of its own.** Every other proof with an anchor uses `vox node`; none points
 //! `--anchor` at a member.
@@ -73,12 +77,13 @@ fn vox(dir: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     )
 }
 
-/// A staging verb that must succeed: anything else is `CANNOT MEASURE`.
+/// A staging verb that must succeed. It is the product doing what a person asks, so a failure
+/// is `PRODUCT (staging)`, not a fault of this test.
 fn staged(dir: &Path, argv: &[&str], stdin: &str) -> String {
     let (ok, out, err) = vox(dir, argv, stdin);
     assert!(
         ok,
-        "CANNOT MEASURE (staging): vox {argv:?} in {}: {err}",
+        "PRODUCT (staging): vox {argv:?} in {}: {err}",
         dir.display()
     );
     out
@@ -87,7 +92,7 @@ fn staged(dir: &Path, argv: &[&str], stdin: &str) -> String {
 /// `dir`'s `vox status --json`.
 fn status(dir: &Path) -> serde_json::Value {
     let (ok, out, err) = vox(dir, &["status", "--json"], "");
-    assert!(ok, "CANNOT MEASURE (staging): vox status --json: {err}");
+    assert!(ok, "PRODUCT (staging): vox status --json: {err}");
     serde_json::from_str(out.trim())
         .unwrap_or_else(|e| panic!("APPARATUS: vox status --json is not JSON ({e}): {out}"))
 }
@@ -111,7 +116,7 @@ fn try_daemon(name: &str, dir: &Path, listen: &str, anchor: Option<&str>) -> Opt
 /// [`try_daemon`], where not starting is a staging failure.
 fn daemon(name: &str, dir: &Path, listen: &str, anchor: Option<&str>) -> VoxProc {
     try_daemon(name, dir, listen, anchor).unwrap_or_else(|| {
-        panic!("CANNOT MEASURE (staging): {name}'s daemon never said its control socket")
+        panic!("PRODUCT (staging): {name}'s daemon never said its control socket")
     })
 }
 
@@ -145,11 +150,13 @@ fn an_always_on_member_is_the_rendezvous_and_relay_for_the_others() {
             try_daemon("c", &c_dir, &format!("[::]:{port}"), None).map(|c| (port, c))
         })
         .expect("CANNOT MEASURE (staging): C found no free dual-stack port in 5 tries");
-    let id = c.expect_staging("C's identity", |l| l.starts_with("vox daemon: identity "));
+    let id = c
+        .line_within(world::LINE_TIMEOUT, |l| l.starts_with("vox daemon: identity "))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): C's daemon never said its identity"));
     assert_eq!(
         id.split_whitespace().last(),
         Some(c_fp.as_str()),
-        "CANNOT MEASURE (staging): C's daemon is not the identity `vox id` made"
+        "PRODUCT (staging): C's daemon is not the identity `vox id` made"
     );
     let c_for_a = format!("{c_fp}@/ip6/::1/udp/{port}");
     let c_for_b = format!("{c_fp}@/ip4/127.0.0.1/udp/{port}");
@@ -163,12 +170,12 @@ fn an_always_on_member_is_the_rendezvous_and_relay_for_the_others() {
     let room = staged(&c_dir, &["room", "list"], "")
         .split_whitespace()
         .find(|w| w.len() >= 12 && w.chars().all(|ch| ch.is_ascii_alphanumeric()))
-        .unwrap_or_else(|| panic!("CANNOT MEASURE (staging): C lists no room"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): C lists no room"))
         .to_owned();
     let link = staged(&c_dir, &["room", "invite", &room], "")
         .lines()
         .find(|l| l.starts_with("vox://"))
-        .unwrap_or_else(|| panic!("CANNOT MEASURE (staging): no invitation for room {room}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no invitation for room {room}"))
         .trim()
         .to_owned();
 
