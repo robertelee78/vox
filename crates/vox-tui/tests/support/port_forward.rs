@@ -24,10 +24,15 @@
 //!
 //! **Every red here names its side** (V210-106), as in `world.rs`: the forward's own sockets are
 //! the apparatus, and an `APPARATUS:` red names which one failed.
+//!
+//! It can also **spoof** (V210-140): while closed, it sends the guest garbage that carries the
+//! connection ID of the host's last packet, from the address the host's packets come from — what
+//! an attacker on the path can do once the real host has gone quiet. Nothing it sends can
+//! authenticate.
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,7 +53,26 @@ struct State {
     /// How long each datagram guest → host is held before it is sent on, in microseconds; 0 sends
     /// at once. A path with latency, as a real one has (V210-122).
     delay_us: AtomicU64,
+    /// Whether to spoof the host to the guest while closed (V210-140).
+    spoof: AtomicBool,
+    /// Spoofed datagrams sent to the guest.
+    spoofed: AtomicU64,
+    /// The head of the host's last short-header datagram (its first byte and the guest's
+    /// connection ID), with the guest it went to: what the spoofer replays.
+    last_short: Mutex<Option<(Vec<u8>, SocketAddr)>>,
+    /// Every guest the spoofer sent to.
+    spoofed_to: Mutex<HashSet<SocketAddr>>,
+    /// The guest source of the last datagram carried guest → host.
+    last_from: Mutex<Option<SocketAddr>>,
 }
+
+/// The most of a short-header datagram the spoofer copies: the first byte and a connection ID of
+/// the longest length QUIC allows (RFC 9000 §17.3). Whatever follows the real ID is the start of
+/// an encrypted packet number and payload, which the garbage after it ruins anyway.
+const SPOOF_HEAD: usize = 1 + 20;
+/// A spoofed datagram's size, and how often one is sent.
+const SPOOF_SIZE: usize = 1200;
+const SPOOF_EVERY: Duration = Duration::from_millis(20);
 
 pub struct PortForward {
     /// The forward's public address — what the host advertises.
@@ -86,8 +110,12 @@ impl PortForward {
                 }
             }
         });
+        let public_sock = Arc::new(public_sock);
+        {
+            let (public, st) = (Arc::clone(&public_sock), Arc::clone(&state));
+            std::thread::spawn(move || spoof(&public, &st));
+        }
         std::thread::spawn(move || {
-            let public_sock = Arc::new(public_sock);
             let mut inside: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
             let mut buf = vec![0u8; 65536];
             while !st.stop.load(Ordering::SeqCst) {
@@ -123,6 +151,13 @@ impl PortForward {
                         let mut buf = vec![0u8; 65536];
                         while !st.stop.load(Ordering::SeqCst) {
                             let Ok(n) = back.recv(&mut buf) else { continue };
+                            // A short header (RFC 9000 §17.3): the form bit clear.
+                            if n > SPOOF_HEAD && buf[0] & 0x80 == 0 {
+                                *st.last_short
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some((buf[..SPOOF_HEAD].to_vec(), from));
+                            }
                             if !st.open.load(Ordering::SeqCst) {
                                 st.dropped.fetch_add(1, Ordering::SeqCst);
                                 continue;
@@ -134,6 +169,9 @@ impl PortForward {
                     });
                     s
                 });
+                *st.last_from
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(from);
                 let delay = Duration::from_micros(st.delay_us.load(Ordering::SeqCst));
                 if !delay.is_zero() {
                     let _ = late.send((Arc::clone(sock), buf[..n].to_vec(), at + delay));
@@ -165,6 +203,43 @@ impl PortForward {
         self.state.open.store(false, Ordering::SeqCst);
     }
 
+    /// Spoof the host to the guest while closed (see the module docs), or stop.
+    pub fn set_spoof(&self, on: bool) {
+        self.state.spoof.store(on, Ordering::SeqCst);
+    }
+
+    /// Spoofed datagrams sent to the guest so far.
+    pub fn spoofed(&self) -> u64 {
+        self.state.spoofed.load(Ordering::SeqCst)
+    }
+
+    /// Every guest the spoofer sent to so far.
+    pub fn spoofed_to(&self) -> HashSet<SocketAddr> {
+        self.state
+            .spoofed_to
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The guest source of the last datagram carried guest → host, if any.
+    pub fn last_from(&self) -> Option<SocketAddr> {
+        *self
+            .state
+            .last_from
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the host has sent the guest a short-header datagram the spoofer can copy.
+    pub fn can_spoof(&self) -> bool {
+        self.state
+            .last_short
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
     /// Bytes carried guest → host so far.
     pub fn to_host(&self) -> u64 {
         self.state.to_host.load(Ordering::SeqCst)
@@ -187,6 +262,43 @@ impl PortForward {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+}
+
+/// The spoofer's loop: while asked to and closed, the head of the host's last short-header
+/// datagram followed by garbage, to the guest it went to, every [`SPOOF_EVERY`].
+fn spoof(public: &UdpSocket, st: &State) {
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut garbage = vec![0u8; SPOOF_SIZE - SPOOF_HEAD];
+    while !st.stop.load(Ordering::SeqCst) {
+        std::thread::sleep(SPOOF_EVERY);
+        if !st.spoof.load(Ordering::SeqCst) || st.open.load(Ordering::SeqCst) {
+            continue;
+        }
+        let Some((head, guest)) = st
+            .last_short
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            continue;
+        };
+        for b in &mut garbage {
+            // xorshift64: garbage, not secrecy.
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *b = seed as u8;
+        }
+        let mut datagram = head;
+        datagram.extend_from_slice(&garbage);
+        if public.send_to(&datagram, guest).is_ok() {
+            st.spoofed.fetch_add(1, Ordering::SeqCst);
+            st.spoofed_to
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(guest);
+        }
     }
 }
 
@@ -219,6 +331,7 @@ pub struct ForwardedWorld {
     pub host_dir: std::path::PathBuf,
     pub guest_dir: std::path::PathBuf,
     pub host_fp: String,
+    pub guest_fp: String,
     pub room: String,
     pub address: String,
     pub passphrase: String,
@@ -319,6 +432,7 @@ impl ForwardedWorld {
             host_dir,
             guest_dir,
             host_fp,
+            guest_fp,
             room,
             address,
             passphrase,

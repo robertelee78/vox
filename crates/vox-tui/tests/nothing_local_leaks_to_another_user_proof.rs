@@ -109,7 +109,7 @@ impl Running {
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: {what:?} was never said; said:\n{said}"
+                "PRODUCT (staging): {what:?} was never said; said:\n{said}"
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -147,12 +147,14 @@ fn signal(pid: u32, sig: &str) {
         .args(["-s", sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "CANNOT MEASURE: kill -s {sig} {pid} failed");
+    assert!(ok, "APPARATUS: `kill -s {sig} {pid}` did not take");
 }
 
 /// This user's uid, as the filesystem records it.
 fn my_uid(tmp: &Path) -> u32 {
-    std::fs::metadata(tmp).unwrap().uid()
+    std::fs::metadata(tmp)
+        .expect("APPARATUS: stat the temp dir")
+        .uid()
 }
 
 /// One profile: its data and config directories, its identity passphrase file, and the extra
@@ -168,9 +170,9 @@ impl Profile {
     fn new(root: &Path, env: &[(&str, &str)]) -> Self {
         let data = root.join("data");
         let cfg = root.join("cfg");
-        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&cfg).expect("APPARATUS: a profile dir");
         let pass = root.join("id.pass");
-        std::fs::write(&pass, ID_PASS).unwrap();
+        std::fs::write(&pass, ID_PASS).expect("APPARATUS: the passphrase file");
         Self {
             data,
             cfg,
@@ -204,8 +206,12 @@ impl Profile {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
-        let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
+            .expect("APPARATUS: spawn vox");
+        let _ = child
+            .stdin
+            .take()
+            .expect("APPARATUS: vox's stdin")
+            .write_all(stdin.as_bytes());
         let (out, err) = (
             Arc::new(Mutex::new(String::new())),
             Arc::new(Mutex::new(String::new())),
@@ -215,7 +221,14 @@ impl Profile {
         let mut running = Running(child, Arc::new(Mutex::new(String::new())));
         let ended = running.exited_within(within);
         std::thread::sleep(Duration::from_millis(100));
-        let (out, err) = (out.lock().unwrap().clone(), err.lock().unwrap().clone());
+        let (out, err) = (
+            out.lock()
+                .expect("APPARATUS: a poisoned output buffer")
+                .clone(),
+            err.lock()
+                .expect("APPARATUS: a poisoned output buffer")
+                .clone(),
+        );
         match ended {
             Some(ok) => (ok, out, err),
             None => (
@@ -237,7 +250,7 @@ impl Profile {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         let said = Arc::new(Mutex::new(String::new()));
         drain(child.stdout.take(), &said);
         drain(child.stderr.take(), &said);
@@ -246,12 +259,12 @@ impl Profile {
 
     fn id(&self) -> String {
         let (ok, out, err) = self.vox(&["id", "--identity-passphrase-file", self.p()]);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     }
 
     fn p(&self) -> &str {
-        self.pass.to_str().unwrap()
+        self.pass.to_str().expect("APPARATUS: a UTF-8 temp path")
     }
 
     /// A real `vox daemon`, and the control socket it says it serves.
@@ -272,7 +285,7 @@ impl Profile {
             .lines()
             .find_map(|l| l.strip_prefix("vox daemon: control socket "))
             .map(|s| PathBuf::from(s.trim()))
-            .unwrap();
+            .unwrap_or_else(|| panic!("PRODUCT: the daemon named no control socket path: {said}"));
         (d, sock)
     }
 }
@@ -292,14 +305,15 @@ fn anchor(root: &Path) -> (Running, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: the anchor printed no spec"
+            "PRODUCT (staging): the anchor printed no spec"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
 }
 
-/// Poll `vox args` until its stdout satisfies `ok`, for up to 60 s.
-fn until(who: &Profile, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) {
+/// Poll `vox args` until its stdout satisfies `ok`, for up to 60 s. `side` names who failed if
+/// it never does: `PRODUCT (staging)` for staging, `PRODUCT` for a propagation the claim relies on.
+fn until(side: &str, who: &Profile, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut last = String::new();
     while Instant::now() < deadline {
@@ -310,14 +324,14 @@ fn until(who: &Profile, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) {
         last = format!("stdout={out:?} stderr={err:?}");
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: timed out waiting for {what}; last saw {last}");
+    panic!("{side}: timed out after 60 s waiting for {what}; `vox {args:?}` last said {last}");
 }
 
 /// Run, as `who`, every `vox room get …` a refusal suggests (each in backticks), into `dir`, and
 /// return how many collected exactly `want`. Panics on one that does not: a suggested command
 /// that fails is the defect.
 fn run_suggestions(who: &Profile, said: &str, dir: &Path, want: &[u8]) -> usize {
-    std::fs::create_dir_all(dir).unwrap();
+    std::fs::create_dir_all(dir).expect("APPARATUS: the suggestions dir");
     let mut ran = 0usize;
     for (i, cmd) in said.split('`').skip(1).step_by(2).enumerate() {
         let Some(args) = cmd.strip_prefix("vox ") else {
@@ -328,12 +342,13 @@ fn run_suggestions(who: &Profile, said: &str, dir: &Path, want: &[u8]) -> usize 
             continue;
         }
         let out = dir.join(format!("{i}.bin"));
-        args.extend(["--out", out.to_str().unwrap()]);
+        args.extend(["--out", out.to_str().expect("APPARATUS: a UTF-8 temp path")]);
         let (ok, stdout, stderr) = who.vox(&args);
         let got = std::fs::read(&out).ok();
         assert!(
             ok && got.as_deref() == Some(want),
-            "the suggested `{cmd}` did not collect the named file ({} bytes): {stdout} {stderr}",
+            "PRODUCT: the suggested `{cmd}` did not collect the named file ({} bytes): {stdout} \
+             {stderr}",
             got.as_ref().map_or(0, Vec::len)
         );
         ran += 1;
@@ -368,7 +383,7 @@ fn listening(pid: u32) -> Option<std::collections::BTreeSet<String>> {
 #[ignore = "two networked nodes and real child processes; CI runs it in release"]
 fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let (_anchor, spec) = anchor(&tmp.path().join("anchor"));
     let alice = Profile::new(&tmp.path().join("alice"), &[]);
     let bob = Profile::new(&tmp.path().join("bob"), &[]);
@@ -385,46 +400,61 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
             "--identity-passphrase-file",
             who.p(),
         ]);
-        assert!(ok, "trust {name}: {err}");
+        assert!(ok, "PRODUCT (staging): trust {name}: {err}");
     }
     let (ok, _, err) = alice.run(
-        &["room", "create", "--name", "mission"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
         ROOM_PASS,
         Duration::from_secs(120),
     );
-    assert!(ok, "room create: {err}");
-    let label = alice.vox(&["room", "list"]).1;
-    let label = label.split_whitespace().next().expect("a room").to_owned();
+    assert!(ok, "PRODUCT (staging): room create: {err}");
+    let (_, listed, list_err) = alice.vox(&["room", "list"]);
+    let label = listed
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `vox room list` names no room after a create: {listed}{list_err}")
+        })
+        .to_owned();
     let (ok, link, err) = alice.vox(&["room", "invite", &label]);
-    assert!(ok, "room invite: {err}");
+    assert!(ok, "PRODUCT (staging): room invite: {err}");
     let link = link.trim().to_owned();
     let room = link
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
-        .expect("an invite naming the room")
+        .unwrap_or_else(|| panic!("PRODUCT: the invite names no room: {link}"))
         .to_owned();
-    let mut joined = String::new();
-    for _ in 0..6 {
-        let (ok, _, err) = bob.run(
-            &["room", "join", &link, "--name", "mission"],
-            ROOM_PASS,
-            Duration::from_secs(120),
-        );
-        if ok {
-            joined.clear();
-            break;
-        }
-        joined = err;
-        std::thread::sleep(Duration::from_secs(5));
-    }
+    // One join, no retry: a join that fails is the product's failure, and #217's busy-host
+    // refusal is fixed (V210-43), so nothing known excuses one.
+    let (ok, out, err) = bob.run(
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
+        ROOM_PASS,
+        Duration::from_secs(120),
+    );
     assert!(
-        joined.is_empty(),
-        "CANNOT MEASURE: bob never joined: {joined}"
+        ok,
+        "PRODUCT: `vox room join` failed for bob.\nstdout: {out}\nstderr: {err}"
     );
     for (who, other, word) in [(&alice, &bob, "warm-bob"), (&bob, &alice, "warm-alice")] {
         let (ok, _, err) = other.vox(&["room", "post", &room, word]);
-        assert!(ok, "post: {err}");
+        assert!(ok, "PRODUCT: a warm-up post failed: {err}");
         until(
+            "PRODUCT (staging)",
             who,
             "each to read the other",
             &["room", "read", &room],
@@ -437,10 +467,16 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     for (i, sig) in ["TERM", "HUP", "KILL"].into_iter().enumerate() {
         let name = format!("offer-{sig}.bin");
         let file = tmp.path().join(&name);
-        std::fs::write(&file, vec![i as u8 + 1; 4096]).unwrap();
-        let mut send = alice.spawn(&["room", "send", &room, file.to_str().unwrap()]);
+        std::fs::write(&file, vec![i as u8 + 1; 4096]).expect("APPARATUS: the offered file");
+        let mut send = alice.spawn(&[
+            "room",
+            "send",
+            &room,
+            file.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ]);
         send.wait_for("vox: offering", Duration::from_secs(60));
         until(
+            "PRODUCT",
             &bob,
             "the offer to reach bob",
             &["room", "read", &room],
@@ -449,15 +485,21 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         signal(send.pid(), sig);
         assert!(
             send.exited_within(Duration::from_secs(10)).is_some(),
-            "CANNOT MEASURE: `vox room send` did not end on SIG{sig}"
+            "PRODUCT (staging): `vox room send` did not end on SIG{sig}"
         );
         let mark = alice_daemon.said().len();
         let out = tmp.path().join(format!("got-{sig}.bin"));
-        let (ok, stdout, stderr) =
-            bob.vox(&["room", "get", &room, &name, "--out", out.to_str().unwrap()]);
+        let (ok, stdout, stderr) = bob.vox(&[
+            "room",
+            "get",
+            &room,
+            &name,
+            "--out",
+            out.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ]);
         assert!(
             !ok,
-            "a withdrawn offer must not be collected: {stdout} {stderr}"
+            "PRODUCT: a withdrawn offer was collected: {stdout} {stderr}"
         );
         let deadline = Instant::now() + Duration::from_secs(20);
         let why = loop {
@@ -469,7 +511,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: alice's daemon never said why it refused bob after SIG{sig}; \
+                "PRODUCT (staging): alice's daemon never said why it refused bob after SIG{sig}; \
                  bob's get said: {stdout} {stderr}\nalice's daemon since:\n{said}"
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -481,7 +523,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         assert!(
             why.contains("no such service is offered in that room")
                 && !why.contains("did not accept the connection"),
-            "`vox room send` ended by SIG{sig} left its offer registered: alice's daemon \
+            "PRODUCT: `vox room send` ended by SIG{sig} left its offer registered: alice's daemon \
              carried bob's dial to a port nobody serves:\n{why}"
         );
         withdrawn += 1;
@@ -491,18 +533,29 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     // ---- (1b) two offers of the same file: ending one leaves the other serving ----
     let twin = tmp.path().join("twin.bin");
     let twin_bytes: Vec<u8> = (0..65_536u32).map(|i| (i % 253) as u8).collect();
-    std::fs::write(&twin, &twin_bytes).unwrap();
-    let mut first = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    std::fs::write(&twin, &twin_bytes).expect("APPARATUS: the twin file");
+    let mut first = alice.spawn(&[
+        "room",
+        "send",
+        &room,
+        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     let first_said = first.wait_for("vox: offering", Duration::from_secs(60));
     // Collected by the second offer's own tag, so the get asks for exactly the offer that is
     // still running.
     until(
+        "PRODUCT",
         &bob,
         "the first twin offer to reach bob",
         &["room", "read", &room],
         |o| o.contains("twin.bin"),
     );
-    let mut second = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let mut second = alice.spawn(&[
+        "room",
+        "send",
+        &room,
+        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     let second_said = second.wait_for("vox: offering", Duration::from_secs(60));
     let tag_of = |said: &str| {
         said.split_whitespace()
@@ -513,6 +566,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     let (t1, t2) = (tag_of(&first_said), tag_of(&second_said));
     eprintln!("[proof] twin offers of one file: tags {t1} and {t2}");
     until(
+        "PRODUCT",
         &bob,
         "the second twin offer to reach bob",
         &["room", "read", &room, "--json"],
@@ -521,11 +575,17 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     signal(first.pid(), "TERM");
     assert!(
         first.exited_within(Duration::from_secs(10)).is_some(),
-        "CANNOT MEASURE: the first twin offer did not end on SIGTERM"
+        "PRODUCT: `vox room send` (the first twin offer) was still running 10 s after SIGTERM"
     );
     let got = tmp.path().join("twin-got.bin");
-    let (ok, stdout, stderr) =
-        bob.vox(&["room", "get", &room, &t2, "--out", got.to_str().unwrap()]);
+    let (ok, stdout, stderr) = bob.vox(&[
+        "room",
+        "get",
+        &room,
+        &t2,
+        "--out",
+        got.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     let collected = std::fs::read(&got).ok();
     eprintln!(
         "[proof] get after the first twin ended: ok={ok}, {} bytes of 65536",
@@ -533,14 +593,20 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     );
     assert!(
         ok && collected.as_deref() == Some(&twin_bytes[..]),
-        "ending one offer of a file withdrew another offer of the same file that was still \
+        "PRODUCT: ending one offer of a file withdrew another offer of the same file that was still \
          running (tags {t1} and {t2}): {stdout} {stderr}"
     );
 
     // ---- (1c) a get by name is not hidden by a newer offer that has ended ----
-    let mut third = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let mut third = alice.spawn(&[
+        "room",
+        "send",
+        &room,
+        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     let t3 = tag_of(&third.wait_for("vox: offering", Duration::from_secs(60)));
     until(
+        "PRODUCT",
         &bob,
         "the third twin offer to reach bob",
         &["room", "read", &room, "--json"],
@@ -549,7 +615,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     signal(third.pid(), "TERM");
     assert!(
         third.exited_within(Duration::from_secs(10)).is_some(),
-        "CANNOT MEASURE: the newest twin offer did not end on SIGTERM"
+        "PRODUCT: `vox room send` (the newest twin offer) was still running 10 s after SIGTERM"
     );
     let by_name = tmp.path().join("twin-by-name.bin");
     let (ok, stdout, stderr) = bob.vox(&[
@@ -558,7 +624,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         &room,
         "twin.bin",
         "--out",
-        by_name.to_str().unwrap(),
+        by_name.to_str().expect("APPARATUS: a UTF-8 temp path"),
     ]);
     let collected = std::fs::read(&by_name).ok();
     eprintln!(
@@ -569,7 +635,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     );
     assert!(
         ok && collected.as_deref() == Some(&twin_bytes[..]),
-        "a get by name failed on the newest offer, which had ended, although an older offer of \
+        "PRODUCT: a get by name failed on the newest offer, which had ended, although an older offer of \
          the same file was still served: {stdout} {stderr}"
     );
 
@@ -578,16 +644,23 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     // name is then the older one, which is a different file: the get by name must fail, leave
     // nothing behind, and say how to ask for the other file exactly.
     let other_dir = tmp.path().join("other");
-    std::fs::create_dir_all(&other_dir).unwrap();
+    std::fs::create_dir_all(&other_dir).expect("APPARATUS: the other dir");
     let other_twin = other_dir.join("twin.bin");
-    std::fs::write(&other_twin, vec![0x5au8; 65_536]).unwrap();
-    let mut different = alice.spawn(&["room", "send", &room, other_twin.to_str().unwrap()]);
+    std::fs::write(&other_twin, vec![0x5au8; 65_536]).expect("APPARATUS: the other twin");
+    let mut different = alice.spawn(&[
+        "room",
+        "send",
+        &room,
+        other_twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     let t4 = tag_of(&different.wait_for("vox: offering", Duration::from_secs(60)));
     assert!(
         t4.len() > 21 && t4[..21] != t2[..21],
-        "CANNOT MEASURE: the different twin has the same content hash ({t4} vs {t2})"
+        "PRODUCT: `vox room send` offered two files with different contents under the same \
+         content hash ({t4} vs {t2})"
     );
     until(
+        "PRODUCT",
         &bob,
         "the different twin offer to reach bob",
         &["room", "read", &room, "--json"],
@@ -596,7 +669,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     signal(different.pid(), "TERM");
     assert!(
         different.exited_within(Duration::from_secs(10)).is_some(),
-        "CANNOT MEASURE: the different twin offer did not end on SIGTERM"
+        "PRODUCT: `vox room send` (the different twin offer) was still running 10 s after SIGTERM"
     );
     let wrong = tmp.path().join("twin-wrong.bin");
     let (ok, stdout, stderr) = bob.vox(&[
@@ -605,7 +678,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         &room,
         "twin.bin",
         "--out",
-        wrong.to_str().unwrap(),
+        wrong.to_str().expect("APPARATUS: a UTF-8 temp path"),
     ]);
     let left = std::fs::read(&wrong).ok();
     eprintln!(
@@ -616,32 +689,40 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     );
     assert!(
         !ok && left.is_none(),
-        "a get by name fell back to a DIFFERENT file that only shares the name \
+        "PRODUCT: a get by name fell back to a DIFFERENT file that only shares the name \
          ({} bytes collected): {stdout} {stderr}",
         left.as_ref().map_or(0, Vec::len)
     );
     assert!(
         stderr.contains("a different file also matches")
             && stderr.contains(&format!("vox room get {room} {t2}")),
-        "the refusal must say a different file matches, and name its live offer exactly: {stderr}"
+        "PRODUCT: the refusal does not say a different file matches and name its live offer \
+         exactly: {stderr}"
     );
     for dead in [&t1, &t3, &t4] {
         assert!(
             !stderr.contains(dead.as_str()) || stderr.contains(&format!("the offer {dead} of")),
-            "the refusal suggests an offer that has ended ({dead}): {stderr}"
+            "PRODUCT: the refusal suggests an offer that has ended ({dead}): {stderr}"
         );
     }
     let ran = run_suggestions(&bob, &stderr, &tmp.path().join("sugg-1d"), &twin_bytes);
     eprintln!("[proof] (1d) suggested commands run and collected the right bytes: {ran}");
     assert!(
         ran >= 1,
-        "CANNOT MEASURE: (1d) suggested no command: {stderr}"
+        "PRODUCT (staging): (1d) suggested no command: {stderr}"
     );
 
     // ---- (verifier v1) the command the refusal suggests collects exactly the named file ----
     let sug = t2[5..21].to_owned();
     let exact = tmp.path().join("twin-exact.bin");
-    let (ok, _o, se) = bob.vox(&["room", "get", &room, &sug, "--out", exact.to_str().unwrap()]);
+    let (ok, _o, se) = bob.vox(&[
+        "room",
+        "get",
+        &room,
+        &sug,
+        "--out",
+        exact.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     let got = std::fs::read(&exact).ok();
     eprintln!(
         "[verifier] v1 suggested `vox room get <room> {sug}`: ok={ok}, {} bytes, equals A: {}; said: {}",
@@ -655,7 +736,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     signal(second.pid(), "TERM");
     assert!(
         second.exited_within(Duration::from_secs(10)).is_some(),
-        "CANNOT MEASURE: second did not end"
+        "PRODUCT (staging): second did not end"
     );
     let carol = Profile::new(&tmp.path().join("carol"), &[]);
     let carol_fp = carol.id();
@@ -675,36 +756,45 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
             "--identity-passphrase-file",
             who.p(),
         ]);
-        assert!(ok, "trust {name}: {err}");
+        assert!(ok, "PRODUCT (staging): trust {name}: {err}");
     }
-    let mut cj = String::from("never tried");
-    for _ in 0..6 {
-        let (ok, _, err) = carol.run(
-            &["room", "join", &link, "--name", "mission"],
-            ROOM_PASS,
-            Duration::from_secs(120),
-        );
-        if ok {
-            cj.clear();
-            break;
-        }
-        cj = err;
-        std::thread::sleep(Duration::from_secs(5));
-    }
-    assert!(cj.is_empty(), "CANNOT MEASURE: carol never joined: {cj}");
+    let (ok, out, err) = carol.run(
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
+        ROOM_PASS,
+        Duration::from_secs(120),
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room join` failed for carol.\nstdout: {out}\nstderr: {err}"
+    );
     for (other, word) in [(&alice, "warm-c-alice"), (&bob, "warm-c-bob")] {
         let (ok, _, err) = other.vox(&["room", "post", &room, word]);
-        assert!(ok, "post: {err}");
+        assert!(ok, "PRODUCT: a warm-up post failed: {err}");
         until(
+            "PRODUCT (staging)",
             &carol,
             "carol to read alice and bob",
             &["room", "read", &room],
             |o| o.contains(word),
         );
     }
-    let bobs = bob.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let bobs = bob.spawn(&[
+        "room",
+        "send",
+        &room,
+        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     let tb = tag_of(&bobs.wait_for("vox: offering", Duration::from_secs(60)));
     until(
+        "PRODUCT",
         &carol,
         "bob's twin offer to reach carol",
         &["room", "read", &room, "--json"],
@@ -712,18 +802,31 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     );
     // control: carol CAN collect bob's offer by its exact tag
     let ctl = tmp.path().join("twin-ctl.bin");
-    let (okc, _o, sec) = carol.vox(&["room", "get", &room, &tb, "--out", ctl.to_str().unwrap()]);
+    let (okc, _o, sec) = carol.vox(&[
+        "room",
+        "get",
+        &room,
+        &tb,
+        "--out",
+        ctl.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     eprintln!(
         "[verifier] v2 control: carol gets bob's {tb} by tag: ok={okc}; said: {}",
         sec.trim()
     );
     assert!(
         okc && std::fs::read(&ctl).ok().as_deref() == Some(&twin_bytes[..]),
-        "CANNOT MEASURE: carol cannot collect bob's offer by tag"
+        "PRODUCT (staging): carol cannot collect bob's offer by tag"
     );
-    let mut newest = alice.spawn(&["room", "send", &room, twin.to_str().unwrap()]);
+    let mut newest = alice.spawn(&[
+        "room",
+        "send",
+        &room,
+        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     let tn = tag_of(&newest.wait_for("vox: offering", Duration::from_secs(60)));
     until(
+        "PRODUCT",
         &carol,
         "alice's newest twin to reach carol",
         &["room", "read", &room, "--json"],
@@ -732,7 +835,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     signal(newest.pid(), "TERM");
     assert!(
         newest.exited_within(Duration::from_secs(10)).is_some(),
-        "CANNOT MEASURE: newest did not end"
+        "PRODUCT (staging): newest did not end"
     );
     let cross = tmp.path().join("twin-cross.bin");
     let (ok2, _o, se2) = carol.vox(&[
@@ -741,7 +844,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         &room,
         "twin.bin",
         "--out",
-        cross.to_str().unwrap(),
+        cross.to_str().expect("APPARATUS: a UTF-8 temp path"),
     ]);
     let got2 = std::fs::read(&cross).ok();
     eprintln!(
@@ -757,7 +860,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         &room,
         &sug,
         "--out",
-        exact2.to_str().unwrap(),
+        exact2.to_str().expect("APPARATUS: a UTF-8 temp path"),
     ]);
     eprintln!(
         "[verifier] v2b the suggested sha command in that state: ok={ok3}, {} bytes; said: {}",
@@ -767,35 +870,51 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     // Every command the v2 refusal suggests is run as carol, and must collect bob's copy.
     assert!(
         se2.contains("the same file is also offered by"),
-        "v2: bob's live copy of the same file must be named as the same file: {se2}"
+        "PRODUCT: v2: bob's live copy of the same file is not named as the same file: {se2}"
     );
     assert!(
         !se2.contains("a different file also matches"),
-        "v2: only the same file is served, yet the refusal names a different one: {se2}"
+        "PRODUCT: v2: only the same file is served, yet the refusal names a different one: {se2}"
     );
     let ran2 = run_suggestions(&carol, &se2, &tmp.path().join("sugg-v2"), &twin_bytes);
     eprintln!("[proof] (v2) suggested commands run and collected the right bytes: {ran2}");
-    assert!(ran2 >= 1, "CANNOT MEASURE: v2 suggested no command: {se2}");
+    assert!(
+        ran2 >= 1,
+        "PRODUCT (staging): v2 suggested no command: {se2}"
+    );
     drop(bobs);
     assert!(
         v1,
-        "v1: the suggested command did not collect exactly the named file"
+        "PRODUCT: v1: the suggested `vox room get <room> {sug}` did not collect exactly the named \
+         file; it said: {se}"
     );
     assert!(
         v2,
-        "v2: a same-sha offer from another member was used as the fallback"
+        "PRODUCT: v2: a same-sha offer from another member was used as the fallback ({} bytes \
+         left); it said: {se2}",
+        got2.as_ref().map_or(0, Vec::len)
     );
     drop(second);
 
     // ---- (3) a get ended by SIGTERM, SIGHUP or SIGKILL closes its forward ----
     let Some(_) = listening(bob_daemon.pid()) else {
-        panic!("CANNOT MEASURE: lsof cannot be run here");
+        panic!("APPARATUS, CANNOT MEASURE: lsof cannot be run here");
+    };
+    let ports = |pid: u32| {
+        listening(pid)
+            .unwrap_or_else(|| panic!("APPARATUS, CANNOT MEASURE: lsof could not be run on {pid}"))
     };
     let big = tmp.path().join("stalled.bin");
-    std::fs::write(&big, vec![7u8; 1 << 20]).unwrap();
-    let stalled = alice.spawn(&["room", "send", &room, big.to_str().unwrap()]);
+    std::fs::write(&big, vec![7u8; 1 << 20]).expect("APPARATUS: the stalled file");
+    let stalled = alice.spawn(&[
+        "room",
+        "send",
+        &room,
+        big.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     stalled.wait_for("vox: offering", Duration::from_secs(60));
     until(
+        "PRODUCT",
         &bob,
         "the stalled offer to reach bob",
         &["room", "read", &room],
@@ -805,7 +924,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     signal(stalled.pid(), "STOP");
     let mut closed = 0usize;
     for sig in ["TERM", "HUP", "KILL"] {
-        let before = listening(bob_daemon.pid()).unwrap();
+        let before = ports(bob_daemon.pid());
         let out = tmp.path().join(format!("stalled-{sig}.bin"));
         let mut get = bob.spawn(&[
             "room",
@@ -813,17 +932,17 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
             &room,
             "stalled.bin",
             "--out",
-            out.to_str().unwrap(),
+            out.to_str().expect("APPARATUS: a UTF-8 temp path"),
         ]);
         let deadline = Instant::now() + Duration::from_secs(20);
         let forward = loop {
-            let now = listening(bob_daemon.pid()).unwrap();
+            let now = ports(bob_daemon.pid());
             if let Some(p) = now.difference(&before).next() {
                 break p.clone();
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: bob's daemon never opened a forward for the get; it said: {}",
+                "PRODUCT (staging): bob's daemon never opened a forward for the get; it said: {}",
                 get.said()
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -831,20 +950,20 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         std::thread::sleep(Duration::from_millis(500));
         assert!(
             get.exited_within(Duration::ZERO).is_none(),
-            "CANNOT MEASURE: the get ended before it was signalled: {}",
+            "PRODUCT (staging): the get ended before it was signalled: {}",
             get.said()
         );
         signal(get.pid(), sig);
         assert!(
             get.exited_within(Duration::from_secs(10)).is_some(),
-            "CANNOT MEASURE: `vox room get` did not end on SIG{sig}"
+            "PRODUCT (staging): `vox room get` did not end on SIG{sig}"
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         let t0 = Instant::now();
-        while listening(bob_daemon.pid()).unwrap().contains(&forward) {
+        while ports(bob_daemon.pid()).contains(&forward) {
             assert!(
                 Instant::now() < deadline,
-                "`vox room get` ended by SIG{sig} left bob's daemon listening on its forward \
+                "PRODUCT: `vox room get` ended by SIG{sig} left bob's daemon listening on its forward \
                  {forward} for 10 s"
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -861,13 +980,18 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
 
     // ---- (2) an offer is never persisted: the daemon stops while one runs ----
     let live = tmp.path().join("live.bin");
-    std::fs::write(&live, b"offered while the daemon stops").unwrap();
-    let live_send = alice.spawn(&["room", "send", &room, live.to_str().unwrap()]);
+    std::fs::write(&live, b"offered while the daemon stops").expect("APPARATUS: the live file");
+    let live_send = alice.spawn(&[
+        "room",
+        "send",
+        &room,
+        live.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     let offered = live_send.wait_for("vox: offering", Duration::from_secs(60));
     let tag = offered
         .split_whitespace()
         .find(|w| w.starts_with("file-"))
-        .expect("the offer's tag")
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room send` named no tag: {offered}"))
         .to_owned();
     let mut alice_daemon = alice_daemon;
     signal(alice_daemon.pid(), "TERM");
@@ -875,24 +999,22 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         alice_daemon
             .exited_within(Duration::from_secs(30))
             .is_some(),
-        "CANNOT MEASURE: alice's daemon did not stop on SIGTERM"
+        "PRODUCT: alice's `vox daemon` was still running 30 s after SIGTERM"
     );
     drop(live_send);
     let room_pass = tmp.path().join("room.pass");
-    std::fs::write(&room_pass, ROOM_PASS).unwrap();
+    std::fs::write(&room_pass, ROOM_PASS).expect("APPARATUS: the room passphrase file");
     let list = |what: &str| {
         let (ok, out, err) = alice.vox(&[
             "service",
             "list",
             &room,
-            "--passphrase-file",
-            room_pass.to_str().unwrap(),
             "--identity-passphrase-file",
             alice.p(),
             "--listen",
             "127.0.0.1:0",
         ]);
-        assert!(ok, "CANNOT MEASURE: vox service list ({what}): {err}");
+        assert!(ok, "PRODUCT (staging): vox service list ({what}): {err}");
         eprintln!("[proof] vox service list ({what}): {}", out.trim());
         out
     };
@@ -905,21 +1027,21 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         "kept",
         "127.0.0.1:9",
         "--passphrase-file",
-        room_pass.to_str().unwrap(),
+        room_pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
         "--identity-passphrase-file",
         alice.p(),
         "--listen",
         "127.0.0.1:0",
     ]);
-    assert!(ok, "CANNOT MEASURE: vox service add: {err}");
+    assert!(ok, "PRODUCT (staging): vox service add: {err}");
     let control = list("control, after `vox service add kept`");
     assert!(
         control.contains("kept"),
-        "CANNOT MEASURE: `vox service list` does not show a persisted service: {control}"
+        "PRODUCT (staging): `vox service list` does not show a persisted service: {control}"
     );
     assert!(
         !after.contains(&tag) && !after.contains("file-"),
-        "an offer over the control socket was persisted: alice's store still offers {tag} \
+        "PRODUCT: an offer over the control socket was persisted: alice's store still offers {tag} \
          after her daemon stopped:\n{after}"
     );
     eprintln!("[proof] offers persisted across a daemon stop: 0 (control service listed: 1)");
@@ -929,35 +1051,43 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
 #[ignore = "real daemons and production Argon2id; CI runs it in release"]
 fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let uid = my_uid(tmp.path());
     let t = tmp.path().join("t");
-    std::fs::create_dir_all(&t).unwrap();
-    let t_env = [("TMPDIR", t.to_str().unwrap())];
+    std::fs::create_dir_all(&t).expect("APPARATUS: the shared temp dir");
+    let t_env = [("TMPDIR", t.to_str().expect("APPARATUS: a UTF-8 temp path"))];
     // Profile paths over the 100-byte socket budget, so the fallback is the one used.
     let p = Profile::new(&tmp.path().join("a".repeat(90)), &t_env);
     let q = Profile::new(&tmp.path().join("b".repeat(90)), &t_env);
     assert!(
         p.data.join("default").join("node.sock").as_os_str().len() > 104,
-        "CANNOT MEASURE: the profile path is short enough for the natural socket"
+        "APPARATUS, CANNOT MEASURE: the proof's profile path is short enough for the natural \
+         socket"
     );
     p.id();
     q.id();
 
     // ---- (4) the fallback directory is private, even if it was left wide open ----
     let private = t.join(format!("vox-{uid}"));
-    std::fs::create_dir(&private).unwrap();
-    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::create_dir(&private).expect("APPARATUS: staging the open per-user dir");
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o777))
+        .expect("APPARATUS: staging the open per-user dir");
     let (_pd, sock) = p.daemon(None);
     eprintln!("[proof] fallback socket: {}", sock.display());
     assert_eq!(
         sock.parent(),
         Some(private.as_path()),
-        "the fallback socket is not in the per-user directory {}",
+        "PRODUCT: the fallback socket is not in the per-user directory {}",
         private.display()
     );
-    let dir_meta = std::fs::symlink_metadata(&private).unwrap();
-    let sock_meta = std::fs::symlink_metadata(&sock).unwrap();
+    let dir_meta = std::fs::symlink_metadata(&private)
+        .unwrap_or_else(|e| panic!("PRODUCT: the per-user directory is gone: {e}"));
+    let sock_meta = std::fs::symlink_metadata(&sock).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT: the daemon named {} but it is not there: {e}",
+            sock.display()
+        )
+    });
     eprintln!(
         "[proof] {} mode {:o} uid {}; socket mode {:o} uid {}",
         private.display(),
@@ -966,35 +1096,56 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
         sock_meta.mode() & 0o7777,
         sock_meta.uid()
     );
-    assert!(dir_meta.is_dir() && dir_meta.mode() & 0o7777 == 0o700 && dir_meta.uid() == uid);
+    assert!(
+        dir_meta.is_dir() && dir_meta.mode() & 0o7777 == 0o700 && dir_meta.uid() == uid,
+        "PRODUCT: the per-user directory {} is left directory={} mode {:o} uid {}, not a 0700 \
+         directory owned by uid {uid}",
+        private.display(),
+        dir_meta.is_dir(),
+        dir_meta.mode() & 0o7777,
+        dir_meta.uid()
+    );
     assert!(
         sock_meta.file_type().is_socket()
             && sock_meta.mode() & 0o7777 == 0o600
-            && sock_meta.uid() == uid
+            && sock_meta.uid() == uid,
+        "PRODUCT: the control socket {} is socket={} mode {:o} uid {}, not a 0600 socket owned \
+         by uid {uid}",
+        sock.display(),
+        sock_meta.file_type().is_socket(),
+        sock_meta.mode() & 0o7777,
+        sock_meta.uid()
     );
     let in_tmp: Vec<String> = std::fs::read_dir(&t)
-        .unwrap()
+        .expect("APPARATUS: list the shared temp dir")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".sock"))
         .collect();
     assert!(
         in_tmp.is_empty(),
-        "a control socket landed in the shared temp directory itself: {in_tmp:?}"
+        "PRODUCT: a control socket landed in the shared temp directory itself: {in_tmp:?}"
     );
     let (ok, _, err) = p.run(
-        &["room", "create", "--name", "p-only-room"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "p-only-room",
+        ],
         ROOM_PASS,
         Duration::from_secs(120),
     );
     assert!(
         ok,
-        "CANNOT MEASURE: room create through the fallback socket: {err}"
+        "PRODUCT (staging): room create through the fallback socket: {err}"
     );
     let (ok, out, err) = p.vox(&["room", "list"]);
     assert!(
         ok && out.contains("p-only-room"),
-        "CANNOT MEASURE: room list: {out} {err}"
+        "PRODUCT (staging): room list: {out} {err}"
     );
 
     // ---- (5) a client refuses what is at its socket path unless it is its own socket ----
@@ -1002,35 +1153,43 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
     signal(qd.pid(), "TERM");
     assert!(
         qd.exited_within(Duration::from_secs(30)).is_some(),
-        "CANNOT MEASURE: q's daemon did not stop"
+        "PRODUCT (staging): q's daemon did not stop"
     );
     assert!(
         std::fs::symlink_metadata(&q_sock).is_err(),
-        "CANNOT MEASURE: q's socket was left behind"
+        "PRODUCT (staging): q's socket was left behind"
     );
-    std::os::unix::fs::symlink(&sock, &q_sock).unwrap();
+    std::os::unix::fs::symlink(&sock, &q_sock).expect("APPARATUS: planting the symlink");
     let (ok, out, err) = q.vox(&["room", "list"]);
     eprintln!("[proof] room list at a planted symlink: ok={ok} stdout={out:?} stderr={err:?}");
     assert!(
         !out.contains("p-only-room"),
-        "a client sent its request to a socket that is not its own and was answered with \
+        "PRODUCT: a client sent its request to a socket that is not its own and was answered with \
          another profile's rooms: {out}"
     );
     assert!(
         !ok && err.contains("not a socket owned by you") && err.contains("symlink"),
-        "a client must refuse a socket path that is not its own socket, and say so: {err}"
+        "PRODUCT: a client did not refuse a socket path that is not its own socket, saying so \
+         (ok={ok}): {err}"
     );
-    std::fs::remove_file(&q_sock).unwrap();
+    std::fs::remove_file(&q_sock).expect("APPARATUS: removing the planted symlink");
 
     // ---- (4) a per-user directory that is a symlink is refused, not followed ----
     let t3 = tmp.path().join("t3");
     let elsewhere = tmp.path().join("elsewhere");
-    std::fs::create_dir_all(&t3).unwrap();
-    std::fs::create_dir_all(&elsewhere).unwrap();
-    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, t3.join(format!("vox-{uid}"))).unwrap();
+    std::fs::create_dir_all(&t3).expect("APPARATUS: staging t3");
+    std::fs::create_dir_all(&elsewhere).expect("APPARATUS: staging elsewhere");
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755))
+        .expect("APPARATUS: staging elsewhere");
+    std::os::unix::fs::symlink(&elsewhere, t3.join(format!("vox-{uid}")))
+        .expect("APPARATUS: planting the symlinked per-user dir");
     let q3 = Profile {
-        env: vec![("TMPDIR".into(), t3.to_str().unwrap().to_owned())],
+        env: vec![(
+            "TMPDIR".into(),
+            t3.to_str()
+                .expect("APPARATUS: a UTF-8 temp path")
+                .to_owned(),
+        )],
         ..Profile::new(&tmp.path().join("b".repeat(90)), &[])
     };
     let mut d3 = q3.spawn(&[
@@ -1046,19 +1205,28 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
         "[proof] daemon with a symlinked vox-{uid}: ended={ended:?} said: {}",
         said.trim()
     );
-    let touched: Vec<_> = std::fs::read_dir(&elsewhere).unwrap().collect();
+    let touched: Vec<String> = std::fs::read_dir(&elsewhere)
+        .expect("APPARATUS: list elsewhere")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let elsewhere_mode = std::fs::metadata(&elsewhere)
+        .expect("APPARATUS: stat elsewhere")
+        .mode()
+        & 0o7777;
     assert_eq!(
         ended,
         Some(false),
-        "the daemon started with its socket directory a symlink: {said}"
+        "PRODUCT: the daemon started with its socket directory a symlink: {said}"
     );
     assert!(
         said.contains("not a directory owned by you") && said.contains("symlink"),
-        "the refusal must say why: {said}"
+        "PRODUCT: the refusal does not say the directory is a symlink not owned by you: {said}"
     );
     assert!(
-        touched.is_empty() && std::fs::metadata(&elsewhere).unwrap().mode() & 0o7777 == 0o755,
-        "the directory the symlink points at was used or changed"
+        touched.is_empty() && elsewhere_mode == 0o755,
+        "PRODUCT: the directory the symlink points at was used or changed: it holds {touched:?}, \
+         mode {elsewhere_mode:o} (was 755)"
     );
     eprintln!("[proof] private dir 0700 (from 0777): 1; socket 0600: 1; sockets in <tmp>: 0; foreign socket refused: 1; symlinked dir refused: 1");
 }
@@ -1067,7 +1235,7 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
 #[ignore = "a real daemon under a descriptor limit; CI runs it in release"]
 fn an_accept_error_does_not_end_the_control_socket() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let p = Profile::new(&tmp.path().join("p"), &[]);
     p.id();
     // `ulimit` then `exec`, so the daemon itself runs under the limit.
@@ -1081,7 +1249,7 @@ fn an_accept_error_does_not_end_the_control_socket() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = c.spawn().expect("spawn sh");
+    let mut child = c.spawn().expect("APPARATUS: spawn sh");
     let said = Arc::new(Mutex::new(String::new()));
     drain(child.stdout.take(), &said);
     drain(child.stderr.take(), &said);
@@ -1091,7 +1259,7 @@ fn an_accept_error_does_not_end_the_control_socket() {
         .lines()
         .find_map(|l| l.strip_prefix("vox daemon: control socket "))
         .map(|s| PathBuf::from(s.trim()))
-        .unwrap();
+        .unwrap_or_else(|| panic!("PRODUCT: `vox daemon` named no control socket: {out}"));
 
     // Connect until one is never greeted: the daemon is out of descriptors and its accept fails.
     let mut held = Vec::new();
@@ -1103,7 +1271,8 @@ fn an_accept_error_does_not_end_the_control_socket() {
             refused += 1;
             break;
         };
-        s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("APPARATUS: set a read timeout on the control socket");
         let mut len = [0u8; 4];
         if s.read_exact(&mut len).is_ok() {
             greeted += 1;
@@ -1122,14 +1291,14 @@ fn an_accept_error_does_not_end_the_control_socket() {
     );
     assert!(
         ungreeted >= 1,
-        "CANNOT MEASURE: {greeted} connections were all greeted; the daemon never ran out of \
-         descriptors"
+        "APPARATUS, CANNOT MEASURE: {greeted} connections were all greeted; the proof's \
+         descriptor limit never ran the daemon out of descriptors"
     );
     drop(held);
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         daemon.exited_within(Duration::ZERO).is_none(),
-        "CANNOT MEASURE: the daemon died of the descriptor limit: {}",
+        "PRODUCT: the daemon died of the descriptor limit: {}",
         daemon.said()
     );
     let t0 = Instant::now();
@@ -1142,24 +1311,26 @@ fn an_accept_error_does_not_end_the_control_socket() {
     );
     assert!(
         ok,
-        "the control socket stopped answering after an accept error: {out} {err}"
+        "PRODUCT: the control socket stopped answering after an accept error: {out} {err}"
     );
 }
 
 #[test]
 fn shell_setup_keeps_the_rc_files_symlink_and_mode() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let home = tmp.path().join("home");
     let dotfiles = home.join("dotfiles");
-    std::fs::create_dir_all(&dotfiles).unwrap();
+    let staged = "APPARATUS: staging the person's rc files";
+    std::fs::create_dir_all(&dotfiles).expect(staged);
     let target = dotfiles.join("zshrc");
-    std::fs::write(&target, "export KEPT=1\n").unwrap();
-    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::os::unix::fs::symlink(&target, home.join(".zshrc")).unwrap();
+    std::fs::write(&target, "export KEPT=1\n").expect(staged);
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect(staged);
+    std::os::unix::fs::symlink(&target, home.join(".zshrc")).expect(staged);
     // A plain rc of another shell the person uses, at a mode of their choosing.
-    std::fs::write(home.join(".bashrc"), "export ALSO=1\n").unwrap();
-    std::fs::set_permissions(home.join(".bashrc"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::fs::write(home.join(".bashrc"), "export ALSO=1\n").expect(staged);
+    std::fs::set_permissions(home.join(".bashrc"), std::fs::Permissions::from_mode(0o640))
+        .expect(staged);
 
     let run = |extra: &[&str]| {
         let out = Command::new(VOX)
@@ -1170,10 +1341,10 @@ fn shell_setup_keeps_the_rc_files_symlink_and_mode() {
             .env("PATH", "/usr/bin:/bin")
             .env("SHELL", "/bin/zsh")
             .output()
-            .expect("shell-setup ran");
+            .expect("APPARATUS: run vox shell-setup");
         assert!(
             out.status.success(),
-            "vox shell-setup {extra:?}: {}{}",
+            "PRODUCT: vox shell-setup {extra:?} failed: {}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -1181,28 +1352,51 @@ fn shell_setup_keeps_the_rc_files_symlink_and_mode() {
     let mut kept = 0usize;
     for (step, extra) in [("setup", &[][..]), ("remove", &["--remove"][..])] {
         run(extra);
-        let link = std::fs::symlink_metadata(home.join(".zshrc")).unwrap();
-        let text = std::fs::read_to_string(&target).unwrap();
-        let mode = std::fs::metadata(&target).unwrap().mode() & 0o7777;
-        let bash_mode = std::fs::metadata(home.join(".bashrc")).unwrap().mode() & 0o7777;
-        let bash = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+        let gone = |what: &str, e: std::io::Error| -> ! {
+            panic!("PRODUCT: after {step}, the person's {what} is gone or unreadable: {e}")
+        };
+        let link =
+            std::fs::symlink_metadata(home.join(".zshrc")).unwrap_or_else(|e| gone(".zshrc", e));
+        let text = std::fs::read_to_string(&target).unwrap_or_else(|e| gone("zshrc target", e));
+        let mode = std::fs::metadata(&target)
+            .unwrap_or_else(|e| gone("zshrc target", e))
+            .mode()
+            & 0o7777;
+        let bash_mode = std::fs::metadata(home.join(".bashrc"))
+            .unwrap_or_else(|e| gone(".bashrc", e))
+            .mode()
+            & 0o7777;
+        let bash =
+            std::fs::read_to_string(home.join(".bashrc")).unwrap_or_else(|e| gone(".bashrc", e));
         eprintln!(
             "[proof] after {step}: .zshrc symlink={} target mode {mode:o}; .bashrc mode {bash_mode:o}",
             link.file_type().is_symlink()
         );
+        let points_at = std::fs::read_link(home.join(".zshrc")).ok();
         assert!(
+            link.file_type().is_symlink() && points_at.as_deref() == Some(target.as_path()),
+            "PRODUCT: {step}: the symlinked .zshrc was replaced (symlink={}, points at \
+             {points_at:?})",
             link.file_type().is_symlink()
-                && std::fs::read_link(home.join(".zshrc")).unwrap() == target,
-            "{step}: the symlinked .zshrc was replaced by a plain file"
         );
-        assert_eq!(mode, 0o600, "{step}: the rc file's mode was changed");
-        assert_eq!(bash_mode, 0o640, "{step}: .bashrc's mode was changed");
-        assert!(text.contains("export KEPT=1") && bash.contains("export ALSO=1"));
+        assert_eq!(
+            mode, 0o600,
+            "PRODUCT: {step}: the rc file's mode was changed"
+        );
+        assert_eq!(
+            bash_mode, 0o640,
+            "PRODUCT: {step}: .bashrc's mode was changed"
+        );
+        assert!(
+            text.contains("export KEPT=1") && bash.contains("export ALSO=1"),
+            "PRODUCT: {step}: the person's own lines were lost:\n--- zshrc:\n{text}\n--- \
+             .bashrc:\n{bash}"
+        );
         let wired = text.contains("vox") && bash.contains("vox");
         assert_eq!(
             wired,
             step == "setup",
-            "{step}: the block was not {} through the symlink",
+            "PRODUCT: {step}: the block was not {} through the symlink",
             if step == "setup" {
                 "written"
             } else {
@@ -1217,10 +1411,10 @@ fn shell_setup_keeps_the_rc_files_symlink_and_mode() {
 #[test]
 fn a_room_passphrase_is_never_taken_from_argv_or_the_environment() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let p = Profile::new(&tmp.path().join("p"), &[]);
     let room_pass = tmp.path().join("room.pass");
-    std::fs::write(&room_pass, ROOM_PASS).unwrap();
+    std::fs::write(&room_pass, ROOM_PASS).expect("APPARATUS: the room passphrase file");
     let base = [
         "up",
         "aaaa",
@@ -1239,7 +1433,8 @@ fn a_room_passphrase_is_never_taken_from_argv_or_the_environment() {
     eprintln!("[proof] --passphrase: ok={ok} {}", err.trim());
     assert!(
         !ok && err.contains("--passphrase is refused") && err.contains("--passphrase-file"),
-        "a room passphrase on the command line must be refused, naming the replacement: {err}"
+        "PRODUCT: a room passphrase on the command line was not refused naming the replacement \
+         (ok={ok}): {err}"
     );
 
     let mut with_env = Profile::new(&tmp.path().join("p"), &[]);
@@ -1250,14 +1445,19 @@ fn a_room_passphrase_is_never_taken_from_argv_or_the_environment() {
     eprintln!("[proof] VOX_ROOM_PASSPHRASE: ok={ok} {}", err.trim());
     assert!(
         !ok && err.contains("VOX_ROOM_PASSPHRASE is refused"),
-        "a room passphrase in the environment must be refused: {err}"
+        "PRODUCT: a room passphrase in the environment was not refused (ok={ok}): {err}"
     );
 
-    // The control: the file form gets past the passphrase to the room, which does not exist.
+    // The control: the file form gets past the passphrase check to the next step, unlocking the
+    // identity, which this profile does not have. A refusal by the check is the product
+    // refusing the form it tells people to use.
     let (_, _, err) = p.run(
         &[
             &base[..],
-            &["--passphrase-file", room_pass.to_str().unwrap()],
+            &[
+                "--passphrase-file",
+                room_pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
+            ],
         ]
         .concat(),
         "",
@@ -1266,7 +1466,12 @@ fn a_room_passphrase_is_never_taken_from_argv_or_the_environment() {
     eprintln!("[proof] --passphrase-file: {}", err.trim());
     assert!(
         !err.contains("is refused"),
-        "CANNOT MEASURE: --passphrase-file was refused too: {err}"
+        "PRODUCT: --passphrase-file, the form the refusals name, was refused too: {err}"
+    );
+    assert!(
+        err.contains("no identity yet"),
+        "PRODUCT (staging): --passphrase-file did not reach the identity unlock after the check, so \
+         this control does not show the file form passes it: {err}"
     );
     eprintln!(
         "[proof] room passphrase refused from argv: 1, from the environment: 1; file accepted: 1"

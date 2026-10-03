@@ -34,26 +34,34 @@
 //!   with its in-process client's `promptAsync`, which starts a turn when the session is
 //!   idle and is taken at the next step boundary mid-turn. It answers one line, so a
 //!   session OpenCode no longer knows is told apart from one that took the prompt.
-//! - **Codex** — reachable in principle through its app-server: `turn/start` when the
-//!   thread is idle, `turn/steer` with `expectedTurnId` when a turn is running (a
-//!   mid-turn `turn/start` is folded into that turn — ADR-020 M19.12). But
-//!   this build has no verified path to that socket from a hook's environment, so
-//!   it is **named and not implemented**. A registration for it is written and
-//!   waking it reports plainly that it cannot, rather than failing silently or
-//!   pretending.
+//! - **Codex** — **not woken, by decision** (V210-169). Its app-server can start a turn on a
+//!   thread it holds, but it keeps a session's thread loaded for a while after the user quits,
+//!   so a wake sent there would start a model turn in a session nobody is in. Vox never starts
+//!   a model run. A Codex session is registered so that the poster of an urgent message to it
+//!   is told, in one line, that it cannot be interrupted and reads the message at its next
+//!   turn ([`uninterruptible`]).
+//!
+//! ## Who is woken (V210-161, V210-163)
+//!
+//! An urgent message addressed to a node wakes the sessions of that node, in whichever room it
+//! lands: `to` names nodes, and every session hears every room its node holds. The node the
+//! message is for decides, on its own daemon, so a session on another node is woken by that
+//! node's daemon once the message reaches it. Not the session that posted it, and not one that
+//! already spoke in the reply chain it answers (V210-121).
 //!
 //! ## What a wake says, and when (V030-15, V030-20)
 //!
 //! A wake is a **notice**: how many urgent messages and replies wait, from whom, in which room,
 //! and never a byte of any of them (`agent_hook::render_wake`). The messages arrive once, in the
 //! drain of the turn the notice starts. The daemon counts what is owed just before it sends
-//! ([`unread`], [`tend`]), keeps at most one notice outstanding, and announces an unread reply to
-//! an idle session on a schedule ([`Settings`]). What it owes each session is kept in
-//! [`Notices`], beside the registration, so a restart resumes it.
+//! ([`unread`], [`tend`]), keeps at most one notice outstanding per session, across every room,
+//! and announces an unread reply to an idle session on a schedule ([`Settings`]). What it owes
+//! each session is kept in [`Notices`], beside the registration, so a restart resumes it.
 
 use std::path::Path;
 
 use vox_agentcomms::envelope::{Envelope, DEFAULT_HOPS};
+use vox_core::hash::Digest32;
 use vox_core::node::api::MessageRow;
 use vox_core::node::paths::Paths;
 
@@ -64,11 +72,6 @@ pub struct Session {
     pub session: String,
     /// `claude`, `opencode` or `codex`.
     pub harness: String,
-    /// The room this session is attached to.
-    pub room: String,
-    /// The petname this session answers to, when it has one.
-    #[serde(default)]
-    pub name: String,
     /// Claude Code's messaging socket, or the Vox OpenCode plugin's wake socket.
     #[serde(default)]
     pub endpoint: String,
@@ -124,17 +127,31 @@ pub fn now_millis() -> u64 {
 ///
 /// Best effort on purpose: a session that cannot be woken should still be able to
 /// read its room, so every failure here is silent and leaves the drain working.
-pub fn register(paths: &Paths, session: &str, room: &str) {
-    let name = std::env::var("VOX_AGENT_NAME").unwrap_or_default();
-    let reg = if let (Ok(endpoint), Ok(token)) = (
+///
+/// A session is woken for an urgent message addressed to its node, in any room: it hears every
+/// room its node holds (V210-161, V210-163).
+///
+/// `codex` says the hook's input is Codex's ([`codex_input`]). It is checked first: a Codex
+/// started from a Claude Code terminal inherits that terminal's messaging socket, and a Codex
+/// session registered by it would have its wakes sent to the Claude session. Vox never wakes a
+/// Codex session (V210-169); it is registered with no endpoint, so the poster is told so.
+pub fn register(paths: &Paths, session: &str, codex: bool) {
+    let reg = if codex {
+        Session {
+            session: session.to_owned(),
+            harness: "codex".into(),
+            endpoint: String::new(),
+            token: String::new(),
+            state: BUSY.into(),
+            state_ms: now_millis(),
+        }
+    } else if let (Ok(endpoint), Ok(token)) = (
         std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
         std::env::var("CLAUDE_CODE_MESSAGING_TOKEN"),
     ) {
         Session {
             session: session.to_owned(),
             harness: "claude".into(),
-            room: room.to_owned(),
-            name,
             endpoint,
             token,
             state: BUSY.into(),
@@ -147,8 +164,6 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
         Session {
             session: session.to_owned(),
             harness: "opencode".into(),
-            room: room.to_owned(),
-            name,
             endpoint,
             token,
             state: BUSY.into(),
@@ -158,8 +173,6 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
         Session {
             session: session.to_owned(),
             harness: std::env::var("VOX_HARNESS").unwrap_or_else(|_| "unknown".into()),
-            room: room.to_owned(),
-            name,
             endpoint: String::new(),
             token: String::new(),
             state: BUSY.into(),
@@ -174,6 +187,44 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
         let _ =
             vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
     }
+}
+
+/// Whether a hook's input is Codex's: it names a Codex rollout (`rollout-*.jsonl`) as the
+/// transcript, or carries Codex's `turn_id`. Read from the input, not the environment, which a
+/// Codex started from another harness's terminal inherits.
+#[must_use]
+pub fn codex_input(transcript_path: &str, has_turn_id: bool) -> bool {
+    has_turn_id
+        || Path::new(transcript_path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.starts_with("rollout-") && f.ends_with(".jsonl"))
+}
+
+/// What the poster of an urgent message is told (V210-169), when it addresses this node and no
+/// session of this node can be interrupted: one line, or `None`.
+///
+/// `to` holds the addressees' whole fingerprints, as the envelope carries them, and `me` is this
+/// node's. The daemon wakes every session of an addressed node that left Vox a way to reach it;
+/// a Codex session never leaves one, because Vox never interrupts it. This says nothing of other
+/// nodes: a session there is woken, or not, by its own node.
+#[must_use]
+pub fn uninterruptible(paths: &Paths, me: &str, to: &[String]) -> Option<String> {
+    if !to.iter().any(|fp| fp == me) {
+        return None;
+    }
+    let reachable = registered(paths)
+        .iter()
+        .any(|s| s.harness != "codex" && !s.endpoint.is_empty());
+    if reachable {
+        return None;
+    }
+    Some(
+        "no session of this node can be interrupted: Vox never interrupts a Codex session, and \
+         no other session here left Vox a way to reach it. Each reads the message at its next \
+         turn."
+            .to_owned(),
+    )
 }
 
 /// Every session that has registered a wake channel.
@@ -206,6 +257,7 @@ pub fn forget(paths: &Paths, session: &Session) -> bool {
     let gone = still && std::fs::remove_file(&path).is_ok();
     if gone {
         let _ = std::fs::remove_file(notices_file(paths, &session.session));
+        let _ = std::fs::remove_file(woke_file(paths, &session.session));
     }
     gone
 }
@@ -230,11 +282,13 @@ pub fn record_idle(paths: &Paths, session: &str) {
     }
 }
 
-/// Remove `session`'s registration and its notice record (Claude Code's `SessionEnd`, V030-20):
-/// a session that has ended is never woken again. Its cursor stays, for a session resumed later.
+/// Remove `session`'s registration, its notice record and its record of wakes (Claude Code's
+/// `SessionEnd`, V030-20): a session that has ended is never woken again. Its cursors stay, for a
+/// session resumed later.
 pub fn end(paths: &Paths, session: &str) {
     let _ = std::fs::remove_file(paths.session_file(session));
     let _ = std::fs::remove_file(notices_file(paths, session));
+    let _ = std::fs::remove_file(woke_file(paths, session));
 }
 
 /// The hop budget `envelope` really has left, given the `rows` of its room (ADR-020 §9).
@@ -278,6 +332,113 @@ where
     let mut reply = Envelope::new(vox_agentcomms::envelope::SAY, "");
     reply.re = Some(re.to_owned());
     hops_left(&reply, rows)
+}
+
+/// Where the daemon records the entries that woke `session`: a file of the same name as its
+/// registration in a directory of its own beside the registrations', so the registrations'
+/// directory still holds one file per session.
+fn woke_file(paths: &Paths, session: &str) -> std::path::PathBuf {
+    let reg = paths.session_file(session);
+    let dir = paths.session_dir().with_extension("wakes");
+    dir.join(reg.file_name().unwrap_or_default())
+}
+
+/// Record that entry `entry` of `room` woke `session` (V210-121), so that the session's
+/// next post with no `--re` answers it rather than starting a chain of its own.
+///
+/// Best effort, as registration is: a wake that cannot be recorded still happened. The
+/// record keeps the latest `WOKE_KEPT` wakes, private to the profile like the registration.
+pub fn note_woke(paths: &Paths, session: &str, room: &str, entry: &Digest32) {
+    let path = woke_file(paths, session);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<&str> = old.lines().collect();
+    let new = format!("{room} {}", vox_core::node::link::b32_encode(entry));
+    lines.push(&new);
+    let keep = &lines[lines.len().saturating_sub(WOKE_KEPT)..];
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = vox_core::node::paths::write_private_file(&path, (keep.join("\n") + "\n").as_bytes());
+}
+
+/// The entries of `room` recorded as having woken `session` (V210-121), oldest first.
+#[must_use]
+pub fn recorded_wakes(paths: &Paths, session: &str, room: &str) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(woke_file(paths, session)) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(r, _)| *r == room)
+        .map(|(_, e)| e.to_owned())
+        .collect()
+}
+
+/// How many wakes a session's record keeps: far more than a session leaves unanswered.
+const WOKE_KEPT: usize = 64;
+
+/// The entries of `room` that woke `session` and that it has not answered yet, oldest first
+/// (V210-121): every recorded wake that `rows` still holds, less those a post of this
+/// session's — signed by this node, `me`, and naming the session in `from` — replies to.
+#[must_use]
+pub fn open_wakes(
+    paths: &Paths,
+    session: &str,
+    room: &str,
+    rows: &[MessageRow],
+    me: &Digest32,
+) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(woke_file(paths, session)) else {
+        return Vec::new();
+    };
+    let answered: std::collections::BTreeSet<String> = rows
+        .iter()
+        .filter(|r| r.author == *me)
+        .filter_map(|r| Envelope::parse(&r.text).ok())
+        .filter(|e| e.from == session)
+        .filter_map(|e| e.re.map(|re| re.trim().to_ascii_lowercase()))
+        .collect();
+    let mut open: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let Some((r, entry)) = line.split_once(' ') else {
+            continue;
+        };
+        if r != room || answered.contains(entry) || open.iter().any(|o| o == entry) {
+            continue;
+        }
+        if find(rows, entry).is_some() {
+            open.push(entry.to_owned());
+        }
+    }
+    open
+}
+
+/// Whether `session`, a session of this node (`me`), already spoke in the `re` chain
+/// `envelope` answers (V210-121): a parent, grandparent and so on, signed by `me` and
+/// naming `session` in `from`. Waking it again would answer it with its own conversation,
+/// which is how two agents keep each other awake; the message still queues for its next turn.
+#[must_use]
+pub fn in_chain<'a, R>(envelope: &Envelope, rows: &'a R, me: &Digest32, session: &str) -> bool
+where
+    R: ?Sized,
+    &'a R: IntoIterator<Item = &'a MessageRow>,
+{
+    let mut re = envelope.re.clone();
+    let mut depth: u32 = 0;
+    while let Some(parent) = re.as_deref().and_then(|h| find(rows, h)) {
+        depth += 1;
+        if depth > DEFAULT_HOPS {
+            break;
+        }
+        let Ok(p) = Envelope::parse(&parent.text) else {
+            break;
+        };
+        if parent.author == *me && p.from == session {
+            return true;
+        }
+        re = p.re;
+    }
+    false
 }
 
 fn find<'a, R>(rows: &'a R, re: &str) -> Option<&'a MessageRow>
@@ -324,9 +485,10 @@ pub async fn wake(session: &Session, text: &str) -> Result<(), WakeError> {
             )
             .await
         }
+        // Never woken (V210-169): Codex keeps a quit session's thread loaded, so a turn started
+        // there could run with nobody in the session.
         "codex" => Err(WakeError::Failed(
-            "codex sessions cannot be interrupted by this build; the message waits for the \
-             session's next turn"
+            "Vox does not interrupt Codex sessions; the message waits for the session's next turn"
                 .into(),
         )),
         other => Err(WakeError::Failed(format!(
@@ -460,9 +622,10 @@ pub fn is_reply(
             .is_some_and(|h| asked.contains(&h))
 }
 
-/// What `session` has not been given yet that it is owed a notice for: the urgent messages
-/// addressed to it that may still interrupt (hops left, ADR-020 §9), and the replies to its posts
-/// (V030-20), each oldest first.
+/// What `session` has not been given yet in one room that it is owed a notice for: the urgent
+/// messages addressed to its node `me` that may still interrupt it (hops left, ADR-020 §9; not a
+/// reply chain it already spoke in, V210-121), and the replies to its posts (V030-20), each oldest
+/// first.
 ///
 /// "Not given yet" is the drain's own rule: past the session's `cursor` by arrival (a cursor the
 /// room no longer holds starts from the first message, as the drain does), not the session's own,
@@ -482,6 +645,8 @@ pub fn unread<'a>(
             .map(|r| r.arrival)
     });
     let asked = asked(timeline.iter(), me, &session.session);
+    // `to` names nodes, by whole fingerprint (V210-161).
+    let me_fp = me.map(|m| vox_core::node::link::b32_encode(&m));
     let mut rows: Vec<&MessageRow> = timeline
         .iter()
         .filter(|r| !r.owed && mark.is_none_or(|m| r.arrival > m))
@@ -496,7 +661,10 @@ pub fn unread<'a>(
         if me == Some(r.author) && !e.from.is_empty() && e.from == session.session {
             continue;
         }
-        if !session.name.is_empty() && e.may_interrupt(&session.name) && hops_left(&e, timeline) > 0
+        let for_me = me_fp.as_deref().is_some_and(|fp| e.may_interrupt(fp));
+        if for_me
+            && hops_left(&e, timeline) > 0
+            && !me.is_some_and(|m| in_chain(&e, timeline, &m, &session.session))
         {
             urgent.push(r);
         } else if is_reply(&e, &asked) && hops_left(&e, timeline) > 0 {
@@ -610,7 +778,7 @@ fn duration(v: &str) -> Option<std::time::Duration> {
 /// that a daemon restart resumes where it was.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Notices {
-    /// An urgent message addressed to this session landed and has not been announced yet.
+    /// An urgent message addressed to this session's node landed and has not been announced yet.
     #[serde(default)]
     pub urgent_due: bool,
     /// When the last notice was sent, in Unix milliseconds.

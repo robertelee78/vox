@@ -44,6 +44,10 @@ pub enum StreamKind {
     /// nodes, through the app API (ADR-022 decision 7). 9, not the 8 ADR-022 first gave it:
     /// v0.2.10 took 8 for [`StreamKind::Goodbye`].
     App = 9,
+    /// **Does a member hold a claim this node just posted?** (V210-168): the claimant's node asks
+    /// every member it can reach, and its client says "you hold it" only when every one folds to
+    /// that claim. See `node::agreestream`. Members only. Not 9, which [`StreamKind::App`] takes.
+    Agree = 10,
 }
 
 /// The largest kind frame we will read: `[kind]` is 2 bytes; anything bigger is
@@ -64,6 +68,7 @@ impl StreamKind {
             7 => Some(Self::Circuit),
             8 => Some(Self::Goodbye),
             9 => Some(Self::App),
+            10 => Some(Self::Agree),
             _ => None,
         }
     }
@@ -124,10 +129,21 @@ pub async fn accept_typed(conn: &VoxConnection) -> Result<(StreamKind, SendStrea
 pub async fn accept_typed_on(
     conn: &quinn::Connection,
 ) -> Result<(StreamKind, SendStream, RecvStream)> {
-    let (mut send, mut recv) = conn
+    let (send, recv) = conn
         .accept_bi()
         .await
         .map_err(|_| Error::Unreachable("quic stream: the connection is closed"))?;
+    read_kind(send, recv).await
+}
+
+/// Read the kind frame of a bi-stream already accepted. Waits at most
+/// [`crate::transport::framing::FRAME_PATIENCE`] for it, so a caller that accepts in a loop must
+/// run this on a task of its own: a peer that opens a stream and withholds its kind would
+/// otherwise hold every stream it opens after it.
+pub async fn read_kind(
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> Result<(StreamKind, SendStream, RecvStream)> {
     let frame = read_frame(&mut recv, MAX_KIND_FRAME)
         .await?
         .ok_or(Error::MalformedBundle("stream closed before kind"))?;

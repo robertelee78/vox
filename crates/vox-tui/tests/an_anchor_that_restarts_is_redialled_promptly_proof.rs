@@ -37,6 +37,13 @@
 
 #![cfg(unix)]
 
+// One test here is optional (decider, 2026-10-01): the one named below. CI only compiles it, and
+// without `--features optional-proofs` a stand-in says it was not run
+// (`support/optional_proof.rs`; docs/release/optional-proofs.md). The rest block.
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_connection_held_only_through_the_stopped_anchor_says_so);
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -75,6 +82,10 @@ const KILLED_WITHIN: Duration = Duration::from_secs(11);
 /// How soon after a SIGTERM the forward must say it: the close arrives at once and the next 1 s
 /// tick reads it. Short of the 8 s any inference from silence needs.
 const CLOSED_WITHIN: Duration = Duration::from_secs(3);
+/// The most this machine's own clock may stall (a `/usr/bin/true` start, or the redial poll's
+/// slowest turn past its 200 ms sleep and 2 s echo) before a missed [`BACK_WITHIN`] is the
+/// runner's, not the forward's.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
@@ -84,15 +95,15 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
     let started = Instant::now();
     let at = w.forward();
     let first = round_trip(at, b"before", Duration::from_secs(30));
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
-        "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
-        w.fwd.as_mut().unwrap().transcript()
+        "PRODUCT (staging): no echo through the forward before the anchor went: {first:?}\n{}",
+        forward(&mut w.fwd).transcript()
     );
     w.expect_still_relayed();
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
@@ -120,18 +131,23 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
 
     // ---- the forward carries again within BACK_WITHIN -----------------------------------------
     let mut carried = None;
+    let mut slowest_turn = Duration::ZERO;
     while back.elapsed() < BACK_WITHIN + Duration::from_secs(20) {
+        let turn = Instant::now();
         if round_trip(at, b"after", Duration::from_secs(2)).is_ok_and(|b| b == b"after") {
             carried = Some(back.elapsed());
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
+        // A turn is at most a 2 s echo and a 200 ms sleep; anything past that is this machine.
+        slowest_turn = slowest_turn.max(turn.elapsed().saturating_sub(Duration::from_millis(2200)));
     }
-    let said = w.fwd.as_mut().unwrap().transcript();
+    let apparatus = slowest_turn.max(apparatus_spawn());
+    let said = forward(&mut w.fwd).transcript();
     let saw_it_go = said.lines().any(|l| l.contains(GONE));
     eprintln!(
         "[proof] the forward carried again {carried:?} after the anchor was back (bound \
-         {BACK_WITHIN:?}); it said its anchor went: {saw_it_go}"
+         {BACK_WITHIN:?}, apparatus {apparatus:?}); it said its anchor went: {saw_it_go}"
     );
     let carried = carried.unwrap_or_else(|| {
         panic!(
@@ -142,11 +158,18 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
             w.host.as_mut().map(|h| h.transcript()).unwrap_or_default()
         )
     });
-    assert!(
-        carried < BACK_WITHIN,
-        "PRODUCT: the forward carried again only {carried:?} after its anchor was back, over {BACK_WITHIN:?}: \
-         a lost anchor waited for a periodic redial\n---- the forward ----\n{said}"
-    );
+    if carried >= BACK_WITHIN {
+        assert!(
+            apparatus <= APPARATUS_BUDGET,
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
+             forward carried again only {carried:?} after its anchor was back"
+        );
+        panic!(
+            "PRODUCT: the forward carried again only {carried:?} after its anchor was back, over \
+             {BACK_WITHIN:?} (apparatus {apparatus:?}): a lost anchor waited for a periodic \
+             redial\n---- the forward ----\n{said}"
+        );
+    }
     assert!(
         saw_it_go,
         "PRODUCT: the forward did not say its anchor connection went ({GONE:?})\n{said}"
@@ -194,13 +217,38 @@ fn assert_says_stopped(who: &str, said: &str, anchor: &str) {
     );
 }
 
-/// Send `sig` to `pid`. A signal that cannot be sent leaves the scene unstaged: CANNOT MEASURE.
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
+    let t = Instant::now();
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
+    assert!(
+        ok,
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
+    );
+    t.elapsed()
+}
+
+/// The guest's `vox forward` (`RelayWorld::fwd`), which [`RelayWorld::forward`] started.
+fn forward(fwd: &mut Option<world::VoxProc>) -> &mut world::VoxProc {
+    fwd.as_mut()
+        .expect("APPARATUS: the proof reads the forward before it started it")
+}
+
+/// Send `sig` to `pid`. A signal that cannot be sent leaves the scene unstaged: APPARATUS.
 fn kill<const N: usize>(args: [&str; N]) {
     let sent = std::process::Command::new("kill")
         .args(args)
         .status()
         .is_ok_and(|s| s.success());
-    assert!(sent, "CANNOT MEASURE: `kill {}` failed", args.join(" "));
+    assert!(sent, "APPARATUS: `kill {}` failed", args.join(" "));
 }
 
 /// The anchor's identity, from its `--anchor` spec.
@@ -239,7 +287,7 @@ fn a_killed_anchor_is_noticed_promptly() {
 fn an_anchor_stopped_while_it_carries_a_transfer_is_said_to_have_stopped() {
     let mut w = stopped_for_good("INT", CLOSED_WITHIN, true, false);
     let anchor = anchor_id(&w);
-    let said = w.fwd.as_mut().unwrap().transcript();
+    let said = forward(&mut w.fwd).transcript();
     assert_says_stopped("the forward", &said, &anchor);
 }
 
@@ -251,10 +299,10 @@ fn an_anchor_stopped_while_it_carries_a_transfer_is_said_to_have_stopped() {
 fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
     let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false, false);
     let anchor = anchor_id(&w);
-    let said = w.fwd.as_mut().unwrap().transcript();
+    let said = forward(&mut w.fwd).transcript();
     assert_says_stopped("the forward", &said, &anchor);
     // ---- and a forward stops on SIGTERM, saying so (V210-108's contract, #303) ----------------
-    let fwd = w.fwd.as_mut().unwrap();
+    let fwd = forward(&mut w.fwd);
     let signalled = Instant::now();
     kill(["-TERM", &fwd.child.id().to_string()]);
     let status = loop {
@@ -282,7 +330,7 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
     );
 }
 
-/// **What else a relay's stop ends** (V210-93; opt-in, `--features heavy-proofs`). The forward
+/// **What else a relay's stop ends** (V210-93; optional, `--features optional-proofs`). The forward
 /// also names its host as an anchor (`--anchor`): the families are split, so its only path to the
 /// host is a circuit through the anchor that is stopped (SIGTERM). The forward must say the anchor
 /// stopped, and of its host — still running — that the connection went because its path ran
@@ -293,17 +341,17 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
 /// **Optional, and why.** Whether the forward holds that relayed connection as its host's — rather
 /// than keep redialling the host directly, with "dialling this anchor failed … no direct
 /// candidates" — is not settled by anything the proof controls (a filing question of its own,
-/// reported apart from V210-93). Held, the claim is measured; not held, the arm says CANNOT MEASURE.
+/// reported apart from V210-93). Held, the claim is measured; not held, the arm says PRODUCT (staging).
 ///
 /// Mutation: the relay's stop not carried to the connections over its circuits (the reason left to
 /// the probe) → red on the host's line, with the probe's verdict.
-#[cfg(feature = "heavy-proofs")]
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "opt-in proof: real binaries, production Argon2id and a PoW; run with --features heavy-proofs"]
+#[ignore = "real binaries, production Argon2id and a PoW; optional, run it in release"]
 fn a_connection_held_only_through_the_stopped_anchor_says_so() {
     let mut w = stopped_for_good("TERM", CLOSED_WITHIN, false, true);
     let anchor = anchor_id(&w);
-    let said = w.fwd.as_mut().unwrap().transcript();
+    let said = forward(&mut w.fwd).transcript();
     assert_says_stopped("the forward", &said, &anchor);
 }
 
@@ -316,15 +364,18 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
     let anchor12: String = anchor_id(&w).chars().take(12).collect();
     let host12: String = w.host_fp.chars().take(12).collect();
     let started = Instant::now();
     let at = if host_too {
-        let host = w
-            .host_spec()
-            .unwrap_or_else(|| panic!("CANNOT MEASURE: no address for the host in {}", w.address));
+        let host = w.host_spec().unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): no address for the host in {}",
+                w.address
+            )
+        });
         w.forward_with_anchors(&[&host])
     } else {
         w.forward()
@@ -332,11 +383,11 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     let first = round_trip(at, b"before", Duration::from_secs(30));
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
-        "CANNOT MEASURE: no echo through the forward before the anchor went: {first:?}\n{}",
-        w.fwd.as_mut().unwrap().transcript()
+        "PRODUCT (staging): no echo through the forward before the anchor went: {first:?}\n{}",
+        forward(&mut w.fwd).transcript()
     );
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));
-    let fwd = w.fwd.as_mut().unwrap();
+    let fwd = forward(&mut w.fwd);
     if host_too {
         // The forward holds its host, which it names as an anchor too, over the only path it has
         // to it: a circuit through the anchor about to be stopped (the families are split, so its
@@ -344,7 +395,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
         // relay; and once it holds that connection as the host's, it stops redialling it — the
         // last "dialling this anchor failed …; the next try is in N s" goes N s and more without a
         // "dialling this anchor again". Until then the host is not held as an anchor and there is
-        // nothing of it for the stop to end: CANNOT MEASURE, not a verdict.
+        // nothing of it for the stop to end: PRODUCT (staging), not a verdict.
         let about_host = format!("connection to {host12} — dialling this anchor");
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -382,7 +433,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: the forward never held its host as an anchor over the relay \
+                "PRODUCT (staging): the forward never held its host as an anchor over the relay \
                  (reached: {reached}, still relayed: {relayed}, redialling it: {})\n{}",
                 !settled,
                 fwd.transcript()
@@ -398,7 +449,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
     assert_eq!(
         before,
         0,
-        "CANNOT MEASURE: the forward said its anchor went before it was stopped\n{}",
+        "PRODUCT (staging): the forward said its anchor went before it was stopped\n{}",
         fwd.transcript()
     );
 
@@ -412,15 +463,15 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
         );
         assert!(
             flowing,
-            "CANNOT MEASURE: the transfer through the forward never echoed {TRANSFER_FLOWING} bytes \
+            "PRODUCT (staging): the transfer through the forward never echoed {TRANSFER_FLOWING} bytes \
              ({} did)\n{}",
             t.echoed(),
-            w.fwd.as_mut().unwrap().transcript()
+            forward(&mut w.fwd).transcript()
         );
     }
 
     // ---- the anchor is stopped, and stays down --------------------------------------------------
-    let fwd_pid = w.fwd.as_mut().unwrap().child.id().to_string();
+    let fwd_pid = forward(&mut w.fwd).child.id().to_string();
     if carrying {
         kill(["-STOP", &fwd_pid]);
         std::thread::sleep(FROZEN_BEFORE_STOP);
@@ -438,7 +489,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
             "{}the anchor did not exit within 10 s of SIG{signal}",
             // SIGKILL is the kernel's to carry out; any other stop is the product's to obey.
             if signal == "KILL" {
-                "CANNOT MEASURE: "
+                "APPARATUS: the kernel did not carry out SIGKILL: "
             } else {
                 "PRODUCT: `vox node` did not obey a stop: "
             }
@@ -457,7 +508,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
 
     // ---- the forward says so ---------------------------------------------------------------------
     // Watched well past the bound, so a red prints how long it did take.
-    let fwd = w.fwd.as_mut().unwrap();
+    let fwd = forward(&mut w.fwd);
     let mut said = None;
     while stopped.elapsed() < within + Duration::from_secs(30) {
         let _ = fwd.transcript();
@@ -558,8 +609,8 @@ impl Transfer {
         let echoed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut out =
-            std::net::TcpStream::connect(at).expect("CANNOT MEASURE: connect to the forward");
-        let mut back = out.try_clone().expect("CANNOT MEASURE: clone the stream");
+            std::net::TcpStream::connect(at).expect("PRODUCT (staging): connect to the forward");
+        let mut back = out.try_clone().expect("APPARATUS: clone the stream");
         let _ = out.set_write_timeout(Some(Duration::from_millis(200)));
         let _ = back.set_read_timeout(Some(Duration::from_millis(200)));
         let idle = |e: &std::io::Error| {
@@ -646,7 +697,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
     let _ = w.forward();
     let anchor_dir = w.tmp.path().join("anchor");
@@ -654,7 +705,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
     for round in 1..=STOPS_AT_ONCE {
         // The next "connected" line, read as it arrives: the stop follows it at once. The first
         // may already have been read while the forward started.
-        let fwd = w.fwd.as_mut().unwrap();
+        let fwd = forward(&mut w.fwd);
         let reached = if round == 1 && fwd.seen.iter().any(|l| l.contains(CONNECTED)) {
             Some(Instant::now())
         } else {
@@ -662,8 +713,8 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
         };
         assert!(
             reached.is_some(),
-            "CANNOT MEASURE: round {round}: the forward never said it reached its anchor\n{}",
-            w.fwd.as_mut().unwrap().transcript()
+            "PRODUCT (staging): round {round}: the forward never said it reached its anchor\n{}",
+            forward(&mut w.fwd).transcript()
         );
         kill(["-INT", &w.anchor.proc.child.id().to_string()]);
         let stopping = Instant::now();
@@ -695,7 +746,7 @@ fn an_anchor_lost_the_moment_it_is_reached_is_noticed() {
             .count()
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    let fwd = w.fwd.as_mut().unwrap();
+    let fwd = forward(&mut w.fwd);
     let mut said = fwd.transcript();
     while said_of_it(&said) < stops && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));

@@ -19,7 +19,7 @@
 //! **Asserted,** with hard-coded numbers, after each arm keeps reading 45–60 s past the moment
 //! its required posts arrived (a late history release must be caught): in arm A bob reads
 //! exactly posts 1,101–1,110; in arm B exactly 1,101–2,050, all 950 of them; in neither any of
-//! posts 1–1,100. Precondition, or `CANNOT MEASURE`: alice's own paged reads show every post she
+//! posts 1–1,100. Precondition, or `PRODUCT (staging)`: alice's own paged reads show every post she
 //! made in both rooms.
 //!
 //! **The clock-step attack cannot be staged here** (it needs clock control, and sudo is
@@ -35,7 +35,15 @@
 //! arms). Dropping the live generation's post-trust part (the first fix's behaviour) leaves arm B
 //! at 50 of 950.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -80,17 +88,17 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -100,8 +108,10 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 
 /// Start `vox daemon` with the identity passphrase piped in, its output to files by the profile.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: create a staging file");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: create a staging file");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -111,10 +121,11 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: spawn vox daemon");
     // Write, then close: the daemon reads stdin to EOF before it binds its socket.
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
     Daemon(child)
 }
@@ -132,7 +143,7 @@ fn attached(dir: &Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "CANNOT MEASURE: {tag}'s daemon never answered: {last}\nits stderr: {}",
+        "PRODUCT (staging): {tag}'s daemon never answered: {last}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
     );
 }
@@ -151,12 +162,14 @@ fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize, usize) {
             args.extend(["--since", c]);
         }
         let (ok, out, err) = vox(dir, &args, None);
-        assert!(ok, "vox room read --json refused: {err}");
+        assert!(ok, "PRODUCT (staging): vox room read --json refused: {err}");
         pages += 1;
         let page: Vec<serde_json::Value> = out
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad row ({e}): {l}")))
+            .map(|l| {
+                serde_json::from_str(l).unwrap_or_else(|e| panic!("PRODUCT: bad row ({e}): {l}"))
+            })
             .collect();
         for row in &page {
             if let Some(n) = row["text"]
@@ -173,7 +186,7 @@ fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize, usize) {
                 since = Some(
                     last["entry_hash"]
                         .as_str()
-                        .expect("every row carries its entry hash")
+                        .expect("PRODUCT: every row carries its entry hash")
                         .to_owned(),
                 );
             }
@@ -187,36 +200,44 @@ fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize, usize) {
 fn create_room(alice: &Path, name: &str, before: &BTreeSet<String>) -> String {
     let (ok, _, err) = vox(
         alice,
-        &["room", "create", "--name", name],
+        &["room", "create", "--passphrase-file", "-", "--name", name],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
     attached(alice, "alice")
         .split_whitespace()
         .filter(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned)
         .find(|w| !before.contains(w))
-        .expect("a new room id in `room list`")
+        .expect("PRODUCT: a new room id in `room list`")
 }
 
 /// `post <lo>` .. `post <hi>`, each a separate `vox room post`.
 fn post_range(alice: &Path, room: &str, lo: usize, hi: usize) {
     for i in lo..=hi {
         let (ok, _, err) = vox(alice, &["room", "post", room, &format!("post {i}")], None);
-        assert!(ok, "CANNOT MEASURE: alice's post {i} was refused: {err}");
+        assert!(ok, "PRODUCT (staging): alice's post {i} was refused: {err}");
     }
 }
 
 /// Bob joins `room` from alice's `vox room invite`.
 fn join(bob: &Path, alice: &Path, room: &str, name: &str) {
     let (ok, link, err) = vox(alice, &["room", "invite", room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, _, err) = vox(
         bob,
-        &["room", "join", link.trim(), "--name", name],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            name,
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: vox room join: {err}");
+    assert!(ok, "PRODUCT (staging): vox room join: {err}");
 }
 
 /// Read bob's view of `room` until every post in `need` is there (or [`BOUND`] passes), then
@@ -261,26 +282,27 @@ fn ranges(seen: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
     out
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real vox daemons, 3,160 CLI posts and production Argon2id; CI runs it in release"]
+#[ignore = "real vox daemons, 3,160 CLI posts and production Argon2id; optional, run it in release"]
 fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
     // Two joins; 8 unlocks: two `vox id`s, two `trust add`s, two daemons and two rooms created.
     watchdog::arm_for_setup(2, 8);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     for d in [&alice, &bob] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let mut fps = Vec::new();
     for dir in [&alice, &bob] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         fps.push(out.trim().to_owned());
     }
     // Only bob trusts alice up front; alice's decision comes later.
     let (ok, _, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
-    assert!(ok, "bob trusts alice: {err}");
+    assert!(ok, "PRODUCT (staging): bob trusts alice: {err}");
 
     let alice_daemon = daemon(&alice, "alice");
     let before: BTreeSet<String> = attached(&alice, "alice")
@@ -309,7 +331,7 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
     // No pause around the decision: the order is logical, so the same second as a mint or a
     // post decides nothing.
     let (ok, _, err) = vox(&alice, &["trust", "add", &fps[1], "--name", "bob"], None);
-    assert!(ok, "alice trusts bob: {err}");
+    assert!(ok, "PRODUCT (staging): alice trusts bob: {err}");
 
     post_range(&alice, &room_a, 1_101, 1_110);
     post_range(&alice, &room_b, 1_101, 2_050);
@@ -318,7 +340,7 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
         let (mine, rows, _) = read_posts(&alice, room);
         assert!(
             mine.len() == total && rows == total,
-            "CANNOT MEASURE: alice herself reads {} distinct posts in {rows} rows of {room}, not \
+            "PRODUCT (staging): alice herself reads {} distinct posts in {rows} rows of {room}, not \
              {total}",
             mine.len()
         );
@@ -362,26 +384,26 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
     };
     assert!(
         a_pre.is_empty(),
-        "LEAK arm A: bob reads {} posts alice sealed before she trusted him: {:?}",
+        "PRODUCT: LEAK arm A: bob reads {} posts alice sealed before she trusted him: {:?}",
         a_pre.len(),
         ranges(a_pre.iter().copied())
     );
     assert!(
         b_pre.is_empty(),
-        "LEAK arm B: bob reads {} posts alice sealed before she trusted him: {:?}",
+        "PRODUCT: LEAK arm B: bob reads {} posts alice sealed before she trusted him: {:?}",
         b_pre.len(),
         ranges(b_pre.iter().copied())
     );
     assert!(
         a_post.contains(&1_110),
-        "CANNOT MEASURE: in arm A bob never read post 1110, made after alice trusted him, so his \
+        "PRODUCT (staging): in arm A bob never read post 1110, made after alice trusted him, so his \
          key never arrived{}",
         daemons()
     );
     assert_eq!(
         a_post,
         (1_101..=1_110).collect::<Vec<_>>(),
-        "arm A: bob must read exactly posts 1101-1110, the 10 alice made after trusting him"
+        "PRODUCT: arm A: bob must read exactly posts 1101-1110, the 10 alice made after trusting him"
     );
     assert_eq!(
         (
@@ -390,7 +412,7 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
             b_post.last().copied()
         ),
         (950, Some(1_101), Some(2_050)),
-        "arm B: bob must read all 950 posts alice made after trusting him, 1101-2050, however the \
+        "PRODUCT: arm B: bob must read all 950 posts alice made after trusting him, 1101-2050, however the \
          generations fall; he read {:?}",
         ranges(b_post.iter().copied())
     );

@@ -21,11 +21,11 @@
 //! **Asserted.**
 //! 1. 300 strangers, each on its own connection, put a pre-join for the room on the anchor and on
 //!    the victim, and at least 256 of them are taken by each — the slots really are full. Fewer is
-//!    `CANNOT MEASURE`.
+//!    `PRODUCT (staging)`.
 //! 2. 4100 geneses for rooms one stranger invented are offered, over one connection, to the
 //!    victim and to the anchor (a default `vox node`, which serves any room published to it). The
 //!    anchor takes at least 4095 — its 4096 rooms from peers less the room in use — so its board
-//!    is full (fewer is `CANNOT MEASURE`), and it still
+//!    is full (fewer is `PRODUCT (staging)`), and it still
 //!    serves the room in use: a room with live members is never displaced by empty ones.
 //! 3. The victim then creates a second room, and **both** boards serve its genesis — what a
 //!    joiner reaching either fetches first. (A join races both boards, so a join alone could
@@ -106,19 +106,24 @@ fn flood_batch(
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let mut other = [salt ^ 0x33; 32];
             other[..8].copy_from_slice(&(i as u64).to_be_bytes());
-            let s = SoftwareRootSigner::from_component_seeds(&seed, &other).unwrap();
+            let s = SoftwareRootSigner::from_component_seeds(&seed, &other)
+                .expect("APPARATUS: build the stand-in peer's signer");
             let t = hostile::now();
-            let ring = PrekeyRing::generate(&s, &seed, t).unwrap();
-            let bundle = ring.bundle(&s.public_key()).unwrap();
+            let ring = PrekeyRing::generate(&s, &seed, t)
+                .expect("APPARATUS: generate the stand-in peer's prekeys");
+            let bundle = ring
+                .bundle(&s.public_key())
+                .expect("APPARATUS: build the stand-in peer's records");
             let record = PreJoinRecord::build(
                 &s,
                 &room,
                 bundle,
-                EndpointList::new(Vec::new()).unwrap(),
+                EndpointList::new(Vec::new())
+                    .expect("APPARATUS: build the stand-in peer's records"),
                 1,
                 t,
             )
-            .unwrap();
+            .expect("APPARATUS: build the stand-in peer's records");
             let (ep, conn) = connect(&s, addr, id).await;
             let ok = put(&conn, &record.to_wire()).await.is_ok();
             conn.quinn().close(0u32.into(), b"done");
@@ -139,7 +144,19 @@ fn flood_batch(
 
 fn join(dir: &std::path::Path, link: &str, name: &str) -> (bool, Duration, String) {
     let t0 = Instant::now();
-    let (ok, out, err) = vox_in(dir, &["room", "join", link, "--name", name], ROOM_PASS);
+    let (ok, out, err) = vox_in(
+        dir,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link,
+            "--name",
+            name,
+        ],
+        ROOM_PASS,
+    );
     (ok, t0.elapsed(), format!("{out}{err}"))
 }
 
@@ -147,22 +164,22 @@ fn join(dir: &std::path::Path, link: &str, name: &str) -> (bool, Duration, Strin
 #[ignore = "real vox processes with production Argon2id, a flood and two real joins; run in release"]
 fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "victim"),
         profile_dir(tmp.path(), "joiner"),
     );
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
 
     let anchor_port = free_port();
     let (_anchor, spec) = hostile::anchor(&anchor_dir, &format!("127.0.0.1:{anchor_port}"));
     let anchor_id = vox_core::node::link::b32_decode(
-        spec.split('@').next().expect("an anchor spec"),
+        spec.split('@').next().expect("PRODUCT: an anchor spec"),
         "anchor fingerprint",
     )
-    .expect("the anchor's fingerprint");
+    .expect("PRODUCT: the anchor's fingerprint");
     let victim_id = fingerprint(&victim_dir);
     fingerprint(&joiner_dir);
     let victim_port = free_port();
@@ -170,8 +187,12 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     let (room, link) = create_room(&victim_dir, "first", ROOM_PASS);
     // The anchor holds the room once the victim has published it there.
     std::thread::sleep(Duration::from_secs(3));
-    let victim_addr = format!("127.0.0.1:{victim_port}").parse().unwrap();
-    let anchor_addr = format!("127.0.0.1:{anchor_port}").parse().unwrap();
+    let victim_addr = format!("127.0.0.1:{victim_port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
+    let anchor_addr = format!("127.0.0.1:{anchor_port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
 
     let rt = Rt::new();
 
@@ -186,7 +207,7 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     );
     assert!(
         on_anchor >= SLOTS && on_victim >= SLOTS,
-        "CANNOT MEASURE: the flood did not fill the room's {SLOTS} pre-join slots \
+        "PRODUCT (staging): the flood did not fill the room's {SLOTS} pre-join slots \
          (anchor took {on_anchor}, victim {on_victim})"
     );
 
@@ -203,7 +224,7 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
                 min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
             };
             Genesis::create_with_nonce(&inventor, hostile::now(), policy, nonce)
-                .unwrap()
+                .expect("APPARATUS: build the stand-in peer's records")
                 .to_wire()
         })
         .collect();
@@ -212,7 +233,7 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
             let (_ep, conn) = connect(&inventor, addr, id).await;
             let mut client = vox_core::nat::service::RendezvousClient::open(&conn)
                 .await
-                .expect("CANNOT MEASURE: a rendezvous stream");
+                .expect("PRODUCT (staging): vox did not open a rendezvous stream");
             let mut taken = 0usize;
             for g in &geneses {
                 if client.put(g).await.is_ok() {
@@ -231,7 +252,7 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
             let (_ep, conn) = connect(&inventor, addr, id).await;
             let mut client = vox_core::nat::service::RendezvousClient::open(&conn)
                 .await
-                .expect("CANNOT MEASURE: a rendezvous stream");
+                .expect("PRODUCT (staging): vox did not open a rendezvous stream");
             let set = client
                 .get(&room, 0, vox_core::nat::service::RecordKinds::GENESIS)
                 .await;
@@ -248,14 +269,14 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     );
     assert!(
         on_anchor >= 4095,
-        "CANNOT MEASURE: the anchor took only {on_anchor} of {GENESES} stranger geneses, so its \
+        "PRODUCT (staging): the anchor took only {on_anchor} of {GENESES} stranger geneses, so its \
          board was never full (it holds 4096 rooms from peers, one of them the room in use)"
     );
     let first_kept = serves(anchor_addr, anchor_id, room);
     println!("[proof] the anchor still serves the room in use: {first_kept:?}");
     assert!(
         matches!(first_kept, Ok(true)),
-        "strangers' {GENESES} empty rooms displaced a room in use from the anchor ({first_kept:?})"
+        "PRODUCT: strangers' {GENESES} empty rooms displaced a room in use from the anchor ({first_kept:?})"
     );
     let (second, second_link) = create_room(&victim_dir, "second", ROOM_PASS);
     std::thread::sleep(Duration::from_secs(3));
@@ -267,13 +288,13 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     );
     assert!(
         matches!(on_victim_board, Ok(true)),
-        "a room the victim created after strangers offered its board {GENESES} geneses is not on \
+        "PRODUCT: a room the victim created after strangers offered its board {GENESES} geneses is not on \
          the victim's own board ({on_victim_board:?}): nobody reaching that node can join it \
          through it"
     );
     assert!(
         matches!(on_anchor_board, Ok(true)),
-        "a room created after a stranger filled the anchor with {GENESES} geneses is not on the \
+        "PRODUCT: a room created after a stranger filled the anchor with {GENESES} geneses is not on the \
          anchor ({on_anchor_board:?}): an anchor that serves any room published to it serves no \
          new one"
     );
@@ -287,12 +308,12 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     let _ = room;
     assert!(
         ok1 && took1 < JOIN_BOUND,
-        "a real joiner could not join a room whose pre-join slots strangers had filled \
+        "PRODUCT: a real joiner could not join a room whose pre-join slots strangers had filled \
          (ok={ok1}, {took1:?}, bound {JOIN_BOUND:?}): {said1}"
     );
     assert!(
         ok2 && took2 < JOIN_BOUND,
-        "a real joiner could not join a room its host created after strangers flooded the host's \
+        "PRODUCT: a real joiner could not join a room its host created after strangers flooded the host's \
          board with {GENESES} geneses (ok={ok2}, {took2:?}, bound {JOIN_BOUND:?}): {said2}"
     );
 }

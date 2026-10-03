@@ -23,9 +23,15 @@
 //! first is advertised (it is now the second newest), the second never is, but is served.
 //!
 //! ## Asserted
-//! 1. Bob reads "p9 visible" (the pair syncs; precondition, else CANNOT MEASURE);
+//! 1. Bob reads "p9 visible" (the pair syncs; precondition, else PRODUCT (staging));
 //! 2. Bob **never** reads "p9 hidden", over [`WATCH`];
 //! 3. Bob's `vox status --json` names the violation as the last failure with Alice.
+//!
+//! **(2) is a negative claim, so every read it rests on must have worked.** The harness's read
+//! returns no rows when the control socket fails, which would read as "never stored". Once Bob has
+//! read "p9 visible", every later read must still show it: a read that does not is a blind read,
+//! and any blind read in the watch makes (2) PRODUCT (staging) rather than green. Reds on (2) and (3)
+//! are PRODUCT and quote Bob's own transcript.
 //!
 //! ## Mutation
 //! Remove the coverage check in the receiver (`Coverage::admit` always true): Bob stores and
@@ -55,7 +61,7 @@ const MODE: &str = "serve-unasked";
 fn an_entry_that_was_not_asked_for_is_refused() {
     watchdog::arm();
     let sender = mutant_sender();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let alice = Member::new(root, "alice");
     let bob = Member::new(root, "bob");
@@ -81,7 +87,7 @@ fn an_entry_that_was_not_asked_for_is_refused() {
         }
         assert!(
             start.elapsed() < Duration::from_secs(90),
-            "CANNOT MEASURE: bob never read alice's warm-up\nalice:\n{}\nbob:\n{}",
+            "PRODUCT (staging): bob never read alice's warm-up\nalice:\n{}\nbob:\n{}",
             alice_d.transcript(),
             bob_d.transcript()
         );
@@ -91,9 +97,17 @@ fn an_entry_that_was_not_asked_for_is_refused() {
     let posted = Instant::now();
     let mut visible_at = None;
     let mut hidden_at = None;
+    let (mut reads, mut blind) = (0usize, 0usize);
     while posted.elapsed() < WATCH {
         let texts = rb.texts(cb);
-        if visible_at.is_none() && texts.iter().any(|t| t == "p9 visible") {
+        let visible = texts.iter().any(|t| t == "p9 visible");
+        if visible_at.is_some() {
+            reads += 1;
+            if !visible {
+                blind += 1;
+            }
+        }
+        if visible_at.is_none() && visible {
             visible_at = Some(posted.elapsed());
         }
         if hidden_at.is_none() && texts.iter().any(|t| t == "p9 hidden") {
@@ -112,27 +126,39 @@ fn an_entry_that_was_not_asked_for_is_refused() {
         })
     });
     println!(
-        "[proof] P9: visible read after {visible_at:?}; hidden read after {hidden_at:?}; bob's \
-         sessions with alice failed {failed}; last failures {:?}",
+        "[proof] P9: visible read after {visible_at:?}; hidden read after {hidden_at:?}; {reads} \
+         reads after it, {blind} blind; bob's sessions with alice failed {failed}; last failures \
+         {:?}",
         failures(&st)
     );
     assert!(
         announced(&alice_d, MODE),
-        "CANNOT MEASURE: alice's daemon never announced the mutant mode {MODE:?}\nalice:\n{}",
+        "APPARATUS (the mutant peer): alice's daemon never announced the mutant mode {MODE:?}\nalice:\n{}",
         alice_d.transcript()
     );
     assert!(
         visible_at.is_some(),
-        "CANNOT MEASURE: bob never read \"p9 visible\" within {WATCH:?}\nbob:\n{}",
+        "PRODUCT (staging): bob never read \"p9 visible\" within {WATCH:?}\nbob:\n{}",
         bob_d.transcript()
     );
     assert!(
         hidden_at.is_none(),
-        "bob stored and read an entry he never asked for, {hidden_at:?} after it was posted"
+        "PRODUCT: bob stored and read an entry he never asked for, {hidden_at:?} after it was \
+         posted\nbob:\n{}",
+        bob_d.transcript()
+    );
+    assert!(
+        reads > 0 && blind == 0,
+        "PRODUCT (staging): {blind} of {reads} reads after \"p9 visible\" came back without it, so \
+         \"p9 hidden\" not being read is not evidence it was refused (a failed control-socket read \
+         returns no rows)\nbob:\n{}",
+        bob_d.transcript()
     );
     assert!(
         named,
-        "bob's sessions with the mutant sender did not fail as a protocol violation: {:?}",
-        failures(&st)
+        "PRODUCT: bob's sessions with the mutant sender did not fail as a protocol violation \
+         ({VIOLATION:?}); his last failures: {:?}\nbob:\n{}",
+        failures(&st),
+        bob_d.transcript()
     );
 }

@@ -24,6 +24,12 @@ dropped:
    what it injects — the machine's API key returned 401 and no model ran. M19.5b closes it: a real
    model now reproduces a codeword only the room knew, with `--pure` as the mutation control.
 
+**Amended 2026-10-01** (the decider, after a read-only review of agent-tincan): §6 is to change how a wake
+reads and when an idle session is told of a reply; §9 is to gain a cycle check and a parent that a reply
+cannot opt out of; the non-goals gain the principle that **Vox never spawns instances of anything**. Planned in
+`docs/release/v0.3.0.md` (V030-15 to V030-21) and `docs/release/v0.2.10.md` (V210-121, V210-123). V210-121 is
+built (§9, #322); the rest is not built yet.
+
 **Date**: 2026-09-21
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, app-tier, node, ipc, consent, keyring, harness-integration
@@ -174,6 +180,18 @@ A genesis "open room" flag was designed and **rejected**. Instead:
   whether they let me read them is their decision, made in their ring. This is ADR-007's per-direction
   rule unchanged. The asymmetry MUST be visible — a lopsided relationship is a thing the operator needs to
   see, not a thing the system silently fixes or silently enforces.
+  > **And my ring decides whom I read (decider, 2026-10-01, V210-118).** *"if agent-1 has not trusted
+  > agent-2, then agent-1 shouldn't see messages from agent-2"*; *"same for humans"*; *"we have no typed
+  > entity of agent or human -- they're both just nodes"*. Trust still runs one way per decision, and each
+  > direction is decided by its own node, but reading needs both: the author's ring releases its key, and
+  > the reader's node takes that key only if the reader's ring names the author. A key from an author not
+  > in the ring is refused on the pairwise stream (`KeyRefusal::NotTrusted`), so nothing of that author's
+  > opens on the node: not in the TUI, the CLI, or an agent's wake and drain. The member is still listed,
+  > as present and "(not in keyring)". The author's re-key round offers the key again, and a member that
+  > hands over a generation new to us is offered ours at once, so trusting the author makes its messages
+  > readable, earlier ones included, from where its consent began. Removing a key from the ring drops
+  > that author's keys in every room (a closed room drops them when it opens), so nothing it posts
+  > afterwards opens; what was already read stays read.
 - **Removing a key from the ring MUST change the lock.** Read access is a sender key already handed over,
   so removal cannot take it back — it can only stop the removed party reading what comes *next*. Removal
   therefore rotates this identity's sender key and re-keys everyone still in the ring, in **every** room
@@ -433,7 +451,7 @@ conventions and vocabulary; a hook guarantees the read.
 | Harness | Drain at turn start | Push into a live session |
 | --- | --- | --- |
 | Claude Code | `UserPromptSubmit` hook returning `hookSpecificOutput.additionalContext` | `CLAUDE_CODE_MESSAGING_SOCKET` (between tool calls; new turn if idle) |
-| Codex | `UserPromptSubmit` hook; plain stdout becomes `additionalContext`. **MUST** be synchronous (`async: true` is observation-only) | `turn/start` when idle. **Mid-turn, `turn/start` is accepted but folded into the running turn** (no new turn; measured by Orca on codex-cli 0.147.0, 0.150.1 and 0.153.4), so a mid-turn delivery uses `turn/steer` with `expectedTurnId` (ctm's path). Corrected 2026-09-25 (M19.12); this row said "`turn/start` — ungated, valid both idle and mid-turn at `rust-v0.155.1`" |
+| Codex | `UserPromptSubmit` hook; plain stdout becomes `additionalContext`. **MUST** be synchronous (`async: true` is observation-only) | **Not used by Vox** (M19.6): a quit session's thread can stay loaded, so a wake could start a turn nobody is in. For reference: `turn/start` when idle; mid-turn, `turn/start` is folded into the running turn (Orca, codex-cli 0.147.0, 0.150.1 and 0.153.4), and ctm delivers with `turn/steer` and `expectedTurnId` (M19.12) |
 | OpenCode | plugin `chat.message`, mutating `output.parts` | `POST /session/:id/prompt_async` — valid mid-turn |
 
 Claude Code and Codex share the hook name *and* the injection field, so one mechanism covers both.
@@ -580,6 +598,16 @@ same IPC, buying typed arguments over a CLI that already accepts JSON on stdin.
   **MUST NOT** auto-reply to `status`, `hello`, `bye` or `ack` at all.
 - `hops` **MUST** be decremented on relay and the message dropped at zero. The default **MUST** be 8
   (ruflo ADR-097's value, whose default "alone closes the recursion-loop class").
+- **A session cannot escape the hop budget by omitting `re` when it was woken** (V210-121). A
+  budget counted along `re` was bypassed by leaving `re` out, an ordinary omission, and two agents
+  answering each other urgently that way woke each other for ever. So a session's post right after a wake **MUST** answer the
+  message that woke it when exactly one such wake is unanswered (an explicit `re` still wins), and
+  an urgent one with two or more unanswered **MUST** be refused until it names one; a raw
+  urgent envelope with no `re` from a session with an unanswered wake **MUST** be refused; and the
+  daemon **MUST NOT** wake a session that already spoke in the `re` chain the message answers. That
+  message still queues for the session's next turn. An agent that keeps passing an explicit `--re`
+  naming an unrelated old entry never shortens its hop chain; that is deliberate mis-naming, which
+  this guard does not try to stop.
 - Identical repeats from the same `(author, session)` within a short window **MAY** be dropped. There is
   **no rate cap**: the decider's product principle is no rate limits (2026-09-24), and loop prevention
   rests on `hops`, on addressing, and on the rules above and below. (This said a sender "SHOULD be
@@ -753,6 +781,14 @@ hook` attach to.
 - **IP-level anonymity**, per ADR-017. Confidentiality is the goal.
 - **An MCP delivery path**, per §6.
 - **Carrying file bytes through the log.** Withdrawn in §11 — a room-bound service already does it.
+- **Spawning anything** (the decider, 2026-10-01): "vox does not spin up instances of anything ever. Vox is a
+  transport layer with apps/use cases (like chat, agent comms, etc) on top of it." No Vox feature starts a
+  model, a harness or a headless run, so Codex is not woken by starting `codex exec`; it reads at its next turn.
+- **A council feature.** "Any message in the room can be seen by any node in the room that has the key material
+  to read it. Any node can respond." A council is an `ask` in a room whose agents span model families.
+- **An operator hold on messages.** "no, never. I'll be conscious about which nodes trust which nodes, and which
+  nodes are in rooms with which nodes." The trust keyring (§3) and room membership are the controls.
+- **Hosted agent sandboxes** that allow only HTTP out are out of scope.
 
 ## Consequences
 
@@ -891,7 +927,9 @@ Both unknowns are already spiked; neither remains open.
   alternative is a clock nobody has. Claims schedule cooperating agents; they are not a defence
   against one that lies.
 - **M19.4 — CLI and skill. DONE 2026-09-22.** `vox room post|read|tail|roster|list`, and
-  `vox agent skill` prints the skill for an operator to install where their harness looks.
+  `vox agent skill` prints the skill for an operator to install where their harness looks: at user
+  scope (`~/.claude/skills/vox-agent-comms/SKILL.md`), beside the hook in `~/.claude/settings.json`,
+  so a session opened in any repository has both (V210-121).
 
   > **Named defect, found 2026-09-24 and fixed in PR #14 (ADR-021 F13) — `tail` never showed another member's
   > message.** The node emits `NewEntry` only for its own appends; an entry synced from a peer is
@@ -1002,7 +1040,7 @@ Both unknowns are already spiked; neither remains open.
   > (`Content::VERSION = 2`, `CACHE_VERSION = 2`, version 1 still read); `work_board_proof` went
   > 1-in-3 failing → **6 of 6** at loads 4–45 and is back in the blocking release gate.
 
-- **M19.6 — the interrupt path. DONE 2026-09-22**, for Claude Code and OpenCode; Codex named and not implemented. §6 says queue always and interrupt only when
+- **M19.6 — the interrupt path. DONE 2026-09-22**, for Claude Code and OpenCode; Codex wakes are not supported, and the poster is told so (V210-169). §6 says queue always and interrupt only when
   *addressed* and *urgent*; the queue half is built and proven, this is the other half. It is the
   most speculative milestone left, because all three mechanisms are undocumented and the OpenCode
   work showed what that costs — four confident hypotheses, each with a run that appeared to confirm
@@ -1042,10 +1080,18 @@ Both unknowns are already spiked; neither remains open.
 
   Built as designed: `vox agent hook` records the session's wake channel as a side effect of the
   drain, and `vox daemon` — the only thing that sees every entry land *and* knows which local
-  sessions exist — decides and delivers. Codex is **named and not implemented**: this build has no
-  verified path to its app-server socket from a hook's environment, so waking it reports plainly
-  that it cannot, and the message waits for the session's next turn. That is the correct
-  degradation, because queueing always is the default and the interrupt is the optimisation.
+  sessions exist — decides and delivers. **Codex wakes are not supported** (decided 2026-10-02,
+  V210-169). Codex's shared app-server keeps a session's thread loaded for a while after the user
+  quits, so a `turn/start` or `turn/steer` sent there can start a model turn in a session nobody is
+  in, and Vox **MUST NOT** start a model run. Vox **MUST NOT** send either to Codex. A Codex session
+  **MUST** be registered from the hook's input (its rollout `transcript_path` or `turn_id`), before
+  any Claude Code variables a Codex started from a Claude Code terminal inherits. A wake is addressed to a node, not a session (V210-161), so a Codex session needs no
+  name. When an urgent post addresses the poster's own node and no session of that node can be
+  interrupted (only Codex sessions, or none that left Vox a way to reach it), `vox room post` **MUST**
+  tell the poster so in one line, and that each session reads the message at its next turn. That line
+  speaks only for the poster's node: another node wakes its own sessions, or not, and a poster there
+  is not told. The message waits in the room, because
+  queueing always is the default and the interrupt is the optimisation.
 
   > **Named defect, 2026-09-24 (ADR-021 F17) — measured: the OpenCode half of this milestone never
   > worked for a hand-opened session.** OpenCode 1.18.32 sets no `OPENCODE_SERVER_URL`, and a plain TUI
@@ -1171,7 +1217,7 @@ Both unknowns are already spiked; neither remains open.
   app-server `turn/start` works mid-turn (corrected 2026-09-25). Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a
   mid-turn `turn/start` is **folded into the running turn**, and ctm delivers mid-turn with `turn/steer`
   and `expectedTurnId`. The text **MUST** say so, and any Codex wake **MUST** use `turn/steer` for a
-  running turn. Implementing the Codex wake is not decided here.
+  running turn. Vox does not wake Codex (M19.6, decided 2026-10-02), so neither is sent.
 
 A TUI view for the operator is explicitly deferred until a real room has misbehaved and shown what
 needs filtering.

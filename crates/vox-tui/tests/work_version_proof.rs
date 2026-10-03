@@ -30,6 +30,10 @@
 //!   has 12 fields where v0.2.6 writes 10, so every entry it writes is refused at decode
 //!   (no compatibility, by design). Its claim would never reach alice, and the gate would
 //!   measure the log format, not the version refusal.
+//!
+//! Every red names its side: `PRODUCT:` quotes what `vox` said, `CANNOT MEASURE:` is a
+//! staging step that did not happen (a precondition), and `APPARATUS:` is the proof's own
+//! fault (the runtime, its temporary directory).
 
 #![cfg(unix)]
 
@@ -47,14 +51,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// "0.2.9" matches, coordination is rightly allowed, and the proof waited for a refusal that
 /// could not come (CI 869d8f0).
 fn another_version() -> String {
-    let mut parts = VERSION
-        .split('.')
-        .map(|p| p.parse::<u64>().expect("a numeric version"));
-    let (major, minor, patch) = (
-        parts.next().unwrap(),
-        parts.next().unwrap(),
-        parts.next().unwrap(),
-    );
+    let mut parts = VERSION.split('.').map(|p| {
+        p.parse::<u64>()
+            .expect("APPARATUS: this build's version is not numeric")
+    });
+    let mut next = || {
+        parts
+            .next()
+            .unwrap_or_else(|| panic!("APPARATUS: this build's version {VERSION} is not x.y.z"))
+    };
+    let (major, minor, patch) = (next(), next(), next());
     format!("{major}.{minor}.{}", patch + 1)
 }
 
@@ -71,11 +77,15 @@ fn runs(stamp: &str, is_version: bool) -> String {
 }
 
 fn refused_naming(o: &Out, who: &Worker, what: &str) {
-    assert_eq!(o.code, Some(3), "a version refusal must exit 3: {o:?}");
+    assert_eq!(
+        o.code,
+        Some(3),
+        "PRODUCT: a version refusal must exit 3: {o:?}"
+    );
     for needle in [&who.b32()[..12], what, &format!("required {VERSION}")] {
         assert!(
             o.stderr.contains(needle),
-            "the refusal must name {needle:?}: {}",
+            "PRODUCT: the refusal must name {needle:?}: {}",
             o.stderr
         );
     }
@@ -83,7 +93,7 @@ fn refused_naming(o: &Out, who: &Worker, what: &str) {
 
 fn claims_by(w: &Worker, reader: &Worker, r: &str) -> usize {
     let o = reader.vox(None, &["room", "read", r, "--json"]);
-    assert!(o.ok, "{o:?}");
+    assert!(o.ok, "PRODUCT: `vox room read --json` failed: {o:?}");
     o.ndjson()
         .iter()
         .filter(|x| x["author"] == w.b32() && x["envelope"]["type"] == "claim")
@@ -98,8 +108,8 @@ fn a_worker_on_another_version_is_refused_by_name() {
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot build the runtime: {e}"));
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: tempdir: {e}"));
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
@@ -134,7 +144,11 @@ fn a_worker_on_another_version_is_refused_by_name() {
         })
         .count();
     eprintln!("[receipt] unstamped claims from bob that reached alice: {unstamped}");
-    assert_eq!(unstamped, 1, "exactly bob's unstamped claim reached alice");
+    assert_eq!(
+        unstamped, 1,
+        "PRODUCT: exactly bob's unstamped claim must reach alice, and `vox room read --json` \
+         shows {unstamped}"
+    );
     eprintln!(
         "[receipt] alice's own claims before her first: {}",
         claims_by(alice, alice, r)
@@ -142,14 +156,14 @@ fn a_worker_on_another_version_is_refused_by_name() {
     assert_eq!(
         claims_by(alice, alice, r),
         0,
-        "precondition: alice has never claimed"
+        "PRODUCT: alice has never claimed, and `vox room read --json` shows a claim by her"
     );
     let o = alice.vox(Some("a1"), &["room", "claim", r, "new-work"]);
     refused_naming(&o, bob, "no version");
     assert_eq!(
         claims_by(alice, alice, r),
         0,
-        "a refused claim must never be posted"
+        "PRODUCT: a refused claim must never be posted"
     );
 
     // ---- (3) post --work, board --json and the drain hook all refuse ----
@@ -171,14 +185,18 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let b = alice
         .vox(Some("a1"), &["room", "board", r, "--json"])
         .json();
-    assert_eq!(b["coordination"], "refused", "{b}");
+    assert_eq!(
+        b["coordination"], "refused",
+        "PRODUCT: board --json must say refused: {b}"
+    );
     let p = b["participants"]
         .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["author"] == bob.b32())
-        .expect("bob in the table");
-    assert_eq!(p["stamp"], "missing", "{b}");
+        .and_then(|ps| ps.iter().find(|p| p["author"] == bob.b32()))
+        .unwrap_or_else(|| panic!("PRODUCT: board --json has no participants row for bob: {b}"));
+    assert_eq!(
+        p["stamp"], "missing",
+        "PRODUCT: board --json must say bob's stamp is missing: {b}"
+    );
     let hook = alice.vox(
         Some("a1"),
         &[
@@ -194,7 +212,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
     );
     assert!(
         hook.stdout.contains("work coordination refused") && hook.stdout.contains(&bob.b32()[..12]),
-        "the drain hook must say it plainly: {hook:?}"
+        "PRODUCT: the drain hook must say it plainly: {hook:?}"
     );
 
     // ---- (4) conversation survives ----
@@ -206,7 +224,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
         o.ok,
         "PRODUCT: plain conversation was refused while coordination is: {o:?}"
     );
-    // **And structured conversation**: a reply addressed to a session, urgent, is still
+    // **And structured conversation**: a reply addressed to a member, urgent, is still
     // conversation — only `--work` takes part in coordination. A refusal that reached
     // every structured post stayed green while this checked only the plain form.
     let re = alice
@@ -224,7 +242,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
             "--type",
             "say",
             "--to",
-            "b1",
+            "bob",
             "--urgent",
             "--re",
             &re,
@@ -263,7 +281,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let o = bob.vox(Some("b1"), &["room", "claim", r, "bob-work"]);
     assert!(
         o.ok && o.stdout.contains("you hold bob-work"),
-        "a current worker among current workers coordinates: {o:?}"
+        "PRODUCT: a current worker among current workers coordinates: {o:?}"
     );
     let o = until(
         alice,
@@ -272,9 +290,15 @@ fn a_worker_on_another_version_is_refused_by_name() {
         &["room", "claim", r, "new-work"],
         |o: &Out| o.ok,
     );
-    assert!(o.stdout.contains("you hold new-work"), "{o:?}");
+    assert!(
+        o.stdout.contains("you hold new-work"),
+        "PRODUCT: alice's claim after recovery must hold new-work: {o:?}"
+    );
     let b = alice
         .vox(Some("a1"), &["room", "board", r, "--json"])
         .json();
-    assert_eq!(b["coordination"], "ok", "{b}");
+    assert_eq!(
+        b["coordination"], "ok",
+        "PRODUCT: board --json must say ok once everyone is current: {b}"
+    );
 }

@@ -100,11 +100,19 @@ impl Profile {
         // both saw no vault, and the second moved the first's store aside and renamed its own
         // vault over the first's: both printed a fingerprint, and one of them was gone. The
         // directory is locked across the whole create, so the check below and the files it
-        // guards are one step; whoever comes second finds the vault and is refused.
-        let _creating = lock_dir(
+        // guards are one step; whoever comes second finds the vault and is refused — at once,
+        // as soon as the vault is there, even while its maker goes on holding the lock (a TUI
+        // keeps it for as long as it runs). The lock is then kept with the profile.
+        let vault_file = paths.vault_file();
+        let lock = lock_dir(
             &paths.profile_dir,
             "lock the profile to create its identity",
             waiting,
+            &|| {
+                vault_file
+                    .is_file()
+                    .then_some(Error::Profile("identity already exists in this profile"))
+            },
         )?;
         if Self::exists(&paths) {
             return Err(Error::Profile("identity already exists in this profile"));
@@ -143,8 +151,10 @@ impl Profile {
             })?;
             aside = Some(to);
         }
-        let made = Store::open(&store_file).and_then(|store| {
-            let store = std::sync::Arc::new(store);
+        // The store keeps a handle on the lock, so the lock outlives the store whatever holds it
+        // last; this function keeps its own until it is done, failure cleanup included.
+        let made = open_letting_go(|| Store::open(&store_file)).and_then(|store| {
+            let store = std::sync::Arc::new(store.keep_lock(clone_lock(&lock)?));
             store.put_meta(META_FINGERPRINT, &fingerprint)?;
             store.put_meta(META_CREATED, &now_secs.to_be_bytes())?;
             // Named as the vault's, not the store's: it is the file a person would look for.
@@ -190,15 +200,24 @@ impl Profile {
 
     /// Open an existing profile, **locked**.
     pub fn open(paths: Paths) -> Result<Self> {
+        Self::open_noting(paths, &|| {})
+    }
+
+    /// [`Profile::open`], first taking the profile's lock ([`lock_profile`]) and keeping it for
+    /// as long as the profile is open; `waiting` is called once if that takes over a second.
+    pub fn open_noting(paths: Paths, waiting: LockWaitNotice<'_>) -> Result<Self> {
         if !paths.vault_file().is_file() {
             return Err(Error::Profile("no identity in this profile"));
         }
+        let lock = lock_profile(&paths, waiting)?;
         let vault = read_vault(&paths)?;
         // **Read-only while locked.** A locked profile only reads its public facts, and opening
         // the store writable writes to it — so a command refused for a wrong passphrase used to
         // leave the profile changed. It becomes writable in `unlock`, once the passphrase is
         // proved (see `store::Backing`).
-        let store = std::sync::Arc::new(Store::open_read_only(&paths.store_file())?);
+        let store = std::sync::Arc::new(
+            open_letting_go(|| Store::open_read_only(&paths.store_file()))?.keep_lock(lock),
+        );
         let fingerprint: Digest32 = store
             .get_meta(META_FINGERPRINT)?
             .and_then(|v| v.as_slice().try_into().ok())
@@ -221,34 +240,17 @@ impl Profile {
 
     /// Unlock with the identity passphrase. A wrong passphrase (or a tampered
     /// vault) is [`Error::AtRestUnlockFailed`]; the profile stays locked.
+    ///
+    /// A version-1 vault is migrated here (V210-40), and the migration rewrites the store into a
+    /// new file and renames it over the old one. redb's own lock is on the file, so it lapses
+    /// between the two; a second vox opening the profile at that moment used to migrate the old
+    /// file again and rename its copy over the first one's, losing every row written since
+    /// (V210-100). It cannot now: this profile holds the profile directory's lock from before its
+    /// store was opened ([`lock_profile`]), so no other vox has the store open at all.
     pub fn unlock(&mut self, passphrase: &[u8]) -> Result<()> {
-        self.unlock_noting(passphrase, &|| {})
-    }
-
-    /// [`Profile::unlock`], calling `waiting` once if a migration has to wait more than a second
-    /// for another vox holding the profile's lock (see [`LockWaitNotice`]).
-    pub fn unlock_noting(&mut self, passphrase: &[u8], waiting: LockWaitNotice<'_>) -> Result<()> {
         if self.unlocked.is_some() {
             return Ok(());
         }
-        // **A version-1 vault is migrated under the profile lock, start to finish** (V210-100).
-        // The migration rewrites the store into a new file and renames it over the old one, and
-        // redb's own lock is on the file, so it lapses between releasing the old file and the
-        // rename: a second vox unlocking the same profile at that moment opened the old file,
-        // migrated it again and renamed its copy over the first one's, and every row the first
-        // had written since was gone. Whoever waits here reads the vault again once it has the
-        // lock, so a profile another vox has just migrated is not migrated twice.
-        let _migrating = if self.vault.version < VAULT_VERSION {
-            let held = lock_dir(
-                &self.paths.profile_dir,
-                "lock the profile to migrate its identity",
-                waiting,
-            )?;
-            self.vault = read_vault(&self.paths)?;
-            Some(held)
-        } else {
-            None
-        };
         let backup = self.vault.unlock(passphrase)?;
         let signer = VaultRootSigner::from_backup(&backup)?;
         if signer.fingerprint() != self.fingerprint {
@@ -438,20 +440,102 @@ pub(crate) fn test_pause(env: &str, what: &str) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
-/// What a vox does when it has waited a second for another one's profile lock: called
-/// once, from another thread, while the wait goes on.
+/// How long a vox waits for another one holding the profile before it is refused as
+/// [`Error::ProfileBusy`] (V210-100): long enough for a command to finish — a production Argon2id
+/// unlock and what follows it — so two started together both run, one after the other. A holder
+/// that answers on the profile's control socket (a `vox daemon` or `vox tui`, which keep the
+/// profile for as long as they run) is not waited for at all.
+pub const PROFILE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a vox waits for another one's profile lock before saying that it is waiting.
+const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Take the profile directory's lock before opening its store, and hold it for as long as the
+/// store is open (V210-100). **Every vox that opens a profile's store takes it first**: a
+/// profile's node ([`Profile::open`]), its creation ([`Profile::create_noting`]) and a `vox node`
+/// keeping its anchor logs in the profile's store.
+///
+/// Before, the store's own (redb) lock was the only one, and it refused rather than waited: of
+/// two commands started together, the second was refused because the first had started first.
+/// Now the second waits — saying so after a second, through `waiting` — and runs when the first
+/// is done. It is refused, as [`Error::ProfileBusy`], only if the holder answers on the profile's
+/// control socket (it is a daemon or a TUI, which do not finish) or after [`PROFILE_PATIENCE`].
+///
+/// # Errors
+/// [`Error::ProfileBusy`] as above, or the lock cannot be taken at all.
+pub fn lock_profile(paths: &Paths, waiting: LockWaitNotice<'_>) -> Result<std::fs::File> {
+    let socket = paths.socket_file();
+    lock_dir(
+        &paths.profile_dir,
+        "lock the profile to open it",
+        waiting,
+        &|| holder_serves(&socket).then_some(Error::ProfileBusy),
+    )
+}
+
+/// How long a vox that holds the profile's lock waits for a store that is still open elsewhere.
+///
+/// With the lock held, the only way to find the store open is another vox's process ending: a
+/// store releases the lock only after it is closed, but a process that ends closes its files in
+/// whatever order the kernel takes, and the lock's file can go first. That gap is a matter of
+/// milliseconds, so this is short; a vox that still has the store open past it is not ending,
+/// and is refused as [`Error::ProfileBusy`].
+const LET_GO_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Open a profile's store with `open`, waiting up to half a second (`LET_GO_PATIENCE`) for another vox's
+/// process that is ending to let go of it (V210-100).
+pub fn open_letting_go<T>(open: impl Fn() -> Result<T>) -> Result<T> {
+    let started = std::time::Instant::now();
+    loop {
+        match open() {
+            Err(Error::ProfileBusy) if started.elapsed() < LET_GO_PATIENCE => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Another handle on the same profile lock: the lock is released only when every handle is.
+pub fn clone_lock(lock: &std::fs::File) -> Result<std::fs::File> {
+    lock.try_clone().map_err(|e| Error::Path {
+        op: "keep the profile's lock",
+        detail: e.to_string(),
+    })
+}
+
+/// Whether a vox answers on the profile's control socket: a daemon or a TUI, which hold the
+/// profile for as long as they run.
+pub fn holder_serves(socket: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        false
+    }
+}
+
+/// What a vox does when it has waited a second for another one's profile lock: called once,
+/// while the wait goes on.
 ///
 /// **The caller decides where the notice goes** (V210-100). It was printed to stderr from here,
 /// and `vox tui` draws on the terminal stderr writes to: the line landed inside the TUI's screen,
-/// across its prompt box, and stayed there. The node turns it into
-/// [`NodeEvent::WaitingForProfile`](crate::node::api::NodeEvent::WaitingForProfile); a CLI verb
-/// prints its words, and the TUI puts its own in its status line.
+/// across its prompt box, and stayed there. A CLI verb prints its words; a node that is already
+/// running (the TUI, creating an identity) reports
+/// [`NodeEvent::WaitingForProfile`](crate::node::api::NodeEvent::WaitingForProfile), which the
+/// TUI puts in its status line.
 pub type LockWaitNotice<'a> = &'a (dyn Fn() + Sync);
 
-/// Take an exclusive lock on the directory `dir`, waiting for any other holder; it is
-/// released when the returned handle drops (or the process exits, however it exits). `op`
-/// names what the lock is for, in an error. If the lock is not free within [`LOCK_PATIENCE`],
-/// `waiting` is called, once.
+/// Take an exclusive lock on the directory `dir`, waiting for any other holder; it is released
+/// when the returned handle drops (or the process exits, however it exits). `op` names what the
+/// lock is for, in an error.
+///
+/// While it waits it asks `give_up` (each 50 ms) whether to stop waiting with that error, says it
+/// is waiting through `waiting` once after [`LOCK_PATIENCE`], and stops with
+/// [`Error::ProfileBusy`] after [`PROFILE_PATIENCE`]. It never waits without bound.
 ///
 /// The directory itself is locked rather than a lock file beside the vault, so locking a
 /// profile leaves no file behind that is not the profile's own.
@@ -459,43 +543,40 @@ fn lock_dir(
     dir: &std::path::Path,
     op: &'static str,
     waiting: LockWaitNotice<'_>,
+    give_up: &dyn Fn() -> Option<Error>,
 ) -> Result<std::fs::File> {
     let fail = |e: std::io::Error| Error::Path {
         op,
         detail: format!("{}: {e}", dir.display()),
     };
     let handle = std::fs::File::open(dir).map_err(fail)?;
-    match handle.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::Error(e)) => return Err(fail(e)),
-        // **A wait is never silent** (V210-100). Another vox holds the profile while it creates
-        // or upgrades the identity, which takes a second or two; but one that is stopped
-        // (Ctrl-Z) or stuck holds it for as long as it stays so, and a vox waiting on it with
-        // nothing on the screen looked hung. So if the wait goes on, the caller is told, once.
-        Err(std::fs::TryLockError::WouldBlock) => {
-            let (done, patience) = std::sync::mpsc::channel::<()>();
-            let locked = std::thread::scope(|scope| {
-                scope.spawn(move || {
-                    if patience.recv_timeout(LOCK_PATIENCE)
-                        == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    {
-                        waiting();
-                    }
-                });
-                let locked = handle.lock();
-                drop(done);
-                locked
-            });
-            locked.map_err(fail)?;
+    let started = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        match handle.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::Error(e)) => return Err(fail(e)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
         }
+        if let Some(e) = give_up() {
+            return Err(e);
+        }
+        // **A wait is never silent** (V210-100): a holder that is stopped (Ctrl-Z) or slow holds
+        // the profile for as long as it stays so, and a vox waiting with nothing on the screen
+        // looked hung.
+        if !said && started.elapsed() >= LOCK_PATIENCE {
+            waiting();
+            said = true;
+        }
+        if started.elapsed() >= PROFILE_PATIENCE {
+            return Err(Error::ProfileBusy);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
     #[cfg(feature = "test-knobs")]
     test_pause(TEST_LOCK_HOLD_ENV, "holding the profile lock");
     Ok(handle)
 }
-
-/// How long a vox waits for another one's profile lock before saying that it is waiting.
-const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// **For proofs only.** When set, a vox that has just taken the profile lock (to create the
 /// identity, or to migrate it) holds it this many milliseconds before going on, so a proof can

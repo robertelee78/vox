@@ -300,10 +300,20 @@ impl Member {
         self.daemon_env(bin, anchor, &[])
     }
 
+    /// [`Member::daemon`] with `env` set too (a proof's test-only knobs).
+    pub fn daemon_with(&self, env: &[(&str, &str)]) -> Proc {
+        self.daemon_env(VOX, None, env)
+    }
+
     /// [`Member::daemon`] from the mutant sender build `bin` (see [`mutant_sender`]), misbehaving
     /// as `mode` (`serve-nothing`, `serve-unasked`). Check [`announced`] once it has synced.
     pub fn daemon_mutant(&self, bin: &str, mode: &str, anchor: Option<&str>) -> Proc {
         self.daemon_env(bin, anchor, &[("VOX_MUTANT_SENDER_MODE", mode)])
+    }
+
+    /// [`Member::daemon_with`], behind `anchor`.
+    pub fn daemon_with_anchor(&self, anchor: Option<&str>, env: &[(&str, &str)]) -> Proc {
+        self.daemon_env(VOX, anchor, env)
     }
 
     fn daemon_env(&self, bin: &str, anchor: Option<&str>, env: &[(&str, &str)]) -> Proc {
@@ -361,7 +371,10 @@ impl Member {
 
     /// Create a room and return its id as `vox room list` prints it.
     pub fn create(&self, name: &str) -> String {
-        let (ok, out, err) = self.vox(&["room", "create", "--name", name], Some(ROOM_PASS));
+        let (ok, out, err) = self.vox(
+            &["room", "create", "--passphrase-file", "-", "--name", name],
+            Some(ROOM_PASS),
+        );
         assert!(
             ok,
             "PRODUCT: {}'s `vox room create` of {name} failed.\nstdout:\n{out}\nstderr:\n{err}",
@@ -394,7 +407,18 @@ impl Member {
     /// a retry would pass a join that does not work the first time a person asks.
     pub fn join(&self, link: &str, name: &str) {
         let t0 = Instant::now();
-        let (ok, out, err) = self.vox(&["room", "join", link, "--name", name], Some(ROOM_PASS));
+        let (ok, out, err) = self.vox(
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link,
+                "--name",
+                name,
+            ],
+            Some(ROOM_PASS),
+        );
         assert!(
             ok,
             "PRODUCT: {} could not join {name}: `vox room join` was refused after {:?}.\n\

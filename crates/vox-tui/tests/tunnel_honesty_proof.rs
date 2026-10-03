@@ -11,6 +11,12 @@
 //!   bound. Here the host's `vox serve` is killed and the same room brought back by
 //!   `vox daemon` on a **different port**, and the *same* forward must carry a new
 //!   connection.
+//! - **A restarted host is reached again promptly, by a forward and by a proxy** (V210-141). The
+//!   host's process is killed and the room brought back by `vox daemon`, on a new port and on the
+//!   same port, and the first connection a running `vox forward` or `vox up` makes afterwards
+//!   must reach the new process within V210-57's host-restart bound, [`HOST_BACK_WITHIN`], one
+//!   attempt and no retry. A dialer that kept its stale connection to the dead process would wait
+//!   out the silence rule (30 s) or QUIC's idle timeout (about 60 s) instead.
 //! - **A refused SOCKS CONNECT is refused in the reply, and says why** (R23, D6). `vox up`
 //!   replied "succeeded" before it had asked the host, so a refusal looked like a
 //!   connection that died.
@@ -43,12 +49,54 @@
 //!   made whose id starts with the same character as the first's; both hold a session. The host's
 //!   `vox tunnel close <that character>` is refused, naming both members, and both sessions still
 //!   echo; then the second's own longer prefix closes only the second's.
+//! - **A quiet session is not dropped** (RP-09). quinn's defaults are a 30 s idle timeout and
+//!   no keep-alive, so on defaults an `ssh` session through a forward dies while its person
+//!   reads. Three things keep the guest's connection to the host up, and any one of them is
+//!   enough on its own:
+//!   - the transport's keep-alive (`KEEP_ALIVE`, 20 s);
+//!   - the members' periodic sync over the same connection (`SYNC_INTERVAL_SECS`, 30 s);
+//!   - V210-93's liveness probe of a quiet anchor connection (`close_if_unanswering`): the
+//!     invite names the host itself as one of the places to reach the room, so the guest keeps
+//!     it as an anchor and probes it once it falls quiet.
+//!
+//!   So this proves what a person sees: a quiet forwarded session survives with the product as
+//!   it is. It goes red only when all three are gone, so it guards against losing every one of
+//!   them, not against losing any single one; removing the keep-alive alone, or using quinn's
+//!   defaults, stays green while the other two hold.
+//! - **Withdrawing trust cuts a live session and refuses the next request** (ADR-017 M17.11,
+//!   RP-10). An `ssh` session opened while the guest was trusted is reset the moment the host's
+//!   operator runs `vox trust remove`, and `vox up` says the host withdrew access. A new CONNECT
+//!   through the **same** proxy — whose connection to the host was made while trusted — is
+//!   refused in the SOCKS reply, and the service behind it never accepts a connection.
+//!
+//!   *A stream parked open across the withdrawal* (opened while trusted, its request sent only
+//!   after) cannot be produced by the shipped binary: no honest `vox` delays its request. It is
+//!   judged by the same gate this proof reaches — the request is read first and the reacher set
+//!   consulted after it, live (`tunnel::session::accept_reporting`) — so the refusal here and a
+//!   parked refusal are one line of code; that the set is a live handle rather than a copy rests
+//!   on review (ADR-017 M17.11).
+//! - **A `.vox` name for a room this machine never joined is refused at the proxy, and nothing
+//!   is dialled** (ADR-017, RP-44). The room is real: its host runs on the same anchor, trusts
+//!   this guest and offers a service that counts connections. The guest only never joined it.
+//!   The CONNECT is refused in the reply with the proxy's own reason ("no room on this machine
+//!   answers to …", not a host's refusal), and neither room's service is ever dialled.
+//!
+//! Every red in those two proofs says which kind it is: **PRODUCT** (what the product did, as a
+//! person sees it), **PRODUCT (staging)** (a step vox itself performs before the claim failed),
+//! or **APPARATUS** / **CANNOT MEASURE** (the proof's own fault, or a case the shared harness never
+//! staged, so the run says nothing).
+//!
+//! Every red names its side: `PRODUCT:` quotes what the tunnel's application saw and what
+//! `vox` said; `PRODUCT (staging):` is a step `vox` performs that failed before the event under
+//! test (a forward that never carried a byte, a session never live); `CANNOT MEASURE:` is only a
+//! runner that stalled through a timed window, which [`StallClock`] measures on the same
+//! timeline as the bound.
 //!
 //! ## Why it is `#[ignore]`d
 //!
 //! Production Argon2id on several profiles plus a real ADR-005 proof of work per test, and a
-//! wait on QUIC's idle timeout in the restart proof. CI runs these in release with the other
-//! real-parameter proofs.
+//! wait on QUIC's idle timeout in the restart proof. They run on demand, in release, by name:
+//! CI runs no tests.
 
 #![cfg(unix)]
 
@@ -63,15 +111,64 @@ mod pty_driver;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use world::{
-    args, echo_service, read_to_end_within, resetting_service, round_trip, socks5_connect,
-    vox_once, Ending, World, PARTIAL,
+    args, counting_echo_service, echo_service, read_to_end_within, resetting_service, round_trip,
+    socks5_connect, vox_once, Ending, VoxProc, World, PARTIAL,
 };
 
+/// How long the idle session says nothing: past quinn's 30 s default idle timeout and past
+/// Vox's own 60 s one, so the session survives only if something keeps its connection alive.
+const QUIET: Duration = Duration::from_secs(75);
+
+/// The runner's own stalls, on the proof's timeline: a thread that asks to sleep [`Self::TICK`]
+/// and records how much longer than that it was away. A bound missed while the runner itself
+/// stalled for a good part of it measured the runner, not `vox`.
+struct StallClock {
+    stop: Arc<AtomicBool>,
+    worst_us: Arc<AtomicU64>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl StallClock {
+    const TICK: Duration = Duration::from_millis(10);
+
+    fn start() -> Self {
+        let (stop, worst_us) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let (s, w) = (stop.clone(), worst_us.clone());
+        let thread = std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let t = Instant::now();
+                std::thread::sleep(Self::TICK);
+                let late = t.elapsed().saturating_sub(Self::TICK);
+                w.fetch_max(late.as_micros() as u64, Ordering::Relaxed);
+            }
+        });
+        Self {
+            stop,
+            worst_us,
+            thread,
+        }
+    }
+
+    /// The longest the runner was away past one tick.
+    fn stop(self) -> Duration {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread
+            .join()
+            .expect("APPARATUS: the stall clock's thread panicked");
+        Duration::from_micros(self.worst_us.load(Ordering::Relaxed))
+    }
+}
+
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW + a QUIC idle timeout, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW + a QUIC idle timeout, driving the real binary; run on demand"]
 fn a_forward_carries_a_new_connection_after_its_host_restarts() {
     watchdog::arm();
     let mut w = World::new(echo_service(), true);
@@ -79,9 +176,20 @@ fn a_forward_carries_a_new_connection_after_its_host_restarts() {
     let (mut fwd, at) = w.forward("forward", &guest_dir);
 
     // Step 1: the forward works at all — otherwise the restart proves nothing.
-    let before = round_trip(at, b"before the restart", Duration::from_secs(120))
-        .expect("the forward must carry a connection before the host restarts");
-    assert_eq!(before, b"before the restart", "bytes must cross unchanged");
+    let before =
+        round_trip(at, b"before the restart", Duration::from_secs(120)).unwrap_or_else(|e| {
+            let host_said = w.host.as_mut().map(|h| h.transcript()).unwrap_or_default();
+            panic!(
+                "PRODUCT (staging): the forward carried no connection before \
+                 the restart ({e}), so a restart proves nothing. The forward said:\n{}\nThe host \
+                 said:\n{host_said}",
+                fwd.transcript()
+            )
+        });
+    assert_eq!(
+        before, b"before the restart",
+        "PRODUCT: bytes changed crossing the forward"
+    );
     eprintln!(
         "[test] step 1: {} bytes echoed before the restart",
         before.len()
@@ -103,29 +211,96 @@ fn a_forward_carries_a_new_connection_after_its_host_restarts() {
     let after = after.unwrap_or_else(|e| {
         let host_said = w.host.as_mut().map(|h| h.transcript()).unwrap_or_default();
         panic!(
-            "the same forward must carry a new connection after its host restarted \
+            "PRODUCT: the same forward must carry a new connection after its host restarted \
              (PRD-001 R24); after {waited:?} it failed with {e}. The forward said:\n{}\n\
              The restarted host said:\n{host_said}",
             fwd.transcript()
         )
     });
-    assert_eq!(after, b"after the restart", "bytes must cross unchanged");
+    assert_eq!(
+        after, b"after the restart",
+        "PRODUCT: bytes changed crossing the forward after the restart"
+    );
     eprintln!(
         "[test] step 3: {} bytes echoed through the same forward {waited:?} after the host \
          restarted on a new port",
         after.len()
     );
     // The forward process never restarted: it is the same child throughout.
+    let exited = fwd
+        .child
+        .try_wait()
+        .expect("APPARATUS: could not ask whether the forward process is alive");
     assert!(
-        fwd.child.try_wait().unwrap().is_none(),
-        "the forward process must still be the one that started"
+        exited.is_none(),
+        "PRODUCT: the forward process exited ({exited:?}) — it must be the one that started. It \
+         said:\n{}",
+        fwd.transcript()
     );
     drop(fwd);
     drop(w);
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW + 75 s of quiet, driving the real binary; run on demand"]
+fn a_quiet_session_still_carries_bytes() {
+    watchdog::arm();
+    let w = World::new(echo_service(), true);
+    let guest_dir = w.guest_dir.clone();
+    let (mut fwd, at) = w.forward("forward", &guest_dir);
+
+    // Step 1: the session carries bytes, so what follows measures the quiet and not a path
+    // that never worked.
+    let mut s = TcpStream::connect(at)
+        .expect("PRODUCT (staging): the forward's own port refused a connection");
+    s.set_read_timeout(Some(
+        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
+    ))
+    .expect("APPARATUS: set a read timeout");
+    s.write_all(b"before the quiet")
+        .expect("PRODUCT (staging): the forward's session never took a first write");
+    let mut back = [0u8; 16];
+    if let Err(e) = s.read_exact(&mut back) {
+        panic!(
+            "PRODUCT (staging): the forward's session never carried bytes ({e}), before any quiet: \
+             vox failed to carry a fresh session. The forward said:\n{}",
+            fwd.transcript()
+        );
+    }
+    assert_eq!(
+        &back, b"before the quiet",
+        "PRODUCT: bytes must cross unchanged"
+    );
+    eprintln!("[test] step 1: the session echoed {} bytes", back.len());
+
+    // Step 2: nobody types.
+    std::thread::sleep(QUIET);
+
+    // Step 3: the same session, on the same socket, still carries bytes.
+    let t0 = Instant::now();
+    let wrote = s.write_all(b"after the quiet");
+    // An echo on a live connection takes milliseconds; a dead session ends sooner than this.
+    let (got, ending) = read_to_end_within(&mut s, Duration::from_secs(10));
+    let waited = t0.elapsed();
+    eprintln!(
+        "[test] step 3: after {QUIET:?} of quiet the session took the write ({wrote:?}), gave {} \
+         bytes, then {ending:?} after {waited:?}",
+        got.len()
+    );
+    assert!(
+        got == b"after the quiet" && ending == Ending::StillOpen,
+        "PRODUCT: a session quiet for {QUIET:?} must still carry bytes and stay open (RP-09): \
+         an idle ssh session must not drop while its person reads. The write gave {wrote:?}; \
+         the session gave {:?} and ended {ending:?} after {waited:?}. The forward said:\n{}",
+        String::from_utf8_lossy(&got),
+        fwd.transcript()
+    );
+    drop(fwd);
+    drop(w);
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn removing_a_service_cuts_its_live_sessions_within_a_second() {
     watchdog::arm();
     let mut w = World::new(echo_service(), true);
@@ -133,19 +308,36 @@ fn removing_a_service_cuts_its_live_sessions_within_a_second() {
     // is not (it serves no control socket). A daemon holding the same room is.
     w.restart_host_as_daemon();
     let guest_dir = w.guest_dir.clone();
-    let (_fwd, at) = w.forward("forward", &guest_dir);
+    let (mut fwd, at) = w.forward("forward", &guest_dir);
 
-    // Step 1: a live session carrying bytes both ways.
-    let mut s = TcpStream::connect(at).expect("connect to the forward");
+    // Step 1: a live session carrying bytes both ways. Staging: without it there is nothing
+    // for the removal to cut.
+    let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT (staging): the forward's listener {at} refused a \
+             connection: {e}. It said:\n{}",
+            fwd.transcript()
+        )
+    });
     s.set_read_timeout(Some(
         vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
     ))
-    .unwrap();
-    s.write_all(b"are you there").unwrap();
+    .expect("APPARATUS: set the session's read timeout");
     let mut back = [0u8; 13];
-    s.read_exact(&mut back)
-        .expect("the session must be live before the removal");
-    assert_eq!(&back, b"are you there");
+    if let Err(e) = s
+        .write_all(b"are you there")
+        .and_then(|()| s.read_exact(&mut back))
+    {
+        panic!(
+            "PRODUCT (staging): the session was never live before the \
+             removal ({e}). The forward said:\n{}",
+            fwd.transcript()
+        );
+    }
+    assert_eq!(
+        &back, b"are you there",
+        "PRODUCT: bytes changed crossing the forward"
+    );
     eprintln!("[test] step 1: live session echoed {} bytes", back.len());
 
     // Step 2: the host's operator removes the service, from the command line.
@@ -156,40 +348,79 @@ fn removing_a_service_cuts_its_live_sessions_within_a_second() {
     let removed_at = Instant::now();
     assert!(
         ok,
-        "`vox service remove` must reach the running host.\nstdout:\n{out}\nstderr:\n{err}"
+        "PRODUCT: `vox service remove` did not reach the running host.\nstdout:\n{out}\n\
+         stderr:\n{err}"
     );
     eprintln!("[test] step 2: {}", out.trim());
 
-    // Step 3: the live session is cut, within a second, and not by a quiet EOF.
-    let (tail, ending) = read_to_end_within(&mut s, Duration::from_secs(1));
+    // Step 3: the live session is cut, within a second, and not by a quiet EOF. The read goes
+    // on past the bound, so a late cut reads "cut late at X" and a missing one "never cut";
+    // the runner's own stalls are timed alongside, so a stalled runner reads CANNOT MEASURE.
+    let bound = Duration::from_secs(1);
+    let clock = StallClock::start();
+    let (tail, ending) = read_to_end_within(&mut s, Duration::from_secs(30));
     let elapsed = removed_at.elapsed();
+    let stall = clock.stop();
     eprintln!(
-        "[test] step 3: session ended {ending:?} after {elapsed:?}, {} stray bytes",
+        "[test] step 3: session ended {ending:?} after {elapsed:?}, {} stray bytes; the runner's \
+         longest stall was {stall:?}",
         tail.len()
     );
-    assert_eq!(
-        ending,
-        Ending::Reset,
-        "removing a service must cut its live sessions immediately (PRD-001 R22), and say so \
-         with a reset; it ended {ending:?} within {elapsed:?}"
-    );
+    let transcript = fwd.transcript();
+    match ending {
+        Ending::Reset => {}
+        Ending::StillOpen => panic!(
+            "PRODUCT: removing a service never cut its live session (PRD-001 R22): still open \
+             {elapsed:?} after `vox service remove` returned. The forward said:\n{transcript}"
+        ),
+        other => panic!(
+            "PRODUCT: removing a service ended its live session as {other:?} after {elapsed:?}, \
+             not a reset (PRD-001 R22). The forward said:\n{transcript}"
+        ),
+    }
+    if elapsed > bound {
+        // Half the bound away from the clock: the runner, not `vox`, may have spent the second.
+        assert!(
+            stall <= bound / 2,
+            "APPARATUS, CANNOT MEASURE: the runner stalled {stall:?} on the proof's timeline while a \
+             {bound:?} bound was timed (the cut came at {elapsed:?})"
+        );
+        panic!(
+            "PRODUCT: removing a service cut its live session late, at {elapsed:?} (bound \
+             {bound:?}; the runner's longest stall {stall:?}) (PRD-001 R22). The forward \
+             said:\n{transcript}"
+        );
+    }
     assert!(
         tail.is_empty(),
-        "nothing should arrive after the cut: {tail:?}"
+        "PRODUCT: {} bytes arrived after the service was removed: {tail:?}",
+        tail.len()
     );
     drop(w);
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn a_backend_reset_reaches_the_far_client_as_a_reset() {
     watchdog::arm();
     let w = World::new(resetting_service(), true);
     let guest_dir = w.guest_dir.clone();
-    let (_fwd, at) = w.forward("forward", &guest_dir);
+    let (mut fwd, at) = w.forward("forward", &guest_dir);
 
-    let mut s = TcpStream::connect(at).expect("connect to the forward");
-    s.write_all(b"GET /").unwrap();
+    let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT (staging): the forward's listener {at} refused a \
+             connection: {e}. It said:\n{}",
+            fwd.transcript()
+        )
+    });
+    s.write_all(b"GET /").unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT (staging): the request could not be written to the \
+             forward: {e}. It said:\n{}",
+            fwd.transcript()
+        )
+    });
     // The first read may wait for the forward to reach its host.
     let (got, ending) = read_to_end_within(
         &mut s,
@@ -201,22 +432,41 @@ fn a_backend_reset_reaches_the_far_client_as_a_reset() {
         PARTIAL.len()
     );
     // Step 1: the path works — the partial reply crossed — so the ending is the backend's.
+    // Nothing at all crossing is staging that did not happen (the far side never carried the
+    // request, or the test's backend never answered); any byte that crossed makes the rest
+    // the tunnel's.
+    let transcript = fwd.transcript();
+    assert!(
+        !got.is_empty(),
+        "PRODUCT (staging): not one byte of the backend's reply crossed \
+         (the read ended {ending:?}), so no reset was ever relayed. The forward said:\n\
+         {transcript}"
+    );
+    assert!(
+        PARTIAL.starts_with(&got),
+        "PRODUCT: the backend's reply changed crossing the tunnel: {:?}",
+        String::from_utf8_lossy(&got)
+    );
     assert_eq!(
-        got, PARTIAL,
-        "the partial reply must cross before the reset, or this measures a broken path"
+        got.len(),
+        PARTIAL.len(),
+        "PRODUCT: the client got {} of the {} bytes the backend sent before its reset, then \
+         {ending:?}. The forward said:\n{transcript}",
+        got.len(),
+        PARTIAL.len()
     );
     // Step 2: the backend's reset is a reset at the far end, not a clean EOF.
     assert_eq!(
         ending,
         Ending::Reset,
-        "a backend that reset its connection must reach the client as a reset, not as a clean \
-         EOF after a truncated reply (PRD-001 D11)"
+        "PRODUCT: a backend that reset its connection reached the client as {ending:?}, not as \
+         a reset (PRD-001 D11). The forward said:\n{transcript}"
     );
     drop(w);
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn a_refused_forward_resets_the_application_and_says_why() {
     watchdog::arm();
     // The guest joined with the address and the passphrase and was never trusted.
@@ -225,7 +475,13 @@ fn a_refused_forward_resets_the_application_and_says_why() {
     let (mut fwd, at) = w.forward("stranger-forward", &guest_dir);
 
     let t0 = Instant::now();
-    let mut s = TcpStream::connect(at).expect("connect to the forward");
+    let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT (staging): the forward's listener {at} refused a \
+             connection: {e}. It said:\n{}",
+            fwd.transcript()
+        )
+    });
     // **Nothing is written.** A socket closed with unread data in its receive buffer is
     // reset by the kernel whatever the closer intended, so writing first made a quiet close
     // look like a reset and this proof pass against the defect — its first mutation check
@@ -242,13 +498,17 @@ fn a_refused_forward_resets_the_application_and_says_why() {
     );
     assert!(
         got.is_empty(),
-        "an untrusted joiner must carry no bytes: {got:?}"
+        "PRODUCT: an untrusted joiner's forward carried {} bytes: {got:?}. It said:\n{}",
+        got.len(),
+        fwd.transcript()
     );
     assert_eq!(
         ending,
         Ending::Reset,
-        "a refused forward must fail the application's connection as a reset — a quiet close \
-         reads as `connected, then the server hung up` (PRD-001 R23)"
+        "PRODUCT: a refused forward ended the application's connection as {ending:?} after \
+         {waited:?}, not as a reset — a quiet close reads as `connected, then the server hung \
+         up` (PRD-001 R23). It said:\n{}",
+        fwd.transcript()
     );
     // And this node, which is the operator's own, says why.
     let why = fwd.expect_within(Duration::from_secs(10), "the reason, on stderr", |l| {
@@ -260,7 +520,7 @@ fn a_refused_forward_resets_the_application_and_says_why() {
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn a_refused_socks_connect_is_refused_in_the_reply_and_says_why() {
     watchdog::arm();
     // The guest joined with the address and the passphrase and was never trusted.
@@ -276,14 +536,17 @@ fn a_refused_socks_connect_is_refused_in_the_reply_and_says_why() {
     let waited = t0.elapsed();
     eprintln!("[test] the untrusted CONNECT got SOCKS reply code {code} after {waited:?}");
     assert_eq!(
-        code, 0x02,
-        "an untrusted joiner's CONNECT must be refused in the SOCKS reply itself — code 2, \
-         not allowed — not told it succeeded"
+        code,
+        0x02,
+        "PRODUCT: an untrusted joiner's CONNECT got SOCKS reply code {code}, not 2 (not \
+         allowed): it must be refused in the reply itself. `vox up` said:\n{}",
+        up.transcript()
     );
     let (got, ending) = read_to_end_within(&mut s, Duration::from_secs(5));
     assert!(
         got.is_empty(),
-        "a refused CONNECT must carry nothing: {got:?}"
+        "PRODUCT: a refused CONNECT carried {} bytes: {got:?}",
+        got.len()
     );
     eprintln!("[test] and the socket then ended {ending:?}");
     // And this node, the operator's own, says why.
@@ -373,7 +636,7 @@ fn a_tunnel_is_closed_from_either_end_and_nothing_else_changes() {
 
     // Step 1: a live session, and the host's `vox status` names its member.
     let mut first = echoes(at, b"before the close").unwrap_or_else(|e| {
-        panic!("CANNOT MEASURE: the forward never carried a first session: {e}")
+        panic!("PRODUCT (staging): the forward never carried a first session: {e}")
     });
     let host_status = status_of(&w.host_dir, "the host");
     let live = rows(&host_status, "tunnels", &port, "in");
@@ -517,7 +780,7 @@ fn a_stuck_tunnel_is_closed_and_an_idle_one_is_not() {
 
     // An idle session: it echoes once, then nothing moves on it.
     let mut idle = echoes(at, b"idle from here on").unwrap_or_else(|e| {
-        panic!("CANNOT MEASURE: the forward never carried the idle session: {e}")
+        panic!("PRODUCT (staging): the forward never carried the idle session: {e}")
     });
     let idle_since = Instant::now();
     let reported = [
@@ -761,7 +1024,7 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
         } else {
             "the driver is still running".to_owned()
         };
-        panic!("CANNOT MEASURE: the guest's TUI never opened its room; {said}");
+        panic!("PRODUCT (staging): the guest's TUI never opened its room; {said}");
     }
 
     // A session through a forward of the TUI's own node, as `vox room get` makes one.
@@ -784,7 +1047,10 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
             .map(|(id, _, _)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(&w.room))
             .unwrap_or_else(|| {
-                panic!("CANNOT MEASURE: room {} is not on the guest's node", w.room)
+                panic!(
+                    "PRODUCT (staging): room {} is not on the guest's node",
+                    w.room
+                )
             }),
         other => panic!("PRODUCT: the guest's TUI did not list its rooms: {other:?}"),
     };
@@ -814,14 +1080,16 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
         .filter_map(|t| t["id"].as_u64())
         .collect()
     };
-    let mut first = echoes(at, b"the first session")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: the first session never carried bytes: {e}"));
+    let mut first = echoes(at, b"the first session").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): the first session never carried bytes: {e}")
+    });
     let first_id = match ids_now().as_slice() {
         [one] => *one,
         other => panic!("PRODUCT: with one session open, the TUI's node lists tunnels {other:?}"),
     };
-    let mut second = echoes(at, b"the second session")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: the second session never carried bytes: {e}"));
+    let mut second = echoes(at, b"the second session").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): the second session never carried bytes: {e}")
+    });
     let second_id = match ids_now()
         .iter()
         .copied()
@@ -858,9 +1126,7 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
                 screen("red")
             );
         }
-        panic!(
-            "CANNOT MEASURE: the TUI driver neither closed a tunnel nor said why in 90 s; {said}"
-        );
+        panic!("PRODUCT: the TUI closed no tunnel within 90 s and its driver saw no red; {said}");
     }
     eprintln!(
         "[test] tunnels {first_id} and {second_id}; the TUI's tunnel list:\n{}\n[test] after Down \
@@ -879,7 +1145,7 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
         other => {
             std::fs::write(cues.join("stop"), b"").expect("APPARATUS: write the stop cue");
             panic!(
-                "CANNOT MEASURE: the driver names no closed tunnel among {first_id} and \
+                "APPARATUS: the driver names no closed tunnel among {first_id} and \
                  {second_id} ({other:?}); {}",
                 said_by(driver)
             )
@@ -914,7 +1180,7 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
     );
     assert!(
         driven.stdout.contains("guest RED") || driven.has_verdict("guest"),
-        "CANNOT MEASURE: the TUI driver gave no verdict (stage {:?}):\n{}",
+        "APPARATUS: the TUI driver gave no verdict (stage {:?}):\n{}",
         driven.stage,
         driven.stdout
     );
@@ -972,7 +1238,7 @@ fn an_ambiguous_member_prefix_closes_nothing() {
     let (ok, first_fp, err) = vox_once(&guest_dir, &args(&["id"]));
     assert!(
         ok,
-        "CANNOT MEASURE: the first guest's `vox id` failed: {err}"
+        "PRODUCT (staging): the first guest's `vox id` failed: {err}"
     );
     let first_fp = first_fp.trim().to_ascii_lowercase();
 
@@ -986,7 +1252,7 @@ fn an_ambiguous_member_prefix_closes_nothing() {
         let (ok, fp, err) = vox_once(&second_dir, &args(&["id"]));
         assert!(
             ok,
-            "CANNOT MEASURE: the second guest's `vox id` failed: {err}"
+            "PRODUCT (staging): the second guest's `vox id` failed: {err}"
         );
         let fp = fp.trim().to_ascii_lowercase();
         if fp[..1] == first_fp[..1] {
@@ -995,7 +1261,10 @@ fn an_ambiguous_member_prefix_closes_nothing() {
         }
     }
     let second_fp = second_fp.unwrap_or_else(|| {
-        panic!("CANNOT MEASURE: no identity in {TRIES} shared the first guest's opening character")
+        panic!(
+            "APPARATUS, CANNOT MEASURE: no identity in {TRIES} shared the first guest's opening \
+             character"
+        )
     });
     let shared = &first_fp[..1];
     let (ok, out, err) = vox_once(
@@ -1004,20 +1273,22 @@ fn an_ambiguous_member_prefix_closes_nothing() {
     );
     assert!(
         ok,
-        "CANNOT MEASURE: the host could not trust the second guest: {out}{err}"
+        "PRODUCT (staging): the host could not trust the second guest: {out}{err}"
     );
     let (ok, _, out, err) = w.join(&second_dir);
     assert!(
         ok,
-        "CANNOT MEASURE: the second guest could not join: {out}{err}"
+        "PRODUCT (staging): the second guest could not join: {out}{err}"
     );
 
     let (_fwd1, at1) = w.forward("forward-1", &guest_dir);
     let (_fwd2, at2) = w.forward("forward-2", &second_dir);
-    let mut one = echoes(at1, b"the first guest")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: the first guest's session never echoed: {e}"));
-    let mut two = echoes(at2, b"the second guest")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: the second guest's session never echoed: {e}"));
+    let mut one = echoes(at1, b"the first guest").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): the first guest's session never echoed: {e}")
+    });
+    let mut two = echoes(at2, b"the second guest").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): the second guest's session never echoed: {e}")
+    });
     eprintln!("[test] two guests, {first_fp} and {second_fp}, share the prefix {shared:?}");
 
     // The shared prefix names two members: refused, naming both, and nothing closed.
@@ -1059,4 +1330,424 @@ fn an_ambiguous_member_prefix_closes_nothing() {
         &second_fp[..12]
     );
     drop(w);
+}
+
+/// A trusted session through `vox up`, carrying bytes: the staging both trust proofs start
+/// from. Every failure here is vox's own, so it is `PRODUCT (staging)`; a proxy that breaks the
+/// SOCKS exchange is `socks5_connect`'s PRODUCT red.
+fn live_session(up: &mut VoxProc, at: std::net::SocketAddr, name: &str, port: u16) -> TcpStream {
+    let (code, mut s) = socks5_connect(at, name, port);
+    assert_eq!(
+        code,
+        0,
+        "PRODUCT (staging): vox up refused a trusted member's CONNECT to {name}:{port} \
+         (reply {code}); vox up said:\n{}",
+        up.transcript()
+    );
+    s.set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("APPARATUS: setting a read timeout on the proof's own socket");
+    let echoed = s
+        .write_all(b"are you there")
+        .and_then(|()| {
+            let mut back = [0u8; 13];
+            s.read_exact(&mut back).map(|()| back)
+        })
+        .unwrap_or_else(|e| {
+            panic!("PRODUCT (staging): the trusted session through vox up carried no echo: {e}")
+        });
+    assert_eq!(
+        &echoed, b"are you there",
+        "PRODUCT (staging): the trusted session through vox up altered the echo"
+    );
+    s
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
+fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
+    watchdog::arm();
+    let (port, accepted) = counting_echo_service();
+    let mut w = World::new(port, true);
+    // `vox trust remove` asks the running node, which `vox serve` does not answer (it serves
+    // no control socket); a daemon holding the same room does.
+    w.restart_host_as_daemon();
+    let guest_dir = w.guest_dir.clone();
+    let (mut up, at) = w.up("guest-up", &guest_dir);
+    let name = format!("{}.vox", w.room);
+
+    // Step 1: a live session, as `ssh user@<room>.vox` holds one.
+    let mut s = live_session(&mut up, at, &name, port);
+    let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        dialled, 1,
+        "PRODUCT (staging): the service counted {dialled} connections for one session, so it cannot \
+         say whether a later one was dialled"
+    );
+    eprintln!("[test] step 1: a trusted session through vox up echoed; the service counted 1");
+
+    // Step 2: the host's operator withdraws trust, from the command line.
+    let (ok, out, err) = vox_once(&w.host_dir, &args(&["trust", "remove", &w.guest_fp]));
+    let removed_at = Instant::now();
+    assert!(
+        ok,
+        "PRODUCT: `vox trust remove` did not take effect on the running host.\nstdout:\n{out}\n\
+         stderr:\n{err}"
+    );
+    eprintln!("[test] step 2: {}", out.trim());
+
+    // Step 3: the live session is cut — a reset, not a quiet EOF — within a second.
+    let (tail, ending) = read_to_end_within(&mut s, Duration::from_secs(1));
+    let elapsed = removed_at.elapsed();
+    eprintln!(
+        "[test] step 3: the live session ended {ending:?} {elapsed:?} after the removal, {} \
+         stray bytes",
+        tail.len()
+    );
+    assert_eq!(
+        ending,
+        Ending::Reset,
+        "PRODUCT: withdrawing trust must cut the live session at once, with a reset (ADR-017 \
+         M17.11); it ended {ending:?} within {elapsed:?}"
+    );
+    assert!(
+        tail.is_empty(),
+        "PRODUCT: bytes arrived after trust was withdrawn: {tail:?}"
+    );
+    let said = up.try_expect_within(
+        Duration::from_secs(10),
+        "that the host withdrew access",
+        |l| l.contains("the host withdrew access") && l.contains(&port.to_string()),
+    );
+    assert!(
+        said.is_ok(),
+        "PRODUCT: vox up must tell its person the host withdrew access, so they do not retry a \
+         thing that cannot work; it said:\n{}",
+        up.transcript()
+    );
+
+    // Step 4: the next request, through the same proxy and the same connection to the host —
+    // made while the guest was trusted — is refused, and the service is never dialled.
+    let (code, mut s2) = socks5_connect(at, &name, port);
+    eprintln!("[test] step 4: the CONNECT after the withdrawal got SOCKS reply {code}");
+    assert_eq!(
+        code, 0x02,
+        "PRODUCT: a CONNECT after `vox trust remove` must be refused in the reply — code 2, not \
+         allowed; it got {code}"
+    );
+    let (got, _) = read_to_end_within(&mut s2, Duration::from_secs(2));
+    assert!(
+        got.is_empty(),
+        "PRODUCT: a refused CONNECT carried bytes: {got:?}"
+    );
+    let why = up.try_expect_within(Duration::from_secs(10), "that the host refused", |l| {
+        l.starts_with("! ") && l.contains("the host refused")
+    });
+    assert!(
+        why.is_ok(),
+        "PRODUCT: vox up must say the host refused the CONNECT; it said:\n{}",
+        up.transcript()
+    );
+    let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        dialled, 1,
+        "PRODUCT: the host dialled its service for a guest it no longer trusts — the service \
+         counted {dialled} connections, one more than the session before the withdrawal"
+    );
+    eprintln!("[test] step 4: refused, said why, and the service still counted 1");
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
+fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dialled() {
+    watchdog::arm();
+    let (port, accepted) = counting_echo_service();
+    let w = World::new(port, true);
+
+    // A second, real room on the same anchor, hosted by someone who trusts this guest and
+    // offers a service that counts connections. The guest never joins it: that is the only
+    // reason left for a refusal.
+    let (other_port, other_accepted) = counting_echo_service();
+    let other_dir = w.tmp.path().join("other-host");
+    std::fs::create_dir_all(other_dir.join("cfg"))
+        .expect("APPARATUS: creating the other host's profile directory");
+    let (ok, _, err) = vox_once(&other_dir, &args(&["id"]));
+    assert!(ok, "PRODUCT (staging): `vox id` (other host) failed: {err}");
+    let (ok, out, err) = vox_once(
+        &other_dir,
+        &args(&["trust", "add", &w.guest_fp, "--name", "the guest"]),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the other host's `vox trust add` failed: {out}\n{err}"
+    );
+    let mut other = VoxProc::spawn(
+        "other-host",
+        &other_dir,
+        &args(&[
+            "serve",
+            &other_port.to_string(),
+            "--anchor",
+            &w.host_anchor,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+    );
+    let other_room = world::after_label(
+        &other.expect_line("the other room", |l| l.starts_with("room ")),
+        "room",
+    );
+    assert_ne!(
+        other_room, w.room,
+        "PRODUCT (staging): the other host's `vox serve` printed this world's room"
+    );
+    let other_name = format!("{other_room}.vox");
+
+    let guest_dir = w.guest_dir.clone();
+    let (mut up, at) = w.up("guest-up", &guest_dir);
+
+    // Control: the proxy dials a room this machine did join — otherwise a refusal below could
+    // be a proxy that reaches nothing.
+    let s = live_session(&mut up, at, &format!("{}.vox", w.room), port);
+    let _ = s.shutdown(std::net::Shutdown::Both);
+    let joined = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        joined, 1,
+        "PRODUCT (staging): the joined room's service counted {joined} connections for one session"
+    );
+    eprintln!("[test] control: the joined room's name was carried; its service counted 1");
+
+    // The unjoined room's name, at its own service's port and at the joined room's: a proxy
+    // that resolved the name anywhere — the other room's host, or the room it does hold —
+    // would dial one of the two services.
+    for p in [other_port, port] {
+        let t0 = Instant::now();
+        let (code, mut s) = socks5_connect(at, &other_name, p);
+        eprintln!(
+            "[test] CONNECT {other_name}:{p} got SOCKS reply {code} after {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            code, 0x02,
+            "PRODUCT: a CONNECT to the .vox name of a room this machine never joined must be \
+             refused in the reply — code 2, not allowed; {other_name}:{p} got {code}"
+        );
+        let (got, _) = read_to_end_within(&mut s, Duration::from_secs(2));
+        assert!(
+            got.is_empty(),
+            "PRODUCT: a refused CONNECT carried bytes: {got:?}"
+        );
+    }
+    // Refused **at the proxy**: its own reason, not a host's refusal relayed back.
+    let why = up.try_expect_within(Duration::from_secs(10), "the proxy's own refusal", |l| {
+        l.starts_with("! ")
+            && l.contains("no room on this machine answers to")
+            && l.contains(&other_room)
+    });
+    assert!(
+        why.is_ok(),
+        "PRODUCT: vox up must refuse an unjoined room's name itself, saying no room on this \
+         machine answers to it; it said:\n{}",
+        up.transcript()
+    );
+    assert!(
+        !up.transcript().contains("the host refused"),
+        "PRODUCT: a host was asked about a room this machine never joined (the refusal came \
+         from a host, not the proxy); vox up said:\n{}",
+        up.transcript()
+    );
+    let (mine, theirs) = (
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        other_accepted.load(std::sync::atomic::Ordering::SeqCst),
+    );
+    assert_eq!(
+        (mine, theirs),
+        (1, 0),
+        "PRODUCT: an unjoined room's name was dialled — the joined room's service counted {mine} \
+         (1 is the control), the unjoined room's {theirs}"
+    );
+    eprintln!("[test] both refused at the proxy; the services counted 1 (the control) and 0");
+    drop(other);
+}
+
+/// V210-57's bound for a host restart (`BACK_WITHIN` in `an_anchor_that_restarts_is_redialled_
+/// promptly_proof`): the first connection after the host is back reaches it within this.
+const HOST_BACK_WITHIN: Duration = Duration::from_secs(10);
+
+/// How a restarted host comes back.
+#[derive(Clone, Copy, Debug)]
+enum Back {
+    /// On a different port: what `World::restart_host_as_daemon` does.
+    NewPort,
+    /// On the port it had, so the dialer's stale connection still names a live address.
+    SamePort,
+}
+
+/// The UDP port the host's process listens on, read from the system (`lsof` on its PID).
+fn host_udp_port(w: &World) -> u16 {
+    let pid = w
+        .host
+        .as_ref()
+        .expect("APPARATUS: a running host")
+        .child
+        .id();
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-iUDP", "-Fn", "-P", "-n"])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run lsof to read the host's port: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .filter_map(|l| l.strip_prefix('n'))
+        .find_map(|a| a.rsplit(':').next()?.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: lsof found no UDP port for the host's pid {pid}: {text:?}")
+        })
+}
+
+/// Kill the host and bring the same identity and room back as `vox daemon`, as `back` says.
+/// Returns when the daemon holds the room.
+fn restart_host(w: &mut World, back: Back) {
+    match back {
+        Back::NewPort => w.restart_host_as_daemon(),
+        Back::SamePort => {
+            let port = host_udp_port(w);
+            drop(w.host.take());
+            let pass_file = w.tmp.path().join("daemon-passphrases");
+            std::fs::write(
+                &pass_file,
+                format!("{}\n{}\n", world::IDENTITY, w.passphrase),
+            )
+            .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
+            let listen = format!("127.0.0.1:{port}");
+            let mut daemon = world::VoxProc::spawn(
+                "host-daemon",
+                &w.host_dir,
+                &args(&[
+                    "daemon",
+                    "--passphrase-file",
+                    &world::utf8(&pass_file),
+                    "--anchor",
+                    &w.host_anchor,
+                    "--listen",
+                    &listen,
+                ]),
+            );
+            let room = w.room.clone();
+            daemon.expect_within(
+                Duration::from_secs(60),
+                &format!("the restarted daemon to hold the room open on port {port}"),
+                |l| l.starts_with("vox daemon: holding room") && l.contains(&room),
+            );
+            w.host = Some(daemon);
+        }
+    }
+}
+
+/// One world, one dialer, one restart: the first connection after it reaches the new process
+/// within [`HOST_BACK_WITHIN`]. `proxy` says whether the dialer is `vox up` (else `vox forward`).
+fn reached_again(proxy: bool, back: Back) -> Duration {
+    let mut w = World::new(echo_service(), true);
+    let guest_dir = w.guest_dir.clone();
+    let what = if proxy { "vox up" } else { "vox forward" };
+    let hostname = format!("{}.vox", w.room);
+    let port = w.service_port;
+    let (mut dialer, at) = if proxy {
+        w.up("up", &guest_dir)
+    } else {
+        w.forward("forward", &guest_dir)
+    };
+    // One connection through the dialer, echoed; `Err` says how it failed.
+    let once = |payload: &[u8], patience: Duration| -> Result<Vec<u8>, String> {
+        if proxy {
+            let (code, mut s) = socks5_connect(at, &hostname, port);
+            if code != 0 {
+                return Err(format!("SOCKS reply {code}"));
+            }
+            s.set_read_timeout(Some(patience))
+                .map_err(|e| format!("APPARATUS: {e}"))?;
+            s.write_all(payload).map_err(|e| e.to_string())?;
+            let mut back = vec![0u8; payload.len()];
+            s.read_exact(&mut back).map_err(|e| e.to_string())?;
+            Ok(back)
+        } else {
+            round_trip(at, payload, patience).map_err(|e| e.to_string())
+        }
+    };
+    let before = once(b"before the restart", Duration::from_secs(120)).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT (staging): {what} carried nothing before the host restarted ({e}): vox \
+             failed to carry a fresh connection.\nIt said:\n{}",
+            dialer.transcript()
+        )
+    });
+    assert!(
+        before == b"before the restart",
+        "PRODUCT: the bytes changed crossing {what} before the restart: {:?}",
+        String::from_utf8_lossy(&before)
+    );
+    restart_host(&mut w, back);
+    // Timed from the restarted daemon holding its room: one attempt, as an application makes.
+    let t0 = Instant::now();
+    let after = once(
+        b"after the restart",
+        HOST_BACK_WITHIN + Duration::from_secs(60),
+    );
+    let took = t0.elapsed();
+    eprintln!(
+        "[test] {what}, host back on {back:?}: first connection {took:?} after the restart ({})",
+        match &after {
+            Ok(b) => format!("echoed {:?}", String::from_utf8_lossy(b)),
+            Err(e) => format!("failed: {e}"),
+        }
+    );
+    // How the dialer let go of the dead process, as it said it (times from the daemon holding
+    // its room): the record of the mechanism ADR-013 names, green or red.
+    for l in dialer.said_since(t0) {
+        if l.contains("vox: connection to") {
+            eprintln!("[test] {what} said: {l}");
+        }
+    }
+    let host_said = w.host.as_mut().map(|h| h.transcript()).unwrap_or_default();
+    match after {
+        Ok(b) if b == b"after the restart" => {}
+        Ok(b) => panic!(
+            "PRODUCT: the bytes changed crossing {what} after the restart: {:?}",
+            String::from_utf8_lossy(&b)
+        ),
+        Err(e) => panic!(
+            "PRODUCT: {what}'s first connection after its host restarted on {back:?} failed after \
+             {took:?}: {e}.\nIt said:\n{}\nThe restarted host said:\n{host_said}",
+            dialer.transcript()
+        ),
+    }
+    assert!(
+        took <= HOST_BACK_WITHIN,
+        "PRODUCT: {what}'s first connection after its host restarted on {back:?} took {took:?}, \
+         past V210-57's {HOST_BACK_WITHIN:?}: it waited on its stale connection to the dead \
+         process (V210-141).\nIt said:\n{}\nThe restarted host said:\n{host_said}",
+        dialer.transcript()
+    );
+    took
+}
+
+#[test]
+#[ignore = "four worlds with production Argon2id profiles + a real PoW each, driving the real binary; run on demand"]
+fn a_restarted_host_is_reached_again_promptly_by_a_forward_and_by_a_proxy() {
+    watchdog::arm();
+    let mut took = Vec::new();
+    for proxy in [false, true] {
+        for back in [Back::NewPort, Back::SamePort] {
+            took.push((proxy, back, reached_again(proxy, back)));
+        }
+    }
+    eprintln!(
+        "[test] V210-141: first connection after a host restart, each within {HOST_BACK_WITHIN:?}: {}",
+        took.iter()
+            .map(|(p, b, t)| format!(
+                "{} {b:?} {:.2}s",
+                if *p { "up" } else { "forward" },
+                t.as_secs_f64()
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }

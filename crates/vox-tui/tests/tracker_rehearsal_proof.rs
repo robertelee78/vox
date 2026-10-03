@@ -51,8 +51,20 @@
 //! its claim and `working` in a separate turn, so a product that drops ownership on
 //! `blocked` is caught at checkpoint 1, not as a claim that never arrived.
 
+// Optional (decider, 2026-10-01): it needs a live model, so it blocks nothing and CI only
+// compiles it. Without `--features optional-proofs` a stand-in takes its place and says it was not
+// run (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
 
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict
+);
+
+#[path = "support/oc_sandbox.rs"]
+mod oc_sandbox;
 #[path = "support/room.rs"]
 mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -66,28 +78,14 @@ use std::time::Duration;
 
 use support::{Out, Worker, HARNESS_SESSION_VARS, VOX};
 
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
-}
 fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|d| d.join(bin))
         .find(|p| p.is_file())
 }
-fn auth_present() -> bool {
-    std::env::var_os("HOME").is_some_and(|h| {
-        Path::new(&h)
-            .join(".local/share/opencode/auth.json")
-            .is_file()
-    })
-}
 fn model() -> String {
-    std::env::var("VOX_PROOF_OPENCODE_MODEL")
-        .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
+    oc_sandbox::model()
 }
 
 // ------------------------------------------------------------------ the stub tracker
@@ -176,7 +174,7 @@ impl Tracker {
     fn observe(&mut self, row: &serde_json::Value) {
         assert_eq!(
             row["schema"], "vox.room.row/1",
-            "the adapter refuses any other schema"
+            "PRODUCT: the adapter refuses any other schema"
         );
         self.cursor = row["entry_hash"].as_str().map(str::to_owned);
         self.rows_seen += 1;
@@ -252,18 +250,18 @@ impl Tracker {
     fn board(&mut self, board: &serde_json::Value) {
         assert_ne!(
             board["coordination"], "refused",
-            "the adapter records no owner under a refusal"
+            "PRODUCT: the adapter records no owner under a refusal"
         );
         for (work, item) in &mut self.items {
             let held = board["resources"]
                 .as_array()
-                .unwrap()
+                .expect("PRODUCT: vox room board's JSON has no resources list")
                 .iter()
                 .find(|r| r["resource"] == *work && r["state"] == "held");
             item.owner = held.map(|h| {
                 (
-                    h["owner_fp"].as_str().unwrap().to_owned(),
-                    h["owner_session"].as_str().unwrap().to_owned(),
+                    h["owner_fp"].as_str().expect("PRODUCT: a held resource in vox room board's JSON has no owner_fp").to_owned(),
+                    h["owner_session"].as_str().expect("PRODUCT: a held resource in vox room board's JSON has no owner_session").to_owned(),
                 )
             });
             if item.owner.is_none() && item.phase == Phase::Executing {
@@ -306,12 +304,18 @@ impl Adapter {
         for v in HARNESS_SESSION_VARS {
             cmd.env_remove(v);
         }
-        let mut child = cmd.spawn().expect("tail");
-        let out = child.stdout.take().unwrap();
+        let mut child = cmd.spawn().expect("APPARATUS: tail");
+        let out = child
+            .stdout
+            .take()
+            .expect("APPARATUS: a piped stdio handle");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for l in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                if tx.send(serde_json::from_str(&l).expect("row")).is_err() {
+                if tx
+                    .send(serde_json::from_str(&l).expect("PRODUCT: row"))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -333,6 +337,9 @@ impl Adapter {
 
 struct Agent<'a> {
     worker: &'a Worker,
+    /// The sandbox every turn of this agent runs in, and its profile (support/oc_sandbox.rs).
+    sb: &'a oc_sandbox::OcSandbox,
+    profile: PathBuf,
     name: &'static str,
     project: PathBuf,
     session: Option<String>,
@@ -348,13 +355,9 @@ impl Agent<'_> {
         prompt: &str,
         kill_after: Option<Duration>,
     ) -> String {
-        let mut cmd = Command::new("opencode");
-        cmd.env_clear();
-        for key in ["HOME", "SHELL", "LANG", "TMPDIR", "USER"] {
-            if let Some(v) = std::env::var_os(key) {
-                cmd.env(key, v);
-            }
-        }
+        // Confined, with a fixed environment (`OcSandbox::opencode`): the recording `vox` shim
+        // first on the model's PATH, then the system's.
+        let mut cmd = self.sb.opencode(&self.profile, &[bin_dir], &self.project);
         let mut args = vec!["run".to_owned(), "--auto".into(), "-m".into(), model()];
 
         if let Some(s) = &self.session {
@@ -362,16 +365,7 @@ impl Agent<'_> {
             args.push(s.clone());
         }
         args.push(prompt.to_owned());
-        cmd.current_dir(&self.project)
-            .args(&args)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
+        cmd.args(&args)
             .env("XDG_CONFIG_HOME", oc_cfg)
             .env("VOX_DATA_DIR", &self.worker.data)
             .env("VOX_CONFIG_DIR", &self.worker.cfg)
@@ -380,7 +374,9 @@ impl Agent<'_> {
             .env("VOX_BIN", VOX)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("opencode");
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot run opencode in its sandbox: {e}"));
         // Every turn has a deadline of its own, so a turn that never returns is reported
         // as exactly that — with its output — rather than surfacing as the whole-process
         // watchdog, which says only that something, somewhere, hung.
@@ -392,7 +388,9 @@ impl Agent<'_> {
         if timed_out {
             let _ = child.kill(); // the worker dies mid-attempt, or the turn overran
         }
-        let out = child.wait_with_output().unwrap();
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: wait for a child process");
         if timed_out && kill_after.is_none() {
             eprintln!(
                 "[receipt] {} turn TIMED OUT after 240 s and was killed",
@@ -404,6 +402,7 @@ impl Agent<'_> {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        self.sb.check(&s, "an `opencode run` turn");
         eprintln!("[receipt] {} turn {prompt:?}\n{s}", self.name);
         s
     }
@@ -456,43 +455,55 @@ fn instructions(steps: &[&str]) -> String {
     )
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "two nodes, production Argon2id, and live model turns; CI runs it in release"]
+#[ignore = "two nodes, production Argon2id, and live model turns; optional, run it in release"]
 fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict() {
     watchdog::arm();
-    if which("opencode").is_none() || !auth_present() {
-        assert!(allow_unproven("opencode"), "UNPROVEN: the rehearsal needs `opencode` and a credential. Set VOX_PROOF_ALLOW_UNPROVEN=opencode to accept that gap deliberately.");
+    if !oc_sandbox::live_model_allowed(
+        "tracker_rehearsal_proof::workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict",
+    ) {
         return;
     }
+    assert!(
+        which("opencode").is_some(),
+        "APPARATUS, CANNOT MEASURE: the rehearsal needs `opencode` on PATH"
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: start a runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
 
-    // **One fixture per `vox` under test, never one for the machine** (as the drain proof's):
-    // every run rewrites its `bin/vox`, so two trees sharing one path ran each other's `vox`.
-    // Keyed by the binary's path, a tree still reuses its own OpenCode install.
-    let fixture = std::env::temp_dir().join(format!("vox-tracker-rehearsal-{:016x}", {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        VOX.hash(&mut h);
-        h.finish()
-    }));
+    // **Every model turn runs confined** (support/oc_sandbox.rs): a throwaway HOME, a fixed
+    // environment, a whitelist of readable paths, a canary in the real HOME it must never see.
+    // The plugins' hooks and the models' `vox` need the two workers' vox profiles; nothing
+    // else outside the sandbox is readable. A missing credential is CANNOT MEASURE there.
+    let sb = oc_sandbox::OcSandbox::new(tmp.path());
+    let profile = sb.profile(
+        "tracker",
+        &[&alice.data, &alice.cfg, &bob.data, &bob.cfg],
+        &[Path::new(VOX)],
+    );
+    // **This run's own fixture, inside its sandbox**: two trees sharing one fixture ran each
+    // other's `vox` (as the drain proof's); OpenCode installs into it on the warm-up turn.
+    let fixture = sb.root.join("fixture");
     let oc_cfg = fixture.join("config");
     let bin_dir = fixture.join("bin");
-    std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
-    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(oc_cfg.join("opencode"))
+        .expect("APPARATUS: create a staging directory");
+    std::fs::create_dir_all(&bin_dir).expect("APPARATUS: create a staging directory");
     let calls = fixture.join("model-shell-calls.log");
     support::model_shim(&bin_dir, &calls);
     let mut agents = Vec::new();
     for (w, name) in [(alice, "w1"), (bob, "w2")] {
         let project = fixture.join(name);
-        std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
+        std::fs::create_dir_all(project.join(".opencode/plugin"))
+            .expect("APPARATUS: create a staging directory");
         let plugin = project.join(".opencode/plugin/vox.js");
         // The mutation control: without the Vox plugin the room never reaches the model and
         // the model's shells carry no session, so the rehearsal must fail — or it was
@@ -502,10 +513,13 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         if std::env::var_os("VOX_PROOF_WITHOUT_PLUGIN").is_some() {
             let _ = std::fs::remove_file(&plugin);
         } else {
-            std::fs::write(&plugin, vox_tui::agent_hook::OPENCODE_PLUGIN).unwrap();
+            std::fs::write(&plugin, vox_tui::agent_hook::OPENCODE_PLUGIN)
+                .expect("APPARATUS: write a staging file");
         }
         agents.push(Agent {
             worker: w,
+            sb: &sb,
+            profile: profile.clone(),
             name,
             project,
             session: None,
@@ -523,7 +537,12 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         .vox(None, &["room", "read", &r, "--json"])
         .ndjson()
         .last()
-        .map(|x| x["entry_hash"].as_str().unwrap().to_owned());
+        .map(|x| {
+            x["entry_hash"]
+                .as_str()
+                .expect("PRODUCT: a row of vox room read --json has no entry_hash")
+                .to_owned()
+        });
     for (item, to) in [(item1, "w1"), (item2, "w2")] {
         let o = bob.vox_in(
             Some("tracker"),
@@ -543,7 +562,7 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
             ],
             Some(&format!("please take {item}")),
         );
-        assert!(o.ok, "the tracker could not assign: {o:?}");
+        assert!(o.ok, "PRODUCT: the tracker could not assign: {o:?}");
     }
     support::arrives(
         alice,
@@ -554,7 +573,7 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     let start = start.unwrap_or_else(|| {
         bob.vox(None, &["room", "read", &r, "--json"]).ndjson()[0]["entry_hash"]
             .as_str()
-            .unwrap()
+            .expect("PRODUCT: a row of vox room read --json has no entry_hash")
             .to_owned()
     });
     let adapter = Adapter::start(bob, &r, &start);
@@ -583,9 +602,10 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         w1.session.as_deref().is_some_and(|s| s.starts_with("ses")),
         "PRODUCT: w1's claim must carry its OpenCode session: {w1_session}"
     );
-    let w1_acquisition = support::resource(&w1_session, item1).unwrap()["acquisition"]
+    let w1_acquisition = support::resource(&w1_session, item1)
+        .expect("PRODUCT: the board names no resource for w1's item")["acquisition"]
         .as_str()
-        .unwrap()
+        .expect("PRODUCT: w1's resource has no acquisition")
         .to_owned();
     adapter.pump(&mut tracker);
     tracker.board(&w1_session);
@@ -691,7 +711,10 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     eprintln!("[proof] checkpoint 1: {:?}", tracker.items);
 
     // ---- (6) the tracker goes away; work continues ----
-    let resume = tracker.cursor.clone().unwrap();
+    let resume = tracker
+        .cursor
+        .clone()
+        .expect("APPARATUS: the tracker kept a cursor");
     adapter.stop();
     w2.run(&oc_cfg, &bin_dir, &calls, &r, &[
         "vox room post \"$VOX_ROOM\" --type failed --work 'wl:rehearsal#2' --data '{\"reason\":\"the schema never came\"}' giving-up",
@@ -863,7 +886,9 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         x["envelope"]["data"]["work"].is_string() || x["envelope"]["data"]["resource"].is_string()
     }) {
         let (kind, from) = (
-            row["envelope"]["type"].as_str().unwrap(),
+            row["envelope"]["type"]
+                .as_str()
+                .expect("PRODUCT: a row of vox room read --json has no envelope type"),
             row["envelope"]["from"].as_str().unwrap_or(""),
         );
         if kind == "assign" {

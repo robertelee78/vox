@@ -348,16 +348,61 @@ pub const RETIRE_GRACE_SECS: u64 = 60;
 /// ends agree on the new one. Two **live** connections both keep hearing keep-alives, so a
 /// live duplicate still goes to `tie_key`, which both ends compute identically.
 ///
-/// **Residual, stated rather than implied:** the count is of datagrams routed to the
-/// connection, before authentication, so an on-path attacker that knows a connection ID can
-/// keep a dead connection looking alive. That only returns the node to the idle timeout it had
-/// before this rule; it cannot make a live connection look dead.
+/// **Only what authenticates is heard** (V210-140, #359): see `heard_count`. The count was of
+/// datagrams routed to the connection, before authentication, so an on-path attacker that knew a
+/// connection ID could keep a dead connection looking alive with garbage, until the idle timeout.
 pub const SILENCE_IS_DEATH: Duration = Duration::from_secs(KEEP_ALIVE.as_secs() * 3 / 2);
+
+/// How much `quic` has received **that authenticated**: the frames of every packet that decrypted
+/// on it and was not a replay (V210-140, #359). Every liveness verdict here reads this, never the
+/// datagram count, which quinn takes before it decrypts anything: a datagram that carries a known
+/// connection ID and garbage counted there, so anyone on the path could keep a dead connection
+/// looking alive. A live peer's every packet carries at least an ACK or a PING.
+fn heard_count(quic: &quinn::Connection) -> u64 {
+    let f = quic.stats().frame_rx;
+    [
+        f.acks,
+        f.ack_frequency,
+        f.crypto,
+        f.connection_close,
+        f.data_blocked,
+        f.datagram,
+        u64::from(f.handshake_done),
+        f.immediate_ack,
+        f.max_data,
+        f.max_stream_data,
+        f.max_streams_bidi,
+        f.max_streams_uni,
+        f.new_connection_id,
+        f.new_token,
+        f.path_challenge,
+        f.path_response,
+        f.ping,
+        f.reset_stream,
+        f.retire_connection_id,
+        f.stream_data_blocked,
+        f.streams_blocked_bidi,
+        f.streams_blocked_uni,
+        f.stop_sending,
+        f.stream,
+    ]
+    .iter()
+    .fold(0u64, |sum, n| sum.wrapping_add(*n))
+}
 
 /// The one byte a liveness probe carries. Too short to be a framed datagram (which starts with an
 /// 8-byte sequence number), so the far end drops it unread; what matters is that the frame is
 /// ack-eliciting.
 const PROBE_BYTE: u8 = 0;
+
+/// Send one liveness probe on `conn` (see `PROBE_BYTE`): a live peer's QUIC stack ACKs it within
+/// a round trip, whatever its application is doing. Whether it could be sent.
+#[must_use]
+pub fn probe(conn: &VoxConnection) -> bool {
+    conn.quinn()
+        .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
+        .is_ok()
+}
 
 /// The least time between two probes [`ConnectionManager::close_if_unanswering`] counts.
 const PROBE_SPACING: Duration = Duration::from_millis(900);
@@ -378,11 +423,11 @@ fn probe_patience(rtt: Duration) -> Duration {
 ///
 /// `None` is an answer, or a connection that cannot be probed (no datagram support) or that
 /// closed on its own meanwhile — none of which is evidence that a live peer is absent.
-/// `Some(before)` is no answer, with the received-datagram count the probe started from, so the
+/// `Some(before)` is no answer, with the `heard_count` the probe started from, so the
 /// verdict can be re-checked at the moment it is acted on (see [`ConnectionManager::file_inner`]).
 async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     let quic = conn.quinn();
-    let before = quic.stats().udp_rx.datagrams;
+    let before = heard_count(quic);
     if quic
         .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
         .is_err()
@@ -391,7 +436,7 @@ async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     }
     let deadline = tokio::time::Instant::now() + probe_patience(quic.rtt());
     loop {
-        if quic.stats().udp_rx.datagrams != before || !is_live(conn) {
+        if heard_count(quic) != before || !is_live(conn) {
             return None;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -401,7 +446,7 @@ async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     }
 }
 
-/// Connections a probe found unanswered, each with the received-datagram count its probe started
+/// Connections a probe found unanswered, each with the `heard_count` its probe started
 /// from. Closed only inside [`ConnectionManager::file_inner`], under the connection lock.
 type Unanswered = Vec<(Arc<VoxConnection>, u64)>;
 
@@ -412,7 +457,7 @@ pub struct ConnectionManager {
     /// Connections a better path displaced, with the time each may be closed. They
     /// keep serving what is already on them; nothing new is opened on them.
     retiring: Mutex<Vec<(Arc<VoxConnection>, u64)>>,
-    /// Per connection (by [`VoxConnection::serial`]): how many datagrams it had received when
+    /// Per connection (by [`VoxConnection::serial`]): its `heard_count` when
     /// last sampled, and when that count last moved. The evidence [`SILENCE_IS_DEATH`] reads.
     /// Not keyed by quinn's stable id, which a new connection can reuse from a freed one and
     /// so inherit its silence.
@@ -425,6 +470,27 @@ pub struct ConnectionManager {
     /// Where [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote)s go,
     /// once the node that owns this manager says.
     notes: Mutex<Option<tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>>>,
+    /// Direct dials under way, per peer (V210-122): a reach that knows no address of its own
+    /// holds its circuits back while one of these may yet land (see `NodeNet::reach_ladder`).
+    dialling: Arc<Mutex<HashMap<Digest32, usize>>>,
+}
+
+/// A direct dial counted in [`ConnectionManager::direct_dial_under_way`] until dropped.
+pub struct DirectDial {
+    dialling: Arc<Mutex<HashMap<Digest32, usize>>>,
+    peer: Digest32,
+}
+
+impl Drop for DirectDial {
+    fn drop(&mut self) {
+        let mut dialling = lock(&self.dialling);
+        if let Some(n) = dialling.get_mut(&self.peer) {
+            *n -= 1;
+            if *n == 0 {
+                dialling.remove(&self.peer);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for ConnectionManager {
@@ -455,7 +521,31 @@ impl ConnectionManager {
             retire_grace_secs: grace_secs,
             clock,
             notes: Mutex::new(None),
+            dialling: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Count a direct dial to `peer` as under way until the returned guard is dropped.
+    #[must_use]
+    pub fn direct_dial(&self, peer: Digest32) -> DirectDial {
+        *lock(&self.dialling).entry(peer).or_insert(0) += 1;
+        DirectDial {
+            dialling: Arc::clone(&self.dialling),
+            peer,
+        }
+    }
+
+    /// Whether a direct dial to `peer` is under way anywhere in this node (V210-122).
+    #[must_use]
+    pub fn direct_dial_under_way(&self, peer: &Digest32) -> bool {
+        lock(&self.dialling).contains_key(peer)
+    }
+
+    /// Whether any direct dial is under way in this node — to an anchor, say, that a reach with
+    /// nobody to carry its circuit is waiting for (V210-57).
+    #[must_use]
+    pub fn any_direct_dial_under_way(&self) -> bool {
+        !lock(&self.dialling).is_empty()
     }
 
     /// Say what happens to this manager's connections on `events`, as
@@ -558,6 +648,20 @@ impl ConnectionManager {
         &self.endpoint
     }
 
+    /// The connection this node holds for each peer, as `vox status --json` reports it: the
+    /// peer, the connection's tag (the first bytes of its TLS exporter, the same at both ends, as
+    /// the connection notes name it) and its path. Only connections not yet closed.
+    #[must_use]
+    pub fn held_connections(&self) -> Vec<(Digest32, String, PathClass)> {
+        let mut held: Vec<(Digest32, String, PathClass)> = lock(&self.conns)
+            .iter()
+            .filter(|(_, c)| is_live(c))
+            .map(|(peer, c)| (*peer, conn_tag(c), path_class(&self.endpoint, c)))
+            .collect();
+        held.sort_by(|a, b| a.0.cmp(&b.0));
+        held
+    }
+
     /// The live connection to `peer`, if any.
     ///
     /// **Live means heard from**, not merely unclosed: a connection silent past
@@ -585,10 +689,10 @@ impl ConnectionManager {
         Some(conn)
     }
 
-    /// How long `conn` has received nothing, sampling its datagram count now. A connection
+    /// How long `conn` has received nothing, sampling its `heard_count` now. A connection
     /// never sampled before counts as heard this instant: the first sample is the baseline.
     fn silent_for(&self, conn: &VoxConnection) -> Duration {
-        let received = conn.quinn().stats().udp_rx.datagrams;
+        let received = heard_count(conn.quinn());
         let now = Instant::now();
         let mut heard = lock(&self.heard);
         let entry = heard.entry(conn.serial()).or_insert((received, now));
@@ -752,6 +856,36 @@ impl ConnectionManager {
         if let Some(conn) = self.existing(&peer) {
             return Ok(conn);
         }
+        // Counted until the connection is filed, so a reach waiting on it never sees neither.
+        let dial = self.direct_dial(peer);
+        let conn =
+            connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
+        let filed = self.file(conn).await;
+        drop(dial);
+        Ok(filed)
+    }
+
+    /// Whether `peer` answers at `candidates` (V210-167): `Ok` only if a connection authenticated
+    /// as `peer` is held on one of them, or one dialled there now completes. Unlike
+    /// [`Self::connect_to`], a connection held elsewhere — another port, a relay — does not count:
+    /// the question is whether these addresses are where the peer is.
+    ///
+    /// # Errors
+    /// Why no candidate answered as `peer`.
+    pub async fn answers_at(
+        &self,
+        peer: Digest32,
+        candidates: &[std::net::SocketAddr],
+    ) -> Result<Arc<VoxConnection>> {
+        let same = |a: &std::net::SocketAddr, b: &std::net::SocketAddr| {
+            a.port() == b.port() && a.ip().to_canonical() == b.ip().to_canonical()
+        };
+        if let Some(conn) = self.existing(&peer) {
+            let at = conn.quinn().remote_address();
+            if candidates.iter().any(|c| same(c, &at)) {
+                return Ok(conn);
+            }
+        }
         let conn =
             connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
         Ok(self.file(conn).await)
@@ -865,7 +999,7 @@ impl ConnectionManager {
     }
 
     /// **Ask the connections held for a peer whether anyone is there**, before a newcomer for
-    /// the same peer is filed against them — and close each one nobody answers on.
+    /// the same peer is filed against them — and retire each one nobody answers on.
     ///
     /// Silence ([`SILENCE_IS_DEATH`]) tells a dead connection from a live one, but only after
     /// 30s, and a restarted peer's new connection usually arrives within a second or two of the
@@ -875,12 +1009,12 @@ impl ConnectionManager {
     ///
     /// So the question is asked instead of waited for. One datagram goes out on each held
     /// connection — one byte, deliberately unframed, which the far end's
-    /// [`VoxConnection::recv_datagram`] discards before any application sees it — and a
+    /// datagram reader discards before any application sees it — and a
     /// datagram frame is ack-eliciting, so a live peer ACKs it within its ACK delay (25ms)
     /// whether or not anything reads datagrams. Anything at all arriving on a held connection
     /// within [`probe_patience`] of its probe is an answer. Nothing is a connection whose far
-    /// end is gone: it is closed, and [`Self::file_inner`] then files the newcomer against no
-    /// rival.
+    /// end is gone, or busy: it is retired (V210-104, see [`Self::file_inner`]), and the newcomer
+    /// is then filed against no rival.
     ///
     /// Measured against `a_restarted_host_is_reached_through_its_anchor` (real nodes, a relayed
     /// client, the host crashed and restarted): reachable again within 0.1s of being back, where
@@ -958,18 +1092,43 @@ impl ConnectionManager {
     fn file_inner(&self, conn: VoxConnection, serve_loser: bool, unanswered: Unanswered) -> Filed {
         let peer = conn.peer_id();
         let mut map = lock(&self.conns);
+        // **Unanswered is retired, not closed** (V210-104). Only a connection to the newcomer's own
+        // process is probed (see [`Self::probe_held`]), and that process has just completed a
+        // handshake: it is alive. A probe it did not answer in time is a busy process or a path
+        // that has gone, and closing on it reset whatever was in flight there. Measured: an anchor
+        // dialling a room's hundreds of offline members answered late, its joiners closed the
+        // connection their room fetch was riding, and 1–2% of joins into a 200-member room failed
+        // `quic stream: closed by the peer`; both ends did it to each other. Retired, the
+        // connection leaves the newcomer's way exactly as a close did, and what it carries
+        // finishes; [`Self::retire_expired`] closes it once nothing does.
         for (dead, before) in unanswered {
-            if is_live(&dead) && dead.quinn().stats().udp_rx.datagrams == before {
-                dead.close(WireError::Unresponsive);
-                self.note(
-                    dead.peer_id(),
-                    format!(
-                        "the connection {} did not answer a probe while a new one {} was filed, \
-                         and is closed",
-                        conn_tag(&dead),
-                        conn_tag(&conn)
-                    ),
-                );
+            if is_live(&dead) && heard_count(dead.quinn()) == before {
+                let held = map.get(&peer).is_some_and(|c| Arc::ptr_eq(c, &dead));
+                if held {
+                    map.remove(&peer);
+                    let retire_at = (self.clock)().saturating_add(self.retire_grace_secs);
+                    lock(&self.retiring).push((Arc::clone(&dead), retire_at));
+                    self.note(
+                        peer,
+                        format!(
+                            "the connection held {} did not answer a probe in time when a new one \
+                             {} arrived; retired, not closed, so what it carries finishes",
+                            conn_tag(&dead),
+                            conn_tag(&conn)
+                        ),
+                    );
+                } else {
+                    // Said, not silent (V210-93, #287): it is already retiring, and stays so.
+                    self.note(
+                        dead.peer_id(),
+                        format!(
+                            "the connection {} did not answer a probe when a new one {} arrived; \
+                             it is already retiring, and is left to finish",
+                            conn_tag(&dead),
+                            conn_tag(&conn)
+                        ),
+                    );
+                }
             }
         }
         // **A newcomer from another process of the identity supersedes every connection to the

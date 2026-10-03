@@ -86,7 +86,16 @@ impl std::fmt::Debug for SharedPolicy {
 #[cfg(feature = "test-knobs")]
 pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 
-/// How long a reach gives its direct dial before it asks any peer to carry a circuit (V210-122):
+/// How long a reach gives its direct dial before it asks any peer to carry a circuit (V210-122).
+///
+/// **500 ms, not 250** (#321, attempt 3). A direct dial's first answer cannot come before the peer
+/// has done its post-quantum handshake crypto, and on a loaded machine that is most of the time:
+/// a CI runner's direct dial over a 30 ms path took 271 ms and lost to the circuit at 250 ms
+/// (run 36968701360). 500 ms is the top of the range the plan gave. A reach pays it only while a
+/// direct dial to the peer is under way: one with no direct address and no dial elsewhere asks for
+/// its circuit at once. Waiting on the peer's first answer instead does not help:
+/// the dialling side's handshake finishes as soon as that answer arrives.
+///
 /// RFC 8305's connection-attempt delay, as for a join's board search. Measured: a direct join over
 /// a LAN address dials its board in under 5 ms, so a reachable peer answers well inside it, and a
 /// peer that cannot be reached directly costs this much and no more — its circuits start the moment
@@ -96,20 +105,15 @@ pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 /// circuit asked of the anchor on the same instant; the circuit lost the tie-break, was retired,
 /// and the anchor carried it for its 60 s grace — an anchor working for a pair that never needed
 /// it, which is everything ADR-012's anchor principle says it must not do.
-pub const DIRECT_HEAD_START: std::time::Duration = std::time::Duration::from_millis(250);
+pub const DIRECT_HEAD_START: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// The longest a reach's circuits wait for a **dial-back** under way (V030-22), counted from the
-/// reach's start: the peer asked, through a coordinator, to dial this node directly. The wait ends
-/// as soon as the peer says how its dial went (`Dialled`): a peer that could not dial says so at
-/// once, so a pair that cannot reach each other pays about one round trip through the coordinator
-/// more than the head start; this caps a peer whose dial is still under way. Measured: the peer's
+/// The longest a **dial-back** (V030-22) waits for the peer's word, counted from the reach's
+/// start: the peer asked, through a coordinator, to dial this node directly. It races the reach's
+/// circuits and holds none of them back (decider, 2026-10-03): a relay-only pair takes its circuit
+/// at once, and a direct path found later replaces it. This caps a peer whose dial is still under
+/// way. Measured: the peer's
 /// post-quantum handshake took 150–575 ms on a machine at load 45–97.
 pub const DIAL_BACK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(3000);
-
-/// How long a reach that knows no address for a member waits on one connected board's read of the
-/// room before it moves on (V030-22, [`NodeNet::member_endpoints`]): a live board answers a read in
-/// milliseconds.
-pub const BOARD_LOOKUP_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1000);
 
 #[cfg(feature = "test-knobs")]
 fn test_advertise() -> Option<EndpointList> {
@@ -277,6 +281,15 @@ pub enum Inbound {
         /// The stream's receive half.
         recv: RecvStream,
     },
+    /// The peer asks whether this node holds a claim it posted (V210-168).
+    Agree {
+        /// The authenticated peer, a member.
+        peer: Digest32,
+        /// The stream's send half.
+        send: SendStream,
+        /// The stream's receive half.
+        recv: RecvStream,
+    },
     /// The peer wants an ADR-008 sync session.
     Sync {
         /// The authenticated peer.
@@ -404,12 +417,12 @@ impl Drop for ReachOwner<'_> {
             self.manager.note(
                 self.peer,
                 format!(
-                    "a reach was cancelled {} ms into its ladder; {} waiting for it",
+                    "a reach was cancelled {} ms into its ladder; {}",
                     self.started.elapsed().as_millis(),
                     if woken.is_some() {
-                        "any reach"
+                        "any reach waiting for it now tries on its own"
                     } else {
-                        "nothing"
+                        "nothing was waiting for it"
                     }
                 ),
             );
@@ -432,6 +445,10 @@ impl std::fmt::Debug for NodeNet {
 impl NodeNet {
     /// Count this node's reachability ladders in `book` (`vox status --json`'s `reach`).
     pub fn count_ladders_in(&self, book: crate::node::status::SharedSyncBook) {
+        // And let the same report say which connection this node holds for each peer (#50).
+        book.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read_connections_from(&self.manager);
         *lock(&self.status) = Some(book);
     }
 
@@ -620,7 +637,20 @@ impl NodeNet {
         conn: &quinn::Connection,
         peer: Digest32,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
-        let (kind, mut send, mut recv) = accept_typed_on(conn).await?;
+        let typed = accept_typed_on(conn).await?;
+        self.authorize_typed(peer, typed)
+    }
+
+    /// Authorize a stream whose kind has been read: refused, with the coded answer, when `peer`
+    /// may not open that kind (see [`Self::classify`]).
+    ///
+    /// # Errors
+    /// [`crate::error::Error::StreamRefused`] when the peer may not open that kind.
+    pub fn authorize_typed(
+        &self,
+        peer: Digest32,
+        (kind, mut send, mut recv): (StreamKind, SendStream, RecvStream),
+    ) -> Result<(StreamKind, SendStream, RecvStream)> {
         let class = self.classify(&peer);
         if !PeerPolicy::allows(class, kind) {
             crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
@@ -788,6 +818,7 @@ impl NodeNet {
             StreamKind::Join => Ok(Inbound::Join { peer, send, recv }),
             StreamKind::Pairwise => Ok(Inbound::Pairwise { peer, send, recv }),
             StreamKind::Sync => Ok(Inbound::Sync { peer, send, recv }),
+            StreamKind::Agree => Ok(Inbound::Agree { peer, send, recv }),
             StreamKind::Coord => {
                 // The answer to `WHOAMI` is this connection's source address as *this*
                 // node sees it — the peer's reflexive address (ADR-012 rung 3).
@@ -1029,22 +1060,43 @@ impl NodeNet {
         // dialable address that never answers and a helper that refuses to relay call for
         // opposite next steps.
         let mut set: JoinSet<(String, Result<VoxConnection>)> = JoinSet::new();
-        let candidates = direct_candidates(endpoints);
+        // Only what this node's socket can send to is a direct path (V210-122): a reach whose peer
+        // advertises only addresses it cannot dial has no direct rung, and asks for its circuit at
+        // once rather than after a dial that could only fail.
+        let advertised = direct_candidates(endpoints);
+        let candidates =
+            crate::nat::reachability::dialable_candidates(self.manager.endpoint(), &advertised);
+        if candidates.is_empty() && !advertised.is_empty() {
+            self.manager.note(
+                peer,
+                format!(
+                    "this node's socket cannot dial any address it advertises ({})",
+                    join_addrs(&advertised)
+                ),
+            );
+        }
         // **Direct first, by a head start** (V210-122, ADR-012): every circuit waits
         // [`DIRECT_HEAD_START`] before it asks a relay for anything, and gives way at once to a
         // direct connection to the peer — this ladder's own direct rung, a dial elsewhere in the
-        // node, or the peer's own connection **inbound**. It starts sooner only if this ladder's
-        // direct rung failed.
+        // node, or the peer's own connection inbound. It starts sooner once nothing direct is
+        // under way: this ladder's direct rung failed, or there was none, and no dial elsewhere
+        // in the node is still running.
         //
-        // **Whatever this reach knows of the peer's address.** Two reaches with no direct
-        // candidate asked for a circuit at once, and each raced a direct path that was already
-        // coming: a node that had not read the peer's board record yet, while it dialled the
-        // peer's invite-link address (3 of 12 cold `vox up`s), and a host that cannot dial a
-        // guest at all, while the guest's own direct connection was arriving (4 of 9 runs, the
-        // anchor carrying the host's circuit). Not knowing an address is not knowing there is no
-        // direct path, so they wait the head start too.
-        let (direct_failed, failed) = tokio::sync::watch::channel(false);
-        let has_direct = !candidates.is_empty();
+        // **A dial elsewhere counts.** A node that had not read the peer's board record yet asked
+        // for a circuit at once while it dialled the peer's invite-link address (3 of 12 cold
+        // `vox up`s); that dial holds the circuits back too.
+        //
+        // **Nothing direct under way, no wait.** Every circuit waited the whole head start even
+        // with no direct dial anywhere, so a pair that can only be relayed paid it on every reach:
+        // a relayed `vox forward` restart took 253–271 ms, against 7–9 ms before (V210-57's bound
+        // is 150 ms). A host that cannot dial its guest may then bridge while the guest's own
+        // connection is arriving; the decider rules those circuits legitimate (2026-10-02). A
+        // dial-back under way (below) races them and holds nothing back: the decider rules a
+        // relay-only pair takes its circuit at once (2026-10-03), and a direct path found later
+        // replaces it through [`Self::upgrade`].
+        let candidates_none = candidates.is_empty();
+        let has_direct = !candidates_none;
+        let (direct_failed, failed) = tokio::sync::watch::channel(candidates_none);
         if has_direct {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
@@ -1060,30 +1112,31 @@ impl NodeNet {
                 (label, result)
             });
         }
+        let started = tokio::time::Instant::now();
+        // **Nobody to carry a circuit yet, but somebody being dialled** (V210-57). A one-shot verb
+        // reaches its host the moment its room is open, and a restarted `vox forward` did so before
+        // its anchor connection existed: no candidate, no helper, "no peer is connected to carry a
+        // circuit" — and the forward's next attempt came 500 ms later (restarts of 556 and 617 ms
+        // against V210-57's 150 ms). While a direct dial is under way anywhere in this node, a reach
+        // with no candidate and no helper waits for it, for at most [`DIRECT_HEAD_START`].
+        let mut helpers = self.helpers(peer);
+        if candidates_none && helpers.is_empty() {
+            self.wait_for_a_helper(peer, started + DIRECT_HEAD_START)
+                .await;
+            if let Some(conn) = self.manager.existing(&peer) {
+                return Ok(conn);
+            }
+            helpers = self.helpers(peer);
+        }
         // **Then ask the peer to dial back** (V030-22): a reach with no direct path of its own — no
         // candidate it can dial, or a direct rung that failed — asks the peer, through each
         // coordinator it is connected to, to dial this node directly. It is the hole-punch
         // exchange (`coordstream`): signalling only, at most a few frames, never a data path, and
         // the peer answers it under the same rule as any relayed punch session. A host that
         // cannot dial its guest at all, while the guest could dial it, bridged through the anchor
-        // for every sync; now the guest dials it back, and no circuit is asked for.
-        let started = tokio::time::Instant::now();
-        let punching = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let helpers = self.helpers(peer);
-        // **What each coordinator said of the dial-back**, for the circuit through it (V030-27):
-        // `None` until the dial-back through it has been asked or refused; `Some(true)` when the
-        // coordinator held no connection to the peer. A circuit through that relay waits for the
-        // word, and is not asked when it is `Some(true)`: a host reaching a guest that had just
-        // joined asked a circuit 0 ms into the reach, before its dial-back had been refused, and
-        // when the guest reached the anchor in between the anchor carried the circuit for a pair
-        // the guest could have joined directly (1 of 3 runs of R42's direct arm).
-        let mut said_of_dial_back: std::collections::HashMap<
-            Digest32,
-            tokio::sync::watch::Receiver<Option<bool>>,
-        > = std::collections::HashMap::new();
+        // for every sync; now the guest dials it back, racing the circuit, and a direct
+        // connection that lands replaces the relayed one.
         for coordinator in &helpers {
-            let (said_tx, said_rx) = tokio::sync::watch::channel(None::<bool>);
-            said_of_dial_back.insert(coordinator.peer_id(), said_rx);
             let observed = self.observed_or_ask(coordinator.peer_id()).await;
             let Ok(local_eps) = self.local_endpoints() else {
                 continue;
@@ -1094,7 +1147,6 @@ impl NodeNet {
             let now = self.now();
             let label = format!("dial-back via {}", short_id(coordinator.peer_id()));
             let mut failed = failed.clone();
-            let punching = Arc::clone(&punching);
             let manager = Arc::clone(&self.manager);
             set.spawn(async move {
                 // With a direct rung of its own, only once that rung has failed.
@@ -1109,14 +1161,9 @@ impl NodeNet {
                         );
                     }
                 }
-                punching.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let session = async {
-                    let opened = coordstream::open_punch_session(&coordinator, peer).await;
-                    let _ = said_tx.send(Some(matches!(
-                        opened,
-                        Err(Error::HolePunchFailed(why)) if why == coordstream::COORDINATOR_CANNOT_REACH
-                    )));
-                    let (mut send, mut recv) = opened?;
+                    let (mut send, mut recv) =
+                        coordstream::open_punch_session(&coordinator, peer).await?;
                     coordstream::count_dial_back(peer, false);
                     let plan =
                         coordstream::run_punch_initiator(&mut send, &mut recv, local).await?;
@@ -1206,7 +1253,6 @@ impl NodeNet {
                         outcome
                     }
                 };
-                punching.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 (label, result)
             });
         }
@@ -1216,26 +1262,51 @@ impl NodeNet {
             let label = format!("circuit via {}", short_id(relay.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
-            let punching = Arc::clone(&punching);
-            let mut said = said_of_dial_back.remove(&relay.peer_id());
             set.spawn(async move {
                 let deadline = started + DIRECT_HEAD_START;
+                let mut elsewhere = false;
                 loop {
-                    // This ladder's direct rung failed: nothing direct is coming from it.
-                    if *failed.borrow() {
-                        break;
-                    }
+                    // Read before the win is looked for: a dial elsewhere files its connection
+                    // before it stops counting, so a dial seen ended here has filed whatever it won.
+                    let dialling = manager.direct_dial_under_way(&peer);
+                    elsewhere |= dialling;
                     // Its sender is dropped when the rung ends, failed or not: a rung that failed
                     // sent `true` first, so read the value again rather than take the drop for a
                     // win (`has_changed` errs on a dropped sender whatever it last sent).
                     let rung_won = failed.has_changed().is_err() && !*failed.borrow();
-                    if rung_won || manager.existing(&peer).is_some() {
+                    let held = manager.existing(&peer);
+                    if rung_won || held.is_some() {
+                        // Said, so a pair that never bridges shows what it waited for (V210-122):
+                        // how long, and whether the connection that answered is direct.
+                        let what = match held
+                            .as_deref()
+                            .map(|c| crate::node::net::path_class(manager.endpoint(), c))
+                        {
+                            Some(crate::node::net::PathClass::Direct) | None => {
+                                "a direct connection"
+                            }
+                            Some(_) => "a relayed connection",
+                        };
+                        manager.note(
+                            peer,
+                            format!(
+                                "not asking {} for a circuit: {what} answered first, {} ms into \
+                                 the reach",
+                                short_id(relay.peer_id()),
+                                started.elapsed().as_millis()
+                            ),
+                        );
                         return (
                             label,
                             Err(Error::Unreachable(
                                 "not asked for: a direct connection answered first",
                             )),
                         );
+                    }
+                    // This ladder's direct rung failed or there was none, and no dial elsewhere
+                    // was under way: nothing direct is coming.
+                    if *failed.borrow() && !dialling {
+                        break;
                     }
                     if tokio::time::Instant::now() >= deadline {
                         break;
@@ -1245,66 +1316,25 @@ impl NodeNet {
                         () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                     }
                 }
-                // The dial-back through this relay asked or refused first (V030-27). A relay that
-                // could not reach the peer for a dial-back is not asked to carry a circuit to it in
-                // this reach: had the peer reached it since, the peer could dial this node itself.
-                let patience = started + DIAL_BACK_PATIENCE;
-                // Only once that dial-back can have been asked: with a direct rung still under way
-                // it is not asked yet, and a stale address must not hold the circuit past the head
-                // start for it.
-                let asked_yet = !has_direct || *failed.borrow();
-                if let Some(said) = said.as_mut().filter(|_| asked_yet) {
-                    let word = tokio::time::timeout_at(patience, said.wait_for(Option::is_some))
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .and_then(|w| *w);
-                    if word == Some(true) {
-                        manager.note(
-                            peer,
-                            format!(
-                                "not asking {} for a circuit: it could not reach the peer for a \
-                                 dial-back, {} ms into the reach",
-                                short_id(relay.peer_id()),
-                                started.elapsed().as_millis()
-                            ),
-                        );
-                        return (
-                            label,
-                            Err(Error::Unreachable(
-                                "not asked for: the relay could not reach the peer for a dial-back",
-                            )),
-                        );
-                    }
-                }
-                // A dial-back under way: wait for the peer's connection, within its patience.
-                while punching.load(std::sync::atomic::Ordering::SeqCst) > 0
-                    && tokio::time::Instant::now() < patience
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                if manager.existing(&peer).is_some() {
-                    return (
-                        label,
-                        Err(Error::Unreachable(
-                            "not asked for: a direct connection answered first",
-                        )),
-                    );
-                }
-                // Said, so a pair that bridges shows why (V210-122, V030-27): how long the reach
+                // Said, so a pair that bridges shows why (V210-122): how long the reach
                 // waited, and whether its direct dial had failed or was still under way.
                 manager.note(
                     peer,
                     format!(
-                        "asking {} for a circuit {} ms into the reach; its direct dial {}",
+                        "asking {} for a circuit {} ms into the reach; its direct dial {}{}",
                         short_id(relay.peer_id()),
                         started.elapsed().as_millis(),
-                        if !has_direct {
+                        if candidates_none {
                             "there was none"
                         } else if *failed.borrow() {
                             "failed"
                         } else {
                             "had not finished"
+                        },
+                        if elsewhere {
+                            "; a direct dial elsewhere in this node held it back"
+                        } else {
+                            ""
                         }
                     ),
                 );
@@ -1442,6 +1472,27 @@ impl NodeNet {
             .filter(|p| *p != peer)
             .filter_map(|p| self.manager.existing(&p))
             .collect()
+    }
+
+    /// **Nobody connected to help reach `peer` yet, but somebody being dialled** (V210-57): wait,
+    /// until `until` at most, while a direct dial is under way anywhere in this node (an anchor's,
+    /// say) and neither a helper nor `peer` itself is connected. Says how long it waited.
+    async fn wait_for_a_helper(&self, peer: Digest32, until: tokio::time::Instant) {
+        let began = tokio::time::Instant::now();
+        while self.helpers(peer).is_empty()
+            && self.manager.existing(&peer).is_none()
+            && self.manager.any_direct_dial_under_way()
+            && tokio::time::Instant::now() < until
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let waited = began.elapsed().as_millis();
+        if waited > 0 {
+            self.manager.note(
+                peer,
+                format!("nobody to carry a circuit yet; waited {waited} ms for a dial under way"),
+            );
+        }
     }
 
     /// The initiator's side of rung 3 on its own: ask `coordinator` to carry a punch
@@ -1598,45 +1649,90 @@ impl NodeNet {
             .unwrap_or_default()
     }
 
-    /// Where to dial `member` of `channel_id`: this node's board record for it, or — when this
-    /// node's board holds none yet — the record a connected board holds (V030-22).
+    /// Where to dial `member` of `channel_id`: this node's board record for it, or, when this
+    /// node's board holds none yet, the record a connected board holds (V210-122, as V030-22).
     ///
-    /// **Read the board before bridging.** A node that has just come online has not read its
-    /// room's board yet, so a reach it makes at once knows no address for the member and could only
-    /// relay: measured, a guest's `vox up` asked its anchor for a circuit to a host it could dial
-    /// directly, the host's address record sitting on that same anchor's board. One read of a
-    /// connected board, bounded by [`BOARD_LOOKUP_PATIENCE`] each, comes first. The identity is
-    /// pinned, so a stale or wrong address only fails.
+    /// **Read the board before bridging.** A reach that knows no address for its peer has no
+    /// direct rung, so its circuit is asked at once. A `vox forward` reached its host before its
+    /// node had read the host's board record: it asked the anchor for a circuit at 0 ms and was
+    /// carried by it, though the host was directly reachable and its address sat on that same
+    /// anchor's board (1 of 36 forwards at load 81, #321's verdict on candidate 5). Waiting for
+    /// the node's own board read instead cost every relayed restart the whole head start. So the
+    /// connected boards are asked, all at once, for the member's address record, and the first
+    /// answer is used. A board still being dialled is waited for while the dial is under way.
+    ///
+    /// **Bounded by [`DIRECT_HEAD_START`] in all.** A pair that can only be relayed pays one
+    /// board read, which takes milliseconds on a live board, and never more than the head start.
+    /// The identity is pinned, so a stale or wrong address only fails its dial.
     pub async fn member_endpoints(&self, channel_id: &Digest32, member: Digest32) -> EndpointList {
         let local = self.board_endpoints(channel_id, &member);
-        if !local.is_empty() {
+        if !local.is_empty() || self.manager.existing(&member).is_some() {
             return local;
         }
-        for board in self.helpers(member) {
-            let read = tokio::time::timeout(
-                BOARD_LOOKUP_PATIENCE,
-                self.fetch_channel(&board, channel_id, 0),
-            )
-            .await;
-            if let Ok(Ok(set)) = read {
-                if let Some(record) = set
+        let began = tokio::time::Instant::now();
+        let until = began + DIRECT_HEAD_START;
+        let mut boards = self.helpers(member);
+        if boards.is_empty() {
+            self.wait_for_a_helper(member, until).await;
+            boards = self.helpers(member);
+        }
+        if boards.is_empty() || self.manager.existing(&member).is_some() {
+            return local;
+        }
+        let mut reads: JoinSet<Option<(Digest32, EndpointList)>> = JoinSet::new();
+        for board in boards {
+            let channel = *channel_id;
+            reads.spawn(async move {
+                let mut client = RendezvousClient::open(&board).await.ok()?;
+                let set = client.get(&channel, 0, RecordKinds::MEMBERS).await;
+                client.finish();
+                let record = set
+                    .ok()?
                     .members
-                    .iter()
-                    .find(|r| r.author_id == member && !r.endpoints.is_empty())
-                {
-                    // Said, so a person — and a proof — can see where the address came from.
-                    self.manager.note(
-                        member,
-                        format!(
-                            "its address was read from board {}'s record; this node held none",
-                            short_id(board.peer_id())
-                        ),
-                    );
-                    return record.endpoints.clone();
+                    .into_iter()
+                    .find(|r| r.author_id == member && !r.endpoints.is_empty())?;
+                Some((board.peer_id(), record.endpoints))
+            });
+        }
+        let found = tokio::time::timeout_at(until, async {
+            while let Some(read) = reads.join_next().await {
+                if let Ok(Some(hit)) = read {
+                    return Some(hit);
                 }
             }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let ms = began.elapsed().as_millis();
+        match found {
+            Some((board, endpoints)) => {
+                // Said, so a person — and a proof — can see where the address came from.
+                self.manager.note(
+                    member,
+                    format!(
+                        "its address was read from board {}'s record in {ms} ms; this node held \
+                         none: {}",
+                        short_id(board),
+                        endpoints
+                            .addrs()
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                endpoints
+            }
+            None => {
+                self.manager.note(
+                    member,
+                    format!("no address for it on this node's board, nor on a connected board ({ms} ms)"),
+                );
+                local
+            }
         }
-        local
     }
 
     /// Whether this node's board holds a live member address or bundle record for
@@ -1943,7 +2039,7 @@ impl NodeNet {
     ) -> Result<JoinOutcome>
     where
         F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
-        Fut: std::future::Future<Output = ()>,
+        Fut: std::future::Future<Output = Result<()>>,
     {
         let cfg = ResponderConfig {
             ctx,

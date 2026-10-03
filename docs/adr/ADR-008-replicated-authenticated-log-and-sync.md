@@ -2,7 +2,7 @@
 
 **Status**: implemented (M5, `crates/vox-core/src/log/`)
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6). 2026-09-24 — PRD-001 R5: a node answers a sync session for a room only from that room's members and anchors (§"Who is served"). 2026-09-24 — PRD-001 R1/R3: the per-author quota is **removed** (wire code `0x06` reserved). See §"Abuse resistance" and the 2026-09-24 Implementation note. 2026-09-24 — PRD-001 D2/R4: a `WANT` is served clamped to what is held, merged, and bounded per session (see the 2026-09-24 Implementation note). 2026-09-24 — ADR-023 M23.2: the skeleton gains `claimed_ms` and `seen`, and the room has one order (§"Cross-author edges and the one order"). 2026-09-25 — ADR-023 M23.6: checkpoints and shed signatures (authenticator type `0`, struct tag `0x0015`).
+**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6). 2026-09-24 — PRD-001 R5: a node answers a sync session for a room only from that room's members and anchors (§"Who is served"). 2026-09-24 — PRD-001 R1/R3: the per-author quota is **removed** (wire code `0x06` reserved). See §"Abuse resistance" and the 2026-09-24 Implementation note. 2026-09-24 — PRD-001 D2/R4: a `WANT` is served clamped to what is held, merged, and bounded per session (see the 2026-09-24 Implementation note). 2026-09-24 — ADR-023 M23.2: the skeleton gains `claimed_ms` and `seen`, and the room has one order (§"Cross-author edges and the one order"). 2026-09-25 — ADR-023 M23.6: checkpoints and shed signatures (authenticator type `0`, struct tag `0x0016`; `0x0015` is v0.2.10's presence statement).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
@@ -435,7 +435,7 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
 - **Checkpoints and shed signatures (2026-09-25, ADR-023 M23.6).**
   - **Wire:** the entry wire gains authenticator type `0`, "dropped under a checkpoint", which
     carries an empty byte string. Type `2`, the removed deniable authenticator, stays refused.
-  - **Struct tag `0x0015`** (`vox/checkpoint/v1`) is an author's checkpoint on its own feed,
+  - **Struct tag `0x0016`** (`vox/checkpoint/v1`) is an author's checkpoint on its own feed,
     `[seq, entry_hash]`, carried as the payload of an ordinary signed entry of that feed.
   - **What `Dag::accept` does with them:**
     - An unsigned entry is taken only body-less and only provisionally. It becomes authentic when

@@ -4,7 +4,7 @@
 # Rust clients over it. Crates are added to `members` as milestones land.
 [workspace]
 resolver = "2"
-members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms", "crates/vox-ffi"]
+members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms", "crates/vox-ffi", "crates/vox-text"]
 # Test apparatus only (V210-55, #242): built on its own by the proofs that need it, never a member,
 # never linked into vox.
 exclude = ["crates/vox-test-interpose"]
@@ -90,9 +90,12 @@ quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc
 # The congestion controller's interface names quinn-proto's `RttEstimator`, which quinn does not
 # re-export (transport::congestion). No features: quinn selects them.
 quinn-proto = { version = "0.11", default-features = false }
+# Diagnostics for the tapered congestion controller's tier switches (ADR-024): debug events under
+# `vox::congestion`, printed only where a subscriber is installed. Already in the tree through quinn.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Socket options quinn does not set: the UDP buffer sizes (R41). Already in the tree through
 # tokio and quinn-udp; named here so the node can ask for buffers a burst fits in.
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 # quinn-udp's batched `sendmsg_x`/`recvmsg_x` on Apple platforms (PRD-001 R41): one syscall per
 # batch rather than per packet, measured +18% on a 1452-byte path. It calls a private Apple API;
 # the decider accepted the App Store risk for iOS too (2026-09-25). A no-op elsewhere.
@@ -173,14 +176,11 @@ vt100 = "0.15"
 #                  makes render-snapshot tests possible (the ADR release gate).
 #   crossterm    — terminal backend (raw mode, alternate screen, key/mouse events)
 #                  on Linux + macOS terminals; ratatui's default backend.
-#   qrcode       — QR matrix generation for identity / invite / verification codes
-#                  (rendered as Unicode half-blocks with an ASCII fallback).
 #   clap (+complete/mangen) — args, shell completions, man pages.
 #   secrecy      — `SecretBox`/`SecretString` redaction for the few secret-bearing
 #                  CLI/config inputs (passphrases), complementing `zeroize`.
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
-qrcode = { version = "0.14", default-features = false }
 clap = { version = "4", features = ["derive", "cargo", "env", "wrap_help"] }
 clap_complete = "4"
 clap_mangen = "0.2"

@@ -2,7 +2,7 @@
 """tui_room_truth.py <vox> <tag> — V210-82 (#273), through the shipped `vox tui`.
 
 Alice creates a room; Bob and Carol join it, all through real daemons. Alice and Bob trust each
-other, so each consents to the other; nobody trusts Carol. Alice posts 70 lines, more than Bob's
+other, so each holds the other's key; nobody trusts Carol, and Carol trusts Bob. Alice posts 70 lines, more than Bob's
 timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in a pty (pyte at
 160x50). Each claim prints one `CLAIM <name> ok|RED` line:
 
@@ -11,30 +11,30 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
             lines): m-011 is the first line shown, not m-001 still;
-  consent   Carol, whom Bob never consented to, is not shown "consented"; Alice, whom he did, is;
-  verify    `:verify` on Carol does not show her "verified" (the node has nothing to compare);
+  consent   Carol, whom Bob never trusted, reads "not trusted · you don't read each other"; Alice,
+            whom he did, "trusted · reads you" (V210-155: once "? unverified" on every row and
+            "← in-only" for Carol, though nothing comes in from her);
+  unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
+            the help line names none of them: the TUI offers only what vox supports (V210-155);
   sync      the status bar says how many peers the node is connected to: the anchor and at least
             one member, so 2 or more (it said "idle" always);
-  target    with Carol selected, Dave joins and sorts in above her; `:consent grant` then
-            consents to Carol (her row becomes "consented") and not to whoever took her place;
-  delivers  the grant is the node's: a line Bob then posts from the composer reaches Carol's
-            `vox room read` (a pane that only drew "consented" would pass `target`, not this);
-  revoke    `:consent revoke`, with Carol still selected and not first in the pane, takes her
-            back to "← in-only" and leaves Alice "↔ consented"; a line Bob then posts reaches
-            Alice's `vox room read` and not Carol's;
   reach     back on the channel list, the room reads "● online" while Bob's node is connected to
             its other members;
-  unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline";
+  unreach   once Alice's and Carol's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   idle      once the anchor is stopped too, it says "idle", with no count.
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
 its slack; every other verb 120 s. A verb past its time is a named RED, not a hang.
 
-Exit 0 = pass, 1 = red, 2 = apparatus (CANNOT MEASURE). Every process is recorded and killed by
-PID. Bounded throughout (`vox_pty.py`, V210-54).
+Exit 0 = pass, 1 = red, 2 = apparatus (CANNOT MEASURE). A `vox` step on the way that fails (an
+identity, a daemon, create, invite, join, trust, a post, the roster, the TUI drawing the room or
+answering a command it supports) is the product's red: it prints `PRODUCT:` with what `vox` said
+and exits 1. An exception in the driver itself prints `APPARATUS: driver crashed` with its
+traceback and exits 2. Every process is recorded and killed by PID. Bounded throughout
+(`vox_pty.py`, V210-54).
 """
-import base64, os, re, subprocess, sys, time
+import os, re, subprocess, sys, time, traceback
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -51,7 +51,7 @@ SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix=
 S = f"{SP}/tuit-{TAG}"
 POSTS = 70  # the timeline pane holds 43 lines at 160x50
 subprocess.run(["rm", "-rf", S])
-WHO = ["anchor", "alice", "bob", "carol", "dave"]
+WHO = ["anchor", "alice", "bob", "carol"]
 for w in WHO:
     for d in ("data", "cfg"):
         os.makedirs(f"{S}/{w}/{d}")
@@ -97,9 +97,11 @@ def apparatus(why):
 class Apparatus(Exception):
     pass
 
-def digest(fp):
-    """The 32 bytes a 52-character base32 fingerprint spells: the order the members pane sorts by."""
-    return base64.b32decode(fp.upper() + "====")[:32]
+def product(why):
+    raise Product(why)
+
+class Product(Exception):
+    pass
 
 tui = None
 code = 2
@@ -117,30 +119,33 @@ try:
         m = re.search(r"[a-z2-7]{52}@/ip4/127\.0\.0\.1/udp/\d+", open(f"{S}/anchor.out").read())
         spec = m.group(0) if m else None
         return spec
-    if not until(got_spec, 30): apparatus("anchor spec")
+    if not until(got_spec, 30):
+        product("the anchor `vox node` printed no spec within 30 s: " + open(f"{S}/anchor.err").read())
     stage("identities and daemons")
     fp = {}
     for w in WHO[1:]:
         r = run(w, "id", "--identity-passphrase-file", f"{S}/idpass")
-        if r.returncode != 0: apparatus(f"{w} id: {r.stderr}")
-        fp[w] = re.search(r"[a-z2-7]{52}", r.stdout).group(0)
-    # Dave must sort in above Carol, so that his join moves her down the pane: of two fresh
-    # identities, Carol is the one that sorts later.
-    if digest(fp["dave"]) > digest(fp["carol"]):
-        os.rename(f"{S}/carol", f"{S}/swap"); os.rename(f"{S}/dave", f"{S}/carol"); os.rename(f"{S}/swap", f"{S}/dave")
-        fp["carol"], fp["dave"] = fp["dave"], fp["carol"]
-    dave = "dave"
+        if r.returncode != 0: product(f"{w}'s `vox id` failed: {r.stderr}")
+        m = re.search(r"[a-z2-7]{52}", r.stdout)
+        if m is None: product(f"{w}'s `vox id` printed no fingerprint: {r.stdout!r}")
+        fp[w] = m.group(0)
     daemons = {w: spawn(w, "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
-                        "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol", dave)}
+                        "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol")}
     for w in daemons:
-        if not until(lambda: run(w, "room", "list").returncode == 0, 60): apparatus(f"{w} daemon")
+        if not until(lambda: run(w, "room", "list").returncode == 0, 60):
+            product(f"{w}'s daemon never answered `vox room list` within 60 s: " + open(f"{S}/{w}.err").read())
     stage("room create, invite, join, trust")
-    if run("alice", "room", "create", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
-    room = run("alice", "room", "list").stdout.split()[0]
-    link = run("alice", "room", "invite", room).stdout.strip()
-    # Bob and Carol join at once, as two people given the link might: so the budget holds two
-    # joins' worth of JOIN_SECS in a row (theirs, then Dave's), not three.
-    joins = {w: subprocess.Popen([VOX, "room", "join", link, "--name", "m"], env=env(w),
+    c = run("alice", "room", "create", "--passphrase-file", "-", "--name", "m", stdin="room pass")
+    if c.returncode != 0: product(f"alice's `vox room create` failed: {c.stderr.strip()}")
+    listed = run("alice", "room", "list")
+    if not listed.stdout.split(): product(f"alice's `vox room list` shows no room after create: {listed.stderr.strip()}")
+    room = listed.stdout.split()[0]
+    inv = run("alice", "room", "invite", room)
+    if inv.returncode != 0: product(f"alice's `vox room invite` failed: {inv.stderr.strip()}")
+    link = inv.stdout.strip()
+    # Bob and Carol join at once, as two people given the link might: so the budget holds one
+    # join's worth of JOIN_SECS, not two.
+    joins = {w: subprocess.Popen([VOX, "room", "join", "--passphrase-file", "-", link, "--name", "m"], env=env(w),
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True) for w in ("bob", "carol")}
     PROCS.extend(joins.values())
@@ -151,15 +156,17 @@ try:
         except subprocess.TimeoutExpired as t:
             t.cmd = [VOX, "room", "join"]
             raise
-        if p.returncode != 0: apparatus(f"{w} join: {err.strip()}")
+        if p.returncode != 0: product(f"{w}'s `vox room join` failed: {err.strip()}")
     print(f"{TAG} bob's and carol's joins took {time.time() - t_join:.1f} s")
-    for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob")):
+    # Carol trusts Bob, so what her label says is Bob's trust alone: a node reads only whom its
+    # owner trusts (V210-118).
+    for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob"), ("carol", "bob", "bob")):
         t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
-        if t.returncode != 0: apparatus(f"{w} trust add: {t.stderr}")
+        if t.returncode != 0: product(f"{w}'s `vox trust add` failed: {t.stderr.strip()}")
     stage("alice posts")
     for i in range(1, POSTS + 1):
         p = run("alice", "room", "post", room, f"m-{i:03d}")
-        if p.returncode != 0: apparatus(f"post m-{i:03d}: {p.stderr.strip()}")
+        if p.returncode != 0: product(f"alice's `vox room post` of m-{i:03d} failed: {p.stderr.strip()}")
     stage("bob reads them and lists everyone")
     def bob_ready():
         r = run("bob", "room", "read", room, "--limit", "500")
@@ -167,7 +174,9 @@ try:
         return (r.returncode == 0 and f"m-{POSTS:03d}" in r.stdout and ro.returncode == 0
                 and fp["alice"] in ro.stdout and fp["carol"] in ro.stdout)
     if not until(bob_ready, 120, 1):
-        apparatus("bob never read m-%03d and listed alice and carol: %s" % (POSTS, run("bob", "room", "read", room, "--limit", "500").stdout[-300:]))
+        last = run("bob", "room", "roster", room)
+        product("bob's node never read m-%03d and listed alice and carol within 120 s: read %r; roster %r"
+                % (POSTS, run("bob", "room", "read", room, "--limit", "500").stdout[-300:], last.stdout + last.stderr))
     stop(daemons["bob"])
 
     stage("bob's tui: unlock and open the room")
@@ -182,7 +191,7 @@ try:
     timeline = lambda: "\n".join(row[:112] for row in tui.display())
     def has(text, s):
         return re.search(rf"(^|[^0-9]){re.escape(s)}([^0-9]|$)", text, re.M) is not None
-    if not tui.until(lambda: "m-0" in timeline(), 30, 1): apparatus("the room's timeline never drew a message")
+    if not tui.until(lambda: "m-0" in timeline(), 30, 1): product("bob's `vox tui` never drew a message in the room's timeline within 30 s of unlocking")
 
     stage("newest")
     newest = tui.until(lambda: has(timeline(), f"m-{POSTS:03d}"), 20, 1)
@@ -191,7 +200,8 @@ try:
           f"m-{POSTS:03d} shown: {has(t, f'm-{POSTS:03d}')}; m-001 shown: {has(t, 'm-001')}")
 
     stage("follows")
-    if run("alice", "room", "post", room, f"m-{POSTS + 1:03d}").returncode != 0: apparatus("post while open")
+    p = run("alice", "room", "post", room, f"m-{POSTS + 1:03d}")
+    if p.returncode != 0: product(f"alice's `vox room post` while bob's TUI is open failed: {p.stderr.strip()}")
     follows = tui.until(lambda: has(timeline(), f"m-{POSTS + 1:03d}"), 60, 1)
     claim("follows", follows, f"m-{POSTS + 1:03d} shown within 60 s: {follows}")
 
@@ -213,7 +223,8 @@ try:
     for _ in range((POSTS + 10) // 10):
         tui.key("\x1b[5~", 0.2)  # PageUp, well past the oldest line
     if not tui.until(lambda: first_shown() == 1, 5, 0.2):
-        apparatus(f"PageUp past the top did not show m-001 first (first shown: {first_shown()})")
+        product(f"bob's `vox tui`: PageUp past the top did not show m-001 first within 5 s "
+                f"(first shown: {first_shown()})")
     tui.key("\x1b[6~", 0)  # PageDown, once
     tui.until(lambda: first_shown() == 11, 3, 0.2)
     moved = first_shown()
@@ -234,27 +245,37 @@ try:
         return None, False, None
 
     stage("consent")
-    # Bob consents to Alice on his own (he trusts her): wait for that before judging Carol.
-    alice_ok = tui.until(lambda: "consented" in (label_of("alice")[0] or ""), 60, 1)
-    if label_of("carol")[0] is None: apparatus("carol is not in bob's members pane:\n" + "\n".join(pane()))
+    # Bob's node releases its key to Alice on its own (he trusts her): wait for that before
+    # judging Carol.
+    ALICE, CAROL = "trusted · reads you", "not trusted · you don't read each other"
+    # The pane's border is part of the row: the label is what sits between its edges.
+    bare = lambda row: (row or "").strip().strip("│").strip()
+    alice_ok = tui.until(lambda: bare(label_of("alice")[0]) == ALICE, 60, 1)
+    if label_of("carol")[0] is None: product("bob's node listed carol, and his `vox tui` members pane does not show her:\n" + "\n".join(pane()))
     if not alice_ok:
-        apparatus("bob's pane never showed alice consented, so a 'not consented' for carol shows "
-                  "nothing: " + repr(label_of("alice")[0]))
+        product(f"bob trusts alice, and his `vox tui` members pane never showed her {ALICE!r} "
+                "within 60 s: " + repr(label_of("alice")[0]))
     carol_label = label_of("carol")[0]
-    claim("consent", "consented" not in carol_label,
+    claim("consent", bare(carol_label) == CAROL,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
 
-    stage("select carol")
-    for _ in range(8):
-        if label_of("carol")[1]:
-            break
-        tui.key("\x1b[B", 0.5)  # Down
-    if not label_of("carol")[1]: apparatus("could not put the marker on carol:\n" + "\n".join(pane()))
-
-    stage("verify")
-    tui.key(":verify\r", 2)
-    v = label_of("carol")[0]
-    claim("verify", "verified" in v and "unverified" in v and "✓" not in v, f"carol after :verify: {v.strip()!r}")
+    stage("unknown")
+    # Each answer is read after `:invite`, a command vox supports, has replaced the status line, so
+    # an "unknown command" seen is this command's answer and not the one before it.
+    def bottom():
+        return "\n".join(r.rstrip() for r in tui.display()[-3:])
+    REMOVED = ("show", "hide", "block", "unblock", "verify")
+    answers = {}
+    for c in REMOVED:
+        tui.key(":invite\r", 2)
+        if "unknown command" in bottom():
+            product(f"bob's `vox tui` answered :invite, a command it supports, with unknown command:\n{bottom()}")
+        tui.key(f":{c}\r", 2)
+        answers[c] = bottom().split("\n")[-1].strip()
+    screen = "\n".join(tui.display())
+    named = [c for c in REMOVED if f":{c}" in screen]
+    claim("unknown", all("unknown command" in v for v in answers.values()) and not named,
+          f"answers: {answers!r}; the help line names: {named!r}")
 
     stage("sync")
     def peers():
@@ -265,57 +286,6 @@ try:
     # The anchor and at least one member (the room reads online): two peers or more.
     claim("sync", (peers() or 0) >= 2, f"status bar: {bar.strip()!r}")
 
-    stage("dave joins while carol is selected")
-    before = label_of("carol")[2]
-    j = run(dave, "room", "join", link, "--name", "m", stdin="room pass")
-    if j.returncode != 0: apparatus(f"{dave} join: {j.stderr.strip()}")
-    if not tui.until(lambda: fp[dave][:26] in "\n".join(pane()), 90, 1):
-        apparatus(f"{dave} never appeared in bob's pane")
-    after = label_of("carol")[2]
-    if not (before is not None and after is not None and after > before):
-        apparatus(f"dave's join did not move carol down the pane (row {before} -> {after}), so it "
-                  "tests nothing:\n" + "\n".join(pane()))
-    print(f"{TAG} carol moved from pane row {before} to {after}; marker on carol: {label_of('carol')[1]}")
-
-    stage("target")
-    tui.key(":consent grant\r", 3)
-    granted = tui.until(lambda: "consented" in (label_of("carol")[0] or ""), 30, 1)
-    dave_label = label_of(dave)[0] or ""
-    claim("target", granted and "consented" not in dave_label,
-          f"carol: {label_of('carol')[0].strip()!r}; {dave}: {dave_label.strip()!r}")
-
-    stage("delivers")
-    # The grant is the node's, not the pane's: Carol reads what Bob posts after it.
-    tui.key("\t", 0.5)  # members -> timeline
-    tui.key("\t", 0.5)  # timeline -> composer
-    tui.key("b-after-grant\r", 1)
-    got = until(lambda: "b-after-grant" in run("carol", "room", "read", room, "--limit", "500").stdout, 60, 1)
-    claim("delivers", got, f"carol read bob's post after :consent grant within 60 s: {got}")
-
-    stage("revoke")
-    # Carol is still selected, and is not the pane's first member (Dave sorts in above her).
-    tui.key("\t", 0.5)  # composer -> members
-    if not label_of("carol")[1]: apparatus("the marker left carol before :consent revoke:\n" + "\n".join(pane()))
-    first = next((r.strip("│ ▶") for r in pane() if r.strip("│ ") and "Members" not in r), "")
-    tui.key(":consent revoke\r", 3)
-    back = tui.until(lambda: "in-only" in (label_of("carol")[0] or ""), 30, 1)
-    carol_label, alice_label = label_of("carol")[0] or "", label_of("alice")[0] or ""
-    panes_ok = back and "consented" in alice_label
-    leaked = None
-    if panes_ok:
-        # Then Bob posts again. Alice, still consented to, reads it, so it went out; Carol, who
-        # syncs from the same peers, must not, 10 s after Alice has.
-        tui.key("\t", 0.5)  # members -> timeline
-        tui.key("\t", 0.5)  # timeline -> composer
-        tui.key("b-after-revoke\r", 1)
-        if not until(lambda: "b-after-revoke" in run("alice", "room", "read", room, "--limit", "500").stdout, 60, 1):
-            apparatus("alice never read bob's post after the revoke, so carol not reading it shows nothing")
-        time.sleep(10)
-        leaked = "b-after-revoke" in run("carol", "room", "read", room, "--limit", "500").stdout
-    claim("revoke", panes_ok and leaked is False,
-          f"first in the pane: {first[:30]!r}; carol: {carol_label.strip()!r}; alice: "
-          f"{alice_label.strip()!r}; carol read bob's post after the revoke: {leaked}")
-
     stage("reach")
     tui.key("\x1b", 2)  # Esc back to the channel list
     rows = lambda: [r.strip() for r in tui.display() if "online" in r or "offline" in r]
@@ -323,9 +293,9 @@ try:
     claim("reach", any("● online" in r for r in rows()), f"list rows: {rows()!r}")
 
     stage("unreach")
-    for w in ("alice", "carol", dave):
+    for w in ("alice", "carol"):
         daemons[w].terminate()
-    for w in ("alice", "carol", dave):
+    for w in ("alice", "carol"):
         stop(daemons[w])
     gone = tui.until(lambda: any("○ offline" in r for r in rows()), 30, 1)
     claim("unreach", gone, f"with every other member's daemon stopped, list rows: {rows()!r}")
@@ -351,6 +321,10 @@ try:
 except Apparatus as a:
     print(f"{TAG} APPARATUS: {a}")
     code = 2
+except Product as e:
+    print(f"{TAG} PRODUCT: {e}")
+    print(f"{TAG} RED")
+    code = 1
 except Hung as h:
     print(f"{TAG} HUNG at {h}")
     code = 1
@@ -358,6 +332,9 @@ except subprocess.TimeoutExpired as t:
     # A `vox` verb that never returned is a red of its own, named, not a driver with no verdict.
     print(f"{TAG} RED: `vox {' '.join(t.cmd[1:3])}` did not return within {t.timeout:.0f} s")
     code = 1
+except Exception:
+    print(f"{TAG} APPARATUS: driver crashed: {traceback.format_exc()}")
+    code = 2
 finally:
     disarm()
     stage("stopping every process")

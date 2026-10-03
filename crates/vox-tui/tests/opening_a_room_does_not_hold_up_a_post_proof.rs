@@ -1,5 +1,5 @@
 //! V210-71 (#262), finding 3 — **a post answers while the same node opens another room with its
-//! passphrase**, through the shipped binary. An opt-in proof (`--features heavy-proofs`): it
+//! passphrase**, through the shipped binary. An opt-in proof (`--features optional-proofs`): it
 //! drives the terminal UI and seeds a room with hundreds of posts, so it is not part of every CI
 //! run or release gate.
 //!
@@ -28,7 +28,8 @@
 //! **Asserted:** every post that overlapped the open, from its start to the room being open,
 //! answered within [`BOUND`], V210-08's bound for a post on loopback. The bound is asserted
 //! **before** the preconditions, so a post over it is red whatever else the run shows.
-//! A post that failed is a `PRODUCT` red too. Preconditions, or `APPARATUS`: the open took at least
+//! A post that failed is a `PRODUCT` red too, and a vox step of the staging that failed is
+//! `PRODUCT (staging)`. Preconditions this proof does not control are `APPARATUS`: the open took at least
 //! [`MIN_OPEN`] (else there was nothing to wait for), and at least [`MIN_DURING`] posts overlapped
 //! it.
 //!
@@ -43,7 +44,15 @@
 //! - mutant (the open on the actor), 2 of 2 red: opens of 1.22 s and 1.89 s, with a post made at
 //!   the start taking 1091 ms and 1675 ms.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(target_os = "macos")]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_post_answers_while_the_node_opens_another_room);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -101,7 +110,7 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
             .as_mut()
             .expect("APPARATUS (harness): stdin")
             .write_all(text.as_bytes())
-            .expect("APPARATUS (harness): write stdin");
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(child.stdin.take());
     }
     let out = child.wait_with_output().expect("APPARATUS (harness): wait");
@@ -114,8 +123,10 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 
 /// Start `vox daemon` with the identity passphrase on stdin, output to files by the profile.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: create a staging file");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: create a staging file");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -130,14 +141,15 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         .stdin
         .take()
         .expect("APPARATUS (harness): daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
     let d = Daemon(child);
     let deadline = Instant::now() + Duration::from_secs(90);
     while !vox(dir, &["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "APPARATUS (precondition not met): {tag}'s daemon never answered: {}",
+            "PRODUCT (staging): {tag}'s daemon never answered `vox room list` within 90 s: {}",
             std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -149,19 +161,16 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
 fn create(dir: &Path, name: &str) -> String {
     let (ok, _, err) = vox(
         dir,
-        &["room", "create", "--name", name],
+        &["room", "create", "--passphrase-file", "-", "--name", name],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(
-        ok,
-        "APPARATUS (precondition not met): vox room create {name}: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox room create {name}: {err}");
     let (_, list, _) = vox(dir, &["room", "list"], None);
     list.lines()
         .find(|l| l.split_whitespace().any(|w| w == name))
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| {
-            panic!("APPARATUS (precondition not met): {name} not in room list: {list}")
+            panic!("PRODUCT (staging): {name} not in `vox room list` after its create: {list}")
         })
         .to_owned()
 }
@@ -174,25 +183,31 @@ fn drive(script: &str, args: &[&str], tag: &str) -> String {
         "[proof] {tag}: the TUI driver took {:?}; last stage {:?}",
         out.took, out.stage
     );
-    assert!(
-        out.has_verdict(tag) && out.code == Some(0),
-        "APPARATUS (precondition not met): the {tag} TUI driver gave no verdict, or failed (exit {:?}, stage {:?}): \
-         {said}",
-        out.code,
-        out.stage
+    if out.has_verdict(tag) && out.code == Some(0) {
+        return said;
+    }
+    // The drivers' exit codes: 1 is a red of `vox tui` (or a hang), 2 the driver's own failure.
+    let side = if out.code == Some(1) {
+        "PRODUCT (staging)"
+    } else {
+        "APPARATUS"
+    };
+    panic!(
+        "{side}: the {tag} TUI driver did not finish (exit {:?}, stage {:?}): {said}",
+        out.code, out.stage
     );
-    said
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "opt-in (heavy-proofs): drives the TUI and seeds a room; run in release"]
+#[ignore = "optional: drives the TUI and seeds a room; run in release"]
 fn a_post_answers_while_the_node_opens_another_room() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = tmp.path().join("alice");
-    std::fs::create_dir_all(alice.join("cfg")).unwrap();
+    std::fs::create_dir_all(alice.join("cfg")).expect("APPARATUS: create a staging directory");
     let (ok, _, err) = vox(&alice, &["id"], None);
-    assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
     let cfg = alice.join("cfg").to_string_lossy().into_owned();
     let data = alice.to_string_lossy().into_owned();
 
@@ -206,7 +221,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
             &["room", "post", &bravo, &format!("seed {i}")],
             None,
         );
-        assert!(ok, "APPARATUS (precondition not met): seed post {i}: {err}");
+        assert!(ok, "PRODUCT (staging): seed post {i}: {err}");
     }
     println!(
         "[proof] {SEED} posts seeded into bravo in {:?}",
@@ -223,7 +238,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
     );
     assert!(
         said.contains("close the TUI said done to :close"),
-        "APPARATUS (precondition not met): the TUI did not close bravo: {said}"
+        "PRODUCT (staging): `vox tui` did not say done to :close of bravo: {said}"
     );
 
     // ---- 3. room A, while B stays closed ---------------------------------------------------
@@ -233,7 +248,8 @@ fn a_post_answers_while_the_node_opens_another_room() {
     let bravo_line = list.lines().find(|l| l.contains(&bravo)).unwrap_or("");
     assert!(
         bravo_line.contains("[closed]"),
-        "APPARATUS (precondition not met): bravo is not closed before the TUI opens it: {list}"
+        "PRODUCT (staging): bravo, closed on purpose in the TUI, is not listed [closed] after the \
+         daemon restarts: {list}"
     );
     drop(second);
 
@@ -252,18 +268,27 @@ fn a_post_answers_while_the_node_opens_another_room() {
         let w: Vec<&str> = l.split_whitespace().collect();
         match w.as_slice() {
             ["open", "POST", start, ms, ok] => posts.push((
-                start.parse::<f64>().unwrap(),
-                ms.parse::<f64>().unwrap(),
+                start
+                    .parse::<f64>()
+                    .expect("APPARATUS: the TUI driver printed a time that is not a number"),
+                ms.parse::<f64>()
+                    .expect("APPARATUS: the TUI driver printed a time that is not a number"),
                 *ok == "1",
             )),
             ["open", "OPEN", start, end] => {
-                window = Some((start.parse::<f64>().unwrap(), end.parse::<f64>().unwrap()));
+                window = Some((
+                    start
+                        .parse::<f64>()
+                        .expect("APPARATUS: the TUI driver printed a time that is not a number"),
+                    end.parse::<f64>()
+                        .expect("APPARATUS: the TUI driver printed a time that is not a number"),
+                ));
             }
             _ => {}
         }
     }
-    let (from, to) = window
-        .unwrap_or_else(|| panic!("APPARATUS (precondition not met): no open window: {said}"));
+    let (from, to) =
+        window.unwrap_or_else(|| panic!("APPARATUS: the open driver printed no OPEN line: {said}"));
     let took = Duration::from_secs_f64(to - from);
     // Every post that **overlapped** the open: started before it ended and finished after it
     // began. A post that started just before the open and was held for all of it is the defect at
@@ -284,7 +309,7 @@ fn a_post_answers_while_the_node_opens_another_room() {
         posts.len()
     );
     // **The bound first.** A post over it is the defect whatever else the run shows, so no
-    // precondition may turn it into a APPARATUS (precondition not met): under the defect the first post blocks for
+    // precondition may turn it into an APPARATUS red: under the defect the first post blocks for
     // the whole open, and fewer posts then start during it.
     assert!(
         slowest < BOUND.as_secs_f64() * 1000.0,
@@ -297,11 +322,12 @@ fn a_post_answers_while_the_node_opens_another_room() {
     );
     assert!(
         took >= MIN_OPEN,
-        "APPARATUS (precondition not met): the open took only {took:?}, under {MIN_OPEN:?}: nothing to wait on"
+        "APPARATUS, CANNOT MEASURE: the open took only {took:?}, under {MIN_OPEN:?}: the proof's \
+         seed gave it nothing to wait on"
     );
     assert!(
         during.len() >= MIN_DURING,
-        "APPARATUS (precondition not met): only {} post(s) overlapped the open",
+        "APPARATUS, CANNOT MEASURE: only {} post(s) overlapped the open",
         during.len()
     );
 }

@@ -47,9 +47,9 @@
 //! **Every red names which it is** (the decider: a test that cannot tell a broken product from a
 //! broken test is not a valid test). `PRODUCT:` — `vox` did the wrong thing, and what it said is
 //! quoted; `PRODUCT (staging):` — a `vox` verb the staging runs failed (`vox id`, `vox trust add`,
-//! `vox node`). `APPARATUS:` — the staging was not achieved or a precondition is unmet (the guest
-//! never reached the closed forward, the board still held the host's address), so nothing about
-//! the claim was measured. The watchdog (`support/watchdog.rs`) names itself when it fires.
+//! `vox node`), or vox did not reach the state the claim needs (the guest never reached the closed
+//! forward, the board still held the host's address). `APPARATUS:` — this proof's own machinery
+//! failed. The watchdog (`support/watchdog.rs`) names itself when it fires.
 //!
 //! **Mutations that must turn it red:** `vox serve` refusing without an anchor or public address
 //! (A); minting the address before the host knows an address of its own (E); not counting the
@@ -192,7 +192,7 @@ impl DualAnchor {
         let again = Self::start(dir, port);
         assert_eq!(
             again.v4_spec, self.v4_spec,
-            "APPARATUS: the restarted anchor is not the same anchor on the same port"
+            "PRODUCT (staging): `vox node`, restarted in the same profile on the same port, printed another spec"
         );
         *self = again;
     }
@@ -576,7 +576,9 @@ fn d_a_join_asks_every_board_the_address_names() {
     two_identities(&guest_dir, &host_dir);
     // A guest on [::1] can reach A6 and the forward; A4 and the host's own addresses are IPv4.
     let host_port = port_forward::free_v4_udp_port();
-    let host_addr: SocketAddr = format!("127.0.0.1:{host_port}").parse().unwrap();
+    let host_addr: SocketAddr = format!("127.0.0.1:{host_port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
     let forward = port_forward::PortForward::start(host_addr, false);
     let advertise = forward.public.to_string();
     let mut host = VoxProc::spawn_env(
@@ -665,7 +667,7 @@ fn d_a_join_asks_every_board_the_address_names() {
     );
     assert!(
         knocked.is_some(),
-        "APPARATUS: staging not achieved — the guest's join never sent the host's (closed) forward a \
+        "PRODUCT (staging): the guest's join never sent the host's (closed) forward a \
          datagram, so its board search never had the host as a route and the fallback was not \
          staged. `vox connect` said:\n{out}\n{err}"
     );
@@ -678,7 +680,7 @@ fn d_a_join_asks_every_board_the_address_names() {
     );
     assert!(
         err.contains("another board"),
-        "APPARATUS: staging not achieved — the join got in, but its steps do not say another board \
+        "PRODUCT (staging): the join got in, but its steps do not say another board \
          was asked, so the first board it took held the room and the fallback was never needed \
          (the forward was closed for {FORWARD_OPENS:?} after the guest first knocked). `vox \
          connect` said:\n{err}"
@@ -720,7 +722,7 @@ fn e_an_address_that_would_lead_nowhere_is_withheld_and_why_is_said() {
         let address = after_label(&said, "address");
         assert!(
             !address.contains(&format!("a={host_fp}")),
-            "APPARATUS: staging not achieved — the address names the host as a route, so it knew \
+            "PRODUCT (staging): the address names the host as a route, so it knew \
              an address of its own (`VOX_TEST_ADVERTISE` had no effect): {address}"
         );
         panic!(
@@ -871,7 +873,7 @@ fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
     );
     assert!(
         err.contains("the link's address"),
-        "APPARATUS: staging not achieved — the join neither polled the board nor dialled the \
+        "PRODUCT (staging): the join neither polled the board nor dialled the \
          link's address, so the board it used still held the host's address (or was the host). \
          `vox connect` said:\n{err}"
     );

@@ -7,9 +7,9 @@
 //! of state into a `Frame`, it is covered by `TestBackend` render-snapshot tests.
 //!
 //! ## Accessibility (ADR-015)
-//! State is **never** signalled by colour alone: verification / consent / Block
-//! each render as a glyph **and** a text label (so they survive `NO_COLOR`,
-//! monochrome terminals, and screen readers).
+//! State is **never** signalled by colour alone: trust and reachability each render
+//! as a text label (so they survive `NO_COLOR`, monochrome terminals, and screen
+//! readers).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -18,10 +18,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::state::{Focus, Mode, Prompt, Screen, UiState};
-use crate::viewmodel::{
-    InboundVisibility, MemberView, MessageView, OutboundConsent, Reachability, SyncStatus,
-    Verification, ViewModel,
-};
+use crate::viewmodel::{MemberView, MessageView, Reachability, SyncStatus, Trust, ViewModel};
 
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
 pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
@@ -31,27 +28,16 @@ pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
 /// history; without the marker it would go unseen above what the reader already read.
 pub const LATE_MARKER: &str = "[late] ";
 
-/// A short, colour-independent label + glyph for a verification state.
+/// Where a member stands with you, in words: whether you trust it, and whether it reads you here.
+/// Nothing for yourself.
 #[must_use]
-pub fn verification_label(v: Verification) -> &'static str {
-    match v {
-        Verification::Verified => "✓ verified",
-        Verification::UnverifiedTofu => "? unverified",
-        Verification::KeyChanged => "! key-changed",
-    }
-}
-
-/// A label for the combined consent/visibility/block state of a member.
-#[must_use]
-pub fn consent_label(m: &MemberView) -> &'static str {
-    if m.blocked {
-        return "⊘ blocked";
-    }
-    match (m.outbound, m.inbound) {
-        (OutboundConsent::Granted, InboundVisibility::Visible) => "↔ consented",
-        (OutboundConsent::Granted, InboundVisibility::Hidden) => "→ out-only",
-        (OutboundConsent::Revoked, InboundVisibility::Visible) => "← in-only",
-        (OutboundConsent::Revoked, InboundVisibility::Hidden) => "· none",
+pub fn trust_label(t: Trust) -> Option<&'static str> {
+    match t {
+        Trust::You => None,
+        Trust::Trusted { reads_you: true } => Some("trusted · reads you"),
+        Trust::Trusted { reads_you: false } => Some("trusted · cannot read you yet"),
+        Trust::NotTrusted { reads_you: true } => Some("not trusted · still reads you"),
+        Trust::NotTrusted { reads_you: false } => Some("not trusted · you don't read each other"),
     }
 }
 
@@ -264,8 +250,12 @@ fn render_timeline(
             Style::default().add_modifier(Modifier::BOLD),
         ))
     });
-    let lines: Vec<Line> = notices
-        .chain(timeline.iter().map(|m| {
+    // Built newest first and only as far back as the window reaches (V210-120): every frame built
+    // a line for every message the room had ever held, so a long room cost each frame its history.
+    let lines = timeline
+        .iter()
+        .rev()
+        .map(|m| {
             let body = m
                 .body
                 .clone()
@@ -284,8 +274,8 @@ fn render_timeline(
             ));
             spans.push(Span::raw(body));
             Line::from(spans)
-        }))
-        .collect();
+        })
+        .chain(notices.rev());
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
     // top, a room that outgrew the pane hid every new message below its bottom edge. The lines
     // are wrapped here, not by the widget, so the count the window is taken from is the count
@@ -294,7 +284,7 @@ fn render_timeline(
     let height = usize::from(area.height.saturating_sub(2));
     let want = height.saturating_add(scroll);
     let mut rows: Vec<Line> = Vec::new();
-    for l in lines.into_iter().rev() {
+    for l in lines {
         rows.extend(wrap(l, width).into_iter().rev());
         if rows.len() >= want {
             break;
@@ -370,15 +360,12 @@ fn render_members(
             } else {
                 "  "
             };
-            // Always glyph + label, never colour-only (a11y).
-            ListItem::new(vec![
-                Line::from(format!("{marker}{}", m.nickname)),
-                Line::from(format!(
-                    "    {} · {}",
-                    verification_label(m.verification),
-                    consent_label(m)
-                )),
-            ])
+            // Always words, never colour alone (a11y).
+            let mut lines = vec![Line::from(format!("{marker}{}", m.nickname))];
+            if let Some(label) = trust_label(m.trust) {
+                lines.push(Line::from(format!("    {label}")));
+            }
+            ListItem::new(lines)
         })
         .collect();
     let list = List::new(items).block(pane_block("Members", focus));
@@ -428,7 +415,7 @@ fn render_hint_bar(frame: &mut Frame, area: Rect, ui: &UiState, vm: &ViewModel) 
             " ↑/↓ select · Enter open · t tunnels · :new <name> · :join · :unlock · :lock · Ctrl-C quit"
         }
         Screen::Channel => {
-            " Tab switch pane · Enter send · PgUp/PgDn scroll · :invite · :consent grant · : command · Esc back"
+            " Tab switch pane · Enter send · PgUp/PgDn scroll · :invite · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
     };

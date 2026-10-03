@@ -121,13 +121,13 @@ fn a_guest_bound_to_v6_loopback_never_dials_an_ipv4_mapped_candidate() {
     assert_eq!(
         code,
         0,
-        "CANNOT MEASURE: the guest's request to {hostname} was refused (SOCKS {code}).\nup:\n{}",
+        "PRODUCT (staging): the guest's request to {hostname} was refused (SOCKS {code}).\nup:\n{}",
         up.transcript()
     );
     let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
     assert!(
         echo_over(&mut s, &payload, Duration::from_secs(60)),
-        "CANNOT MEASURE: no echo over the relayed path.\nup:\n{}",
+        "PRODUCT (staging): no echo over the relayed path.\nup:\n{}",
         up.transcript()
     );
     drop(s);
@@ -157,13 +157,13 @@ fn a_guest_bound_to_v6_loopback_never_dials_an_ipv4_mapped_candidate() {
     );
     assert!(
         at_forward >= 1,
-        "CANNOT MEASURE: the `still relayed` report does not name the forward {} — it is not the \
+        "PRODUCT (staging): the `still relayed` report does not name the forward {} — it is not the \
          per-candidate report this proof reads.\n{line}",
         w.forward.public
     );
     assert!(
         unreachable.is_empty(),
-        "DIALLED UNREACHABLE (#222): the guest, bound to [::1], tried {} candidate(s) its socket \
+        "PRODUCT: DIALLED UNREACHABLE (#222): the guest, bound to [::1], tried {} candidate(s) its socket \
          cannot send to, each waiting out a timeout: {unreachable:?}\n{line}",
         unreachable.len()
     );
@@ -181,9 +181,9 @@ struct Trap {
 impl Trap {
     fn bind(at: SocketAddr) -> Self {
         let sock = UdpSocket::bind(at)
-            .unwrap_or_else(|e| panic!("CANNOT MEASURE: could not bind a trap at {at}: {e}"));
+            .unwrap_or_else(|e| panic!("APPARATUS: could not bind a trap at {at}: {e}"));
         sock.set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
+            .expect("APPARATUS: set a read timeout");
         let got = Arc::new(AtomicU64::new(0));
         let from = Arc::new(Mutex::new(Vec::new()));
         let (g, f) = (Arc::clone(&got), Arc::clone(&from));
@@ -192,7 +192,9 @@ impl Trap {
             loop {
                 if let Ok((_, src)) = sock.recv_from(&mut buf) {
                     g.fetch_add(1, Ordering::SeqCst);
-                    f.lock().unwrap().push(src);
+                    f.lock()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
+                        .push(src);
                 }
                 if Arc::strong_count(&g) == 1 {
                     return;
@@ -219,32 +221,32 @@ fn route_ip(probe: &str, bind: &str) -> Option<IpAddr> {
 #[ignore = "production Argon2id + a real PoW; run in release"]
 fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, host_dir, guest_dir) = (
         tmp.path().join("anchor"),
         tmp.path().join("host"),
         tmp.path().join("guest"),
     );
     for d in [&anchor_dir, &host_dir, &guest_dir] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let anchor = relay::Anchor::start(&anchor_dir);
 
     let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-    assert!(ok, "vox id (guest): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
     let (ok, _, err) = vox_once(&host_dir, &args(&["id"]));
-    assert!(ok, "vox id (host): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (host): {err}");
     let (ok, out, err) = vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
     );
-    assert!(ok, "trust add: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
 
     // The host's port, and a trap at that port on every other address of this box.
     let port = UdpSocket::bind("[::1]:0")
-        .unwrap()
+        .expect("APPARATUS: bind a socket")
         .local_addr()
-        .unwrap()
+        .expect("APPARATUS: read a socket the proof bound")
         .port();
     let routable: Vec<IpAddr> = [
         route_ip("[2001:db8::1]:9", "[::]:0"),
@@ -255,7 +257,7 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
     .collect();
     assert!(
         !routable.is_empty(),
-        "CANNOT MEASURE: this box has no routable address, so there is nothing a [::1] host could \
+        "APPARATUS (precondition not met): this box has no routable address, so there is nothing a [::1] host could \
          wrongly advertise"
     );
     let foreign: Vec<SocketAddr> = routable
@@ -313,7 +315,7 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
     );
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join the host's room (after {:?}).\nstdout:\n{out}\n\
+        "PRODUCT (staging): the guest could not join the host's room (after {:?}).\nstdout:\n{out}\n\
          stderr:\n{err}\nhost:\n{}",
         t0.elapsed(),
         host.transcript()
@@ -343,21 +345,21 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
     let proxy: SocketAddr = line
         .split_whitespace()
         .nth(3)
-        .expect("an address in the up line")
+        .expect("PRODUCT: an address in the up line")
         .parse()
-        .expect("a socket address");
+        .expect("PRODUCT: a socket address");
     let hostname = format!("{room}.vox");
     let (code, mut s) = socks5_connect(proxy, &hostname, service_port);
     assert_eq!(
         code,
         0,
-        "CANNOT MEASURE: the guest's request to {hostname} was refused (SOCKS {code}).\nup:\n{}",
+        "PRODUCT (staging): the guest's request to {hostname} was refused (SOCKS {code}).\nup:\n{}",
         up.transcript()
     );
     let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
     assert!(
         echo_over(&mut s, &payload, Duration::from_secs(60)),
-        "CANNOT MEASURE: no echo from the host's service.\nup:\n{}",
+        "PRODUCT (staging): no echo from the host's service.\nup:\n{}",
         up.transcript()
     );
     drop(s);
@@ -384,7 +386,7 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
         trap.at,
         trap.from
             .lock()
-            .unwrap()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
             .iter()
             .collect::<std::collections::BTreeSet<_>>(),
         relayed.len(),
@@ -392,13 +394,13 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
     );
     assert!(
         !relayed.is_empty(),
-        "CANNOT MEASURE: in {WATCH_223:?} `vox up` never reported a direct attempt at the host, so \
+        "PRODUCT (staging): in {WATCH_223:?} `vox up` never reported a direct attempt at the host, so \
          nothing shows which addresses it took from the board.\nup:\n{}",
         up.transcript()
     );
     assert!(
         got == 0 && named.is_empty(),
-        "ADVERTISED UNREACHABLE (#223): the guest dialled {got} datagram(s) at {} and its reports \
+        "PRODUCT: ADVERTISED UNREACHABLE (#223): the guest dialled {got} datagram(s) at {} and its reports \
          name {named:?} — addresses the [::1]-bound host published but does not listen on.\n{}",
         trap.at,
         relayed.join("\n")

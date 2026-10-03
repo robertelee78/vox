@@ -18,7 +18,18 @@
 //! IPv4 host from an IPv6-only guest needs a relay circuit (#173), so the join as a whole is
 //! reported but not asserted.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    an_ipv6_only_joiner_reaches_its_board_within_two_seconds,
+    a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seconds
+);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -33,18 +44,19 @@ use world::{after_label, args, echo_service, vox_once, VoxProc};
 /// PRD-001 R42's bound for a first connection.
 const BOARD_WITHIN: Duration = Duration::from_secs(2);
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "production Argon2id and a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id and a real PoW, driving the real binary; optional, run it in release"]
 fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, host_dir, guest_dir) = (
         tmp.path().join("anchor"),
         tmp.path().join("host"),
         tmp.path().join("guest"),
     );
     for d in [&anchor_dir, &host_dir, &guest_dir] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
 
     let mut anchor = VoxProc::spawn(
@@ -60,14 +72,14 @@ fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
         })
         .trim()
         .to_owned();
-    let (fp, addr) = spec.split_once('@').expect("fp@addr");
-    let port = addr.rsplit('/').next().expect("port");
+    let (fp, addr) = spec.split_once('@').expect("PRODUCT: fp@addr");
+    let port = addr.rsplit('/').next().expect("PRODUCT (staging): port");
     let v4_spec = format!("{fp}@/ip4/127.0.0.1/udp/{port}");
     let v6_spec = format!("{fp}@/ip6/::1/udp/{port}");
 
     for dir in [&host_dir, &guest_dir] {
         let (ok, _, err) = vox_once(dir, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
     }
     let mut host = VoxProc::spawn(
         "host",
@@ -91,7 +103,7 @@ fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
     );
     assert!(
         address.contains("/ip4/") && !address.contains("/ip6/"),
-        "the address must advertise only IPv4 routes, or this is not the case under test: {address}"
+        "PRODUCT: the address must advertise only IPv4 routes, or this is not the case under test: {address}"
     );
 
     let (joined, out, err) = vox_once(
@@ -115,14 +127,14 @@ fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
         .nth(1)
         .and_then(|rest| rest.split('s').next())
         .and_then(|secs| secs.trim().parse::<f64>().ok())
-        .unwrap_or_else(|| panic!("the join must report its board step: {said}"));
+        .unwrap_or_else(|| panic!("PRODUCT: the join must report its board step: {said}"));
     eprintln!(
         "[test] board reached in {board:.2}s (bound {}s)",
         BOARD_WITHIN.as_secs()
     );
     assert!(
         Duration::from_secs_f64(board) < BOARD_WITHIN,
-        "an IPv6-only joiner took {board:.2}s to reach a board it could reach at once — the \
+        "PRODUCT: an IPv6-only joiner took {board:.2}s to reach a board it could reach at once — the \
          address's IPv4 routes were dialled one by one, each to its timeout, before its own IPv6 \
          anchor: {said}"
     );
@@ -137,17 +149,18 @@ fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
 /// a short grace and then not waited for, reaches the live board without first timing out on each
 /// dead one. This is the staging that isolates `reach_a_board`'s concurrency; the first one is
 /// carried by the family filter and the endpoint merge on their own.
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "production Argon2id and a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id and a real PoW, driving the real binary; optional, run it in release"]
 fn a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seconds() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dirs: Vec<std::path::PathBuf> = ["room_anchor", "own_anchor", "host", "guest"]
         .iter()
         .map(|n| tmp.path().join(n))
         .collect();
     for d in &dirs {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let (room_anchor_dir, own_anchor_dir, host_dir, guest_dir) =
         (&dirs[0], &dirs[1], &dirs[2], &dirs[3]);
@@ -175,11 +188,11 @@ fn a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seco
     assert_ne!(
         room_spec.split('@').next(),
         own_spec.split('@').next(),
-        "the joiner's own anchor must be a different node, or the endpoint merge is under test"
+        "PRODUCT: the joiner's own anchor must be a different node, or the endpoint merge is under test"
     );
     for dir in [host_dir, guest_dir] {
         let (ok, _, err) = vox_once(dir, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
     }
     let mut host = VoxProc::spawn(
         "host",
@@ -225,14 +238,14 @@ fn a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seco
         .nth(1)
         .and_then(|rest| rest.split('s').next())
         .and_then(|secs| secs.trim().parse::<f64>().ok())
-        .unwrap_or_else(|| panic!("the join must report its board step: {said}"));
+        .unwrap_or_else(|| panic!("PRODUCT: the join must report its board step: {said}"));
     eprintln!(
         "[test] board reached in {board:.2}s with every addressed board gone (bound {}s)",
         BOARD_WITHIN.as_secs()
     );
     assert!(
         Duration::from_secs_f64(board) < BOARD_WITHIN,
-        "a joiner took {board:.2}s to reach its own live board, because the address's gone boards \
+        "PRODUCT: a joiner took {board:.2}s to reach its own live board, because the address's gone boards \
          were dialled one after another, each to its timeout: {said}"
     );
     drop(own_anchor);

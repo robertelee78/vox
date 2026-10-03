@@ -10,13 +10,12 @@
 //! - **No passphrase anywhere.** There is nothing to unlock — the node holds the
 //!   identity. An agent session never sees a secret, which is what makes it safe
 //!   to hand these verbs to model-authored code.
-//! - **No room is created or joined here.** These verbs speak in a room; putting
-//!   the node in one is the operator's act.
+//! - **Rooms come and go here too.** `join` and `create` take the room passphrase on
+//!   stdin, never argv, and `leave` takes none.
 //!
-//! The socket answers a deliberately narrow request set and these verbs are
-//! exactly it (`post`, `read`, `tail`, `roster`, `list`). There is no verb here
-//! that creates an identity, unlocks, revokes, or edits the trust keyring —
-//! `vox trust` is an operator surface and is not part of this module.
+//! The socket answers a deliberately narrow request set. There is no verb here that
+//! creates an identity, unlocks, revokes, or edits the trust keyring — `vox trust` is
+//! an operator surface and is not part of this module.
 
 use std::io::Read as _;
 use std::io::Write as _;
@@ -57,7 +56,7 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
     // Each way an attach fails needs a different remedy, so each gets its own sentence
     // (#191): they were one, "nothing answered — the node may have stopped", which is true
     // only of a stale socket, and the actual error was thrown away.
-    IpcClient::open(&sock).await.map_err(|e| {
+    let mut client = IpcClient::open(&sock).await.map_err(|e| {
         let at = sock.display();
         AppError::Usage(match e {
             Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
@@ -74,7 +73,10 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
                  have stopped without cleaning up. Starting a node again replaces it."
             ),
         })
-    })
+    })?;
+    // Every author this command prints is named as this node names it (V210-162).
+    crate::ident::load_names(&mut client).await;
+    Ok(client)
 }
 
 /// Ask the node for its rooms, as `(id, local name, open)`.
@@ -97,15 +99,23 @@ fn held_since(since_secs: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let ago = now.saturating_sub(since_secs);
-    let elapsed = if ago < 60 {
-        format!("{ago}s ago")
-    } else if ago < 3600 {
-        format!("{}m ago", ago / 60)
-    } else if ago < 86_400 {
-        format!("{}h{:02}m ago", ago / 3600, (ago % 3600) / 60)
+    // A stamp can be later than this clock: another member's clock is ahead, or a post was
+    // stamped after one it held (V210-168). Say so rather than "0s ago".
+    let span = |n: u64| {
+        if n < 60 {
+            format!("{n}s")
+        } else if n < 3600 {
+            format!("{}m", n / 60)
+        } else if n < 86_400 {
+            format!("{}h{:02}m", n / 3600, (n % 3600) / 60)
+        } else {
+            format!("{}d", n / 86_400)
+        }
+    };
+    let elapsed = if since_secs > now {
+        format!("{} ahead of this clock", span(since_secs - now))
     } else {
-        format!("{}d ago", ago / 86_400)
+        format!("{} ago", span(now - since_secs))
     };
     // A fixed-offset UTC stamp without pulling in a date library: the fields are
     // arithmetic on the epoch, and the only calendar subtlety is leap years.
@@ -170,18 +180,24 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
     // Named by the id the operator typed a prefix of, and by its name only when there is one.
     if let Some((_, name, false)) = rooms.iter().find(|(r, _, _)| *r == id) {
-        let which = if name.is_empty() {
-            format!("room {}", b32_encode(&id))
-        } else {
-            format!("room {name:?} ({})", b32_encode(&id))
-        };
-        return Err(AppError::Usage(format!(
-            "{which} is closed on this node, so there is nothing to read or post. A daemon \
-             reopens every room it held open, so this one was closed in `vox tui` or did not \
-             reopen. Open it in `vox tui`, or give `vox daemon` a line with its passphrase"
-        )));
+        return Err(room_closed(&id, name));
     }
     Ok(id)
+}
+
+/// What every verb says of a room the node holds closed, with a daemon or without one
+/// (`vox service list`'s one-shot form, V210-149).
+pub(crate) fn room_closed(id: &Digest32, name: &str) -> AppError {
+    let which = if name.is_empty() {
+        format!("room {}", b32_encode(id))
+    } else {
+        format!("room {name:?} ({})", b32_encode(id))
+    };
+    AppError::Usage(format!(
+        "{which} is closed on this node, so there is nothing to read or post. A daemon \
+         reopens every room it held open, so this one was closed in `vox tui` or did not \
+         reopen. Open it in `vox tui`, or give `vox daemon` a line with its passphrase"
+    ))
 }
 
 /// Every `vox` verb identifies a room or a member by its **base32** rendering —
@@ -263,9 +279,9 @@ pub struct PostOpts {
     pub work: Option<String>,
     /// The attempt, carried in `data.attempt`; defaults to this session's claim.
     pub attempt: Option<String>,
-    /// Addressees, by petname.
+    /// Addressees: the poster's names for members, or their fingerprints.
     pub to: Vec<String>,
-    /// May interrupt an addressed session.
+    /// May interrupt the agents of the nodes addressed.
     pub urgent: bool,
     /// Reply-to entry hash.
     pub re: Option<String>,
@@ -290,6 +306,43 @@ impl PostOpts {
             || self.coord.op.is_some()
             || self.coord.json
     }
+}
+
+/// A room's members, as the node holds them.
+async fn members_of(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<Vec<Digest32>, AppError> {
+    match client.request(&Request::Roster { channel_id }).await {
+        Ok(Frame::Members { members }) => Ok(members),
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `--to`, as the envelope carries it (V210-161): each word resolved by the poster, once, to a
+/// member's whole fingerprint, so every reader resolves it to the same node. A word that names
+/// no member is refused, saying why.
+async fn addressees(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    words: &[String],
+) -> Result<Vec<String>, AppError> {
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+    let members = members_of(client, channel_id).await?;
+    let mut to: Vec<String> = Vec::new();
+    for w in words {
+        let fp = crate::ident::resolve_member(w, &members, crate::ident::names())
+            .map_err(|e| AppError::Usage(format!("refusing --to: {e}")))?;
+        let fp = b32_encode(&fp);
+        if !to.contains(&fp) {
+            to.push(fp);
+        }
+    }
+    Ok(to)
 }
 
 /// `vox room post` — append a message.
@@ -317,7 +370,31 @@ pub async fn post_cmd(
         if body.trim().is_empty() {
             return Err(AppError::Usage("refusing to post an empty message".into()));
         }
+        // An envelope every reader would refuse is refused here, before it is posted
+        // (V210-123): a type or name not on one line would otherwise sit in the log unread.
+        if let Err(e @ vox_agentcomms::envelope::ParseError::Malformed(_)) = Envelope::parse(&body)
+        {
+            return Err(AppError::Usage(format!("refusing to post it: {e}")));
+        }
         if let Ok(env) = Envelope::parse(&body) {
+            // **A raw envelope addresses members by fingerprint** (V210-161), as `--to` writes
+            // them: a name in `to` would read as addressed to nobody on every node.
+            if !env.to.is_empty() {
+                let (mut client, cid, _) = open_room(paths, room).await?;
+                let members = members_of(&mut client, cid).await?;
+                if let Some(bad) = env
+                    .to
+                    .iter()
+                    .find(|t| !crate::ident::recipient(t).is_some_and(|fp| members.contains(&fp)))
+                {
+                    return Err(AppError::Usage(format!(
+                        "refusing to post it: `to` names {:?}, which is not a member's whole \
+                         fingerprint as `vox room roster` prints it. Use --to, which takes your \
+                         name for a member or its fingerprint",
+                        vox_agentcomms::envelope::shown(bad, vox_agentcomms::envelope::SHOWN_NAME)
+                    )));
+                }
+            }
             if claim::is_claim_protocol(&env) {
                 return Err(AppError::Usage(format!(
                     "refusing a raw `{}`: claim-protocol operations need a session, an \
@@ -325,11 +402,44 @@ pub async fn post_cmd(
                     env.kind, env.kind
                 )));
             }
+            // **A raw envelope cannot start an urgent chain of its own from a woken session**
+            // (V210-121): it is posted exactly as given, so it would not inherit the `re` a
+            // structured post takes, and two agents answering each other that way woke each
+            // other for ever.
+            if env.urgent && env.re.is_none() {
+                if let Some(session) = coord::session(opts.coord.session.as_deref()) {
+                    let (mut client, cid, room_key) = open_room(paths, room).await?;
+                    let me = client
+                        .me()
+                        .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?;
+                    // The wakes and what followed the oldest of them (V210-120).
+                    let rows =
+                        coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
+                    let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &me);
+                    if !open.is_empty() {
+                        return Err(AppError::Usage(format!(
+                            "refusing a raw urgent message with no `re` from session {session}: \
+                             it was woken by {} and has not answered. Reply with `--re <entry>`, \
+                             or post with the structured flags (`--type`, `--to`, `--urgent`), \
+                             which answer the message that woke it when only one is open.",
+                            open.join(", ")
+                        )));
+                    }
+                }
+            }
         }
         return post(paths, room, Some(&body)).await;
     }
 
     let kind = opts.kind.clone().unwrap_or_else(|| "say".into());
+    if !vox_agentcomms::envelope::is_valid_name(&kind, vox_agentcomms::envelope::MAX_NAME) {
+        return Err(AppError::Usage(format!(
+            "--type {} is refused: a type must be at most {} bytes on one line, with no control \
+             characters, line separators or bidi controls, because other agents' rooms print it",
+            vox_agentcomms::envelope::shown(&kind, vox_agentcomms::envelope::SHOWN_NAME),
+            vox_agentcomms::envelope::MAX_NAME
+        )));
+    }
     let mut data = match &opts.data {
         None => serde_json::Map::new(),
         Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
@@ -400,6 +510,7 @@ pub async fn post_cmd(
         None => coord::new_op()?,
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
+    let to = addressees(&mut client, cid, &opts.to).await?;
     let snap = if work.is_some() {
         coord::participate(&mut client, cid, &room_key, &session).await?
     } else {
@@ -415,9 +526,11 @@ pub async fn post_cmd(
     // have been renewed, re-taken or failed since, and a different id would make the retry
     // a conflict rather than the same message.
     if let (Some(w), None) = (&work, data.get("attempt")) {
-        let earlier = snap
-            .posted
-            .iter()
+        // A retry's earlier post, read by its operation id (V210-120): the snapshot holds the
+        // coordination posts, not every post an operation id may be on.
+        let earlier = coord::op_group(&mut client, cid, &op)
+            .await?
+            .into_iter()
             .find(|p| p.author == snap.me && vox_agentcomms::ops::op_of(&p.envelope) == Some(&op))
             .and_then(|p| p.envelope.data.get("attempt").cloned());
         let seeded = match snap.fold.resources.get(w) {
@@ -432,28 +545,87 @@ pub async fn post_cmd(
             data.insert("attempt".into(), a);
         }
     }
+    // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
+    // chain of its own with a fresh hop budget, and two agents answering each other urgently
+    // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
+    // with several, the agent must say which.
+    let re = match &opts.re {
+        Some(re) => Some(re.clone()),
+        None => {
+            // The wakes and what followed the oldest of them, read from there (V210-120).
+            let rows = coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
+            let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &snap.me);
+            match &open[..] {
+                [] => None,
+                [only] => {
+                    eprintln!(
+                        "vox: replying to {} (the message that woke this session); pass --re to \
+                         answer another",
+                        &only[..12.min(only.len())]
+                    );
+                    Some(only.clone())
+                }
+                // **Several unanswered, and an urgent post must say which it answers** (V210-121).
+                // Sent with no `re` it started a chain of its own at a fresh budget, and a session
+                // that left two wakes unanswered stayed that way: every later wake added to the
+                // set rather than being inherited, and two such sessions woke each other for ever.
+                several if opts.urgent => {
+                    return Err(AppError::Usage(format!(
+                        "refusing an urgent message with no --re from session {session}: it was \
+                         woken by {} messages it has not answered ({}). Pass --re <entry> to say \
+                         which one this answers.",
+                        several.len(),
+                        several.join(", ")
+                    )));
+                }
+                _ => None,
+            }
+        }
+    };
+    // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
+    // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
+    let hops_of_reply = match &re {
+        Some(re) => Some(crate::wake::reply_hops(
+            re,
+            &coord::reply_chain(&mut client, cid, re).await?,
+        )),
+        None => None,
+    };
     let draft = Draft {
         kind,
-        to: opts.to.clone(),
+        to,
         urgent: opts.urgent,
-        re: opts.re.clone(),
+        re: re.clone(),
         thread: opts.thread.clone(),
         // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's
         // budget less one, so an urgent reply chain ends at zero instead of looping.
-        hops: opts
-            .re
-            .as_ref()
-            .map(|re| crate::wake::reply_hops(re, &snap.rows)),
+        hops: hops_of_reply,
         body: body.trim_end().to_owned(),
         data,
     };
     let is_result = draft.kind == vox_agentcomms::envelope::work::RESULT;
     let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
+    // **An addressee that cannot be interrupted is named to the poster** (V210-169): the
+    // message is posted, and waits in the room for that session's next turn. This node's
+    // sessions only: another node decides for its own.
+    if opts.urgent {
+        let me = client.me().map(|m| b32_encode(&m)).unwrap_or_default();
+        if let Some(line) = crate::wake::uninterruptible(paths, &me, &draft.to) {
+            eprintln!("vox: {line}");
+        }
+    }
     // **A `result` says what it has not read** (ADR-021 M21.10). A redirect addressed
     // to this session can land after its last drain and before it reports; the result
     // still posts, and the caller is shown every such message so it can follow up.
     let unread = if is_result {
-        unread_addressed(paths, &room_key, &session, &posting)
+        // What follows this session's drain cursor, read from there (V210-120); the whole room
+        // only if the node no longer holds that cursor.
+        let cursor = crate::agent_hook::load_cursor(paths, &room_key, &session);
+        let after = match coord::read_all(&mut client, cid, cursor).await {
+            Ok(rows) => rows,
+            Err(_) => coord::read_all(&mut client, cid, None).await?,
+        };
+        unread_addressed(&session, &posting, &after)
     } else {
         Vec::new()
     };
@@ -491,46 +663,34 @@ pub async fn post_cmd(
     Ok(())
 }
 
-/// Messages addressed to this session that its drain has not delivered yet: past its
-/// drain cursor, not its own, naming it in `to` — by `VOX_AGENT_NAME`, the name it is
-/// addressed by, or by its session id. The one just posted is excluded.
+/// Messages addressed to this node that this session's drain has not delivered yet: past its
+/// drain cursor, not its own, naming this node in `to` (V210-161). The one just posted is
+/// excluded.
 fn unread_addressed(
-    paths: &Paths,
-    room_key: &str,
     session: &str,
     posting: &coord::Posting,
+    after_cursor: &[vox_core::node::api::MessageRow],
 ) -> Vec<(String, String, String, String)> {
     let snap = &posting.after;
-    let names: Vec<String> = std::iter::once(session.to_owned())
-        .chain(
-            std::env::var("VOX_AGENT_NAME")
-                .ok()
-                .filter(|n| !n.trim().is_empty()),
-        )
-        .collect();
-    let start = crate::agent_hook::load_cursor(paths, room_key, session)
-        .and_then(|c| snap.rows.iter().position(|r| r.entry_hash == c))
-        .map_or(0, |i| i + 1);
-    snap.rows[start..]
+    let me = b32_encode(&snap.me);
+    after_cursor
         .iter()
         .filter(|r| r.entry_hash != posting.entry_hash)
         .filter_map(|r| {
             let env = Envelope::parse(&r.text).ok()?;
             let own = r.author == snap.me && env.from == session;
-            (!own && names.iter().any(|n| env.is_addressed_to(n))).then(|| {
-                let body: String = env
-                    .body
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(160)
-                    .collect();
+            (!own && env.is_addressed_to(&me)).then(|| {
+                // Every field is the author's, and this lands on the reporting agent's stderr: each
+                // is shown on one line and cut (V210-123). The body's first line ends at any
+                // character a reader breaks a line at, not only `\n`.
+                use vox_agentcomms::envelope::{breaks_lines, shown, SHOWN_NAME};
+                let first = env.body.trim_start();
+                let first = first.split(breaks_lines).next().unwrap_or("");
                 (
                     claim::b32(&r.entry_hash),
-                    env.from.clone(),
-                    env.kind.clone(),
-                    body,
+                    crate::ident::name_of(&r.author),
+                    shown(&env.kind, SHOWN_NAME),
+                    shown(first, 160),
                 )
             })
         })
@@ -654,14 +814,15 @@ fn after_cursor(
     }
 }
 
-/// One row as `vox room read` and `tail` print it: `<entry-hash> <author-prefix> <text>`.
+/// One row as `vox room read` and `tail` print it: `<entry-hash> <author> <text>`, the author
+/// by this node's name for it, or its fingerprint when it has none (V210-162).
 ///
 /// **No message can forge a row** (PRD-001 R19). A row starts at the beginning of a line,
 /// so a message carrying a newline followed by `<hash> <author> …` would otherwise print a
 /// second row attributed to someone else — and agents read this output. Every continuation
 /// line is therefore indented with `  | `, which no row begins with, and every other
-/// control character (a carriage return, an escape sequence) is shown escaped rather than
-/// passed to the terminal. `--json` needs none of this: each row is one JSON-escaped line.
+/// control character (a carriage return, an escape sequence) and the Unicode line and
+/// paragraph separators are shown escaped rather than passed on. `--json` needs none of this: each row is one JSON-escaped line.
 fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
     // A message whose envelope is held and whose body is still asked for (V030-10).
     if r.owed {
@@ -677,21 +838,25 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
         match c {
             '\n' => text.push_str("\n  | "),
             '\t' => text.push('\t'),
-            c if c.is_control() => text.push_str(&c.escape_unicode().to_string()),
+            // U+2028 and U+2029 break a line for a model or a JSON viewer, not a
+            // terminal, so they are escaped too (V210-123).
+            c if vox_agentcomms::envelope::breaks_lines(c) => {
+                text.push_str(&c.escape_unicode().to_string());
+            }
             c => text.push(c),
         }
     }
     format!(
         "{} {} {}",
         id(&r.entry_hash),
-        crate::ident::author_id(&r.author),
+        crate::ident::name_of(&r.author),
         text
     )
 }
 
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
 ///
-/// Each line is `<entry-hash> <author-prefix> <text>`; with `--json`, one
+/// Each line is `<entry-hash> <author> <text>`; with `--json`, one
 /// `vox.room.row/1` object per line. The entry hash **is** the cursor.
 ///
 /// # Errors
@@ -710,48 +875,63 @@ pub async fn read(
         Some(s) => Some(parse_cursor(s)?),
     };
     if !json {
-        let rows = coord::read_all(&mut client, channel_id, since).await?;
+        // No further than `--limit` (V210-120): a limit was applied only after every row past
+        // the cursor had been read. `--late` filters, so it reads on and keeps `--limit` of those.
+        let take = usize::try_from(limit).unwrap_or(usize::MAX);
+        let read = if only_late { 0 } else { take };
+        let Some(rows) = coord::read_upto(&mut client, channel_id, since, read).await? else {
+            return Err(AppError::Usage(format!(
+                "cursor {} is not in this room's timeline",
+                since.map(|c| id(&c)).unwrap_or_default()
+            )));
+        };
         let held_back = equivocations_in(paths, &channel_id).await;
         let mut out = std::io::stdout().lock();
-        // **A member held back for equivocating is said first** (V210-63), by the same short id
-        // the rows below use: the keyring's names need the identity passphrase, which reading a
-        // room does not ask for. `vox status --json` carries the same, in full, for agents.
+        // **A member held back for equivocating is said first** (V210-63), named as the rows
+        // below name it. `vox status --json` carries the same, in full, for agents.
         for (author, seq) in &held_back {
             let _ = writeln!(
                 out,
                 "! {}",
-                crate::ident::equivocation_notice(&crate::ident::author_id(author), *seq)
+                crate::ident::equivocation_notice(&crate::ident::name_of(author), *seq)
             );
         }
-        let take = if limit == 0 {
-            rows.len()
-        } else {
-            usize::try_from(limit).unwrap_or(usize::MAX)
-        };
+        let take = if take == 0 { usize::MAX } else { take };
         for r in rows.iter().filter(|r| r.late || !only_late).take(take) {
             let _ = writeln!(out, "{}", plain_row(r));
         }
         return Ok(());
     }
-    // The operation index needs the whole room, not only what follows the cursor: an
-    // entry after it may repeat, or conflict with, one before it.
-    let all = coord::read_all(&mut client, channel_id, None).await?;
-    let wanted = after_cursor(&all, since)?;
-    let mut ops = vox_agentcomms::ops::OpIndex::new();
-    for p in coord::posted_of(&all) {
-        ops.insert(p.entry_hash, p.author, p.created_millis, &p.envelope);
-    }
-    let take = if limit == 0 {
-        usize::MAX
-    } else {
-        usize::try_from(limit).unwrap_or(usize::MAX)
+    // Only the rows asked for, and only the operations they carry (V210-120). An operation's
+    // verdict needs its whole group, and an entry after the cursor may repeat, or conflict with,
+    // one before it: so each shown row's group is read by its id, from the node's index, rather
+    // than the whole room on every call. `--late` filters, so it reads on and keeps `--limit` of
+    // those.
+    let take = usize::try_from(limit).unwrap_or(usize::MAX);
+    let read = if only_late { 0 } else { take };
+    let Some(shown) = coord::read_upto(&mut client, channel_id, since, read).await? else {
+        return Err(AppError::Usage(format!(
+            "cursor {} is not in this room's timeline",
+            since.map(|c| id(&c)).unwrap_or_default()
+        )));
     };
-    let mut out = std::io::stdout().lock();
-    for r in wanted
+    let take = if take == 0 { usize::MAX } else { take };
+    let shown: Vec<_> = shown
         .into_iter()
         .filter(|r| r.late || !only_late)
         .take(take)
-    {
+        .collect();
+    let mut ids: Vec<String> = shown
+        .iter()
+        .filter_map(|r| Envelope::parse(&r.text).ok())
+        .filter_map(|e| vox_agentcomms::ops::op_of(&e).map(str::to_owned))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let group = coord::structured(&mut client, channel_id, &[], &ids).await?;
+    let ops = coord::index_of(&coord::posted_of(&group));
+    let mut out = std::io::stdout().lock();
+    for r in &shown {
         let _ = writeln!(out, "{}", row_json(&room_key, r, &ops, None));
     }
     Ok(())
@@ -1082,6 +1262,8 @@ fn parse_cursor(s: &str) -> Result<Digest32, AppError> {
 // Claims are **messages, not locks**. Nothing here reserves anything in the node:
 // the state is whatever `claim::fold` computes from the room's log, so two workers
 // on one version converge on the same answer without either asking a coordinator.
+// Converge, not agree at once: so a claim says "you hold it" only after every other
+// member has it and folds it the same (V210-168; exit 5 when one cannot be reached).
 //
 // What ADR-021 changed, and why each verb now carries so much:
 //
@@ -1126,6 +1308,10 @@ struct Done {
     outcome: Option<Outcome>,
     session: String,
     room: String,
+    /// The room's id.
+    cid: Digest32,
+    /// The resource's state just before the post, as this node folded it.
+    before: Option<State>,
 }
 
 /// Run one claim-protocol operation end to end: session, version gate, post exactly
@@ -1139,6 +1325,22 @@ async fn run_op(
     body: String,
 ) -> Result<Done, AppError> {
     let session = coord::require_session(opts.session.as_deref())?;
+    // Every node folds these names and prints them into its agents' contexts, so a name
+    // that would not stay on one line is refused here, before anything is posted, as the
+    // fold refuses it there (V210-123).
+    use vox_agentcomms::envelope::{is_valid_name, shown, MAX_NAME, MAX_RESOURCE, SHOWN_NAME};
+    for (key, max) in [("resource", MAX_RESOURCE), ("to_session", MAX_NAME)] {
+        if let Some(v) = data.get(key).and_then(serde_json::Value::as_str) {
+            if !is_valid_name(v, max) {
+                return Err(AppError::Usage(format!(
+                    "the {key} {} is refused: it must be at most {max} bytes on one line, with \
+                     no control characters or line separators, because other agents' rooms \
+                     print it",
+                    shown(v, SHOWN_NAME)
+                )));
+            }
+        }
+    }
     let op = match &opts.op {
         Some(op) if vox_agentcomms::ops::is_valid_op(op) => op.clone(),
         Some(op) => {
@@ -1150,6 +1352,11 @@ async fn run_op(
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
     let snap = coord::participate(&mut client, cid, &room_key, &session).await?;
+    let before = data
+        .get("resource")
+        .and_then(|v| v.as_str())
+        .and_then(|r| snap.fold.resources.get(r))
+        .cloned();
     let draft = Draft {
         kind: kind.into(),
         body,
@@ -1163,10 +1370,11 @@ async fn run_op(
         .outcomes
         .get(&posting.entry_hash)
         .cloned();
-    // **A claim is recorded when it is made** (V210-79), so one that lapses before this
+    // **A renewal is recorded when it is made** (V210-79), so a holding that lapses before this
     // session's next drain is still reported lost there. By what the operation did, not by
-    // what the fold says now: a short ttl can already have run out by the read-back.
-    if matches!(kind, claim::CLAIM | claim::RENEW) && outcome == Some(Outcome::Applied) {
+    // what the fold says now: a short ttl can already have run out by the read-back. A claim is
+    // recorded by `claim_resource`, once the room's members have answered (V210-168).
+    if kind == claim::RENEW && outcome == Some(Outcome::Applied) {
         if let Some(resource) = draft.data.get("resource").and_then(|v| v.as_str()) {
             crate::agent_hook::note_held(paths, &room_key, &session, resource);
         }
@@ -1176,6 +1384,8 @@ async fn run_op(
         outcome,
         session,
         room: room_key,
+        cid,
+        before,
     })
 }
 
@@ -1253,6 +1463,21 @@ fn report(
     ok: bool,
     said: &str,
 ) -> Result<(), AppError> {
+    report_as(done, kind, resource, opts, ok, said, 1, None)
+}
+
+/// [`report`] with the exit status a refusal ends with, and anything a verb adds to its JSON.
+#[allow(clippy::too_many_arguments)]
+fn report_as(
+    done: &Done,
+    kind: &str,
+    resource: &str,
+    opts: &CoordOpts,
+    ok: bool,
+    said: &str,
+    code: u8,
+    extra: Option<(&str, serde_json::Value)>,
+) -> Result<(), AppError> {
     let me = Owner {
         author: done.posting.after.me,
         session: done.session.clone(),
@@ -1265,30 +1490,31 @@ fn report(
             .resources
             .get(resource)
             .map(|s| state_json(resource, s, &me));
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": "vox.room.op/1",
-                "room": done.room,
-                "type": kind,
-                "resource": resource,
-                "session": done.session,
-                "entry_hash": claim::b32(&done.posting.entry_hash),
-                "op": done.posting.op,
-                "status": done.posting.status,
-                "outcome": outcome_json(done.outcome.as_ref()),
-                "ok": ok,
-                "state": state,
-            })
-        );
+        let mut out = serde_json::json!({
+            "schema": "vox.room.op/1",
+            "room": done.room,
+            "type": kind,
+            "resource": resource,
+            "session": done.session,
+            "entry_hash": claim::b32(&done.posting.entry_hash),
+            "op": done.posting.op,
+            "status": done.posting.status,
+            "outcome": outcome_json(done.outcome.as_ref()),
+            "ok": ok,
+            "state": state,
+        });
+        if let (Some((key, value)), Some(map)) = (extra, out.as_object_mut()) {
+            map.insert(key.to_owned(), value);
+        }
+        println!("{out}");
     } else if ok {
         println!("{said}");
     }
     if ok {
         Ok(())
-    } else if opts.json {
+    } else if opts.json || code != 1 {
         Err(AppError::Refused {
-            code: 1,
+            code,
             message: said.to_owned(),
         })
     } else {
@@ -1296,8 +1522,24 @@ fn report(
     }
 }
 
+/// `<author>/<session>`, the session on one line and cut (V210-123): it is the author's
+/// text, and this lands in other agents' contexts.
 fn who(o: &Owner) -> String {
-    format!("{}/{}", crate::ident::author_id(&o.author), o.session)
+    format!(
+        "{}/{}",
+        crate::ident::name_of(&o.author),
+        session_name(&o.session)
+    )
+}
+
+/// An author-chosen session as this module prints it: one line, about 64 bytes (V210-123).
+fn session_name(s: &str) -> String {
+    vox_agentcomms::envelope::shown(s, vox_agentcomms::envelope::SHOWN_NAME)
+}
+
+/// An author-chosen resource as this module prints it: one line, cut (V210-123).
+fn name(s: &str) -> String {
+    vox_agentcomms::envelope::shown(s, vox_agentcomms::envelope::MAX_RESOURCE)
 }
 
 fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, AppError> {
@@ -1320,8 +1562,12 @@ fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, App
 
 /// `vox room claim` — take a resource, or complete a handoff pending for this session.
 ///
+/// It says "you hold it" only once every other member of the room agrees (V210-168): see
+/// `agreement`.
+///
 /// # Errors
-/// Exit 1 if somebody else holds it, 3 on a version refusal, 4 on an op conflict.
+/// Exit 1 if somebody else holds it, 3 on a version refusal, 4 on an op conflict, 5 if not every
+/// member could agree.
 pub async fn claim_resource(
     paths: &Paths,
     room: &str,
@@ -1339,7 +1585,7 @@ pub async fn claim_resource(
     if let Some(t) = ttl_secs {
         data.insert("ttl_secs".into(), t.into());
     }
-    let done = run_op(
+    let mut done = run_op(
         paths,
         room,
         opts,
@@ -1352,12 +1598,76 @@ pub async fn claim_resource(
         author: done.posting.after.me,
         session: done.session.clone(),
     };
-    // **Say whether it was won.** A claim is a message, not a lock: an earlier claim
-    // beats this one, and an agent that cannot tell would start work somebody else is
-    // already doing. The current state is the answer, not this post's own outcome —
-    // on a retry the resource may have moved on since the first attempt.
-    let (ok, said) = match done.posting.after.fold.resources.get(&resource) {
-        Some(State::Held { owner, .. }) if *owner == me => (true, format!("you hold {resource}")),
+    // **Say whether it was won, and only once the room agrees** (V210-168). A claim is a post,
+    // and this node folds it as won until a claim that crossed it arrives from another member:
+    // two claims made at once were both told "you hold it". So a claim this node folds as won is
+    // put to every other member first, and "you hold it" waits for every one of them to fold the
+    // same. One that crossed another is put to them too, so the loser is told whose claim the
+    // room orders first, which a third member's claim this node has not seen yet may be. The
+    // current state is the answer, not this post's own outcome: on a retry the resource may have
+    // moved on since the first attempt.
+    //
+    // Crossed: the holder's claim was not in this node's log when this one was made.
+    let before = done.before.clone();
+    let crossed = move |acquisition: &[u8; 32]| match &before {
+        Some(State::Held { acquisition: a, .. }) => a != acquisition,
+        _ => true,
+    };
+    let mut unagreed: Vec<(Digest32, String)> = Vec::new();
+    let ask_the_room = match done.posting.after.fold.resources.get(&resource) {
+        Some(State::Held { owner, .. }) if *owner == me => true,
+        Some(State::Held { acquisition, .. }) => crossed(acquisition),
+        Some(State::Pending { .. }) => false,
+        None => true,
+    };
+    if ask_the_room {
+        let (fold, why) = agreement(paths, &done, &me, &resource).await?;
+        done.posting.after.fold = fold;
+        unagreed = why;
+    }
+    let (ok, said, code) = match done.posting.after.fold.resources.get(&resource) {
+        Some(State::Held { owner, .. }) if *owner == me && unagreed.is_empty() => {
+            (true, format!("you hold {resource}"), 1)
+        }
+        Some(State::Held { owner, .. }) if *owner == me => (
+            false,
+            format!(
+                "{resource} is not agreed yet: {}. Your claim is posted, but it is not sure to be \
+                 yours{}.{} Run `vox room board {room}` later to see who holds it, claim it \
+                 again to ask again, or release it",
+                unagreed_text(&me.author, &unagreed),
+                // A member that has not agreed can still post a claim ordered first. A post the
+                // claim is stamped before is already made: the note below says what that means.
+                if unagreed.iter().any(|(_, w)| !w.starts_with(STAMPED_AHEAD)) {
+                    ": a claim by such a member can still be ordered before it, even one made \
+                     after it"
+                } else {
+                    ""
+                },
+                clocks_note(&unagreed),
+            ),
+            coord::EXIT_UNAGREED,
+        ),
+        Some(State::Held {
+            owner, acquisition, ..
+        }) if crossed(acquisition) => (
+            false,
+            format!(
+                "{resource} went to {}: your claims crossed and the room orders theirs first — \
+                 you did not get it{}",
+                who(owner),
+                if clocks_note(&unagreed).is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({}.{})",
+                        unagreed_text(&me.author, &unagreed),
+                        clocks_note(&unagreed)
+                    )
+                }
+            ),
+            1,
+        ),
         Some(State::Held {
             owner,
             since_millis,
@@ -1369,6 +1679,7 @@ pub async fn claim_resource(
                 who(owner),
                 millis_as_time(*since_millis)
             ),
+            1,
         ),
         Some(State::Pending {
             to_fp, to_session, ..
@@ -1376,12 +1687,13 @@ pub async fn claim_resource(
             false,
             format!(
                 "{resource} is reserved by a handoff for {}{} — you did not get it",
-                &crate::ident::author_id(to_fp),
+                &crate::ident::name_of(to_fp),
                 to_session
                     .as_ref()
-                    .map(|s| format!("/{s}"))
+                    .map(|s| format!("/{}", session_name(s)))
                     .unwrap_or_default()
             ),
+            1,
         ),
         None => (
             false,
@@ -1389,9 +1701,201 @@ pub async fn claim_resource(
                 "{resource} is not held by anyone, including you — the claim has not \
                  converged yet; run `vox room board {room}` to check"
             ),
+            1,
         ),
     };
-    report(&done, claim::CLAIM, &resource, opts, ok, &said)
+    // **Recorded once the room has answered** (V210-79, V210-168): a session that holds it, agreed
+    // or not yet, is told at its next drain if it stops holding it; one told it lost is not told
+    // again that it "lapsed".
+    if matches!(
+        done.posting.after.fold.resources.get(&resource),
+        Some(State::Held { owner, .. }) if *owner == me
+    ) {
+        crate::agent_hook::note_held(paths, &done.room, &done.session, &resource);
+    }
+    let unagreed_json: Vec<serde_json::Value> = unagreed
+        .iter()
+        .map(|(m, why)| serde_json::json!({"member": claim::b32(m), "why": why}))
+        .collect();
+    report_as(
+        &done,
+        claim::CLAIM,
+        &resource,
+        opts,
+        ok,
+        &said,
+        code,
+        Some(("unagreed", unagreed_json.into())),
+    )
+}
+
+/// Why members did not agree to a claim, as one line naming each: `me` is the claimant, named
+/// "you".
+fn unagreed_text(me: &Digest32, unagreed: &[(Digest32, String)]) -> String {
+    let name = |m: &Digest32| {
+        if m == me {
+            "you".to_owned()
+        } else {
+            format!("member {}", crate::ident::author_id(m))
+        }
+    };
+    let mut parts: Vec<String> = unagreed
+        .iter()
+        .filter(|(_, why)| !why.starts_with(STAMPED_AHEAD))
+        .map(|(m, why)| format!("{} {why}", name(m)))
+        .collect();
+    // The authors of posts the claim is stamped before, in one clause: it is one cause.
+    let ahead: Vec<String> = unagreed
+        .iter()
+        .filter(|(_, why)| why.starts_with(STAMPED_AHEAD))
+        .map(|(m, _)| name(m))
+        .collect();
+    if !ahead.is_empty() {
+        parts.push(format!(
+            "your node holds posts by {} stamped more than {} minutes ahead of your clock, and \
+             your claim is stamped before them although it was made after; check the clocks",
+            ahead.join(" and "),
+            vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
+        ));
+    }
+    parts.join("; ")
+}
+
+/// What a claimant must know when clocks are too far apart (V210-168): the room orders claims by
+/// the stamps their nodes gave them, so the board can name a holder whose claim was made later.
+fn clocks_note(unagreed: &[(Digest32, String)]) -> String {
+    let mut note = String::new();
+    if unagreed
+        .iter()
+        .any(|(_, why)| why.starts_with(CLOCKS_APART))
+    {
+        note.push_str(
+            " While the clocks are apart, the board can name a holder whose claim was made later.",
+        );
+    }
+    if unagreed
+        .iter()
+        .any(|(_, why)| why.starts_with(STAMPED_AHEAD))
+    {
+        note.push_str(
+            " The room orders claims by their stamps, so it can order yours before a claim made \
+             earlier, whose maker may have been told they hold it.",
+        );
+    }
+    note
+}
+
+/// How a member whose clock is too far from the claimant's is described.
+const CLOCKS_APART: &str = "has a clock more than";
+
+/// How the author of a post the claim is stamped before, although made after, is described.
+const STAMPED_AHEAD: &str = "made a post stamped more than";
+
+/// The claim-protocol `type`s an agreement compares (V210-168).
+const CLAIM_TYPES: &[&str] = &[
+    claim::CLAIM,
+    claim::RELEASE,
+    claim::HANDOFF,
+    claim::RENEW,
+    vox_agentcomms::envelope::work::DECLINE,
+];
+
+/// How many agreement rounds a claim asks for while claim posts keep arriving between the node's
+/// answer and this client's read of the same posts.
+const AGREE_TRIES: usize = 3;
+
+/// **Does every other member of the room fold this claim as `me`'s?** (V210-168)
+///
+/// The node asks every member it can reach whether it holds this claim, and which claim posts it
+/// holds, pulls what they hold that it does not, and reports each member's set against its own
+/// ([`vox_core::node::agreestream`]). Each set is folded here, as this node's own is. Returns
+/// this node's fold after that, and, for every member that does not fold to `me`, why.
+async fn agreement(
+    paths: &Paths,
+    done: &Done,
+    me: &Owner,
+    resource: &str,
+) -> Result<(claim::Fold, Vec<(Digest32, String)>), AppError> {
+    use vox_core::node::agreestream::Agreement;
+    let mut client = attach(paths).await?;
+    let types: Vec<String> = CLAIM_TYPES.iter().map(|t| (*t).to_owned()).collect();
+    for _ in 0..AGREE_TRIES {
+        let report = match client
+            .request(&Request::Agree {
+                channel_id: done.cid,
+                entry: done.posting.entry_hash,
+                types: types.clone(),
+            })
+            .await
+        {
+            Ok(Frame::Agreement { report }) => report,
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+        // The node compared its posts as they were when it answered; these must be the same ones.
+        let rows = coord::structured(&mut client, done.cid, CLAIM_TYPES, &[]).await?;
+        if rows.len() as u64 != report.mine {
+            continue;
+        }
+        let posted = coord::posted_of(&rows);
+        let now = coord::now_millis();
+        let own = claim::fold(&posted, coord::VERSION, now);
+        let mut why = Vec::new();
+        for (member, stands) in &report.members {
+            let reason = match stands {
+                Agreement::Holds { unseen, .. } if !unseen.is_empty() => {
+                    Some("holds claims this node has not received".to_owned())
+                }
+                Agreement::Holds { absent, .. } => {
+                    let theirs: Vec<Posted> = posted
+                        .iter()
+                        .filter(|p| !absent.contains(&p.entry_hash))
+                        .cloned()
+                        .collect();
+                    match claim::fold(&theirs, coord::VERSION, now)
+                        .resources
+                        .get(resource)
+                    {
+                        Some(State::Held { owner, .. }) if owner == me => None,
+                        Some(State::Held { owner, .. }) => {
+                            Some(format!("sees {} holding it", who(owner)))
+                        }
+                        Some(State::Pending { .. }) => {
+                            Some("sees it reserved by a handoff".to_owned())
+                        }
+                        None => Some("sees nobody holding it".to_owned()),
+                    }
+                }
+                Agreement::NotReceived => Some(
+                    "has not received your claim (each of you must trust the other)".to_owned(),
+                ),
+                Agreement::NotHeld => Some("does not count you a member of this room".to_owned()),
+                Agreement::TooDifferent => {
+                    Some("holds claims too different from this node's to compare".to_owned())
+                }
+                Agreement::Unreachable => Some("could not be reached".to_owned()),
+                Agreement::Unanswered => Some("did not answer in time".to_owned()),
+                Agreement::ClocksApart => Some(format!(
+                    "{CLOCKS_APART} {} minutes away from yours, too far apart to order claims by; \
+                     set both clocks right",
+                    vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
+                )),
+                Agreement::StampedAhead => Some(format!(
+                    "{STAMPED_AHEAD} {} minutes ahead of your clock, and your claim is stamped \
+                     before it although it was made after; check both clocks",
+                    vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
+                )),
+            };
+            if let Some(r) = reason {
+                why.push((*member, r));
+            }
+        }
+        return Ok((own, why));
+    }
+    Err(AppError::Usage(
+        "the room's claims kept changing while its members were asked; run the claim again".into(),
+    ))
 }
 
 /// `vox room release` — give a resource up. Only the exact holding session's release
@@ -1561,18 +2065,9 @@ pub async fn handoff_resource(
     // to different owners on different nodes (ADR-021 F2).
     let to_fp = {
         let (mut client, cid, _) = open_room(paths, room).await?;
-        let members = match client.request(&Request::Roster { channel_id: cid }).await {
-            Ok(Frame::Members { members }) => members,
-            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-            Err(e) => return Err(AppError::Usage(e.to_string())),
-        };
-        resolve_prefix(to, &members).map_err(|e| {
-            AppError::Usage(format!(
-                "--to names a room member by fingerprint (a unique prefix of one in \
-                 `vox room roster`): {e}"
-            ))
-        })?
+        let members = members_of(&mut client, cid).await?;
+        crate::ident::resolve_member(to, &members, crate::ident::names())
+            .map_err(|e| AppError::Usage(format!("refusing --to: {e}")))?
     };
     let ttl = ttl_secs.unwrap_or(claim::DEFAULT_HANDOFF_TTL_SECS);
     if ttl == 0 {
@@ -1583,7 +2078,8 @@ pub async fn handoff_resource(
     let mut data = serde_json::Map::new();
     data.insert("resource".into(), resource.into());
     data.insert("to_fp".into(), claim::b32(&to_fp).into());
-    data.insert("to".into(), to.into());
+    // The fingerprint, not the word typed: a name is the poster's own and means nothing elsewhere.
+    data.insert("to".into(), claim::b32(&to_fp).into());
     data.insert("ttl_secs".into(), ttl.into());
     if let Some(s) = to_session.filter(|s| !s.is_empty()) {
         data.insert("to_session".into(), s.into());
@@ -1594,7 +2090,7 @@ pub async fn handoff_resource(
         opts,
         claim::HANDOFF,
         data,
-        format!("handing {resource} to {}", crate::ident::author_id(&to_fp)),
+        format!("handing {resource} to {}", crate::ident::name_of(&to_fp)),
     )
     .await?;
     let (ok, said) = match (&done.outcome, done.posting.after.fold.resources.get(resource)) {
@@ -1602,8 +2098,8 @@ pub async fn handoff_resource(
             true,
             format!(
                 "{resource} is reserved for {}{} until {}; it completes when that session claims it",
-                &crate::ident::author_id(&to_fp),
-                to_session.map(|s| format!("/{s}")).unwrap_or_default(),
+                &crate::ident::name_of(&to_fp),
+                to_session.map(|s| format!("/{}", session_name(s))).unwrap_or_default(),
                 millis_as_time(*deadline_millis)
             ),
         ),
@@ -1733,6 +2229,24 @@ pub async fn board(
 ) -> Result<(), AppError> {
     let (mut client, cid, room_key) = open_room(paths, room).await?;
     let snap = coord::snapshot(&mut client, cid).await?;
+    // The board's position is the whole room's: its row count and newest row, which the node
+    // counts rather than this reading every row (V210-120).
+    let (entries, last) = if json {
+        match client
+            .request(&vox_core::node::ipc::Request::Count {
+                channel_id: cid,
+                since: None,
+            })
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
+        {
+            vox_core::node::ipc::Frame::Count { n, last } => (n, last),
+            vox_core::node::ipc::Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        }
+    } else {
+        (0, None)
+    };
     let session = coord::session(session).unwrap_or_default();
     let me = Owner {
         author: snap.me,
@@ -1791,9 +2305,10 @@ pub async fn board(
                 "resources": resources,
                 "violations": violations,
                 "position": {
-                    "entries": snap.rows.len(),
-                    // A cursor, so never a message not received yet (V030-10).
-                    "last": snap.rows.iter().rev().find(|r| !r.owed).map(|r| claim::b32(&r.entry_hash)),
+                    // A cursor, so never a message not received yet (V030-10): the node's
+                    // `last` is the row that arrived last.
+                    "entries": entries,
+                    "last": last.map(|h| claim::b32(&h)),
                 },
                 "now_millis": snap.now_millis,
             })
@@ -1825,7 +2340,7 @@ pub async fn board(
                     Some(_) => " expired".to_owned(),
                     None => String::new(),
                 };
-                format!("{resource}\t{}{mine}{expiry}", who(owner))
+                format!("{}\t{}{mine}{expiry}", name(resource), who(owner))
             }
             State::Pending {
                 from,
@@ -1834,12 +2349,13 @@ pub async fn board(
                 deadline_millis,
                 ..
             } => format!(
-                "{resource}\tpending handoff from {} to {}{}{} (lapses in {}s)",
+                "{}\tpending handoff from {} to {}{}{} (lapses in {}s)",
+                name(resource),
                 who(from),
-                &crate::ident::author_id(to_fp),
+                &crate::ident::name_of(to_fp),
                 to_session
                     .as_ref()
-                    .map(|s| format!("/{s}"))
+                    .map(|s| format!("/{}", session_name(s)))
                     .unwrap_or_default(),
                 if s.is_eligible(&me) {
                     " — you may claim or decline it"
@@ -2271,7 +2787,7 @@ pub async fn get_file(
     for o in live {
         use std::fmt::Write as _;
         let short = &o.sha256[..o.sha256.len().min(16)];
-        let who = crate::ident::author_id(&o.author);
+        let who = crate::ident::name_of(&o.author);
         if o.sha256 == newest.sha256 {
             let _ = write!(
                 said,
@@ -2688,14 +3204,38 @@ async fn receive(bound: &str, mut file: std::fs::File, offer: &Offer) -> Result<
     Ok(total)
 }
 
-/// Read a passphrase from stdin, stripping exactly one trailing newline.
+/// A room passphrase from `--passphrase-file` (`-` reads stdin), stripping exactly one trailing
+/// newline; else asked for at the terminal, twice when `confirm`.
 ///
-/// Stdin rather than an argument: argv is visible to anything that can run `ps`.
-fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(|e| AppError::Usage(format!("reading {what} on stdin: {e}")))?;
+/// Never an argument: argv is visible to anything that can run `ps`. **Never stdin unasked**
+/// (V210-165): this read stdin to its end whenever there was no `--passphrase-file`, and an
+/// agent's harness leaves stdin open and writes nothing, so the command waited for ever, saying
+/// nothing. Without a terminal and without the flag it fails at once, saying how to give it.
+fn room_passphrase(
+    file: Option<&std::path::Path>,
+    what: &str,
+    confirm: bool,
+) -> Result<String, AppError> {
+    let Some(path) = file else {
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return Err(AppError::Usage(format!(
+                "this needs {what}, and there is no terminal to ask at.\n\
+                 \x20      {}",
+                crate::tunnel_cli::GIVE_ROOM_PASSPHRASE
+            )));
+        }
+        let first = crate::tunnel_cli::prompt_passphrase("room passphrase")?;
+        if first.is_empty() {
+            return Err(AppError::Usage(format!("no {what} was given")));
+        }
+        if confirm && crate::tunnel_cli::prompt_passphrase("again")? != first {
+            return Err(AppError::Usage(
+                "the two passphrases differ; nothing was done".into(),
+            ));
+        }
+        return Ok(first);
+    };
+    let buf = crate::tunnel_cli::passphrase_file_text(path)?;
     let p = buf
         .strip_suffix('\n')
         .unwrap_or(&buf)
@@ -2703,10 +3243,15 @@ fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
         .unwrap_or_else(|| buf.strip_suffix('\n').unwrap_or(&buf));
     if p.is_empty() {
         // The caller's phrase is a noun phrase ("the room's passphrase", "a passphrase
-        // for the new room"), so it reads as "expected <phrase> on stdin" and never as
-        // "no a passphrase", which is what "no {what}" produced.
+        // for the new room"), so it reads as "expected <phrase>" and never as "no a
+        // passphrase", which is what "no {what}" produced.
         return Err(AppError::Usage(format!(
-            "expected {what} on stdin — pipe it in, e.g. `echo … | vox room join …`"
+            "expected {what} in {}, and it is empty",
+            if path == std::path::Path::new("-") {
+                "stdin".to_owned()
+            } else {
+                path.display().to_string()
+            }
         )));
     }
     Ok(p.to_owned())
@@ -2723,9 +3268,62 @@ fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
 /// If the node cannot be reached, or the join is refused — and the refusal is
 /// reported as the node gave it, because `Unreachable` and a wrong passphrase need
 /// completely different responses from whoever holds the link.
-pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), AppError> {
-    let passphrase = passphrase_from_stdin("the room's passphrase")?;
+pub async fn join(
+    paths: &Paths,
+    link: &str,
+    local_name: &str,
+    passphrase_file: Option<&std::path::Path>,
+) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
+    // A room this node holds open is not joined again: its address is taken as where the room's
+    // host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
+    // is used.
+    let held = match vox_core::node::link::InviteLink::parse(link) {
+        Ok(parsed) => rooms_of(&mut client)
+            .await?
+            .into_iter()
+            .find(|(id, _, open)| *id == parsed.channel_id && *open)
+            .map(|(id, name, _)| {
+                if name.is_empty() {
+                    b32_encode(&id)
+                } else {
+                    name
+                }
+            }),
+        Err(_) => None,
+    };
+    if let Some(name) = held {
+        return match client
+            .request(&Request::Join {
+                link: link.to_owned(),
+                local_name: local_name.to_owned(),
+                passphrase: String::new(),
+            })
+            .await
+        {
+            Ok(Frame::Ok) => {
+                println!(
+                    "vox: this node already holds {name}; a member answered at the address \
+                     given, so it is kept as where the room's host is now"
+                );
+                Ok(())
+            }
+            Ok(Frame::Error { reason }) if reason.starts_with("Failed(Unreachable)") => {
+                Err(AppError::Usage(format!(
+                    "this node already holds {name}, and nobody answered at the address given; \
+                     nothing was changed{}",
+                    crate::tunnel_cli::join_detail(&reason)
+                )))
+            }
+            Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+                "this node already holds {name}; nothing was changed{}",
+                crate::tunnel_cli::join_detail(&reason)
+            ))),
+            Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => Err(AppError::Usage(e.to_string())),
+        };
+    }
+    let passphrase = room_passphrase(passphrase_file, "the room's passphrase", false)?;
     match client
         .request(&Request::Join {
             link: link.to_owned(),
@@ -2736,7 +3334,7 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
     {
         Ok(Frame::Ok) => {
             println!("vox: joined {local_name}");
-            println!("     you can read this room; whether anyone can read YOU is their decision");
+            println!("     you read a member once you trust it and it trusts you: `vox trust add`");
             Ok(())
         }
         // The daemon sends the outcome's name; turn it into the same guidance `vox connect`
@@ -2760,8 +3358,12 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
 ///
 /// # Errors
 /// If the node cannot be reached or the create is refused.
-pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
-    let passphrase = passphrase_from_stdin("a passphrase for the new room")?;
+pub async fn create(
+    paths: &Paths,
+    local_name: &str,
+    passphrase_file: Option<&std::path::Path>,
+) -> Result<(), AppError> {
+    let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
     let mut client = attach(paths).await?;
     match client
         .request(&Request::Create {
@@ -2837,6 +3439,53 @@ pub async fn retention(
     }
 }
 
+/// `vox room leave` — leave a room (V210-164).
+///
+/// The node writes its departure into the room and answers once another member has it; then
+/// the room is gone from this node. The other members stop listing this identity in the
+/// room's roster.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown or closed, or no other member could be
+/// told in time (the node then leaves as soon as one can be).
+pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let rooms = rooms_of(&mut client).await?;
+    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
+    if ids.is_empty() {
+        return Err(AppError::Usage("this node holds no rooms".into()));
+    }
+    let channel_id = resolve_prefix(room, &ids)?;
+    let name = rooms
+        .iter()
+        .find(|(r, _, _)| *r == channel_id)
+        .map(|(_, n, _)| n.clone())
+        .unwrap_or_default();
+    let which = if name.is_empty() {
+        format!("room {}", b32_encode(&channel_id))
+    } else {
+        format!("room {name:?} ({})", b32_encode(&channel_id))
+    };
+    if rooms.iter().any(|(r, _, open)| *r == channel_id && !open) {
+        return Err(AppError::Usage(format!(
+            "{which} is closed on this node, and leaving is said in the room\n       open it \
+             first: in `vox tui`, or a line with its passphrase to `vox daemon`"
+        )));
+    }
+    match client.request(&Request::Leave { channel_id }).await {
+        Ok(Frame::Ok) => {
+            println!("vox: left {which}");
+            println!("     its other members see that you left; this node no longer holds it");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("{which} was not left: {reason}")))
+        }
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox room invite` — print a room's address for someone else to join with.
 ///
 /// The address is rendezvous information, not a credential: it names the room and
@@ -2877,27 +3526,54 @@ pub async fn node_is_running(paths: &Paths) -> bool {
     sock.exists() && IpcClient::open(&sock).await.is_ok()
 }
 
+/// Send a keyring change, giving the identity passphrase only when the node says it needs it
+/// (V210-159): within 30 minutes of its last entry none is needed. `given` is what the command line
+/// gave (`--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`); it is sent at once, and a right
+/// one starts the window again. With none given and the window passed, it is asked for at the
+/// terminal and the change sent again; with no terminal, the node's reason is the answer.
+async fn keyring_change(
+    client: &mut IpcClient,
+    given: Option<String>,
+    request: impl Fn(String) -> Request,
+) -> Result<Frame, AppError> {
+    let asked = given.is_none();
+    let reply = client
+        .request(&request(given.unwrap_or_default()))
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let needed = vox_core::node::api::Fault::PassphraseNeeded.explain();
+    match reply {
+        Frame::Error { reason }
+            if asked && reason == needed && std::io::IsTerminal::is_terminal(&std::io::stdin()) =>
+        {
+            eprintln!("vox: {}", reason.lines().next().unwrap_or_default());
+            let passphrase = crate::tunnel_cli::ask_identity_passphrase()?;
+            client
+                .request(&request(passphrase))
+                .await
+                .map_err(|e| AppError::Usage(e.to_string()))
+        }
+        other => Ok(other),
+    }
+}
+
 /// `vox trust add`, asked of the running node instead of a second one.
-///
-/// The keyring is the one thing an agent session must not be able to change (ADR-020 §7),
-/// so the request carries the identity passphrase and the node checks it before doing
-/// anything. That is what makes this safe to put on a socket an agent can reach.
 pub async fn trust_add(
     paths: &Paths,
     target: Digest32,
     petname: &str,
-    identity_passphrase: &str,
+    given: Option<String>,
     full_history: bool,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client
-        .request(&Request::Trust {
-            target,
-            petname: petname.to_owned(),
-            identity_passphrase: identity_passphrase.to_owned(),
-            full_history,
-        })
-        .await
+    crate::ident::check_new_name(crate::ident::names(), &target, petname)?;
+    match keyring_change(&mut client, given, |identity_passphrase| Request::Trust {
+        target,
+        petname: petname.to_owned(),
+        identity_passphrase,
+        full_history,
+    })
+    .await
     {
         Ok(Frame::Ok) => {
             println!(
@@ -2908,25 +3584,29 @@ pub async fn trust_add(
                 println!("     with full history: it may also read what you wrote before now");
             }
             println!("     it may now read what you write in every room you share — now and later");
+            println!("     and you read what it writes, once it trusts you too");
             println!("     and reach every service you bind to a room you are both in");
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
+        Err(e) => Err(e),
     }
 }
 
-/// `vox trust rename`, asked of the running node: only an identity already trusted.
+/// `vox trust rename`, asked of the running node: only an identity already trusted. A keyring
+/// change, so the identity passphrase is asked for only when the node says it is needed
+/// (V210-159), as `vox trust add` and `remove` do.
 pub async fn trust_rename(
     paths: &Paths,
     fingerprint: &str,
     name: &str,
-    identity_passphrase: &str,
+    given: Option<String>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    let entries = match client.trusted(identity_passphrase).await {
+    // A read, so no passphrase (V210-165).
+    let entries = match client.trusted("").await {
         Ok(Frame::Trusted { entries }) => entries,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
@@ -2939,17 +3619,18 @@ pub async fn trust_rename(
              `vox trust add` it first"
         ))
     })?;
-    match client
-        .request(&Request::Rename {
-            target,
-            petname: name.to_owned(),
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
+    crate::ident::check_new_name(&entries, &target, name)?;
+    match keyring_change(&mut client, given, |identity_passphrase| Request::Rename {
+        target,
+        petname: name.to_owned(),
+        identity_passphrase,
+    })
+    .await
     {
         Ok(Frame::Ok) => {
             println!(
-                "vox: {} is now {name:?} — reachable as {}.<room>.vox",
+                "vox: {} is now {name:?} — its services are reachable as \
+                 <service>.{}.<room>.vox",
                 short(&target),
                 vox_core::node::resolver::label_of(name)
             );
@@ -2957,7 +3638,7 @@ pub async fn trust_rename(
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
+        Err(e) => Err(e),
     }
 }
 
@@ -2965,15 +3646,14 @@ pub async fn trust_rename(
 pub async fn trust_remove(
     paths: &Paths,
     target: Digest32,
-    identity_passphrase: &str,
+    given: Option<String>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client
-        .request(&Request::Untrust {
-            target,
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
+    match keyring_change(&mut client, given, |identity_passphrase| Request::Untrust {
+        target,
+        identity_passphrase,
+    })
+    .await
     {
         Ok(Frame::Ok) => {
             println!(
@@ -2985,14 +3665,14 @@ pub async fn trust_remove(
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
+        Err(e) => Err(e),
     }
 }
 
-/// `vox trust list`, asked of the running node.
-pub async fn trust_list(paths: &Paths, identity_passphrase: &str) -> Result<(), AppError> {
+/// `vox trust list`, asked of the running node: a read, so no passphrase (V210-165).
+pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client.trusted(identity_passphrase).await {
+    match client.trusted("").await {
         Ok(Frame::Trusted { entries }) => {
             if entries.is_empty() {
                 println!("no trusted identities");

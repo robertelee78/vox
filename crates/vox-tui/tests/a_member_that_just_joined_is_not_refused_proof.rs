@@ -15,15 +15,29 @@
 //! 1. no joiner reports a failed sync as a governance, malformed-data or authenticator failure;
 //! 2. alice reads each joiner's first post within [`READ_WITHIN`] of it being posted.
 //!
-//! It prints how many syncs a joiner was told "not a member of the room yet" (`NotYetMember`): the
-//! honest name for that window, which the push retry resolves.
+//! 3. **the window was reached**: at least one joiner was told "not a member of the room yet"
+//!    (`NotYetMember`), the honest name for it, which the push retry resolves. A run in which none
+//!    was is `PRODUCT (staging)`, never a pass: it would have passed with the
+//!    defect present (V210-106).
 //!
-//! **Why it makes load.** The window is a race between the joiner's first session with its anchor
-//! and its first records landing there, and on an idle machine the records nearly always win: #202's
-//! proof met it once in 42 reports unloaded and in 3 of 8 runs with one busy process per core. So
-//! this proof runs one `yes` per core while the joiners join — started here, killed here by PID, and
-//! checked gone — and each joiner is a fresh chance. Run it alone (the timing lock), as every
+//! **How the window is forced.** It is a race between the joiner's first session with its anchor
+//! and its address record landing there, and the record usually wins: with #261 on the tree, runs
+//! met the window in 0 of 4. So each joiner's daemon runs with the test-only
+//! `VOX_TEST_HOLD_ADDRESS_MS` = [`HOLD_ADDRESS_MS`] (the `test-knobs` feature, V210-105), which keeps
+//! its address record off every board for that long after it joins, while its bundle goes as usual
+//! and is mirrored by alice. Its first syncs with the anchor then meet an anchor that knows it only
+//! by its pre-join record and that bundle — every joiner, every run. The proof refuses as CANNOT
+//! MEASURE a `vox` built without the knob.
+//!
+//! **Why it still makes load.** The other three refusals below are races of their own, so the proof
+//! runs one `yes` per core while the joiners join — started here, killed here by PID, and checked
+//! gone — and each joiner is a fresh chance. Run it alone (the timing lock), as every
 //! timing-sensitive proof is.
+//!
+//! **Mutation that must turn it red:** a joiner's pre-join record dropped when the bundle that
+//! admits it lands (#297 c1, which ac-ver286c2 caught): the anchor then knows the joiner as neither
+//! member nor pending joiner, refuses its sync uninformatively, and it reports "authenticator
+//! invalid" — a PRODUCT red.
 //!
 //! What it guards is four refusals of a member at join, each once sent as `0x05`: the anchor's gate
 //! refusing a pending joiner (now `NotYetMember`), the joiner's gate and actor refusing the member
@@ -32,13 +46,24 @@
 //! runs of 5. Each path alone is rare: a mutant restoring one of them was green in 2 runs of 2 with
 //! four joiners, which is why there are eight.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_member_that_just_joined_is_not_refused_by_its_anchor);
 
 #[path = "support/world.rs"]
 mod world;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -59,6 +84,9 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 const ROOM_PASS: &str = "room pass";
 /// What a joiner is told when its anchor does not know it yet (`WireError::NotYetMember`).
 const NOT_YET: &str = "not know this node as a member";
+/// How long each joiner keeps its address record off the boards after it joins
+/// (`VOX_TEST_HOLD_ADDRESS_MS`): long enough that its first post's push meets the anchor first.
+const HOLD_ADDRESS_MS: u64 = 10_000;
 
 /// One `yes` per core, for as long as this is held; killed by PID when dropped, and checked gone.
 struct Load(Vec<Child>);
@@ -72,7 +100,7 @@ impl Load {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
-                    .expect("spawn yes")
+                    .expect("APPARATUS: spawn yes")
             })
             .collect();
         eprintln!("[proof] load: {cores} `yes` process(es), one per core");
@@ -106,14 +134,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
+    let out = child.wait_with_output().expect("APPARATUS: vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -121,8 +149,8 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     )
 }
 
-fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
-    let p = VoxProc::spawn(
+fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, env: &[(&str, &str)]) -> VoxProc {
+    let p = VoxProc::spawn_env(
         name,
         data,
         &args(&[
@@ -132,8 +160,11 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
+        env,
     );
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
@@ -142,23 +173,25 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "real vox processes, production Argon2id and deliberate CPU load; run alone, in release"]
 fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
+    test_knobs::require(&["VOX_TEST_HOLD_ADDRESS_MS"]);
     // A join per joiner; unlocks: a `vox id` and a daemon per member, two `trust add`s per joiner,
     // and the room created.
     watchdog::arm_for_setup(JOINERS.len() as u32, 4 * JOINERS.len() as u32 + 3);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write a staging file");
 
     let anchor_dir = dir("anchor");
     let mut anchor = VoxProc::spawn(
@@ -177,7 +210,7 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     let alice_dir = dir("alice");
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     };
     let alice_fp = fp(&alice_dir);
@@ -187,7 +220,7 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         .lines()
         .find_map(|l| l.split("identity ").nth(1))
         .map(|f| f.trim().to_owned())
-        .expect("the anchor names its identity");
+        .expect("PRODUCT (staging): the anchor names its identity");
     let mut names: Vec<(String, &str)> =
         vec![(anchor_fp, "the anchor"), (alice_fp.clone(), "alice")];
     let joiners: Vec<(&str, std::path::PathBuf)> = JOINERS.iter().map(|n| (*n, dir(n))).collect();
@@ -195,32 +228,46 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         let their = fp(d);
         names.push((their.clone(), name));
         let (ok, out, err) = vox_once(&alice_dir, &args(&["trust", "add", &their, "--name", name]));
-        assert!(ok, "alice trusts {name}: {out}{err}");
+        assert!(ok, "PRODUCT (staging): alice trusts {name}: {out}{err}");
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", &alice_fp, "--name", "alice"]));
-        assert!(ok, "{name} trusts alice: {out}{err}");
+        assert!(ok, "PRODUCT (staging): {name} trusts alice: {out}{err}");
     }
 
-    let mut alice = daemon("alice", &alice_dir, &spec, &idpass);
+    let mut alice = daemon("alice", &alice_dir, &spec, &idpass, &[]);
     let (ok, out, err) = vox_in(
         &alice_dir,
-        &["room", "create", "--name", "family"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "family",
+        ],
         &format!("{ROOM_PASS}\n"),
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("family"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): room not listed: {list}"))
         .to_owned();
 
     // The joiners' daemons are up before the load: what is measured is the join, not start-up.
+    let hold = HOLD_ADDRESS_MS.to_string();
     let mut procs: Vec<(&str, std::path::PathBuf, VoxProc)> = joiners
         .into_iter()
         .map(|(name, d)| {
-            let p = daemon(name, &d, &spec, &idpass);
+            let p = daemon(
+                name,
+                &d,
+                &spec,
+                &idpass,
+                &[("VOX_TEST_HOLD_ADDRESS_MS", &hold)],
+            );
             (name, d, p)
         })
         .collect();
@@ -231,16 +278,24 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         let _load = Load::start();
         for (name, d, _) in &procs {
             let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-            assert!(ok, "vox room invite: {err}");
+            assert!(ok, "PRODUCT (staging): vox room invite: {err}");
             let (ok, out, err) = vox_in(
                 d,
-                &["room", "join", link.trim(), "--name", "family"],
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    link.trim(),
+                    "--name",
+                    "family",
+                ],
                 &format!("{ROOM_PASS}\n"),
             );
-            assert!(ok, "{name} joins: {out}{err}");
+            assert!(ok, "PRODUCT: {name}'s `vox room join` failed: {out}{err}");
             let said = format!("{name} is here");
             let (ok, _, err) = vox_once(d, &args(&["room", "post", &room, &said]));
-            assert!(ok, "{name} posts: {err}");
+            assert!(ok, "PRODUCT: {name}'s `vox room post` failed: {err}");
             let posted = Instant::now();
             loop {
                 let (_, read, _) = vox_once(&alice_dir, &args(&["room", "read", &room]));
@@ -250,8 +305,8 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
                 }
                 assert!(
                     posted.elapsed() < READ_WITHIN,
-                    "alice did not read {name}'s first post within {READ_WITHIN:?} of it being \
-                     posted"
+                    "PRODUCT: alice did not read {name}'s first post within {READ_WITHIN:?} of it \
+                     being posted"
                 );
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -302,8 +357,17 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         .collect();
     assert!(
         misnamed.is_empty(),
-        "a member that had just joined reported a failed sync as a governance, malformed-data or \
-         authenticator failure: {misnamed:#?}"
+        "PRODUCT: a member that had just joined reported a failed sync as a governance, \
+         malformed-data or authenticator failure: {misnamed:#?}"
+    );
+    // Green only if the window was met: with no sync told "not a member yet", nothing above was
+    // asked of the anchor while it knew a joiner only by its pre-join record, and the defect would
+    // have passed too.
+    assert!(
+        not_yet > 0,
+        "PRODUCT (staging): no joiner's sync was told \"not a member yet\", so \
+         no joiner synced with the anchor while it knew it only by its pre-join record, though each \
+         held its address record back for {HOLD_ADDRESS_MS} ms"
     );
     let _ = anchor.transcript();
 }

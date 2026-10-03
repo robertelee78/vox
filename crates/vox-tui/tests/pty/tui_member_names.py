@@ -5,7 +5,9 @@ Alice creates a room; Bob and Carol join it, all through real daemons. Bob trust
 "alice" and does not trust Carol. Bob's daemon is stopped and his real `vox tui` is opened in a
 pty (pyte at 160x50). His members pane must name Alice "alice" (not her fingerprint), and Carol by
 26 characters of her fingerprint followed by "(not in keyring)", whole. Exit 0 = pass, 1 = red
-(the product's), 2 = apparatus (CANNOT MEASURE). Every process is recorded and killed by PID.
+(the product's), 2 = apparatus (CANNOT MEASURE). A `vox` step on the way that fails (an identity,
+a daemon, create, invite, join, trust, the roster) is the product's red: it prints `PRODUCT:` with
+what `vox` said and exits 1. Every process is recorded and killed by PID.
 
 Every wait is bounded by what the product allows: `vox room join` by JOIN_SECS, every other verb
 by 120 s, and a verb past its bound is a named product RED. The driver's own budget (`vox_pty.py`,
@@ -75,6 +77,11 @@ def until(pred, secs, step=0.5):
 def apparatus(why):
     print(f"{TAG} APPARATUS: {why}"); sys.exit(2)
 
+def product(why):
+    global code
+    code = 1
+    print(f"{TAG} PRODUCT: {why}"); print(f"{TAG} RED"); sys.exit(1)
+
 tui = None
 code = 2
 try:
@@ -86,32 +93,43 @@ try:
         m = re.search(r"[a-z2-7]{52}@/ip4/127\.0\.0\.1/udp/\d+", open(f"{S}/anchor.out").read())
         spec = m.group(0) if m else None
         return spec
-    if not until(got_spec, 30): apparatus("anchor spec")
+    if not until(got_spec, 30):
+        product("the anchor `vox node` printed no spec within 30 s: " + open(f"{S}/anchor.err").read())
     stage("identities and daemons")
     fp = {}
     for w in ("alice", "bob", "carol"):
         r = run(w, "id", "--identity-passphrase-file", f"{S}/idpass")
-        if r.returncode != 0: apparatus(f"{w} id: {r.stderr}")
-        fp[w] = re.search(r"[a-z2-7]{52}", r.stdout).group(0)
+        if r.returncode != 0: product(f"{w}'s `vox id` failed: {r.stderr}")
+        m = re.search(r"[a-z2-7]{52}", r.stdout)
+        if m is None: product(f"{w}'s `vox id` printed no fingerprint: {r.stdout!r}")
+        fp[w] = m.group(0)
     daemons = {w: spawn(w, "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
                         "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol")}
     for w in daemons:
-        if not until(lambda: run(w, "room", "list").returncode == 0, 60): apparatus(f"{w} daemon")
+        if not until(lambda: run(w, "room", "list").returncode == 0, 60):
+            product(f"{w}'s daemon never answered `vox room list` within 60 s: " + open(f"{S}/{w}.err").read())
     stage("room create, invite, join")
-    if run("alice", "room", "create", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
-    room = run("alice", "room", "list").stdout.split()[0]
-    link = run("alice", "room", "invite", room).stdout.strip()
+    c = run("alice", "room", "create", "--passphrase-file", "-", "--name", "m", stdin="room pass")
+    if c.returncode != 0: product(f"alice's `vox room create` failed: {c.stderr.strip()}")
+    listed = run("alice", "room", "list")
+    if not listed.stdout.split(): product(f"alice's `vox room list` shows no room after create: {listed.stderr.strip()}")
+    room = listed.stdout.split()[0]
+    inv = run("alice", "room", "invite", room)
+    if inv.returncode != 0: product(f"alice's `vox room invite` failed: {inv.stderr.strip()}")
+    link = inv.stdout.strip()
     for w in ("bob", "carol"):
-        j = run(w, "room", "join", link, "--name", "m", stdin="room pass")
-        if j.returncode != 0: apparatus(f"{w} join: {j.stderr.strip()}")
+        j = run(w, "room", "join", "--passphrase-file", "-", link, "--name", "m", stdin="room pass")
+        if j.returncode != 0: product(f"{w}'s `vox room join` failed: {j.stderr.strip()}")
     t = run("bob", "trust", "add", fp["alice"], "--name", "alice", "--identity-passphrase-file", f"{S}/idpass")
-    if t.returncode != 0: apparatus(f"trust add: {t.stderr}")
+    if t.returncode != 0: product(f"bob's `vox trust add` failed: {t.stderr.strip()}")
     stage("bob's roster")
     # Bob's node must know both members before its TUI is opened.
     def roster():
         r = run("bob", "room", "roster", room)
         return r.returncode == 0 and fp["alice"] in r.stdout and fp["carol"] in r.stdout
-    if not until(roster, 90, 1): apparatus("bob never listed both alice and carol: " + run("bob", "room", "roster", room).stdout)
+    if not until(roster, 90, 1):
+        last = run("bob", "room", "roster", room)
+        product(f"bob's `vox room roster` never listed both alice and carol within 90 s: {last.stdout}{last.stderr}")
     stop(daemons["bob"])
 
     stage("bob's tui: unlock and open the room")

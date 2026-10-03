@@ -48,6 +48,9 @@ use crate::transport::identity_cert::verify_peer_certificate;
 #[derive(Clone, Debug, Default)]
 pub struct VerifiedPeer {
     inner: Arc<Mutex<Option<Digest32>>>,
+    /// Why this end's verifier refused the peer, for this end's own error only: the wire carries
+    /// one uninformative alert whatever the reason (V210-143).
+    rejected: Arc<Mutex<Option<String>>>,
 }
 
 impl VerifiedPeer {
@@ -72,6 +75,24 @@ impl VerifiedPeer {
             *g = Some(fp);
         }
     }
+
+    /// Why this end's verifier refused the peer's certificate, if it did.
+    #[must_use]
+    pub fn rejection(&self) -> Option<String> {
+        self.rejected.lock().map_or(None, |g| g.clone())
+    }
+
+    fn reject(&self, why: String) {
+        if let Ok(mut g) = self.rejected.lock() {
+            *g = Some(why);
+        }
+    }
+}
+
+/// The first 26 base32 characters of a fingerprint, as the node's own messages name a peer.
+fn short(fp: &Digest32) -> String {
+    let full = crate::node::link::b32_encode(fp);
+    full.chars().take(26).collect()
 }
 
 /// Who a verifier requires the peer to be.
@@ -93,12 +114,24 @@ fn authenticate(
     expect: &Expectation,
     out: &VerifiedPeer,
 ) -> Result<Digest32, Error> {
-    let identity: CompositePublicKey = verify_peer_certificate(cert.as_ref())
-        .map_err(|_| Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure))?;
+    let identity: CompositePublicKey = verify_peer_certificate(cert.as_ref()).map_err(|e| {
+        out.reject(format!(
+            "the peer's certificate carries no valid Vox identity ({e})"
+        ));
+        Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
+    })?;
     let fp = identity.fingerprint();
     match expect {
         Expectation::Pinned(expected) if &fp != expected => {
-            // Wrong identity: collapse to the same error as "no identity".
+            // Wrong identity: on the wire, the same error as "no identity", so a peer learns
+            // nothing from which check failed. This end says which (V210-143): an honest peer
+            // that answered in another's place — a port another process shares — was reported as
+            // "signature verification failed", and nothing said who had answered.
+            out.reject(format!(
+                "the peer that answered is {}, not the expected {}",
+                short(&fp),
+                short(expected)
+            ));
             return Err(Error::InvalidCertificate(
                 CertificateError::ApplicationVerificationFailure,
             ));

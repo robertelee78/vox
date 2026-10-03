@@ -27,7 +27,7 @@
 //!   time restarted from the cursor it had persisted.
 //! - then the consumer's **node** killed with SIGKILL and started again (ADR-021 F19), after
 //!   alice and bob have posted alternately so bob's local order differs from canonical
-//!   order (the proof says CANNOT MEASURE if it does not).
+//!   order (the proof says PRODUCT (staging) if it does not).
 //!
 //! - a **second consumer** of the same room on the same node, attached at the same time
 //!   and never paused or killed, as a second tracker's adapter would be (RP-18, RP-45).
@@ -54,7 +54,7 @@
 //! meaning across a reboot was read from the code, not proved.
 //!
 //! Every red says whose it is: `PRODUCT:` for what the node or `vox room tail` did,
-//! `CANNOT MEASURE:` for staging that was not achieved.
+//! `PRODUCT (staging):` for staging that was not achieved.
 //!
 //! ## Mutations
 //! - the node's subscription pumps share one lock across their socket writes: the frozen
@@ -98,13 +98,20 @@ fn start(w: &Worker, r: &str, cursor: &str, stderr: &std::path::Path) -> Run {
                 .create(true)
                 .append(true)
                 .open(stderr)
-                .unwrap(),
+                .expect("APPARATUS: cannot open the tail's stderr file"),
         );
     for v in HARNESS_SESSION_VARS {
         cmd.env_remove(v);
     }
-    let mut child = cmd.spawn().expect("spawn tail");
-    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox room tail: {e}"));
+    let mut lines = BufReader::new(
+        child
+            .stdout
+            .take()
+            .expect("APPARATUS: the tail was spawned without a stdout pipe"),
+    );
     let (tx, rx) = std::sync::mpsc::channel();
     let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let p = paused.clone();
@@ -147,11 +154,7 @@ fn signal(run: &Run, sig: &str) {
         .args([sig, &run.child.id().to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(
-        ok,
-        "CANNOT MEASURE: staging not achieved — `kill {sig} {}` failed",
-        run.child.id()
-    );
+    assert!(ok, "APPARATUS: `kill {sig} {}` failed", run.child.id());
 }
 
 /// Process up to `n` rows, waiting at most `idle` for each, persisting the cursor after
@@ -177,7 +180,12 @@ fn consume(
             row["schema"], "vox.room.row/1",
             "PRODUCT: `vox room tail --json` printed a row of another schema"
         );
-        let h = row["entry_hash"].as_str().unwrap().to_owned();
+        let h = row["entry_hash"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: `vox room tail --json` printed a row with no entry_hash: {row}")
+            })
+            .to_owned();
         *seen.entry(h.clone()).or_default() += 1;
         *cursor = h; // persisted AFTER processing
         got += 1;
@@ -205,7 +213,9 @@ impl Steady {
             while let Ok(line) = feed.recv() {
                 let row: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_default();
                 if let Some(h) = row["entry_hash"].as_str() {
-                    into.lock().unwrap().push(h.to_owned());
+                    into.lock()
+                        .expect("APPARATUS: the second consumer's row lock")
+                        .push(h.to_owned());
                 }
             }
         });
@@ -214,7 +224,12 @@ impl Steady {
 
     /// The distinct rows it has emitted so far.
     fn distinct(&self) -> BTreeSet<String> {
-        self.rows.lock().unwrap().iter().cloned().collect()
+        self.rows
+            .lock()
+            .expect("APPARATUS: the second consumer's row lock")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Wait up to `secs` for it to hold at least `n` distinct rows; how many it holds.
@@ -268,8 +283,8 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: cannot build the proof's runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let mut room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
@@ -341,11 +356,16 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let board = bob.vox(None, &["room", "board", &r, "--json"]).json();
     let from_board: BTreeMap<String, (String, String)> = board["resources"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `vox room board --json` has no resources list: {board}")
+        })
         .iter()
         .map(|x| {
             (
-                x["resource"].as_str().unwrap().to_owned(),
+                x["resource"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("PRODUCT: a board resource has no name: {x}"))
+                    .to_owned(),
                 (
                     x["owner_fp"].as_str().unwrap_or("").to_owned(),
                     x["owner_session"].as_str().unwrap_or("").to_owned(),
@@ -377,9 +397,12 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     mark!("fold half done");
 
     // ---- the stream half ----
-    let start_cursor = rows.last().unwrap()["entry_hash"]
-        .as_str()
-        .unwrap()
+    let start_cursor = rows
+        .last()
+        .and_then(|row| row["entry_hash"].as_str())
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): `vox room read --json` gave no last row with an entry_hash")
+        })
         .to_owned();
     let stderr = tmp.path().join("tail.stderr");
 
@@ -403,7 +426,9 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let mut restarts = 0;
     let idle = Duration::from_secs(10);
     let kill = |run: &mut Run, restarts: &mut u32, cursor: &str, seen: &BTreeMap<String, u32>| {
-        run.child.kill().unwrap(); // SIGKILL, mid-stream
+        run.child
+            .kill()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot SIGKILL the tail: {e}")); // mid-stream
         let _ = run.child.wait();
         *restarts += 1;
         eprintln!(
@@ -428,7 +453,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     assert_eq!(
         consume(&run, 1, idle, &mut cursor, &mut seen),
         1,
-        "CANNOT MEASURE: staging not achieved — the consumer was not subscribed and live \
+        "PRODUCT (staging): the consumer (`vox room tail`) was not subscribed and live \
          before it was to be frozen (no row within {idle:?})"
     );
     // Both clients are attached and live before one is frozen: the staging RP-18 and RP-45
@@ -436,7 +461,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     assert_eq!(
         steady.wait_for(1, 10),
         1,
-        "CANNOT MEASURE: staging not achieved — the second consumer was not subscribed and \
+        "PRODUCT (staging): the second consumer (`vox room tail`) was not subscribed and \
          live before the first was to be frozen (no row within 10s)"
     );
     run.paused.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -531,14 +556,21 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     .ndjson();
     let after: Vec<String> = all
         .iter()
-        .map(|x| x["entry_hash"].as_str().unwrap().to_owned())
+        .map(|x| {
+            x["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("PRODUCT: `vox room read --json` printed a row with no entry_hash: {x}")
+                })
+                .to_owned()
+        })
         .skip_while(|h| *h != start_cursor)
         .skip(1)
         .collect();
     assert_eq!(
         after.len(),
         1800,
-        "CANNOT MEASURE: staging not achieved — the log after the starting cursor is not the \
+        "PRODUCT (staging): bob's log after the starting cursor is not the \
          1,800-message burst"
     );
     mark!("log holds 1800");
@@ -568,7 +600,12 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         .iter()
         .filter(|h| !steady_rows.contains(**h))
         .count();
-    let steady_dups = steady.rows.lock().unwrap().len() - steady_rows.len();
+    let steady_dups = steady
+        .rows
+        .lock()
+        .expect("APPARATUS: the second consumer's row lock")
+        .len()
+        - steady_rows.len();
     eprintln!(
         "[proof] second client: {held} distinct rows held; missing {steady_missing} of {}; \
          duplicated {steady_dups}; still running {still_running}; lag reports {}",
@@ -617,7 +654,7 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     );
     assert!(
         lags > 0,
-        "CANNOT MEASURE: staging not achieved — the consumer never lagged, so this run proved \
+        "PRODUCT (staging): the consumer never lagged, so this run proved \
          nothing about lag"
     );
     assert!(
@@ -635,18 +672,15 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     // taken in one step, while hers needs a sync session of several round trips, so bob holds
     // his later row before her earlier one. A node that rebuilt canonically, or in any other
     // order, is then told apart from one that kept its order.
-    let bob_pid = bob.daemon_pid().unwrap_or_else(|| {
-        panic!("CANNOT MEASURE: staging not achieved — bob's daemon has no pid")
-    });
+    let bob_pid = bob
+        .daemon_pid()
+        .unwrap_or_else(|| panic!("APPARATUS: the harness kept no pid for bob's daemon"));
     let to_bob = |sig: &str| {
         let ok = Command::new("kill")
             .args([sig, &bob_pid.to_string()])
             .status()
             .is_ok_and(|s| s.success());
-        assert!(
-            ok,
-            "CANNOT MEASURE: staging not achieved — `kill {sig} {bob_pid}` failed"
-        );
+        assert!(ok, "APPARATUS: `kill {sig} {bob_pid}` failed");
     };
     for i in 0..20 {
         to_bob("-STOP");
@@ -659,7 +693,8 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             bobs.join()
         });
         assert!(o.ok, "PRODUCT: alice's post {i} was refused: {o:?}");
-        let o = posted.unwrap_or_else(|_| panic!("CANNOT MEASURE: bob's post {i} thread panicked"));
+        let o = posted
+            .unwrap_or_else(|_| panic!("APPARATUS: the thread posting bob's post {i} panicked"));
         assert!(o.ok, "PRODUCT: bob's post {i} was refused: {o:?}");
     }
     until(
@@ -728,12 +763,12 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     );
     assert!(
         off_canonical > 0,
-        "CANNOT MEASURE (staging not achieved): bob's local order equals canonical order, so a node \
+        "PRODUCT (staging): bob's local order equals canonical order, so a node \
          that rebuilt it canonically on reopen could not be told apart"
     );
     assert!(
         followed.len() >= 40,
-        "CANNOT MEASURE (staging not achieved): only {} rows follow the consumer's cursor {cursor}",
+        "PRODUCT (staging): only {} rows follow the consumer's cursor {cursor}",
         followed.len()
     );
 

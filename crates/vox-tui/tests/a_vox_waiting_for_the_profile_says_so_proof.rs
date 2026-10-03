@@ -1,34 +1,63 @@
-//! V210-100 (#296) — **a vox that waits for another one's profile lock says so**, through the
-//! shipped binary.
+//! V210-100 (#296) — **a vox that waits for another one's profile lock says so where its user
+//! sees it, and the one it waited for goes first**, through the shipped binary.
 //!
 //! Creating an identity (V210-91) and migrating a v0.2.9 profile (V210-100) each hold the profile
 //! directory's lock, and a second vox on the same profile waits for it. That is a second or two
-//! when the holder is working; but a holder that is stopped (Ctrl-Z) holds the lock until it is
-//! resumed, and the vox waiting on it printed nothing at all — a person saw a hung `vox`. The wait
-//! now says, once, after a second, that it is waiting for another vox using this profile, and how
-//! to resume a stopped one.
+//! when the holder is working; a holder that is stopped (Ctrl-Z) holds the lock until it is
+//! resumed. Three things are claimed of the vox that waits:
+//! - **It says so, once, after a second**: a CLI verb on stderr, with advice that is true wherever
+//!   the other vox runs; `vox tui` in its own status line, never on stderr — stderr is the
+//!   terminal it draws on, and a line written there landed across its prompt box and stayed.
+//! - **It lets the holder go first.** It used to keep the store open read-only while it waited,
+//!   and a read-only handle stops anyone opening the store writable: the holder, resumed, was
+//!   refused at its own unlock and the waiter went first. Now the holder's command succeeds, and
+//!   then the waiter's.
+//! - It waits; it does not fail while the holder is stopped.
+//! - **If the holder is still not done when it stops waiting, it says so truthfully**: that
+//!   another vox is still using the profile, and how to find it (`lsof` on the profile directory,
+//!   which names the holder), never to stop a node — the holder may only be slow or stopped.
 //!
-//! Staging, in two arms, one per path that takes the lock:
-//! 1. **Create.** On a fresh profile, `vox id` A takes the lock and holds it
-//!    (`VOX_TEST_LOCK_HOLD_MS`, proof-only, inert when unset, says when it has the lock). A is
-//!    stopped with SIGSTOP, by its PID, and `vox id` B is started.
-//! 2. **Migration.** The same on a profile the **released v0.2.9 binary** wrote, with
-//!    `vox trust add` for A and B: A holds the lock to migrate it.
+//! Staging, per arm: vox A takes the lock and holds it (`VOX_TEST_LOCK_HOLD_MS`, proof-only,
+//! inert when unset, says when it has the lock), and is stopped with SIGSTOP by its PID; vox B
+//! starts; A is resumed with SIGCONT. Five arms:
+//! 1. **CLI, create**: two `vox id`s on a fresh profile. B is refused, naming the concurrent
+//!    creation; A made the identity.
+//! 2. **CLI, migration**: two `vox trust add`s on a profile the **released v0.2.9 binary** wrote.
+//!    **A exits 0, then B exits 0** (B after A), and `vox trust list` names both.
+//! 3. **TUI, create** (`tests/pty/tui_lock_wait.py`): `vox id` holds the lock, `vox tui` is given a
+//!    passphrase at its first-run prompt; read through `pyte`.
+//! 4. **TUI, migration**: `vox trust add` holds the lock migrating a v0.2.9 profile. `vox tui`
+//!    waits when it opens the profile, before it takes the screen, and says so on the terminal as
+//!    a CLI verb does; once A is done the TUI starts, its screen clean, and is given the passphrase
+//!    at its unlock prompt. A exits 0; the TUI then unlocks.
+//! 5. **CLI, past the patience**: two `vox trust add`s on a profile this build made; A stays
+//!    stopped until B gives up. B is refused saying another vox is still using the profile, not
+//!    "Stop that node", and `lsof` on the directory it names lists A's PID. A, resumed, exits 0.
 //!
-//! Asserted, per arm: B says it is waiting for another vox using this profile within
-//! [`SAYS_WITHIN`], exactly once, and is still running [`STOPPED_FOR`] later (it waits; it does not
-//! fail). After SIGCONT to A, both finish within [`FINISHES_WITHIN`]: at least one exits 0, and
-//! any that does not refuses with a reason that names the other vox (the concurrent creation, or
-//! a vox holding the profile) — never anything else. A run that never saw A take the lock is CANNOT
-//! MEASURE.
+//! Asserted, per CLI arm: B says it is waiting within [`SAYS_WITHIN`], exactly once, and is still
+//! running [`STOPPED_FOR`] later. Per TUI arm: it says it is waiting within 15 s (arm 3 in its
+//! status line, arm 4 on the terminal before it starts); on the TUI's screen no CLI text is
+//! anywhere (quoted if it is) and every box border row ends with its partner; after SIGCONT the
+//! TUI answers as above.
 //!
-//! Mutation that must turn it red: the waiting notice removed from the lock helper — B waits in
-//! silence.
+//! Every red names its side: a PRODUCT verdict quotes what the product said or drew; a vox step
+//! of the staging that failed (A never said it took the lock, `vox id` for arm 5, the TUI driver
+//! saying the TUI failed or hung) is PRODUCT (staging); only the proof's own machinery (a signal
+//! that could not be sent, `lsof` that would not run, the released v0.2.9 binary it stages with,
+//! a driver that stopped for any other reason) is APPARATUS, CANNOT MEASURE.
+//!
+//! Mutations that must turn it red: the notice removed (B waits in silence, arms 1–4); the notice
+//! written to stderr by the lock or the node (arms 3–4: CLI text on the TUI's screen); the waiter
+//! keeping the store open while it waits (arms 2 and 4: A is refused); the refusal telling a
+//! user to stop a holder that serves nothing (arm 5).
 
 #![cfg(unix)]
 
 #[path = "support/world.rs"]
 mod world;
+
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -39,12 +68,12 @@ mod previous_release;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use previous_release::previous_release;
-use world::{args, VoxProc, IDENTITY};
+use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 
 /// B must say it is waiting within this of starting (its own start-up, then the one-second
 /// patience).
@@ -56,38 +85,33 @@ const FINISHES_WITHIN: Duration = Duration::from_secs(240);
 /// How long A holds the lock once it has it, so it can be stopped holding it.
 const HOLD_MS: &str = "4000";
 const HOLDING: &str = "holding the profile lock";
-const WAITING: &str = "waiting for another vox that is using this profile";
-/// What a refused B may say: the concurrent creation, or a vox holding the profile.
-const NAMED: [&str; 3] = [
-    "another vox created this profile's identity at the same time",
-    "a vox is already running for this profile",
-    "another vox holds this profile open",
-];
+const WAITING: &str = "waiting: another vox holds this profile open";
+const CONCURRENT: &str = "another vox created this profile's identity at the same time";
+/// What B says when A has not finished in all the time B waits (arm 5).
+const STILL_USING: &str = "another vox is still using this profile";
+/// What B points to, to find A: `lsof` on the profile directory.
+const FIND_IT: &str = "To see which process it is: lsof ";
+/// The remedy for a holder that serves the profile (a daemon or a TUI): wrong for one that is
+/// only slow or stopped.
+const STOP_THAT_NODE: &str = "Stop that node";
+/// How long B may take to be refused when A never lets go: the 30 s patience, B's own start-up,
+/// and room for an ordinary load.
+const REFUSED_WITHIN: Duration = Duration::from_secs(120);
 
 fn signal(pid: u32, sig: &str) {
     let ok = Command::new("kill")
         .args([sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill {sig} {pid}");
+    assert!(
+        ok,
+        "APPARATUS, CANNOT MEASURE: could not send {sig} to vox A (pid {pid}), so the staging \
+         (A stopped holding the lock) did not happen"
+    );
 }
 
-/// Wait up to `within` for `p` to exit; its status, or `None` if it is still running.
-fn exited_within(p: &mut VoxProc, within: Duration) -> Option<std::process::ExitStatus> {
-    let deadline = Instant::now() + within;
-    loop {
-        if let Some(s) = p.child.try_wait().unwrap() {
-            return Some(s);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// One arm: A takes the lock and is stopped holding it, B waits; then A is resumed.
-fn arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str]) -> Vec<String> {
+/// Start A, wait until it holds the lock, and stop it there. Its process and PID.
+fn hold_and_stop(label: &str, data: &Path, a_args: &[&str]) -> (VoxProc, u32) {
     test_knobs::require(&["VOX_TEST_LOCK_HOLD_MS"]);
     let mut a = VoxProc::spawn_env(
         &format!("{label} A"),
@@ -95,16 +119,81 @@ fn arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str]) -> Vec<String
         &args(a_args),
         &[("VOX_TEST_LOCK_HOLD_MS", HOLD_MS)],
     );
-    a.expect_within(
-        Duration::from_secs(180),
-        "A holding the profile lock",
-        |l| l.contains(HOLDING),
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut held = false;
+    while !held && Instant::now() < deadline {
+        match a.lines.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                eprintln!("[{label} A] {line}");
+                held = line.contains(HOLDING);
+                a.seen.push(line);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert!(
+        held,
+        "PRODUCT (staging): vox A never said it holds the profile lock, so nothing below would \
+         wait on it; A said:\n{}",
+        a.transcript()
     );
-    let a_pid = a.child.id();
-    signal(a_pid, "-STOP");
+    let pid = a.child.id();
+    signal(pid, "-STOP");
+    (a, pid)
+}
+
+/// Wait until `p` exits or `deadline` passes: its status and when it was seen to exit.
+fn exit_of(p: &mut VoxProc, deadline: Instant) -> Option<(ExitStatus, Instant)> {
+    loop {
+        if let Some(s) = p.child.try_wait().expect("APPARATUS: poll a child process") {
+            return Some((s, Instant::now()));
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Both A and B, polled together so each one's exit time is when it exited.
+fn exits(a: &mut VoxProc, b: &mut VoxProc) -> [Option<(ExitStatus, Instant)>; 2] {
+    let deadline = Instant::now() + FINISHES_WITHIN;
+    let (mut ea, mut eb) = (None, None);
+    while (ea.is_none() || eb.is_none()) && Instant::now() < deadline {
+        if ea.is_none() {
+            ea = a
+                .child
+                .try_wait()
+                .expect("APPARATUS: poll a child process")
+                .map(|s| (s, Instant::now()));
+        }
+        if eb.is_none() {
+            eb = b
+                .child
+                .try_wait()
+                .expect("APPARATUS: poll a child process")
+                .map(|s| (s, Instant::now()));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    [ea, eb]
+}
+
+/// What a CLI arm expects once A is resumed.
+enum Then {
+    /// A made the identity; B is refused, naming the concurrent creation.
+    ARefusesB,
+    /// A exits 0, then B exits 0.
+    AThenB,
+}
+
+/// A CLI arm: A holds the lock and is stopped, B waits; then A is resumed.
+fn cli_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str], then: &Then) -> Vec<String> {
+    let (mut a, a_pid) = hold_and_stop(label, data, a_args);
     let t0 = Instant::now();
     let mut b = VoxProc::spawn(&format!("{label} B"), data, &args(b_args));
-    // Not `expect_within`: a B that says nothing must be a red with counts, not a timeout panic.
+    // Not `expect_within`: a B that says nothing must be a product red, not a timeout panic.
     let mut said_at = None;
     while t0.elapsed() < SAYS_WITHIN && said_at.is_none() {
         if let Ok(line) = b.lines.recv_timeout(Duration::from_millis(100)) {
@@ -116,86 +205,269 @@ fn arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str]) -> Vec<String
         }
     }
     std::thread::sleep(STOPPED_FOR);
-    let b_still_waiting = b.child.try_wait().unwrap().is_none();
+    let b_still_waiting = b
+        .child
+        .try_wait()
+        .expect("APPARATUS: poll a child process")
+        .is_none();
     let waited = t0.elapsed();
     signal(a_pid, "-CONT");
     let resumed = Instant::now();
-    let a_status = exited_within(&mut a, FINISHES_WITHIN);
-    let b_status = exited_within(&mut b, FINISHES_WITHIN.saturating_sub(resumed.elapsed()));
-    let finished = resumed.elapsed();
+    let [ea, eb] = exits(&mut a, &mut b);
     let b_said = b.transcript();
     let a_said = a.transcript();
     let notices = b_said.matches(WAITING).count();
-    let b_named = NAMED.iter().any(|n| b_said.contains(n));
-    let a_named = NAMED.iter().any(|n| a_said.contains(n));
+    let at = |e: &Option<(ExitStatus, Instant)>| {
+        e.map(|(s, t)| format!("{s} at +{:.2}s", t.duration_since(resumed).as_secs_f64()))
+    };
     println!(
         "[proof] {label}: A held the lock and was stopped; B said it was waiting after {said_at:?} \
          (bound {SAYS_WITHIN:?}), {notices} time(s); B still waiting after {waited:?} = \
-         {b_still_waiting}; after SIGCONT both finished in {finished:?}: A {a_status:?}, B \
-         {b_status:?}, refusals name the other vox: A {a_named}, B {b_named}"
+         {b_still_waiting}; after SIGCONT: A {:?}, B {:?}",
+        at(&ea),
+        at(&eb)
     );
     let mut red = Vec::new();
     if said_at.is_none() {
         red.push(format!(
-            "{label}: B did not say it was waiting within {SAYS_WITHIN:?}; it said:\n{b_said}"
+            "PRODUCT: {label}: B did not say it was waiting within {SAYS_WITHIN:?}; it said:\n{b_said}"
         ));
     }
     if notices > 1 {
-        red.push(format!("{label}: B said it was waiting {notices} times"));
+        red.push(format!(
+            "PRODUCT: {label}: B said it was waiting {notices} times:\n{b_said}"
+        ));
     }
     if !b_still_waiting {
         red.push(format!(
-            "{label}: B exited while A was stopped, instead of waiting: {b_said}"
+            "PRODUCT: {label}: B exited while A was stopped, instead of waiting: {b_said}"
         ));
     }
-    match (a_status, b_status) {
-        (Some(sa), Some(sb)) => {
-            // A B that held the store open while it waited can leave A refused for a busy
-            // profile; that is named, and B goes on. What may not happen: an unnamed failure, or
-            // neither getting through.
-            if !sa.success() && !a_named {
+    let (Some((sa, ta)), Some((sb, tb))) = (ea, eb) else {
+        red.push(format!(
+            "PRODUCT: {label}: not both finished {FINISHES_WITHIN:?} after SIGCONT: A {:?}, B {:?}",
+            at(&ea),
+            at(&eb)
+        ));
+        return red;
+    };
+    if !sa.success() {
+        red.push(format!(
+            "PRODUCT: {label}: A, which held the lock first, failed after it was resumed: {a_said}"
+        ));
+    }
+    match then {
+        Then::ARefusesB => {
+            if sb.success() || !b_said.contains(CONCURRENT) {
                 red.push(format!(
-                    "{label}: A failed without naming the other vox: {a_said}"
+                    "PRODUCT: {label}: B did not refuse naming the concurrent creation ({sb}): \
+                     {b_said}"
                 ));
-            }
-            if !sb.success() && !b_named {
-                red.push(format!(
-                    "{label}: B failed without naming the other vox: {b_said}"
-                ));
-            }
-            if !sa.success() && !sb.success() {
-                red.push(format!("{label}: neither A nor B got through"));
             }
         }
-        _ => red.push(format!(
-            "{label}: not finished {FINISHES_WITHIN:?} after SIGCONT: A {a_status:?}, B {b_status:?}"
+        Then::AThenB => {
+            if !sb.success() {
+                red.push(format!(
+                    "PRODUCT: {label}: B failed after A finished ({sb}): {b_said}"
+                ));
+            } else if tb < ta {
+                red.push(format!(
+                    "PRODUCT: {label}: B finished before A, which held the lock first ({:.2}s \
+                     earlier)",
+                    ta.duration_since(tb).as_secs_f64()
+                ));
+            }
+        }
+    }
+    red
+}
+
+/// Arm 5: A holds the lock and stays stopped for longer than B waits. B is refused, saying that
+/// another vox is still using the profile, never to stop a node (A serves no socket; it is only
+/// stopped), and naming `lsof` on the profile directory, which then does name A. A, resumed, then
+/// finishes its own command.
+fn past_patience_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str]) -> Vec<String> {
+    let (mut a, a_pid) = hold_and_stop(label, data, a_args);
+    let t0 = Instant::now();
+    let mut b = VoxProc::spawn(&format!("{label} B"), data, &args(b_args));
+    let eb = exit_of(&mut b, t0 + REFUSED_WITHIN);
+    let b_said = b.transcript();
+    // Read B's advice back before A is resumed, while A still holds the lock.
+    let dir = b_said
+        .lines()
+        .find_map(|l| l.split_once(FIND_IT).map(|(_, d)| d.trim().to_owned()));
+    let lsof = dir.as_ref().map(|d| {
+        let out = Command::new("lsof").args(["-t", "--", d]).output();
+        let out = out.unwrap_or_else(|e| {
+            panic!("APPARATUS, CANNOT MEASURE: could not run `lsof {d}` as B advised: {e}")
+        });
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    });
+    signal(a_pid, "-CONT");
+    let ea = exit_of(&mut a, Instant::now() + FINISHES_WITHIN);
+    let a_said = a.transcript();
+    println!(
+        "[proof] {label}: A held the lock and stayed stopped; B {:?} after {:.1}s; B pointed at          {dir:?}; `lsof` there listed {:?} (A is {a_pid}); A after SIGCONT: {:?}",
+        eb.map(|(s, _)| s),
+        eb.map_or(t0.elapsed(), |(_, t)| t.duration_since(t0))
+            .as_secs_f64(),
+        lsof.as_deref().map(str::split_whitespace).map(Iterator::collect::<Vec<_>>),
+        ea.map(|(s, _)| s)
+    );
+    let mut red = Vec::new();
+    match eb {
+        None => red.push(format!(
+            "PRODUCT: {label}: B was still waiting {REFUSED_WITHIN:?} after it started, with A \
+             stopped holding the lock all along; it said:\n{b_said}"
+        )),
+        Some((sb, _)) if sb.success() => red.push(format!(
+            "PRODUCT: {label}: B exited 0 while A was stopped holding the lock: {b_said}"
+        )),
+        Some(_) => {}
+    }
+    if eb.is_some() {
+        if !b_said.contains(STILL_USING) {
+            red.push(format!(
+                "PRODUCT: {label}: B's refusal does not say {STILL_USING:?}: {b_said}"
+            ));
+        }
+        if b_said.contains(STOP_THAT_NODE) {
+            red.push(format!(
+                "PRODUCT: {label}: B told its user to stop a node, and A is a stopped command \
+                 that serves nothing: {b_said}"
+            ));
+        }
+        match (&dir, &lsof) {
+            (Some(d), Some(l)) => {
+                if !l.split_whitespace().any(|p| p == a_pid.to_string()) {
+                    red.push(format!(
+                        "PRODUCT: {label}: B said to find the holder with `lsof {d}`, and that \
+                         does not list A (pid {a_pid}); it listed {:?}",
+                        l.trim()
+                    ));
+                }
+            }
+            _ => red.push(format!(
+                "PRODUCT: {label}: B's refusal names no way to find the holder ({FIND_IT:?}): \
+                 {b_said}"
+            )),
+        }
+    }
+    if !ea.is_some_and(|(s, _)| s.success()) {
+        red.push(format!(
+            "PRODUCT: {label}: A, resumed after B gave up, did not finish its command ({:?}): \
+             {a_said}",
+            ea.map(|(s, _)| s)
+        ));
+    }
+    red
+}
+
+/// A TUI arm: A holds the lock and is stopped, `vox tui` waits on it (driven in a pty); then the
+/// driver resumes A.
+fn tui_arm(label: &str, data: &Path, mode: &str, a_args: &[&str], answer: &[&str]) -> Vec<String> {
+    let (mut a, pid) = hold_and_stop(label, data, a_args);
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_lock_wait.py");
+    let out = pty_driver::run(
+        script,
+        &[
+            VOX,
+            &data.to_string_lossy(),
+            &data.join("cfg").to_string_lossy(),
+            IDENTITY,
+            label,
+            mode,
+            &pid.to_string(),
+        ],
+    );
+    // The driver resumes A; make sure, then let it finish.
+    let _ = Command::new("kill")
+        .args(["-CONT", &pid.to_string()])
+        .status();
+    let ea = exit_of(&mut a, Instant::now() + FINISHES_WITHIN);
+    let said = out.stdout.clone();
+    println!(
+        "[proof] {label}: the TUI driver took {:?}, exit {:?}, last stage {:?}; A {:?}\n{}",
+        out.took,
+        out.code,
+        out.stage,
+        ea.map(|(s, _)| s),
+        said.trim()
+    );
+    let line = |p: &str| {
+        said.lines()
+            .find_map(|l| l.strip_prefix(&format!("{label} {p}")))
+            .map(str::to_owned)
+    };
+    // The driver prints `<tag> RED: PRODUCT…` or `HUNG at` when `vox tui` failed (no prompt, no
+    // answer, a wait that never ended): the product's, at staging. Anything else that stops it is
+    // the driver's own machinery.
+    let side = if said.contains(&format!("{label} RED: PRODUCT"))
+        || said.contains(&format!("{label} HUNG at"))
+    {
+        "PRODUCT (staging)"
+    } else {
+        "APPARATUS"
+    };
+    assert!(
+        !out.has_verdict(label) && out.code == Some(0) && line("AFTER:").is_some(),
+        "{side}: the {label} arm's TUI driver did not run to the end (exit {:?}, stage {:?}): \
+         {said}",
+        out.code,
+        out.stage
+    );
+    let notice = line("NOTICE ").unwrap_or_default();
+    let stray = line("STRAY: ").unwrap_or_default();
+    let frame = line("FRAME: ").unwrap_or_default();
+    let after = line("AFTER: ").unwrap_or_default();
+    let mut red = Vec::new();
+    if !notice.starts_with("after") {
+        red.push(format!(
+            "PRODUCT: {label}: the TUI's status line never said it was waiting: {notice}"
+        ));
+    }
+    if stray.trim() != "no" {
+        red.push(format!(
+            "PRODUCT: {label}: CLI text was written into the TUI's screen: {stray}"
+        ));
+    }
+    if !frame.starts_with("ok") {
+        red.push(format!(
+            "PRODUCT: {label}: the TUI's box borders are broken: {frame}"
+        ));
+    }
+    if !answer.iter().any(|w| after.contains(w)) {
+        red.push(format!(
+            "PRODUCT: {label}: after A resumed, the TUI said {after:?}, expected one of {answer:?}"
+        ));
+    }
+    match ea {
+        Some((s, _)) if s.success() => {}
+        other => red.push(format!(
+            "PRODUCT: {label}: A, which held the lock first, did not succeed after it was resumed \
+             ({:?}): {}",
+            other.map(|(s, _)| s),
+            a.transcript()
         )),
     }
     red
 }
 
 #[test]
-#[ignore = "real vox processes with production Argon2id, and the v0.2.9 release; CI runs it in release"]
+#[ignore = "real vox processes and `vox tui` in a pty, with production Argon2id and the v0.2.9 release; needs pyte (VOX_PYTE_PATH); CI runs it in release"]
 fn a_vox_waiting_for_the_profile_says_so() {
     watchdog::arm_for(Duration::from_secs(if cfg!(debug_assertions) {
-        1800
+        2400
     } else {
-        600
+        900
     }));
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
-    let mut red = Vec::new();
-
-    // ---- 1. create: two `vox id`s on a fresh profile -------------------------------------
-    red.extend(arm("create", &dir("fresh"), &["id"], &["id"]));
-
-    // ---- 2. migration: two `vox trust add`s on a profile v0.2.9 wrote ------------------------
     let old = previous_release();
-    let (carol, x, y) = (dir("carol"), dir("x"), dir("y"));
     let run_old = |data: &Path, argv: &[&str]| {
         let out = Command::new(&old)
             .args(argv)
@@ -203,23 +475,96 @@ fn a_vox_waiting_for_the_profile_says_so() {
             .env("VOX_CONFIG_DIR", data.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
             .output()
-            .unwrap();
+            .expect("APPARATUS: run a process");
         assert!(
             out.status.success(),
-            "CANNOT MEASURE: v0.2.9 `vox {argv:?}` failed: {}",
+            "APPARATUS, CANNOT MEASURE: the v0.2.9 release this proof stages with failed \
+             `vox {argv:?}`: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     };
-    run_old(&carol, &["id"]);
-    let x_fp = run_old(&x, &["id"]);
-    let y_fp = run_old(&y, &["id"]);
-    red.extend(arm(
-        "migration",
+    // A profile v0.2.9 wrote, so this build's first unlock of it migrates.
+    let v029 = |name: &str| -> PathBuf {
+        let d = dir(name);
+        run_old(&d, &["id"]);
+        d
+    };
+    let (x_fp, y_fp) = (run_old(&dir("x"), &["id"]), run_old(&dir("y"), &["id"]));
+    let mut red = Vec::new();
+
+    // ---- 1. CLI, create ---------------------------------------------------------------------
+    red.extend(cli_arm(
+        "cli-create",
+        &dir("fresh-cli"),
+        &["id"],
+        &["id"],
+        &Then::ARefusesB,
+    ));
+
+    // ---- 2. CLI, migration: A's `trust add` succeeds, then B's -------------------------------
+    let carol = v029("carol");
+    red.extend(cli_arm(
+        "cli-migration",
         &carol,
+        &["trust", "add", &x_fp, "--name", "x"],
+        &["trust", "add", &y_fp, "--name", "y"],
+        &Then::AThenB,
+    ));
+    let (ok, listed, err) = vox_once(&carol, &args(&["trust", "list"]));
+    println!(
+        "[proof] cli-migration: `vox trust list` afterwards: {}",
+        listed.trim()
+    );
+    assert!(
+        ok,
+        "PRODUCT: cli-migration: `vox trust list` afterwards failed: {listed}{err}"
+    );
+    if red.iter().all(|r| !r.contains("cli-migration")) {
+        for name in ["x", "y"] {
+            if !listed
+                .lines()
+                .any(|l| l.trim_end().ends_with(&format!("  {name}")))
+            {
+                red.push(format!(
+                    "PRODUCT: cli-migration: both `trust add`s exited 0, and `trust list` does \
+                     not name {name}: {listed}"
+                ));
+            }
+        }
+    }
+
+    // ---- 3. TUI, create ---------------------------------------------------------------------
+    red.extend(tui_arm(
+        "tui-create",
+        &dir("fresh-tui"),
+        "create",
+        &["id"],
+        &[CONCURRENT],
+    ));
+
+    // ---- 4. TUI, migration ------------------------------------------------------------------
+    red.extend(tui_arm(
+        "tui-migration",
+        &v029("dave"),
+        "startup",
+        &["trust", "add", &x_fp, "--name", "x"],
+        &["unlocked", "done"],
+    ));
+
+    // ---- 5. CLI, past the patience: A never lets go while B waits ---------------------------
+    let erin = dir("erin");
+    let (ok, made, err) = vox_once(&erin, &args(&["id"]));
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox id` could not make the profile for arm 5: {made}{err}"
+    );
+    red.extend(past_patience_arm(
+        "cli-past-patience",
+        &erin,
         &["trust", "add", &x_fp, "--name", "x"],
         &["trust", "add", &y_fp, "--name", "y"],
     ));
 
-    assert!(red.is_empty(), "{red:#?}");
+    assert!(red.is_empty(), "PRODUCT: {red:#?}");
 }

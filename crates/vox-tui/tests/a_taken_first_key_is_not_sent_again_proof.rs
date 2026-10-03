@@ -22,9 +22,20 @@
 //! out on a clean stop.
 //!
 //! **Asserted.** In [`WATCH`] after the restart, the victim sends mallory **no key**: she took it,
-//! and the node remembers. `CANNOT MEASURE` if the first key never reached her before the restart,
-//! or if the restarted victim opened no stream to her at all in [`WATCH`] (then it never reached
-//! her, and "no key" would measure nothing).
+//! and the node remembers. `PRODUCT (staging)` if the first key never reached her before the restart,
+//! or if, after [`WATCH`], **a key the restarted victim does owe her** does not reach her: the
+//! victim stops trusting her and trusts her again (`vox trust remove`, `vox trust add`), which
+//! rotates its key and consents to her afresh, and that key must arrive on the same connection
+//! within [`FIRST_KEY_WITHIN`]. That is the positive control: it shows the key-delivery path of
+//! the restarted node reaches her, so "no key in [`WATCH`]" is the node remembering, not a path
+//! that never ran. (Counting any stream, as this did, proved only that a sync ran; a node that
+//! owes nothing opens no pairwise stream at all, so a pairwise-stream count cannot be required.)
+//!
+//! **Which side a red is on.** A key sent again, or a daemon that would not stop on SIGTERM, is
+//! `PRODUCT:`; a `vox` step of the setup that failed, or a key the node owed that never came, is
+//! `PRODUCT (staging):`; mallory's own connection not made is `PRODUCT (staging):`; a fault of this proof's own (a runtime,
+//! a file, a signal it could not send) is `APPARATUS:`. Mallory joins **once**: a join turned away
+//! is the product's red, not something to retry past.
 //!
 //! **Mutation that must turn it red.** `note_delivered` defaulting a missing record to 0 before it
 //! compares, as before: generation 0 is never written, and the restarted victim sends it again.
@@ -64,7 +75,14 @@ const ROOM_PASS: &str = "room passphrase";
 #[derive(Debug, Default)]
 struct Seen {
     streams: usize,
+    /// The pairwise streams among them: the path a key is delivered on.
+    pairwise: usize,
     keys: Vec<Duration>,
+}
+
+fn lock(seen: &Mutex<Seen>) -> std::sync::MutexGuard<'_, Seen> {
+    seen.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Answer every stream the victim opens on `conn` as mallory's node would: a sync is answered as a
@@ -78,7 +96,7 @@ fn answer_as_mallory(rt: &Rt, conn: Arc<VoxConnection>, t0: Instant) -> Arc<Mute
         {
             let record = Arc::clone(&record);
             tokio::spawn(async move {
-                record.lock().unwrap().streams += 1;
+                lock(&record).streams += 1;
                 if kind != StreamKind::Pairwise {
                     let Ok((_cid, _epoch)) =
                         vox_core::node::syncstream::read_sync_request(&mut recv).await
@@ -96,6 +114,7 @@ fn answer_as_mallory(rt: &Rt, conn: Arc<VoxConnection>, t0: Instant) -> Arc<Mute
                     .await;
                     return;
                 }
+                lock(&record).pairwise += 1;
                 let mut key = false;
                 while let Ok(Some(f)) =
                     read_frame_within(&mut recv, MAX_PAIRWISE_FRAME, Duration::from_secs(5)).await
@@ -110,7 +129,7 @@ fn answer_as_mallory(rt: &Rt, conn: Arc<VoxConnection>, t0: Instant) -> Arc<Mute
                     }
                 }
                 if key {
-                    record.lock().unwrap().keys.push(t0.elapsed());
+                    lock(&record).keys.push(t0.elapsed());
                     let _ = send.write_all(&[KEY_TAKEN]).await;
                 }
                 let _ = send.finish();
@@ -131,14 +150,16 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start vox {argv:?}: {e}"));
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: vox was started without a stdin pipe")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write vox {argv:?}'s stdin: {e}"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot wait for vox {argv:?}: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -154,7 +175,9 @@ struct Rt(Option<tokio::runtime::Runtime>);
 impl std::ops::Deref for Rt {
     type Target = tokio::runtime::Runtime;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
+        self.0
+            .as_ref()
+            .expect("APPARATUS: a process the proof started")
     }
 }
 
@@ -168,9 +191,8 @@ impl Drop for Rt {
 
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+        .and_then(|s| s.local_addr())
+        .unwrap_or_else(|e| panic!("APPARATUS: no free UDP port: {e}"))
         .port()
 }
 
@@ -185,7 +207,9 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: the passphrase file's path is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -195,7 +219,7 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT: {name}'s `vox daemon` never answered `vox room list` within {SETUP:?}");
 }
 
 /// How the victim's daemon goes down before it is started again.
@@ -207,15 +231,19 @@ enum Halt {
     Kill,
 }
 
-/// Stop a process by its PID, with SIGTERM or SIGKILL, and reap it.
+/// Stop a process by its PID, with SIGTERM or SIGKILL, and reap it. The signal must be sent
+/// (APPARATUS); a daemon must stop on it (PRODUCT for SIGTERM; a SIGKILL that did not end it is
+/// APPARATUS, since nothing a process does can survive one).
 fn stop(mut p: VoxProc, halt: Halt) {
     let signal = match halt {
         Halt::Term => "-TERM",
         Halt::Kill => "-KILL",
     };
-    let _ = Command::new("kill")
+    let sent = Command::new("kill")
         .args([signal, &p.child.id().to_string()])
-        .status();
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(sent, "APPARATUS: {signal} could not be sent to {}", p.name);
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         if matches!(p.child.try_wait(), Ok(Some(_))) {
@@ -223,14 +251,24 @@ fn stop(mut p: VoxProc, halt: Halt) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // Drop kills it by PID.
+    match halt {
+        Halt::Term => {
+            let said = p.transcript();
+            panic!(
+                "PRODUCT: {}'s `vox daemon` did not stop within 20 s of SIGTERM\n{said}",
+                p.name
+            )
+        }
+        Halt::Kill => panic!("APPARATUS: {} was still running 20 s after SIGKILL", p.name),
+    }
 }
 
 fn fingerprint(data: &Path) -> [u8; 32] {
     let (ok, out, err) = vox_once(data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
-    vox_core::node::link::b32_decode(out.trim(), "fingerprint")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: vox id printed no fingerprint ({e:?}): {out}"))
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
+    vox_core::node::link::b32_decode(out.trim(), "fingerprint").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): vox id printed no fingerprint ({e:?}): {out}")
+    })
 }
 
 #[test]
@@ -247,15 +285,17 @@ fn a_taken_first_key_is_not_sent_again_after_a_crash() {
 
 fn taken_first_key_after(halt: Halt) {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", d.display()));
         d
     };
     let (anchor_dir, victim_dir, mallory_dir) = (dir("anchor"), dir("victim"), dir("mallory"));
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n"))
+        .expect("APPARATUS: cannot write the passphrase file");
 
     // ---- staging, all through the shipped binary ----------------------------------------
     let mut anchor = VoxProc::spawn(
@@ -267,7 +307,7 @@ fn taken_first_key_after(halt: Halt) {
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .unwrap()
+        .expect("APPARATUS: the matched spec line has no spec word")
         .to_owned();
 
     let victim_id = fingerprint(&victim_dir);
@@ -280,32 +320,36 @@ fn taken_first_key_after(halt: Halt) {
 
     let (ok, out, err) = vox_in(
         &victim_dir,
-        &["room", "create", "--name", "team"],
+        &["room", "create", "--passphrase-file", "-", "--name", "team"],
         ROOM_PASS,
     );
-    assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, list, _) = vox_once(&victim_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
         .next()
-        .expect("CANNOT MEASURE: the new room in `vox room list`")
+        .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
     let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "CANNOT MEASURE: room invite: {err}");
+    assert!(ok, "PRODUCT (staging): room invite: {err}");
     let link = link.trim().to_owned();
-    let joined = (1..=6).any(|attempt| {
-        let (ok, out, err) = vox_in(
-            &mallory_dir,
-            &["room", "join", &link, "--name", "team"],
-            ROOM_PASS,
-        );
-        if !ok {
-            eprintln!("[proof] mallory's join attempt {attempt} refused: {out} {err}");
-            std::thread::sleep(Duration::from_secs(5));
-        }
-        ok
-    });
-    assert!(joined, "CANNOT MEASURE: mallory could not join the room");
+    let (joined, out, err) = vox_in(
+        &mallory_dir,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "team",
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        joined,
+        "PRODUCT: mallory's `vox room join` was refused: {out}\n{err}"
+    );
 
     // Mallory's node goes; her identity stays, in the profile the binary wrote.
     stop(mallory, Halt::Term);
@@ -315,7 +359,7 @@ fn taken_first_key_after(halt: Halt) {
             .worker_threads(4)
             .enable_all()
             .build()
-            .unwrap(),
+            .expect("APPARATUS: the member's runtime"),
     ));
     let _enter = rt.enter();
     let mallory_paths = Paths::resolve(
@@ -323,14 +367,17 @@ fn taken_first_key_after(halt: Halt) {
         Some(&mallory_dir),
         Some(&mallory_dir.join("cfg")),
     )
-    .unwrap();
+    .expect("APPARATUS: mallory's profile paths");
+    let victim_addr: std::net::SocketAddr = victim_listen
+        .parse()
+        .expect("APPARATUS: the victim's listen address");
     let connect = |rt: &Rt| {
         rt.block_on(async {
             let endpoint = raw_sync::endpoint_as_member(&mallory_paths, IDENTITY.as_bytes()).await;
             let deadline = Instant::now() + SETUP;
             loop {
                 match endpoint
-                    .connect(victim_listen.parse().unwrap(), victim_id, raw_sync::now())
+                    .connect(victim_addr, victim_id, raw_sync::now())
                     .await
                 {
                     Ok(conn) => break (endpoint, Arc::new(conn)),
@@ -338,7 +385,9 @@ fn taken_first_key_after(halt: Halt) {
                         let _ = e;
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
-                    Err(e) => panic!("CANNOT MEASURE: mallory's identity did not connect: {e:?}"),
+                    Err(e) => {
+                        panic!("PRODUCT (staging): mallory's identity did not connect: {e:?}")
+                    }
                 }
             }
         })
@@ -354,21 +403,21 @@ fn taken_first_key_after(halt: Halt) {
     );
     assert!(
         ok,
-        "CANNOT MEASURE: the victim could not trust mallory: {out}\n{err}"
+        "PRODUCT (staging): the victim could not trust mallory: {out}\n{err}"
     );
     let deadline = Instant::now() + FIRST_KEY_WITHIN;
-    while before.lock().unwrap().keys.is_empty() && Instant::now() < deadline {
+    while lock(&before).keys.is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
-    let taken = before.lock().unwrap().keys.len();
+    let taken = lock(&before).keys.len();
     assert!(
         taken >= 1,
-        "CANNOT MEASURE: no key reached mallory within {FIRST_KEY_WITHIN:?} of the victim \
+        "PRODUCT (staging): no key reached mallory within {FIRST_KEY_WITHIN:?} of the victim \
          trusting her"
     );
     // The victim records the key as delivered when her answer reaches it.
     std::thread::sleep(Duration::from_secs(3));
-    let taken = before.lock().unwrap().keys.len();
+    let taken = lock(&before).keys.len();
 
     // ---- the victim restarts, and mallory's identity connects again ---------------------
     drop(conn);
@@ -378,24 +427,52 @@ fn taken_first_key_after(halt: Halt) {
     let (_endpoint, conn) = connect(&rt);
     let after = answer_as_mallory(&rt, Arc::clone(&conn), Instant::now());
     std::thread::sleep(WATCH);
-    let (streams, resent) = {
-        let a = after.lock().unwrap();
-        (a.streams, a.keys.clone())
+    let (streams, pairwise, resent) = {
+        let a = lock(&after);
+        (a.streams, a.pairwise, a.keys.clone())
     };
     println!(
         "[proof] {halt:?}: before the restart mallory took {taken} key(s); in {WATCH:?} after it \
-         the victim opened {streams} stream(s) to her, {} of them with a key: {resent:?}",
+         the victim opened {streams} stream(s) to her, {pairwise} pairwise, {} of them with a \
+         key: {resent:?}",
         resent.len()
-    );
-    assert!(
-        streams >= 1,
-        "CANNOT MEASURE: the restarted victim opened no stream to mallory in {WATCH:?}"
     );
     assert!(
         resent.is_empty(),
-        "after a {halt:?} the restarted victim sent mallory the room's key again ({} time(s), at \
+        "PRODUCT: after a {halt:?} the restarted victim sent mallory the room's key again ({} time(s), at \
          {resent:?}) though she had taken it: it did not remember the delivery",
         resent.len()
+    );
+
+    // ---- the positive control: a key the restarted victim does owe her reaches her -------------
+    // Timed from before the re-trust: its consent may deliver the key before `vox trust add`
+    // returns.
+    let owed_at = Instant::now();
+    for verb in [
+        vec!["trust", "remove", &mallory_b32],
+        vec!["trust", "add", &mallory_b32, "--name", "mallory"],
+    ] {
+        let (ok, out, err) = vox_in(&victim_dir, &verb, "");
+        assert!(
+            ok,
+            "PRODUCT (staging): the positive control's `vox {}` failed: {out}\n{err}",
+            verb.join(" ")
+        );
+    }
+    while lock(&after).keys.is_empty() && owed_at.elapsed() < FIRST_KEY_WITHIN {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let owed = lock(&after).keys.len();
+    println!(
+        "[proof] {halt:?}: positive control — {owed} key(s) reached her {:?} after the victim began \
+         re-trusting her",
+        owed_at.elapsed()
+    );
+    assert!(
+        owed >= 1,
+        "PRODUCT (staging): a key the restarted victim owed mallory (it re-trusted her) did not reach \
+         her within {FIRST_KEY_WITHIN:?}, so its key-delivery path never reached her and \"no key \
+         sent again\" measures nothing"
     );
     drop(anchor.child.kill());
 }

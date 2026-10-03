@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""tui_lock_wait.py <vox> <data_dir> <config_dir> <identity_pass> <tag> <create|unlock> <holder_pid>
+"""tui_lock_wait.py <vox> <data_dir> <config_dir> <identity_pass> <tag> <create|startup> <holder_pid>
 
 A `vox tui` that has to wait for another vox holding the profile's lock, as a person would meet
 it: the holder (started by the caller, which has stopped it with SIGSTOP while it holds the lock)
-is in the middle of creating the identity, or of migrating a v0.2.9 profile. The TUI is given the
-passphrase at its first-run "Create identity" prompt (`create`) or its "Unlock" prompt (`unlock`),
-and so waits on the lock. Its screen is read while it waits, then the holder is resumed with
+is in the middle of creating the identity, or of migrating a v0.2.9 profile.
+- `create`: the profile has no identity yet, so the TUI starts, and waits on the lock when it is
+  given a passphrase at its first-run "Create identity" prompt; that wait is said in its status line.
+- `startup`: the profile has one, and the holder has it open, so the TUI waits when it opens the
+  profile — before it takes the screen — and says so as a CLI verb does; once the holder is
+  resumed and done, the TUI starts and is given the passphrase at its "Unlock" prompt. Its screen is read while it waits, then the holder is resumed with
 SIGCONT (by the PID the caller recorded), and what the TUI says afterwards is read too.
 
 The TUI runs in a pty at 160x50 and its screen is read through the `pyte` terminal emulator.
@@ -13,15 +16,16 @@ The TUI runs in a pty at 160x50 and its screen is read through the `pyte` termin
 Prints, each on its own line:
 - `<tag> NOTICE after <secs>: <status line>` — the status line once it said it is waiting, or
   `<tag> NOTICE none: <status line>` if it never did within 15 s;
-- `<tag> STRAY: <yes|no>` — whether a CLI-only line ("vox: waiting …", "resume it") is anywhere
-  on the screen, which is stderr written into the TUI;
+- `<tag> STRAY: no`, or `<tag> STRAY: yes: <rows>` quoting every screen row that holds a CLI-only
+  line ("vox: waiting …", "resume it"), which is stderr written into the TUI;
 - `<tag> FRAME: ok (<n> rows)` or `<tag> FRAME: broken: <rows>` — every row that starts a box
   border (`│`, `┌`, `└`) ends with its partner;
 - `<tag> AFTER: <status line>` — the status line once the TUI answered, after SIGCONT;
 - `<tag> SCREEN:` and the screen while waiting, when anything above is not clean.
 
-Exit 0 = it ran to the end (the caller judges the lines); 2 = apparatus (pyte missing, no
-prompt, no answer after SIGCONT); 1 = the driver hung (`HUNG at <stage>`, `vox_pty.py`). The TUI
+Exit 0 = it ran to the end (the caller judges the lines); 1 = the TUI failed (`<tag> RED:
+PRODUCT: <what>`, with its screen: no prompt, no answer to the unlock or after SIGCONT) or the driver hung (`HUNG
+at <stage>`, `vox_pty.py`); 2 = apparatus, the driver's own machinery only (pyte missing). The TUI
 is killed by its PID, with bounded waits.
 """
 import os, signal, sys, time
@@ -33,8 +37,9 @@ from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 VOX, DATA, CFG, IDPASS, TAG, MODE, HOLDER = sys.argv[1:8]
 HOLDER = int(HOLDER)
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
-TUI_NOTICE = "another vox is using this profile"
+TUI_NOTICE = "waiting: another vox holds this profile open"
 CLI_ONLY = ("vox: waiting", "resume it", "Ctrl-Z")
+CLI_WAITING = "vox: waiting: another vox holds this profile open"
 PAIRS = {"│": "│", "┌": "┐", "└": "┘"}
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
@@ -47,33 +52,13 @@ env.update(VOX_DATA_DIR=DATA, VOX_CONFIG_DIR=CFG, TERM="xterm-256color")
 code = 2
 tui = None
 resumed = False
-try:
-    stage("prompt")
-    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], env)
 
-    def status():
-        """The bottom rows, where the TUI's status line is."""
-        return " ".join(" ".join(r.split()) for r in tui.display()[-3:])
 
-    want = "create identity" if MODE == "create" else "unlock"
-    if not tui.until(lambda: want in tui.text().lower(), 60):
-        print(f"{TAG} APPARATUS: the TUI never showed its {want!r} prompt:\n{tui.text()}")
-        sys.exit(2)
-    tui.pump(1)
-
-    stage("give the passphrase, and wait on the lock")
-    tui.key(IDPASS + "\r", 0.5)
-    if MODE == "create":
-        tui.key(IDPASS + "\r", 0.5)
-    t0 = time.time()
-    if tui.until(lambda: TUI_NOTICE in status(), 15, step=0.2):
-        print(f"{TAG} NOTICE after {time.time() - t0:.2f}: {status()}")
-    else:
-        print(f"{TAG} NOTICE none: {status()}")
-    tui.pump(3)
+def check_screen():
+    """STRAY and FRAME lines for the screen as it is now."""
     screen = tui.display()
     text = "\n".join(r.rstrip() for r in screen)
-    stray = any(w in text for w in CLI_ONLY)
+    stray_rows = [r.strip() for r in text.splitlines() if any(w in r for w in CLI_ONLY)]
     framed, broken = 0, []
     for i, row in enumerate(screen):
         row = row.rstrip()
@@ -81,22 +66,78 @@ try:
             framed += 1
             if not row.endswith(PAIRS[row[0]]):
                 broken.append(f"row {i}: {row!r}")
-    print(f"{TAG} STRAY: {'yes' if stray else 'no'}")
+    print(f"{TAG} STRAY: " + ("yes: " + " | ".join(stray_rows) if stray_rows else "no"))
     print(f"{TAG} FRAME: " + (f"ok ({framed} rows)" if not broken else "broken: " + "; ".join(broken)))
-    if stray or broken or framed == 0:
+    if stray_rows or broken or framed == 0:
         print(f"{TAG} SCREEN:\n{text}")
 
-    stage("resume the holder")
+
+def resume():
+    global resumed
     os.kill(HOLDER, signal.SIGCONT)
     resumed = True
-    waiting = status()
+
+
+try:
+    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], env)
+
+    def status():
+        """The bottom rows, where the TUI's status line is."""
+        return " ".join(" ".join(r.split()) for r in tui.display()[-3:])
+
     answered = ("another vox created", "done", "unlocked", "holds this profile", "error",
                 "wrong", "could not")
-    if tui.until(lambda: status() != waiting and any(w in status() for w in answered), 180):
-        code = 0
-        print(f"{TAG} AFTER: {status()}")
+    if MODE == "startup":
+        # The holder has the profile before this TUI opens it, so the TUI waits at its start,
+        # before it takes the screen: the wait is said as a CLI verb says it, on the terminal.
+        stage("wait at start-up")
+        t0 = time.time()
+        if tui.until(lambda: CLI_WAITING in tui.text(), 15, step=0.2):
+            print(f"{TAG} NOTICE after {time.time() - t0:.2f}: (before the TUI started) "
+                  + " ".join(l.strip() for l in tui.text().splitlines() if CLI_WAITING in l))
+        else:
+            print(f"{TAG} NOTICE none: {tui.text().strip()[:300]}")
+        stage("resume the holder")
+        resume()
+        if not tui.until(lambda: "unlock" in tui.text().lower(), 120):
+            print(f"{TAG} RED: PRODUCT: the TUI never showed its unlock prompt:\n{tui.text()}")
+            sys.exit(1)
+        tui.pump(1)
+        check_screen()
+        stage("unlock")
+        before = status()
+        tui.key(IDPASS + "\r", 0.5)
+        if tui.until(lambda: status() != before and any(w in status() for w in answered), 180):
+            code = 0
+            print(f"{TAG} AFTER: {status()}")
+        else:
+            code = 1
+            print(f"{TAG} RED: PRODUCT: no answer to the unlock; the screen:\n{tui.text()}")
     else:
-        print(f"{TAG} APPARATUS: no answer after SIGCONT; the screen:\n{tui.text()}")
+        stage("prompt")
+        if not tui.until(lambda: "create identity" in tui.text().lower(), 60):
+            print(f"{TAG} RED: PRODUCT: the TUI never showed its create prompt:\n{tui.text()}")
+            sys.exit(1)
+        tui.pump(1)
+        stage("give the passphrase, and wait on the lock")
+        tui.key(IDPASS + "\r", 0.5)
+        tui.key(IDPASS + "\r", 0.5)
+        t0 = time.time()
+        if tui.until(lambda: TUI_NOTICE in status(), 15, step=0.2):
+            print(f"{TAG} NOTICE after {time.time() - t0:.2f}: {status()}")
+        else:
+            print(f"{TAG} NOTICE none: {status()}")
+        tui.pump(3)
+        check_screen()
+        stage("resume the holder")
+        resume()
+        waiting = status()
+        if tui.until(lambda: status() != waiting and any(w in status() for w in answered), 180):
+            code = 0
+            print(f"{TAG} AFTER: {status()}")
+        else:
+            code = 1
+            print(f"{TAG} RED: PRODUCT: no answer after SIGCONT; the screen:\n{tui.text()}")
     tui.key(":q\r", 1)
 except Hung as h:
     print(f"{TAG} HUNG at {h}")

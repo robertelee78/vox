@@ -45,7 +45,6 @@ struct Daemon(Child, Arc<Mutex<String>>);
 
 impl Daemon {
     /// Whatever the daemon has said so far, for an assertion message.
-    #[allow(dead_code)]
     fn said(&self) -> String {
         self.1.lock().map(|s| s.clone()).unwrap_or_default()
     }
@@ -113,13 +112,19 @@ fn vox_in(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn vox: {e}"));
     if let Some(text) = input {
-        let mut pipe = child.stdin.take().expect("vox stdin");
-        pipe.write_all(text.as_bytes()).expect("write stdin");
+        let mut pipe = child.stdin.take().expect("APPARATUS: vox stdin");
+        pipe.write_all(text.as_bytes()).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT (staging): vox exited without reading its stdin (the write failed: {e})"
+            )
+        });
         drop(pipe);
     }
-    let out = child.wait_with_output().expect("vox ran");
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: wait for vox: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -127,8 +132,16 @@ fn vox_in(
     )
 }
 
-/// Wait for the daemon's socket to answer, rather than guessing at a sleep.
-fn until_attached(data: &std::path::Path, cfg: &std::path::Path, why: &str) -> String {
+/// Wait for the daemon's socket to answer, rather than guessing at a sleep. `side` names whose
+/// red a timeout is: `PRODUCT (staging)` for staging, `PRODUCT` for a claim; `said` is what the
+/// daemon has said so far.
+fn until_attached(
+    data: &std::path::Path,
+    cfg: &std::path::Path,
+    why: &str,
+    side: &str,
+    said: impl Fn() -> String,
+) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
@@ -139,14 +152,18 @@ fn until_attached(data: &std::path::Path, cfg: &std::path::Path, why: &str) -> S
         last = err;
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    panic!("timed out waiting for {why}; last error: {last}");
+    panic!(
+        "{side}: timed out after 60 s waiting for {why}; the last `room list` said: {last}\n--- \
+         the daemon said:\n{}",
+        said()
+    );
 }
 
 #[test]
 #[ignore = "production Argon2id at setup + runs the real binary as a daemon; CI runs it in release"]
 fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
 
@@ -157,10 +174,13 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
 
     // Nothing is running: the verbs say so rather than hanging.
     let (ok, _, err) = vox(&data, &cfg, &["room", "list"]);
-    assert!(!ok, "with no node running, `room list` must fail");
+    assert!(
+        !ok,
+        "PRODUCT: with no node running, `room list` must fail: {err:?}"
+    );
     assert!(
         err.contains("no node is running"),
-        "it must say what is wrong: {err:?}"
+        "PRODUCT: with no node running, `room list` must say what is wrong: {err:?}"
     );
 
     // ---- (4) and (5): the passphrase is checked before anything is served ----
@@ -170,12 +190,15 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         .env("VOX_CONFIG_DIR", &cfg)
         .stdin(Stdio::null())
         .output()
-        .expect("spawn vox");
-    assert!(!out.status.success(), "an empty passphrase must not start");
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn vox: {e}"));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
+        !out.status.success(),
+        "PRODUCT: a daemon with an empty passphrase started: {err:?}"
+    );
+    assert!(
         err.contains("passphrase"),
-        "it must say what is missing: {err:?}"
+        "PRODUCT: a daemon with an empty passphrase must say what is missing: {err:?}"
     );
 
     let mut child = Command::new(VOX)
@@ -186,22 +209,24 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox daemon");
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn vox daemon: {e}"));
     child
         .stdin
         .as_mut()
-        .unwrap()
+        .expect("APPARATUS: the daemon's stdin")
         .write_all(b"the wrong passphrase\n")
-        .unwrap();
-    let out = child.wait_with_output().expect("wait");
-    assert!(
-        !out.status.success(),
-        "a wrong passphrase must fail, not start an unusable daemon"
-    );
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): the daemon exited without reading its passphrases (the write failed: {e})"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: wait for the daemon: {e}"));
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(
+        !out.status.success(),
+        "PRODUCT: a wrong passphrase must fail, not start an unusable daemon: {said:?}"
+    );
+    assert!(
         said.contains("passphrase is wrong"),
-        "a wrong passphrase must be named as the reason: {said:?}"
+        "PRODUCT: a wrong passphrase must be named as the reason: {said:?}"
     );
 
     // ---- (1) the real thing, with the passphrase piped in ----
@@ -213,13 +238,13 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox daemon");
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn vox daemon: {e}"));
     child
         .stdin
         .as_mut()
-        .unwrap()
+        .expect("APPARATUS: the daemon's stdin")
         .write_all(format!("{IDENTITY}\n{} {ROOMPASS}\n", &room[..12]).as_bytes())
-        .unwrap();
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): the daemon exited without reading its passphrases (the write failed: {e})"));
     // Closing stdin is what a pipe does; the daemon must not need it held open.
     drop(child.stdin.take());
     let pid = child.id();
@@ -229,10 +254,18 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
     let daemon = Daemon(child, said);
 
     // ---- (2) another process attaches to it ----
-    let listed = until_attached(&data, &cfg, "the daemon to serve its control socket");
+    let listed = until_attached(
+        &data,
+        &cfg,
+        "the daemon to serve its control socket",
+        "PRODUCT",
+        || daemon.said(),
+    );
     assert!(
         listed.contains(&room[..12]),
-        "an attached client must see the daemon's room: {listed:?}"
+        "PRODUCT: an attached client must see the daemon's room: {listed:?}\n--- the daemon \
+         said:\n{}",
+        daemon.said()
     );
 
     // ---- (3) and it can speak through it ----
@@ -241,12 +274,21 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         &cfg,
         &["room", "post", &room, "from an agent session"],
     );
-    assert!(ok, "posting through the daemon failed: {err}");
+    assert!(
+        ok,
+        "PRODUCT: posting through the daemon failed: {err}\n--- the daemon said:\n{}",
+        daemon.said()
+    );
     let (ok, read, err) = vox(&data, &cfg, &["room", "read", &room]);
-    assert!(ok, "reading through the daemon failed: {err}");
+    assert!(
+        ok,
+        "PRODUCT: reading through the daemon failed: {err}\n--- the daemon said:\n{}",
+        daemon.said()
+    );
     assert!(
         read.contains("from an agent session"),
-        "the post did not reach the log: {read:?}"
+        "PRODUCT: the post did not reach the log: {read:?}\n--- the daemon said:\n{}",
+        daemon.said()
     );
 
     println!("[proof] daemon pid {pid}: attached, posted and read back");
@@ -258,8 +300,12 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
 /// room's full id, from its invite link.
 fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
     let (ok, fp, err) = vox(data, cfg, &["id"]);
-    assert!(ok, "vox id: {err}");
-    assert_eq!(fp.trim().len(), 52, "`vox id` prints a fingerprint: {fp:?}");
+    assert!(ok, "PRODUCT (staging): `vox id` failed: {err}");
+    assert_eq!(
+        fp.trim().len(),
+        52,
+        "PRODUCT (staging): `vox id` printed no fingerprint: {fp:?}"
+    );
 
     let mut setup = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
@@ -267,36 +313,54 @@ fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
         .env("VOX_CONFIG_DIR", cfg)
         .env_remove("VOX_ROOM")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn the setup daemon");
-    let mut pipe = setup.stdin.take().expect("daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn the setup daemon: {e}"));
+    let mut pipe = setup
+        .stdin
+        .take()
+        .expect("APPARATUS: the setup daemon's stdin");
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): the setup daemon exited without reading its passphrase (the write failed: {e})"));
     drop(pipe);
     let pid = setup.id();
-    let setup = Daemon(setup, Arc::new(Mutex::new(String::new())));
-    until_attached(data, cfg, "the setup daemon");
+    let said = Arc::new(Mutex::new(String::new()));
+    drain(setup.stdout.take(), &said);
+    drain(setup.stderr.take(), &said);
+    let setup = Daemon(setup, said);
+    until_attached(data, cfg, "the setup daemon", "PRODUCT (staging)", || {
+        setup.said()
+    });
     let (ok, _, err) = vox_in(
         data,
         cfg,
-        &["room", "create", "--name", "mission"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
-    let listed = until_attached(data, cfg, "the setup daemon");
+    assert!(ok, "PRODUCT (staging): `vox room create` failed: {err}");
+    let listed = until_attached(data, cfg, "the setup daemon", "PRODUCT (staging)", || {
+        setup.said()
+    });
     let label = listed
         .split_whitespace()
         .next()
-        .expect("the new room in `vox room list`")
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no room in `vox room list`: {listed:?}"))
         .to_owned();
     let (ok, link, err) = vox(data, cfg, &["room", "invite", &label]);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): `vox room invite` failed: {err}");
     let room = link
         .trim()
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
-        .expect("an invite link naming the room")
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no invite link naming the room: {link:?}"))
         .to_owned();
 
     // Stopped as a service manager stops it, and waited for: the proof proper starts from
@@ -304,17 +368,27 @@ fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
     let stopped = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()
-        .expect("run kill");
-    assert!(stopped.success(), "could not stop the setup daemon");
+        .unwrap_or_else(|e| panic!("APPARATUS: run kill: {e}"));
+    assert!(
+        stopped.success(),
+        "APPARATUS: `kill -TERM {pid}` did not deliver the signal"
+    );
     let mut setup = setup;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        if setup.0.try_wait().expect("wait").is_some() {
+        if setup
+            .0
+            .try_wait()
+            .unwrap_or_else(|e| panic!("APPARATUS: wait on the setup daemon: {e}"))
+            .is_some()
+        {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "CANNOT MEASURE: the setup daemon (pid {pid}) did not exit within 30s of SIGTERM"
+            "PRODUCT: `vox daemon` (the setup daemon, pid {pid}) was still running 30 s after SIGTERM; it \
+             said:\n{}",
+            setup.said()
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

@@ -12,12 +12,10 @@
 //! becomes the node's zeroizing [`Secret`] and is dropped. Every outcome maps to
 //! the closed [`CommandStatus`] / [`UiError`] set — no free text from the core.
 //!
-//! Consent, reachability and sync are the node's own state, never assumed (V210-82): consent is
-//! who this identity consents to on the room's log, a room is online when the node holds a
-//! connection to another of its members, and sync says how many peers it is connected to.
-//! Verification is shown as unverified for every other member: the node exposes no safety code to
-//! compare, so there is nothing a mark could rest on, and `:verify` says it is not available. The
-//! ADR-015 visibility and block verbs report `NotAvailableYet` too.
+//! Trust, reachability and sync are the node's own state, never assumed (V210-82): a member's
+//! trust is whether the keyring names it and whether it holds this identity's key on the room's
+//! log, a room is online when the node holds a connection to another of its members, and sync
+//! says how many peers it is connected to.
 
 use std::collections::BTreeMap;
 
@@ -28,8 +26,8 @@ use vox_core::node::api::{Fault, NodeCommand, NodeEvent, NodeView, Outcome, Secr
 
 use crate::app::CoreHandle;
 use crate::viewmodel::{
-    ChannelSummary, ChannelView, Command, CommandStatus, InboundVisibility, MemberView,
-    MessageView, OutboundConsent, Reachability, SyncStatus, UiError, Verification, ViewModel,
+    ChannelSummary, ChannelView, Command, CommandStatus, MemberView, MessageView, Reachability,
+    SyncStatus, Trust, UiError, ViewModel,
 };
 
 /// The TUI's binding to a running node.
@@ -43,6 +41,28 @@ pub struct LiveCore {
     /// The most recent network notice to show (an invite link, a join, a consent).
     /// Public facts only — see [`ViewModel::notice`].
     notice: Option<String>,
+    /// The on-screen room's timeline as last projected (V210-120). See [`Projected`].
+    projected: Option<Projected>,
+}
+
+/// The on-screen room's timeline as projected for the UI, and what it was projected from.
+///
+/// **A frame costs what changed, not the room's history.** Every frame projected the room's whole
+/// timeline again — every row's text copied, every author named — so in a long room the TUI spent
+/// each frame on rows nobody had changed. When the rows already projected are unchanged, the rows
+/// added since are projected and appended; anything else (another room, a reopened one, a changed
+/// keyring, which renames authors, a late row taking its place above them, an owed body arriving)
+/// projects it whole again.
+struct Projected {
+    channel_id: Digest32,
+    me: Option<Digest32>,
+    trusted: Vec<(Digest32, String)>,
+    /// How many of the node's rows are projected, and the newest of them.
+    len: usize,
+    last: Option<Digest32>,
+    /// A projected row was owed (V030-10): its body may have arrived since, in place.
+    owed: bool,
+    rows: std::sync::Arc<Vec<MessageView>>,
 }
 
 impl std::fmt::Debug for LiveCore {
@@ -80,6 +100,7 @@ impl LiveCore {
             rt,
             active: None,
             unread: BTreeMap::new(),
+            projected: None,
         }
     }
 
@@ -154,7 +175,7 @@ impl LiveCore {
                 NodeEvent::InviteLink { url, .. } => {
                     self.notice = Some(format!("invite link: {url}"));
                 }
-                NodeEvent::AddressNote { note, .. } => {
+                NodeEvent::AddressNote { note, .. } | NodeEvent::NodeNote { note } => {
                     self.notice = Some(note);
                 }
                 NodeEvent::AddressWithheld { reason, .. } => {
@@ -211,7 +232,71 @@ impl LiveCore {
         }
     }
 
-    fn project(&self, nv: &NodeView) -> ViewModel {
+    /// The on-screen room's timeline for the UI, extended by the rows the node added since the last
+    /// frame (see [`Projected`]).
+    fn project_timeline(
+        &mut self,
+        d: &vox_core::node::api::ChannelDetail,
+        me: Option<Digest32>,
+        trusted: &[(Digest32, String)],
+    ) -> std::sync::Arc<Vec<MessageView>> {
+        let view_of = |r: &vox_core::node::api::MessageRow| MessageView {
+            author: r.author,
+            author_nick: if me == Some(r.author) {
+                "you".to_owned()
+            } else {
+                crate::ident::member_name(trusted, &r.author)
+            },
+            // Displayed as a time of day, so seconds; the full precision is kept for ordering.
+            timestamp: r.created_millis / 1_000,
+            body: Some(if r.owed {
+                vox_core::node::api::NOT_RECEIVED_YET.to_owned()
+            } else {
+                r.text.clone()
+            }),
+            late: r.late,
+        };
+        let from = match &self.projected {
+            Some(p)
+                if p.channel_id == d.channel_id
+                    && p.me == me
+                    && p.trusted.as_slice() == trusted
+                    && !p.owed
+                    && p.len > 0
+                    && p.len <= d.timeline.len()
+                    && d.timeline.get(p.len - 1).map(|r| r.entry_hash) == p.last =>
+            {
+                Some(p.len)
+            }
+            _ => None,
+        };
+        let (rows, owed) = match (from, self.projected.take()) {
+            (Some(n), Some(mut p)) => {
+                if n < d.timeline.len() {
+                    // In place when the last frame's view model is gone, as it is between frames.
+                    std::sync::Arc::make_mut(&mut p.rows)
+                        .extend(d.timeline.iter_from(n).map(view_of));
+                }
+                (p.rows, d.timeline.iter_from(n).any(|r| r.owed))
+            }
+            _ => (
+                std::sync::Arc::new(d.timeline.iter().map(view_of).collect()),
+                d.timeline.iter().any(|r| r.owed),
+            ),
+        };
+        self.projected = Some(Projected {
+            channel_id: d.channel_id,
+            me,
+            trusted: trusted.to_vec(),
+            len: d.timeline.len(),
+            last: d.timeline.last().map(|r| r.entry_hash),
+            owed,
+            rows: std::sync::Arc::clone(&rows),
+        });
+        rows
+    }
+
+    fn project(&mut self, nv: &NodeView) -> ViewModel {
         let me = nv.identity.as_ref().map(|i| i.fingerprint);
         // A room is reachable when this node holds a connection to another of its members. A
         // closed room's members are under its lock, and this node does not sync it: offline.
@@ -242,6 +327,10 @@ impl LiveCore {
                 reachability: reachability(&c.channel_id),
             })
             .collect();
+        let timeline = self.active.and_then(|cid| {
+            let d = nv.open_channels.iter().find(|d| d.channel_id == cid)?;
+            Some(self.project_timeline(d, me, &nv.trusted))
+        });
         let active = self.active.and_then(|cid| {
             nv.open_channels
                 .iter()
@@ -261,47 +350,23 @@ impl LiveCore {
                                 } else {
                                     crate::ident::member_name(&nv.trusted, m)
                                 },
-                                // Nothing to compare yet (see the module doc), so nobody else
-                                // is shown verified.
-                                verification: if is_me {
-                                    Verification::Verified
-                                } else {
-                                    Verification::UnverifiedTofu
+                                // Off the keyring and the room's log: this node releases its key
+                                // only to a member its keyring trusts (V210-148), and takes a
+                                // member's key only if it trusts it.
+                                trust: {
+                                    let reads_you = d.consented.binary_search(m).is_ok();
+                                    if is_me {
+                                        Trust::You
+                                    } else if nv.trusted.iter().any(|(t, _)| t == m) {
+                                        Trust::Trusted { reads_you }
+                                    } else {
+                                        Trust::NotTrusted { reads_you }
+                                    }
                                 },
-                                // Off the room's log: granted only if this identity consented.
-                                outbound: if is_me || d.consented.binary_search(m).is_ok() {
-                                    OutboundConsent::Granted
-                                } else {
-                                    OutboundConsent::Revoked
-                                },
-                                inbound: InboundVisibility::Visible,
-                                blocked: false,
-                                // Safety codes need both parties' public keys; the
-                                // node exposes them with the member bundle work (M14).
-                                safety_code: String::new(),
                             }
                         })
                         .collect(),
-                    timeline: d
-                        .timeline
-                        .iter()
-                        .map(|r| MessageView {
-                            author: r.author,
-                            author_nick: if me == Some(r.author) {
-                                "you".to_owned()
-                            } else {
-                                crate::ident::member_name(&nv.trusted, &r.author)
-                            },
-                            // Displayed as a time of day, so seconds; the full precision is kept for ordering.
-                            timestamp: r.created_millis / 1_000,
-                            body: Some(if r.owed {
-                                vox_core::node::api::NOT_RECEIVED_YET.to_owned()
-                            } else {
-                                r.text.clone()
-                            }),
-                            late: r.late,
-                        })
-                        .collect(),
+                    timeline: timeline.clone().unwrap_or_default(),
                     // **Every member held back, each on its own line** (V210-66): once one notice in
                     // the one-line hint bar, where a second was cut off at the screen's edge.
                     held_back: d
@@ -359,11 +424,15 @@ pub fn ui_error(f: Fault) -> UiError {
         }
         Fault::SolveTooSlow => UiError::JoinPowTooSlow,
         Fault::MembersBusy => UiError::JoinMembersBusy,
+        Fault::RoomFull => UiError::JoinRoomFull,
+        Fault::NotAdmittedAfterJoin => UiError::JoinNotAdmitted,
         Fault::Refused => UiError::Refused,
         Fault::NotAdmitted => UiError::NotAdmitted,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
         Fault::AddressInUse => UiError::AddressInUse,
+        Fault::AddressNotHere => UiError::AddressNotHere,
+        Fault::BindFailed => UiError::BindFailed,
         Fault::AlreadyMember => UiError::AlreadyMember,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
@@ -461,9 +530,6 @@ impl CoreHandle for LiveCore {
             Command::SendText { channel_id, text } => {
                 self.send(NodeCommand::SendText { channel_id, text })
             }
-            // A mark needs a comparison behind it, and the node exposes no safety code to
-            // compare yet: marking a member verified on the word alone was a false claim (V210-82).
-            Command::MarkVerified { .. } => CommandStatus::Failed(UiError::NotAvailableYet),
             Command::Join {
                 local_name,
                 link,
@@ -474,22 +540,6 @@ impl CoreHandle for LiveCore {
                 passphrase: Self::secret(&passphrase),
             }),
             Command::Invite { channel_id } => self.send(NodeCommand::Invite { channel_id }),
-            // ADR-007: consent is per-sender and human-initiated. This is the human
-            // act; the node delivers the sender key and records the grant.
-            Command::GrantConsent { channel_id, member } => self.send(NodeCommand::Consent {
-                channel_id,
-                target: member,
-            }),
-            // ADR-007 revocation: rotating this identity's sender key to a generation
-            // the member holds no key for. Forward-only, and honest about it — what
-            // they already received is not recalled.
-            Command::RevokeConsent { channel_id, member } => self.send(NodeCommand::Revoke {
-                channel_id,
-                target: member,
-            }),
-            Command::SetVisibility { .. } | Command::Block { .. } | Command::Unblock { .. } => {
-                CommandStatus::Failed(UiError::NotAvailableYet)
-            }
         }
     }
 

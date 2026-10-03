@@ -45,17 +45,44 @@ pub fn resolve_prefix(prefix: &str, among: &[Digest32]) -> Result<Digest32, AppE
     }
 }
 
-/// Collect the identity passphrase, asking for confirmation when the profile has no
-/// identity yet and this will therefore *create* one.
-///
-/// The confirmation is not politeness. A profile's identity is unlocked by this
-/// passphrase and by nothing else (ADR-010's double lock), so a typo on first use does
-/// not produce a warning later — it produces an identity nobody can ever open.
-pub fn identity_passphrase_for(
-    paths: &Paths,
+/// The text of a passphrase file, or of stdin when the path is `-`: the explicit way to pipe a
+/// passphrase in. Wiped on drop, so only the copy a caller takes outlives the read.
+pub fn passphrase_file_text(
+    path: &std::path::Path,
+) -> Result<zeroize::Zeroizing<String>, AppError> {
+    use std::io::Read as _;
+    let mut text = zeroize::Zeroizing::new(String::new());
+    if path == std::path::Path::new("-") {
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| AppError::Usage(format!("reading stdin: {e}")))?;
+    } else {
+        std::fs::File::open(path)
+            .and_then(|mut f| f.read_to_string(&mut text))
+            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+    }
+    Ok(text)
+}
+
+/// Where a passphrase file's text came from, for the message when it holds none.
+fn source_name(path: &std::path::Path) -> String {
+    if path == std::path::Path::new("-") {
+        "stdin".to_owned()
+    } else {
+        path.display().to_string()
+    }
+}
+
+/// How to give the identity passphrase without a terminal, for every message that needs one.
+pub const GIVE_IDENTITY_PASSPHRASE: &str =
+    "Use --identity-passphrase-file <path> (`-` reads stdin), or VOX_IDENTITY_PASSPHRASE.";
+
+/// The identity passphrase the command line gave, without asking anyone: `--identity-passphrase-
+/// file`, else `VOX_IDENTITY_PASSPHRASE`. `None` when neither did.
+pub fn identity_passphrase_given(
     given: Option<String>,
     file: Option<std::path::PathBuf>,
-) -> Result<String, AppError> {
+) -> Result<Option<String>, AppError> {
     // **A passphrase on a command line is disclosed to the whole machine.** `ps` and
     // `/proc/<pid>/cmdline` are world-readable while a process runs, so `--identity-
     // passphrase secret` hands the identity to every other process on the box, including
@@ -73,55 +100,67 @@ pub fn identity_passphrase_for(
         ));
     }
     if let Some(path) = file {
-        // The whole file is the passphrase and whatever follows it, so it is wiped on drop like
-        // the copy returned: only that copy should outlive this read.
-        let text = zeroize::Zeroizing::new(
-            std::fs::read_to_string(&path)
-                .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?,
-        );
+        let text = passphrase_file_text(&path)?;
         let first = text.lines().next().unwrap_or_default();
         if first.is_empty() {
             return Err(AppError::Usage(format!(
                 "{} is empty; an identity passphrase cannot be",
-                path.display()
+                source_name(&path)
             )));
         }
-        return Ok(first.to_owned());
+        return Ok(Some(first.to_owned()));
     }
     // Read the variable here rather than through clap's `env`, because clap merges a flag
     // and its variable into one value and the whole point is to tell them apart.
     if let Ok(p) = std::env::var("VOX_IDENTITY_PASSPHRASE") {
         if !p.is_empty() {
-            return Ok(p);
+            return Ok(Some(p));
         }
     }
-    let exists = vox_core::node::profile::Profile::exists(paths);
-    if exists {
-        let p = prompt_passphrase("identity passphrase")?;
-        // Without a terminal `prompt_passphrase` reads a line, and a closed or empty
-        // stdin yields "" — which would otherwise be tried as a passphrase and reported
-        // as a wrong one, sending a person to look at their passphrase instead of at the
-        // fact that they never supplied it.
-        if p.is_empty() {
-            return Err(AppError::Usage(
-                "no identity passphrase: nothing on stdin and no terminal to prompt at.\n\
-                 \x20      Use --identity-passphrase-file <path> or VOX_IDENTITY_PASSPHRASE."
-                    .into(),
-            ));
-        }
+    Ok(None)
+}
+
+/// Ask at the terminal for the identity passphrase of a profile that has one, or, with no
+/// terminal, fail at once saying how to give it (V210-165). Stdin that is not a terminal is never
+/// read for it unasked: an agent's harness leaves stdin open and writes nothing, and a read there
+/// waited for ever, saying nothing.
+pub fn ask_identity_passphrase() -> Result<String, AppError> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(AppError::Usage(format!(
+            "this needs the identity passphrase, and there is no terminal to ask at.\n\
+             \x20      {GIVE_IDENTITY_PASSPHRASE}"
+        )));
+    }
+    let p = prompt_passphrase("identity passphrase")?;
+    if p.is_empty() {
+        return Err(AppError::Usage("no identity passphrase was given".into()));
+    }
+    Ok(p)
+}
+
+/// Collect the identity passphrase, asking for confirmation when the profile has no
+/// identity yet and this will therefore *create* one.
+///
+/// The confirmation is not politeness. A profile's identity is unlocked by this
+/// passphrase and by nothing else (ADR-010's double lock), so a typo on first use does
+/// not produce a warning later — it produces an identity nobody can ever open.
+pub fn identity_passphrase_for(
+    paths: &Paths,
+    given: Option<String>,
+    file: Option<std::path::PathBuf>,
+) -> Result<String, AppError> {
+    if let Some(p) = identity_passphrase_given(given, file)? {
         return Ok(p);
     }
-    // **Without a terminal there is nobody to ask twice.** `prompt_passphrase` falls back
-    // to reading a line, so a closed stdin yielded "" and this printed "creating one",
-    // asked for a confirmation nobody could give, and then said "an empty identity
-    // passphrase" — three lines, none of which say what to do, after announcing a
-    // creation that did not happen.
+    if vox_core::node::profile::Profile::exists(paths) {
+        return ask_identity_passphrase();
+    }
+    // **Without a terminal there is nobody to ask twice.**
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Err(AppError::Usage(
             "this profile has no identity yet, and there is no terminal to ask at.\n\
-             \x20      Make one interactively:  vox id\n\
-             \x20      Or give the passphrase:  --identity-passphrase-file <path>, or \
-             VOX_IDENTITY_PASSPHRASE"
+             \x20      Make one at a terminal with `vox id`, or give its new passphrase with \
+             --identity-passphrase-file <path> (`-` reads stdin) or VOX_IDENTITY_PASSPHRASE."
                 .into(),
         ));
     }
@@ -153,13 +192,33 @@ pub fn identity_passphrase_for(
 /// `serve`, `connect`, `service`, `forward` and `up` — which go through
 /// `open_room` — still got the bare "another vox already has this profile open" with no
 /// remedy, which is the message the fix existed to replace.
-fn profile_busy(socket: &std::path::Path) -> AppError {
+///
+/// **A holder that is only slow is not told to stop** (V210-100). A `vox daemon` or `vox tui`
+/// answers on the control socket and keeps the profile for as long as it runs, so stopping it, or
+/// asking it through `vox room …`, is the remedy. Any other holder is a `vox node` (which serves
+/// no socket) or a command that has not finished while this one waited (up to
+/// [`PROFILE_PATIENCE`](vox_core::node::profile::PROFILE_PATIENCE)) — slow, or stopped — and the
+/// true thing to say is that it is still using the profile, and how to find it: the lock is the
+/// profile directory held open, so `lsof` on it names the process.
+fn profile_busy(paths: &Paths) -> AppError {
+    let socket = paths.socket_file();
+    if vox_core::node::profile::holder_serves(&socket) {
+        return AppError::Usage(format!(
+            "a vox is already running for this profile, and only one at a time may hold it.\n\
+             \x20      Its control socket is {}\n\
+             \x20      Stop that node to run this command, or use the `vox room …` verbs, \
+             which ask the running node instead of starting a second one.",
+            socket.display()
+        ));
+    }
     AppError::Usage(format!(
-        "a vox is already running for this profile, and only one at a time may hold it.\n\
-         \x20      Its control socket is {}\n\
-         \x20      Stop that node to run this command, or use the `vox room …` verbs, \
-         which ask the running node instead of starting a second one.",
-        socket.display()
+        "another vox is still using this profile, and only one at a time may hold it.\n\
+         \x20      It is a command that has not finished (a slow one, or one stopped, e.g. with \
+         Ctrl-Z, which goes on once resumed), or a `vox node` on this profile, which holds it \
+         until it stops.\n\
+         \x20      To see which process it is: lsof {}\n\
+         \x20      Run this command again once it is done.",
+        paths.profile_dir.display()
     ))
 }
 
@@ -197,11 +256,73 @@ pub fn serve_control_socket(
 /// holding the profile (V210-100). It names no particular remedy beyond the one that is true
 /// wherever that vox runs: under a shell's job control `fg` resumes a stopped one, but a daemon
 /// under tmux or a service manager is resumed its own way.
-pub const WAITING_FOR_PROFILE: &str = "vox: waiting for another vox that is using this profile; \
-     this goes on as soon as that one is done (if that vox is stopped, e.g. with Ctrl-Z, resume it)";
+/// It names the cause in the words a refusal uses (`Fault::ProfileBusy`, V210-114), so a person
+/// sees one phrase for one cause.
+pub const WAITING_FOR_PROFILE: &str =
+    "vox: waiting: another vox holds this profile open, and only \
+     one at a time may write it\n       this goes on as soon as that one is done; if that vox is \
+     stopped (e.g. with Ctrl-Z), resume it";
+
+/// Say [`WAITING_FOR_PROFILE`] on stderr: what a verb's node calls if opening the profile waits
+/// for another vox holding it.
+pub fn say_waiting() {
+    eprintln!("{WAITING_FOR_PROFILE}");
+}
 
 /// Apply `cmd` (creating or unlocking the identity), and if the node says it is waiting for
 /// another vox holding the profile, say so on stderr — once, while it waits.
+/// Which kind of socket a failed bind was for, so it can be asked again (V210-134).
+#[derive(Clone, Copy)]
+pub(crate) enum Socket {
+    /// The node's QUIC port (`--listen`).
+    Udp,
+    /// A local TCP port: `vox up --bind`, a forward's local port.
+    Tcp,
+}
+
+/// What the operating system says now when `addr` is bound as `socket`, quoted after a failed
+/// bind so the person reads its own words (V210-134): the node's [`Fault`] names the cause
+/// but cannot carry the text. `None` if the address binds now (it was freed in between).
+pub(crate) fn bind_said(addr: SocketAddr, socket: Socket) -> Option<String> {
+    let err = match socket {
+        Socket::Udp => std::net::UdpSocket::bind(addr).err(),
+        Socket::Tcp => std::net::TcpListener::bind(addr).err(),
+    }?;
+    Some(err.to_string())
+}
+
+/// The message for a failed bind of `addr`: what `fault` names, and the operating system's own
+/// words (V210-134). `None` if `fault` is not a failed bind.
+pub(crate) fn bind_failure(addr: SocketAddr, socket: Socket, fault: Fault) -> Option<String> {
+    if !fault.is_bind() {
+        return None;
+    }
+    let what = match (fault, socket) {
+        (Fault::AddressInUse, Socket::Udp) => {
+            "something else already holds that UDP port".to_owned()
+        }
+        (Fault::AddressInUse, Socket::Tcp) => {
+            "that port is already in use: another program holds it".to_owned()
+        }
+        (Fault::AddressNotHere, _) => format!("{} is not an address of this machine", addr.ip()),
+        _ => "it could not be listened on".to_owned(),
+    };
+    let said = bind_said(addr, socket)
+        .map(|os| format!(" (the system says: {os})"))
+        .unwrap_or_default();
+    let remedy = match fault {
+        Fault::AddressInUse => format!(
+            "\n       Pick another, or stop whatever holds it (`lsof -i :{}` names it).",
+            addr.port()
+        ),
+        Fault::AddressNotHere => "\n       Use an address this machine has (`ifconfig` lists \
+                                  them), or 127.0.0.1."
+            .to_owned(),
+        _ => String::new(),
+    };
+    Some(format!("{what}{said}{remedy}"))
+}
+
 pub async fn apply_saying_waits(node: &NodeHandle, cmd: NodeCommand) -> Outcome {
     let mut events = node.subscribe();
     let apply = node.apply(cmd);
@@ -214,6 +335,10 @@ pub async fn apply_saying_waits(node: &NodeHandle, cmd: NodeCommand) -> Outcome 
                 Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
                     eprintln!("{WAITING_FOR_PROFILE}");
                     said = true;
+                }
+                // Said while the verb waits: the node picks its port as it unlocks (V210-167).
+                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::NodeNote { note })) => {
+                    eprintln!("vox: {note}");
                 }
                 Some(_) => {}
                 // The actor is gone; the apply answers for itself.
@@ -230,8 +355,11 @@ pub async fn open_profile(
     identity_passphrase: &str,
 ) -> Result<NodeHandle, AppError> {
     let existed = vox_core::node::profile::Profile::exists(&paths);
-    let cfg = NodeConfig::new().bind(Bind::Addr(listen)).anchors(anchors);
-    let socket = paths.socket_file();
+    let cfg = NodeConfig::new()
+        .bind(Bind::Addr(listen))
+        .anchors(anchors)
+        .on_profile_wait(say_waiting);
+    let for_busy = paths.clone();
     let node = match Node::spawn_config(paths, cfg) {
         Ok(n) => n,
         // **A profile that is busy is not a profile that is broken.** redb is
@@ -240,7 +368,7 @@ pub async fn open_profile(
         // with "store open: Database already open. Cannot acquire lock.", which names a
         // storage engine and no remedy. Running a daemon is the documented way to run
         // agent comms, so this was the ordinary case, not an edge one.
-        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&socket)),
+        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&for_busy)),
         Err(e) => return Err(e.into()),
     };
     let secret = Secret::new(identity_passphrase.as_bytes().to_vec());
@@ -261,7 +389,12 @@ pub async fn open_profile(
         ));
     }
     if out == Outcome::Failed(Fault::ProfileBusy) {
-        return Err(profile_busy(&socket));
+        return Err(profile_busy(&for_busy));
+    }
+    if let Outcome::Failed(fault) = out {
+        if let Some(why) = bind_failure(listen, Socket::Udp, fault) {
+            return Err(AppError::Usage(format!("cannot listen on {listen}: {why}")));
+        }
     }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
@@ -272,19 +405,26 @@ pub async fn open_profile(
 }
 
 /// Spawn a node, unlock it, and open one room — the preamble every verb shares.
+///
+/// With no room passphrase it opens nothing: the room is resolved among the profile's rooms and
+/// left as the unlock left it, open if the profile holds it open, closed if it was closed on
+/// purpose (`vox service list`, V210-149).
 async fn open_room(
     paths: Paths,
     listen: SocketAddr,
     anchors: vox_core::nat::bootstrap::BootstrapSet,
     identity_passphrase: &str,
     room_prefix: &str,
-    room_passphrase: &str,
+    room_passphrase: Option<&str>,
 ) -> Result<(NodeHandle, Digest32), AppError> {
-    let cfg = NodeConfig::new().bind(Bind::Addr(listen)).anchors(anchors);
-    let socket = paths.socket_file();
+    let cfg = NodeConfig::new()
+        .bind(Bind::Addr(listen))
+        .anchors(anchors)
+        .on_profile_wait(say_waiting);
+    let for_busy = paths.clone();
     let node = match Node::spawn_config(paths, cfg) {
         Ok(n) => n,
-        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&socket)),
+        Err(vox_core::error::Error::ProfileBusy) => return Err(profile_busy(&for_busy)),
         Err(e) => return Err(e.into()),
     };
     let out = apply_saying_waits(
@@ -295,7 +435,12 @@ async fn open_room(
     )
     .await;
     if out == Outcome::Failed(Fault::ProfileBusy) {
-        return Err(profile_busy(&socket));
+        return Err(profile_busy(&for_busy));
+    }
+    if let Outcome::Failed(fault) = out {
+        if let Some(why) = bind_failure(listen, Socket::Udp, fault) {
+            return Err(AppError::Usage(format!("cannot listen on {listen}: {why}")));
+        }
     }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
@@ -307,6 +452,9 @@ async fn open_room(
         return Err(AppError::Usage("this profile holds no rooms".into()));
     }
     let channel_id = resolve_prefix(room_prefix, &known)?;
+    let Some(room_passphrase) = room_passphrase else {
+        return Ok((node, channel_id));
+    };
     let out = node
         .apply(NodeCommand::OpenChannel {
             channel_id,
@@ -370,20 +518,26 @@ pub async fn service_remove(
     Ok(())
 }
 
-/// `vox service list`
-pub fn service_list(node: &NodeHandle, channel_id: Digest32) {
-    let view = node.view();
-    let Some(detail) = view
-        .open_channels
-        .iter()
-        .find(|d| d.channel_id == channel_id)
-    else {
-        println!("vox: that room is not open");
-        return;
+/// `vox service list`, on a node this verb unlocked and which opened no room for it.
+///
+/// # Errors
+/// If the profile does not hold the room open (V210-149): it fails, non-zero, rather than
+/// printing a reason and exiting 0 for a script to read as success. The words are the ones a
+/// running daemon answers the same request with, so the two say the same thing.
+pub async fn service_list(node: &NodeHandle, channel_id: Digest32) -> Result<(), AppError> {
+    let Some(detail) = node.open_detail(channel_id).await else {
+        let view = node.view();
+        let name = view
+            .channels
+            .iter()
+            .find(|c| c.channel_id == channel_id)
+            .and_then(|c| c.local_name.clone())
+            .unwrap_or_default();
+        return Err(crate::room_cli::room_closed(&channel_id, &name));
     };
     if detail.services.is_empty() {
         println!("vox: no services offered in {}", short(&channel_id));
-        return;
+        return Ok(());
     }
     println!(
         "vox: services offered in {} ({})",
@@ -393,6 +547,7 @@ pub fn service_list(node: &NodeHandle, channel_id: Digest32) {
     for (tag, addr) in &detail.services {
         println!("  {tag}  →  {addr}");
     }
+    Ok(())
 }
 
 /// `vox forward` — serves until interrupted.
@@ -488,6 +643,11 @@ pub async fn forward(
         // and cannot be granted — `vox grant`, the only thing that issued it, is
         // withdrawn too. What actually decides is the host's keyring, and the host is
         // the only one who can change it.
+        if let Outcome::Failed(fault) = out {
+            if let Some(why) = bind_failure(local, Socket::Tcp, fault) {
+                return Err(AppError::Usage(format!("cannot forward to {local}: {why}")));
+            }
+        }
         if !matches!(out, Outcome::Failed(Fault::Unreachable | Fault::Refused)) {
             return Err(AppError::Usage(format!("cannot forward to {local}: {out}")));
         }
@@ -709,11 +869,19 @@ pub async fn connect(
         passphrase: Secret::new(room_passphrase.as_bytes().to_vec()),
     });
     tokio::pin!(join);
+    // A join that waits — for a host to publish its room at its boards (V210-143) — says what it
+    // waits for, once, rather than sitting silent for up to half a minute.
+    let mut said_waiting = std::collections::HashSet::new();
     let out = loop {
         tokio::select! {
             out = &mut join => break out,
             item = steps.next() => match item {
-                Some(EventStreamItem::Event(NodeEvent::JoinStep { step })) => waiting.on(step),
+                Some(EventStreamItem::Event(NodeEvent::JoinStep { step })) => {
+                    if step.starts_with("waiting:") && said_waiting.insert(step.clone()) {
+                        eprintln!("vox: {step}");
+                    }
+                    waiting.on(step);
+                }
                 Some(_) => {}
                 None => break (&mut join).await,
             },
@@ -825,6 +993,13 @@ impl Waiting {
 /// file, and a tool that edits it unasked is a tool that will one day edit it wrongly.
 pub async fn up(node: &NodeHandle, channel_id: Digest32, bind: SocketAddr) -> Result<(), AppError> {
     let out = node.apply(NodeCommand::Up { channel_id, bind }).await;
+    if let Outcome::Failed(fault) = out {
+        if let Some(why) = bind_failure(bind, Socket::Tcp, fault) {
+            return Err(AppError::Usage(format!(
+                "cannot bring the proxy up on {bind}: {why}"
+            )));
+        }
+    }
     if !out.is_done() {
         return Err(AppError::Usage(format!(
             "cannot bring the proxy up on {bind}: {out}"
@@ -963,6 +1138,7 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
                 crate::ident::author_id(peer)
             );
         }
+        NodeEvent::NodeNote { note } => eprintln!("vox: {note}"),
         _ => {}
     }
 }
@@ -1124,6 +1300,8 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         }
         Some(Fault::SolveTooSlow) => Fault::SolveTooSlow.explain(),
         Some(Fault::MembersBusy) => Fault::MembersBusy.explain(),
+        Some(Fault::RoomFull) => Fault::RoomFull.explain(),
+        Some(Fault::NotAdmittedAfterJoin) => Fault::NotAdmittedAfterJoin.explain(),
         // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
         // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
         // responder, so it is the responder that says no. Leading with "the refusal is
@@ -1205,8 +1383,8 @@ pub struct RoomTarget {
     pub identity_passphrase: String,
     /// The room's id, or a unique prefix.
     pub room: String,
-    /// The room's passphrase.
-    pub room_passphrase: String,
+    /// The room's passphrase, or `None` for a verb that opens no room.
+    pub room_passphrase: Option<String>,
 }
 
 /// Shared entry: open the room, run `body`, shut down.
@@ -1235,7 +1413,7 @@ where
         target.anchors,
         &target.identity_passphrase,
         &target.room,
-        &target.room_passphrase,
+        target.room_passphrase.as_deref(),
     );
     let (node, channel_id) = tokio::select! {
         opened = opening => opened?,
@@ -1264,19 +1442,21 @@ where
 const STOP_PATIENCE: Duration = Duration::from_secs(5);
 
 /// Read a passphrase from the terminal without echoing it (ADR-015: a passphrase is
-/// never shown, never in a flag, never in the shell's history). Falls back to a plain
-/// line when stdin is not a terminal, so the verbs remain scriptable through a pipe.
+/// never shown, never in a flag, never in the shell's history).
+///
+/// **Only from a terminal** (V210-165). It fell back to a line of stdin when stdin was not one,
+/// and an agent's harness leaves stdin open and writes nothing: the read waited for ever, saying
+/// nothing. Without a terminal this fails at once; a script names its source instead, a file or
+/// `-` for stdin.
 pub fn prompt_passphrase(what: &str) -> Result<String, AppError> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use std::io::{IsTerminal, Write};
 
     if !std::io::stdin().is_terminal() {
-        let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
-            .map_err(AppError::Io)?;
-        return Ok(line.trim_end_matches(['\n', '\r']).to_owned());
+        return Err(AppError::Usage(format!(
+            "this needs the {what}, and there is no terminal to ask at"
+        )));
     }
     print!("{what}: ");
     std::io::stdout().flush().map_err(AppError::Io)?;
@@ -1305,8 +1485,8 @@ pub fn prompt_passphrase(what: &str) -> Result<String, AppError> {
     result.map(|()| out)
 }
 
-/// The room passphrase: from `--passphrase-file`, else prompted for (a line of stdin when
-/// stdin is not a terminal).
+/// The room passphrase: from `--passphrase-file` (`-` for stdin), else asked for at the terminal;
+/// with no terminal, it fails at once saying how to give it (V210-165).
 ///
 /// **Never from argv or the environment** (V210-72). A command line is readable by every
 /// process on the machine while it runs (`ps`, `/proc/<pid>/cmdline`), and an environment
@@ -1335,19 +1515,27 @@ pub fn room_passphrase_for(
         ));
     }
     if let Some(path) = file {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+        let text = passphrase_file_text(path)?;
         let first = text.lines().next().unwrap_or_default();
         if first.is_empty() {
             return Err(AppError::Usage(format!(
                 "{} is empty; a room passphrase cannot be",
-                path.display()
+                source_name(path)
             )));
         }
         return Ok(first.to_owned());
     }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(AppError::Usage(format!(
+            "this needs the room passphrase, and there is no terminal to ask at.\n\
+             \x20      {GIVE_ROOM_PASSPHRASE}"
+        )));
+    }
     prompt_passphrase("room passphrase")
 }
+
+/// How to give a room passphrase without a terminal.
+pub const GIVE_ROOM_PASSPHRASE: &str = "Use --passphrase-file <path> (`-` reads stdin).";
 
 /// `vox trust add` — decide that an identity may read this node, and reach its services.
 ///
@@ -1368,6 +1556,7 @@ pub async fn trust_add(
     full_history: bool,
 ) -> Result<(), AppError> {
     let target = resolve_trust_target(node, fingerprint)?;
+    crate::ident::check_new_name(&node.view().trusted, &target, petname)?;
     let out = node
         .apply(NodeCommand::TrustWith {
             fingerprint: target,
@@ -1389,6 +1578,7 @@ pub async fn trust_add(
         println!("     with full history: it may also read what you wrote before now");
     }
     println!("     it may now read what you write in every room you share — now and later");
+    println!("     and you read what it writes, once it trusts you too");
     println!("     and reach every service you bind to a room you are both in");
     println!("     `vox trust remove` undoes it and changes the lock everywhere");
     Ok(())

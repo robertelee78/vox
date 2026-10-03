@@ -13,6 +13,10 @@ decider's own. Each rule names the ADR section that holds the full record.
 - **No unit tests and no in-process library tests.** No `#[test]` in `src/`, no in-process `Node`,
   no assertion on an internal value or a proxy for what a person sees. Why: a red from real use has
   one meaning, and any other red has three. (ADR-018, same section)
+- **A test-side attacker is apparatus, and allowed.** A test that crafts forged or malicious input
+  (even with Vox's own library code) and sends it to a real running shipped `vox` is apparatus.
+  What's forbidden is testing internals in-process or asserting on internal values; "the verdict
+  must come from what the real binary does". (Decider, 2026-10-01; ADR-018, 2026-10-01 section)
 - **A gate that grows CI without proving a feature works for a user is invalid.** "gates that
   increase CI without proving a product/feature actually works for a user, invalid"; "yet we still
   build bullshit tests". Do not add one. A verifier rejects a candidate that adds a harness,
@@ -31,8 +35,10 @@ decider's own. Each rule names the ADR section that holds the full record.
     `ok`, and never reads as a pass. "those types of tests are great to have at the ready for
     troubleshooting". One mechanism: the cargo feature `optional-proofs`. Expensive user-facing
     claims are optional proofs; the live-model OpenCode proofs and R40, R41 and R42 are fully
-    optional and never block a tag. Planned, not yet built (#301): CI is to compile optional proofs
-    without running them, and `docs/release/optional-proofs.md` is to list them.
+    optional and never block a tag. CI compiles optional proofs without running them, and
+    `docs/release/optional-proofs.md` lists each one and how to run it (#301). Without the
+    feature, each optional test compiles a stand-in that says `OPTIONAL PROOF NOT RUN`
+    (`not_run!` in `crates/vox-tui/tests/support/optional_proof.rs`).
 - **Run a proof once; repeat only on smoke.** "it feels wasteful to test the same things
   2398439487398327492847239847234 times"; "test when you find smoke"; "not just for funzies". (ADR-018,
   2026-10-01 section)

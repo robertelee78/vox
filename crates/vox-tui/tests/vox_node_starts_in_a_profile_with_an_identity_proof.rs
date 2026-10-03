@@ -81,7 +81,7 @@ fn start(data: &Path, extra: &[&str]) -> VoxProc {
 #[ignore = "real vox processes with production Argon2id; run in release"]
 fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = hostile::profile_dir(tmp.path(), "anchor");
     hostile::fingerprint(&data);
     let trusted = hostile::stranger(0x71);
@@ -93,7 +93,7 @@ fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed
     );
     assert!(
         ok,
-        "CANNOT MEASURE: vox trust add in the anchor's profile: {out}{err}"
+        "PRODUCT (staging): vox trust add in the anchor's profile: {out}{err}"
     );
 
     // ---- 1. the start --------------------------------------------------------------------------
@@ -103,11 +103,11 @@ fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed
         println!("[proof] vox node --serve trusted in a profile with an identity: started");
         assert!(
             !said.contains("already has this profile open"),
-            "`vox node --serve trusted` said the profile is already open:\n{said}"
+            "PRODUCT: `vox node --serve trusted` said the profile is already open:\n{said}"
         );
         assert!(
             said.contains("serving only rooms made by the 1 identity this profile trusts"),
-            "`vox node --serve trusted` did not say it serves only the trusted identity's rooms:\n{said}"
+            "PRODUCT: `vox node --serve trusted` did not say it serves only the trusted identity's rooms:\n{said}"
         );
 
         // ---- 2. nothing readable, while it runs ----------------------------------------------
@@ -119,7 +119,7 @@ fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed
             .unwrap_or_default();
         assert!(
             !argv.trim().is_empty(),
-            "CANNOT MEASURE: could not read the anchor's command line"
+            "APPARATUS, CANNOT MEASURE: `ps` could not read the anchor's command line"
         );
         let mut all = Vec::new();
         files(&data, &mut all);
@@ -156,12 +156,13 @@ fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed
         );
         assert!(
             all.len() >= 3,
-            "CANNOT MEASURE: only {} file(s) under the anchor's profile",
+            "APPARATUS, CANNOT MEASURE (the proof's premise): only {} file(s) under the anchor's \
+             profile, so the scan for secrets covers too little",
             all.len()
         );
         assert!(
             leaks.is_empty(),
-            "`vox node --serve trusted` left its secrets readable: {leaks:?}"
+            "PRODUCT: `vox node --serve trusted` left its secrets readable: {leaks:?}"
         );
         drop(node);
     }
@@ -179,7 +180,7 @@ fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed
 fn vox_node_serve_trusted_names_what_is_wrong_with_its_trust_list() {
     use std::os::unix::fs::PermissionsExt as _;
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let run = |data: &Path| {
         let out = std::process::Command::new(world::VOX)
             .args(["node", "--listen", "127.0.0.1:0", "--serve", "trusted"])
@@ -188,7 +189,7 @@ fn vox_node_serve_trusted_names_what_is_wrong_with_its_trust_list() {
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
             .stdin(std::process::Stdio::null())
             .output()
-            .expect("run vox node");
+            .expect("APPARATUS: run vox node");
         (
             out.status.success(),
             format!(
@@ -207,7 +208,7 @@ fn vox_node_serve_trusted_names_what_is_wrong_with_its_trust_list() {
     );
     assert!(
         !ok && said.contains("has no identity") && said.contains("vox trust add"),
-        "`vox node --serve trusted` in a profile with no identity must refuse and say to make one: \
+        "PRODUCT: `vox node --serve trusted` in a profile with no identity must refuse and say to make one: \
          ok={ok}: {said}"
     );
 
@@ -216,19 +217,22 @@ fn vox_node_serve_trusted_names_what_is_wrong_with_its_trust_list() {
     let store = locked.join("default").join("store.redb");
     assert!(
         store.is_file(),
-        "CANNOT MEASURE: no store at {}",
+        "APPARATUS, CANNOT MEASURE (the proof's premise): `vox id` made no store at {}, the file \
+         the proof makes unreadable",
         store.display()
     );
-    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o000))
+        .expect("APPARATUS: set a staging file's mode");
     let (ok, said) = run(&locked);
-    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600))
+        .expect("APPARATUS: set a staging file's mode");
     println!(
         "[proof] --serve trusted, unreadable store: ok={ok}: {}",
         said.trim()
     );
     assert!(
         !ok && said.contains("exist but could not be opened") && !said.contains("make one with"),
-        "`vox node --serve trusted` with an unreadable store must say the list exists but could \
+        "PRODUCT: `vox node --serve trusted` with an unreadable store must say the list exists but could \
          not be opened, and must not advise making one: ok={ok}: {said}"
     );
 }

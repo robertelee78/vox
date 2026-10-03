@@ -34,17 +34,19 @@
 //! - **the profile was migrated exactly once**: every process runs with
 //!   `VOX_TEST_REWRITE_DELAY_MS` (0 when nothing is staged), which makes each one that migrates
 //!   say so, and the trial counts those lines;
-//! - every run that failed names another vox holding the profile — never an internal error.
+//! - every run that failed names another vox holding the profile — never an internal error;
+//! - **in the natural arm, none of the 20 two-at-once starts refuses either process**: every vox
+//!   takes the profile's lock before it opens the store, so the second waits for the first;
+//! - the same for a profile this build made (no migration): 20 pairs of `vox trust add` started at
+//!   the same instant, neither refused, both names listed.
 //!
 //! A lone unlock of a copy is the control: it must pass the same row checks, or nothing here
 //! would mean anything.
 //!
-//! Mutations that must turn it red: the profile lock released before the store's rename (or not
-//! taken at all): in the staged arm the second process migrates the old file and renames it over
-//! the first one's, and the first one's `trust add` is gone. A waiter that does not read the vault
-//! again under the lock: it migrates a second time (harmlessly, but a trial counts 2).
-//! `Error::ProfileBusy` reported as an internal fault again: the natural arm's refusals are
-//! unnamed.
+//! Mutations that must turn it red: the store opened before the profile's lock is taken, or the
+//! lock released before the store is closed: of two started together, one is refused. The profile lock not held across the migration: in the staged
+//! arm the second process migrates the old file and renames it over the first one's, and the
+//! first one's `trust add` is gone (or the profile is migrated twice).
 
 #![cfg(unix)]
 
@@ -84,9 +86,10 @@ const REPLACE_PAUSE_MS: &str = "8000";
 /// How long a second process that migrates too waits before its own rewrite.
 const REWRITE_DELAY_MS: &str = "12000";
 /// What a refusal says when another vox holds the profile (the CLI's words, and the fault's).
-const NAMED: [&str; 2] = [
+const NAMED: [&str; 3] = [
     "a vox is already running for this profile",
-    "another vox holds this profile open",
+    "another vox is still using this profile",
+    "run this again once that one is done",
 ];
 /// What the knobs print when their moment is reached.
 const AT_REPLACE: &str = "the store is released, not yet replaced";
@@ -109,11 +112,16 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     if let Some(s) = stdin {
-        child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
+        child
+            .stdin
+            .take()
+            .expect("APPARATUS: a piped stdio handle")
+            .write_all(s.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
     }
-    let out = child.wait_with_output().expect("vox finished");
+    let out = child.wait_with_output().expect("APPARATUS: vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -123,7 +131,13 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
 
 fn ok(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> String {
     let (good, out, err) = vox_with(exe, data, argv, stdin);
-    assert!(good, "CANNOT MEASURE: vox {argv:?} failed: {out}{err}");
+    // This build failing a step is the product's; the previous release failing one is not.
+    let side = if exe == Path::new(VOX) {
+        "PRODUCT (staging)"
+    } else {
+        "APPARATUS, CANNOT MEASURE: the previous release"
+    };
+    assert!(good, "{side}: vox {argv:?} failed: {out}{err}");
     out
 }
 
@@ -156,7 +170,9 @@ fn daemon(exe: &Path, name: &str, data: &Path, spec: &str, pass_file: &Path) -> 
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
         &[],
     );
@@ -167,7 +183,7 @@ fn daemon(exe: &Path, name: &str, data: &Path, spec: &str, pass_file: &Path) -> 
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 /// Create a room on `host`'s daemon, have `guest` join it, and return the room's id.
@@ -175,7 +191,7 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
     ok(
         exe,
         host,
-        &["room", "create", "--name", name],
+        &["room", "create", "--passphrase-file", "-", "--name", name],
         Some("room pass"),
     );
     let list = ok(exe, host, &["room", "list"], None);
@@ -183,13 +199,21 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
         .lines()
         .find(|l| l.contains(name))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): room not listed: {list}"))
         .to_owned();
     let link = ok(exe, host, &["room", "invite", &room], None);
     ok(
         exe,
         guest,
-        &["room", "join", link.trim(), "--name", name],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            name,
+        ],
         Some("room pass"),
     );
     room
@@ -203,14 +227,19 @@ fn profile_dir(data: &Path) -> PathBuf {
 
 /// Copy a stopped profile's data directory (its files; a daemon's leftover socket is not one).
 fn copy_tree(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap().filter_map(Result::ok) {
-        let ty = e.file_type().unwrap();
+    std::fs::create_dir_all(to).expect("APPARATUS: create a staging directory");
+    for e in std::fs::read_dir(from)
+        .expect("APPARATUS: list a directory")
+        .filter_map(Result::ok)
+    {
+        let ty = e
+            .file_type()
+            .expect("APPARATUS: read a staging file's type");
         let dest = to.join(e.file_name());
         if ty.is_dir() {
             copy_tree(&e.path(), &dest);
         } else if ty.is_file() {
-            std::fs::copy(e.path(), &dest).unwrap();
+            std::fs::copy(e.path(), &dest).expect("APPARATUS: copy the v0.2.9 profile");
         }
     }
 }
@@ -224,27 +253,39 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// redb would repair on open is not changed by reading it.
 fn row_keys(data: &Path) -> BTreeSet<String> {
     let copy = data.with_extension("rows.redb");
-    std::fs::copy(profile_dir(data).join("store.redb"), &copy).unwrap();
-    let db = redb::Database::open(&copy).expect("open a copy of the stopped store");
-    let r = db.begin_read().unwrap();
+    std::fs::copy(profile_dir(data).join("store.redb"), &copy)
+        .expect("PRODUCT (staging): the profile has no store.redb to read");
+    let db = redb::Database::open(&copy).expect("APPARATUS: open a copy of the stopped store");
+    let r = db
+        .begin_read()
+        .expect("PRODUCT: vox's stopped store cannot be read");
     let mut keys = BTreeSet::new();
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     if let Ok(t) = r.open_table(SEGMENTS) {
-        for item in t.iter().unwrap() {
-            let (k, _) = item.unwrap();
+        for item in t
+            .iter()
+            .expect("PRODUCT: a table of vox's stopped store cannot be read")
+        {
+            let (k, _) = item.expect("PRODUCT: a row of vox's stopped store cannot be read");
             let (c, kind, id) = k.value();
             keys.insert(format!("segments/{}/{kind}/{id}", hex(&c)));
         }
     }
     if let Ok(t) = r.open_table(SEK_WRAPS) {
-        for item in t.iter().unwrap() {
-            let (k, _) = item.unwrap();
+        for item in t
+            .iter()
+            .expect("PRODUCT: a table of vox's stopped store cannot be read")
+        {
+            let (k, _) = item.expect("PRODUCT: a row of vox's stopped store cannot be read");
             keys.insert(format!("sek_wraps/{}", hex(&k.value())));
         }
     }
     if let Ok(t) = r.open_table(META) {
-        for item in t.iter().unwrap() {
-            let (k, _) = item.unwrap();
+        for item in t
+            .iter()
+            .expect("PRODUCT: a table of vox's stopped store cannot be read")
+        {
+            let (k, _) = item.expect("PRODUCT: a row of vox's stopped store cannot be read");
             keys.insert(format!("meta/{}", k.value()));
         }
     }
@@ -252,14 +293,17 @@ fn row_keys(data: &Path) -> BTreeSet<String> {
 }
 
 fn vault_version(data: &Path) -> u64 {
-    let bytes = std::fs::read(profile_dir(data).join("vault.cbor")).unwrap();
-    IdentityVault::from_canonical_slice(&bytes).unwrap().version
+    let bytes = std::fs::read(profile_dir(data).join("vault.cbor"))
+        .expect("PRODUCT (staging): the profile has no vault.cbor");
+    IdentityVault::from_canonical_slice(&bytes)
+        .expect("PRODUCT: the vault vox wrote does not parse")
+        .version
 }
 
 /// Files a migration must not leave behind: its rewrite's new file, or a store moved aside.
 fn leftovers(data: &Path) -> Vec<String> {
     std::fs::read_dir(profile_dir(data))
-        .unwrap()
+        .expect("APPARATUS: list a directory")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains(".rewrite") || n.contains("orphaned"))
@@ -306,7 +350,7 @@ fn trust_add(data: &Path, who: &'static str, fp: &str, env: &[(&str, &str)]) -> 
 }
 
 fn finish(mut p: VoxProc, name: &'static str) -> Ran {
-    let status = p.child.wait().expect("wait for vox");
+    let status = p.child.wait().expect("APPARATUS: wait for vox");
     // The reader threads end when the pipes close; give them a moment to hand over the rest.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut said = String::new();
@@ -412,14 +456,14 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     } else {
         600
     }));
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write a staging file");
     let new = PathBuf::from(VOX);
 
     // ---- a profile written by v0.2.9: a trusted member, and a room with a post ---------------
@@ -454,7 +498,8 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     assert_eq!(
         vault_version(&carol),
         1,
-        "CANNOT MEASURE: {PREVIOUS} did not write a version-1 vault"
+        "APPARATUS, CANNOT MEASURE: the previous release {PREVIOUS} did not write a version-1 \
+         vault"
     );
     let template = row_keys(&carol);
     let room_rows = template
@@ -467,7 +512,7 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     );
     assert!(
         room_rows >= 3,
-        "CANNOT MEASURE: {PREVIOUS}'s store holds only {room_rows} room rows: {template:?}"
+        "APPARATUS, CANNOT MEASURE: the previous release {PREVIOUS}'s store holds only {room_rows} room rows: {template:?}"
     );
     // The identities the trials trust: made by this build, once.
     let (erin, frank) = (dir("erin"), dir("frank"));
@@ -486,17 +531,21 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
             && ctl.lost_rows.is_empty()
             && ctl.not_v2 == 0
             && ctl.left.is_empty()
-            && ctl.dave_gone == 0
-            && ctl.not_once.is_empty(),
-        "CANNOT MEASURE: a lone unlock of the copy already fails the checks (or its migration is \
-         not counted): adds lost {:?}, rows lost {:?}, not v2 {}, left {:?}, dave gone {}, \
-         unnamed {:?}, migrations {:?}",
+            && ctl.dave_gone == 0,
+        "PRODUCT: one unlock of a {PREVIOUS} profile, with nothing racing it, already loses \
+         something: adds lost {:?}, rows lost {:?}, not v2 {}, left {:?}, dave gone {}, \
+         unnamed {:?}",
         ctl.lost_adds,
         ctl.lost_rows,
         ctl.not_v2,
         ctl.left,
         ctl.dave_gone,
-        ctl.unnamed,
+        ctl.unnamed
+    );
+    assert!(
+        ctl.not_once.is_empty(),
+        "APPARATUS, CANNOT MEASURE (test knob): the lone unlock's migration was not counted by \
+         its {AT_REWRITE:?} notice, so no trial's count means anything: {:?}",
         ctl.not_once
     );
 
@@ -541,6 +590,41 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
         staged.judge(&format!("staged {i}"), &data, &template, &runs);
     }
 
+    // ---- 3. this build's own profile: two `trust add`s started at the same instant -------------
+    // Not a migration: the claim that neither of two commands started together is refused holds
+    // for every profile, and verification of c5 found it broken on a fresh one too.
+    let own = dir("own-template");
+    ok(&new, &own, &["id"], None);
+    let (mut own_both, mut own_refused, mut own_lost) = (0, Vec::new(), Vec::new());
+    for i in 0..TRIALS {
+        let data = dir(&format!("own-{i}"));
+        copy_tree(&own, &data);
+        let a = trust_add(&data, "x", &x_fp, &[]);
+        let b = trust_add(&data, "y", &y_fp, &[]);
+        let runs = [finish(a, "x"), finish(b, "y")];
+        for r in runs.iter().filter(|r| !r.exited_ok) {
+            own_refused.push(format!("own {i} `trust add {}`: {}", r.name, r.said.trim()));
+        }
+        let names = trusted_names(&data);
+        for r in runs.iter().filter(|r| r.exited_ok) {
+            if !names.contains(r.name) {
+                own_lost.push(format!(
+                    "own {i}: `trust add {}` exited 0, and `trust list` shows {names:?}",
+                    r.name
+                ));
+            }
+        }
+        if runs.iter().all(|r| r.exited_ok) {
+            own_both += 1;
+        }
+    }
+    println!(
+        "[proof] own profile: {TRIALS} trials x 2 started together: both exited 0 {own_both}; \
+         refused {}; `trust add`s that exited 0 and are gone {}",
+        own_refused.len(),
+        own_lost.len()
+    );
+
     for (arm, t) in [("natural", &nat), ("staged", &staged)] {
         println!(
             "[proof] {arm}: {} trials x 2: both exited 0 {}, one {}, none {}; refused naming \
@@ -564,35 +648,62 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     }
     println!("[proof] staged: the first process reached the released store in {reached}/{STAGED}");
 
+    // **Two started together both run** (V210-100): each takes the profile's lock before it
+    // opens the store, so the second waits for the first instead of being refused.
+    assert!(
+        nat.refused_named == 0 && nat.one_ok == 0,
+        "PRODUCT: of {} two-at-once starts, {} ended with one of the two refused (\"a vox is \
+         already running for this profile\"), {} refusals in all — two vox started together \
+         must both run, the second after the first",
+        nat.trials,
+        nat.one_ok,
+        nat.refused_named
+    );
+    assert!(
+        own_refused.is_empty(),
+        "PRODUCT: of {TRIALS} pairs of `vox trust add` started together on this build's own \
+         profile, {} commands were refused — two vox started together must both run, the second \
+         after the first: {:#?}",
+        own_refused.len(),
+        own_refused
+    );
+    assert!(
+        own_lost.is_empty(),
+        "PRODUCT: a `vox trust add` exited 0 and its row is gone: {own_lost:#?}"
+    );
     for t in [&nat, &staged] {
         assert!(
             t.lost_adds.is_empty(),
-            "a `vox trust add` exited 0 and its row is gone: {:#?}",
+            "PRODUCT: a `vox trust add` exited 0 and its row is gone: {:#?}",
             t.lost_adds
         );
         assert!(
             t.lost_rows.is_empty(),
-            "rows v0.2.9 wrote are gone from the store: {:#?}",
+            "PRODUCT: rows v0.2.9 wrote are gone from the store: {:#?}",
             t.lost_rows
         );
-        assert_eq!(t.dave_gone, 0, "the member v0.2.9 trusted is gone");
+        assert_eq!(t.dave_gone, 0, "PRODUCT: the member v0.2.9 trusted is gone");
         assert!(
             t.unnamed.is_empty(),
-            "a refused unlock did not name another vox holding the profile: {:#?}",
+            "PRODUCT: a refused unlock did not name another vox holding the profile: {:#?}",
             t.unnamed
         );
         assert_eq!(
             t.not_v2, 0,
-            "a profile that was unlocked is still a v1 vault"
+            "PRODUCT: a profile that was unlocked is still a v1 vault"
         );
-        assert!(t.left.is_empty(), "files left behind: {:?}", t.left);
+        assert!(
+            t.left.is_empty(),
+            "PRODUCT: files left behind: {:?}",
+            t.left
+        );
         assert_eq!(
             t.none_ok, 0,
-            "both unlocks were refused, so the profile could be opened by neither"
+            "PRODUCT: both unlocks were refused, so the profile could be opened by neither"
         );
         assert!(
             t.not_once.is_empty(),
-            "a profile was not migrated exactly once — a vox that waited for the lock migrated \
+            "PRODUCT: a profile was not migrated exactly once — a vox that waited for the lock migrated \
              it again: {:#?}",
             t.not_once
         );

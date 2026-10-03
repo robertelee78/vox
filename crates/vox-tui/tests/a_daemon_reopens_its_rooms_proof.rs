@@ -57,14 +57,19 @@ impl Daemon {
         let ok = Command::new("kill")
             .args(["-TERM", &pid])
             .status()
-            .expect("run kill")
+            .expect("APPARATUS: run kill")
             .success();
-        assert!(ok, "kill -TERM {pid} failed");
+        assert!(ok, "APPARATUS: kill -TERM {pid} did not take");
         let deadline = Instant::now() + Duration::from_secs(30);
-        while self.0.try_wait().expect("try_wait").is_none() {
+        while self
+            .0
+            .try_wait()
+            .expect("APPARATUS: the daemon's exit status could not be read")
+            .is_none()
+        {
             assert!(
                 Instant::now() < deadline,
-                "the daemon did not leave within 30s of SIGTERM"
+                "PRODUCT: the daemon did not leave within 30s of SIGTERM"
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -86,17 +91,17 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: vox stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: write vox stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -107,8 +112,10 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 /// Start `vox daemon` given the identity passphrase and **nothing else**, then wait until it
 /// answers.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: harness file I/O");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: harness file I/O");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -118,11 +125,18 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+        .expect("APPARATUS: spawn vox daemon");
+    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .expect("APPARATUS: write the daemon's passphrase");
     drop(pipe);
     let d = Daemon(child);
+    // The first start is staging; every later start is the restart this proof is about.
+    let side = if tag.ends_with("-start") {
+        "PRODUCT (staging): on its first start,"
+    } else {
+        "PRODUCT: restarted with only its identity passphrase,"
+    };
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let (ok, _, err) = vox(dir, &["room", "list"], None);
@@ -131,7 +145,7 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         }
         assert!(
             Instant::now() < deadline,
-            "{tag}'s daemon never answered: {err}\nits stderr: {}",
+            "{side} {tag}'s daemon never answered on its control socket: {err}\nits stderr: {}",
             std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -143,16 +157,22 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
 fn reads(dir: &Path, who: &str, when: &str, room: &str, want: Option<&str>) {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
     let (_, listed, _) = vox(dir, &["room", "list"], None);
+    // At the first start the room being open is staging; after a restart it is the claim.
+    let side = if when == "start" {
+        "PRODUCT (staging):"
+    } else {
+        "PRODUCT:"
+    };
     assert!(
         ok,
-        "{when}: {who}'s daemon does not hold the room open (#208): {err}\n`room list`: \
+        "{side} {when}: {who}'s daemon does not hold the room open (#208): {err}\n`room list`: \
          {listed:?}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{who}-{when}.err"))).unwrap_or_default()
     );
     if let Some(want) = want {
         assert!(
             out.lines().any(|l| l.ends_with(want)),
-            "{when}: {who} reads the room but not the post {want:?}: {out:?}"
+            "{side} {when}: {who} reads the room but not the post {want:?}: {out:?}"
         );
     }
 }
@@ -161,54 +181,67 @@ fn reads(dir: &Path, who: &str, when: &str, room: &str, want: Option<&str>) {
 #[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
 fn a_restarted_daemon_holds_every_room_it_held_without_a_room_passphrase() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     for d in [&alice, &bob] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: harness file I/O");
     }
 
     // ---- two identities that consent to each other -------------------------------------
     let mut fps = Vec::new();
     for dir in [&alice, &bob] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id failed: {err}");
         fps.push(out.trim().to_owned());
     }
     for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(ok, "vox trust add {name}: {err}");
+        assert!(ok, "PRODUCT (staging): vox trust add {name} failed: {err}");
     }
 
     // ---- alice creates a room and posts; bob joins it ----------------------------------
     let a = daemon(&alice, "alice-start");
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "kept"],
+        &["room", "create", "--passphrase-file", "-", "--name", "kept"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
-    let (_, listed, _) = vox(&alice, &["room", "list"], None);
+    assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
+    let (_, listed, list_err) = vox(&alice, &["room", "list"], None);
     let room: String = listed
         .split_whitespace()
         .next()
-        .expect("a room id in `room list`")
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): `room list` shows no room id after `room create`: \
+                 {listed:?} {list_err:?}"
+            )
+        })
         .chars()
         .take(12)
         .collect();
     let (ok, _, err) = vox(&alice, &["room", "post", &room, POST], None);
-    assert!(ok, "vox room post: {err}");
+    assert!(ok, "PRODUCT (staging): vox room post failed: {err}");
     reads(&alice, "alice", "start", &room, Some(POST));
 
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
     let b = daemon(&bob, "bob-start");
     let (ok, _, err) = vox(
         &bob,
-        &["room", "join", link.trim(), "--name", "kept"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "kept",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room join: {err}");
+    assert!(ok, "PRODUCT (staging): vox room join failed: {err}");
     reads(&bob, "bob", "start", &room, None);
 
     // ---- a crash: SIGKILL both, restart both with the identity passphrase alone --------
@@ -229,7 +262,7 @@ fn a_restarted_daemon_holds_every_room_it_held_without_a_room_passphrase() {
         &["room", "post", &room, "said after the restarts"],
         None,
     );
-    assert!(ok, "a reopened room takes a post: {err}");
+    assert!(ok, "PRODUCT: the reopened room refused a post: {err}");
     reads(
         &alice,
         "alice",

@@ -77,6 +77,20 @@ impl Anchor {
         }
     }
 
+    /// The UDP port this anchor listens on, from its spec.
+    pub fn port(&self) -> u16 {
+        self.v4_spec
+            .rsplit('/')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "APPARATUS: no port in this harness's spec {:?}",
+                    self.v4_spec
+                )
+            })
+    }
+
     /// Stop this anchor (by its PID) and start it again from the same `dir` on the same port, so
     /// every spec naming it still does (V210-57's proof of a prompt redial). A new process: a new
     /// endpoint, a new certificate, every connection to the old one gone.
@@ -338,6 +352,12 @@ impl RelayWorld {
 
     /// Anchor, and a host serving a loopback echo service with the guest already trusted.
     pub fn new(split: Split) -> Self {
+        Self::new_with_host_env(split, &[])
+    }
+
+    /// [`RelayWorld::new`] with extra environment for the host, for the proofs' test-only knobs
+    /// (`test_knobs::require` them first).
+    pub fn new_with_host_env(split: Split, host_env: &[(&str, &str)]) -> Self {
         let tmp = tempdir();
         let (anchor_dir, host_dir, guest_dir) = (
             tmp.path().join("anchor"),
@@ -362,7 +382,7 @@ impl RelayWorld {
         );
 
         let service = echo_service().to_string();
-        let mut host = VoxProc::spawn(
+        let mut host = VoxProc::spawn_env(
             "host",
             &host_dir,
             &args(&[
@@ -373,6 +393,7 @@ impl RelayWorld {
                 "--listen",
                 "127.0.0.1:0",
             ]),
+            host_env,
         );
         let room = after_label(
             &host.expect_line("room", |l| l.starts_with("room ")),
@@ -431,8 +452,18 @@ impl RelayWorld {
 
     /// [`Self::forward`], naming `extra` anchors (`--anchor` specs) beside the world's own.
     pub fn forward_with_anchors(&mut self, extra: &[&str]) -> SocketAddr {
-        let (listen, spec) = self.guest_net();
-        let (listen, spec) = (listen.to_owned(), spec.to_owned());
+        let spec = self.guest_net().1.to_owned();
+        self.spawn_forward(&spec, extra)
+    }
+
+    /// [`Self::forward`], naming the anchor by `anchor_spec` instead of the world's own spec — the
+    /// same anchor reached another way, such as through a slow port forward.
+    pub fn forward_through(&mut self, anchor_spec: &str) -> SocketAddr {
+        self.spawn_forward(anchor_spec, &[])
+    }
+
+    fn spawn_forward(&mut self, spec: &str, extra: &[&str]) -> SocketAddr {
+        let listen = self.guest_net().0;
         let passphrase_file = self.passphrase_file();
         let mut list = vec![
             "forward",
@@ -443,9 +474,9 @@ impl RelayWorld {
             "--passphrase-file",
             &passphrase_file,
             "--anchor",
-            &spec,
+            spec,
             "--listen",
-            &listen,
+            listen,
         ];
         for a in extra {
             list.push("--anchor");

@@ -1,4 +1,4 @@
-//! An author's **checkpoint** on its own feed (ADR-023 decision 3, tag `0x0015`,
+//! An author's **checkpoint** on its own feed (ADR-023 decision 3, tag `0x0016`,
 //! domain `vox/checkpoint/v1`).
 //!
 //! A room that keeps messages for a while still keeps every signed skeleton forever, and the
@@ -40,7 +40,7 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// The framed payload: `tag(0x0015) ‖ version ‖ [seq, entry_hash]`.
+    /// The framed payload: `tag(0x0016) ‖ version ‖ [seq, entry_hash]`.
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
         let mut e = Encoder::new();

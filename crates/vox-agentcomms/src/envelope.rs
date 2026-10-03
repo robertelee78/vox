@@ -24,6 +24,45 @@ pub const DEFAULT_HOPS: u32 = 8;
 /// Longest petname accepted in [`Envelope::to`], matching the keyring's bound.
 pub const MAX_NAME: usize = 64;
 
+/// Longest resource name a claim may carry: a work reference's scheme, `:` and
+/// [`MAX_WORK_ID`], with room to spare.
+pub const MAX_RESOURCE: usize = 160;
+
+/// How many bytes of an author-chosen name [`shown`] prints.
+pub const SHOWN_NAME: usize = 64;
+
+/// Whether `c` may not appear in a name printed for somebody reading (V210-123): the rule lives in
+/// `vox-text`, which the core shares for what peers say (V210-154).
+pub use vox_text::breaks_lines;
+
+/// One character of each kind [`breaks_lines`] refuses, for a proof to forge a name through
+/// each (as `agent_hook::LINE_BREAKS` is for message rows): a sanitiser that stops refusing any
+/// one of them turns that proof red.
+pub const NAME_BREAKERS: &[char] = &[
+    '\n', '\r', '\u{0b}', '\u{0c}', '\u{85}', '\u{1b}', '\0', '\u{2028}', '\u{2029}', '\u{202E}',
+    '\u{202A}', '\u{2066}', '\u{2069}', '\u{200F}',
+];
+
+/// Whether `s` may name a session, an addressee or a resource: non-empty, at most `max`
+/// bytes, and **on one line** — no control character, no line or paragraph separator
+/// (V210-123).
+///
+/// These names are chosen by whoever posts, and they are printed into other agents'
+/// contexts: in the drain's notices, `vox room board` and a claim's answer. A newline in
+/// one would start a line of its own there, outside Vox's framing, where a model reads it
+/// as anyone's words — the operator's included.
+#[must_use]
+pub fn is_valid_name(s: &str, max: usize) -> bool {
+    !s.is_empty() && s.len() <= max && !s.chars().any(breaks_lines)
+}
+
+/// An author-chosen name as it may be printed where a person or a model reads it: on one
+/// line, every character that could break it replaced with U+FFFD, and cut to `max` bytes
+/// with `…` (V210-123). [`is_valid_name`] refuses such a name on the way in; this is the
+/// second guard, for every printer, so a name that got in some other way still cannot
+/// start a line.
+pub use vox_text::shown;
+
 /// The data key naming the work item a message is about (ADR-021 §2). Its **shape** is
 /// checked ([`is_valid_work`]); its meaning never is — carried, compared byte for byte
 /// and filtered by, never interpreted, never looked up in any tracker.
@@ -124,7 +163,7 @@ pub struct Envelope {
     /// Where that session is working.
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub at: Context,
-    /// Petnames addressed. **Empty addresses the room.**
+    /// The nodes addressed, each by its whole fingerprint in base32. **Empty addresses the room.**
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<String>,
     /// The message type. `hello`, `bye` and `say` are reserved; anything else is
@@ -267,14 +306,23 @@ impl Envelope {
 
     /// Check the fields this crate is entitled to police.
     fn validate(&self) -> Result<(), ParseError> {
-        if self.kind.is_empty() {
-            return Err(ParseError::Malformed("empty type"));
+        // The type is printed into other agents' contexts too (V210-123): a name, like `from`.
+        if !is_valid_name(&self.kind, MAX_NAME) {
+            return Err(ParseError::Malformed(
+                "the type is empty, too long, or not on one line",
+            ));
         }
-        if self.kind.len() > MAX_NAME {
-            return Err(ParseError::Malformed("type too long"));
+        if self.to.iter().any(|n| !is_valid_name(n, MAX_NAME)) {
+            return Err(ParseError::Malformed(
+                "an addressee name is empty, too long, or not on one line",
+            ));
         }
-        if self.to.iter().any(|n| n.is_empty() || n.len() > MAX_NAME) {
-            return Err(ParseError::Malformed("addressee name length"));
+        // `from` names the posting session, and is printed into other agents' contexts
+        // (V210-123). Empty is a message from no session (a person typing), not an error.
+        if !self.from.is_empty() && !is_valid_name(&self.from, MAX_NAME) {
+            return Err(ParseError::Malformed(
+                "`from` is too long or not on one line",
+            ));
         }
         Ok(())
     }

@@ -20,6 +20,13 @@
 //! 2. every post made during it is taken within [`ANSWER_WITHIN`];
 //! 3. bob's daemon reports no stall of a second or more while opening the forward.
 //!
+//! **Which side a red names.** A failed or slow post is `PRODUCT:` and quotes what vox said; a
+//! `vox` step of the setup that failed is `PRODUCT (staging):`. Before the fetch, bob makes the
+//! same posts with no fetch running: the product's baseline, never part of the apparatus clock,
+//! so one that fails or misses [`ANSWER_WITHIN`] is `PRODUCT (staging):`. The **apparatus clock**
+//! is only the apparatus: the time to run `/usr/bin/true`, not vox, right after any slow post. A slow
+//! post is `APPARATUS (runner stalled)` only while that clock is over [`APPARATUS_BUDGET`].
+//!
 //! Mutation: the dial back on the actor (the parent of this change) — (2) and (3) go red.
 
 #![cfg(unix)]
@@ -43,7 +50,6 @@ struct Running(Child, Arc<Mutex<String>>);
 
 impl Running {
     /// Whatever the child has said so far, for an assertion message.
-    #[allow(dead_code)]
     fn said(&self) -> String {
         self.1.lock().map(|s| s.clone()).unwrap_or_default()
     }
@@ -104,14 +110,14 @@ impl Agent {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         child
             .stdin
             .take()
-            .unwrap()
+            .expect("APPARATUS: vox's stdin")
             .write_all(stdin.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
+        let out = child.wait_with_output().expect("APPARATUS: wait for vox");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -120,7 +126,7 @@ impl Agent {
     }
 
     fn id_pass(&self) -> &str {
-        self.pass.to_str().unwrap()
+        self.pass.to_str().expect("APPARATUS: a UTF-8 temp path")
     }
 
     fn vox(&self, args: &[&str]) -> (bool, String, String) {
@@ -131,7 +137,7 @@ impl Agent {
             .env_remove("VOX_ROOM")
             .stdin(Stdio::null())
             .output()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -150,7 +156,7 @@ impl Agent {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .expect("spawn vox")
+                .expect("APPARATUS: spawn vox")
         };
         let said = Arc::new(Mutex::new(String::new()));
         drain(child.stdout.take(), &said);
@@ -164,9 +170,9 @@ impl Agent {
 fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
     let data = tmp.path().join(name).join("data");
     let cfg = tmp.path().join(name).join("cfg");
-    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::create_dir_all(&cfg).expect("APPARATUS: create a staging dir");
     let pass = tmp.path().join(format!("{name}.pass"));
-    std::fs::write(&pass, ID_PASS).unwrap();
+    std::fs::write(&pass, ID_PASS).expect("APPARATUS: write a staging file");
     let mut a = Agent {
         data,
         cfg,
@@ -174,7 +180,7 @@ fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
         daemon: None,
     };
     let (ok, _, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
-    assert!(ok, "{name}: vox id: {err}");
+    assert!(ok, "PRODUCT (staging): {name}: vox id: {err}");
     a.daemon = Some(a.spawn(&[
         "daemon",
         "--listen",
@@ -185,8 +191,17 @@ fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
         a.id_pass(),
     ]));
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !a.vox(&["room", "list"]).0 {
-        assert!(Instant::now() < deadline, "{name}'s daemon never answered");
+    loop {
+        let (ok, _, err) = a.vox(&["room", "list"]);
+        if ok {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): {name}'s daemon never answered `vox room list` in 60 s ({err}); \
+             the daemon said: {}",
+            a.daemon.as_ref().map(Running::said).unwrap_or_default()
+        );
         std::thread::sleep(Duration::from_millis(250));
     }
     a
@@ -195,7 +210,7 @@ fn agent(tmp: &tempfile::TempDir, name: &str, spec: &str) -> Agent {
 /// A real `vox node` anchor on loopback, and the `--anchor` spec it prints.
 fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
     let dir = tmp.path().join("anchor");
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: create a staging dir");
     let a = Agent {
         data: dir.join("data"),
         cfg: dir.join("cfg"),
@@ -205,7 +220,11 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
     let node = a.spawn(&["node", "--listen", "127.0.0.1:0"]);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let said = node.1.lock().unwrap().clone();
+        let said = node
+            .1
+            .lock()
+            .expect("APPARATUS: a poisoned output buffer")
+            .clone();
         if let Some(spec) = said
             .split_whitespace()
             .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
@@ -214,7 +233,7 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "PRODUCT (staging): the anchor never printed its spec in 60 s; it said: {said}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -222,7 +241,7 @@ fn anchor(tmp: &tempfile::TempDir) -> (Running, String) {
 
 fn fingerprint(a: &Agent) -> String {
     let (ok, out, err) = a.vox(&["id", "--identity-passphrase-file", a.id_pass()]);
-    assert!(ok, "vox id: {err}");
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
     out.trim().to_owned()
 }
 
@@ -237,11 +256,53 @@ fn until(who: &Agent, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> S
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}; last saw {last}");
+    panic!("PRODUCT (staging): timed out waiting for {what}; last saw {last}");
 }
 
 /// How long the daemon may take to take a post while a fetch dials.
 const ANSWER_WITHIN: Duration = Duration::from_secs(2);
+/// The most `/usr/bin/true` may take to run on a runner that can time an [`ANSWER_WITHIN`] bound.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(1);
+
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
+    let t = std::time::Instant::now();
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
+    assert!(
+        ok,
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
+    );
+    t.elapsed()
+}
+
+/// Red if a post missed [`ANSWER_WITHIN`]: `APPARATUS (runner stalled)` when the apparatus clock taken right
+/// after it is over [`APPARATUS_BUDGET`], otherwise `side` (the product's). A post that failed
+/// is the product's, whatever the clock.
+fn answered_within(side: &str, what: &str, ok: bool, took: Duration, said: &str) {
+    assert!(ok, "{side}: {what} failed in {took:?}: {said}");
+    if took < ANSWER_WITHIN {
+        return;
+    }
+    let apparatus = apparatus_spawn();
+    assert!(
+        apparatus <= APPARATUS_BUDGET,
+        "APPARATUS (runner stalled): apparatus took {apparatus:?} (`/usr/bin/true`, budget \
+         {APPARATUS_BUDGET:?}) right after {what} took {took:?}, so the runner, not the node, may \
+         be slow"
+    );
+    panic!(
+        "{side}: {what} took {took:?} (bound {ANSWER_WITHIN:?}; apparatus {apparatus:?}). It \
+         said: {said}"
+    );
+}
 
 /// The node treats a connection that has heard nothing for this long as dead
 /// (`SILENCE_IS_DEATH`, 30 s), plus a margin: after it, a fetch dials afresh.
@@ -251,9 +312,9 @@ const SILENCE: Duration = Duration::from_secs(36);
 #[ignore = "two networked nodes, real child processes and a 36 s wait; CI runs it in release"]
 fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let source = tmp.path().join("artifact.bin");
-    std::fs::write(&source, vec![7u8; 100_000]).unwrap();
+    std::fs::write(&source, vec![7u8; 100_000]).expect("APPARATUS: write a staging file");
 
     let (_anchor, spec) = anchor(&tmp);
     let mut alice = agent(&tmp, "alice", &spec);
@@ -269,40 +330,79 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
             "--identity-passphrase-file",
             who.id_pass(),
         ]);
-        assert!(ok, "trust {name}: {err}");
+        assert!(ok, "PRODUCT (staging): trust {name}: {err}");
     }
-    let (ok, _, err) = alice.vox_with(&["room", "create", "--name", "mission"], ROOM_PASS);
-    assert!(ok, "vox room create: {err}");
+    let (ok, _, err) = alice.vox_with(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
+        ROOM_PASS,
+    );
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let label = alice
         .vox(&["room", "list"])
         .1
         .split_whitespace()
         .next()
-        .expect("a room")
+        .expect("PRODUCT (staging): alice's new room in `vox room list`")
         .to_owned();
     let (ok, link, err) = alice.vox(&["room", "invite", &label]);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let link = link.trim().to_owned();
     let room = link
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
-        .expect("an invite link naming the room")
+        .unwrap_or_else(|| panic!("PRODUCT (staging): an invite link naming the room: {link:?}"))
         .to_owned();
-    let mut joined = false;
-    for _ in 0..6 {
-        if bob
-            .vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS)
-            .0
-        {
-            joined = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(5));
+    // One join, no retry: a join that fails is the product's failure, and #217's busy-host
+    // refusal is fixed (V210-43), so nothing known excuses one.
+    let (ok, out, err) = bob.vox_with(
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room join` failed for bob.\nstdout: {out}\nstderr: {err}"
+    );
+
+    // ---- the product's baseline: the same posts, timed the same way, with no fetch running ----
+    // Taken while alice is still up, so these posts start no dial to her that could change
+    // what the fetch below dials.
+    let mut quiet = Duration::ZERO;
+    for n in 0..3 {
+        let asked = Instant::now();
+        let (ok, _, err) = bob.vox(&["room", "post", &room, &format!("before {n}")]);
+        let t = asked.elapsed();
+        answered_within(
+            "PRODUCT (staging)",
+            &format!("bob's post {n}, with no fetch running,"),
+            ok,
+            t,
+            &err,
+        );
+        quiet = quiet.max(t);
     }
-    assert!(joined, "bob never joined");
 
     // ---- alice offers a file; bob sees the offer; alice's node goes, unannounced ----
-    let offer = alice.spawn(&["room", "send", &room, source.to_str().unwrap()]);
+    let offer = alice.spawn(&[
+        "room",
+        "send",
+        &room,
+        source.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
     until(
         &bob,
         "the announcement to reach bob",
@@ -322,11 +422,14 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
                 .args(["room", "get", &room, "artifact.bin"])
                 .env("VOX_DATA_DIR", &data)
                 .env("VOX_CONFIG_DIR", &cfg)
-                .env("HOME", data.parent().unwrap())
+                .env(
+                    "HOME",
+                    data.parent().expect("APPARATUS: the profile's parent dir"),
+                )
                 .env_remove("VOX_ROOM")
                 .stdin(Stdio::null())
                 .output()
-                .expect("spawn vox room get");
+                .expect("APPARATUS: spawn vox room get");
             (
                 out.status.success(),
                 started.elapsed(),
@@ -345,37 +448,45 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
         let (ok, _, err) = bob.vox(&["room", "post", &room, &format!("still here {n}")]);
         answers.push((asked.elapsed(), ok, err));
     }
-    let (got, took, said) = fetch.join().unwrap();
+    let (got, took, said) = fetch
+        .join()
+        .expect("APPARATUS: the thread running `vox room get` panicked");
     let stalls: Vec<String> = bob
         .daemon
         .as_ref()
-        .unwrap()
+        .expect("APPARATUS: bob's daemon handle")
         .said()
         .lines()
         .filter(|l| l.contains("busy ") && l.contains("forward"))
         .map(str::to_owned)
         .collect();
     eprintln!(
-        "[proof] the fetch took {took:?} (ok={got}); `vox room post` during it answered after {:?}; \
-         bob's daemon reported {} forward stall(s): {stalls:?}",
+        "[proof] the fetch took {took:?} (ok={got}); `vox room post` during it answered after {:?} \
+         (quiet {quiet:?}); bob's daemon reported {} forward stall(s): {stalls:?}",
         answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>(),
         stalls.len()
     );
     assert!(
         !got,
-        "CANNOT PROVE: the fetch from a member who is gone succeeded, so nothing was dialled: {said}"
+        "PRODUCT (staging): the fetch from a member who is gone succeeded, so nothing was dialled: \
+         {said}"
     );
+    let all = answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>();
     for (t, ok, err) in &answers {
-        assert!(*ok, "`vox room post` failed during the fetch: {err}");
-        assert!(
-            *t < ANSWER_WITHIN,
-            "bob's daemon took {t:?} to take a post while a fetch dialled — the dial \
-             held its actor (#215); all answers: {:?}",
-            answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>()
+        answered_within(
+            "PRODUCT",
+            &format!(
+                "bob's daemon taking a post while a fetch dialled — the dial held its actor (#215); \
+                 quiet {quiet:?}, all answers {all:?} —"
+            ),
+            *ok,
+            *t,
+            err,
         );
     }
     assert!(
         stalls.is_empty(),
-        "bob's daemon stopped answering while it opened the forward (#215): {stalls:?}"
+        "PRODUCT: bob's daemon said it stopped answering while it opened the forward (#215): \
+         {stalls:?}"
     );
 }

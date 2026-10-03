@@ -75,7 +75,8 @@ pub struct MessageRow {
 /// V030-10).
 pub const NOT_RECEIVED_YET: &str = "(not received yet)";
 
-/// A room's rendered timeline as the view carries it, oldest first (V210-120).
+/// Rows the view carries, oldest first, in shared chunks (V210-120): a room's timeline, and the
+/// positions of its structured posts.
 ///
 /// **A new message costs what it adds, not what came before it.** Each new row was published by
 /// rebuilding the room's whole timeline, so the work a node did per message grew with the room's
@@ -84,13 +85,25 @@ pub const NOT_RECEIVED_YET: &str = "(not received yet)";
 /// into larger ones only up to [`Timeline::CHUNK`] rows, and a full chunk is never copied again.
 /// So an append copies at most a chunk's worth of rows, and a clone of the view copies one pointer
 /// per chunk.
-#[derive(Clone, Default)]
-pub struct Timeline {
-    chunks: Vec<std::sync::Arc<[MessageRow]>>,
+#[derive(Clone)]
+pub struct Chunks<T> {
+    chunks: Vec<std::sync::Arc<[T]>>,
     len: usize,
 }
 
-impl Timeline {
+/// A room's rendered timeline: [`Chunks`] of its rows.
+pub type Timeline = Chunks<MessageRow>;
+
+impl<T> Default for Chunks<T> {
+    fn default() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<T: Clone> Chunks<T> {
     /// The most rows a chunk holds before it is frozen.
     pub const CHUNK: usize = 1024;
 
@@ -107,12 +120,12 @@ impl Timeline {
     }
 
     /// Every row, oldest first.
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &MessageRow> + '_ {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + '_ {
         self.chunks.iter().flat_map(|c| c.iter())
     }
 
     /// Every row from position `start` on, oldest first, skipping whole chunks before it.
-    pub fn iter_from(&self, start: usize) -> impl Iterator<Item = &MessageRow> + '_ {
+    pub fn iter_from(&self, start: usize) -> impl Iterator<Item = &T> + '_ {
         let mut skip = start;
         self.chunks.iter().flat_map(move |c| {
             let from = skip.min(c.len());
@@ -123,7 +136,7 @@ impl Timeline {
 
     /// The row at position `i`, oldest first.
     #[must_use]
-    pub fn get(&self, mut i: usize) -> Option<&MessageRow> {
+    pub fn get(&self, mut i: usize) -> Option<&T> {
         for c in &self.chunks {
             if i < c.len() {
                 return c.get(i);
@@ -135,21 +148,21 @@ impl Timeline {
 
     /// The oldest row.
     #[must_use]
-    pub fn first(&self) -> Option<&MessageRow> {
+    pub fn first(&self) -> Option<&T> {
         self.chunks.first().and_then(|c| c.first())
     }
 
     /// The newest row.
     #[must_use]
-    pub fn last(&self) -> Option<&MessageRow> {
+    pub fn last(&self) -> Option<&T> {
         self.chunks.last().and_then(|c| c.last())
     }
 
     /// This timeline with `rows` added after its newest row. Nothing already held is copied but
     /// the open chunks that the new rows merge into, which are at most [`Self::CHUNK`] rows.
     #[must_use]
-    pub fn appended(&self, rows: impl IntoIterator<Item = MessageRow>) -> Self {
-        let added: std::sync::Arc<[MessageRow]> = rows.into_iter().collect();
+    pub fn appended(&self, rows: impl IntoIterator<Item = T>) -> Self {
+        let added: std::sync::Arc<[T]> = rows.into_iter().collect();
         if added.is_empty() {
             return self.clone();
         }
@@ -163,8 +176,7 @@ impl Timeline {
             if older.len() > newer.len() || older.len() + newer.len() > Self::CHUNK {
                 break;
             }
-            let merged: std::sync::Arc<[MessageRow]> =
-                older.iter().chain(newer.iter()).cloned().collect();
+            let merged: std::sync::Arc<[T]> = older.iter().chain(newer.iter()).cloned().collect();
             next.chunks.pop();
             next.chunks.pop();
             next.chunks.push(merged);
@@ -184,8 +196,8 @@ impl Timeline {
     }
 }
 
-impl FromIterator<MessageRow> for Timeline {
-    fn from_iter<I: IntoIterator<Item = MessageRow>>(rows: I) -> Self {
+impl<T: Clone> FromIterator<T> for Chunks<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(rows: I) -> Self {
         let mut t = Self::default();
         let mut chunk = Vec::with_capacity(Self::CHUNK);
         for row in rows {
@@ -203,26 +215,213 @@ impl FromIterator<MessageRow> for Timeline {
     }
 }
 
-impl<'a> IntoIterator for &'a Timeline {
-    type Item = &'a MessageRow;
-    type IntoIter = Box<dyn DoubleEndedIterator<Item = &'a MessageRow> + 'a>;
+impl<'a, T: Clone> IntoIterator for &'a Chunks<T> {
+    type Item = &'a T;
+    type IntoIter = Box<dyn DoubleEndedIterator<Item = &'a T> + 'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         Box::new(self.iter())
     }
 }
 
-impl PartialEq for Timeline {
+impl<T: Clone + PartialEq> PartialEq for Chunks<T> {
     fn eq(&self, other: &Self) -> bool {
         self.shares_chunks(other) || (self.len == other.len && self.iter().eq(other.iter()))
     }
 }
 
-impl Eq for Timeline {}
+impl<T: Clone + Eq> Eq for Chunks<T> {}
 
-impl std::fmt::Debug for Timeline {
+impl<T: Clone + std::fmt::Debug> std::fmt::Debug for Chunks<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// Where a room's **structured posts** sit in its timeline (V210-120): by `type`, and by
+/// operation id.
+///
+/// A structured post is a body that parses as a JSON object with a string `type`; it may carry an
+/// operation id, a string at `data.op`. Nothing here knows what any `type` or id means: a client
+/// names the types and ids it wants ([`crate::node::ipc::Request::Structured`]) and is served those
+/// rows. A client that needed a room's claims, or the posts under one operation id, read every row
+/// of the room for them, every time, so its work grew with the room's history. Filled as rows are
+/// added, never rebuilt, and shared like the timeline.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct StructuredIndex {
+    /// Positions in the timeline, oldest first, of the posts of each `type`.
+    pub by_type: std::collections::BTreeMap<String, Chunks<u32>>,
+    /// The posts carrying an operation id, by a hash of the id.
+    pub by_op: OpRuns,
+}
+
+impl std::fmt::Debug for StructuredIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StructuredIndex")
+            .field(
+                "by_type",
+                &self
+                    .by_type
+                    .iter()
+                    .map(|(t, c)| (t, c.len()))
+                    .collect::<Vec<_>>(),
+            )
+            .field("by_op", &self.by_op.len())
+            .finish()
+    }
+}
+
+/// `(hash of an operation id, position)` pairs in sorted runs, each run sorted by hash.
+///
+/// A new post's pair becomes a run of one, and the newest two runs merge while the older is no
+/// longer than the newer, as a binary counter carries: so there are about log2(n) runs, an append
+/// does amortized O(log n) work, a lookup is a binary search in each run, and a clone copies one
+/// pointer per run. (The ids are many, one or a few per post, so a map of them would be copied
+/// whole on every append the view is shared across.)
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct OpRuns {
+    runs: Vec<std::sync::Arc<[(u64, u32)]>>,
+    len: usize,
+}
+
+impl OpRuns {
+    /// How many pairs.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether there are none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// These runs with `pairs` added.
+    #[must_use]
+    pub fn appended(&self, mut pairs: Vec<(u64, u32)>) -> Self {
+        if pairs.is_empty() {
+            return self.clone();
+        }
+        pairs.sort_unstable();
+        let mut next = self.clone();
+        next.len += pairs.len();
+        next.runs.push(pairs.into());
+        while let [.., older, newer] = next.runs.as_slice() {
+            if older.len() > newer.len() {
+                break;
+            }
+            let mut merged: Vec<(u64, u32)> = Vec::with_capacity(older.len() + newer.len());
+            let (mut i, mut j) = (0, 0);
+            while i < older.len() && j < newer.len() {
+                if older[i] <= newer[j] {
+                    merged.push(older[i]);
+                    i += 1;
+                } else {
+                    merged.push(newer[j]);
+                    j += 1;
+                }
+            }
+            merged.extend_from_slice(&older[i..]);
+            merged.extend_from_slice(&newer[j..]);
+            next.runs.pop();
+            next.runs.pop();
+            next.runs.push(merged.into());
+        }
+        next
+    }
+
+    /// The positions of the posts whose id hashes to `hash`, in no order. A hash can collide, so
+    /// a caller checks the id itself.
+    #[must_use]
+    pub fn find(&self, hash: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        for run in &self.runs {
+            let from = run.partition_point(|(h, _)| *h < hash);
+            out.extend(
+                run[from..]
+                    .iter()
+                    .take_while(|(h, _)| *h == hash)
+                    .map(|(_, p)| *p),
+            );
+        }
+        out
+    }
+}
+
+impl std::fmt::Debug for OpRuns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OpRuns({} in {} runs)", self.len, self.runs.len())
+    }
+}
+
+/// The hash an operation id is indexed by: FNV-1a, 64 bits. Not a security boundary: a collision
+/// only serves a client a row it then discards.
+#[must_use]
+pub fn op_hash(op: &str) -> u64 {
+    op.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// A structured post's `type` and operation id, or `None` for any other body.
+#[must_use]
+pub fn structured_kind(text: &str) -> Option<(String, Option<String>)> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let kind = value.get("type")?.as_str()?.to_owned();
+    let op = value
+        .get("data")
+        .and_then(|d| d.get("op"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Some((kind, op))
+}
+
+impl StructuredIndex {
+    /// This index with the bodies of the rows at `start..` of a timeline added.
+    #[must_use]
+    pub fn appended<'a>(&self, start: usize, texts: impl IntoIterator<Item = &'a String>) -> Self {
+        let mut by_type: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        let mut ops = Vec::new();
+        for (i, text) in texts.into_iter().enumerate() {
+            let Some((kind, op)) = structured_kind(text) else {
+                continue;
+            };
+            let at = u32::try_from(start + i).unwrap_or(u32::MAX);
+            by_type.entry(kind).or_default().push(at);
+            if let Some(op) = op {
+                ops.push((op_hash(&op), at));
+            }
+        }
+        let mut next = self.clone();
+        for (kind, at) in by_type {
+            let entry = next.by_type.entry(kind).or_default();
+            *entry = entry.appended(at);
+        }
+        next.by_op = next.by_op.appended(ops);
+        next
+    }
+
+    /// The positions of the posts of any type in `types`, and of those whose operation id hashes
+    /// like one in `ops`, oldest first, each once.
+    #[must_use]
+    pub fn positions(&self, types: &[String], ops: &[String]) -> Vec<u32> {
+        let mut out: Vec<u32> = types
+            .iter()
+            .filter_map(|t| self.by_type.get(t))
+            .flat_map(|c| c.iter().copied())
+            .collect();
+        for op in ops {
+            out.extend(self.by_op.find(op_hash(op)));
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 }
 
@@ -245,6 +444,8 @@ pub struct ChannelDetail {
     /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
     /// sequence restricted to rendered rows.
     pub order: Vec<(Digest32, u64)>,
+    /// Where its structured posts sit in `timeline`, by `type` (V210-120).
+    pub structured: StructuredIndex,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
@@ -398,6 +599,12 @@ pub enum NodeCommand {
         /// The channelID.
         channel_id: Digest32,
     },
+    /// Leave an open room (V210-164): say so in the room, and once another member has it,
+    /// remove the room from this node.
+    LeaveChannel {
+        /// The channelID.
+        channel_id: Digest32,
+    },
     /// Author a text message in an open channel.
     SendText {
         /// The channelID.
@@ -422,29 +629,6 @@ pub enum NodeCommand {
         local_name: String,
         /// The channel passphrase.
         passphrase: Secret,
-    },
-    /// Consent to `target` reading this identity's messages in a channel (ADR-007:
-    /// per-sender, human-initiated). Delivers this identity's sender key to the
-    /// target and records the grant on the log.
-    Consent {
-        /// The channel.
-        channel_id: Digest32,
-        /// The member being consented to.
-        target: Digest32,
-    },
-    /// Revoke `target`'s consent to read this identity's messages in a channel
-    /// (ADR-007 §Revocation). Rotates this identity's sender key to a generation
-    /// `target` holds no key for, records the revocation on the log, and re-keys the
-    /// members who keep consent.
-    ///
-    /// The forward guarantee is immediate and cryptographic: it does not wait on
-    /// anyone being reachable. What `target` already received is not recalled and
-    /// cannot be (ADR-007 §"Enforcement honesty").
-    Revoke {
-        /// The channel.
-        channel_id: Digest32,
-        /// The member whose consent is withdrawn.
-        target: Digest32,
     },
     /// Trust an identity node-wide, under a local petname (ADR-020 §3).
     ///
@@ -591,6 +775,19 @@ pub enum NodeCommand {
         /// The channel.
         channel_id: Digest32,
     },
+    /// Ask every other member of a room whether it holds this node's post `entry`, and which
+    /// posts of `types` it holds (V210-168): the agreement a claim waits for before it says "you
+    /// hold it". The report goes on `report`; the outcome is `Done` once it is sent.
+    Agree {
+        /// The room.
+        channel_id: Digest32,
+        /// This node's post every member must hold.
+        entry: Digest32,
+        /// The `type`s whose posts are compared.
+        types: Vec<String>,
+        /// Where the report goes.
+        report: tokio::sync::oneshot::Sender<crate::node::agreestream::Report>,
+    },
     /// Stop the actor (locks first).
     Shutdown,
     /// Change nothing and answer `Done`: proof that the actor is taking commands. A control
@@ -617,6 +814,10 @@ pub enum Fault {
     ChannelNotOpen,
     /// An input exceeded its bound (name or text length).
     TooLong,
+    /// A trust add or remove needs the identity passphrase again: it was last entered more than
+    /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) ago (V210-159). Not
+    /// [`Fault::WrongPassphrase`]: none was given, and the client asks for it and tries again.
+    PassphraseNeeded,
     /// The trust keyring already holds its maximum number of identities
     /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too
     /// long, and "longer than this field allows" sent them looking at the petname.
@@ -672,6 +873,14 @@ pub enum Fault {
     /// (V210-92). **Not [`Fault::Refused`]**, which a joiner reads as a wrong passphrase: this one
     /// was never checked.
     MembersBusy,
+    /// A member answered and checked the passphrase, and the room already holds as many members as
+    /// a room can, so it could not admit the joiner. **Not [`Fault::Refused`]**, which reads as a
+    /// wrong passphrase, and never a success: this was told it had joined, and exited 0.
+    RoomFull,
+    /// A member accepted the passphrase and then could not admit the joiner: it was locked or
+    /// closing mid-join, or its store refused the write (V210-128). **Not [`Fault::Refused`]**,
+    /// whose advice is "usually the passphrase is wrong": this one was accepted.
+    NotAdmittedAfterJoin,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
     /// A consent named a member this node has not admitted to the room (yet): it holds no
@@ -683,26 +892,37 @@ pub enum Fault {
     /// consent has already been revoked (ADR-007 — consent is single-writer, so this
     /// is a settled fact, not a race).
     NotConsented,
-    /// The target is in this node's trust keyring, so a **per-room** revocation of it
-    /// would not hold: `deliver_owed_consents` re-issues consent to every trusted
-    /// admitted author on the next tick, so the revocation would heal itself within
-    /// seconds and silently (found by review, 2026-09-21).
-    ///
-    /// It is also incoherent with the model: trust is an identity-level, room-independent
-    /// decision (ADR-020 decision 3), so there is no such thing as trusting someone
-    /// except in one room. Withdraw the trust instead — `Untrust` removes the entry and
-    /// changes the lock in **every** shared room (ADR-017 M17.14).
-    StillTrusted,
+    /// The target is not in this node's trust keyring, so this node releases it no key
+    /// (V210-148). A key goes only to a member the owner trusts: there are rooms, nodes and
+    /// trust, and no per-room grant beside them. The node refuses whatever a client asks, so
+    /// no client can hand a key to someone its owner never trusted.
+    NotTrusted,
     /// The requested local bind address is not a loopback address. A forward carries
     /// traffic into a room *this* machine is a member of, so binding it anywhere the
     /// network can reach would hand that membership to whoever reaches the port
     /// (ADR-013; the same rule `vox up` enforces).
     NotLoopback,
-    /// A local address this node was asked to listen on is taken, or is not an address of
-    /// this machine: the node's `--listen` port, a `vox up --bind`, a forward's local port.
+    /// A local address this node was asked to listen on is held by another program: the
+    /// node's `--listen` port, a `vox up --bind`, a forward's local port.
     AddressInUse,
+    /// A local address this node was asked to listen on is not an address of this machine
+    /// (V210-134). Not [`Fault::AddressInUse`], which sent people looking for a program that
+    /// did not exist.
+    AddressNotHere,
+    /// A local address this node was asked to listen on could not be bound for a reason that is
+    /// neither of the two above (V210-134); the front end quotes the operating system.
+    BindFailed,
     /// A join named a room this profile already holds.
     AlreadyMember,
+    /// A room this node joined has not synced with another member yet, so nothing is written
+    /// to it (V210-164).
+    RoomNotSynced,
+    /// A leave was written, but no other member of the room took it within the wait: the room
+    /// is held until one does (V210-164).
+    LeaveNotHeard,
+    /// A leave was overtaken: this node wrote in the room after it, so it is in the room again
+    /// (V210-164).
+    LeaveUndone,
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
     NotAServiceRoom,
@@ -734,6 +954,8 @@ impl Fault {
     const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
     // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
     const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
+    // `Fault::PassphraseNeeded`'s explanation names the window in words.
+    const _KEYRING_WINDOW_NAMED: () = assert!(crate::node::actor::KEYRING_WINDOW_SECS == 30 * 60);
 
     /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
     /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,
@@ -750,6 +972,9 @@ impl Fault {
                 "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
             }
             Fault::WrongPassphrase => "the passphrase is wrong",
+            Fault::PassphraseNeeded => {
+                "changing who you trust needs your identity passphrase again: it was last entered more than 30 minutes ago\n       give it, and the change is made: `vox trust` asks at a terminal, or takes --identity-passphrase-file or VOX_IDENTITY_PASSPHRASE"
+            }
             Fault::UnknownChannel => {
                 "no such room in this profile\n       `vox room list` shows the rooms it holds"
             }
@@ -764,7 +989,7 @@ impl Fault {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
             }
             Fault::ProfileBusy => {
-                "another vox holds this profile open, and only one at a time may write it\n       stop that one to run this, or use the `vox room …` verbs, which ask a running node"
+                "another vox holds this profile open, and only one at a time may write it\n       run this again once that one is done; a `vox daemon` or `vox tui` holds it until stopped, and the `vox room …` verbs ask it instead"
             }
             Fault::IdentityFileUnwritable => {
                 "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
@@ -796,6 +1021,12 @@ impl Fault {
             Fault::MembersBusy => {
                 "a member answered, but it is busy answering other joins\n       your passphrase was never checked — this is not a verdict on it\n       try the join again shortly"
             }
+            Fault::RoomFull => {
+                "the room is full, so you were not admitted\n       your passphrase was accepted; the room takes no more members"
+            }
+            Fault::NotAdmittedAfterJoin => {
+                "a member accepted your passphrase, then could not admit you, so you were not admitted\n       the member may have been locking or closing; run the join again while it is running"
+            }
             Fault::Refused => "the other side refused",
             Fault::NotAdmitted => {
                 "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
@@ -803,17 +1034,30 @@ impl Fault {
             Fault::NotConsented => {
                 "there is nothing to withdraw: that identity was never trusted or consented to, or already is not"
             }
-            Fault::StillTrusted => {
-                "that identity is in your trust keyring, so a per-room revoke would heal itself\n       run `vox trust remove <fingerprint>` instead"
+            Fault::NotTrusted => {
+                "that identity is not in your trust keyring, so it is given no key to read you\n       run `vox trust add <fingerprint>` if you mean it to read you"
             }
             Fault::NotLoopback => {
                 "a local port for Vox must be on loopback (127.0.0.1 or ::1)\n       anything else would hand this room's membership to whoever reaches the port"
             }
             Fault::AddressInUse => {
-                "a local address it needs is already in use, or is not an address of this machine\n       pick another port, or stop whatever holds it (`lsof -i :<port>` names it)"
+                "a local port it needs is already in use: another program holds it\n       pick another port, or stop whatever holds it (`lsof -i :<port>` names it)"
             }
+            Fault::AddressNotHere => {
+                "a local address it was asked to use is not an address of this machine\n       use one this machine has (`ifconfig` lists them), or 127.0.0.1"
+            }
+            Fault::BindFailed => "a local address it was asked to use could not be listened on",
             Fault::AlreadyMember => {
                 "this profile already holds that room — there is nothing to join\n       `vox room list` shows it; open it with its passphrase if it is closed"
+            }
+            Fault::RoomNotSynced => {
+                "this room was joined and has not yet synced with another member, so nothing can be written to it\n       try again once a member is reachable"
+            }
+            Fault::LeaveNotHeard => {
+                "no other member of the room could be told within 30s, so this node still holds it\n       it leaves as soon as one can be told, and the members see it then"
+            }
+            Fault::LeaveUndone => {
+                "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
             }
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
@@ -880,6 +1124,7 @@ fault_names!(
     IdentityExists,
     Locked,
     WrongPassphrase,
+    PassphraseNeeded,
     UnknownChannel,
     ChannelNotOpen,
     TooLong,
@@ -896,13 +1141,20 @@ fault_names!(
     Unreachable,
     SolveTooSlow,
     MembersBusy,
+    RoomFull,
+    NotAdmittedAfterJoin,
     Refused,
     NotAdmitted,
     NotConsented,
-    StillTrusted,
+    NotTrusted,
     NotLoopback,
     AddressInUse,
+    AddressNotHere,
+    BindFailed,
     AlreadyMember,
+    RoomNotSynced,
+    LeaveNotHeard,
+    LeaveUndone,
     NotAServiceRoom,
     NotOffered,
     NoSuchForward,
@@ -928,6 +1180,27 @@ pub enum Outcome {
     Failed(Fault),
 }
 
+impl Fault {
+    /// The fault a failed local bind is, by its cause (V210-134).
+    #[must_use]
+    pub fn of_bind(cause: crate::error::BindCause) -> Self {
+        match cause {
+            crate::error::BindCause::InUse => Fault::AddressInUse,
+            crate::error::BindCause::NotHere => Fault::AddressNotHere,
+            crate::error::BindCause::Other => Fault::BindFailed,
+        }
+    }
+
+    /// Whether this is a failed local bind.
+    #[must_use]
+    pub fn is_bind(self) -> bool {
+        matches!(
+            self,
+            Fault::AddressInUse | Fault::AddressNotHere | Fault::BindFailed
+        )
+    }
+}
+
 impl Outcome {
     /// Whether the command succeeded.
     #[must_use]
@@ -950,11 +1223,12 @@ impl std::fmt::Display for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeEvent {
-    /// Creating or unlocking the identity has waited more than a second for another vox that
-    /// holds this profile's lock (it is creating the identity, or migrating a v0.2.9 profile, or
-    /// it is stopped while doing so). Sent once per wait; the command goes on when the lock is
-    /// free. Each front end says it in its own place: the CLI on stderr, the TUI in its status
-    /// line (V210-100).
+    /// Creating the identity has waited more than a second for another vox that holds this
+    /// profile's lock (it is creating the identity, or holds the profile, or is stopped while
+    /// doing so). Sent once per wait; the command goes on when the lock is free. Each front end
+    /// says it in its own place: the CLI on stderr, the TUI in its status line (V210-100). A wait
+    /// to open an existing profile comes before the node exists, and is said through
+    /// [`NodeConfig::on_profile_wait`](crate::node::actor::NodeConfig::on_profile_wait).
     WaitingForProfile,
     /// A new rendered entry in a channel.
     NewEntry {
@@ -1091,6 +1365,13 @@ pub enum NodeEvent {
     ConnectionNote {
         /// The peer the connection is to.
         peer: Digest32,
+        /// What happened, for the operator.
+        note: String,
+    },
+    /// Something about this node itself an operator should know (V210-167): that its usual port
+    /// was taken and it listens on another this run, or that a member was found on this computer
+    /// or the local network.
+    NodeNote {
         /// What happened, for the operator.
         note: String,
     },

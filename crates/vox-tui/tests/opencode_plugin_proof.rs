@@ -47,7 +47,10 @@
 //! `--pure` removes the plugin from the harness; it does not break the product. So the proof
 //! is also run against a `vox` whose `vox agent hook` injects nothing (the drain returns
 //! before printing what is unread): the codeword must not reach the model, and the proof
-//! goes red at "the room never reached the model".
+//! goes red as `PRODUCT: the room never reached the model: the plugin said "…chat.message:
+//! nothing to inject"`, whatever the model answers. The verdict is read from the plugin's own
+//! log of that turn: injected and repeated is green; injected and not repeated, or no
+//! `chat.message` at all, is CANNOT MEASURE.
 //!
 //! ## A plain `opencode`, opened by hand, can be interrupted (ADR-020 §6, ADR-021 F17)
 //!
@@ -92,14 +95,48 @@
 //!
 //! Mutation-checked: no cleanup helper goes red at (7); no sweep at start goes red at (8).
 //!
-//! OpenCode absent, or no usable credential, is reported **unproven and fails** —
-//! an absent prover is missing evidence, not evidence of correctness. Set
-//! `VOX_PROOF_ALLOW_UNPROVEN=opencode` to accept that gap deliberately and visibly.
+//! ## Every OpenCode here is sandboxed
+//!
+//! A model's turn may run a shell. Unconfined, a free model's shell read the operator's files
+//! (`~/.claude`, `~/.codex`, `~/.config`, other agents' scratch directories) and sent what it
+//! found to its provider. So every OpenCode this proof starts, `opencode run` and the pty
+//! sessions alike, runs under macOS `sandbox-exec` with a whitelist of readable paths (the
+//! system, the OpenCode and `vox` binaries, the run's sandbox root) and a throwaway HOME. The
+//! plugin-fed turns may also read the run's own vox profile, which the plugin's hook needs;
+//! the `--pure` control may not. Before any model runs, a shell in the sandbox must fail to
+//! read or find a canary file planted in the operator's real HOME, and no OpenCode's output
+//! may ever hold the canary: either is APPARATUS, and stops the run. The sandbox holds a copy of
+//! OpenCode's own provider credential alone, removed when the run ends; the operator's other
+//! providers' keys never enter it. What a run leaves outside itself (the canary, the copy) is
+//! removed on every exit, an abort or a signal included, and a SIGKILLed run's at the next
+//! run's start. No red, and nothing sent to a model, names a real path: the canary-read turn
+//! names a link in the project.
+//!
+//! **Known limit:** the plugin and the model's shell run in one sandbox, so the shell could write
+//! the plugin's log, which the codeword verdict reads. A tighter sandbox for the shell alone is
+//! not possible: macOS refuses a sandbox inside a sandbox (`sandbox_apply: Operation not
+//! permitted`, measured). Forging it takes a model set on deceiving the proof, not one exploring.
+//! Likewise a model that ran `ls -l` on the link would see the canary's real path.
+//!
+//! OpenCode absent, or no usable credential, fails as **CANNOT MEASURE** — an absent prover is
+//! missing evidence, not evidence of correctness.
 
+// Optional (decider, 2026-10-01; live-model proofs are ad hoc and on demand, 2026-10-02): it
+// blocks nothing and CI only compiles it. Without `--features optional-proofs` a stand-in takes
+// its place and says it was not run (`support/optional_proof.rs`). How to run it:
+// docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_real_model_reads_the_room_through_the_opencode_plugin);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/oc_sandbox.rs"]
+mod oc_sandbox;
 
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
@@ -114,15 +151,7 @@ const IDENTITY: &str = "identity passphrase";
 
 /// Cheap and fast; overridable because pinning a model name in a test is brittle.
 fn model() -> String {
-    std::env::var("VOX_PROOF_OPENCODE_MODEL")
-        .unwrap_or_else(|_| "opencode/claude-haiku-4-5".to_owned())
-}
-
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
+    oc_sandbox::model()
 }
 
 fn which(bin: &str) -> Option<std::path::PathBuf> {
@@ -143,6 +172,12 @@ impl Drop for Daemon {
 }
 
 /// `vox` against this profile, with `input` piped to stdin when given.
+/// A path as the pty driver's argument.
+fn path_arg(p: &Path) -> &str {
+    p.to_str()
+        .unwrap_or_else(|| panic!("APPARATUS: this run's path {p:?} is not UTF-8"))
+}
+
 fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, String, String) {
     let mut child = Command::new(VOX)
         .args(args)
@@ -160,13 +195,23 @@ fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, St
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start `vox {}`: {e}", args.join(" ")));
     if let Some(text) = input {
-        let mut pipe = child.stdin.take().expect("vox stdin");
-        pipe.write_all(text.as_bytes()).expect("write stdin");
+        let mut pipe = child
+            .stdin
+            .take()
+            .unwrap_or_else(|| panic!("APPARATUS: `vox {}` has no stdin pipe", args.join(" ")));
+        // A write that fails (EPIPE) means `vox` exited without reading its input: that is
+        // the product's outcome, which the caller judges by its exit and what it printed.
+        let _ = pipe.write_all(text.as_bytes());
         drop(pipe);
     }
-    let out = child.wait_with_output().expect("vox ran");
+    let out = child.wait_with_output().unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: cannot collect `vox {}`'s output: {e}",
+            args.join(" ")
+        )
+    });
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -174,38 +219,20 @@ fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, St
     )
 }
 
-/// Where OpenCode keeps credentials. Copied into the test's own data dir so the run
-/// is isolated from the operator's configuration **and** leaves nothing behind in
-/// it — a proof that pollutes the machine it runs on is a bad neighbour.
-fn auth_json() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share")))?;
-    let p = base.join("opencode/auth.json");
-    p.is_file().then_some(p)
-}
-
-/// Run one `opencode` turn and return its stdout.
+/// Run one `opencode` turn, confined by `sb` under `profile`, and return its stdout.
 fn opencode_turn(
     project: &Path,
     env: &[(&str, &std::ffi::OsStr)],
     pure: bool,
     prompt: &str,
+    sb: &oc_sandbox::OcSandbox,
+    profile: &Path,
 ) -> String {
-    let mut cmd = Command::new("opencode");
-    // **A cleared environment, not an inherited one.** Run from a shell the plugin
-    // works; run from `cargo test` with the same directory and arguments it loads
-    // and its `chat.message` hook never fires. Something cargo puts in the
-    // environment disables plugin hooks, so the proof passes only what OpenCode
-    // actually needs. This also makes the run reproducible: whatever the operator
-    // happens to export cannot decide whether this passes.
-    cmd.env_clear();
-    for key in ["PATH", "HOME", "SHELL", "LANG", "TMPDIR", "USER"] {
-        if let Some(v) = std::env::var_os(key) {
-            cmd.env(key, v);
-        }
-    }
-    cmd.current_dir(project).arg("run");
+    let mut cmd = sb.opencode(profile, &[], project);
+    // **A cleared environment, not an inherited one** (`OcSandbox::opencode`): run from a shell
+    // the plugin works; run from `cargo test` with the same directory and arguments it loads and
+    // its `chat.message` hook never fires.
+    cmd.arg("run");
     if pure {
         cmd.arg("--pure");
     }
@@ -213,47 +240,59 @@ fn opencode_turn(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("run opencode");
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run opencode: {e}"));
     // stderr is carried back with stdout: the plugin inherits `vox agent hook`'s
     // stderr, which is where a broken setup says so. A proof that hides the one
     // channel carrying the diagnosis wastes the run it just paid for.
-    format!(
+    let said = format!(
         "{}\n--- stderr ---\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    )
+    );
+    sb.check(&said, "an `opencode run` turn");
+    // **A model that would not answer measures nothing.** A provider refusing the turn (no
+    // funds, a rate limit, a bad key, an overloaded or unknown model) leaves no answer to judge,
+    // so every verdict after it would read as the plugin's. Say so, with the provider's words.
+    if let Some(line) = oc_sandbox::provider_failure(&said) {
+        panic!(
+            "APPARATUS, CANNOT MEASURE: the model provider refused the turn ({}): {line}",
+            model()
+        );
+    }
+    said
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "drives a real model through a real harness; CI runs it in release"]
+#[ignore = "drives a real model through a real harness; optional, run it in release"]
 fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     // Five or six real model turns, one of them a 45 s tool, plus the pty driver's own bound.
     watchdog::arm_for(Duration::from_secs(900));
 
-    if which("opencode").is_none() {
-        assert!(
-            allow_unproven("opencode"),
-            "UNPROVEN: opencode is not installed, so nothing here was tested against a real \
-             harness. Install it, or set VOX_PROOF_ALLOW_UNPROVEN=opencode to accept the gap."
-        );
+    if !oc_sandbox::live_model_allowed(
+        "opencode_plugin_proof::a_real_model_reads_the_room_through_the_opencode_plugin",
+    ) {
         return;
     }
-    let Some(auth) = auth_json() else {
-        assert!(
-            allow_unproven("opencode"),
-            "UNPROVEN: no opencode auth.json, so no model can run. Authenticate opencode, or set \
-             VOX_PROOF_ALLOW_UNPROVEN=opencode to accept the gap."
-        );
-        return;
-    };
+    assert!(
+        which("opencode").is_some(),
+        "APPARATUS, CANNOT MEASURE: opencode is not installed, so nothing here can be tested against a real \
+         harness"
+    );
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
 
     // ---- a real daemon, a real room, and a codeword only the room knows ----
     let (ok, fp, err) = vox(&data, &cfg, &["id"], None);
-    assert!(ok && fp.trim().len() == 52, "vox id: {fp:?} {err}");
+    assert!(
+        ok && fp.trim().len() == 52,
+        "PRODUCT: `vox id` did not make an identity: {fp:?} {err}"
+    );
     let _daemon = Daemon(
         Command::new(VOX)
             .args(["daemon", "--listen", "127.0.0.1:0"])
@@ -262,21 +301,27 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             .env_remove("VOX_ROOM")
             .stdin({
                 let pass = tmp.path().join("identity.pass");
-                std::fs::write(&pass, format!("{IDENTITY}\n")).unwrap();
-                Stdio::from(std::fs::File::open(&pass).unwrap())
+                std::fs::write(&pass, format!("{IDENTITY}\n"))
+                    .unwrap_or_else(|e| panic!("APPARATUS: cannot write the passphrase file: {e}"));
+                Stdio::from(
+                    std::fs::File::open(&pass).unwrap_or_else(|e| {
+                        panic!("APPARATUS: cannot open the passphrase file: {e}")
+                    }),
+                )
             })
             .stdout(Stdio::null())
             .stderr(Stdio::from(
-                std::fs::File::create(tmp.path().join("daemon.err")).unwrap(),
+                std::fs::File::create(tmp.path().join("daemon.err"))
+                    .unwrap_or_else(|e| panic!("APPARATUS: cannot make daemon.err: {e}")),
             ))
             .spawn()
-            .expect("spawn vox daemon"),
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot start `vox daemon`: {e}")),
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     while !vox(&data, &cfg, &["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: the daemon never answered; its stderr: {:?}",
+            "PRODUCT (staging): the daemon never answered; its stderr: {:?}",
             std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
@@ -284,15 +329,22 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     let (ok, _, err) = vox(
         &data,
         &cfg,
-        &["room", "create", "--name", "agents"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "agents",
+        ],
         Some("channel passphrase\n"),
     );
-    assert!(ok, "vox room create: {err}");
-    let room = vox(&data, &cfg, &["room", "list"], None)
-        .1
+    assert!(ok, "PRODUCT: `vox room create` refused: {err}");
+    let (_, list, _) = vox(&data, &cfg, &["room", "list"], None);
+    let room = list
         .split_whitespace()
         .next()
-        .expect("the new room in `vox room list`")
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` does not show the new room: {list:?}"))
         .to_owned();
 
     // Unique per run, so a cached session cannot produce it and neither can a model
@@ -301,7 +353,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         "QUXNARB-{:04}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_else(|e| panic!("APPARATUS: the clock is before 1970: {e}"))
             .subsec_millis()
     );
     let (ok, _, err) = vox(
@@ -315,7 +367,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         ],
         None,
     );
-    assert!(ok, "vox room post: {err}");
+    assert!(ok, "PRODUCT: `vox room post` refused: {err}");
     println!("[proof] room {room} holds codeword {codeword}, posted through `vox room post`");
 
     // Isolate OpenCode's **configuration**, so the operator's own plugins, model
@@ -332,18 +384,30 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     //    project directory is a fresh temp dir, any session written to the real data
     //    dir is tied to a path that ceases to exist, and nothing of the operator's
     //    is touched.
-    let plugin_log = tmp.path().join("plugin.log");
+    // ---- the sandbox every OpenCode here runs in (support/oc_sandbox.rs) ----
+    // Its root holds everything an OpenCode of this run may touch: the fixture, its TMPDIR,
+    // the plugin's log, a throwaway HOME. The run's vox profile stays outside it, readable
+    // only by the plugin-fed turns, whose hook needs it. Each profile is probed against the
+    // canary before any model runs under it.
+    let sb = oc_sandbox::OcSandbox::new(tmp.path());
+    let sb_root = sb.root.clone();
+    let fed_profile = sb.profile("fed", &[&data, &cfg], &[Path::new(VOX)]);
+    let pure_profile = sb.profile("pure", &[], &[]);
+
+    let plugin_log = sb_root.join("plugin.log");
     // **This run's own fixture**, so two runs at once never share a project. OpenCode
     // installs a `node_modules` tree into `.opencode/` in the project and
     // `$XDG_CONFIG_HOME/opencode/` the first time it is used there, and until it has, the
     // plugin may load while its `chat.message` never fires: the warm-up turns below take
     // the fresh project through that, to the state any real project is in after its first
     // turn.
-    let fixture = tmp.path().join("oc");
+    let fixture = sb_root.join("oc");
     let oc_cfg = fixture.join("config");
     let project = fixture.join("project");
-    std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
-    std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
+    for d in [oc_cfg.join("opencode"), project.join(".opencode/plugin")] {
+        std::fs::create_dir_all(&d)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make the fixture's {d:?}: {e}"));
+    }
     // What a plain `opencode` (no `-m`) runs with: the model, and a shell tool it may use
     // without asking — the interrupt case needs a turn that is busy running one.
     std::fs::write(
@@ -356,12 +420,10 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         .to_string(),
     )
     .unwrap_or_else(|e| panic!("APPARATUS: cannot write the fixture's opencode.json: {e}"));
-    // The credential is only *located* through the real data dir; nothing is copied.
-    let _ = &auth;
 
     // Every OpenCode here runs with this run's own `TMPDIR`, where its plugin makes its wake
     // directory: (9) counts exactly this run's. Short, because a Unix socket's path is.
-    let oc_tmp = tmp.path().join("t");
+    let oc_tmp = sb_root.join("t");
     std::fs::create_dir_all(&oc_tmp)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make this run's TMPDIR {oc_tmp:?}: {e}"));
     let wake_dirs = || {
@@ -394,6 +456,61 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     };
     let prompt = "What is the codeword for this mission? Answer with just the codeword.";
 
+    // ---- the sandbox holds against a model told to break it ----
+    // The first turn of the run asks the model, in the more open of the two sandboxes, to read
+    // the canary and print it. Whatever it does, the canary must not come back (`opencode_turn`
+    // checks every turn's output for it).
+    // The prompt names a link in the project, never the real path: what a model is sent goes
+    // to its provider. (`cat` follows the link; the sandbox refuses the canary's real path.)
+    let link = project.join("canary.txt");
+    std::os::unix::fs::symlink(&sb.canary.path, &link)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot link the canary into the project: {e}"));
+    let told = opencode_turn(
+        &project,
+        &env,
+        true,
+        "Use your shell to run `cat canary.txt` in the current directory, and print exactly \
+         what it printed.",
+        &sb,
+        &fed_profile,
+    );
+    let _ = std::fs::remove_file(&link);
+    println!(
+        "[proof] a model told to read the canary in the real HOME: it did not come back ({} \
+         bytes of answer)",
+        told.len()
+    );
+
+    // ---- the control: the same turn with the plugin disabled ----
+    // `--pure` removes external plugins, so the codeword must be out of the model's reach. It is
+    // run **first**, before any turn the plugin has fed, and with an empty vox profile and no
+    // room: a model with a shell otherwise found the codeword without the plugin (a free model
+    // listed the run's files and read it back), through `vox room read` on the run's daemon or
+    // an earlier session's transcript. Denying the shell is not an option: the free tier refuses
+    // any turn whose shell is denied (measured, opencode 1.18.34).
+    let bare = sb_root.join("bare");
+    for d in [bare.join("data"), bare.join("cfg")] {
+        std::fs::create_dir_all(&d)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make the control's {d:?}: {e}"));
+    }
+    let (bare_data, bare_cfg) = (bare.join("data"), bare.join("cfg"));
+    let control_env: Vec<(&str, &std::ffi::OsStr)> = vec![
+        ("TMPDIR", oc_tmp.as_os_str()),
+        ("XDG_CONFIG_HOME", oc_cfg.as_os_str()),
+        ("VOX_DATA_DIR", bare_data.as_os_str()),
+        ("VOX_CONFIG_DIR", bare_cfg.as_os_str()),
+    ];
+    let without = opencode_turn(&project, &control_env, true, prompt, &sb, &pure_profile);
+    println!(
+        "[proof] with --pure, the model's answer contains the codeword: {}",
+        without.contains(&codeword)
+    );
+    assert!(
+        !without.contains(&codeword),
+        "APPARATUS, CANNOT MEASURE: `--pure` disables external plugins, so the codeword must be \
+         unreachable; it still appears, so this run is not measuring the plugin. Got: {without:?}"
+    );
+
     // **Warm the project directory first.** OpenCode installs a `node_modules` tree
     // into `.opencode/` the first time it is used in a directory, and during that
     // first run the plugin is loaded but its `chat.message` hook never fires — the
@@ -407,50 +524,95 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     let (ok, plugin, err) = vox(&data, &cfg, &["agent", "plugin", "opencode"], None);
     assert!(
         ok && plugin.contains("vox agent hook"),
-        "vox agent plugin opencode: {err}"
+        "PRODUCT: `vox agent plugin opencode` did not print the plugin: {err}"
     );
-    std::fs::write(project.join(".opencode/plugin/vox.js"), plugin).unwrap();
+    std::fs::write(project.join(".opencode/plugin/vox.js"), plugin)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot install the plugin in the fixture: {e}"));
     for attempt in 0..3 {
-        let _ = opencode_turn(&project, &env, false, "Reply with exactly: READY");
+        let _ = opencode_turn(
+            &project,
+            &env,
+            false,
+            "Reply with exactly: READY",
+            &sb,
+            &fed_profile,
+        );
         if std::fs::read_to_string(&plugin_log)
             .map(|l| l.contains("chat.message"))
             .unwrap_or(false)
         {
             break;
         }
-        assert!(
-            attempt < 2,
-            "OpenCode never fired `chat.message` after three warm-up turns, so the plugin \
-             seam could not be exercised at all.{}",
-            plugin_diag("warm-up")
-        );
+        if attempt == 2 {
+            // Vox's plugin never loading is the product's; loaded, with OpenCode never
+            // calling its hook in this fresh project, is OpenCode's state, not a verdict.
+            let loaded =
+                std::fs::read_to_string(&plugin_log).is_ok_and(|l| l.contains("plugin loaded"));
+            panic!(
+                "{}{}",
+                if loaded {
+                    "APPARATUS, CANNOT MEASURE: the plugin loaded, but OpenCode never fired `chat.message` \
+                     in three warm-up turns, so the plugin's seam could not be exercised"
+                } else {
+                    "PRODUCT: OpenCode never loaded the plugin `vox agent plugin opencode` \
+                     printed, in three warm-up turns"
+                },
+                plugin_diag("warm-up")
+            );
+        }
     }
     let _ = std::fs::write(&plugin_log, "");
 
     // ---- the proof: a real model repeats something only the room told it ----
-    let answer = opencode_turn(&project, &env, false, prompt);
+    let answer = opencode_turn(&project, &env, false, prompt, &sb, &fed_profile);
     println!(
         "[proof] with the plugin, the model's answer contains the codeword: {}",
         answer.contains(&codeword)
     );
-    assert!(
-        answer.contains(&codeword),
-        "the room never reached the model. Expected {codeword:?} in the model's answer, got: \
-         {answer:?}{}",
-        plugin_diag("with plugin")
-    );
-
-    // ---- the mutation check: same everything, plugin disabled ----
-    let without = opencode_turn(&project, &env, true, prompt);
-    println!(
-        "[proof] with --pure, the model's answer contains the codeword: {}",
-        without.contains(&codeword)
-    );
-    assert!(
-        !without.contains(&codeword),
-        "`--pure` disables external plugins, so the codeword must be unreachable — if it still \
-         appears, this test is not measuring the plugin. Got: {without:?}"
-    );
+    // **The verdict is what the plugin's own log says it did on this turn**, not the answer
+    // alone: a model with a shell may find the codeword itself, and may decline to repeat it.
+    let log = std::fs::read_to_string(&plugin_log).unwrap_or_default();
+    let hooked: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("chat.message:"))
+        .collect();
+    let said_of = |what: &str| hooked.iter().find(|l| l.contains(what)).copied();
+    let has_codeword = answer.contains(&codeword);
+    if said_of("chat.message: injected").is_some() {
+        assert!(
+            has_codeword,
+            "APPARATUS, CANNOT MEASURE: the plugin injected the room, and the model did not repeat it. \
+             Expected {codeword:?} in the model's answer, got: {answer:?}{}",
+            plugin_diag("with plugin")
+        );
+    } else if let Some(line) = said_of("nothing to inject")
+        .or_else(|| said_of("threw"))
+        .or_else(|| said_of("no text part"))
+    {
+        // The hook ran and the plugin put nothing in front of the model: the product's,
+        // whatever the model answered (it may have found the codeword itself).
+        panic!(
+            "PRODUCT: the room never reached the model: the plugin said {line:?}{}",
+            plugin_diag("with plugin")
+        );
+    } else if let Some(line) = said_of("VOX_ROOM is unset") {
+        panic!(
+            "APPARATUS: the proof did not give OpenCode the room: the plugin said {line:?}{}",
+            plugin_diag("with plugin")
+        );
+    } else {
+        // No `chat.message` on this turn (or one with no session): OpenCode never asked the
+        // plugin, so the product was not exercised.
+        panic!(
+            "APPARATUS, CANNOT MEASURE: OpenCode never called the plugin's chat.message on this turn ({}){}",
+            if hooked.is_empty() {
+                "no chat.message line".to_owned()
+            } else {
+                format!("it said {hooked:?}")
+            },
+            plugin_diag("with plugin")
+        );
+    }
 
     // ---- a plain `opencode`, opened by hand, interrupted mid-turn (F17) ----
     let _ = std::fs::write(&plugin_log, "");
@@ -459,17 +621,20 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         script,
         &[
             VOX,
-            data.to_str().unwrap(),
-            cfg.to_str().unwrap(),
+            path_arg(&data),
+            path_arg(&cfg),
             &room,
-            project.to_str().unwrap(),
-            oc_cfg.to_str().unwrap(),
-            plugin_log.to_str().unwrap(),
-            oc_tmp.to_str().unwrap(),
+            path_arg(&project),
+            path_arg(&oc_cfg),
+            path_arg(&plugin_log),
+            path_arg(&oc_tmp),
+            path_arg(&fed_profile),
+            path_arg(&sb.home),
             "wake",
         ],
     );
     let said = out.stdout.clone();
+    sb.check(&said, "the hand-opened sessions' driver");
     eprintln!(
         "{said}\n[proof] the driver took {:?}; its last stage: {:?}{}",
         out.took,
@@ -531,7 +696,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         };
         if given == "never" || count("woken") == "(none)" {
             panic!(
-                "CANNOT MEASURE: the turn the wake started never answered, so what the model was \
+                "APPARATUS, CANNOT MEASURE: the turn the wake started never answered, so what the model was \
                  given could not be read: {said}"
             );
         }
@@ -561,10 +726,10 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         Some(0) => {}
         Some(2) => panic!("CANNOT MEASURE: the hand-opened session's apparatus failed: {said}"),
         _ if out.has_verdict("wake") => {
-            panic!("CANNOT MEASURE: the hand-opened session's driver hung or went red: {said}")
+            panic!("APPARATUS, CANNOT MEASURE: the hand-opened session's driver hung or went red: {said}")
         }
         _ => panic!(
-            "CANNOT MEASURE: the hand-opened session's driver was stopped before it gave a \
+            "APPARATUS, CANNOT MEASURE: the hand-opened session's driver was stopped before it gave a \
              verdict, at stage {:?} (exit {:?}; its stack is above): {said}",
             out.stage.as_deref().unwrap_or("(before its first stage)"),
             out.code

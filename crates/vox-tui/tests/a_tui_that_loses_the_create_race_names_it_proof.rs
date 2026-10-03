@@ -16,6 +16,12 @@
 //! profile's identity at the same time") and that nothing was created here; afterwards, with both
 //! stopped, `vox id` opens the identity the first made.
 //!
+//! Which side a red is on: whatever a `vox tui` did or failed to do is `PRODUCT:` — no first-run
+//! prompt, no identity made, no answer to the second create (the driver's `RED: PRODUCT`), a TUI
+//! that stopped reading what is typed (`HUNG at`), the wrong answer, or a profile with no identity
+//! after the first TUI made one. Only the driver's own machinery (pyte missing, a crash, a `vox tui`
+//! it could not reap) and a temp dir this proof could not make are `APPARATUS:`.
+//!
 //! Mutation that must turn it red: the TUI's create path mapping the race to the generic
 //! `IdentityExists` again — it says "an identity already exists in this profile".
 
@@ -39,9 +45,10 @@ const NOTHING_HERE: &str = "nothing was created here";
 #[ignore = "`vox tui` in a pty with production Argon2id; needs pyte (VOX_PYTE_PATH); CI runs it in release"]
 fn a_tui_that_loses_the_create_race_names_it() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("p");
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", data.display()));
 
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_create_race.py");
     let out = pty_driver::run(
@@ -60,16 +67,29 @@ fn a_tui_that_loses_the_create_race_names_it() {
         out.took, out.code, out.stage
     );
     println!("[proof] tui: {}", said.trim());
+    // What a `vox tui` failed to do (the driver's `RED: PRODUCT`), or a TUI that stopped reading
+    // what is typed (`HUNG at`), is the product's; only the driver's own machinery is the
+    // apparatus.
+    assert!(
+        !said.contains("cargo RED: PRODUCT"),
+        "PRODUCT: a `vox tui` in the create race failed (exit {:?}, stage {:?}): {said}",
+        out.code,
+        out.stage
+    );
+    assert!(
+        !said.contains("cargo HUNG at"),
+        "PRODUCT: a `vox tui` in the create race stopped answering (stage {:?}): {said}",
+        out.stage
+    );
     assert!(
         !out.has_verdict("cargo"),
-        "CANNOT MEASURE: the TUI driver stopped on an apparatus failure or a hang (exit {:?}, \
-         stage {:?}): {said}",
+        "APPARATUS: the TUI driver's own machinery failed (exit {:?}, stage {:?}): {said}",
         out.code,
         out.stage
     );
     assert!(
         out.code == Some(0) && said.contains("cargo SAID:"),
-        "CANNOT MEASURE: the TUI driver gave no answer to the create (exit {:?}, stage {:?}): {said}",
+        "APPARATUS: the TUI driver gave no answer to the create (exit {:?}, stage {:?}): {said}",
         out.code,
         out.stage
     );
@@ -88,10 +108,10 @@ fn a_tui_that_loses_the_create_race_names_it() {
     );
     assert!(
         ok && !now.trim().is_empty(),
-        "CANNOT MEASURE: the profile holds no usable identity afterwards: {now}{err}"
+        "PRODUCT: after the first TUI made the identity, `vox id` opens none: {now}{err}"
     );
     assert!(
         answer.contains(NAMED) && answer.contains(NOTHING_HERE),
-        "the TUI that lost the create race did not name it: it said {answer:?}"
+        "PRODUCT: the TUI that lost the create race did not name it: it said {answer:?}"
     );
 }

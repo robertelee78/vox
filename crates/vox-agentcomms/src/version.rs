@@ -58,9 +58,14 @@ impl Stamp {
     pub fn describe(&self, mine: &str) -> String {
         match self {
             Stamp::Match => mine.to_owned(),
-            Stamp::Other(v) => v.clone(),
+            Stamp::Other(v) => crate::envelope::shown(v, crate::envelope::SHOWN_NAME),
             Stamp::Missing => "no version (a vox that predates ADR-021)".to_owned(),
-            Stamp::Unknown(v) => format!("{v:?}, which is not a version"),
+            // Quoted and cut: the stamp is the author's text, printed into every
+            // coordinating session's context (V210-123).
+            Stamp::Unknown(v) => format!(
+                "{}, which is not a version",
+                crate::envelope::shown(&format!("{v:?}"), crate::envelope::SHOWN_NAME)
+            ),
         }
     }
 

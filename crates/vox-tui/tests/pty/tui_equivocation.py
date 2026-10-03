@@ -6,7 +6,8 @@ whose profile is at <data>/<cfg> holds two others back for equivocating (eve and
 it gave them), with every node stopped. Its real `vox tui` is opened in a pty (pyte at 160x50), the
 room opened, and the timeline pane read: **each** held-back member must be said on a line of its
 own, by the keyring name — `! eve signed two different messages at the same place …` and the same
-for frank. Exit 0 = pass, 1 = red, 2 = apparatus. Every process is recorded and killed by PID.
+for frank. Exit 0 = pass, 1 = red (a TUI that never
+opened the room is `RED: PRODUCT (staging)`), 2 = apparatus (pyte missing). Every process is recorded and killed by PID.
 
 Bounded throughout (`vox_pty.py`, V210-54): past its budget the driver says `HUNG at <stage>` with
 its stack, stops everything and exits red.
@@ -53,8 +54,8 @@ try:
     for r in pane:
         print(f"  |{r}")
     if not any(ROOM in r for r in tui.display()) and not any("Timeline" in r for r in pane):
-        print(f"{TAG} APPARATUS: the room {ROOM!r} never opened")
-        code = 2
+        print(f"{TAG} RED: PRODUCT (staging): the TUI never opened the room {ROOM!r}")
+        code = 1
     else:
         seen = {n: said(n) for n in NAMES}
         print(f"{TAG} said on a line of its own: {seen}")

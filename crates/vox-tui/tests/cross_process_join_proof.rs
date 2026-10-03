@@ -84,17 +84,17 @@ fn vox(dir: &std::path::Path, args: &[String], stdin: Option<&str>) -> (bool, St
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: stdin")
             .write_all(text.as_bytes())
-            .expect("write");
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -127,15 +127,15 @@ fn until(
 #[ignore = "three real vox processes, a real anchor and production Argon2id; CI runs it in release"]
 fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let anchor_dir = tmp.path().join("anchor");
     let alice_dir = tmp.path().join("alice");
     let bob_dir = tmp.path().join("bob");
     for d in [&anchor_dir, &alice_dir, &bob_dir] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let idpass = tmp.path().join("identity-passphrase");
-    std::fs::write(&idpass, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&idpass, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
     let roompass = "the room passphrase";
 
     // ---- the anchor: what makes this cross-process rather than loopback ----
@@ -153,21 +153,24 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         .to_owned();
     assert!(
         !spec.contains("0.0.0.0"),
-        "an anchor spec must be dialable, not a wildcard bind: {spec}"
+        "PRODUCT: an anchor spec must be dialable, not a wildcard bind: {spec}"
     );
 
     // ---- identities, headless. `vox id` bootstraps one on a fresh profile ----
     let mut fps = Vec::new();
     for dir in [&alice_dir, &bob_dir] {
         let (ok, out, err) = vox(dir, &["id".into()], None);
-        assert!(ok, "vox id must bootstrap an identity headlessly: {err}");
+        assert!(
+            ok,
+            "PRODUCT: vox id must bootstrap an identity headlessly: {err}"
+        );
         fps.push(out.trim().to_owned());
     }
     let (alice_fp, bob_fp) = (fps[0].clone(), fps[1].clone());
     assert_eq!(
         alice_fp.len(),
         52,
-        "a fingerprint pipes as one line: {alice_fp:?}"
+        "PRODUCT: a fingerprint pipes as one line: {alice_fp:?}"
     );
 
     // ---- the decision, before any daemon holds the profile (redb is single-writer) ----
@@ -183,7 +186,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
             ],
             None,
         );
-        assert!(ok, "vox trust add {name}: {err}");
+        assert!(ok, "PRODUCT (staging): vox trust add {name}: {err}");
     }
 
     // ---- daemons: agent comms with no terminal anywhere ----
@@ -212,12 +215,17 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         &[
             "room".into(),
             "create".into(),
+            "--passphrase-file".into(),
+            "-".into(),
             "--name".into(),
             "mission".into(),
         ],
         Some(&format!("{roompass}\n")),
     );
-    assert!(ok, "vox room create on a running daemon: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): vox room create on a running daemon: {err}"
+    );
     let listed = until(
         &alice_dir,
         "the room to appear",
@@ -225,11 +233,11 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         30,
         |o| o.contains("mission"),
     )
-    .expect("alice's room");
+    .expect("PRODUCT: alice's room");
     let room = listed
         .split_whitespace()
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .expect("a room id in `room list`")
+        .expect("PRODUCT: a room id in `room list`")
         .to_owned();
 
     let (ok, link, err) = vox(
@@ -237,15 +245,15 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         &["room".into(), "invite".into(), room.clone()],
         None,
     );
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let link = link.trim().to_owned();
     assert!(
         link.starts_with("vox://"),
-        "an address, not prose: {link:?}"
+        "PRODUCT: an address, not prose: {link:?}"
     );
     assert!(
         !link.contains(roompass),
-        "the address must never carry the passphrase: {link}"
+        "PRODUCT: the address must never carry the passphrase: {link}"
     );
 
     // ---- THE ACT UNDER TEST: bob joins, in a different process, through the anchor ----
@@ -255,6 +263,8 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         &[
             "room".into(),
             "join".into(),
+            "--passphrase-file".into(),
+            "-".into(),
             link.clone(),
             "--name".into(),
             "mission".into(),
@@ -278,7 +288,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
             anchor.transcript()
         );
         panic!(
-            "a cross-process join through an anchor failed after {took:.2}s — {err}\n{transcript}"
+            "PRODUCT: a cross-process join through an anchor failed after {took:.2}s — {err}\n{transcript}"
         );
     }
 
@@ -295,7 +305,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         ],
         None,
     );
-    assert!(ok, "alice posts: {err}");
+    assert!(ok, "PRODUCT (staging): alice posts: {err}");
     until(
         &bob_dir,
         "alice's message to reach bob across processes",
@@ -303,7 +313,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         60,
         |o| o.contains("port the wire codec"),
     )
-    .expect("the message crosses");
+    .expect("PRODUCT: the message crosses");
 
     // A claim, so the work board is exercised across processes too.
     let (ok, out, err) = vox(
@@ -316,8 +326,11 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         ],
         None,
     );
-    assert!(ok, "bob claims: stdout={out:?} stderr={err:?}");
-    assert!(out.contains("you hold port-the-codec"), "{out:?}");
+    assert!(ok, "PRODUCT: bob claims: stdout={out:?} stderr={err:?}");
+    assert!(
+        out.contains("you hold port-the-codec"),
+        "PRODUCT: bob's claim did not say he holds it: {out:?}"
+    );
     until(
         &alice_dir,
         "bob's claim to reach alice",
@@ -325,7 +338,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         60,
         |o| o.contains("port-the-codec"),
     )
-    .expect("the claim crosses");
+    .expect("PRODUCT: the claim crosses");
 
     // ---- the file leg: agent-comms file transfer, across processes ----
     //
@@ -338,7 +351,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     // defect, or the reverse.
     let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
     let source = tmp.path().join("artifact.bin");
-    std::fs::write(&source, &payload).unwrap();
+    std::fs::write(&source, &payload).expect("APPARATUS: write a staging file");
 
     let mut offer = VoxProc::spawn(
         "alice-send",
@@ -363,7 +376,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         60,
         |o| o.contains("artifact.bin"),
     )
-    .expect("the announcement crosses");
+    .expect("PRODUCT: the announcement crosses");
 
     let dest = tmp.path().join("collected.bin");
     let (ok, out, err) = vox(
@@ -380,7 +393,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     );
     if !ok {
         panic!(
-            "a file transfer across processes failed — {err}\n`vox room send|get` rides a \
+            "PRODUCT: a file transfer across processes failed — {err}\n`vox room send|get` rides a \
              room-bound service and a `Forward`\n--- alice's send ---\n{}\n--- alice's daemon \
              ---\n{}\n--- bob's daemon ---\n{}",
             offer.transcript(),
@@ -390,12 +403,12 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     }
     assert!(
         out.contains("verified"),
-        "the collector must verify: {out:?}"
+        "PRODUCT: the collector must verify: {out:?}"
     );
-    let got = std::fs::read(&dest).expect("the collected file");
+    let got = std::fs::read(&dest).expect("PRODUCT: the collected file");
     assert!(
         got == payload,
-        "the bytes differ across the overlay: got {} of {}",
+        "PRODUCT: the bytes differ across the overlay: got {} of {}",
         got.len(),
         payload.len()
     );

@@ -19,7 +19,8 @@
 //! the same profile.
 //!
 //! **Asserted** — every red says whether it is the product's verdict (`PRODUCT:`, quoting what the
-//! product said) or the staging's (`APPARATUS:`, naming what was not achieved).
+//! product said), a vox step that stages it failing (`PRODUCT (staging):`), or this proof's own
+//! machinery (`APPARATUS:`).
 //! 1. `vox node` prints its `--anchor` spec within [`START_BOUND`] and has not exited, and it never
 //!    says the profile is already open.
 //! 2. It serves: a guest joins the host's room through it, and the anchor reports the room on its
@@ -116,12 +117,13 @@ fn start_anchor(data: &Path, run: &str) -> (VoxProc, String) {
 }
 
 /// A labelled line the host printed, e.g. `address …`. The host is staging: a host that never
-/// says it is an apparatus fault, shown with what the anchor said in case the anchor is why.
+/// says it is the product's fault (staging), shown with what the anchor said in case the anchor
+/// is why.
 fn host_says(host: &mut VoxProc, anchor: &mut VoxProc, label: &str) -> String {
     match wait_for(host, SERVE_BOUND, |l| l.starts_with(&format!("{label} "))) {
         Ok(line) => after_label(&line, label),
         Err(missed) => panic!(
-            "APPARATUS: staging not achieved — the host's `vox serve` never printed its {label} \
+            "PRODUCT (staging): the host's `vox serve` never printed its {label} \
              ({missed:?} within {SERVE_BOUND:?}).\nthe host said:\n{}\nthe anchor said:\n{}",
             host.transcript(),
             anchor.transcript()
@@ -145,12 +147,12 @@ fn an_anchor_runs_and_serves_on_a_profile_made_by_vox_id() {
     let (ok, fp, err) = vox_once(&anchor_dir, &args(&["id"]));
     assert!(
         ok,
-        "APPARATUS: staging not achieved — `vox id` in the anchor's profile failed: {err}"
+        "PRODUCT (staging): `vox id` in the anchor's profile failed: {err}"
     );
     let vault = anchor_dir.join("default").join("vault.cbor");
     assert!(
         vault.is_file(),
-        "APPARATUS: staging not achieved — `vox id` printed {fp:?} but left no vault at {}",
+        "PRODUCT (staging): `vox id` printed {fp:?} but left no vault at {}",
         vault.display()
     );
     println!("[proof] vox id made the anchor profile's identity");
@@ -161,10 +163,7 @@ fn an_anchor_runs_and_serves_on_a_profile_made_by_vox_id() {
     // ---- 2. it serves: a guest joins a host's room through it --------------------------------
     for (who, dir) in [("host", &host_dir), ("guest", &guest_dir)] {
         let (ok, _, err) = vox_once(dir, &args(&["id"]));
-        assert!(
-            ok,
-            "APPARATUS: staging not achieved — `vox id` ({who}) failed: {err}"
-        );
+        assert!(ok, "PRODUCT (staging): `vox id` ({who}) failed: {err}");
     }
     let port = echo_service();
     let mut host = VoxProc::spawn(

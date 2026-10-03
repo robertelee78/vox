@@ -1,11 +1,9 @@
-// vox — OpenCode plugin (ADR-020 §6). Drains this session's Vox room at the top of
-// every turn and injects what it finds, so an agent reads its room whether or not
+// vox — OpenCode plugin (ADR-020 §6). Drains every Vox room this node holds at the top
+// of every turn and injects what it finds, so an agent reads its rooms whether or not
 // the model would have thought to.
 //
 // Install:
 //   vox agent plugin opencode > ~/.config/opencode/plugin/vox.js
-//   export VOX_ROOM=<room id or unique prefix>
-//   export VOX_AGENT_NAME=<the name others address this agent by>   # to be interruptible
 //
 // This is a shim, not a second implementation. Everything that decides what an
 // agent has not yet read — attaching to the node, resolving the room, the cursor,
@@ -303,11 +301,6 @@ export default async function vox({ $, client }) {
           log("chat.message: no session id")
           return
         }
-        const room = process.env.VOX_ROOM
-        if (!room) {
-          log("chat.message: VOX_ROOM is unset")
-          return
-        }
         const bin = process.env.VOX_BIN || "vox"
 
         // `.quiet()` keeps the child's output out of OpenCode's, `.nothrow()`
@@ -323,7 +316,7 @@ export default async function vox({ $, client }) {
         }
 
         const result =
-          await $`${bin} agent hook --format text --room ${room} --session ${sessionID}`
+          await $`${bin} agent hook --format text --session ${sessionID}`
             .env(env)
             .quiet()
             .nothrow()

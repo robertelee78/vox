@@ -11,10 +11,16 @@
 //! admitted with `vox trust add`, ready once each has rendered a post by the other. Bob's
 //! session registers with his daemon **the way a harness does it**: its turn-start hook
 //! runs `vox agent hook --room …` with Claude Code's hook JSON on stdin and the harness's
-//! `CLAUDE_CODE_MESSAGING_SOCKET`/`_TOKEN` and `VOX_AGENT_NAME` in its environment. The one
-//! thing that is not `vox` is that messaging socket: a stand-in for Claude Code's, recording
-//! what the daemon writes to it, because no `vox` command plays a harness session. Alice
-//! posts with `vox room post` on her own daemon; nothing reaches bob but by sync.
+//! `CLAUDE_CODE_MESSAGING_SOCKET`/`_TOKEN` in its environment. The one thing that is not `vox` is
+//! that messaging socket: a stand-in for Claude Code's, recording what the daemon writes to it,
+//! because no `vox` command plays a harness session. Alice posts with `vox room post` on her own
+//! daemon; nothing reaches bob but by sync.
+//!
+//! **Messages address nodes** (v0.2.10, the decider 2026-10-02): `--to` takes the poster's name
+//! for a member, a raw envelope's `to` that member's whole fingerprint (`to_node`), and an urgent
+//! message wakes every session registered on the node it addresses. There is no per-session
+//! name (`VOX_AGENT_NAME` is gone): "addressed to someone else" below is addressed to alice's
+//! node, and the hop-budget exchange addresses the other side's node.
 //!
 //! **The hook runs in a cleared environment.** This test may itself run inside Claude Code,
 //! whose `CLAUDE_CODE_MESSAGING_SOCKET` names a *real* session: inherited, it registers that
@@ -86,8 +92,10 @@
 //! on each node answers every answer it is told of. Each answer spends a hop, and an answer with
 //! none left is announced to nobody: seven notices (hops 7 down to 1), then the exchange stops.
 //!
-//! Every red says PRODUCT, with what the product sent or said, or APPARATUS, naming the
-//! staging that was not achieved.
+//! Every red names its side: `PRODUCT:` with what the product sent or said; `PRODUCT (staging)`
+//! for a `vox` step of the staging that failed (it is the product's); `APPARATUS:` for this
+//! proof's own fault, and `APPARATUS, CANNOT MEASURE:` when the collecting loop itself stalled
+//! for a large part of a window in which a missing wake is judged.
 //!
 //! **Mutation**, one per claim, each red at its own assertion: the message put back in the wake
 //! (V030-15 (1), V030-20 (2)); no recount — the daemon counting from the start of the room rather
@@ -114,7 +122,8 @@ use support::{until, Worker};
 
 /// A stand-in Claude Code messaging socket: every connection's bytes, as they are written.
 fn listen(path: &std::path::Path) -> mpsc::Receiver<String> {
-    let listener = UnixListener::bind(path).expect("APPARATUS: bind the stand-in session socket");
+    let listener = UnixListener::bind(path)
+        .unwrap_or_else(|e| panic!("APPARATUS: bind the stand-in session socket: {e}"));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -152,29 +161,32 @@ fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) 
         })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().expect("APPARATUS: spawn vox agent hook");
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn vox agent hook: {e}"));
     if let Some(input) = stdin {
         child
             .stdin
             .take()
-            .expect("APPARATUS: a piped stdin")
+            .expect("APPARATUS: the hook's stdin")
             .write_all(input.as_bytes())
-            .expect("APPARATUS: write the hook input");
+            .unwrap_or_else(|e| panic!("PRODUCT (staging): `vox agent hook` exited without reading its stdin (the write failed: {e})"));
     }
     let out = child
         .wait_with_output()
-        .expect("APPARATUS: wait for vox agent hook");
+        .unwrap_or_else(|e| panic!("APPARATUS: wait for vox agent hook: {e}"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
     eprintln!(
         "[receipt] vox {} -> {:?}; stderr: {}",
         args.join(" "),
         out.status.code(),
-        String::from_utf8_lossy(&out.stderr).trim()
+        stderr.trim()
     );
     assert!(
         out.status.success(),
-        "PRODUCT: `vox agent hook` must exit 0 whatever happens, so it never breaks a turn; it \
-         exited {:?}",
-        out.status.code()
+        "PRODUCT: `vox agent hook` must exit 0; it exited {:?} and said: {}",
+        out.status.code(),
+        stderr.trim()
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -185,7 +197,10 @@ fn registered_endpoint(bob: &Worker, session: &str) -> (String, String) {
         panic!("PRODUCT (staging): `vox agent hook` registered no session {session}: {e}")
     });
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!("PRODUCT: the session record `vox agent hook` wrote does not parse: {e}")
+        panic!(
+            "PRODUCT: `vox agent hook` wrote a session registration that is not JSON ({e}): {}",
+            String::from_utf8_lossy(&body)
+        )
     });
     (
         v["harness"].as_str().unwrap_or_default().to_owned(),
@@ -199,27 +214,52 @@ fn post_text(w: &Worker, room: &str, text: &str) {
     assert!(o.ok, "PRODUCT (staging): {} could not post: {o:?}", w.name);
 }
 
+/// `envelope` with its `"to":["<to's name>"]` written as `to`'s whole fingerprint. Since v0.2.10 a
+/// raw envelope addresses **nodes**, each by its fingerprint (`--to` takes the poster's names for
+/// them), and an urgent one wakes every session of the node addressed.
+fn to_node(envelope: &str, to: &Worker) -> String {
+    let named = format!("\"to\":[\"{}\"]", to.name);
+    assert!(
+        envelope.contains(&named),
+        "APPARATUS: the proof's envelope does not address {}: {envelope}",
+        to.name
+    );
+    envelope.replacen(&named, &format!("\"to\":[\"{}\"]", to.b32()), 1)
+}
+
 /// Alice posts `text` exactly as given, through `vox room post <room> -` on her daemon.
 fn post(alice: &Worker, room: &str, text: &str) {
     let o = alice.vox_in(None, &["room", "post", room, "-"], Some(text));
     assert!(o.ok, "PRODUCT (staging): alice could not post: {o:?}");
 }
 
-/// Everything bob's stand-in session receives within `within`, stopping early once `done`.
+/// Everything bob's stand-in session receives within `within`, stopping early once `done`, and
+/// the apparatus clock: the longest the collecting loop itself went between two of its own
+/// half-second waits. A loop that stalled for a large part of the window cannot say a wake did
+/// not come in it.
 fn collect(
     inbox: &mpsc::Receiver<String>,
     within: Duration,
     done: impl Fn(&str) -> bool,
-) -> Vec<String> {
+) -> (Vec<String>, Duration) {
+    const WAIT: Duration = Duration::from_millis(500);
     let mut got = Vec::new();
+    let mut stall = Duration::ZERO;
     let deadline = Instant::now() + within;
     while Instant::now() < deadline && !done(&got.join("\n")) {
-        if let Ok(frames) = inbox.recv_timeout(Duration::from_millis(500)) {
+        let asked = Instant::now();
+        if let Ok(frames) = inbox.recv_timeout(WAIT) {
             eprintln!("[receipt] bob's session received: {frames}");
             got.push(frames);
         }
+        stall = stall.max(asked.elapsed().saturating_sub(WAIT));
     }
-    got
+    (got, stall)
+}
+
+/// Whether a stall of the collecting loop leaves too little of `window` to judge a miss.
+fn stalled(stall: Duration, window: Duration) -> bool {
+    stall * 4 > window
 }
 
 /// The user message each stand-in frame carries: what the harness would put before the model.
@@ -389,7 +429,6 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let bob_env = [
         ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
         ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
-        ("VOX_AGENT_NAME", "bob"),
     ];
     // bob's harness, starting a turn on `prompt`: its drain's injection.
     let turn = |prompt: &str| {
@@ -405,7 +444,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     assert_eq!(
         reg,
         ("claude".to_owned(), sock_s.clone()),
-        "APPARATUS: bob's session must be registered at the test's own socket, never a \
+        "PRODUCT (staging): bob's session must be registered at the test's own socket, never a \
          real session's"
     );
 
@@ -425,18 +464,27 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["carol"],"urgent":true,"body":"carol: OTHER-ADDRESSEE"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["alice"],"urgent":true,"body":"alice: OTHER-ADDRESSEE"}"#,
+            alice,
+        ),
     );
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"body":"bob: NOT-URGENT"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"body":"bob: NOT-URGENT"}"#,
+            bob,
+        ),
     );
     // ---- (1) addressed to bob and urgent: woken, by a notice that carries none of it ----
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-URGENT-1 wake up"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-URGENT-1 wake up"}"#,
+            bob,
+        ),
     );
     until(
         bob,
@@ -447,7 +495,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     );
     // Twenty seconds after it landed: ten sweeps of the daemon's two-second tick, and long
     // enough for a wrongly-woken or twice-woken session to show.
-    let frames = collect(&inbox, Duration::from_secs(20), |_| false);
+    let (frames, stall) = collect(&inbox, Duration::from_secs(20), |_| false);
     let all = frames.join("\n");
     let wakes = contents(&frames);
     println!(
@@ -458,6 +506,13 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         all.contains("CANARY-URGENT"),
         all.contains("OTHER-ADDRESSEE"),
         all.contains("NOT-URGENT")
+    );
+    // No wake at all is judged only when the collecting loop was itself awake for the window.
+    assert!(
+        !(wakes.is_empty() && stalled(stall, Duration::from_secs(20))),
+        "APPARATUS, CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 20 s \
+         window, so a missing wake cannot be judged; received {frames:?}; bob's daemon:\n{}",
+        bob_err()
     );
     check(
         &mut failures,
@@ -509,7 +564,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     );
     assert!(
         read.matches("OTHER-ADDRESSEE").count() == 1 && read.matches("NOT-URGENT").count() == 1,
-        "APPARATUS (5): the wake's turn must read the two messages that woke nothing, once \
+        "PRODUCT (staging): (5) the wake's turn must read the two messages that woke nothing, once \
          each, or the read did not reach them: {read}"
     );
     check(
@@ -530,11 +585,12 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-URGENT-2"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-URGENT-2"}"#,
+            bob,
+        ),
     );
-    let got = contents(&collect(&inbox, Duration::from_secs(30), |g| {
-        g.contains("\"user\"")
-    }));
+    let got = contents(&collect(&inbox, Duration::from_secs(30), |g| g.contains("\"user\"")).0);
     println!(
         "[proof] (6) after the session read the first notice, a second urgent message woke it \
          {} time(s) (the hold is 10 minutes; only the moved cursor can end it)",
@@ -551,7 +607,10 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-URGENT-3"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-URGENT-3"}"#,
+            bob,
+        ),
     );
     until(
         bob,
@@ -560,7 +619,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         &["room", "read", &room],
         |o| o.stdout.contains("CANARY-URGENT-3"),
     );
-    let held = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    let held = contents(&collect(&inbox, Duration::from_secs(10), |_| false).0);
     let said_held = bob_err().contains("not waking session session-bob again yet");
     println!(
         "[proof] (6) with a notice outstanding, a further urgent message woke bob {} time(s); \
@@ -589,9 +648,9 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     let read = turn(&second);
     assert!(
         read.contains("CANARY-URGENT-2") && read.contains("CANARY-URGENT-3"),
-        "APPARATUS (7): the session's read must take both held messages first: {read}"
+        "PRODUCT (staging) (7): the session's read must take both held messages first: {read}"
     );
-    let after = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    let after = contents(&collect(&inbox, Duration::from_secs(10), |_| false).0);
     let said_read = bob_err().contains("it already read the urgent message(s)");
     println!(
         "[proof] (7) once the session had read them, the daemon woke it {} time(s); it said \
@@ -612,10 +671,11 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     // An OpenCode plugin's wake socket that accepts and never answers: its wake would wait
     // for ever.
     let wedge_path = tmp.path().join("wedge.sock");
-    let wedge = UnixListener::bind(&wedge_path).expect("APPARATUS: bind the wedged session socket");
+    let wedge = UnixListener::bind(&wedge_path)
+        .unwrap_or_else(|e| panic!("APPARATUS: bind the wedged session socket: {e}"));
     let wedge_url = wedge_path
         .to_str()
-        .expect("APPARATUS: a UTF-8 temporary path")
+        .expect("APPARATUS: a UTF-8 temp path")
         .to_owned();
     std::thread::spawn(move || {
         let mut held = Vec::new();
@@ -628,7 +688,6 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         &[
             ("VOX_OPENCODE_WAKE_SOCKET", wedge_url.as_str()),
             ("VOX_OPENCODE_WAKE_TOKEN", "wedge-token"),
-            ("VOX_AGENT_NAME", "bob"),
         ],
         &[
             "agent",
@@ -644,7 +703,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     assert_eq!(
         reg,
         ("opencode".to_owned(), wedge_url.clone()),
-        "APPARATUS: the wedged session must be registered at the test's own endpoint, \
+        "PRODUCT (staging): the wedged session must be registered at the test's own endpoint, \
          never a real session's"
     );
     let registered = std::fs::read_dir(bob.paths.session_dir())
@@ -654,16 +713,27 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
                 .count()
         })
         .unwrap_or(0);
-    assert_eq!(registered, 2, "APPARATUS: exactly two sessions registered");
+    assert_eq!(
+        registered, 2,
+        "PRODUCT: after two hooks, bob's daemon must hold exactly two session registrations"
+    );
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WEDGE-TEST"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: WEDGE-TEST"}"#,
+            bob,
+        ),
     );
-    let got = contents(&collect(&inbox, Duration::from_secs(45), |g| {
-        g.contains("\"user\"")
-    }));
+    let (frames, stall) = collect(&inbox, Duration::from_secs(45), |g| g.contains("\"user\""));
+    let got = contents(&frames);
     println!("[proof] (4) with a wedged session registered, bob's session got {got:?}");
+    assert!(
+        !(got.is_empty() && stalled(stall, Duration::from_secs(45))),
+        "APPARATUS, CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 45 s \
+         window, so a missing wake cannot be judged; received {frames:?}; bob's daemon:\n{}",
+        bob_err()
+    );
     check(
         &mut failures,
         got.iter()
@@ -686,7 +756,10 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-AHEAD-1"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-AHEAD-1"}"#,
+            bob,
+        ),
     );
     until(
         bob,
@@ -695,12 +768,10 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         &["room", "read", &room],
         |o| o.stdout.contains("CANARY-AHEAD-1") && o.stdout.contains("BULK-59-ROW"),
     );
-    let w1 = contents(&collect(&inbox, Duration::from_secs(30), |g| {
-        g.contains("\"user\"")
-    }));
+    let w1 = contents(&collect(&inbox, Duration::from_secs(30), |g| g.contains("\"user\"")).0);
     assert!(
         w1.len() == 1,
-        "APPARATUS (8): the urgent message must wake bob for the bounded read to be staged; got \
+        "PRODUCT (staging) (8): the urgent message must wake bob for the bounded read to be staged; got \
          {w1:?}; bob's daemon:\n{}",
         bob_err()
     );
@@ -720,7 +791,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     );
     assert!(
         turn1.contains("more unread message(s) not shown"),
-        "APPARATUS (8): the first read must be bounded, or nothing is shown ahead of the cursor: \
+        "PRODUCT (staging) (8): the first read must be bounded, or nothing is shown ahead of the cursor: \
          {turn1}"
     );
     check(
@@ -735,11 +806,12 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-AHEAD-2"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-AHEAD-2"}"#,
+            bob,
+        ),
     );
-    let w2 = contents(&collect(&inbox, Duration::from_secs(30), |g| {
-        g.contains("\"user\"")
-    }));
+    let w2 = contents(&collect(&inbox, Duration::from_secs(30), |g| g.contains("\"user\"")).0);
     println!("[proof] (8) the wake after turn 1: {w2:?}");
     check(
         &mut failures,
@@ -796,7 +868,6 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         &[
             ("VOX_OPENCODE_WAKE_SOCKET", flaky_s.as_str()),
             ("VOX_OPENCODE_WAKE_TOKEN", "flaky-token"),
-            ("VOX_AGENT_NAME", "flaky"),
         ],
         &[
             "agent",
@@ -811,16 +882,19 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     assert_eq!(
         registered_endpoint(bob, "session-flaky"),
         ("opencode".to_owned(), flaky_s.clone()),
-        "APPARATUS: session-flaky must be registered at the test's own socket"
+        "PRODUCT (staging): session-flaky must be registered at the test's own socket"
     );
     post(
         alice,
         &room,
-        r#"{"v":1,"type":"ask","to":["flaky"],"urgent":true,"body":"flaky: CANARY-RETRY"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"flaky: CANARY-RETRY"}"#,
+            bob,
+        ),
     );
     let Ok(refused) = attempts.recv_timeout(Duration::from_secs(30)) else {
         panic!(
-            "APPARATUS (9): the urgent message never reached session-flaky's socket, so its \
+            "PRODUCT (staging) (9): the urgent message never reached session-flaky's socket, so its \
              refusal was never staged; bob's daemon:\n{}",
             bob_err()
         );
@@ -920,7 +994,6 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let env = [
         ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
         ("CLAUDE_CODE_MESSAGING_TOKEN", "asker-token"),
-        ("VOX_AGENT_NAME", "asker"),
     ];
     let event = |bob: &Worker, name: &str, prompt: Option<&str>| {
         hook(
@@ -934,7 +1007,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     assert_eq!(
         registered_endpoint(&r.workers[1], "asker"),
         ("claude".to_owned(), sock_s.clone()),
-        "APPARATUS: asker must be registered at the test's own socket"
+        "PRODUCT (staging): asker must be registered at the test's own socket"
     );
     // It asks alice, as its model would with `vox room post`.
     let o = r.workers[1].vox_in(
@@ -977,7 +1050,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
 
     // ---- (1) busy: an answer waits, and nothing is sent ----
     answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-1");
-    let busy = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    let busy = contents(&collect(&inbox, Duration::from_secs(10), |_| false).0);
     println!("[proof] (1) while busy, asker got {} notice(s)", busy.len());
     check(
         &mut failures,
@@ -1133,10 +1206,10 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let read = injected(&event(&r.workers[1], "UserPromptSubmit", Some("go on")));
     assert!(
         read.contains("CANARY-REPLY-3"),
-        "APPARATUS (6): the session's own read must take the third answer: {read}"
+        "PRODUCT (staging) (6): the session's own read must take the third answer: {read}"
     );
     let _ = event(&r.workers[1], "Stop", None);
-    let after = contents(&collect(&inbox, Duration::from_secs(12), |_| false));
+    let after = contents(&collect(&inbox, Duration::from_secs(12), |_| false).0);
     println!(
         "[proof] (6) answers read, then idle: asker got {} notice(s)",
         after.len()
@@ -1168,7 +1241,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         &["room", "read", &room],
         |o| o.stdout.contains("NOT-A-REPLY-pong"),
     );
-    let quiet = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    let quiet = contents(&collect(&inbox, Duration::from_secs(10), |_| false).0);
     // Then a real answer, so a notice is seen to come at all, and it counts one reply.
     answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-X");
     let control = next_notice(&inbox, Duration::from_secs(20)).map(|f| f.1);
@@ -1179,7 +1252,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     );
     assert!(
         control.is_some(),
-        "APPARATUS (10): a real answer must bring a notice, or the quiet before it proves \
+        "PRODUCT (staging) (10): a real answer must bring a notice, or the quiet before it proves \
          nothing; bob's daemon:\n{}",
         bob_err()
     );
@@ -1201,7 +1274,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let end = event(&r.workers[1], "SessionEnd", None);
     let gone = !r.workers[1].paths.session_file("asker").exists();
     answer(&r.workers[0], &r.workers[1], "CANARY-REPLY-4");
-    let ended = contents(&collect(&inbox, Duration::from_secs(10), |_| false));
+    let ended = contents(&collect(&inbox, Duration::from_secs(10), |_| false).0);
     println!(
         "[proof] (7) after SessionEnd: registration gone {gone}, notices {}",
         ended.len()
@@ -1222,7 +1295,6 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     let late_env = [
         ("CLAUDE_CODE_MESSAGING_SOCKET", late_s.as_str()),
         ("CLAUDE_CODE_MESSAGING_TOKEN", "late-token"),
-        ("VOX_AGENT_NAME", "late"),
     ];
     let late = |w: &Worker, name: &str| {
         hook(
@@ -1273,14 +1345,17 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     post_text(
         &r.workers[0],
         &room,
-        r#"{"v":1,"type":"ask","to":["late"],"urgent":true,"body":"late: CANARY-START-U"}"#,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"late: CANARY-START-U"}"#,
+            &r.workers[1],
+        ),
     );
     // Long enough for both to reach the anchor, from which bob's node takes them when it starts.
     std::thread::sleep(Duration::from_secs(3));
     let started = Instant::now();
     r.restart(1);
     let up = started.elapsed().as_secs_f64();
-    let frames = collect(&late_inbox, Duration::from_secs(20), |g| {
+    let (frames, _stall) = collect(&late_inbox, Duration::from_secs(20), |g| {
         g.contains("urgent message") && g.contains("repl")
     });
     let told = contents(&frames).join("\n");
@@ -1346,7 +1421,6 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
         let env = [
             ("CLAUDE_CODE_MESSAGING_SOCKET", socks[i].as_str()),
             ("CLAUDE_CODE_MESSAGING_TOKEN", "pp-token"),
-            ("VOX_AGENT_NAME", *me),
         ];
         hook(
             w,
@@ -1357,7 +1431,9 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
     };
     // Each side answers what it was told, addressed back, as its model would; then its turn ends.
     let answer = |i: usize, re: Option<&str>, body: &str| -> String {
-        let (w, me, other, _) = &sides[i];
+        let (w, me, _, _) = &sides[i];
+        // `--to` names the other side's node, by this node's name for it (v0.2.10).
+        let other = sides[1 - i].0.name.as_str();
         let mut args = vec![
             "room", "post", &room, "--type", "answer", "--to", other, "--json",
         ];
@@ -1377,7 +1453,7 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
         assert_eq!(
             registered_endpoint(sides[i].0, sides[i].1),
             ("claude".to_owned(), socks[i].clone()),
-            "APPARATUS: {} must be registered at the test's own socket",
+            "PRODUCT (staging): {} must be registered at the test's own socket",
             sides[i].1
         );
     }
@@ -1427,7 +1503,7 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
     assert_eq!(
         hops.first(),
         Some(&8),
-        "APPARATUS: the first question must start with the default budget of 8: {hops:?}"
+        "PRODUCT (staging): the first question must start with the default budget of 8: {hops:?}"
     );
     assert_eq!(
         told,

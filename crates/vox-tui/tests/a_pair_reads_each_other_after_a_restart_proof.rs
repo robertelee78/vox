@@ -22,11 +22,11 @@
 //!    (alice, the responder), the **lower** joins it (bob, the joiner), so the responder → joiner
 //!    arm hits the rule's losing side on every run. carol joins third; she is only the lever.
 //! 2. All three trust each other after the joins; each renders a post by each other
-//!    (`CANNOT MEASURE` otherwise).
+//!    (`PRODUCT (staging)` otherwise).
 //! 3. alice's daemon is killed (SIGKILL, by PID) and started again with its identity passphrase
 //!    alone; it reopens the room by itself (#208). Control: alice then renders a fresh post by
-//!    bob and bob one by alice, both under the keys already held (`CANNOT MEASURE` otherwise), so
-//!    what follows measures the sessions and nothing else.
+//!    bob and bob one by alice, both under the keys already held (`PRODUCT (staging)`
+//!    otherwise), so what follows measures the sessions and nothing else.
 //! 4. One of them rotates **alone**: it runs `vox trust remove <carol>`, which rotates its sender
 //!    key and re-keys everyone still trusted — the other, pairwise — and posts once under it.
 //!    Two tests, one per direction, each in a world of its own: were both to rotate, the first
@@ -114,16 +114,16 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
     for v in HARNESS_VARS {
         cmd.env_remove(v);
     }
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .take()
-            .expect("stdin")
+            .expect("APPARATUS: vox stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: write vox stdin");
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -133,11 +133,11 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 
 fn member(tmp: &Path, name: &'static str) -> Member {
     let dir = tmp.join(name);
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: harness file I/O");
     let pass = tmp.join(format!("{name}.pass"));
-    std::fs::write(&pass, IDPASS).unwrap();
+    std::fs::write(&pass, IDPASS).expect("APPARATUS: harness file I/O");
     let (ok, out, err) = vox(&dir, &["id"], None);
-    assert!(ok, "{name}: vox id: {err}");
+    assert!(ok, "PRODUCT (staging): {name}'s vox id failed: {err}");
     Member {
         name,
         dir,
@@ -149,18 +149,20 @@ fn member(tmp: &Path, name: &'static str) -> Member {
 
 fn spawn_anchor(tmp: &Path) -> (Proc, String) {
     let dir = tmp.join("anchor");
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: harness file I/O");
     let out = tmp.join("anchor.out");
     let mut cmd = Command::new(VOX);
     cmd.args(["node", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", &dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(&out).expect("APPARATUS: harness file I/O"),
+        ))
         .stderr(Stdio::null());
     for v in HARNESS_VARS {
         cmd.env_remove(v);
     }
-    let anchor = Proc(cmd.spawn().expect("spawn vox node"));
+    let anchor = Proc(cmd.spawn().expect("APPARATUS: spawn vox node"));
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let text = std::fs::read_to_string(&out).unwrap_or_default();
@@ -172,7 +174,7 @@ fn spawn_anchor(tmp: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "PRODUCT (staging): the anchor never printed its spec; it printed: {text:?}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -194,17 +196,26 @@ fn start_daemon(m: &mut Member, anchor: &str, tag: &str) {
     .env("VOX_CONFIG_DIR", m.dir.join("cfg"))
     .stdin(Stdio::null())
     .stdout(Stdio::null())
-    .stderr(Stdio::from(std::fs::File::create(&err).unwrap()));
+    .stderr(Stdio::from(
+        std::fs::File::create(&err).expect("APPARATUS: harness file I/O"),
+    ));
     for v in HARNESS_VARS {
         cmd.env_remove(v);
     }
-    m.daemon = Some(Proc(cmd.spawn().expect("spawn vox daemon")));
+    m.daemon = Some(Proc(cmd.spawn().expect("APPARATUS: spawn vox daemon")));
+    // The first start is staging; the restart is what this proof is about.
+    let side = if tag == "start" {
+        "PRODUCT (staging):"
+    } else {
+        "PRODUCT:"
+    };
     let deadline = Instant::now() + Duration::from_secs(60);
     while !vox(&m.dir, &["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "{}'s daemon never answered",
-            m.name
+            "{side} {}'s daemon ({tag}) never answered on its control socket; its stderr: {:?}",
+            m.name,
+            std::fs::read_to_string(&err).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -212,7 +223,11 @@ fn start_daemon(m: &mut Member, anchor: &str, tag: &str) {
 
 fn post(m: &Member, room: &str, text: &str) {
     let (ok, _, err) = vox(&m.dir, &["room", "post", room, text], None);
-    assert!(ok, "{} posts {text:?}: {err}", m.name);
+    assert!(
+        ok,
+        "PRODUCT: {}'s vox room post {text:?} failed: {err}",
+        m.name
+    );
 }
 
 fn renders(m: &Member, room: &str, text: &str) -> bool {
@@ -255,12 +270,19 @@ struct World {
 
 /// Steps 1–3 of the staging (see the module docs).
 fn restarted_responder() -> World {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
 
     // ---- the responder is the higher fingerprint, the joiner the lower ------------------
     let x = member(tmp.path(), "alice");
     let y = member(tmp.path(), "bob");
-    let key = |m: &Member| vox_core::node::link::b32_decode(&m.fp, "fingerprint").unwrap();
+    let key = |m: &Member| {
+        vox_core::node::link::b32_decode(&m.fp, "fingerprint").unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT (staging): `vox id` printed {:?}, not a fingerprint: {e}",
+                m.fp
+            )
+        })
+    };
     let (mut alice, mut bob) = if key(&x) > key(&y) { (x, y) } else { (y, x) };
     // The names follow the roles, whichever identity drew which.
     alice.name = "alice";
@@ -268,7 +290,7 @@ fn restarted_responder() -> World {
     let mut carol = member(tmp.path(), "carol");
     assert!(
         key(&bob) < key(&alice),
-        "CANNOT MEASURE: the joiner's fingerprint is not the lower"
+        "APPARATUS (precondition not met): the joiner's fingerprint is not the lower"
     );
 
     let (anchor, spec) = spawn_anchor(tmp.path());
@@ -279,34 +301,44 @@ fn restarted_responder() -> World {
     // ---- alice creates the room; bob joins through her, then carol ---------------------
     let (ok, _, err) = vox(
         &alice.dir,
-        &["room", "create", "--name", "pair"],
+        &["room", "create", "--passphrase-file", "-", "--name", "pair"],
         Some(ROOMPASS),
     );
-    assert!(ok, "room create: {err}");
-    let (_, listed, _) = vox(&alice.dir, &["room", "list"], None);
+    assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
+    let (_, listed, list_err) = vox(&alice.dir, &["room", "list"], None);
     let room = listed
         .split_whitespace()
         .next()
-        .expect("the room in `vox room list`")
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): `vox room list` names no room after create: \
+                 {listed:?} {list_err:?}"
+            )
+        })
         .to_owned();
     let (ok, link, err) = vox(&alice.dir, &["room", "invite", &room], None);
-    assert!(ok, "room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
     for m in [&bob, &carol] {
-        // A join can be turned away while the host admits another joiner (a known, separate
-        // defect): retried, bounded, as `support/room.rs` does.
-        let joined = (1..=6).any(|attempt| {
-            let (ok, _, err) = vox(
-                &m.dir,
-                &["room", "join", link.trim(), "--name", "pair"],
-                Some(ROOMPASS),
-            );
-            if !ok {
-                eprintln!("[harness] {} join attempt {attempt} refused: {err}", m.name);
-                std::thread::sleep(Duration::from_secs(5));
-            }
-            ok
-        });
-        assert!(joined, "CANNOT MEASURE: {} could not join the room", m.name);
+        // One attempt: a join that fails is the product failing (a join turned away while the
+        // host admits another joiner was #217, fixed), and retrying past it would hide it.
+        let (joined, _, err) = vox(
+            &m.dir,
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "pair",
+            ],
+            Some(ROOMPASS),
+        );
+        assert!(
+            joined,
+            "PRODUCT (staging): {}'s `vox room join` was refused: {err}",
+            m.name
+        );
     }
 
     // ---- everyone trusts everyone, after the joins -------------------------------------
@@ -322,11 +354,15 @@ fn restarted_responder() -> World {
                         "--name",
                         b.name,
                         "--identity-passphrase-file",
-                        a.pass.to_str().unwrap(),
+                        a.pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
                     ],
                     None,
                 );
-                assert!(ok, "{} trusts {}: {err}", a.name, b.name);
+                assert!(
+                    ok,
+                    "PRODUCT (staging): {}'s trust add of {} failed: {err}",
+                    a.name, b.name
+                );
             }
         }
     }
@@ -343,7 +379,7 @@ fn restarted_responder() -> World {
                 );
                 assert!(
                     took.is_some(),
-                    "CANNOT MEASURE: {} never read {} before the restart",
+                    "PRODUCT (staging): {} never read {} before the restart",
                     r.name,
                     a.name
                 );
@@ -359,7 +395,7 @@ fn restarted_responder() -> World {
     while !vox(&alice.dir, &["room", "read", &room], None).0 {
         assert!(
             Instant::now() < reopened,
-            "CANNOT MEASURE: alice's restarted daemon never reopened the room (#208)"
+            "PRODUCT (staging): alice's restarted daemon never reopened the room (#208)"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -379,7 +415,7 @@ fn restarted_responder() -> World {
     );
     assert!(
         control_ab.is_some() && control_ba.is_some(),
-        "CANNOT MEASURE: the restarted room does not sync (control alice<-bob {control_ab:?}, \
+        "PRODUCT (staging): the restarted room does not sync (control alice<-bob {control_ab:?}, \
          bob<-alice {control_ba:?})"
     );
 
@@ -402,11 +438,15 @@ fn one_rotates(w: &World, rotator: &Member, reader: &Member, arm: &str, why: &st
             "remove",
             &w.carol.fp,
             "--identity-passphrase-file",
-            rotator.pass.to_str().unwrap(),
+            rotator.pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
         ],
         None,
     );
-    assert!(ok, "{} removes carol: {err}", rotator.name);
+    assert!(
+        ok,
+        "PRODUCT: {}'s vox trust remove of carol failed: {err}",
+        rotator.name
+    );
     let text = format!("rotated: {} says", rotator.name);
     post(rotator, &w.room, &text);
     let t0 = Instant::now();
@@ -435,7 +475,7 @@ fn one_rotates(w: &World, rotator: &Member, reader: &Member, arm: &str, why: &st
     };
     assert!(
         took.is_some(),
-        "{arm}: {} never read {}'s post under the rotated key within {}s — {why}\nalice's log \
+        "PRODUCT: {arm}: {} never read {}'s post under the rotated key within {}s — {why}\nalice's log \
          tail:\n{}\nbob's log tail:\n{}",
         reader.name,
         rotator.name,

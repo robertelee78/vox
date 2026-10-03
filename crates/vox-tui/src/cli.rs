@@ -116,17 +116,20 @@ impl ProfileArgs {
 }
 
 /// The room args of whichever `service` subcommand this is.
-fn sub_room(sub: &ServiceCmd) -> &RoomArgs {
+fn sub_room(sub: &ServiceCmd) -> RoomArgs {
     match sub {
-        ServiceCmd::Add(a) => &a.room,
-        ServiceCmd::Remove(r) => &r.room,
-        ServiceCmd::List(r) => r,
+        ServiceCmd::Add(a) => a.room.clone(),
+        ServiceCmd::Remove(r) => r.room.clone(),
+        ServiceCmd::List(r) => r.room_args(),
     }
 }
 
 /// The shape every one-shot tunnel verb shares: resolve the profile, collect the two
 /// passphrases, open the room, run the verb, report.
-fn run_tunnel_verb<F, Fut>(room: RoomArgs, body: F) -> ExitCode
+///
+/// With `opens` false the verb opens no room (`vox service list`, V210-149): it asks for no
+/// room passphrase, and the room is one the unlocked profile holds open, or none.
+fn run_tunnel_verb<F, Fut>(room: RoomArgs, opens: bool, body: F) -> ExitCode
 where
     F: FnOnce(vox_core::node::actor::NodeHandle, vox_core::hash::Digest32) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
@@ -179,10 +182,14 @@ where
                 room.identity_passphrase.clone(),
                 room.identity_passphrase_file.clone(),
             )?;
-            let room_pp = crate::tunnel_cli::room_passphrase_for(
-                room.passphrase.as_ref(),
-                room.passphrase_file.as_deref(),
-            )?;
+            let room_pp = if opens {
+                Some(crate::tunnel_cli::room_passphrase_for(
+                    room.passphrase.as_ref(),
+                    room.passphrase_file.as_deref(),
+                )?)
+            } else {
+                None
+            };
             Ok::<_, crate::app::AppError>(crate::tunnel_cli::RoomTarget {
                 paths,
                 listen,
@@ -485,8 +492,44 @@ fn trust_over_socket(sub: &TrustCmd) -> bool {
     rt.block_on(crate::room_cli::node_is_running(&paths))
 }
 
+/// The name `vox trust add` files an identity under (V210-162): `--name`, or asked for on a
+/// terminal. With neither it is refused at once: every identity under one default name could
+/// not be told apart, nor addressed.
+fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
+    use std::io::{BufRead as _, IsTerminal as _, Write as _};
+    if let Some(n) = a.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        return Ok(n.to_owned());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(crate::app::AppError::Usage(
+            "name it: vox trust add <fingerprint> --name <your name for it>".into(),
+        ));
+    }
+    let mut err = std::io::stderr();
+    let _ = write!(err, "Your name for {}: ", a.fingerprint.trim());
+    let _ = err.flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    match line.trim() {
+        "" => Err(crate::app::AppError::Usage(
+            "no name given; nothing was trusted".into(),
+        )),
+        n => Ok(n.to_owned()),
+    }
+}
+
 /// Run a trust verb against the node that is already holding this profile.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
+    let name = match &sub {
+        TrustCmd::Add(a) => match trust_name(a) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => String::new(),
+    };
     let (profile, pass, pass_file) = match &sub {
         TrustCmd::List(a) => (
             a.profile.clone(),
@@ -516,7 +559,9 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let identity = match crate::tunnel_cli::identity_passphrase_for(&paths, pass, pass_file) {
+    // Only what the command line gave. A read needs none, and a change asks for it only when
+    // the node says it is needed (V210-159, V210-165).
+    let given = match crate::tunnel_cli::identity_passphrase_given(pass, pass_file) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("vox: {e}");
@@ -536,18 +581,17 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
     };
     let outcome = rt.block_on(async move {
         match sub {
-            TrustCmd::List(_) => crate::room_cli::trust_list(&paths, &identity).await,
+            TrustCmd::List(_) => crate::room_cli::trust_list(&paths).await,
             TrustCmd::Add(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_add(&paths, target, &a.name, &identity, a.history == "full")
-                    .await
+                crate::room_cli::trust_add(&paths, target, &name, given, a.history == "full").await
             }
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_remove(&paths, target, &identity).await
+                crate::room_cli::trust_remove(&paths, target, given).await
             }
             TrustCmd::Rename(a) => {
-                crate::room_cli::trust_rename(&paths, &a.fingerprint, &a.name, &identity).await
+                crate::room_cli::trust_rename(&paths, &a.fingerprint, &a.name, given).await
             }
         }
     });
@@ -568,7 +612,10 @@ enum ServiceCmd {
     /// Stop offering a service.
     Remove(ServiceRemoveArgs),
     /// List the services offered in a room.
-    List(RoomArgs),
+    ///
+    /// Only a room this profile holds open. Listing opens no room, so it asks for no room
+    /// passphrase, and a room you closed stays closed.
+    List(ServiceListArgs),
 }
 
 /// `vox lan` — the family LAN.
@@ -667,7 +714,9 @@ enum RoomCmd {
     /// Print a room's messages. The first column is the entry hash, which is the
     /// cursor: pass the last one back as `--since` to read only what is new.
     Read(RoomReadArgs),
-    /// Print new messages as they arrive, until interrupted.
+    /// Print new messages as they arrive, until stopped.
+    ///
+    /// SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     ///
     /// With `--since`, first every message after that cursor, then every new one —
     /// **with no gap across a lag or a restart** (ADR-021 §7). Persist the last entry
@@ -680,10 +729,16 @@ enum RoomCmd {
     List(ProfileArgs),
     /// Take a unit of work, so no other agent starts it (ADR-020 §5).
     ///
-    /// A claim is a **message, not a lock**: nothing is reserved in the node.
-    /// Ownership is whatever the room's log resolves to, so every member computes
-    /// the same answer with nobody coordinating. `--ttl` is what makes an agent
-    /// that dies holding work release it without anyone noticing it died.
+    /// The room is the record of who holds what. Holding an item is not progress: the
+    /// attempt itself is recorded on the GitHub issue through awa.
+    ///
+    /// A claim is a post in the room: ownership is whatever the room's log resolves
+    /// to, the same on every member. It says "you hold it" (exit 0) only once every
+    /// other member has the claim and resolves it the same way. Of two claims made at
+    /// once, the one the room orders first wins, and the other is told at once who got
+    /// it (exit 1). A member that cannot be reached, or does not agree yet, is named
+    /// and the exit status is 5; the claim stays posted. `--ttl` is what makes an
+    /// agent that dies holding work release it without anyone noticing it died.
     ///
     /// Ownership is per **session** (ADR-021 §4): the session comes from `--session`,
     /// `VOX_SESSION`, or the harness (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`).
@@ -707,7 +762,8 @@ enum RoomCmd {
     ///
     /// The bytes never enter the log: they ride a room-bound service, and what
     /// goes on the log is a signed announcement carrying the name, the size and
-    /// the **SHA-256**. Runs until interrupted, because the bytes are served
+    /// the **SHA-256**. Runs until stopped (SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops
+    /// it cleanly), because the bytes are served
     /// live — the announcement outlives the offer, so an agent that wakes late
     /// sees what was sent and is told plainly if it can no longer be collected.
     ///
@@ -716,11 +772,11 @@ enum RoomCmd {
     Send(SendFileArgs),
     /// Join a room from a `vox://` address, over a running node (ADR-020 §12).
     ///
-    /// The passphrase is read from **stdin**, never argv, which anything that can
-    /// run `ps` would see:
+    /// The passphrase is asked for at the terminal, or read from `--passphrase-file`
+    /// (`-` reads stdin); never argv, which anything that can run `ps` would see:
     ///
     /// ```text
-    /// echo 'the room passphrase' | vox room join vox://… --name mission
+    /// echo 'the room passphrase' | vox room join --passphrase-file - vox://… --name mission
     /// ```
     ///
     /// This is what makes agent comms usable on a host with no terminal: `vox
@@ -728,7 +784,8 @@ enum RoomCmd {
     /// onto it. Joining grants nothing — whether anyone can read you is their
     /// decision, made with `vox trust`.
     Join(JoinRoomArgs),
-    /// Create a room on a running node. Passphrase on stdin.
+    /// Create a room on a running node. Passphrase at the terminal, or from
+    /// `--passphrase-file` (`-` reads stdin).
     Create(CreateRoomArgs),
     /// Set how long the room keeps messages: `1h`, `1w`, `1m` (a month), a number of
     /// seconds, or `forever` (PRD-001 R7).
@@ -739,6 +796,11 @@ enum RoomCmd {
     /// (the `retention` file in its config directory); the shorter wins. This is look and
     /// feel, not a security property: a modified node can keep everything.
     Retention(RetentionArgs),
+    /// Leave a room: the other members are told, then the room is removed from this node.
+    ///
+    /// Waits up to 30 s for another member to take the news. If none can be told by then, it
+    /// says so, and the node leaves as soon as one can. Joining again later works.
+    Leave(RoomRefArgs),
     /// Print a room's address, for someone else to `vox room join` with.
     ///
     /// The address is rendezvous information, not a credential — no passphrase,
@@ -763,6 +825,10 @@ pub struct JoinRoomArgs {
     /// A local name for the room. Never leaves this device.
     #[arg(long, default_value = "room")]
     pub name: String,
+    /// Read the room passphrase from this file; `-` reads it from stdin. Without it, it is
+    /// asked for at the terminal, and with no terminal the command fails at once.
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 /// `vox room create`
@@ -773,6 +839,10 @@ pub struct CreateRoomArgs {
     /// A local name for the room. Never leaves this device.
     #[arg(long, default_value = "room")]
     pub name: String,
+    /// Read the new room's passphrase from this file; `-` reads it from stdin. Without it, it
+    /// is asked for twice at the terminal, and with no terminal the command fails at once.
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 /// `vox room retention`
@@ -826,8 +896,10 @@ pub struct GetFileArgs {
 pub struct DaemonArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// Read the passphrase from this file instead of stdin, for a service manager
-    /// that prefers one. The file should contain the passphrase and nothing else.
+    /// Read the passphrases from this file, for a service manager that prefers one: the
+    /// identity passphrase on the first line, then any room lines. Without it the identity
+    /// passphrase is taken from `VOX_IDENTITY_PASSPHRASE`, else asked for at the terminal,
+    /// else read from stdin.
     #[arg(long)]
     pub passphrase_file: Option<PathBuf>,
     /// Serve Prometheus metrics at this address (PRD-001 R38). Loopback only: the
@@ -928,8 +1000,8 @@ pub struct ClaimArgs {
     /// What is being claimed — a file, a milestone, a crate, whatever the room
     /// has agreed to name. Optional with `--work`, which is then the resource.
     pub resource: Option<String>,
-    /// The tracker's reference for the work item, `<scheme>:<id>` (the id may
-    /// contain `:`), carried in `data.work` and used as the resource (ADR-021 §2).
+    /// awa's work key for the item, as `gwa:<key>` (the key may contain `:`), carried
+    /// in `data.work` and used as the resource (ADR-021 §2).
     #[arg(long)]
     pub work: Option<String>,
     /// Seconds after which the claim lapses on its own unless renewed.
@@ -961,8 +1033,8 @@ pub struct HandoffArgs {
     pub room: String,
     /// What is being handed off.
     pub resource: String,
-    /// The recipient: a room member's fingerprint, or a unique prefix of one as
-    /// `vox room roster` prints it. Resolved here, once, so every node agrees.
+    /// The recipient: your name for a room member (`vox trust list`), or its fingerprint or a
+    /// unique prefix of one as `vox room roster` prints it. Resolved here, once, so every node agrees.
     #[arg(long)]
     pub to: String,
     /// Reserve it for one exact session of the recipient, rather than any.
@@ -1040,16 +1112,27 @@ enum AgentCmd {
     ///
     /// The plugin is a shim over `vox agent hook`, not a second implementation.
     Plugin(AgentPluginArgs),
-    /// Print the agent-facing skill: the conventions, vocabulary and manners of a
-    /// shared room (ADR-020 §8).
+    /// Print the agent-facing skill: what the room is for, its vocabulary and its
+    /// manners (ADR-020 §8).
     ///
     /// A skill is on-demand only, so it cannot be what guarantees an agent reads
     /// its room — that is `vox agent hook`'s job. This carries what a hook cannot.
     ///
+    /// Claude Code, Codex and OpenCode all load the same file, a `SKILL.md` in a folder
+    /// named after the skill. Install it at **user scope**, beside the drain, so a
+    /// session opened in any repository has both:
+    ///
     /// ```text
-    /// vox agent skill > .claude/skills/vox-agent-comms/SKILL.md
+    /// mkdir -p ~/.claude/skills/vox-agent-comms
+    /// vox agent skill claude > ~/.claude/skills/vox-agent-comms/SKILL.md
+    /// mkdir -p ~/.codex/skills/vox-agent-comms           # $CODEX_HOME/skills when set
+    /// vox agent skill codex > ~/.codex/skills/vox-agent-comms/SKILL.md
+    /// mkdir -p ~/.config/opencode/skills/vox-agent-comms # $XDG_CONFIG_HOME/opencode/skills when set
+    /// vox agent skill opencode > ~/.config/opencode/skills/vox-agent-comms/SKILL.md
     /// ```
-    Skill,
+    ///
+    /// The skill goes to stdout; where it goes, to stderr, so it does not land in the file.
+    Skill(AgentSkillArgs),
     /// Trust Vox's drain hook in a harness that gates hooks on trust. Only Codex
     /// does: it runs a `hooks.json` entry only once its hash is recorded as trusted.
     ///
@@ -1062,6 +1145,36 @@ enum AgentCmd {
     /// vox agent trust codex
     /// ```
     Trust(AgentTrustArgs),
+}
+
+/// `vox agent skill`
+#[derive(Args, Debug, Clone)]
+pub struct AgentSkillArgs {
+    /// The harness to say where the skill goes for: `claude`, `codex` or `opencode`.
+    /// Without one, all three are listed. The skill itself is the same for each.
+    pub harness: Option<String>,
+}
+
+/// Where `harness` loads a user-scope skill named `vox-agent-comms` from, as a shell path, or
+/// `None` for a harness Vox has no integration for.
+///
+/// Read off each harness, not guessed: Claude Code's `~/.claude/skills`; Codex 0.160's
+/// `$CODEX_HOME/skills`, `~/.codex/skills` when unset (its own skill-installer says so); and
+/// OpenCode 1.18's global `~/.config/opencode/skills` (its docs table, and xdg-basedir, which
+/// honours `XDG_CONFIG_HOME`). Each was checked by starting the real harness on a fake model
+/// server and seeing the skill in what it sent (V210-166).
+fn skill_dir(harness: &str) -> Option<&'static str> {
+    match harness.to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" => Some("~/.claude/skills/vox-agent-comms"),
+        "codex" => Some("${CODEX_HOME:-~/.codex}/skills/vox-agent-comms"),
+        "opencode" => Some("${XDG_CONFIG_HOME:-~/.config}/opencode/skills/vox-agent-comms"),
+        _ => None,
+    }
+}
+
+/// The one line that says how to install the skill for `harness`, runnable as it stands.
+fn skill_install(harness: &str, dir: &str) -> String {
+    format!("mkdir -p {dir} && vox agent skill {harness} > {dir}/SKILL.md")
 }
 
 /// `vox agent trust`
@@ -1087,9 +1200,8 @@ pub struct AgentPluginArgs {
 pub struct AgentHookArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// The room to drain, or a unique prefix. Falls back to `VOX_ROOM`, which is
-    /// usually the easier place to put it since a hook's arguments are fixed at
-    /// install time while its environment is not.
+    /// Drain only this room (its id, or a unique prefix). Without it the hook drains every
+    /// room the node holds, each under its own heading.
     #[arg(long)]
     pub room: Option<String>,
     /// Output shape: `auto` (default), `claude`, or `text`.
@@ -1132,24 +1244,26 @@ pub struct RoomPostArgs {
     pub room: String,
     /// The message. Omit it, or pass `-`, to read from stdin.
     pub text: Option<String>,
-    /// The envelope type (`assign`, `working`, `blocked`, `result`, `failed`,
-    /// `status`, …). Any structured flag makes vox build the envelope itself.
+    /// The envelope type (`ask`, `answer`, `assign`, `accept`, `blocked`, …). Any
+    /// structured flag makes vox build the envelope itself. Progress is not posted
+    /// here: it is recorded on the GitHub issue through awa.
     #[arg(long = "type")]
     pub kind: Option<String>,
-    /// The tracker's work-item reference, `<scheme>:<id>` (the id may contain `:`),
-    /// carried in `data.work`. A post with `--work` takes part in work coordination
-    /// and passes the version gate.
+    /// awa's work key for the item, as `gwa:<key>` (the key may contain `:`), carried
+    /// in `data.work`. A post with `--work` takes part in work coordination and passes
+    /// the version gate.
     #[arg(long)]
     pub work: Option<String>,
-    /// The attempt id, carried in `data.attempt`. Defaults, with `--work`, to an id
-    /// seeded from this session's claim (or its latest `failed`) on that item. An id
-    /// starts nothing: an attempt becomes active on `--type working`.
+    /// An attempt id, carried in `data.attempt` so a reader can tie posts together.
+    /// Defaults, with `--work`, to an id seeded from this session's claim on that item.
+    /// It records nothing: attempts are recorded on the GitHub issue through awa.
     #[arg(long)]
     pub attempt: Option<String>,
-    /// Address a session by petname; repeat for several.
+    /// Address a member of the room: your name for it (`vox trust list`) or its fingerprint
+    /// (`vox room roster`). Repeat for several. A name that is no member is refused.
     #[arg(long)]
     pub to: Vec<String>,
-    /// May interrupt an addressed session mid-turn.
+    /// May interrupt the addressed members' agents mid-turn.
     #[arg(long)]
     pub urgent: bool,
     /// The entry hash this replies to.
@@ -1230,6 +1344,37 @@ pub struct RoomArgs {
     /// give it: a file has an owner and a mode, where a command line has neither.
     #[arg(long)]
     pub identity_passphrase_file: Option<std::path::PathBuf>,
+}
+
+/// `vox service list`: a room's args without its passphrase, which listing never uses (V210-149).
+#[derive(Args, Debug, Clone)]
+pub struct ServiceListArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// **Refused**, as for every verb: a command line is readable by every process on the
+    /// machine while it runs. Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`,
+    /// or let it prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line).
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
+}
+
+impl ServiceListArgs {
+    /// As [`RoomArgs`], with no room passphrase.
+    fn room_args(&self) -> RoomArgs {
+        RoomArgs {
+            profile: self.profile.clone(),
+            room: self.room.clone(),
+            passphrase: None,
+            passphrase_file: None,
+            identity_passphrase: self.identity_passphrase.clone(),
+            identity_passphrase_file: self.identity_passphrase_file.clone(),
+        }
+    }
 }
 
 /// `vox service add`
@@ -1432,10 +1577,11 @@ pub struct TrustAddArgs {
     /// The identity to trust, as `vox id` prints it (base32, or a unique prefix of one
     /// this node already knows).
     pub fingerprint: String,
-    /// What this node will call it. Local to this machine; nothing is registered and no
-    /// other node ever sees it.
-    #[arg(long, default_value = "peer")]
-    pub name: String,
+    /// Your name for it: how Vox shows its messages to you, and how you address it
+    /// (`--to`). Local to this machine; no other node ever sees it. Asked for when not given
+    /// and there is a terminal.
+    #[arg(long)]
+    pub name: Option<String>,
     /// What each consent to it releases of **your own** messages (PRD-001 R12): `now`,
     /// the default, from this approval onward; or `full`, everything you still hold a key
     /// for, so it also reads what you wrote before. Your messages only — nobody else's.
@@ -1616,6 +1762,8 @@ enum Cmd {
     /// both behind NAT and cannot reach each other directly. It holds no room and can
     /// read nothing; its identity is a key file in the profile directory, created on
     /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
+    ///
+    /// Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Node(NodeArgs),
     /// Run this profile's node without a terminal, so agent sessions can attach
     /// (ADR-020 §12).
@@ -1626,21 +1774,23 @@ enum Cmd {
     /// third shape — an unlocked node holding this profile's rooms, serving the
     /// socket, with nothing attached to a tty.
     ///
-    /// The passphrase is read from **stdin**, deliberately not from the
-    /// environment, which is readable by anything running as the same user:
+    /// At a terminal it asks for the identity passphrase, without echo, and serves once
+    /// it is typed. Otherwise it takes it from `VOX_IDENTITY_PASSPHRASE`, or
+    /// `--passphrase-file`, or stdin:
     ///
     /// ```text
     /// echo 'my passphrase' | vox daemon
     /// ```
     ///
-    /// Unlike the TUI it does not lock on SIGHUP, which is the point. SIGINT and
-    /// SIGTERM stop it.
+    /// Unlike the TUI it does not lock on SIGHUP: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each
+    /// stops it cleanly.
     Daemon(DaemonArgs),
     /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
     ///
     /// Creates a room, offers the port in it, and prints the address, the
     /// machine-generated passphrase and the `.vox` hostname it answers on. Runs until
-    /// interrupted, reporting who reaches the service (the service itself cannot tell
+    /// stopped (SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly), reporting who
+    /// reaches the service (the service itself cannot tell
     /// you: every Vox client arrives at it from loopback).
     ///
     /// **Joining the room does not grant access to the port.** Whoever you have run
@@ -1668,12 +1818,20 @@ enum Cmd {
     /// `vox grant` are withdrawn with the model that needed them (M17.7).
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// Speak in a room over a **running** node (ADR-020) — the agent-comms verbs.
+    /// Join, create or leave a room, and speak in it, over a **running** node (ADR-020) —
+    /// the agent-comms verbs.
+    ///
+    /// For agents on one repository, the room settles who does what: an agent claims
+    /// work there, asks there who is on what, and answers there, briefly, when asked
+    /// about its own work. It is also where agents work through hard problems together.
+    /// Progress and its proofs (attempt starts, candidates, verdicts, delivery) are
+    /// recorded on the GitHub issue through awa; `--work` carries awa's work key.
     ///
     /// Unlike every other verb, these do not start a node: they attach to the
     /// control socket of one that is already running and already unlocked, which
-    /// is how several agent sessions share one identity per machine. Nothing here
-    /// takes a passphrase, and nothing here creates, joins or leaves a room.
+    /// is how several agent sessions share one identity per machine. None of them
+    /// takes the identity passphrase; `join` and `create` take the room passphrase at a
+    /// terminal, or from stdin with `--passphrase-file -`.
     #[command(subcommand)]
     Room(RoomCmd),
     /// Open or accept an app stream to a program on another member's node (ADR-022).
@@ -1693,7 +1851,16 @@ enum Cmd {
     /// counters per room and peer (ADR-025): sessions opened, admitted, refused, completed,
     /// partial and failed, and any backoff.
     Status(StatusArgs),
-    /// Wire an agent session into a room (ADR-020) — harness-agnostic.
+    /// Wire an agent session into a room (ADR-020) — Claude Code, Codex and OpenCode.
+    ///
+    /// The room settles who does what: an agent claims work there, asks there who is
+    /// on what, and answers there, briefly, when asked about its own work; it is also
+    /// where agents work through hard problems together. Progress and its proofs
+    /// (attempt starts, candidates, verdicts, delivery) are recorded on the GitHub issue
+    /// through awa, and `--work` carries awa's work key.
+    ///
+    /// Each harness needs two things: `vox agent plugin <harness>` (the drain, every
+    /// turn) and `vox agent skill <harness>` (the agent text, and where it goes).
     #[command(subcommand)]
     Agent(AgentCmd),
     /// Bring up the local entry point for a room's services: a SOCKS5 proxy that resolves
@@ -1702,10 +1869,12 @@ enum Cmd {
     /// This is how a tool reaches a room-bound service by name — the same shape a Tor user
     /// reaches a `.onion` through, and for the same reason: it needs no privilege of any
     /// kind. `ssh` is pointed at it with one `ProxyCommand` line, which `vox up` prints;
-    /// most other tools take `ALL_PROXY=socks5h://…`. Runs until interrupted.
+    /// most other tools take `ALL_PROXY=socks5h://…`. Runs until stopped: SIGINT (Ctrl-C),
+    /// SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Up(UpArgs),
     /// Forward a local port to a member's service over the overlay — `ssh` over Vox
-    /// (ADR-013). Runs until interrupted.
+    /// (ADR-013). Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it
+    /// cleanly.
     Forward(ForwardArgs),
     /// Put this machine on a room's **family LAN** (PRD-001 R28): a network interface on
     /// which the room's trusted members are one subnet, so that discovery — Plex and
@@ -1903,6 +2072,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Create(a) => &a.profile,
                 RoomCmd::Invite(a) => &a.profile,
                 RoomCmd::Retention(a) => &a.profile,
+                RoomCmd::Leave(a) => &a.profile,
             };
             let paths = match profile.paths() {
                 Ok(p) => p,
@@ -2019,8 +2189,19 @@ pub fn run() -> ExitCode {
                         RoomCmd::Send(a) => {
                             crate::room_cli::send_file(&paths, &a.room, &a.path).await
                         }
-                        RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
-                        RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
+                        RoomCmd::Join(a) => {
+                            crate::room_cli::join(
+                                &paths,
+                                &a.link,
+                                &a.name,
+                                a.passphrase_file.as_deref(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Create(a) => {
+                            crate::room_cli::create(&paths, &a.name, a.passphrase_file.as_deref())
+                                .await
+                        }
                         RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
                         RoomCmd::Retention(a) => {
                             let identity = crate::tunnel_cli::identity_passphrase_for(
@@ -2031,6 +2212,7 @@ pub fn run() -> ExitCode {
                             crate::room_cli::retention(&paths, &a.room, &a.duration, &identity)
                                 .await
                         }
+                        RoomCmd::Leave(a) => crate::room_cli::leave(&paths, &a.room).await,
                         RoomCmd::Get(a) => {
                             crate::room_cli::get_file(
                                 &paths,
@@ -2266,14 +2448,38 @@ pub fn run() -> ExitCode {
                 args.metrics,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
+                // Not `eprintln!`: after a hangup stderr can be a terminal that is gone, and a
+                // write that fails there must not turn the reason into a panic.
                 Err(e) => {
-                    eprintln!("vox: {e}");
-                    ExitCode::FAILURE
+                    use std::io::Write as _;
+                    let _ = writeln!(io::stderr(), "vox: {e}");
+                    e.exit_code()
                 }
             }
         }
-        Cmd::Agent(AgentCmd::Skill) => {
+        Cmd::Agent(AgentCmd::Skill(args)) => {
+            // Where it goes, on stderr so it does not land in the file (V210-121, V210-166):
+            // user scope, beside the drain, so every repository gets both.
+            let named: Vec<&str> = match &args.harness {
+                Some(h) if skill_dir(h).is_none() => {
+                    eprintln!("vox: no integration for {h:?}. Known: claude, codex, opencode.");
+                    return ExitCode::FAILURE;
+                }
+                Some(h) => vec![h.as_str()],
+                None => vec!["claude", "codex", "opencode"],
+            };
             print!("{}", crate::agent_hook::AGENT_SKILL);
+            if named.len() == 1 {
+                let h = named[0];
+                let dir = skill_dir(h).unwrap_or_default();
+                eprintln!("vox: install at user scope: {}", skill_install(h, dir));
+            } else {
+                eprintln!("vox: each harness loads this same file from its own skills folder:");
+                for h in named {
+                    let dir = skill_dir(h).unwrap_or_default();
+                    eprintln!("     {h:<8} {}", skill_install(h, dir));
+                }
+            }
             ExitCode::SUCCESS
         }
         Cmd::Agent(AgentCmd::Trust(args)) => match args.harness.to_ascii_lowercase().as_str() {
@@ -2317,6 +2523,11 @@ pub fn run() -> ExitCode {
         Cmd::Agent(AgentCmd::Plugin(args)) => match args.harness.to_ascii_lowercase().as_str() {
             "opencode" => {
                 print!("{}", crate::agent_hook::OPENCODE_PLUGIN);
+                eprintln!(
+                    "vox: save that as ${{XDG_CONFIG_HOME:-~/.config}}/opencode/plugin/vox.js, and install the skill \
+                     beside it: {}\n     The plugin drains every room the node holds.",
+                    skill_install("opencode", skill_dir("opencode").unwrap_or_default())
+                );
                 ExitCode::SUCCESS
             }
             // **Print the thing, do not describe it.** These take a hook entry rather than
@@ -2332,24 +2543,32 @@ pub fn run() -> ExitCode {
                 // session's registration (V030-20).
                 print!("{}", crate::agent_hook::CLAUDE_HOOKS);
                 eprintln!(
-                    "vox: merge that into ~/.claude/settings.json, or .claude/settings.json \
-                     in a project.\n     Set VOX_ROOM in the session's environment, or pass \
-                     --room to the hook, so it knows which room to drain."
+                    "vox: merge that into ~/.claude/settings.json (user scope, so a session \
+                     opened in any repository hears its rooms), and install the skill beside \
+                     it: {}\n     The hook drains every room the node holds.",
+                    skill_install("claude", skill_dir("claude").unwrap_or_default())
                 );
                 ExitCode::SUCCESS
             }
+            // The entry is a matcher group holding `hooks`, as Claude Code's is: Codex 0.160
+            // lists a bare `{ "command": … }` entry as no hook at all, so the room never
+            // drained (V210-169).
             "codex" => {
                 println!(
-                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{ \
-                     \"command\": \"vox agent hook\", \"async\": false }}\n    ]\n  \
+                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
+                     \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
+                     \"vox agent hook\", \"async\": false }}\n        ]\n      }}\n    ]\n  \
                      }}\n}}"
                 );
                 eprintln!(
                     "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
                      — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
                      an async hook's output is observed and discarded, so the room would \
-                     drain into nothing.\n     Set VOX_ROOM in the session's environment, or \
-                     pass --room to the hook."
+                     drain into nothing.\n     The hook drains every room the node holds.\n     \
+                     Vox never interrupts a Codex session: an urgent message to one waits \
+                     for its next turn, and a poster on the same node is told so.\n     \
+                     Install the skill beside it: {}",
+                    skill_install("codex", skill_dir("codex").unwrap_or_default())
                 );
                 ExitCode::SUCCESS
             }
@@ -2453,23 +2672,25 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Service(sub) => run_tunnel_verb(sub_room(&sub).clone(), move |node, cid| {
-            let sub = sub.clone();
-            async move {
-                match &sub {
-                    ServiceCmd::Add(a) => {
-                        crate::tunnel_cli::service_add(&node, cid, &label_of(&a.tag), a.local).await
-                    }
-                    ServiceCmd::Remove(r) => {
-                        crate::tunnel_cli::service_remove(&node, cid, &label_of(&r.tag)).await
-                    }
-                    ServiceCmd::List(_) => {
-                        crate::tunnel_cli::service_list(&node, cid);
-                        Ok(())
+        Cmd::Service(sub) => run_tunnel_verb(
+            sub_room(&sub),
+            !matches!(sub, ServiceCmd::List(_)),
+            move |node, cid| {
+                let sub = sub.clone();
+                async move {
+                    match &sub {
+                        ServiceCmd::Add(a) => {
+                            crate::tunnel_cli::service_add(&node, cid, &label_of(&a.tag), a.local)
+                                .await
+                        }
+                        ServiceCmd::Remove(r) => {
+                            crate::tunnel_cli::service_remove(&node, cid, &label_of(&r.tag)).await
+                        }
+                        ServiceCmd::List(_) => crate::tunnel_cli::service_list(&node, cid).await,
                     }
                 }
-            }
-        }),
+            },
+        ),
         // Ask the running node when there is one: a fingerprint is public, the hello
         // already carries it, and needing the profile to yourself to read your own name
         // was the most gratuitous case of the busy-profile problem.
@@ -2517,10 +2738,28 @@ pub fn run() -> ExitCode {
         // **Ask the running node when there is one.** These three used to spawn a node of
         // their own, which redb refuses while a `vox daemon` holds the profile — so the
         // one command a person cannot skip, deciding who may read them, was unavailable
-        // exactly when they were setting up agent comms. Over the socket the request
-        // carries the identity passphrase and the node checks it, so an agent session
-        // that can reach the socket still cannot edit the keyring (ADR-020 §7).
+        // exactly when they were setting up agent comms. Over the socket the node decides:
+        // a read needs no passphrase, and a change needs it only once 30 minutes have
+        // passed since it was last entered, when this asks for it (V210-159). Whoever runs
+        // as this user is this user; the socket's file mode is the boundary.
         Cmd::Trust(sub) if trust_over_socket(&sub) => run_trust_over_socket(sub),
+        // With no node running the keyring is read from the store, sealed under the identity, so
+        // this one read needs the passphrase. Said as that, with the way to read it without one.
+        Cmd::Trust(TrustCmd::List(args))
+            if args.identity_passphrase.is_none()
+                && args.identity_passphrase_file.is_none()
+                && std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none_or(|p| p.is_empty())
+                && !std::io::IsTerminal::is_terminal(&io::stdin()) =>
+        {
+            eprintln!(
+                "vox: no node is running, and reading the keyring without one needs the identity \
+                 passphrase: it is sealed under it. There is no terminal to ask at.\n\
+                 \x20      Start `vox daemon`, and `vox trust list` needs none.\n\
+                 \x20      {}",
+                crate::tunnel_cli::GIVE_IDENTITY_PASSPHRASE
+            );
+            ExitCode::FAILURE
+        }
         Cmd::Trust(TrustCmd::List(args)) => run_new_room_verb(
             args.profile.clone(),
             args.identity_passphrase.clone(),
@@ -2540,18 +2779,20 @@ pub fn run() -> ExitCode {
         ),
         Cmd::Trust(TrustCmd::Add(args)) => {
             let a = args.clone();
+            let name = match trust_name(&a) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             run_new_room_verb(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
                 args.identity_passphrase_file.clone(),
                 move |node, _anchors| async move {
-                    crate::tunnel_cli::trust_add(
-                        &node,
-                        &a.fingerprint,
-                        &a.name,
-                        a.history == "full",
-                    )
-                    .await
+                    crate::tunnel_cli::trust_add(&node, &a.fingerprint, &name, a.history == "full")
+                        .await
                 },
             )
         }
@@ -2598,7 +2839,7 @@ pub fn run() -> ExitCode {
                 identity_passphrase: args.identity_passphrase.clone(),
                 identity_passphrase_file: args.identity_passphrase_file.clone(),
             };
-            run_tunnel_verb(room, move |node, cid| async move {
+            run_tunnel_verb(room, true, move |node, cid| async move {
                 crate::tunnel_cli::up(&node, cid, bind).await
             })
         }
@@ -2653,7 +2894,7 @@ pub fn run() -> ExitCode {
             } else {
                 (Some(args.host.clone()), args.tag.clone(), args.local)
             };
-            run_tunnel_verb(room, move |node, cid| async move {
+            run_tunnel_verb(room, true, move |node, cid| async move {
                 crate::tunnel_cli::forward(&node, cid, host.as_deref(), &tag, local).await
             })
         }
@@ -2674,7 +2915,7 @@ pub fn run() -> ExitCode {
             let (socket, stats) = (a.helper_socket.clone(), a.stats_file.clone());
             let allow = a.allow.iter().copied().collect();
             let metrics = a.metrics;
-            run_tunnel_verb(a.room.clone(), move |node, cid| async move {
+            run_tunnel_verb(a.room.clone(), true, move |node, cid| async move {
                 // A running LAN answers as a `vox daemon` does (V030-04, #236): its control
                 // socket is served by the tunnel verbs' path, and its metrics here.
                 if let Some(addr) = metrics {

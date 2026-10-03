@@ -26,23 +26,36 @@
 //! `STOP_ACK_BOUND`, for tunnels that finished their stream to have their last bytes
 //! acknowledged, then closes its connections. With that bound equal to the daemon's 5 s
 //! patience, a stop that waited out an unacknowledged tail ran into the patience: the daemon
-//! printed "the node did not stop within 5s … stopping anyway" and left with its ordered stop
-//! cut short. Staging, all real processes: Alice and Bob are `vox daemon`s in one room; Alice
-//! offers a [`FILE_BYTES`]-byte file (under a tunnel's window) with `vox room send`, Bob starts
-//! `vox room get`, and at its first bytes Bob's daemon is frozen (SIGSTOP), so Alice's tunnel
-//! finishes its stream with the tail unacknowledged; then Alice's daemon gets SIGINT.
+//! printed that its node did not stop within 5s and left with its ordered stop cut short. Staging, all real processes: Alice and Bob are `vox daemon`s in one room; Alice
+//! offers a [`FILE_BYTES`]-byte file (under a tunnel's window) with `vox room send`, which is then
+//! frozen (SIGSTOP); Bob starts `vox room get`; once Bob's `vox status` lists the tunnel, Bob's
+//! daemon is frozen, and only then does the sender go on, so the whole file goes out with nothing
+//! acknowledged and Alice's tunnel finishes its stream with the tail unacknowledged, every time;
+//! then Alice's daemon gets SIGINT. (Freezing Bob at the collector's first bytes, as this did,
+//! staged the scene on 1 attempt in 4 on a fast machine: the rest of the file had already been
+//! acknowledged.)
 //! Asserted: it exits within [`PATIENCE`], never says it gave up, and reports the stop as a
 //! success (it says "stopped by SIGINT" and exits 0, as a service manager expects of a service it
 //! stopped). The node's worst-case stop is budgeted under the patience, each wait named
 //! (`STOP_WORST_CASE`: 3 s for the tail, 2 × 0.4 s for the goodbye, 0.05 s for relayed closes'
 //! lead, 0.6 s for the closes to leave; 4.45 s against 5 s); this scene spends the tail's wait and,
 //! with Bob frozen, the goodbye's and the flush's too. Preconditions (else the
-//! attempt is staged again, up to [`ATTEMPTS`] times, then CANNOT MEASURE): Alice's
+//! attempt is staged again, up to [`ATTEMPTS`] times, then `PRODUCT (staging)`, since each is vox's doing): Alice's
 //! `vox room send` read the whole file (it closes the file once it has), the collector did
 //! not have it, and the stop took at least [`WAITED`] (a tail acknowledged before the stop
 //! makes it immediate). Mutations: `STOP_ACK_BOUND` back at 5 s — the daemon exits after about
-//! 5.04 s saying "the node did not stop within 5s": red; the goodbye's patience past the budget
-//! (1.5 s, the compile-time budget checks removed) — red the same way.
+//! 5.04 s saying it did not finish stopping: red; the goodbye's patience past the budget (2.5 s,
+//! the compile-time budget checks removed) — red the same way.
+//!
+//! ## And a stop that gives up says so (decider, V210-93)
+//! [`a_stop_past_its_patience_says_it_did_not_finish`]: a stop the daemon abandons at its patience
+//! is a failure, and a person or a service manager must be able to tell it from a stop: the daemon
+//! says it did **not** finish stopping (never "stopped by SIGINT") and exits non-zero. No real
+//! scene runs past the real patience (the stop is budgeted under it), so the proof shortens it with
+//! the test-only `VOX_TEST_SHUTDOWN_PATIENCE_MS` (the `test-knobs` feature) to [`SHORT_PATIENCE`],
+//! and stages the same unacknowledged tail, whose wait alone is longer. Staged when the stop took
+//! at least that patience (else again, up to [`ATTEMPTS`] times, then `PRODUCT (staging)`). Mutation: a
+//! give-up that keeps saying "stopped by SIGINT" and exiting 0 — red, PRODUCT.
 
 #![cfg(unix)]
 
@@ -51,6 +64,9 @@ mod sync_pair;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -84,7 +100,9 @@ fn collect(stream: impl Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            sink.lock().unwrap().push(line);
+            sink.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
+                .push(line);
         }
     });
     lines
@@ -102,12 +120,13 @@ impl Proc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(stdin.as_bytes()).expect("write stdin");
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn {name}: {e}"));
+        let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+        pipe.write_all(stdin.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(pipe);
-        let out = collect(child.stdout.take().expect("stdout"));
-        let err = collect(child.stderr.take().expect("stderr"));
+        let out = collect(child.stdout.take().expect("APPARATUS: stdout"));
+        let err = collect(child.stderr.take().expect("APPARATUS: stderr"));
         Self {
             name,
             child,
@@ -117,7 +136,10 @@ impl Proc {
     }
 
     fn stdout(&self) -> Vec<String> {
-        self.out.lock().unwrap().clone()
+        self.out
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .clone()
     }
 
     fn expect_out(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
@@ -132,7 +154,10 @@ impl Proc {
             "{}: never printed {what}; stdout {:#?}\nstderr:\n{}",
             self.name,
             self.stdout(),
-            self.err.lock().unwrap().join("\n")
+            self.err
+                .lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
+                .join("\n")
         );
     }
 }
@@ -148,11 +173,12 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: &str) -> (bool, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
-    let mut pipe = child.stdin.take().expect("stdin");
-    pipe.write_all(stdin.as_bytes()).expect("write");
+        .expect("APPARATUS: spawn vox");
+    let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+    pipe.write_all(stdin.as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     (
         out.status.success(),
         format!(
@@ -175,10 +201,10 @@ fn alive(pid: u32) -> bool {
 #[ignore = "three real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, host_dir, joiner_dir) = (dir("anchor"), dir("host"), dir("joiner"));
@@ -198,7 +224,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
         .to_owned();
     for d in [&host_dir, &joiner_dir] {
         let (ok, said) = vox(d, &["id"], "");
-        assert!(ok, "vox id: {said}");
+        assert!(ok, "PRODUCT (staging): vox id: {said}");
     }
     let mut host = Proc::spawn(
         "host",
@@ -209,7 +235,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
             .strip_prefix(label)
-            .unwrap()
+            .expect("APPARATUS: a line matched by its label strips it")
             .trim()
             .to_owned()
     };
@@ -223,10 +249,18 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     daemon.expect_out("its control socket", |l| l.contains("control socket"));
     let (ok, said) = vox(
         &joiner_dir,
-        &["room", "join", &address, "--name", "svc"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc",
+        ],
         &format!("{passphrase}\n"),
     );
-    assert!(ok, "CANNOT MEASURE: the join failed: {said}");
+    assert!(ok, "PRODUCT (staging): the join failed: {said}");
 
     // The peers vanish without a word — no close frames, as when a machine loses power.
     let _ = anchor.child.kill();
@@ -240,8 +274,8 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     let sent = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()
-        .expect("send SIGTERM");
-    assert!(sent.success(), "SIGTERM could not be sent");
+        .expect("APPARATUS: send SIGTERM");
+    assert!(sent.success(), "APPARATUS: SIGTERM could not be sent");
     let deadline = started + Duration::from_secs(90);
     while alive(pid) && daemon.child.try_wait().ok().flatten().is_none() {
         if Instant::now() > deadline {
@@ -251,17 +285,21 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     }
     let took = started.elapsed();
     let exited = daemon.child.try_wait().ok().flatten();
-    let said = daemon.err.lock().unwrap().join("\n");
+    let said = daemon
+        .err
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .join("\n");
     eprintln!("[shutdown] SIGTERM -> exit in {took:?}; exit={exited:?}");
     assert!(
         exited.is_some() && took < STOP_WITHIN,
-        "a daemon must stop within {STOP_WITHIN:?} of SIGTERM; it took {took:?} (exited: \
+        "PRODUCT: a daemon must stop within {STOP_WITHIN:?} of SIGTERM; it took {took:?} (exited: \
          {exited:?}). stdout {:#?}\nstderr:\n{said}",
         daemon.stdout()
     );
     assert!(
         daemon.stdout().iter().any(|l| l.contains("shutting down")),
-        "it must say it is shutting down"
+        "PRODUCT: it must say it is shutting down"
     );
 
     // The profile is free the moment the daemon has exited: a one-shot verb that opens it
@@ -270,14 +308,14 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     eprintln!("[shutdown] `vox trust list` right after the exit: opened={opened}");
     assert!(
         opened,
-        "the profile must be free the moment the daemon has exited; `vox trust list` said: \
+        "PRODUCT: the profile must be free the moment the daemon has exited; `vox trust list` said: \
          {said_after}"
     );
 
     // Nothing left behind: every process this test started is gone.
     let pids = [anchor.child.id(), host.child.id(), pid];
     let remaining = pids.iter().filter(|p| alive(**p)).count();
-    assert_eq!(remaining, 0, "processes still running: {pids:?}");
+    assert_eq!(remaining, 0, "PRODUCT: processes still running: {pids:?}");
     eprintln!("[shutdown] {remaining} processes remain");
 }
 
@@ -287,7 +325,14 @@ const FILE_BYTES: usize = 12 << 20;
 /// `vox daemon`'s `SHUTDOWN_PATIENCE`.
 const PATIENCE: Duration = Duration::from_secs(5);
 /// What the daemon prints when it abandons its node's stop.
-const GAVE_UP: &str = "did not stop within";
+const GAVE_UP: &str = "did not finish stopping";
+/// What the daemon prints when its node's stop finished.
+const STOPPED: &str = "vox daemon: stopped by SIGINT";
+/// The test-only knob that shortens the daemon's patience.
+const PATIENCE_KNOB: &str = "VOX_TEST_SHUTDOWN_PATIENCE_MS";
+/// The patience [`a_stop_past_its_patience_says_it_did_not_finish`] gives the daemon: shorter than
+/// the unacknowledged tail's own wait (3 s).
+const SHORT_PATIENCE: Duration = Duration::from_secs(1);
 /// A stop that waited on an unacknowledged tail takes at least this long.
 const WAITED: Duration = Duration::from_secs(2);
 const ATTEMPTS: usize = 4;
@@ -375,14 +420,31 @@ fn read_offsets(pid: u32, name: &str) -> Option<Vec<u64>> {
     listed.then_some(offsets)
 }
 
+/// Send `sig` to `pid`, by PID.
+fn signal_pid(pid: u32, sig: &str) {
+    let ok = Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(ok, "APPARATUS: kill {sig} {pid} did not take");
+}
+
 /// One staging. `None` when a precondition did not hold; else how long Alice's daemon took to
 /// exit after SIGINT, and what it said.
-fn attempt(root: &Path, n: usize) -> Option<(Duration, std::process::ExitStatus, String)> {
+/// Stage the unacknowledged tail and stop Alice's daemon, started with `env`; staged when the stop
+/// took at least `waited`.
+fn attempt(
+    root: &Path,
+    n: usize,
+    env: &[(&str, &str)],
+    waited: Duration,
+) -> Option<(Duration, std::process::ExitStatus, String)> {
     let alice = Member::new(&root.join(format!("a{n}")), "alice");
     let bob = Member::new(&root.join(format!("b{n}")), "bob");
     alice.trust(&bob);
     bob.trust(&alice);
-    let mut alice_d = alice.daemon(None);
+    let mut alice_d = alice.daemon_with(env);
     let bob_d = bob.daemon(None);
     let room = alice.create("pair");
     bob.join(&alice.invite(&room), "pair");
@@ -417,10 +479,18 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, std::process::ExitStatus,
     while !rb.texts(cb).iter().any(|t| t.contains(&offered)) {
         assert!(
             t0.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: Bob never read the offer"
+            "PRODUCT (staging): Bob never read the offer"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The sender is held still until Bob's daemon is frozen: nothing it sends can be
+    // acknowledged before the stop, whatever the machine's speed.
+    let tag = std::fs::read_to_string(&send_out)
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.split(" as ").nth(1).map(|t| t.trim().to_owned()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room send` never named its offer's tag"));
+    signal_pid(send.0.id(), "-STOP");
     let dir = root.join(format!("get{n}"));
     std::fs::create_dir_all(&dir).expect("APPARATUS: create the download directory");
     let get_out = root.join(format!("get{n}.out"));
@@ -438,39 +508,39 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, std::process::ExitStatus,
         ],
         &get_out,
     );
+    // The tunnel is up when Bob's own `vox status` lists it (V210-81).
     let t1 = Instant::now();
-    while bytes_in(&dir) == 0 {
+    loop {
+        let listed = bob.status()["tunnels"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|t| t["service"].as_str() == Some(tag.as_str()) && t["direction"] == "out")
+        });
+        if listed {
+            break;
+        }
         assert!(
             t1.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: the collector received nothing"
+            "PRODUCT (staging): Bob's `vox status` never listed the tunnel to {tag}"
         );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    // Nothing more Alice sends is acknowledged from here on.
-    bob_d.signal("-STOP");
-    let held = bytes_in(&dir);
-    // Alice's `vox room send` writes the whole file into her daemon, and closes.
-    let t2 = Instant::now();
-    // `vox room send` closes the file as soon as it has read all of it; the collector already
-    // holds bytes read from it, so a file no longer open was read to its end (nothing has
-    // stopped the offer, and a read error is not staged here).
-    let (read, open) = loop {
-        let (read, open): (u64, &str) = match read_offsets(send.0.id(), &offered) {
-            Some(offsets) if offsets.is_empty() => (FILE_BYTES as u64, "closed"),
-            Some(offsets) => (offsets.iter().sum(), "open"),
-            None => (0, "not listed"),
-        };
-        if read >= FILE_BYTES as u64 || t2.elapsed() > Duration::from_secs(10) {
-            break (read, open);
-        }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    // Nothing Alice sends from here on is acknowledged; then the sender goes on.
+    bob_d.signal("-STOP");
+    signal_pid(send.0.id(), "-CONT");
+    let held = bytes_in(&dir);
+    // Alice's `vox room send` writes the whole file into her daemon, and closes it: under a
+    // tunnel's window, so nothing holds it back with Bob frozen. A file it still has open after
+    // that was not read to its end.
+    std::thread::sleep(Duration::from_secs(3));
+    let (read, open): (u64, &str) = match read_offsets(send.0.id(), &offered) {
+        Some(offsets) if offsets.is_empty() => (FILE_BYTES as u64, "closed"),
+        Some(offsets) => (offsets.iter().sum(), "open"),
+        None => (0, "not listed"),
     };
     eprintln!(
         "[proof] attempt {n}: the sender read {read} of {FILE_BYTES} (its file {open}); the \
          collector held {held} at the freeze"
     );
-    // Let the daemon read the rest of the file and finish the tunnel's stream.
-    std::thread::sleep(Duration::from_secs(1));
     if read < FILE_BYTES as u64 || held >= FILE_BYTES as u64 {
         eprintln!("[proof] attempt {n}: not staged");
         bob_d.signal("-CONT");
@@ -502,7 +572,7 @@ fn attempt(root: &Path, n: usize) -> Option<(Duration, std::process::ExitStatus,
         "[proof] attempt {n}: the collector held {held} of {FILE_BYTES} at the freeze; Alice's \
          daemon exited {took:?} after SIGINT"
     );
-    if took < WAITED {
+    if took < waited {
         eprintln!("[proof] attempt {n}: not staged: the tail was acknowledged before the stop");
         return None;
     }
@@ -516,17 +586,15 @@ fn a_stop_waits_out_last_bytes_within_its_patience() {
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
     let (took, status, said) = (0..ATTEMPTS)
-        .find_map(|n| attempt(root, n))
+        .find_map(|n| attempt(root, n, &[], WAITED))
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: none of {ATTEMPTS} attempts left a finished tunnel's tail \
-                 unacknowledged at the stop"
+                "PRODUCT (staging): in none of {ATTEMPTS} attempts did vox leave a finished tunnel's tail \
+                 unacknowledged at the stop (each attempt's own line says which step it missed)"
             )
         });
     let gave_up = said.lines().find(|l| l.contains(GAVE_UP));
-    let stopped = said
-        .lines()
-        .any(|l| l.contains("vox daemon: stopped by SIGINT"));
+    let stopped = said.lines().any(|l| l.contains(STOPPED));
     eprintln!(
         "[proof] Alice's daemon exited {took:?} after SIGINT ({status}); said it was stopped by \
          SIGINT: {stopped}; gave up: {gave_up:?}"
@@ -540,5 +608,37 @@ fn a_stop_waits_out_last_bytes_within_its_patience() {
         status.success() && stopped,
         "PRODUCT: a daemon stopped by SIGINT must report the stop as a success (\"stopped by SIGINT\", \
          exit 0): it exited {status} and said it was stopped by SIGINT: {stopped}\n{said}"
+    );
+}
+
+#[test]
+#[ignore = "real daemons with production Argon2id; CI runs it in release"]
+fn a_stop_past_its_patience_says_it_did_not_finish() {
+    watchdog::arm();
+    test_knobs::require(&[PATIENCE_KNOB]);
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let root = tmp.path();
+    let ms = SHORT_PATIENCE.as_millis().to_string();
+    let (took, status, said) = (0..ATTEMPTS)
+        .find_map(|n| attempt(root, n, &[(PATIENCE_KNOB, ms.as_str())], SHORT_PATIENCE))
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): in none of {ATTEMPTS} attempts did vox leave a finished tunnel's tail \
+                 unacknowledged long enough to outlast a {SHORT_PATIENCE:?} patience"
+            )
+        });
+    let gave_up = said.lines().find(|l| l.contains(GAVE_UP));
+    let stopped = said.lines().any(|l| l.contains(STOPPED));
+    eprintln!(
+        "[proof] with a {SHORT_PATIENCE:?} patience, Alice's daemon exited {took:?} after SIGINT \
+         ({status}); said it was stopped by SIGINT: {stopped}; said it did not finish: {gave_up:?}"
+    );
+    use std::os::unix::process::ExitStatusExt;
+    assert!(
+        gave_up.is_some() && !stopped && status.code().is_some_and(|c| c != 0) && status.signal().is_none(),
+        "PRODUCT: a daemon whose stop ran past its {SHORT_PATIENCE:?} patience must say it did not \
+         finish stopping ({GAVE_UP:?}), never {STOPPED:?}, and exit non-zero: it exited {status} \
+         {took:?} after SIGINT, said it did not finish: {gave_up:?}, said it was stopped: \
+         {stopped}\n{said}"
     );
 }

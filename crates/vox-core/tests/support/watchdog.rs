@@ -36,8 +36,13 @@
 //!   thread's stack into the log itself: `/usr/bin/sample` on macOS (a few hundred samples per
 //!   thread, so a spinning frame stands out by its count, not a single snapshot); on Linux, a
 //!   census of every thread from `/proc` with its state and the CPU it burned in the last second
-//!   (a spinning thread is the `R` one with ~100 ticks), plus `gdb`'s backtraces where it is
-//!   installed and allowed to attach.
+//!   (a spinning thread is the `R` one with ~100 ticks) and kernel wait channel, plus `gdb`'s
+//!   backtraces where it is installed and allowed to attach. Linux's default
+//!   `kernel.yama.ptrace_scope=1` lets a process be traced only by its ancestors, and the gdb is
+//!   this process's child: so it could attach neither to this process (its parent) nor to a `vox`
+//!   it started (its sibling), and a hung proof's Linux dump showed no stacks (V210-145, #364).
+//!   So this process allows tracing once the watchdog fires, and a `vox` built with `test-knobs`
+//!   allows it from its start.
 //!
 //! It also names the tests still running: every test arms the watchdog, and each arming is
 //! struck off when that test's thread ends, so what is left is the test that hung.
@@ -101,6 +106,11 @@
 //! and `VOX_TEST_WATCHDOG_SECS=0` disables it — for attaching a debugger, which is the one
 //! case where an unbounded hang is what you want.
 
+// Every proof includes this module, so it carries the temporary HOME every proof's children get
+// (V210-157, #379); see that module.
+#[path = "temp_home.rs"]
+pub mod temp_home;
+
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -114,6 +124,12 @@ const DEFAULT_BUDGET: Duration = Duration::from_secs(600);
 /// A sleep of the watchdog's that overran by more than this means this process was not scheduled
 /// for that long — the runner stalled it, or the machine slept.
 const STALL: Duration = Duration::from_secs(5);
+
+/// A process this test started that used at least this much CPU over the census's last 2 s is
+/// still working, so a budget that ran out on it is not a hang (V210-106): a debug `trust add`
+/// hashing a passphrase ran at 78%, and a release `vox serve` cut short mid-proof at 8-13%. An
+/// idle `vox` measures about 1%: only a process near 0 is stuck.
+const BUSY_PCT: f64 = 5.0;
 
 /// Twice the most one join cost a debug build: `vox room join` returning, its proof of work solved by the
 /// joining node, measured on the equivocation proof's staging (an anchor, five daemons, four
@@ -209,6 +225,9 @@ const CENSUS_EVERY: Duration = Duration::from_secs(2);
 
 static ARMED: Once = Once::new();
 
+/// Set once this process has checked that its children get the temporary HOME.
+static HOME_CHECKED: Once = Once::new();
+
 /// Set once [`fire`] begins. From then on a test thread that panics parks instead of finishing
 /// (see [`arm_for`]).
 static FIRING: AtomicBool = AtomicBool::new(false);
@@ -264,6 +283,8 @@ pub fn arm_for(default_budget: Duration) {
             *t = Some(Running(name));
         }
     });
+    // Before any test of this process starts a child: the child must get the temporary HOME.
+    HOME_CHECKED.call_once(temp_home::check);
     ARMED.call_once(|| {
         // An explicit budget is taken as given; otherwise the largest any test asked for, read
         // afresh on every look, since a test may arm after the first did.
@@ -526,22 +547,33 @@ fn fire(
             "the wall clock agrees with the monotonic one (within {slept:?}): no machine sleep."
         )
     };
-    // The side, from what was measured: a machine that slept or a process that was not scheduled
-    // is the apparatus's; a process that ran throughout on an awake machine and still did not
-    // finish was held up by what it waits on — the product it drives.
-    let verdict = if asleep {
-        "NO RESULT: the machine slept during the run (below), so the budget measured nothing."
-    } else if stalled {
-        "APPARATUS STALL: this process was not scheduled for longer than the stall line (below)."
-    } else {
-        "PRODUCT HANG: this process was scheduled throughout and the machine did not sleep, so\n\
-         the time went to what it waits on — the `vox` processes it started (CPU below:\n\
-         one near 100% is spinning, one near 0 is stuck waiting)."
-    };
     // Found once, before any diagnostic runs: `ps` and `sample` are children of this process too,
     // and are waited for, so they are never in the list.
     let children = ours();
-    let cpu = cpu_census(&children);
+    let (cpu, busiest) = cpu_census(&children);
+    // The side, from what was measured: a machine that slept or a process that was not scheduled
+    // is the apparatus's. A process that ran throughout on an awake machine and still did not
+    // finish was held up by what it waits on — the product it drives — unless that product is
+    // still working: then the budget, not the product, is what ran out.
+    let working = busiest.filter(|(_, pct)| *pct >= BUSY_PCT);
+    let verdict = if asleep {
+        "NO RESULT: the machine slept during the run (below), so the budget measured nothing."
+            .to_owned()
+    } else if stalled {
+        "APPARATUS STALL: this process was not scheduled for longer than the stall line (below)."
+            .to_owned()
+    } else if let Some((pid, pct)) = working {
+        format!(
+            "CANNOT MEASURE: the budget ran out while the product was still working (CPU {pct:.0}%,\n\
+             pid {pid}, below). A budget too short for this machine and a product spinning look\n\
+             the same from here; the stacks below tell them apart."
+        )
+    } else {
+        "PRODUCT HANG: this process was scheduled throughout, the machine did not sleep, and no\n\
+         process it started was working (CPU below), so the time went to what it waits on — a\n\
+         `vox` process stuck waiting."
+            .to_owned()
+    };
     say(&format!(
         "\n\
          ==================== vox test watchdog ====================\n\
@@ -571,6 +603,7 @@ fn fire(
          To hold it open for a debugger instead: VOX_TEST_WATCHDOG_SECS=0\n\
          ===========================================================\n"
     ));
+    allow_tracing();
     dump_threads(std::process::id());
     dump_descendants(&children);
     say("==================== vox test watchdog: end of thread dump; aborting ====================\n");
@@ -588,8 +621,9 @@ fn fire(
 }
 
 /// One line per process — this one, then `pids` — with its state, its CPU over the last 2 s, and
-/// its command line, from two `ps` samples 2 s apart.
-fn cpu_census(pids: &[u32]) -> String {
+/// its command line, from two `ps` samples 2 s apart; and the busiest of `pids` (not this one),
+/// with its CPU percentage, if any was measured.
+fn cpu_census(pids: &[u32]) -> (String, Option<(u32, f64)>) {
     let all: Vec<u32> = std::iter::once(std::process::id())
         .chain(pids.iter().copied())
         .collect();
@@ -616,21 +650,29 @@ fn cpu_census(pids: &[u32]) -> String {
     std::thread::sleep(Duration::from_secs(2));
     let after = sample();
     if after.is_empty() {
-        return "    (ps reported nothing: CPU unknown)".to_owned();
+        return ("    (ps reported nothing: CPU unknown)".to_owned(), None);
     }
-    after
+    let mut busiest: Option<(u32, f64)> = None;
+    let lines = after
         .iter()
         .map(|(pid, state, time, command)| {
             let was = before.iter().find(|(p, ..)| p == pid).and_then(|b| b.2);
             let used = match (was, time) {
-                (Some(a), Some(b)) => format!("{:>5.0}%", (b - a).max(0.0) / 2.0 * 100.0),
+                (Some(a), Some(b)) => {
+                    let pct = (b - a).max(0.0) / 2.0 * 100.0;
+                    if *pid != std::process::id() && busiest.is_none_or(|(_, top)| pct > top) {
+                        busiest = Some((*pid, pct));
+                    }
+                    format!("{pct:>5.0}%")
+                }
                 _ => "    ?%".to_owned(),
             };
             let command: String = command.chars().take(100).collect();
             format!("    {pid:>7} {state:<4} {used}  {command}")
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    (lines, busiest)
 }
 
 /// `ps`'s cumulative CPU time in seconds: `[[dd-]hh:]mm:ss[.ff]`.
@@ -727,29 +769,68 @@ fn dump_threads(pid: u32) {
         say(&format!("(no threads to show: process {pid} is gone)\n"));
         return;
     }
-    let mut out = String::from("threads (tid, state, CPU ticks in the last second, name):\n");
+    // `wchan` is where in the kernel a thread sleeps (`futex_wait_queue`, `do_epoll_wait`, ...).
+    // Unlike a stack, any process of this user may read it, so it is there even where gdb cannot
+    // attach.
+    let mut out = String::from(
+        "threads (tid, state, CPU ticks in the last second, name, kernel wait channel):\n",
+    );
     for (tid, state, ticks, name) in &after {
         let was = before
             .iter()
             .find(|(t, ..)| t == tid)
             .map_or(0, |(_, _, b, _)| *b);
+        let wchan = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/wchan"))
+            .ok()
+            .filter(|w| !w.is_empty() && w != "0")
+            .unwrap_or_else(|| "-".to_owned());
         out.push_str(&format!(
-            "  {tid:>8}  {state}  {:>4}  {name}\n",
+            "  {tid:>8}  {state}  {:>4}  {name:<16}  {wchan}\n",
             ticks.saturating_sub(was)
         ));
     }
     say(&out);
+    // Linux's default `kernel.yama.ptrace_scope=1` lets gdb — this process's child — attach only
+    // to a process that allows it: this one does (`fire`), and a `vox` built with `test-knobs`
+    // does (its `main`). Say so where gdb will be refused, so its refusal is not read as a hang.
+    let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default();
+    if !scope.is_empty() && scope != "0" {
+        say(&format!(
+            "(kernel.yama.ptrace_scope={scope}: gdb can attach only to a process that allows it — \
+             this test process, and a vox built with --features vox-tui/test-knobs; a vox built \
+             without it shows only the threads above)\n"
+        ));
+    }
     let pid = pid.to_string();
-    // Where gdb is installed and the kernel's ptrace policy lets a child attach to its parent.
+    // `debuginfod enabled off`: a dump must not wait on, or ask about, downloading symbols.
     run_bounded(Command::new("gdb").args([
-        "-p",
-        &pid,
         "-batch",
         "-nx",
+        "-iex",
+        "set debuginfod enabled off",
+        "-p",
+        &pid,
         "-ex",
         "thread apply all bt",
     ]));
 }
+
+/// Let any process of this user trace this one, so the gdb the dump runs (a child of this
+/// process) may attach to it under Yama's `ptrace_scope=1`. Only once the watchdog fires: this
+/// process aborts moments later.
+#[cfg(target_os = "linux")]
+fn allow_tracing() {
+    if let Err(e) = rustix::process::set_ptracer(rustix::process::PTracer::Any) {
+        say(&format!(
+            "(PR_SET_PTRACER failed: {e}; gdb may not attach to this process)\n"
+        ));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn allow_tracing() {}
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn dump_threads(_pid: u32) {

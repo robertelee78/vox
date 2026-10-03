@@ -36,7 +36,7 @@
 //! unlocks with the right passphrase, never answers `:close`, or stops reading what is typed. A
 //! step this proof needs that is not the claim (a fingerprint to write into the file, a room id
 //! to read back, the TUI driver's own apparatus: pyte missing, its staging, its own error) is
-//! `CANNOT MEASURE`.
+//! `APPARATUS`.
 //!
 //! **The mutation that must turn it red:** `ProfileArgs::anchor_set` returns the
 //! `AnchorsFileUnusable` error again instead of saying it and carrying on (the V210-75 refusal).
@@ -94,10 +94,14 @@ impl Proc {
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
             .env_remove("VOX_ANCHORS")
             .stdin(Stdio::null())
-            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
-            .stderr(Stdio::from(std::fs::File::create(&err).unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create(&out).expect("APPARATUS: cannot create a file"),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create(&err).expect("APPARATUS: cannot create a file"),
+            ))
             .spawn()
-            .expect("spawn vox");
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox: {e}"));
         Self { child, out, err }
     }
 
@@ -141,11 +145,18 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
-    let mut pipe = child.stdin.take().expect("stdin");
-    pipe.write_all(stdin.as_bytes()).unwrap();
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox: {e}"));
+    let mut pipe = child
+        .stdin
+        .take()
+        .expect("APPARATUS: vox was spawned without a stdin pipe");
+    // A vox that exits before reading closes the pipe; what it said and its status are then the
+    // verdict, so a failed write is not one.
+    let _ = pipe.write_all(stdin.as_bytes());
     drop(pipe);
-    let out = child.wait_with_output().expect("wait");
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot collect vox's output: {e}"));
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -203,37 +214,49 @@ fn daemon(dir: &Path, pass: &str, tag: &str) -> Proc {
 #[ignore = "real vox processes, a TUI in a pty and production Argon2id; CI runs it in release"]
 fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (alice, bob) = (tmp.path().join("alice"), tmp.path().join("bob"));
     let mut fps = Vec::new();
     for dir in [&alice, &bob] {
-        std::fs::create_dir_all(dir.join("cfg")).unwrap();
+        std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: cannot make a directory");
         let (ok, fp, err) = vox_once(dir, &args(&["id"]));
         let fp = fp.trim().to_owned();
         assert!(
             ok && fp.len() == 52,
-            "CANNOT MEASURE: the first `vox id` (no anchors file yet) printed {fp:?}: {err}"
+            "PRODUCT (staging): the first `vox id` (no anchors file yet) printed {fp:?}: {err}"
         );
         fps.push(fp);
     }
     let (alice_fp, bob_fp) = (fps[0].clone(), fps[1].clone());
     let bad = format!("{alice_fp}@no-such-anchor.invalid:4433\nnot-a-fingerprint@127.0.0.1:4433\n");
     for dir in [&alice, &bob] {
-        std::fs::write(dir.join("cfg").join("anchors"), &bad).unwrap();
+        std::fs::write(dir.join("cfg").join("anchors"), &bad)
+            .expect("APPARATUS: cannot write a staging file");
     }
     let alice_file = alice.join("cfg").join("anchors").display().to_string();
     let bob_file = bob.join("cfg").join("anchors").display().to_string();
     let pass = tmp.path().join("identity.pass");
-    std::fs::write(&pass, format!("{IDENTITY}\n")).unwrap();
-    let pass = pass.to_str().unwrap().to_owned();
+    std::fs::write(&pass, format!("{IDENTITY}\n")).expect("APPARATUS: cannot write a staging file");
+    let pass = pass
+        .to_str()
+        .expect("APPARATUS: a temp path is not UTF-8")
+        .to_owned();
     // A daemon opens a closed room from a passphrase on a line of its own (bob's, after his
     // `vox connect` closed it).
     let bob_pass = tmp.path().join("bob.pass");
-    std::fs::write(&bob_pass, format!("{IDENTITY}\n{ROOMPASS}\n")).unwrap();
-    let bob_pass = bob_pass.to_str().unwrap().to_owned();
+    std::fs::write(&bob_pass, format!("{IDENTITY}\n{ROOMPASS}\n"))
+        .expect("APPARATUS: cannot write a staging file");
+    let bob_pass = bob_pass
+        .to_str()
+        .expect("APPARATUS: a temp path is not UTF-8")
+        .to_owned();
     let room_pass = tmp.path().join("room.pass");
-    std::fs::write(&room_pass, format!("{ROOMPASS}\n")).unwrap();
-    let room_pass = room_pass.to_str().unwrap().to_owned();
+    std::fs::write(&room_pass, format!("{ROOMPASS}\n"))
+        .expect("APPARATUS: cannot write a staging file");
+    let room_pass = room_pass
+        .to_str()
+        .expect("APPARATUS: a temp path is not UTF-8")
+        .to_owned();
 
     // ---- vox id and vox trust: said, skipped, done ---------------------------------------------
     let (ok, out, err) = vox_once(&alice, &args(&["id"]));
@@ -264,7 +287,8 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     // ---- an anchors file that cannot be read as text stops nothing either -----------------------
     // It was an error that named neither the file nor why ("profile path read: anchors file"),
     // and every verb, `vox id` included, refused on it (ac-ver302's verdict on 3b790e64).
-    std::fs::write(alice.join("cfg").join("anchors"), b"\xff\xfe\x00bad\n").unwrap();
+    std::fs::write(alice.join("cfg").join("anchors"), b"\xff\xfe\x00bad\n")
+        .expect("APPARATUS: cannot write a staging file");
     let (ok, out, err) = vox_once(&alice, &args(&["id"]));
     let named = err.contains(&format!("{alice_file} is skipped whole: it is not text"))
         && err.contains("names no usable anchor")
@@ -280,7 +304,8 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
          ({alice_fp}), exit 0, and say the file is skipped, why, and that it carries on; it exited \
          ok={ok}, printed {out:?} and said:\n{err}"
     );
-    std::fs::write(alice.join("cfg").join("anchors"), &bad).unwrap();
+    std::fs::write(alice.join("cfg").join("anchors"), &bad)
+        .expect("APPARATUS: cannot write a staging file");
 
     // ---- alice hosts a room from her daemon ------------------------------------------------------
     let alice_daemon = daemon(&alice, &pass, "alice-daemon");
@@ -296,7 +321,14 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     );
     let (ok, _, err) = vox_in(
         &alice,
-        &["room", "create", "--name", "shared"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "shared",
+        ],
         &format!("{ROOMPASS}\n"),
     );
     assert!(
@@ -309,7 +341,7 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned);
     let Some(room) = room.filter(|_| ok) else {
-        panic!("CANNOT MEASURE: no room id in alice's `vox room list`: {listed}{err}");
+        panic!("PRODUCT (staging): no room id in alice's `vox room list`: {listed}{err}");
     };
     let (ok, _, err) = vox_once(&alice, &args(&["room", "post", &room, POST]));
     assert!(ok, "PRODUCT: alice's post in her own room: {err}");
@@ -420,14 +452,14 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     // `:close`, or no longer reading what is typed (`HUNG`) is the product.
     assert!(
         out.has_verdict("bob"),
-        "CANNOT MEASURE: the TUI driver was stopped from outside before it gave a verdict, at \
+        "APPARATUS: the TUI driver was stopped from outside before it gave a verdict, at \
          stage {:?} (exit {:?}): {said}",
         out.stage.as_deref().unwrap_or("(before its first stage)"),
         out.code
     );
     assert!(
         !said.contains("bob APPARATUS"),
-        "CANNOT MEASURE: the TUI driver's own apparatus failed (exit {:?}): {said}",
+        "APPARATUS: the TUI driver's own apparatus failed (exit {:?}): {said}",
         out.code
     );
     assert!(
@@ -441,8 +473,9 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
 
     // ---- `vox node` runs anchorless, and says so -------------------------------------------------
     let node_dir = tmp.path().join("n");
-    std::fs::create_dir_all(node_dir.join("cfg")).unwrap();
-    std::fs::write(node_dir.join("cfg").join("anchors"), &bad).unwrap();
+    std::fs::create_dir_all(node_dir.join("cfg")).expect("APPARATUS: cannot make a directory");
+    std::fs::write(node_dir.join("cfg").join("anchors"), &bad)
+        .expect("APPARATUS: cannot write a staging file");
     let mut node = Proc::spawn(&node_dir, &["node", "--listen", "127.0.0.1:0"], "node");
     let exited = node.exited_within(STAYS_UP);
     let said = node.said();
@@ -465,9 +498,9 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     // never needed. The words it replaced said "the anchor could not be reached" (V210-107).
     drop(alice_daemon);
     let carol = tmp.path().join("carol");
-    std::fs::create_dir_all(carol.join("cfg")).unwrap();
+    std::fs::create_dir_all(carol.join("cfg")).expect("APPARATUS: cannot make a directory");
     let (ok, _, err) = vox_once(&carol, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: carol's `vox id`: {err}");
+    assert!(ok, "PRODUCT (staging): carol's `vox id`: {err}");
     let t0 = Instant::now();
     let mut connect = Proc::spawn(
         &carol,
@@ -490,7 +523,7 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     );
     assert!(
         status.is_some_and(|s| !s.success()),
-        "CANNOT MEASURE: carol's `vox connect` did not fail with the room's host stopped, so this \
+        "PRODUCT (staging): carol's `vox connect` did not fail with the room's host stopped, so this \
          arm did not stage a host that is down; it exited {status:?} and said:\n{said}"
     );
     let host = &alice_fp[..12];

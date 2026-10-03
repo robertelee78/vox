@@ -1,8 +1,7 @@
 //! The typed core↔UI boundary (ADR-015 §"Typed core↔UI boundary").
 //!
-//! core→UI carries **latest-wins state** ([`ViewModel`], delivered over a
-//! `watch`) and **ordered events that must never coalesce** ([`Event`], over an
-//! `mpsc`). UI→core carries [`Command`]s (over an `mpsc`).
+//! core→UI carries **latest-wins state** ([`ViewModel`]); UI→core carries
+//! [`Command`]s.
 //!
 //! ## Binding contract: no secrets cross here
 //! Every type in this module carries **only rendered/redacted view data** —
@@ -17,35 +16,23 @@
 use secrecy::SecretString;
 use vox_core::hash::Digest32;
 
-/// Per-member key-verification state (ADR-007/ADR-015). Distinct from consent.
+/// Where a member stands with you here: trust is yours to give, per member (ADR-020 §3). Your node
+/// takes a member's key only if your trust keyring names it, and releases yours only to such a
+/// member (V210-148). Read off the keyring and the room's log; nothing in the TUI sets it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verification {
-    /// Trust-on-first-use: seen but not verified. The default for a new member.
-    UnverifiedTofu,
-    /// Verified via a successful QR scan or numeric safety-code compare.
-    Verified,
-    /// A previously-known key changed; the member must be re-verified before trust.
-    KeyChanged,
-}
-
-/// Your **outbound** per-sender consent to a member (ADR-007): whether *they* may
-/// read *your* messages. Independent of verification and of inbound visibility.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutboundConsent {
-    /// You have consented; the member can read your messages.
-    Granted,
-    /// You have not consented (or revoked); the member cannot read your messages.
-    Revoked,
-}
-
-/// Your **inbound** visibility preference for a member (ADR-007): whether you want
-/// to render *their* messages. Independent of consent and verification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InboundVisibility {
-    /// You render this member's messages.
-    Visible,
-    /// You have opted out of rendering this member's messages.
-    Hidden,
+pub enum Trust {
+    /// The member is you.
+    You,
+    /// Your keyring names the member: your node takes its key and releases yours to it.
+    Trusted {
+        /// Whether it holds your key here, so it can read what you write.
+        reads_you: bool,
+    },
+    /// Your keyring does not name the member: your node refuses its key, so you cannot read it.
+    NotTrusted {
+        /// Whether it still holds your key here.
+        reads_you: bool,
+    },
 }
 
 /// A member as surfaced to the UI (ADR-015 member pane). Fingerprints and nicknames
@@ -56,17 +43,8 @@ pub struct MemberView {
     pub id: Digest32,
     /// A local, user-assigned nickname (or a short fingerprint if unset).
     pub nickname: String,
-    /// Key-verification state.
-    pub verification: Verification,
-    /// Your outbound consent toward this member.
-    pub outbound: OutboundConsent,
-    /// Your inbound visibility for this member.
-    pub inbound: InboundVisibility,
-    /// `true` if you have Blocked this member (revoked outbound + hidden inbound).
-    /// Block is **not** removal — the member stays listed (ADR-007/ADR-015).
-    pub blocked: bool,
-    /// The grouped-decimal safety code for verifying this member (ADR-015).
-    pub safety_code: String,
+    /// Where the member stands with you.
+    pub trust: Trust,
 }
 
 /// A timeline entry as surfaced to the UI. Carries decrypted display text only when
@@ -132,8 +110,10 @@ pub struct ChannelView {
     pub local_name: String,
     /// The members, in display order.
     pub members: Vec<MemberView>,
-    /// The render-gated timeline, oldest-first.
-    pub timeline: Vec<MessageView>,
+    /// The render-gated timeline, oldest-first. Shared with the core, which adds a new
+    /// message's row to it rather than projecting the whole room again on every frame
+    /// (V210-120).
+    pub timeline: std::sync::Arc<Vec<MessageView>>,
     /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
     /// the name this operator gave them; drawn above the timeline, **each on its own line**.
     pub held_back: Vec<String>,
@@ -183,29 +163,6 @@ pub struct ViewModel {
     pub closed_tunnels: Vec<vox_core::transport::quic::ClosedTunnel>,
 }
 
-/// An ordered core→UI event that must never coalesce (`mpsc`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    /// A new decryptable entry arrived in a channel (drives unread + notifications).
-    NewEntry {
-        /// The channel the entry belongs to.
-        channel_id: Digest32,
-        /// The rendered entry.
-        entry: MessageView,
-    },
-    /// A member's key changed — verification reset to `KeyChanged` (ADR-015).
-    KeyChangeAlert {
-        /// The affected channel.
-        channel_id: Digest32,
-        /// The member whose key changed.
-        member: Digest32,
-    },
-    /// A recoverable error to surface in the alert log. A **typed** error, not a
-    /// free string, so no plaintext/secret can ever leak through the error channel
-    /// (ADR-015 log-redaction). Producers map their failure to a [`UiError`].
-    Error(UiError),
-}
-
 /// The bounded set of user-facing errors the UI surfaces (ADR-015 §"Error & offline
 /// UX"). Each renders to a fixed human string — there is no free-form text path, so
 /// an error can never carry plaintext, a key, or a passphrase into the UI/logs.
@@ -221,14 +178,16 @@ pub enum UiError {
     JoinPowTooSlow,
     /// Every member that answered a join was busy answering others (V210-92).
     JoinMembersBusy,
+    /// The room is at its cap, so the join was refused (V210-128).
+    JoinRoomFull,
+    /// A member accepted the passphrase and then could not admit this identity (V210-128).
+    JoinNotAdmitted,
     /// Join proof-of-possession / identity mismatch.
     JoinProofMismatch,
     /// No reachable peer / your node — "both must be online" for a 2-member channel.
     Unreachable,
     /// The channel epoch advanced (passphrase rotation); re-sync needed.
     EpochMismatch,
-    /// A member's key changed and must be re-verified before trust.
-    KeyChanged,
     /// You have no consent from a member yet ("you'll see them once they consent").
     MissingConsent,
     /// A received entry/structure was malformed (maps ADR-008 wire codes).
@@ -254,8 +213,6 @@ pub enum UiError {
     KeyringFull,
     /// Persisting to the store failed; reopen the channel.
     Storage,
-    /// This action needs the network milestone (M14) — not available yet.
-    NotAvailableYet,
     /// The tunnel to close is no longer open (V030-11).
     NoSuchTunnel,
     /// The other side refused: the channel passphrase is wrong, or it is not
@@ -268,8 +225,12 @@ pub enum UiError {
     NotAdmitted,
     /// This client is not networked, or is locked, so it cannot reach anyone.
     NotNetworked,
-    /// A local address the node needs (its listen port) is already in use.
+    /// A local address the node needs (its listen port) is held by another program.
     AddressInUse,
+    /// A local address the node was asked to listen on is not an address of this machine.
+    AddressNotHere,
+    /// A local address the node was asked to listen on could not be bound for another reason.
+    BindFailed,
     /// A join named a room this profile already holds.
     AlreadyMember,
     /// An unexpected internal error (never carries detail).
@@ -303,10 +264,15 @@ impl UiError {
             UiError::JoinMembersBusy => {
                 "a member is busy answering other joins — try again shortly"
             }
+            UiError::JoinRoomFull => {
+                "the room is full — nobody else can join (your passphrase was accepted)"
+            }
+            UiError::JoinNotAdmitted => {
+                "a member accepted your passphrase but could not admit you (it was locking or closing) — try again"
+            }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — the host or a member must be online",
             UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
-            UiError::KeyChanged => "a member's key changed — re-verify before trusting",
             UiError::MissingConsent => "you'll see this member once they consent to you",
             UiError::Malformed => "received a malformed entry (ignored)",
             UiError::Transport => "connection error",
@@ -316,7 +282,7 @@ impl UiError {
                 "another vox created this profile's identity at the same time; nothing was created here — restart vox tui to unlock it"
             }
             UiError::ProfileBusy => {
-                "another vox holds this profile open — stop it, then try again"
+                "another vox holds this profile open — try again once it is done"
             }
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
@@ -325,11 +291,16 @@ impl UiError {
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
-            UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::NoSuchTunnel => "that tunnel is no longer open",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",
-            UiError::AddressInUse => "a local port it needs is in use — pick another --listen",
+            UiError::AddressInUse => {
+                "a local port it needs is held by another program — pick another --listen"
+            }
+            UiError::AddressNotHere => {
+                "the --listen address is not an address of this machine — use one it has"
+            }
+            UiError::BindFailed => "the --listen address could not be listened on",
             UiError::AlreadyMember => "you already hold that room — it is in your list",
             UiError::Internal => "internal error",
         }
@@ -445,50 +416,6 @@ pub enum Command {
         channel_id: Digest32,
         /// The plaintext to send (becomes ciphertext in the core).
         text: String,
-    },
-    /// Grant outbound consent to a member.
-    GrantConsent {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to consent to.
-        member: Digest32,
-    },
-    /// Revoke outbound consent from a member.
-    RevokeConsent {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to revoke.
-        member: Digest32,
-    },
-    /// Set inbound visibility for a member.
-    SetVisibility {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member.
-        member: Digest32,
-        /// The desired visibility.
-        visibility: InboundVisibility,
-    },
-    /// Block a member (revoke outbound + hide inbound); not removal.
-    Block {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to block.
-        member: Digest32,
-    },
-    /// Unblock a member (restore your outbound consent + your inbound preference).
-    Unblock {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to unblock.
-        member: Digest32,
-    },
-    /// Mark a member verified after a successful scan/compare.
-    MarkVerified {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The verified member.
-        member: Digest32,
     },
     /// Lock the app now (zeroize SEK + identity root, require re-auth).
     Lock,

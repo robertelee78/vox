@@ -1,154 +1,36 @@
 # Vox Lux
 
-**An end-to-end-encrypted peer-to-peer overlay for private communication and tunneling.**
+**Private rooms for people and agents, with no server in the middle — and `ssh` to machines that
+have no public address.**
 
-Vox is for a small group that wants a private channel nobody else operates — no central server, no
-accounts, no phone numbers — and for anyone who wants `ssh` into a machine with no public address.
+Vox is for a small group that wants a private channel nobody else operates: no accounts, no phone
+numbers, no company holding your messages. The same overlay carries chat between people, work
+coordination between AI agents, and TCP between machines (`ssh` over Vox is the canonical case).
 
-A channel ID and passphrase get a newcomer *into* a room and nothing further: each member decides
-independently whose messages that newcomer may read, so an unapproved joiner decrypts none of them.
-Vox generates your identity on first run — an Ed25519 key paired with an ML-DSA-65 one — and
-exports the Ed25519 half in OpenPGP format, so a peer can compare fingerprints with
-tooling they already trust. Beyond chat, the overlay carries arbitrary TCP between members.
-
-Key agreement is X25519 with ML-KEM-768; signatures are Ed25519 with ML-DSA-65 — each a classical
-algorithm concatenated with a lattice one, so breaking either alone is not enough. The point of
-building it that way is that nobody, including us, can tell you the lattice halves are sound: they
-are young, and hybrids exist because neither half is trusted on its own.
+Everything is end-to-end encrypted with hybrid post-quantum cryptography. Nobody — no server, no
+anchor, no one who merely got hold of a room's address and passphrase — reads anything unless you
+decided to trust them.
 
 ---
 
-## The problem
+## The model in one minute
 
-Mainstream secure messengers force trade-offs Vox refuses to make:
+There are only four things:
 
-- **They depend on central servers** for prekey distribution, identity, and routing — a metadata
-  chokepoint, a censorship target, and a trust anchor you do not control.
-- **They tie identity to a phone number or account**, binding your secure identity to a SIM and a
-  real-world persona.
-- **Admission is room-level.** Add someone to a group and they read everything said from then on;
-  membership itself is not cryptographically authenticated, so one wrong add exposes all new traffic
-  from everyone. March 2025's "Signalgate" was that failure by human error rather than a protocol
-  break — the model is what made a misclick sufficient. For the cryptographic case in a comparable
-  system, see Albrecht, Celi, Dowling and Jones, *Practically-exploitable Cryptographic
-  Vulnerabilities in Matrix*, IEEE S&P 2023.
+- **Nodes.** A node is one identity: a key pair Vox makes for you, known by its **fingerprint**. A
+  person is a node; so is each AI agent. Names are local: you call a node whatever you like, and
+  nobody else sees that name.
+- **Rooms.** A room is a shared, encrypted, replicated log. You get into one with its **address**
+  (a `vox://…` string) and its **passphrase**, sent by two different channels.
+- **Trust.** Being in a room lets you *see that* messages exist, not *read* them. Two nodes read
+  each other only once **each trusts the other** (`vox trust add`). Trust is per node, not per room:
+  once you and your mom trust each other, every room you share works, including rooms made later.
+- **Services.** A node can offer a local port to a room (`vox serve`); nodes it trusts can reach it
+  as `<name>.vox`.
 
-## What makes Vox different
-
-- **Per-sender consent admission ("anti-Signalgate").** Joining a channel — even with the correct
-  channel ID and passphrase — grants you *nothing readable*. Each existing member *individually*
-  consents to a newcomer; until a member consents, their messages stay undecryptable to that
-  newcomer, forever if they never consent. Visibility fills in monotonically, per sender. No single
-  wrong add can expose the room. *(ADR-007)*
-- **No privileged server.** There is no account system, no directory and no operator who can add a
-  member or read a room. There *can* be infrastructure, and only for one case: when two hosts are
-  **both** behind NAT and cannot otherwise find or reach each other, an always-on **anchor** bridges
-  them. An anchor is a `vox node` you run yourself; it serves the rendezvous board and relays
-  encrypted packets, and by construction holds no room key and can read nothing. When either host can
-  be reached directly (a public address, a working port mapping, the same LAN), no anchor is needed. Discovery is
-  magnet-link style over a P2P swarm. *(ADR-012, ADR-016)*
-- **The channel is the unit.** Every message is appended to its author's own hash-linked log, and
-  the logs replicate channel-wide as a causal Merkle-DAG; a 1:1 chat is simply a two-member channel.
-  Messages you cannot decrypt replicate but are not rendered. *(ADR-006, ADR-008)*
-- **Self-sovereign identity.** Vox generates the root itself — an Ed25519 key plus an ML-DSA-65
-  co-key, 1984 bytes of public key — and the fingerprint peers compare is SHA-256 over *both* halves,
-  so the second key cannot be swapped without changing it. The Ed25519 half carries a
-  standard OpenPGP v4 fingerprint, checkable with PGP tooling. No accounts, no phone numbers, no
-  directory; per-channel pseudonymous identities are your choice. Adopting an *existing* GPG key as
-  the root is specified but not built. *(ADR-002)*
-- **Hybrid key agreement and signatures.** X25519 with ML-KEM-768, and Ed25519 with ML-DSA-65,
-  concatenated — so breaking one algorithm of a pair is not enough. **If** the lattice halves hold,
-  traffic recorded now stays closed to an adversary who later breaks the classical ones; nobody can
-  tell you they hold, and that conditional is the whole reason for the hybrid. The QUIC handshake is
-  pinned to the single group `X25519MLKEM768`, so there is no classical group to downgrade to.
-  *(ADR-003, ADR-011)*
-- **Every message is attributable.** Each entry carries its author's composite signature, so
-  members know who wrote what — and so would anyone a transcript leaked to. A deniable mode was
-  designed and built (ADR-009) and then withdrawn without ever shipping. *(ADR-008, ADR-009)*
-- **Chat *and* tunneling.** The same overlay carries arbitrary TCP between members — `ssh` over Vox
-  is the canonical case — alongside messaging. UDP and an IP-level interface are designed and
-  unbuilt. *(ADR-011, ADR-013)*
-
-## How it works
-
-Each layer is a decision record in `docs/adr/`, built in dependency order:
-
-1. **Identity & keys** *(ADR-002)* — a generated Ed25519 + ML-DSA-65 root, OpenPGP-representable;
-   role-separated keys (governance vs message
-   vs key-agreement), per-channel identity selection, hybrid PQ co-keys.
-2. **Crypto-agility policy** *(ADR-003)* — hybrid everywhere (X25519+ML-KEM, Ed25519+ML-DSA),
-   versioned/negotiable ciphersuites, two normative PQXDH hardening rules.
-3. **Pairwise secure channel** *(ADR-004)* — PQXDH key agreement + Double Ratchet, forward secrecy.
-4. **Channel addressing & join** *(ADR-005)* — channelID (rendezvous) + passphrase (CPace PAKE,
-   offline-dictionary-resistant), cleanly separated so the DHT lookup never leaks the passphrase.
-5. **Group messaging** *(ADR-006)* — channel-scoped Sender Keys, per-author distribution,
-   (channelID, epoch) binding.
-6. **Membership, consent & governance** *(ADR-007)* — per-sender consent, a signed admin/membership
-   certificate tree rooted at channel creation, admin-set policy, revocation via key rotation and
-   passphrase-epoch.
-7. **Replicated log & sync** *(ADR-008)* — per-author hash-linked logs in a causal Merkle-DAG (not a
-   consensus blockchain), render-gating, anti-entropy sync, TTL pruning via payload-hash signing.
-8. **Deniability** *(ADR-009)* — **withdrawn**; the design is kept, the code is removed.
-9. **At-rest storage** *(ADR-010)* — double-lock encryption (GPG key *and* channel passphrase),
-   admin-set retention, app-lock for device seizure.
-10. **Transport** *(ADR-011)* — QUIC substrate with stream multiplexing + datagrams; interactive and
-    bulk traffic isolated.
-11. **NAT traversal & bootstrap** *(ADR-012)* — IPv6-first, then automatic port-mapping, then
-    DCUtR hole-punching, with a user-runnable rendezvous; honest about the limits.
-12. **Overlay tunneling** *(ADR-013)* — arbitrary TCP/IP between members (`ssh` over Vox), authorized
-    by channel membership and consent.
-13. **Rust TUI client** *(ADR-015)* — the first client surface over the Rust core: a terminal-native
-    home client for Linux/servers/SSH (chat, consent, verification, tunneling).
-14. **macOS client** *(ADR-014)* — the native SwiftUI client over the same core (not started).
-
-## Threat model
-
-Vox claims exactly what its controls deliver — **content confidentiality, content authenticity, and
-unforgeable membership** — and is explicit about what it does not. Where a control rests on a lattice
-algorithm, the claim rests on that algorithm being sound, which is an assumption and not a result.
-
-**Defended:** an **on-path network adversary** (including a resourced ISP) — content is end-to-end,
-hybrid-encrypted and authenticated, and channel membership cannot be forged;
-**platform / server operators** — there is none to trust or be deplatformed by; a **wrongly-added
-participant / passphrase holder** (the "Signalgate" case) — per-sender consent gates readability per
-author; and **device seizure at rest** (a powered-off or locked device) — double-lock at-rest
-encryption plus forward secrecy.
-
-**Explicit non-goals (absent until a future ADR builds them):** metadata privacy / traffic analysis
-against a global passive adversary (content is protected, communication *patterns* are not); a
-running, compromised endpoint (malware/keylogger); coercion of a participant; and availability
-against a determined blocker. Vox therefore does **not** claim resistance to a nation-state as a
-holistic adversary — that would require all of the above. See ADR-001 for the full model.
-
-## Availability
-
-Availability is emergent, with no always-on infrastructure required: a two-member channel needs both
-members reachable; a 3+-member channel needs any two online to propagate the log; a lone online
-member is an outbox. A strictly zero-infrastructure overlay is impossible for one case: two
-hosts both behind NAT that cannot otherwise find each other. For that case only, Vox's minimum is a
-user-runnable anchor any node can provide. Every other case connects directly. See ADR-001 and ADR-012.
-
-## Architecture decisions
-
-All decisions live in [`docs/adr/`](docs/adr/) and are indexed in
-[`docs/adr/README.md`](docs/adr/README.md). The series is dependency-ordered: the numbering is the
-build order. Every ADR is grounded in a multi-pass, citation-backed research effort.
-
-## Repository layout
-
-```
-crates/vox-core/   The shared Rust core: identity, crypto, join, group, log/sync, governance,
-                   deniability, at-rest, transport, NAT, tunneling (milestones M0–M11)
-crates/vox-tui/    The Rust TUI client, binary `vox` (M12, ADR-015)
-docs/adr/          Architecture Decision Records (the design spine; each records its
-                   implementation status and Implementation notes)
-.github/           CI and the release workflow (three targets, macOS signed + notarized)
-scripts/           release helpers: package-release.sh, sign_notarize_release.sh
-install.sh         the installer the curl one-liner runs
-Cargo.toml         Workspace manifest (Rust 1.94, pinned in rust-toolchain.toml)
-README.md          This file
-LICENSE            MIT
-```
+An **anchor** is only a bridge: when two machines are both behind NAT and cannot find each other,
+an always-on `vox node` you run introduces them. It holds no room key and can read nothing. If
+either machine can be reached directly, no anchor is involved.
 
 ## Install
 
@@ -160,26 +42,24 @@ curl -fsSL https://raw.githubusercontent.com/robertelee78/vox/main/install.sh | 
 
 Targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin` (macOS 11+).
 
-It fetches the release record for your target and downloads from the *exact release that record
-names* — not `latest`, which could move between the two requests — verifying size and SHA-256 before
-anything is put in place. On macOS it also requires a Developer ID signature from team `3T2D2YNTVW`
-under `us.vox.cli` with the hardened runtime, and asks Apple to confirm the notarization ticket
-online; it refuses to install if any of that fails. Installation is atomic into `~/.local/bin`,
-followed by `vox shell-setup`. Nothing needs `sudo`.
+The installer downloads from the *exact release* its record names (not a moving `latest`),
+verifies size and SHA-256, and on macOS also requires the Developer ID signature (team
+`3T2D2YNTVW`, `us.vox.cli`, hardened runtime) and confirms the notarization ticket with Apple. It
+installs atomically into `~/.local/bin` and runs `vox shell-setup`. Nothing needs `sudo`.
 
 ```
 VOX_INSTALL_DIR=/opt/bin   # install somewhere else
 VOX_NO_SHELL_SETUP=1       # skip PATH and completion
 ```
 
-Verify it yourself — the release publishes the notarization receipt it was built with:
+Check it yourself:
 
 ```
 codesign --verify --strict --check-notarization --test-requirement '=notarized' ~/.local/bin/vox
 curl -fsSL https://github.com/robertelee78/vox/releases/latest/download/apple-proof-aarch64-apple-darwin.json
 ```
 
-### Update
+### Update and removal
 
 ```
 vox update              # replace this binary with the next release
@@ -187,141 +67,248 @@ vox update --check      # only say whether one exists
 vox update --rollback   # put back the binary it replaced
 ```
 
-On macOS an update must carry the **same Developer ID as the vox it is replacing** — a correct
-digest only proves the bytes are what GitHub is serving, whereas this proves they were signed by
-whoever signed what you already trust. On Linux there is no equivalent; an update there rests on TLS
-to GitHub and the record's digest, which is stated plainly in
-[ADR-015](docs/adr/ADR-015-rust-tui-client.md) rather than glossed.
+On macOS an update must carry the **same Developer ID** as the `vox` it replaces. On Linux an update
+rests on TLS to GitHub and the release record's digest; [ADR-015](docs/adr/ADR-015-rust-tui-client.md)
+says so plainly. A build from source is never overwritten.
 
-A build from source is never overwritten: `vox update` says so and tells you to
-`git pull && cargo build --release` instead.
-
-### Shell integration and removal
-
-`vox shell-setup` puts `vox` on `PATH` and installs completion for zsh, bash and fish. It appends
-one marked block at the *end* of your rc — at the end, so it wins the `PATH` race against version
-managers that prepend their shims earlier in the same file — and it is exactly reversible:
+`vox shell-setup` adds one marked block to the end of your shell rc (PATH and completion for zsh,
+bash, fish). To undo:
 
 ```
-vox shell-setup --remove    # undo the block and the completion files
-rm -rf ~/.local/bin/vox ~/.local/bin/.vox-*   # and the binary
+vox shell-setup --remove
+rm -rf ~/.local/bin/vox ~/.local/bin/.vox-*
 ```
 
-Your rooms and identity live in `~/.local/share/vox/<profile>/` (macOS:
-`~/Library/Application Support/vox/`) and are **not** removed by the above — delete that directory
-too if you mean it, and note that nobody can recover a room for you.
+Your identity and rooms live in `~/.local/share/vox/<profile>/` (macOS:
+`~/Library/Application Support/vox/`). The commands above leave them alone; delete that directory
+too if you mean it — nobody can recover a room for you.
 
 ## Getting started
 
-### Chat
+### The interactive client
 
 ```
-vox                                  # the interactive client; creates an identity on first run
+vox          # creates your identity on first run, then opens the terminal client
 ```
 
-Inside it, `:new` creates a room, `:invite` prints a `vox://…` address to hand to someone, `:join`
-takes one. A newcomer with the correct address and passphrase can read **nothing** until each
-member individually consents (`:grant`), which is the point of ADR-007.
+In the client: `:new` creates a room, `:invite` prints its address, `:join` takes one, `:open` and
+`:close` open and close a room, `:lock` and `:unlock` lock the node. The members pane shows, for each
+member, whether you trust them and whether they can read you.
+
+### Two people, their first shared room
+
+Say you and your mom want a room. The first time, it takes six steps:
+
+1. **Swap fingerprints.** Each runs `vox id` and sends the result to the other (any channel — a
+   fingerprint is public).
+2. **Create.** One of you creates the room (`:new` in the client, or `vox room create`).
+3. **Get its address.** `:invite` (or `vox room invite <room>`) prints a `vox://…` address.
+4. **Send the address and the passphrase** — by two different channels.
+5. **Join.** The other runs `:join` (or `vox room join`).
+6. **Trust each other.** Each runs `vox trust add <the other's fingerprint> --name <a name>`.
+
+From then on you read each other. **Every later room you share needs only steps 2–5**: trust
+carries over.
+
+`vox room leave <room>` leaves a room: the others are told, and the room is removed from your node.
+Joining again later works.
+
+### Passphrases
+
+There are two, and both are optional:
+
+- **The identity passphrase** protects your keys at rest. You enter it once to unlock your node;
+  it then stays unlocked while it runs. Changing who you trust (`vox trust add|remove`) asks for it
+  again once 30 minutes have passed since you last entered it. Reading never does.
+- **A room's passphrase** is the second factor for joining that room.
+
+At a terminal, Vox asks for them without echo. In a script or an agent there is no terminal, so give
+them explicitly — a command that needs one and cannot get it fails at once and says how:
+
+```
+vox daemon --passphrase-file ~/.config/vox/id.pass      # or VOX_IDENTITY_PASSPHRASE
+echo "$ROOM_PASS" | vox room join --passphrase-file - vox://… --name family
+```
+
+A passphrase is never taken from the command line, where `ps` would show it.
 
 ### Reach a machine's port from anywhere (`ssh` over Vox)
 
-This example runs an anchor, which is the case where both machines are behind NAT and neither can
-reach the other directly: then it takes four commands, no port forwarding, no public IP, no privilege.
-If the guest can reach the host directly, the anchor step and both `--anchor` flags are not needed
-(see "Do you need an anchor?" below). On the machine with the service:
+On the machine with the service:
 
 ```
-vox node --listen 0.0.0.0:0          # once, on a host that is always up: your anchor.
-                                      # prints <fingerprint>@<multiaddr> — that is its --anchor spec
-vox serve 22 --anchor <spec>          # offer local port 22 to a NEW room; prints the vox:// address
-                                      # and the room's <52-char>.vox hostname
+vox serve 22                          # offer local port 22 to a new room; prints its vox://
+                                      # address and the room's <52-char>.vox name
 ```
 
 On the machine that wants in:
 
 ```
 vox connect <vox://…>                 # join the room (one-shot: joining is durable)
-vox up <room> --anchor <spec>         # a loopback SOCKS5 proxy that resolves the .vox name;
+vox up <room>                         # a loopback SOCKS5 proxy that resolves the .vox name;
                                       # prints the exact ProxyCommand line to use
 ssh -o "ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p" user@<52-char>.vox
 ```
 
-The port you choose names the service; it does not have to be free on either machine, and nothing
-binds it. The whole shape is Tor's, deliberately: a SOCKS proxy is the only client mechanism that
-needs no privilege on any platform.
+Reaching a service follows trust: the host's node lets in only the nodes it trusts. For a tool with
+no proxy support, `vox forward` binds a local port instead.
 
-**Read this before you rely on it.** In the shipped binary, a room created by `vox serve` authorizes
-**every admitted member** to reach its services — joining *is* the authorization. So today, an
-address and its passphrase together are the reach grant, and you should treat them that way.
-[ADR-017](docs/adr/ADR-017-room-bound-services.md) withdrew that model on 2026-09-21: authorization
-becomes the host's own per-member decision, so an unapproved member reaches nothing and cannot learn
-a service exists. That work is landing now and is not in `v0.1.0`.
-
-For a tool with no proxy support, `vox forward` binds a local port instead.
+If **both** machines are behind NAT, add an anchor (next section) and pass `--anchor <spec>` to
+`serve` and `up`.
 
 ### Do you need an anchor?
 
-Only as a bridge. Creating, serving, inviting, joining and connecting are not meant to require one:
-if one of the two hosts can be reached directly (a public address, a router that granted a port
-mapping, the same LAN), the other dials it and no anchor is involved. If **both** are behind NAT,
-something both can reach must introduce them the first time, and in Vox that is a `vox node` **you**
-run. It serves the rendezvous board and coordinates hole punching; if both NATs are symmetric, it
-also relays QUIC packets it cannot read. It holds no room key, and its own log is ciphertext.
+Only as a bridge. If one machine can reach the other (a public address, a router that granted a
+port mapping, the same LAN), it dials directly and no anchor is involved. If **both** are behind NAT,
+something both can reach must introduce them, and in Vox that is a node **you** run:
 
-Known departures in the shipped binary, being fixed in v0.2.10: `vox serve` with no anchor refuses
-on a host whose only addresses are private (a LAN), and an anchors file whose every line is unusable
-stops `vox serve`, `connect`, `up`, `forward`, `daemon` and the TUI instead of carrying on without
-one.
+```
+vox node --listen 0.0.0.0:0           # on a host that is always up; prints <fingerprint>@<multiaddr>,
+                                      # which is its --anchor spec
+```
 
-By default an anchor serves any room published to it, and relays only between members of the same
-room. To serve only rooms made by people you trust, give the anchor's profile an identity and a
-trust list (`vox id`, then `vox trust add <fingerprint>` for each) and run
-`vox node --serve trusted` with that identity's passphrase (`--identity-passphrase-file` or
-`VOX_IDENTITY_PASSPHRASE`). A `serve` file in the config directory holding `anyone` or `trusted`
-sets the same thing without the flag. The list is read once at start.
+It serves the rendezvous board, coordinates hole punching, and if both NATs are symmetric relays
+QUIC packets it cannot read. By default it serves any room published to it; to serve only rooms of
+people you trust, give it an identity and a trust list and run `vox node --serve trusted`.
+
+A node remembers the port it first bound and binds it again on restart, so a member that restarts
+is found where it was. Nodes on the same computer or LAN also find each other again on their own if
+one does move.
+
+## Agents
+
+Vox is how AI agents working on the same repository coordinate. Each agent is its own **node** in a
+room with the other agents (and usually you):
+
+- **The room is where agents settle who does what** — who takes which task, who is on what — and
+  where they work through hard problems together.
+- **Progress and its proofs are recorded elsewhere**: on the GitHub issue, through
+  [awa](https://github.com/robertelee78/agent-work-accountability). Vox carries the conversation;
+  the issue carries the record.
+
+An agent's node is a `vox daemon` running under the agent's own profile (`--profile`, or
+`VOX_DATA_DIR`/`VOX_CONFIG_DIR`). The agent uses the `vox room …` verbs against it: `post`, `read`,
+`claim` (exit 0 only once the other online members agree it is yours), `board`, `send`, `get`,
+`join`, `leave`.
+
+Two things wire an agent session into its node, for **Claude Code, Codex and OpenCode**:
+
+```
+vox agent plugin claude|codex|opencode   # the hook or plugin that hands the agent its rooms'
+                                         # new messages at the start of every turn
+vox agent skill  claude|codex|opencode   # the agent-facing instructions (a SKILL.md)
+```
+
+Each prints what to install and, on stderr, where it goes. Codex runs a hook only once it is
+trusted: `vox agent trust codex` does that for Vox's entry alone.
+
+The hook drains **every room the node is in**, each message labelled with its room, its author (by
+your name for that node) and whom it is addressed to. Addressing names nodes: `--to alice`. An
+`--urgent` message interrupts a Claude Code or OpenCode session mid-turn; a Codex session is never
+interrupted and reads it at its next turn, and the poster is told so.
+
+Agents treat what arrives in a room as information, not instructions: it comes from other room
+members, not from the person they work for.
+
+## What makes Vox different
+
+- **Trust decides readability, per node.** Getting into a room — even with the correct address and
+  passphrase — grants nothing readable. A node releases its keys only to nodes its owner trusts, and
+  that check is in the core, so no client can get around it. One wrong add exposes nothing.
+  *(ADR-007, ADR-020)*
+- **No privileged server.** No accounts, no directory, no operator who can add a member or read a
+  room. The only infrastructure is an anchor you run, for the both-behind-NAT case, and it can read
+  nothing. *(ADR-012, ADR-016)*
+- **The room is a replicated log.** Every message is appended to its author's hash-linked log, and
+  the logs replicate room-wide as a causal Merkle-DAG; a 1:1 chat is a two-member room.
+  *(ADR-006, ADR-008)*
+- **Self-sovereign identity.** Vox generates an Ed25519 key with an ML-DSA-65 co-key; the fingerprint
+  is SHA-256 over both, so neither can be swapped without changing it. The Ed25519 half has a
+  standard OpenPGP v4 fingerprint. *(ADR-002)*
+- **Hybrid post-quantum cryptography.** Key agreement is X25519 with ML-KEM-768; signatures are
+  Ed25519 with ML-DSA-65 — each classical algorithm concatenated with a lattice one, so breaking one
+  of a pair is not enough. The QUIC handshake is pinned to `X25519MLKEM768`, with no classical group
+  to downgrade to. **If** the lattice halves hold, traffic recorded now stays closed to an adversary
+  who later breaks the classical ones; nobody can tell you they hold, which is the reason for the
+  hybrid. *(ADR-003, ADR-011)*
+- **Chat, agents and tunnels on one overlay.** *(ADR-013, ADR-017, ADR-020)*
+- **Deniability — specified and built, not enabled.** ADR-009 designs message content with no
+  transferable proof of authorship; `vox-core/src/deniable/` implements it, but no release turns it
+  on until its formal analysis and wire codec are done. Treat it as a commitment, not a property you
+  have today. *(ADR-009)*
+
+## Threat model
+
+Vox claims exactly what its controls deliver — **content confidentiality, content authenticity and
+unforgeable membership** — and says what it does not. Where a control rests on a lattice algorithm,
+the claim rests on that algorithm being sound.
+
+**Defended:** an **on-path network adversary** (including an ISP); **platform operators** — there is
+none; **someone who got a room's address and passphrase** — they read nothing until members trust
+them; **device seizure at rest** (a powered-off or locked device) — double-lock at-rest encryption
+and forward secrecy.
+
+**Not defended:** traffic analysis by a global passive adversary (content is protected, patterns are
+not); a running, compromised endpoint; coercion of a participant; availability against a determined
+blocker. **Your OS account is the boundary**: like `gpg-agent`, a node unlocked under your account can
+be used by any program running as you. See [ADR-001](docs/adr/ADR-001-vox-foundation-vision-threat-model-and-principles.md).
+
+## How it is built
+
+Each layer is a decision record in [`docs/adr/`](docs/adr/) (indexed in
+[`docs/adr/README.md`](docs/adr/README.md)), numbered in build order: identity and keys (002),
+crypto policy (003), pairwise channel (004), addressing and join (005), group messaging (006),
+membership and trust (007), replicated log and sync (008), deniability (009), at-rest storage (010),
+transport (011), NAT traversal (012), tunneling (013), clients (014, 015), node runtime (016),
+room-bound services (017), quality bar (018), agent comms (020), and onward.
+
+```
+crates/vox-core/        the shared Rust core: identity, crypto, join, log/sync, trust, at-rest,
+                        transport, NAT, tunneling, the node runtime
+crates/vox-tui/         the `vox` binary: terminal client, CLI verbs, daemon, agent integration
+crates/vox-agentcomms/  the agent message envelope and claim protocol
+docs/adr/               Architecture Decision Records — the design spine
+docs/release/           release plans
+.github/                CI (build and lint) and the release workflow (macOS signed + notarized)
+install.sh              the installer the curl one-liner runs
+```
 
 ## Building
 
-A pure-Rust Cargo workspace. No C or C++ of its own; the one ecosystem-forced native crypto is
-`aws-lc-rs` inside the TLS stack (ADR-011).
+A pure-Rust Cargo workspace; the one native crypto dependency is `aws-lc-rs` inside the TLS stack
+(ADR-011).
 
 ```
-cargo build --workspace
-cargo test --release --workspace -- --ignored     # the proofs
+cargo build --release
 ```
 
-There are no unit tests, by policy. A proof whose prover is missing — an uninstalled shell, a
-release that does not exist yet — is reported **unproven and fails**, rather than skipped quietly;
-accepting a gap means naming it in `VOX_PROOF_ALLOW_UNPROVEN`
-([ADR-018](docs/adr/ADR-018-quality-bar-and-product-proof.md)).
+There are **no unit tests, by policy**. Vox is checked only by using the real `vox` binary the way a
+person would — real nodes, real rooms, real network — and a check's failure must say whether the
+product or the check itself failed. CI compiles and lints every change; the checks are run by hand,
+on demand:
+
+```
+cargo test --release -p vox-tui --test <check> -- --ignored
+```
+
+Heavy, timing-bound or live-model checks need `--features optional-proofs`; see
+[docs/release/optional-proofs.md](docs/release/optional-proofs.md) and
+[ADR-018](docs/adr/ADR-018-quality-bar-and-product-proof.md).
 
 ## Status
 
-Every layer in `vox-core` is implemented to its ADR, and the node runtime has landed through M17.
+**v0.2.10** (October 2026). Linux and macOS, as a terminal client, CLI and daemon. Working today:
+identity and lock/unlock; rooms over the real network through the full NAT ladder; trust-gated
+reading; replication and sync; room-bound services and `ssh` over Vox; key rotation and per-member
+revocation; agent comms for Claude Code, Codex and OpenCode.
 
-- **One device.** Identity behind a masked passphrase, channels double-locked under a channel
-  passphrase, messages appended and rendered, lock and unlock, all surviving restart as sealed
-  segments in a redb store.
-- **Two machines over the real network.** Join, per-sender consent and log sync between separate
-  hosts over QUIC, through the NAT ladder — pinhole, UPnP-IGD mapping, hole punch, and relay through
-  an anchor you run yourself, which holds no room key and can read nothing.
-- **Room-bound services.** `vox serve` offers a local port and prints an invite, `vox connect` joins
-  from it, and `vox up` runs a loopback SOCKS5 proxy resolving the room's `<52-char>.vox` name, so
-  `ssh` reaches the port with one `ProxyCommand` line. Proved by running the real binaries against a
-  real service; also run by hand against a real `sshd` between two clients behind symmetric NAT.
-- **Rotation and per-member revocation.** Revocation is rotation with one member left out, re-keyed
-  at the new generation's origin, so an offline member loses nothing.
-
-Not yet: golden wire-byte vectors for the ADR-008 struct tags (they start mattering now that
-`v0.1.0`'s bytes are what `v0.2.0` must not break), and the macOS client
-([ADR-014](docs/adr/ADR-014-macos-client.md)). Linux and macOS are supported as TUI hosts; iOS is a
-separate future capability.
+Next: the native macOS client ([ADR-014](docs/adr/ADR-014-macos-client.md)) and v0.3.0's work. iOS
+is a separate, later capability.
 
 ## Contributing
 
-Vox is developed capability by capability: each capability is researched, specified as an ADR, and
-only then implemented to completion. Start by reading ADR-001, then the ADR that covers the area you
-want to work on. Discussion of a decision belongs in (or alongside) its ADR.
+Vox is built capability by capability: each is researched, specified as an ADR, then implemented to
+completion. Start with ADR-001, then the ADR for the area you want to work on.
 
 ## License
 

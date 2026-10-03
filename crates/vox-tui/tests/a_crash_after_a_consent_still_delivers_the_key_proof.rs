@@ -26,7 +26,7 @@
 //!
 //! **Asserted,** with hard-coded bounds: in every trial, killed or not, `bob<k>` reads `post <k>`
 //! within [`BOUND`], and still reads no post made before alice trusted him [`HOLD`] later.
-//! Preconditions, or `CANNOT MEASURE`: every `bob<k>` is on alice's roster before she decides;
+//! Preconditions (a vox step that misses one is `PRODUCT (staging)`; too few kill points is `APPARATUS`): every `bob<k>` is on alice's roster before she decides;
 //! alice reads every post she made; at least [`MIN_KILLS`] kill points fell inside a consent; the
 //! sweep ended inside [`MAX_POINTS`]. Every trial prints whether the trust survived the crash.
 //!
@@ -100,12 +100,13 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(text.as_bytes()).expect("write stdin");
+        let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+        pipe.write_all(text.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     let mut err = String::from_utf8_lossy(&out.stderr).into_owned();
     // A process ended by a signal says nothing on stderr: say how it ended, so a verb killed by
     // the watchdog's abort is not read as a verb that failed without a cause (#295).
@@ -123,7 +124,7 @@ fn free_udp_port() -> u16 {
     UdpSocket::bind("127.0.0.1:0")
         .and_then(|s| s.local_addr())
         .map(|a| a.port())
-        .expect("a free port")
+        .expect("APPARATUS: a free port")
 }
 
 /// Start `vox daemon` on `port` with the identity passphrase piped in; `extra` is its environment.
@@ -132,7 +133,7 @@ fn daemon(dir: &Path, port: u16, anchor: &str, tag: &str, extra: &[(&str, &Path)
         .create(true)
         .append(true)
         .open(dir.join(format!("daemon-{tag}.err")))
-        .unwrap();
+        .expect("APPARATUS: open a log file");
     let listen = format!("127.0.0.1:{port}");
     let mut cmd = command(dir, &["daemon", "--listen", &listen, "--anchor", anchor]);
     for (k, v) in extra {
@@ -143,9 +144,10 @@ fn daemon(dir: &Path, port: u16, anchor: &str, tag: &str, extra: &[(&str, &Path)
         .stdout(Stdio::null())
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+        .expect("APPARATUS: spawn vox daemon");
+    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
     Proc(child)
 }
@@ -162,7 +164,7 @@ fn attached(dir: &Path, tag: &str) -> String {
         last = err;
         std::thread::sleep(Duration::from_millis(200));
     }
-    panic!("CANNOT MEASURE: {tag}'s daemon never answered: {last}");
+    panic!("PRODUCT (staging): {tag}'s daemon never answered: {last}");
 }
 
 /// Every `pre <k>` and `post <k>` this profile reads in `room`. A row it cannot open carries a
@@ -173,7 +175,7 @@ fn texts(dir: &Path, room: &str) -> BTreeSet<String> {
         &["room", "read", room, "--json", "--limit", "500"],
         None,
     );
-    assert!(ok, "vox room read --json refused: {err}");
+    assert!(ok, "PRODUCT (staging): vox room read --json refused: {err}");
     out.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -186,7 +188,7 @@ fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
     assert!(
         ok,
-        "CANNOT MEASURE: alice's post {text:?} was refused: {err}"
+        "PRODUCT (staging): alice's post {text:?} was refused: {err}"
     );
 }
 
@@ -201,10 +203,10 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
     // most measured, would ask for 8,838 s, past what any run is given. Two debug runs of this
     // proof took 1,041.7 s and 1,270.0 s.
     watchdog::arm_for_debug_total(Duration::from_millis(1_270_000), 2);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let alice = root.join("alice");
-    std::fs::create_dir_all(alice.join("cfg")).unwrap();
+    std::fs::create_dir_all(alice.join("cfg")).expect("APPARATUS: create a staging directory");
     let arm = root.join("kill-arm");
     let log = root.join("alice-interpose.tsv");
     let interposer = syscalls::interposer().to_path_buf();
@@ -216,7 +218,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
 
     // ---- the anchor, and alice with a room --------------------------------------------------
     let anchor_dir = root.join("anchor");
-    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: create a staging directory");
     let anchor_port = free_udp_port();
     let anchor_out = anchor_dir.join("node.out");
     let _anchor = Proc(
@@ -224,10 +226,12 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
             &anchor_dir,
             &["node", "--listen", &format!("127.0.0.1:{anchor_port}")],
         )
-        .stdout(Stdio::from(std::fs::File::create(&anchor_out).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(&anchor_out).expect("APPARATUS: create a staging file"),
+        ))
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn the anchor"),
+        .expect("APPARATUS: spawn the anchor"),
     );
     let t0 = Instant::now();
     let spec = loop {
@@ -237,12 +241,12 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         }
         assert!(
             t0.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: the anchor printed no spec:\n{out}"
+            "PRODUCT (staging): the anchor printed no spec:\n{out}"
         );
         std::thread::sleep(Duration::from_millis(100));
     };
     let (ok, alice_fp, err) = vox(&alice, &["id"], None);
-    assert!(ok, "vox id: {err}");
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
     let alice_fp = alice_fp.trim().to_owned();
     let alice_port = free_udp_port();
     let mut alice_daemon = daemon(&alice, alice_port, &spec, "alice", &env);
@@ -252,19 +256,33 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         .collect();
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: vox room create: {err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let room = attached(&alice, "alice")
         .split_whitespace()
         .filter(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned)
         .find(|w| !before.contains(w))
-        .expect("CANNOT MEASURE: no new room id in alice's `room list`");
+        .expect("PRODUCT (staging): no new room id in alice's `room list`");
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "CANNOT MEASURE: vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let link = link.trim().to_owned();
+
+    // The recorder's positive control: alice's daemon has opened its store by now, so a log with
+    // no `open` is a recorder that records nothing, and every kill point below would be unarmed.
+    let opens = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.split('\t').nth(2) == Some("open"))
+        .count();
+    assert!(
+        opens > 0,
+        "APPARATUS: the syscall recorder (vox-test-interpose under DYLD_INSERT_LIBRARIES) \
+         recorded no `open` by alice's daemon in {}: it is not recording",
+        log.display()
+    );
 
     // ---- one trial per kill point ----------------------------------------------------------
     let mut made: Vec<String> = Vec::new();
@@ -275,21 +293,29 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
     let mut ended_at = None;
     for k in 1..=MAX_POINTS {
         let bob: PathBuf = root.join(format!("bob{k}"));
-        std::fs::create_dir_all(bob.join("cfg")).unwrap();
+        std::fs::create_dir_all(bob.join("cfg")).expect("APPARATUS: create a staging directory");
         let (ok, bob_fp, err) = vox(&bob, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         let bob_fp = bob_fp.trim().to_owned();
         let (ok, _, err) = vox(&bob, &["trust", "add", &alice_fp, "--name", "alice"], None);
-        assert!(ok, "CANNOT MEASURE: bob{k} trusts alice: {err}");
+        assert!(ok, "PRODUCT (staging): bob{k} trusts alice: {err}");
         let bob_port = free_udp_port();
         let mut bob_daemon = daemon(&bob, bob_port, &spec, "bob", &[]);
         attached(&bob, "bob");
         let (ok, _, err) = vox(
             &bob,
-            &["room", "join", &link, "--name", "r"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &link,
+                "--name",
+                "r",
+            ],
             Some(&format!("{ROOMPASS}\n")),
         );
-        assert!(ok, "CANNOT MEASURE: bob{k} could not join: {err}");
+        assert!(ok, "PRODUCT (staging): bob{k} could not join: {err}");
         let t = Instant::now();
         loop {
             let (_, roster, _) = vox(&alice, &["room", "roster", &room], None);
@@ -298,7 +324,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
             }
             assert!(
                 t.elapsed() < Duration::from_secs(60),
-                "CANNOT MEASURE: bob{k} is not on alice's roster"
+                "PRODUCT (staging): bob{k} is not on alice's roster"
             );
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -322,7 +348,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         while since.elapsed() < QUIET {
             assert!(
                 t.elapsed() < Duration::from_secs(60),
-                "CANNOT MEASURE: alice's store never went quiet before kill point {k}"
+                "PRODUCT (staging): alice's daemon kept flushing its store; it never went quiet before kill point {k}"
             );
             std::thread::sleep(Duration::from_millis(200));
             let now = flushes();
@@ -332,7 +358,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         }
 
         // The decision, with the kill point armed.
-        std::fs::write(&arm, k.to_string()).unwrap();
+        std::fs::write(&arm, k.to_string()).expect("APPARATUS: write a staging file");
         let _ = vox(
             &alice,
             &["trust", "add", &bob_fp, "--name", &format!("bob{k}")],
@@ -342,7 +368,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         while alive(&mut alice_daemon) && t.elapsed() < PAST_THE_END {
             std::thread::sleep(Duration::from_millis(50));
         }
-        std::fs::remove_file(&arm).unwrap();
+        std::fs::remove_file(&arm).expect("APPARATUS: remove a staging file");
         let killed = !alive(&mut alice_daemon);
         if killed {
             kills += 1;
@@ -360,7 +386,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
             // Decided again only if the crash lost the decision itself; otherwise the restarted
             // node must act on what it recorded.
             let (ok, list, err) = vox(&alice, &["trust", "list"], None);
-            assert!(ok, "CANNOT MEASURE: alice's trust list: {err}");
+            assert!(ok, "PRODUCT (staging): alice's trust list: {err}");
             if !list.lines().any(|l| l.trim_start().starts_with(&bob_fp)) {
                 retrusted.push(k);
                 let (ok, _, err) = vox(
@@ -368,7 +394,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
                     &["trust", "add", &bob_fp, "--name", &format!("bob{k}")],
                     None,
                 );
-                assert!(ok, "CANNOT MEASURE: alice re-trusts bob{k}: {err}");
+                assert!(ok, "PRODUCT (staging): alice re-trusts bob{k}: {err}");
             }
         }
         let after = format!("post {k}");
@@ -410,7 +436,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         }
         assert!(
             got.is_some(),
-            "kill point {k}: bob{k} never read `{after}`, made after alice's restart {}— the \
+            "PRODUCT: kill point {k}: bob{k} never read `{after}`, made after alice's restart {}— the \
              restarted node did not deliver the key it had decided to release (alice's daemon {}). \
              His daemon said:\n{}\nalice's said:\n{}\nalice's status:\n{}\nhis status:\n{}",
             if retrusted.contains(&k) {
@@ -447,20 +473,20 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
     );
     assert!(
         missing.is_empty(),
-        "CANNOT MEASURE: alice does not read her own posts {missing:?}"
+        "PRODUCT: alice does not read her own posts {missing:?}"
     );
     assert!(
         leaks.is_empty(),
-        "a consent cut short released posts sealed before it:\n{}",
+        "PRODUCT: a consent cut short released posts sealed before it:\n{}",
         leaks.join("\n")
     );
     assert!(
         ended_at.is_some(),
-        "CANNOT MEASURE: every one of {MAX_POINTS} kill points fell inside a consent"
+        "APPARATUS (precondition not met): every one of {MAX_POINTS} kill points fell inside a consent, and bob read the key after each, so the sweep is too short to reach the consent's end"
     );
     assert!(
         kills >= MIN_KILLS,
-        "CANNOT MEASURE: only {kills} kill point(s) fell inside a consent"
+        "APPARATUS (precondition not met): only {kills} kill point(s) fell inside a consent, and bob read the key after each: too few crashes to measure"
     );
     drop(alice_daemon);
 }

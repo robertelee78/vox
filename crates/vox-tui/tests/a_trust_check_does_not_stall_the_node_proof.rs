@@ -25,7 +25,15 @@
 //! [`LOCAL_BOUND`], and the loaded median must not be more than [`MEDIAN_SLACK`] above the
 //! quiet one. Both are printed with the samples.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_trust_check_does_not_stall_posts_and_reads_on_the_same_node);
 
 #[path = "support/room.rs"]
 mod support;
@@ -43,7 +51,7 @@ fn rss(pid: u32) -> u64 {
     let out = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
-        .expect("ps");
+        .expect("APPARATUS: ps");
     String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse::<u64>()
@@ -65,16 +73,16 @@ const CHECKERS: usize = 4;
 fn post_then_read(w: &Worker, r: &str, tag: &str) -> Duration {
     let started = Instant::now();
     let o = w.vox(Some("s"), &["room", "post", r, tag]);
-    assert!(o.ok, "post {tag}: {o:?}");
+    assert!(o.ok, "PRODUCT: post {tag}: {o:?}");
     loop {
         let o = w.vox(None, &["room", "read", r]);
-        assert!(o.ok, "read: {o:?}");
+        assert!(o.ok, "PRODUCT: read: {o:?}");
         if o.stdout.contains(tag) {
             return started.elapsed();
         }
         assert!(
             started.elapsed() < Duration::from_secs(30),
-            "{tag} never became readable on its own node"
+            "PRODUCT (staging): {tag} never became readable on its own node"
         );
     }
 }
@@ -83,7 +91,7 @@ fn stats(label: &str, v: &[Duration]) -> (Duration, Duration) {
     let mut s = v.to_vec();
     s.sort();
     let median = s[s.len() / 2];
-    let max = *s.last().unwrap();
+    let max = *s.last().expect("APPARATUS: no samples");
     eprintln!(
         "[proof] {label}: n={} min={:?} median={median:?} p90={:?} max={max:?}",
         s.len(),
@@ -93,20 +101,25 @@ fn stats(label: &str, v: &[Duration]) -> (Duration, Duration) {
     (median, max)
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "two networked nodes with production Argon2id; CI runs it in release"]
+#[ignore = "two networked nodes with production Argon2id; optional, run it in release"]
 fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: start a runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let alice = &room.workers[0];
     let r = room.id.as_str();
-    let pass = alice.pass.to_str().unwrap().to_owned();
+    let pass = alice
+        .pass
+        .to_str()
+        .expect("APPARATUS: a path that is not UTF-8")
+        .to_owned();
 
     let quiet: Vec<Duration> = (0..SAMPLES)
         .map(|i| post_then_read(alice, r, &format!("QUIET-{i:02}")))
@@ -124,7 +137,7 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
                         None,
                         &["trust", "list", "--identity-passphrase-file", &pass],
                     );
-                    assert!(o.ok, "trust list: {o:?}");
+                    assert!(o.ok, "PRODUCT (staging): trust list: {o:?}");
                     checks.fetch_add(1, Ordering::SeqCst);
                 }
             });
@@ -142,7 +155,7 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
         while v.len() < SAMPLES || checks.load(Ordering::SeqCst) - before < 2 * CHECKERS {
             assert!(
                 window.elapsed() < Duration::from_secs(60),
-                "the loaded phase never saw {} trust checks finish ({} did)",
+                "PRODUCT: the loaded phase never saw {} trust checks finish ({} did)",
                 2 * CHECKERS,
                 checks.load(Ordering::SeqCst) - before
             );
@@ -158,9 +171,10 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
         checks.load(Ordering::SeqCst)
     );
     // ---- the flood: 32 wrong-passphrase checks at once ----
-    let daemon = alice.daemon_pid().expect("alice's daemon");
+    let daemon = alice.daemon_pid().expect("PRODUCT: alice's daemon");
     let wrong = tmp.path().join("wrong.pass");
-    std::fs::write(&wrong, "not the identity passphrase\n").unwrap();
+    std::fs::write(&wrong, "not the identity passphrase\n")
+        .expect("APPARATUS: write a staging file");
     let base_rss = rss(daemon);
     let done = Arc::new(AtomicUsize::new(0));
     let (peak, flood_posts) = std::thread::scope(|scope| {
@@ -173,10 +187,10 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
                         "trust",
                         "list",
                         "--identity-passphrase-file",
-                        wrong.to_str().unwrap(),
+                        wrong.to_str().expect("APPARATUS: a path that is not UTF-8"),
                     ],
                 );
-                assert!(!o.ok, "a wrong passphrase must be refused: {o:?}");
+                assert!(!o.ok, "PRODUCT: a wrong passphrase must be refused: {o:?}");
                 done.fetch_add(1, Ordering::SeqCst);
             });
         }
@@ -186,7 +200,7 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
         while done.load(Ordering::SeqCst) < FLOOD {
             assert!(
                 started.elapsed() < Duration::from_secs(300),
-                "the flood never drained: {} of {FLOOD} checks answered",
+                "PRODUCT: the flood never drained: {} of {FLOOD} checks answered",
                 done.load(Ordering::SeqCst)
             );
             peak = peak.max(rss(daemon));
@@ -201,7 +215,7 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
     let after = alice.vox(None, &["room", "list"]);
     assert!(
         after.ok,
-        "the daemon must still answer after the flood: {after:?}"
+        "PRODUCT: the daemon must still answer after the flood: {after:?}"
     );
     eprintln!(
         "[proof] flood: {FLOOD} wrong-passphrase checks; daemon RSS {} MiB before, peak {} MiB \
@@ -214,25 +228,25 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
     let (_, flood_max) = stats("flood  post → readable", &flood_posts);
     assert!(
         peak.saturating_sub(base_rss) <= FLOOD_HEADROOM,
-        "the flood raised the daemon's resident memory by {} MiB, past {} MiB: checks are \
+        "PRODUCT: the flood raised the daemon's resident memory by {} MiB, past {} MiB: checks are \
          not bounded",
         peak.saturating_sub(base_rss) >> 20,
         FLOOD_HEADROOM >> 20
     );
     assert!(
         flood_max < LOCAL_BOUND,
-        "a post waited {flood_max:?} during the flood (bound {LOCAL_BOUND:?})"
+        "PRODUCT: a post waited {flood_max:?} during the flood (bound {LOCAL_BOUND:?})"
     );
 
     let (quiet_median, _) = stats("quiet  post → readable", &quiet);
     let (loaded_median, loaded_max) = stats("loaded post → readable", &loaded);
     assert!(
         loaded_max < LOCAL_BOUND,
-        "a post waited {loaded_max:?} behind concurrent trust checks (bound {LOCAL_BOUND:?})"
+        "PRODUCT: a post waited {loaded_max:?} behind concurrent trust checks (bound {LOCAL_BOUND:?})"
     );
     assert!(
         loaded_median <= quiet_median + MEDIAN_SLACK,
-        "concurrent trust checks raised the median from {quiet_median:?} to {loaded_median:?} \
+        "PRODUCT: concurrent trust checks raised the median from {quiet_median:?} to {loaded_median:?} \
          (slack {MEDIAN_SLACK:?})"
     );
 }

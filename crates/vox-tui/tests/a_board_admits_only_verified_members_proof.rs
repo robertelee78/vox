@@ -53,7 +53,7 @@
 //! **Every red names its side.** An attack the node carried is `PRODUCT:`. A staging step the
 //! product performs (a join, a control circuit, the anchor taking a room) is `PRODUCT (staging):`.
 //! A record the attacker could not build, or a temp file it could not write, is
-//! `CANNOT MEASURE (harness error):`.
+//! `APPARATUS (harness error):`.
 //!
 //! **Mutations that must turn it red**, one assertion each:
 //! - (2) `nat::service`'s `put`: take a peer's genesis on any board (drop the `serve_any_room`
@@ -317,8 +317,7 @@ fn feed_entry(author: &dyn RootSigner, room: Digest32, prev: &[Entry], payload: 
         claimed_ms: 0,
         seen: Vec::new(),
     };
-    Entry::build_signed(author, skeleton, payload)
-        .expect("CANNOT MEASURE (harness error): a feed entry")
+    Entry::build_signed(author, skeleton, payload).expect("APPARATUS (harness error): a feed entry")
 }
 
 /// Deliver `skdm` to the node on `conn` as a member's node does: a session opened from the node's
@@ -330,14 +329,13 @@ async fn deliver_key(
     bundle: &PrekeyBundlePublic,
     skdm: &Skdm,
 ) -> (bool, String) {
-    let ik = X25519IdentityKey::generate().expect("CANNOT MEASURE (harness error): a DH key");
+    let ik = X25519IdentityKey::generate().expect("APPARATUS (harness error): a DH key");
     let (initial, mut session) =
         Session::initiate(&ik, bundle, &room, 0, VOX_SUITE_1.id, SuiteFloor::DAY_ONE)
-            .expect("CANNOT MEASURE (harness error): a session from the victim's bundle");
+            .expect("APPARATUS (harness error): a session from the victim's bundle");
     let frames = vec![
         hello_frame(&room, &initial),
-        skdm_frame(&room, &mut session, skdm)
-            .expect("CANNOT MEASURE (harness error): the sealed key"),
+        skdm_frame(&room, &mut session, skdm).expect("APPARATUS (harness error): the sealed key"),
     ];
     let mut recv = match write_pairwise(conn, &frames).await {
         Ok(r) => r,
@@ -355,7 +353,7 @@ async fn deliver_key(
 #[ignore = "real vox processes with production Argon2id and two real joins; run in release"]
 fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("CANNOT MEASURE (harness error): a temp dir");
+    let tmp = tempfile::tempdir().expect("APPARATUS (harness error): a temp dir");
     let (anchor_dir, victim_dir, bravo_dir, charlie_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "victim"),
@@ -364,7 +362,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     );
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n"))
-        .expect("CANNOT MEASURE (harness error): the identity passphrase file");
+        .expect("APPARATUS (harness error): the identity passphrase file");
 
     // ---- the real room ------------------------------------------------------------------
     let anchor_port = free_port();
@@ -384,7 +382,19 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let (room, link) = create_room(&victim_dir, "team", ROOM_PASS);
     for (name, dir) in [("bravo", &bravo_dir), ("charlie", &charlie_dir)] {
         let d = daemon(name, dir, free_port(), &spec, &pass_file);
-        let (ok, out, err) = vox_in(dir, &["room", "join", &link, "--name", "team"], ROOM_PASS);
+        let (ok, out, err) = vox_in(
+            dir,
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &link,
+                "--name",
+                "team",
+            ],
+            ROOM_PASS,
+        );
         assert!(
             ok,
             "PRODUCT (staging): {name} could not join the room: {out}{err}"
@@ -397,10 +407,10 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let charlie = member_signer(&charlie_dir);
     let victim_addr = format!("127.0.0.1:{victim_port}")
         .parse()
-        .expect("CANNOT MEASURE (harness error): the victim's address");
+        .expect("APPARATUS (harness error): the victim's address");
     let anchor_addr = format!("127.0.0.1:{anchor_port}")
         .parse()
-        .expect("CANNOT MEASURE (harness error): the anchor's address");
+        .expect("APPARATUS (harness error): the anchor's address");
 
     let rt = Rt::new();
     let (b1, bravo_v) = rt.block_on(connect(&*bravo, victim_addr, victim_id));
@@ -439,39 +449,38 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     };
     let genesis = Genesis::create(&s, hostile::now(), policy)
-        .expect("CANNOT MEASURE (harness error): the stranger's genesis");
+        .expect("APPARATUS (harness error): the stranger's genesis");
     let fake = genesis.channel_id();
     let minted = genesis.to_wire();
     let t = hostile::now();
     let ring2 = PrekeyRing::generate(&s2, &[0x3D; 32], t)
-        .expect("CANNOT MEASURE (harness error): a prekey ring");
+        .expect("APPARATUS (harness error): a prekey ring");
     let witness = JoinWitness::build(&s, &fake, 0, &s2.fingerprint(), t)
-        .expect("CANNOT MEASURE (harness error): a join witness");
+        .expect("APPARATUS (harness error): a join witness");
     let s2_bundle = MemberBundleRecord::build(
         &s2,
         &fake,
         0,
         ring2
             .bundle(&s2.public_key())
-            .expect("CANNOT MEASURE (harness error): a prekey bundle"),
+            .expect("APPARATUS (harness error): a prekey bundle"),
         1,
         t,
         3600,
         Admission::Witnessed(Box::new(witness)),
     )
-    .expect("CANNOT MEASURE (harness error): the second identity's bundle")
+    .expect("APPARATUS (harness error): the second identity's bundle")
     .to_wire();
     let s2_address = RendezvousRecord::build(
         &s2,
         &fake,
         0,
-        EndpointList::new(Vec::new())
-            .expect("CANNOT MEASURE (harness error): an empty endpoint list"),
+        EndpointList::new(Vec::new()).expect("APPARATUS (harness error): an empty endpoint list"),
         1,
         t,
         3600,
     )
-    .expect("CANNOT MEASURE (harness error): the second identity's address record")
+    .expect("APPARATUS (harness error): the second identity's address record")
     .to_wire();
     let (_s1, s_v) = rt.block_on(connect(&s, victim_addr, victim_id));
     let (_s3, s2_v) = rt.block_on(connect(&s2, victim_addr, victim_id));
@@ -504,24 +513,23 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     // ---- 3. a key nobody witnessed, vouched for by a real member ---------------------------
     let x = stranger(0x77);
     let t = hostile::now();
-    let ring = PrekeyRing::generate(&x, &[0x3C; 32], t)
-        .expect("CANNOT MEASURE (harness error): a prekey ring");
+    let ring =
+        PrekeyRing::generate(&x, &[0x3C; 32], t).expect("APPARATUS (harness error): a prekey ring");
     let bundle = ring
         .bundle(&x.public_key())
-        .expect("CANNOT MEASURE (harness error): a prekey bundle");
+        .expect("APPARATUS (harness error): a prekey bundle");
     let x_bundle = MemberBundleRecord::build(&x, &room, 0, bundle, 1, t, 3600, Admission::Creator)
-        .expect("CANNOT MEASURE (harness error): X's bundle");
+        .expect("APPARATUS (harness error): X's bundle");
     let x_address = RendezvousRecord::build(
         &x,
         &room,
         0,
-        EndpointList::new(Vec::new())
-            .expect("CANNOT MEASURE (harness error): an empty endpoint list"),
+        EndpointList::new(Vec::new()).expect("APPARATUS (harness error): an empty endpoint list"),
         1,
         t,
         3600,
     )
-    .expect("CANNOT MEASURE (harness error): X's address record");
+    .expect("APPARATUS (harness error): X's address record");
     let vouched = rt.block_on(put(&bravo_v, &x_bundle.to_wire()));
     println!("[proof] step: bravo publishes X's bundle with no witness → {vouched:?}");
     let (_x1, x_v) = rt.block_on(connect(&x, victim_addr, victim_id));
@@ -543,34 +551,33 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let forger = stranger(0x79);
     let t = hostile::now();
     let ring = PrekeyRing::generate(&x2, &[0x3E; 32], t)
-        .expect("CANNOT MEASURE (harness error): a prekey ring");
+        .expect("APPARATUS (harness error): a prekey ring");
     let mut forged = JoinWitness::build(&forger, &room, 0, &x2.fingerprint(), t)
-        .expect("CANNOT MEASURE (harness error): the forged witness");
+        .expect("APPARATUS (harness error): the forged witness");
     forged.witness_id = bravo_id;
     let x2_bundle = MemberBundleRecord::build(
         &x2,
         &room,
         0,
         ring.bundle(&x2.public_key())
-            .expect("CANNOT MEASURE (harness error): a prekey bundle"),
+            .expect("APPARATUS (harness error): a prekey bundle"),
         1,
         t,
         3600,
         Admission::Witnessed(Box::new(forged)),
     )
-    .expect("CANNOT MEASURE (harness error): X2's bundle")
+    .expect("APPARATUS (harness error): X2's bundle")
     .to_wire();
     let x2_address = RendezvousRecord::build(
         &x2,
         &room,
         0,
-        EndpointList::new(Vec::new())
-            .expect("CANNOT MEASURE (harness error): an empty endpoint list"),
+        EndpointList::new(Vec::new()).expect("APPARATUS (harness error): an empty endpoint list"),
         1,
         t,
         3600,
     )
-    .expect("CANNOT MEASURE (harness error): X2's address record")
+    .expect("APPARATUS (harness error): X2's address record")
     .to_wire();
     let (_x2, x2_v) = rt.block_on(connect(&x2, victim_addr, victim_id));
     let forged_bundle = rt.block_on(put(&x2_v, &x2_bundle));
@@ -591,20 +598,19 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let p = stranger(0x81);
     let q = stranger(0x82);
     let t = hostile::now();
-    let qring = PrekeyRing::generate(&q, &[0x3F; 32], t)
-        .expect("CANNOT MEASURE (harness error): a prekey ring");
+    let qring =
+        PrekeyRing::generate(&q, &[0x3F; 32], t).expect("APPARATUS (harness error): a prekey ring");
     let q_prejoin = PreJoinRecord::build(
         &q,
         &room,
         qring
             .bundle(&q.public_key())
-            .expect("CANNOT MEASURE (harness error): a prekey bundle"),
-        EndpointList::new(Vec::new())
-            .expect("CANNOT MEASURE (harness error): an empty endpoint list"),
+            .expect("APPARATUS (harness error): a prekey bundle"),
+        EndpointList::new(Vec::new()).expect("APPARATUS (harness error): an empty endpoint list"),
         1,
         t,
     )
-    .expect("CANNOT MEASURE (harness error): Q's pre-join")
+    .expect("APPARATUS (harness error): Q's pre-join")
     .to_wire();
     let (_p1, p_v) = rt.block_on(connect(&p, victim_addr, victim_id));
     let (_p2, p_a) = rt.block_on(connect(&p, anchor_addr, anchor_id));
@@ -645,25 +651,25 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let f2_forger = stranger(0x93);
     let t = hostile::now();
     let f1_ring = PrekeyRing::generate(&f1, &[0x40; 32], t)
-        .expect("CANNOT MEASURE (harness error): a prekey ring");
+        .expect("APPARATUS (harness error): a prekey ring");
     let f1_bundle = MemberBundleRecord::build(
         &f1,
         &room,
         0,
         f1_ring
             .bundle(&f1.public_key())
-            .expect("CANNOT MEASURE (harness error): a prekey bundle"),
+            .expect("APPARATUS (harness error): a prekey bundle"),
         1,
         t,
         3600,
         Admission::Creator,
     )
-    .expect("CANNOT MEASURE (harness error): F1's bundle")
+    .expect("APPARATUS (harness error): F1's bundle")
     .to_wire();
     let f2_ring = PrekeyRing::generate(&f2, &[0x41; 32], t)
-        .expect("CANNOT MEASURE (harness error): a prekey ring");
+        .expect("APPARATUS (harness error): a prekey ring");
     let mut f2_witness = JoinWitness::build(&f2_forger, &room, 0, &f2.fingerprint(), t)
-        .expect("CANNOT MEASURE (harness error): F2's forged witness");
+        .expect("APPARATUS (harness error): F2's forged witness");
     f2_witness.witness_id = bravo_id;
     let f2_bundle = MemberBundleRecord::build(
         &f2,
@@ -671,32 +677,32 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         0,
         f2_ring
             .bundle(&f2.public_key())
-            .expect("CANNOT MEASURE (harness error): a prekey bundle"),
+            .expect("APPARATUS (harness error): a prekey bundle"),
         1,
         t,
         3600,
         Admission::Witnessed(Box::new(f2_witness)),
     )
-    .expect("CANNOT MEASURE (harness error): F2's bundle")
+    .expect("APPARATUS (harness error): F2's bundle")
     .to_wire();
     // F1's log, as its node would write it once admitted: a consent grant naming the victim,
     // then a post under a fresh sender key. The key is F1's to deliver, over its own connection.
     let room_ref = b32_encode(&room);
     let mut f1_chain = SenderChain::new(&room, 0, &f1.fingerprint(), 0, t)
-        .expect("CANNOT MEASURE (harness error): F1's sender key");
+        .expect("APPARATUS (harness error): F1's sender key");
     let (iteration, chain_key) = f1_chain.current_position();
     let f1_skdm = f1_chain
         .skdm_for(&f1, iteration, chain_key)
-        .expect("CANNOT MEASURE (harness error): F1's key message");
+        .expect("APPARATUS (harness error): F1's key message");
     let grant = issue_consent_grant(&f1, &room, 0, victim_id, &f1_skdm, HistoryMode::ForwardOnly)
-        .expect("CANNOT MEASURE (harness error): F1's consent grant")
+        .expect("APPARATUS (harness error): F1's consent grant")
         .to_wire();
     let post = Content::text(t * 1000, FORGED_POST)
-        .expect("CANNOT MEASURE (harness error): F1's post")
+        .expect("APPARATUS (harness error): F1's post")
         .to_canonical_vec();
     let sealed = f1_chain
         .encrypt(&post)
-        .expect("CANNOT MEASURE (harness error): F1's sealed post")
+        .expect("APPARATUS (harness error): F1's sealed post")
         .to_wire();
     let mut f1_log = vec![feed_entry(&f1, room, &[], grant)];
     f1_log.push(feed_entry(&f1, room, &f1_log, sealed));
@@ -744,7 +750,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     );
     assert!(
         answered >= 1,
-        "CANNOT MEASURE (harness error): the victim asked bravo's board {asked} time(s) but the \
+        "APPARATUS (harness error): the victim asked bravo's board {asked} time(s) but the \
          test could not answer it in full"
     );
     // The victim admits from what it read before its session goes on; give its view a moment to
@@ -752,7 +758,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     std::thread::sleep(Duration::from_secs(3));
     let mut sync = rt
         .block_on(open_sync(&bravo_v2, rt.handle().clone(), &room, 0))
-        .expect("CANNOT MEASURE (harness error): bravo's sync stream to the victim");
+        .expect("PRODUCT (staging): bravo's sync stream to the victim");
     let session = frontier_session_room(&mut sync, &*feed);
     let sent = feed.served.load(Ordering::SeqCst);
     println!(
@@ -774,9 +780,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
             set
         })
         .unwrap_or_else(|e| {
-            panic!(
-                "CANNOT MEASURE (harness error): the test could not read the victim's board: {e:?}"
-            )
+            panic!("PRODUCT (staging): the test could not read the victim's board: {e:?}")
         })
         .bundles
         .into_iter()

@@ -24,14 +24,28 @@
 //! restart (samples 1–4 at 250–258 ms against sample 0's 6–30 ms, both trees), and could keep it:
 //! CI run 36418572653 had a sample at 30065 ms after the anchor closed the restarted process's
 //! connection. The anchor now supersedes another process's connections outright, so every restart
-//! sample is asserted under [`RESTART_WITHIN`], and the anchor must say it superseded the previous
-//! process on each restart and never put the restarted guest to a tie-break.
+//! sample reached on its first attempt is asserted under [`RESTART_WITHIN`], and the anchor must
+//! say it superseded the previous process on each restart and never put the restarted guest to a
+//! tie-break. A sample whose first attempt found no anchor connected yet ("no peer is connected to
+//! carry a circuit") waited on its own start-up, not on its predecessor, and `vox forward` retries
+//! it 500 ms later: it is held to R42 and not to the restart bound (seen at 861 ms, 2 attempts, on
+//! 2026-10-02). A run with no restart reached on its first attempt is CANNOT MEASURE.
 //!
 //! Mutations: make the ladder's circuit rung wait (or remove it) and every sample either exceeds
-//! [`R42`] or never connects; stop superseding another process's connections and the restart
-//! samples exceed [`RESTART_WITHIN`], with no supersede said.
+//! [`R42`] or never connects; stop superseding another process's connections and the anchor says
+//! no supersede and weighs the restarts in tie-breaks (run 2026-10-02: "superseded the guest's
+//! previous process 0 time(s) in 4 restarts", 2 tie-breaks; the restarts themselves took
+//! 261–292 ms, inside [`RESTART_WITHIN`]).
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_first_relayed_connection_completes_in_under_two_seconds);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -51,9 +65,15 @@ use world::round_trip;
 const R42: Duration = Duration::from_secs(2);
 /// Cold first connections measured; the bound is asserted on every one.
 const SAMPLES: usize = 5;
-/// A restart (samples 1 on) connects this fast: under the 250 ms a probe of the dead predecessor
-/// cost, with margin for a loaded box. Sample 0 took 6–30 ms.
-const RESTART_WITHIN: Duration = Duration::from_millis(150);
+/// A restart (samples 1 on) connects this fast: a relayed reach's direct head start (V210-122,
+/// 250 ms, which every sample pays: the guest has no direct candidate) plus 150 ms, under the head
+/// start plus the 250 ms a probe of the dead predecessor cost. Before the head start, sample 0 took
+/// 6–30 ms and the bound was 150 ms; after it, every sample took 261–281 ms (2026-10-02), and a
+/// fixed 150 ms read every restart as a wait on its predecessor.
+const RESTART_WITHIN: Duration =
+    vox_core::node::network::DIRECT_HEAD_START.saturating_add(Duration::from_millis(150));
+/// What `vox forward` says of an attempt made before its node had any anchor connected.
+const NO_HELPER_YET: &str = "no peer is connected to carry a circuit";
 /// What the anchor says when a newcomer supersedes another process of its identity.
 const SUPERSEDED: &str = "a new connection is from a new process of this identity";
 
@@ -73,25 +93,28 @@ fn reached(transcript: &str) -> Option<(u64, String)> {
     })
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+#[ignore = "real binaries, production Argon2id and a PoW; optional, run it in release"]
 fn a_first_relayed_connection_completes_in_under_two_seconds() {
     watchdog::arm();
     let mut w = RelayWorld::new(Split::Families);
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT PROVE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
 
     let guest_fp = {
         let (ok, out, err) = world::vox_once(&w.guest_dir, &world::args(&["id"]));
-        assert!(ok, "vox id (guest): {err}");
+        assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
         out.trim().chars().take(26).collect::<String>()
     };
     // Only what the anchor says from the first forward on counts for the restart claims.
     let mark = w.anchor.proc.transcript().lines().count();
     let mut samples: Vec<(u64, String)> = Vec::new();
+    // Per sample: an attempt before the one that got through found no anchor connected yet.
+    let mut before_its_anchor: Vec<bool> = Vec::new();
     for n in 0..SAMPLES {
         // A fresh `vox forward` each time: the previous one's process is killed by its PID first.
         drop(w.fwd.take());
@@ -100,20 +123,32 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
         let back =
             round_trip(at, payload.as_bytes(), Duration::from_secs(120)).unwrap_or_else(|e| {
                 panic!(
-                    "CANNOT PROVE (sample {n}): no echo through the forward ({e}).\n{}",
-                    w.fwd.as_mut().unwrap().transcript()
+                    "PRODUCT (sample {n}): no echo through the forward ({e}).\n{}",
+                    w.fwd
+                        .as_mut()
+                        .map(world::VoxProc::transcript)
+                        .unwrap_or_default()
                 )
             });
         assert_eq!(
             back,
             payload.as_bytes(),
-            "sample {n}: the echo came back changed"
+            "PRODUCT: sample {n}: the echo came back changed"
         );
         w.expect_still_relayed();
-        let said = w.fwd.as_mut().unwrap().transcript();
+        let said = w
+            .fwd
+            .as_mut()
+            .map(world::VoxProc::transcript)
+            .unwrap_or_default();
         let sample = reached(&said).unwrap_or_else(|| {
-            panic!("sample {n}: the forward never said how long reaching the host took:\n{said}")
+            panic!("PRODUCT: sample {n}: the forward never said how long reaching the host took:\n{said}")
         });
+        before_its_anchor.push(
+            said.lines()
+                .take_while(|l| !l.contains("vox: reached "))
+                .any(|l| l.contains(NO_HELPER_YET)),
+        );
         samples.push(sample);
     }
     w.assert_relayed("after the samples");
@@ -141,7 +176,7 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
     for (m, line) in &samples {
         assert!(
             Duration::from_millis(*m) < R42,
-            "a first relayed connection took {m} ms, over PRD-001 R42's {R42:?}: {line}"
+            "PRODUCT: a first relayed connection took {m} ms, over PRD-001 R42's {R42:?}: {line}"
         );
     }
     // ---- a restart is as quick as a first start, and the anchor supersedes, never weighs ----
@@ -168,23 +203,37 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
         SAMPLES - 1,
         weighed.len()
     );
+    let mut judged = 0;
     for (n, (m, line)) in samples.iter().enumerate().skip(1) {
+        if before_its_anchor[n] {
+            eprintln!(
+                "[proof] restart {n}: {m} ms, not held to {RESTART_WITHIN:?}: an attempt before it \
+                 found no anchor connected yet ({NO_HELPER_YET:?}), a wait on its own start-up"
+            );
+            continue;
+        }
+        judged += 1;
         assert!(
             Duration::from_millis(*m) < RESTART_WITHIN,
-            "restart {n} took {m} ms, over {RESTART_WITHIN:?} — a restarted process waited on its \
+            "PRODUCT: restart {n} took {m} ms, over {RESTART_WITHIN:?} — a restarted process waited on its \
              dead predecessor: {line}\nthe anchor said:\n{}",
             anchor_said.join("\n")
         );
     }
     assert!(
+        judged > 0,
+        "CANNOT MEASURE: every restart's first attempt found no anchor connected yet, so none \
+         measures a wait on a predecessor"
+    );
+    assert!(
         superseded >= SAMPLES - 1,
-        "the anchor superseded the guest's previous process {superseded} time(s) in {} restarts:\n{}",
+        "PRODUCT: the anchor superseded the guest's previous process {superseded} time(s) in {} restarts:\n{}",
         SAMPLES - 1,
         anchor_said.join("\n")
     );
     assert!(
         weighed.is_empty(),
-        "the anchor put a restarted guest to a tie-break against its predecessor:\n{}",
+        "PRODUCT: the anchor put a restarted guest to a tie-break against its predecessor:\n{}",
         anchor_said.join("\n")
     );
 }

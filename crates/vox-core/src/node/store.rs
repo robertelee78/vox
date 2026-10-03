@@ -86,6 +86,11 @@ pub const TEST_REPLACE_PAUSE_ENV: &str = "VOX_TEST_REPLACE_PAUSE_MS";
 pub struct Store {
     db: RwLock<Backing>,
     path: PathBuf,
+    /// The profile directory's lock, when this store is a profile's (V210-100). Declared after
+    /// `db` so it is released only after the database is closed: the store goes with its last
+    /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
+    /// store the other was still closing and be refused.
+    _lock: Option<std::fs::File>,
 }
 
 /// How the store's file is open.
@@ -141,6 +146,7 @@ impl Store {
         let store = Self {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
+            _lock: None,
         };
         store.init_schema()?;
         Ok(store)
@@ -162,6 +168,7 @@ impl Store {
         let store = Self {
             db: RwLock::new(Backing::ReadOnly(db)),
             path: path.to_owned(),
+            _lock: None,
         };
         if store.schema_is_current()? {
             Ok(store)
@@ -169,6 +176,14 @@ impl Store {
             drop(store);
             Self::open(path)
         }
+    }
+
+    /// Keep `lock` (the profile directory's) for as long as this store is open, releasing it only
+    /// after the database is closed (V210-100).
+    #[must_use]
+    pub fn keep_lock(mut self, lock: std::fs::File) -> Self {
+        self._lock = Some(lock);
+        self
     }
 
     /// Reopen a read-only store writable; a no-op for one that already is.
@@ -650,6 +665,50 @@ impl Batch<'_> {
         let key: SegmentKey = (*channel, kind_code(kind), id);
         let existed = t.remove(key).map_err(storage("delete segment"))?.is_some();
         Ok(existed)
+    }
+
+    /// Queue the removal of everything this node holds **as a member** of `channel`: its SEK
+    /// wrap and every segment sealed under that SEK (V210-164). An anchor's copy of the room
+    /// (`AnchorLog`, `AnchorMeta`) is a separate role and stays. Returns how many rows went.
+    pub fn delete_room(&mut self, channel: &Digest32) -> Result<usize> {
+        let mut removed = 0usize;
+        {
+            let mut t = self
+                .txn
+                .open_table(SEGMENTS)
+                .map_err(storage("open segments"))?;
+            for kind in [
+                SegmentKind::LogDb,
+                SegmentKind::PlaintextCache,
+                SegmentKind::Index,
+                SegmentKind::KeyMaterial,
+            ] {
+                let lo: SegmentKey = (*channel, kind_code(kind), 0);
+                let hi: SegmentKey = (*channel, kind_code(kind), u64::MAX);
+                let keys: Vec<SegmentKey> = t
+                    .range(lo..=hi)
+                    .map_err(storage("range segments"))?
+                    .map(|item| item.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(storage("iterate segments"))?;
+                for key in keys {
+                    t.remove(key).map_err(storage("delete segment"))?;
+                    removed += 1;
+                }
+            }
+        }
+        let mut wraps = self
+            .txn
+            .open_table(SEK_WRAPS)
+            .map_err(storage("open sek_wraps"))?;
+        if wraps
+            .remove(*channel)
+            .map_err(storage("delete sek wrap"))?
+            .is_some()
+        {
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     /// Queue a public metadata write (see [`Store::put_meta`]).

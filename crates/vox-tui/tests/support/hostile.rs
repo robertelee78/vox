@@ -25,7 +25,7 @@ use vox_core::transport::streams::{accept_typed, open_typed, StreamKind};
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("APPARATUS: the clock went backwards")
         .as_secs()
 }
 
@@ -41,7 +41,7 @@ impl Rt {
                 .worker_threads(4)
                 .enable_all()
                 .build()
-                .unwrap(),
+                .expect("APPARATUS: start a runtime"),
         ))
     }
 }
@@ -49,7 +49,9 @@ impl Rt {
 impl std::ops::Deref for Rt {
     type Target = tokio::runtime::Runtime;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
+        self.0
+            .as_ref()
+            .expect("APPARATUS: a process the proof started")
     }
 }
 
@@ -63,7 +65,8 @@ impl Drop for Rt {
 
 /// A fresh identity, deterministic from `seed`.
 pub fn stranger(seed: u8) -> SoftwareRootSigner {
-    SoftwareRootSigner::from_component_seeds(&[seed; 32], &[seed ^ 0x5A; 32]).unwrap()
+    SoftwareRootSigner::from_component_seeds(&[seed; 32], &[seed ^ 0x5A; 32])
+        .expect("APPARATUS: build the stand-in peer's signer")
 }
 
 /// Connect to the node at `addr`, pinned to its fingerprint `id`, as `signer`. The endpoint
@@ -80,7 +83,13 @@ pub async fn connect<S: vox_core::identity::composite::RootSigner>(
     } else {
         "127.0.0.1:0"
     };
-    let endpoint = VoxEndpoint::bind(signer, local.parse().unwrap()).unwrap();
+    let endpoint = VoxEndpoint::bind(
+        signer,
+        local
+            .parse()
+            .expect("APPARATUS: a socket address the proof wrote"),
+    )
+    .expect("APPARATUS: bind the stand-in peer's endpoint");
     let conn = endpoint
         .connect(addr, id, now())
         .await
@@ -189,14 +198,14 @@ pub fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
+    let out = child.wait_with_output().expect("APPARATUS: vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -207,16 +216,16 @@ pub fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String)
 /// A free loopback UDP port.
 pub fn free_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
+        .expect("APPARATUS: bind a socket")
         .local_addr()
-        .unwrap()
+        .expect("APPARATUS: read a socket the proof bound")
         .port()
 }
 
 /// A profile directory (with its config dir) under `root`.
 pub fn profile_dir(root: &Path, name: &str) -> PathBuf {
     let d = root.join(name);
-    std::fs::create_dir_all(d.join("cfg")).unwrap();
+    std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     d
 }
 
@@ -234,7 +243,7 @@ pub fn anchor_with(data: &Path, listen: &str, extra: &[&str]) -> (VoxProc, Strin
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .unwrap()
+        .expect("APPARATUS: the line matched for the spec holds it")
         .to_owned();
     (p, spec)
 }
@@ -242,9 +251,10 @@ pub fn anchor_with(data: &Path, listen: &str, extra: &[&str]) -> (VoxProc, Strin
 /// The fingerprint `vox id` prints for the profile at `data` (creating the identity).
 pub fn fingerprint(data: &Path) -> Digest32 {
     let (ok, out, err) = vox_once(data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
-    vox_core::node::link::b32_decode(out.trim(), "fingerprint")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: vox id printed no fingerprint ({e:?}): {out}"))
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
+    vox_core::node::link::b32_decode(out.trim(), "fingerprint").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): vox id printed no fingerprint ({e:?}): {out}")
+    })
 }
 
 /// Start `vox daemon` on `127.0.0.1:port` for `data` and wait until it answers.
@@ -259,7 +269,9 @@ pub fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) 
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -269,29 +281,33 @@ pub fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) 
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 /// Create room `name` on the daemon at `data`; returns its id and an invite link.
 pub fn create_room(data: &Path, name: &str, pass: &str) -> (Digest32, String) {
-    let (ok, out, err) = vox_in(data, &["room", "create", "--name", name], pass);
-    assert!(ok, "CANNOT MEASURE: vox room create {name}: {out}{err}");
+    let (ok, out, err) = vox_in(
+        data,
+        &["room", "create", "--passphrase-file", "-", "--name", name],
+        pass,
+    );
+    assert!(ok, "PRODUCT (staging): vox room create {name}: {out}{err}");
     let (ok, list, err) = vox_once(data, &args(&["room", "list"]));
-    assert!(ok, "CANNOT MEASURE: vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let short = list
         .lines()
         .find(|l| l.contains(name))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: room {name} not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): room {name} not listed: {list}"))
         .to_owned();
     let (ok, link, err) = vox_once(data, &args(&["room", "invite", &short]));
-    assert!(ok, "CANNOT MEASURE: vox room invite {name}: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite {name}: {err}");
     let link = link.trim().to_owned();
     let full = link
         .strip_prefix("vox://")
         .and_then(|rest| rest.get(..52))
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: an invite link, not {link:?}"));
-    let id = vox_core::node::link::b32_decode(full, "room id").expect("a room id");
+        .unwrap_or_else(|| panic!("PRODUCT (staging): an invite link, not {link:?}"));
+    let id = vox_core::node::link::b32_decode(full, "room id").expect("PRODUCT: a room id");
     (id, link)
 }
 
@@ -300,7 +316,7 @@ pub fn create_room(data: &Path, name: &str, pass: &str) -> (Digest32, String) {
 pub fn member_signer(data: &Path) -> Arc<vox_core::atrest::vault::VaultRootSigner> {
     let paths =
         vox_core::node::paths::Paths::resolve("default", Some(data), Some(&data.join("cfg")))
-            .expect("the member's paths");
+            .expect("APPARATUS: the member's paths");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut profile = loop {
         match vox_core::node::profile::Profile::open(paths.clone()) {
@@ -315,5 +331,7 @@ pub fn member_signer(data: &Path) -> Arc<vox_core::atrest::vault::VaultRootSigne
     profile
         .unlock(IDENTITY.as_bytes())
         .expect("CANNOT MEASURE: the member's identity unlocks");
-    profile.signer_arc().expect("the member's signer")
+    profile
+        .signer_arc()
+        .expect("APPARATUS: the member's signer")
 }

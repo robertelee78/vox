@@ -25,7 +25,7 @@
 //!    running out, which is the refusing side naming the gate.
 //!
 //! Expected values are hard-coded (480s, 150s, 485s), not read from the product, so a changed
-//! patience goes red here. A grind the floor did not lengthen is CANNOT MEASURE, never green.
+//! patience goes red here. A grind the floor did not lengthen is PRODUCT (staging), never green.
 //!
 //! **Mutations that must turn it red.**
 //! - `SOLVE_BUDGET_PER_EXPECTED_SOLVE` back to 30s in `joinstream.rs` (the cause): case 1 red,
@@ -34,7 +34,18 @@
 //! - Drop the late-grind check in `run_initiator` (the old report): case 2 red, bob is told no
 //!   member could be reached.
 
+// Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
+// `--features optional-proofs` a stand-in takes its place and says it was not run
+// (`support/optional_proof.rs`). How to run it: docs/release/optional-proofs.md.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    a_joiner_slower_than_the_old_patience_gets_in,
+    a_joiner_slower_than_the_patience_is_told_why
+);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -93,8 +104,8 @@ impl Who {
             cfg: tmp.join(name).join("cfg"),
             pass: tmp.join(format!("{name}.pass")),
         };
-        std::fs::create_dir_all(&w.cfg).unwrap();
-        std::fs::write(&w.pass, IDENTITY).unwrap();
+        std::fs::create_dir_all(&w.cfg).expect("APPARATUS: create a staging directory");
+        std::fs::write(&w.pass, IDENTITY).expect("APPARATUS: write a staging file");
         w
     }
 
@@ -115,12 +126,13 @@ impl Who {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         if let Some(text) = input {
-            let mut pipe = child.stdin.take().unwrap();
-            pipe.write_all(text.as_bytes()).unwrap();
+            let mut pipe = child.stdin.take().expect("APPARATUS: a piped stdio handle");
+            pipe.write_all(text.as_bytes())
+                .expect("PRODUCT (staging): vox exited without reading its stdin");
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child.wait_with_output().expect("APPARATUS: vox ran");
         let o = (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -146,16 +158,18 @@ impl Who {
             .env("VOX_CONFIG_DIR", &self.cfg)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(err).unwrap()));
+            .stderr(Stdio::from(
+                std::fs::File::create(err).expect("APPARATUS: create a staging file"),
+            ));
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let proc = Proc(cmd.spawn().expect("spawn vox daemon"));
+        let proc = Proc(cmd.spawn().expect("APPARATUS: spawn vox daemon"));
         let started = Instant::now();
         while !self.vox(&["room", "list"], None).0 {
             assert!(
                 started.elapsed() < START_PATIENCE,
-                "CANNOT MEASURE: a daemon never answered; its stderr:\n{}",
+                "PRODUCT (staging): a daemon never answered; its stderr:\n{}",
                 std::fs::read_to_string(err).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(500));
@@ -182,10 +196,12 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &anchor_who.data)
             .env("VOX_CONFIG_DIR", &anchor_who.cfg)
-            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create(&out).expect("APPARATUS: create a staging file"),
+            ))
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: spawn vox node"),
     );
     let started = Instant::now();
     let spec = loop {
@@ -198,7 +214,7 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
         }
         assert!(
             started.elapsed() < START_PATIENCE,
-            "CANNOT MEASURE: the anchor never printed its spec"
+            "PRODUCT (staging): the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(250));
     };
@@ -211,7 +227,10 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
     let (alice_proc, bob_proc) = std::thread::scope(|sc| {
         let ids = [&alice, &bob].map(|w| sc.spawn(move || w.vox(&["id"], None).0));
         for id in ids {
-            assert!(id.join().unwrap(), "CANNOT MEASURE: vox id failed");
+            assert!(
+                id.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+                "PRODUCT (staging): vox id failed"
+            );
         }
         let a = sc.spawn(|| alice.daemon(&spec, &alice_err, &[]));
         let b = sc.spawn(|| {
@@ -221,20 +240,26 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
                 &[("VOX_TEST_SOLVE_AT_LEAST_MS", grind_ms.to_string())],
             )
         });
-        (a.join().unwrap(), b.join().unwrap())
+        (
+            a.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            b.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        )
     });
     assert!(
         alice
-            .vox(&["room", "create", "--name", "slow"], Some(ROOM_PASS))
+            .vox(
+                &["room", "create", "--passphrase-file", "-", "--name", "slow"],
+                Some(ROOM_PASS)
+            )
             .0,
-        "CANNOT MEASURE: room create failed"
+        "PRODUCT (staging): room create failed"
     );
     let id = alice
         .vox(&["room", "list"], None)
         .1
         .split_whitespace()
         .next()
-        .expect("the new room in `vox room list`")
+        .expect("PRODUCT: the new room in `vox room list`")
         .to_owned();
     let link = alice
         .vox(&["room", "invite", &id], None)
@@ -251,17 +276,26 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
     }
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "a grind floored at 150s, production Argon2id and a real anchor; CI runs it in release"]
+#[ignore = "a grind floored at 150s, production Argon2id and a real anchor; optional, run it in release"]
 fn a_joiner_slower_than_the_old_patience_gets_in() {
     test_knobs::require(&["VOX_TEST_SOLVE_AT_LEAST_MS"]);
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let s = stage(tmp.path(), SLOW_GRIND_MS);
 
     let t = Instant::now();
     let (ok, out, err) = s.bob.vox(
-        &["room", "join", &s.link, "--name", "slow"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &s.link,
+            "--name",
+            "slow",
+        ],
         Some(ROOM_PASS),
     );
     let took = t.elapsed();
@@ -275,21 +309,21 @@ fn a_joiner_slower_than_the_old_patience_gets_in() {
     );
     assert!(
         ok,
-        "a joiner grinding {}s — past the old {OLD_PATIENCE_SECS}s, inside {PATIENCE_SECS}s — was \
+        "PRODUCT: a joiner grinding {}s — past the old {OLD_PATIENCE_SECS}s, inside {PATIENCE_SECS}s — was \
          refused after {:.1}s\n  bob: {out}{err}\n  alice's own report:\n{alice_said}",
         SLOW_GRIND_MS / 1000,
         took.as_secs_f64()
     );
     assert!(
         took >= Duration::from_millis(SLOW_GRIND_MS),
-        "CANNOT MEASURE: the join took {:.1}s, under the {}s grind floor — the floor did not apply",
+        "PRODUCT (staging): the join took {:.1}s, under the {}s grind floor — the floor did not apply",
         took.as_secs_f64(),
         SLOW_GRIND_MS / 1000
     );
     assert!(
         // The join's own report, not a sync's (`sync of room … did not complete`).
         !alice_said.contains("a join did not complete"),
-        "alice reported a join that did not complete although bob got in:\n{alice_said}"
+        "PRODUCT: alice reported a join that did not complete although bob got in:\n{alice_said}"
     );
     eprintln!(
         "[proof] {} slow joiner: 1/1 got in, grind floor {}s, join {:.1}s",
@@ -299,17 +333,26 @@ fn a_joiner_slower_than_the_old_patience_gets_in() {
     );
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "a grind floored at 485s, production Argon2id and a real anchor; CI runs it in release"]
+#[ignore = "a grind floored at 485s, production Argon2id and a real anchor; optional, run it in release"]
 fn a_joiner_slower_than_the_patience_is_told_why() {
     test_knobs::require(&["VOX_TEST_SOLVE_AT_LEAST_MS"]);
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let s = stage(tmp.path(), TOO_SLOW_GRIND_MS);
 
     let t = Instant::now();
     let (ok, out, err) = s.bob.vox(
-        &["room", "join", &s.link, "--name", "slow"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &s.link,
+            "--name",
+            "slow",
+        ],
         Some(ROOM_PASS),
     );
     let took = t.elapsed();
@@ -333,39 +376,39 @@ fn a_joiner_slower_than_the_patience_is_told_why() {
     );
     assert!(
         took >= Duration::from_millis(TOO_SLOW_GRIND_MS),
-        "CANNOT MEASURE: the join ended after {:.1}s, under the {}s grind floor: {said}",
+        "PRODUCT (staging): the join ended after {:.1}s, under the {}s grind floor: {said}",
         took.as_secs_f64(),
         TOO_SLOW_GRIND_MS / 1000
     );
     assert!(
         !ok,
-        "a joiner grinding {}s got in although a member waits {PATIENCE_SECS}s: {said}",
+        "PRODUCT: a joiner grinding {}s got in although a member waits {PATIENCE_SECS}s: {said}",
         TOO_SLOW_GRIND_MS / 1000
     );
     // The refusing side names the gate: its wait for the solve ran out.
     assert!(
         alice_said.contains("a join did not complete") && alice_said.contains(refusal),
-        "alice did not report her wait for the solve running out:\n{alice_said}"
+        "PRODUCT: alice did not report her wait for the solve running out:\n{alice_said}"
     );
     // And the joiner is told why, in numbers, not that nobody could be reached.
     assert!(
         !said.contains("no member it knows could be reached"),
-        "bob was told no member could be reached, about a member that answered and waited: {said}"
+        "PRODUCT: bob was told no member could be reached, about a member that answered and waited: {said}"
     );
     let waits = format!("a member waits {PATIENCE_SECS}s");
     assert!(
         said.contains("to solve the join's proof of work") && said.contains(&waits),
-        "bob was not told his grind outlasted a member's {PATIENCE_SECS}s: {said}"
+        "PRODUCT: bob was not told his grind outlasted a member's {PATIENCE_SECS}s: {said}"
     );
     // The advice says "this device took longer…"; the member's own line carries the number.
     let solved: u64 = said
         .split("this device took ")
         .skip(1)
         .find_map(|r| r.split('s').next().and_then(|n| n.trim().parse().ok()))
-        .unwrap_or_else(|| panic!("no 'this device took Ns' in: {said}"));
+        .unwrap_or_else(|| panic!("PRODUCT: no 'this device took Ns' in: {said}"));
     assert!(
         solved >= TOO_SLOW_GRIND_MS / 1000,
-        "bob said his grind took {solved}s, under its {}s floor: {said}",
+        "PRODUCT: bob said his grind took {solved}s, under its {}s floor: {said}",
         TOO_SLOW_GRIND_MS / 1000
     );
     eprintln!(

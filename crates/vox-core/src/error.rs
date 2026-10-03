@@ -270,18 +270,30 @@ pub enum Error {
     #[error("the connection could not be set up: {0}")]
     Handshake(String),
 
+    /// A QUIC handshake failed its **authentication** (a TLS alert), and which end refused, the
+    /// alert, and why this end refused when it did (V210-143). Every such failure used to be
+    /// [`Self::SignatureInvalid`], which threw the alert and the check away: a host whose dial to
+    /// its anchor reached another honest node, through a port that node shared, was told only
+    /// "signature verification failed".
+    #[error("the connection's authentication failed: {0}")]
+    HandshakeAuth(String),
+
     /// This node could not listen on a local address it was told to use.
     ///
     /// Carried whole rather than as a `&'static str`: "quic endpoint bind" was the only thing
     /// the daemon could say when its `--listen` port was taken, and it reached the person as
     /// `Failed(Internal)` — a bug report for what is an occupied port (PRD-001 R36).
-    #[error("cannot listen on {addr}: {reason}")]
+    ///
+    /// **It names its real cause** (V210-134): a port another program holds, an address this
+    /// machine does not have, or whatever else the operating system said, quoted. "Something
+    /// else already holds that port" for an address the machine does not have sent people
+    /// looking for a process that did not exist.
+    #[error("cannot listen on {addr}: {}{reason}", cause.said())]
     LocalBind {
         /// The address that could not be bound.
         addr: std::net::SocketAddr,
-        /// Whether something else already holds it (the common case, and the one with an
-        /// obvious fix).
-        in_use: bool,
+        /// Why, as far as the operating system's error says.
+        cause: BindCause,
         /// What the operating system said.
         reason: String,
     },
@@ -316,6 +328,11 @@ pub enum Error {
     /// TUI), at its other end, or as stuck. Carries why, in the words `vox status` shows.
     #[error("the tunnel was {0}")]
     TunnelClosed(String),
+
+    /// A room this node joined has not yet synced with another member, so it writes nothing to
+    /// it (V210-164): its identity may already have entries there that it does not hold yet.
+    #[error("this room has not synced with another member since it was joined")]
+    RoomNotSynced,
 
     /// A tunnel control message (service request, stream-setup handshake) or an
     /// SSH-CA certificate was structurally malformed on parse, exceeded a size
@@ -388,6 +405,22 @@ pub enum Error {
     /// no reason to confirm a guess. Carries a static reason.
     #[error("join refused: {0}")]
     JoinRefused(&'static str),
+
+    /// The room is at its cap (`MAX_AUTHORS`, as the answering member counts it), so the member that
+    /// answered the join could not admit the joiner, and refused it. Before this the refusal was
+    /// dropped and the joiner was told it was in: it exited 0, a member of nothing.
+    #[error("the room is full: {members} members")]
+    RoomFull {
+        /// How many members the refusing member holds for the room.
+        members: u64,
+    },
+
+    /// The member answering a join accepted the passphrase, and then could not admit the joiner:
+    /// it was locked or closing mid-join, its store would not take the write, or it already holds
+    /// another key under the joiner's fingerprint (V210-128). Not [`Error::JoinRefused`], which a
+    /// joiner reads as a wrong passphrase: this one was checked, and accepted.
+    #[error("a member accepted the passphrase but could not admit this identity")]
+    JoinNotAdmitted,
 
     /// Every one of the responder's join slots was held, so it refused before the exchange began
     /// (V210-92). The passphrase was never checked.
@@ -569,4 +602,37 @@ pub enum IpcHandshake {
         /// How long the ping was given.
         secs: u64,
     },
+}
+
+/// Why a local address could not be bound, read from the operating system's error (V210-134).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindCause {
+    /// Another program already holds it (`EADDRINUSE`).
+    InUse,
+    /// No interface of this machine has that address (`EADDRNOTAVAIL`).
+    NotHere,
+    /// Anything else: the operating system's own words say what.
+    Other,
+}
+
+impl BindCause {
+    /// The cause of `e`, a failed bind.
+    #[must_use]
+    pub fn of(e: &std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::AddrInUse => Self::InUse,
+            std::io::ErrorKind::AddrNotAvailable => Self::NotHere,
+            _ => Self::Other,
+        }
+    }
+
+    /// What a person is told before the operating system's own words.
+    #[must_use]
+    pub const fn said(self) -> &'static str {
+        match self {
+            Self::InUse => "another program already holds it — ",
+            Self::NotHere => "it is not an address of this machine — ",
+            Self::Other => "",
+        }
+    }
 }

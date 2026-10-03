@@ -146,7 +146,7 @@ proposal is **author checkpoints**:
 
 - **Only the author checkpoints, and only its own feed.**
   - The checkpoint is the payload of an ordinary entry in the author's own feed (struct tag
-    `0x0015`, body `[seq, entry_hash]`), signed like any entry. It names a position on the same
+    `0x0016`, body `[seq, entry_hash]`), signed like any entry. It names a position on the same
     hash chain its signatures already vouch for, so it adds no trust.
   - A checkpoint by anyone else would let one member make every node forget another member's
     signatures, which are the evidence a fork proof needs.
@@ -184,7 +184,7 @@ proposal is **author checkpoints**:
 
 - **An owed sender-key message goes into the log.** When a member owes another member a sender key
   (consent granted, or a rotation), it seals the SKDM to the recipient and posts it as a log entry of
-  a new kind, `key-package` (struct tag `0x0016`, domain `vox/key-package/v1`; `0x0015` is the M23.6 checkpoint, merged first).
+  a new kind, `key-package` (struct tag `0x0017`, domain `vox/key-package/v1`; `0x0015` is the presence statement and `0x0016` the M23.6 checkpoint).
 - **The seal is always a one-shot PQXDH** to the recipient's published prekey bundle (ADR-004): the
   package carries the PQXDH initial message and the first ratchet message, which seals the SKDM.
   **This deviates from the plan above**, which said to use the pairwise session's keys when one exists.

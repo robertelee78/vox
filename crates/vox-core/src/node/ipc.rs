@@ -196,6 +196,8 @@ const T_PUBLISH_REFUSED: u64 = 1717;
 const T_PUBLISH_CURED: u64 = 2091;
 /// `NodeEvent::ConnectionNote` (#229's diagnostics). Additive, beside `T_PUBLISH_CURED`.
 const T_CONNECTION_NOTE: u64 = 2092;
+/// `NodeEvent::NodeNote` (V210-167). Additive, away from the tags beside it.
+const T_NODE_NOTE: u64 = 2392;
 /// `NodeEvent::HandshakesQueued` (V210-86). Additive, away from the tags beside it.
 const T_HANDSHAKES_QUEUED: u64 = 2186;
 /// `NodeEvent::AddressWithheld` (V210-96). Additive, away from the sequential range and the tags
@@ -266,9 +268,10 @@ const T_INVITE: u64 = 13;
 // A person setting up two agents hit "Database already open. Cannot acquire lock." on the
 // one command they could not skip.
 //
-// So the door opens only for someone who can prove they hold the identity passphrase,
-// which the operator does and the agent does not. The socket's file mode is still the
-// outer boundary; this is the inner one.
+// So the keyring is reachable here. The socket's file mode is the boundary: whoever runs as
+// this user is this user. A change needs the identity passphrase once 30 minutes have passed
+// since it was last entered, which the node decides for every client alike (V210-159); a read
+// needs none (V210-165).
 const T_TRUST: u64 = 14;
 const T_UNTRUST: u64 = 15;
 const T_TRUST_LIST: u64 = 16;
@@ -285,11 +288,26 @@ const T_RENAME: u64 = 25;
 // request can tell a node at work from a suspended or stuck one. Not a protocol bump: a node that
 // does not know it answers with an error, and any answer is proof of life.
 const T_PING: u64 = 17;
+// V210-120: a room's structured posts by `type`, and rows by entry hash, so a client that needs a
+// room's coordination posts, or one row, does not read the whole room for them. Numbered far from
+// the others so a concurrently-developed branch taking 18 does not collide.
+const T_STRUCTURED: u64 = 120;
+const T_FIND: u64 = 121;
+const T_COUNT_REQ: u64 = 122;
+// V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
+// far from the others, like V210-120's.
+const T_LEAVE: u64 = 164;
+/// [`Frame::Count`] (V210-120), in the frame and event tag space, far from the others.
+const T_COUNT: u64 = 1200;
 // The services a room offers (V030-24): `vox service list` with a daemon running. `add` and
 // `remove` reached the daemon (V030-06) while `list` still opened the profile, which the daemon
 // holds, so a service just added could not be listed. Not a protocol bump: additive, and a node
 // that does not know it answers with an error.
 const T_SERVICES_REQ: u64 = 18;
+// V210-168: ask every member whether it holds a claim this node posted.
+const T_AGREE: u64 = 123;
+/// [`Frame::Agreement`] (V210-168).
+const T_AGREEMENT: u64 = 1201;
 
 /// What a client sends.
 ///
@@ -416,13 +434,21 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
-    /// Add an identity to the trust keyring. Requires the identity passphrase.
+    /// Leave a room (V210-164): the node says so in the room, and removes it once another
+    /// member has that. Answers [`Frame::Ok`] once it is removed.
+    Leave {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Add an identity to the trust keyring. Needs the identity passphrase once more than
+    /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) have passed since it was
+    /// last entered (V210-159).
     Trust {
         /// Who to trust, as a full fingerprint.
         target: Digest32,
         /// The petname to file it under.
         petname: String,
-        /// The identity passphrase, proving this is the operator and not an agent.
+        /// The identity passphrase, or empty for none: within the window none is needed.
         identity_passphrase: String,
         /// Whether its consents release this node's full history (PRD-001 R12). On the
         /// wire only when `true`, so an older client's request still decodes.
@@ -438,34 +464,80 @@ pub enum Request {
         /// The identity passphrase, proving this is the operator and not an agent.
         identity_passphrase: String,
     },
-    /// Remove an identity from the trust keyring. Requires the identity passphrase.
+    /// Remove an identity from the trust keyring. Needs the passphrase as [`Request::Trust`] does.
     Untrust {
         /// Who to stop trusting.
         target: Digest32,
-        /// The identity passphrase.
+        /// The identity passphrase, or empty for none.
         identity_passphrase: String,
     },
     /// Rename an identity already in the trust keyring, keeping what its consents release
-    /// (the history grant, PRD-001 R12). Requires the identity passphrase. A rename through
-    /// `Trust` would reset a full-history grant to from-now-on as a side effect.
+    /// (the history grant, PRD-001 R12). Needs the passphrase as [`Request::Trust`] does: a
+    /// keyring change (V210-159). A rename through `Trust` would reset a full-history grant to
+    /// from-now-on as a side effect.
     Rename {
         /// Who to rename, as a full fingerprint.
         target: Digest32,
         /// The new petname.
         petname: String,
-        /// The identity passphrase, proving this is the operator and not an agent.
+        /// The identity passphrase, or empty for none.
         identity_passphrase: String,
     },
-    /// Read the trust keyring. Requires the identity passphrase.
+    /// Read the trust keyring: who this node trusts and the name it gave each. A read, so the
+    /// node checks no passphrase.
     TrustList {
-        /// The identity passphrase.
+        /// Carried on the wire and not checked.
         identity_passphrase: String,
         /// The last fingerprint of the previous page, or `None` for the first.
         after: Option<Digest32>,
     },
     /// Answered `Ok` by the node's actor, changing nothing: proof it is taking commands.
     Ping,
+    /// A room's **structured posts** (V210-120): every row whose body is a JSON object with a
+    /// `type` in `types`, or whose operation id is in `ops`, oldest first, answered as
+    /// [`Frame::Rows`] and paged like [`Request::Read`]. The node knows no `type`'s meaning; see
+    /// [`crate::node::api::StructuredIndex`]. A row matched by an id's hash alone may carry
+    /// another id: the client checks.
+    Structured {
+        /// The room.
+        channel_id: Digest32,
+        /// The `type` values wanted.
+        types: Vec<String>,
+        /// The operation ids wanted; at most [`MAX_FIND`] with `types`.
+        ops: Vec<String>,
+        /// Return only matching rows **after** this one. Absent reads from the first.
+        since: Option<Digest32>,
+    },
+    /// How many rows of a room follow `since` (all of them when absent), as [`Frame::Count`]
+    /// (V210-120): what a reader that reads a page at a time says is still waiting.
+    Count {
+        /// The room.
+        channel_id: Digest32,
+        /// Count only rows **after** this one.
+        since: Option<Digest32>,
+    },
+    /// The rows of a room with these entry hashes, those it holds, as [`Frame::Rows`] (V210-120).
+    Find {
+        /// The room.
+        channel_id: Digest32,
+        /// The entry hashes wanted; at most [`MAX_FIND`].
+        entries: Vec<Digest32>,
+    },
+    /// Ask every other member of a room whether it holds this node's post `entry`, and compare
+    /// the posts of `types` each holds with this node's own (V210-168), answered as
+    /// [`Frame::Agreement`]. What a claim waits for before it says "you hold it".
+    Agree {
+        /// The room.
+        channel_id: Digest32,
+        /// The post.
+        entry: Digest32,
+        /// The `type`s compared; at most [`crate::node::agreestream::MAX_TYPES`].
+        types: Vec<String>,
+    },
 }
+
+/// The most entries one [`Request::Find`] may name.
+pub const MAX_FIND: usize = 64;
 
 impl Request {
     /// Canonical CBOR body (unframed).
@@ -479,8 +551,59 @@ impl Request {
             Request::Ping => {
                 e.array(1).uint(T_PING);
             }
+            Request::Structured {
+                channel_id,
+                types,
+                ops,
+                since,
+            } => {
+                e.array(5)
+                    .uint(T_STRUCTURED)
+                    .bytes(channel_id)
+                    .array(types.len());
+                for t in types {
+                    e.text(t);
+                }
+                e.array(ops.len());
+                for o in ops {
+                    e.text(o);
+                }
+                e.bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Request::Count { channel_id, since } => {
+                e.array(3)
+                    .uint(T_COUNT_REQ)
+                    .bytes(channel_id)
+                    .bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Request::Find {
+                channel_id,
+                entries,
+            } => {
+                e.array(3)
+                    .uint(T_FIND)
+                    .bytes(channel_id)
+                    .array(entries.len());
+                for h in entries {
+                    e.bytes(h);
+                }
+            }
             Request::Post { channel_id, text } => {
                 e.array(3).uint(T_POST).bytes(channel_id).text(text);
+            }
+            Request::Agree {
+                channel_id,
+                entry,
+                types,
+            } => {
+                e.array(4)
+                    .uint(T_AGREE)
+                    .bytes(channel_id)
+                    .bytes(entry)
+                    .array(types.len());
+                for t in types {
+                    e.text(t);
+                }
             }
             Request::Read {
                 channel_id,
@@ -568,6 +691,9 @@ impl Request {
             }
             Request::Invite { channel_id } => {
                 e.array(2).uint(T_INVITE).bytes(channel_id);
+            }
+            Request::Leave { channel_id } => {
+                e.array(2).uint(T_LEAVE).bytes(channel_id);
             }
             Request::Trust {
                 target,
@@ -712,6 +838,77 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Rooms { after })
             }
+            (T_STRUCTURED, 5) => {
+                let channel_id = digest(&mut d)?;
+                let n = d.array().map_err(|_| Error::MalformedIpc("ipc types"))?;
+                if n > MAX_FIND {
+                    return Err(Error::MalformedIpc("ipc too many types"));
+                }
+                let mut types = Vec::with_capacity(n);
+                for _ in 0..n {
+                    types.push(text(&mut d, "ipc type")?);
+                }
+                let m = d.array().map_err(|_| Error::MalformedIpc("ipc ops"))?;
+                if n + m > MAX_FIND {
+                    return Err(Error::MalformedIpc("ipc too many operation ids"));
+                }
+                let mut ops = Vec::with_capacity(m);
+                for _ in 0..m {
+                    ops.push(text(&mut d, "ipc op")?);
+                }
+                let since = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Structured {
+                    channel_id,
+                    types,
+                    ops,
+                    since,
+                })
+            }
+            (T_COUNT_REQ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let since = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Count { channel_id, since })
+            }
+            (T_AGREE, 4) => {
+                let channel_id = digest(&mut d)?;
+                let entry = digest(&mut d)?;
+                let n = d.array().map_err(|_| Error::MalformedIpc("ipc types"))?;
+                if n > crate::node::agreestream::MAX_TYPES {
+                    return Err(Error::MalformedIpc("ipc too many types"));
+                }
+                let mut types = Vec::with_capacity(n);
+                for _ in 0..n {
+                    types.push(text(&mut d, "ipc type")?);
+                }
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Agree {
+                    channel_id,
+                    entry,
+                    types,
+                })
+            }
+            (T_FIND, 3) => {
+                let channel_id = digest(&mut d)?;
+                let n = d.array().map_err(|_| Error::MalformedIpc("ipc entries"))?;
+                if n > MAX_FIND {
+                    return Err(Error::MalformedIpc("ipc too many entries"));
+                }
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    entries.push(digest(&mut d)?);
+                }
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Find {
+                    channel_id,
+                    entries,
+                })
+            }
             (T_TRUST, n @ (4 | 5)) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
@@ -855,6 +1052,12 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
             }
+            (T_LEAVE, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Leave { channel_id })
+            }
             _ => Err(Error::UnknownIpcRequest),
         }
     }
@@ -897,6 +1100,18 @@ pub enum Frame {
     Error {
         /// Why it failed.
         reason: String,
+    },
+    /// Where every other member stands on a post, answering [`Request::Agree`] (V210-168).
+    Agreement {
+        /// The report.
+        report: crate::node::agreestream::Report,
+    },
+    /// How many rows a [`Request::Count`] found, and the room's newest row.
+    Count {
+        /// The count.
+        n: u64,
+        /// The entry hash of the room's newest row, if it has any.
+        last: Option<Digest32>,
     },
     /// The rows a [`Request::Read`] asked for, oldest first.
     Rows {
@@ -972,6 +1187,16 @@ impl Frame {
             }
             Frame::Error { reason } => {
                 e.array(2).uint(T_ERROR).text(reason);
+            }
+            Frame::Agreement { report } => {
+                e.array(2).uint(T_AGREEMENT);
+                crate::node::agreestream::encode_report(&mut e, report);
+            }
+            Frame::Count { n, last } => {
+                e.array(3)
+                    .uint(T_COUNT)
+                    .uint(*n)
+                    .bytes(last.as_ref().map_or(&[][..], |d| &d[..]));
             }
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
@@ -1177,6 +1402,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::ConnectionNote { peer, note } => {
             e.array(3).uint(T_CONNECTION_NOTE).bytes(peer).text(note);
         }
+        NodeEvent::NodeNote { note } => {
+            e.array(2).uint(T_NODE_NOTE).text(note);
+        }
         NodeEvent::HandshakesQueued {
             waited,
             most_waiting,
@@ -1344,6 +1572,15 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc error reason"))?
                     .to_owned(),
             })
+        }
+        (T_AGREEMENT, 2) => {
+            let report = crate::node::agreestream::decode_report(d)?;
+            return Ok(Frame::Agreement { report });
+        }
+        (T_COUNT, 3) => {
+            let n = d.uint().map_err(|_| Error::MalformedIpc("ipc count"))?;
+            let last = optional_digest(d)?;
+            return Ok(Frame::Count { n, last });
         }
         (T_ROWS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc rows"))?;
@@ -1589,6 +1826,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             note: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc connection note"))?
+                .to_owned(),
+        },
+        (T_NODE_NOTE, 2) => NodeEvent::NodeNote {
+            note: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc node note"))?
                 .to_owned(),
         },
         (T_PUBLISH_CURED, 3) => NodeEvent::PublishCured {
@@ -2138,14 +2381,8 @@ async fn serve_requests(
     }
 }
 
-/// Prove the caller holds the identity passphrase, or say why not.
-///
-/// ADR-020 §7 keeps trust-keyring edits off this socket, on the grounds that an agent
-/// session runs model-authored code and the socket is reachable by anything running as
-/// the user. That reasoning is kept; this is the exception that does not weaken it. The
-/// operator knows the identity passphrase and an agent does not, so requiring it here
-/// lets the person who owns the profile use their own daemon without handing the agent
-/// the ability to decide who may read them.
+/// Prove the caller holds the identity passphrase, or say why not. A right one is an entry of it,
+/// so the node's keyring window starts again (V210-159).
 async fn verify_operator(
     handle: &NodeHandle,
     passphrase: String,
@@ -2171,6 +2408,15 @@ async fn verify_operator(
             reason: other.to_string(),
         }),
     }
+}
+
+/// [`verify_operator`] for a passphrase that was given; nothing to check for one that was not
+/// (the empty string), and the node's keyring window decides.
+async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
+    if passphrase.is_empty() {
+        return Ok(());
+    }
+    verify_operator(handle, passphrase).await
 }
 
 /// One page of a collection reply: entries in id order, strictly after `after`, at most
@@ -2228,15 +2474,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        // The keyring, gated on the identity passphrase. The check is first and the
-        // command is only issued if it passes, so a caller who cannot prove they are the
-        // operator changes nothing and learns nothing.
+        // A keyring change (V210-159). A passphrase given is checked first, and the command is
+        // only issued if it passes; a right one is also an entry of it, so the window starts
+        // again. None given is the empty string, and the node then allows the change only
+        // within its window since the passphrase was last entered, and otherwise refuses it
+        // with `Fault::PassphraseNeeded`, which the client answers by asking for it.
         Request::Trust {
             target,
             petname,
             identity_passphrase,
             full_history,
-        } => match verify_operator(handle, identity_passphrase).await {
+        } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
                 .apply(crate::node::api::NodeCommand::TrustWith {
@@ -2275,7 +2523,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::Untrust {
             target,
             identity_passphrase,
-        } => match verify_operator(handle, identity_passphrase).await {
+        } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
                 .apply(crate::node::api::NodeCommand::Untrust {
@@ -2293,7 +2541,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             target,
             petname,
             identity_passphrase,
-        } => match verify_operator(handle, identity_passphrase).await {
+        } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
                 .apply(crate::node::api::NodeCommand::Rename {
@@ -2308,26 +2556,39 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
-        Request::TrustList {
-            identity_passphrase,
-            after,
-        } => match verify_operator(handle, identity_passphrase).await {
-            Err(f) => f,
-            Ok(()) => Frame::Trusted {
-                entries: page(handle.view().trusted, after, |(id, petname)| {
-                    (*id, petname.len())
-                }),
-            },
+        // **A read, so no passphrase** (V210-162, V210-165): the names this node gave its
+        // members are how every surface on this account names an author, the agent drain
+        // included, and the OS account is the boundary. Only a change to the keyring is gated.
+        Request::TrustList { after, .. } => Frame::Trusted {
+            entries: page(handle.view().trusted, after, |(id, petname)| {
+                (*id, petname.len())
+            }),
         },
         Request::Post { channel_id, text } => {
-            match handle
-                .apply(crate::node::api::NodeCommand::SendText { channel_id, text })
-                .await
-            {
-                crate::node::api::Outcome::Done => Frame::Ok,
-                other => Frame::Error {
-                    reason: other.to_string(),
-                },
+            // A room just joined is written to once its first sync with another member has ended
+            // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
+            // that rather than failing.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match handle
+                    .apply(crate::node::api::NodeCommand::SendText {
+                        channel_id,
+                        text: text.clone(),
+                    })
+                    .await
+                {
+                    crate::node::api::Outcome::Done => break Frame::Ok,
+                    crate::node::api::Outcome::Failed(crate::node::api::Fault::RoomNotSynced)
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    other => {
+                        break Frame::Error {
+                            reason: other.to_string(),
+                        }
+                    }
+                }
             }
         }
         Request::Read {
@@ -2435,30 +2696,177 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
+        // V210-120: only the rows asked for, found through the room's index of structured posts,
+        // so a client after a room's coordination posts no longer reads every row of the room.
+        Request::Structured {
+            channel_id,
+            types,
+            ops,
+            since,
+        } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            // Arrival order, as a read from a cursor is (ADR-023 decision 1): a late post lands
+            // above rows already shown, so "the posts below the cursor" would skip it for good. On
+            // a room where nothing arrived late this is the timeline's own order.
+            let mut matched: Vec<&MessageRow> = detail
+                .structured
+                .positions(&types, &ops)
+                .into_iter()
+                .filter_map(|i| detail.timeline.get(i as usize))
+                .collect();
+            matched.sort_by_key(|r| r.arrival);
+            if let Some(cursor) = since {
+                let Some(mark) = matched
+                    .iter()
+                    .rev()
+                    .find(|r| r.entry_hash == cursor && !r.owed)
+                    .map(|r| r.arrival)
+                else {
+                    return Frame::Error {
+                        reason: "cursor not among this room's structured posts".into(),
+                    };
+                };
+                matched.retain(|r| r.arrival > mark);
+            }
+            let mut rows: Vec<MessageRow> = Vec::new();
+            let mut bytes = 0usize;
+            for r in matched {
+                let cost = r.text.len() + ROW_OVERHEAD;
+                if !rows.is_empty() && bytes + cost > rows_budget() {
+                    break;
+                }
+                bytes += cost;
+                rows.push(r.clone());
+            }
+            Frame::Rows { rows }
+        }
+        Request::Count { channel_id, since } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            // Counted by arrival, as a read from the cursor delivers (ADR-023 decision 1), and
+            // `last` is the row that arrived last, the cursor such a read ends on. A message not
+            // received yet (V030-10) has no arrival and is neither.
+            let len = detail.timeline.len();
+            let last = detail
+                .timeline
+                .iter()
+                .filter(|r| !r.owed)
+                .max_by_key(|r| r.arrival)
+                .map(|r| r.entry_hash);
+            match since {
+                None => Frame::Count {
+                    n: len as u64,
+                    last,
+                },
+                // From the newest row back: a reader's cursor is usually near the end.
+                Some(cursor) => match detail
+                    .timeline
+                    .iter()
+                    .rev()
+                    .find(|r| r.entry_hash == cursor && !r.owed)
+                    .map(|r| r.arrival)
+                {
+                    Some(mark) => Frame::Count {
+                        n: detail.timeline.iter().filter(|r| r.arrival > mark).count() as u64,
+                        last,
+                    },
+                    None => Frame::Error {
+                        reason: "cursor not in this room's timeline".into(),
+                    },
+                },
+            }
+        }
+        // Searched from the newest row back: what a client looks up (a reply's parent) is
+        // usually recent.
+        Request::Find {
+            channel_id,
+            entries,
+        } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            let mut want: std::collections::BTreeSet<Digest32> = entries.into_iter().collect();
+            let mut rows: Vec<MessageRow> = Vec::new();
+            for r in detail.timeline.iter().rev() {
+                if want.is_empty() {
+                    break;
+                }
+                if want.remove(&r.entry_hash) {
+                    rows.push(r.clone());
+                }
+            }
+            rows.reverse();
+            Frame::Rows { rows }
+        }
+        // Open or not by the node's own count, not by whether the view has caught up with an
+        // open (V210-149): the one-shot form asks the same question the same way.
+        Request::Services { channel_id } => match handle.open_detail(channel_id).await {
+            Some(detail) => Frame::Services {
+                room: detail.local_name.clone(),
+                services: detail
+                    .services
+                    .iter()
+                    .map(|(tag, local)| (tag.clone(), local.to_string()))
+                    .collect(),
+            },
+            None => Frame::Error {
+                reason: "room not open".into(),
+            },
+        },
+        Request::Agree {
+            channel_id,
+            entry,
+            types,
+        } => {
+            let (report, wait) = tokio::sync::oneshot::channel();
+            match handle
+                .apply(crate::node::api::NodeCommand::Agree {
+                    channel_id,
+                    entry,
+                    types,
+                    report,
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => match wait.await {
+                    Ok(report) => Frame::Agreement { report },
+                    Err(_) => Frame::Error {
+                        reason: "the node stopped before its members answered".into(),
+                    },
+                },
+                other => Frame::Error {
+                    reason: other.to_string(),
+                },
+            }
+        }
         // **Not paged, and bounded by the product's scale.** A room is at most 500 members
         // (PRD-001's family scale); a member is a 32-byte key, so a roster is ~17 KiB of a
         // 256 KiB frame. A frame would hold ~7,700; paging this is owed only if that scale
         // ever rises past a few thousand (V210-16).
-        Request::Services { channel_id } => {
-            let view = handle.view();
-            match view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            {
-                Some(detail) => Frame::Services {
-                    room: detail.local_name.clone(),
-                    services: detail
-                        .services
-                        .iter()
-                        .map(|(tag, local)| (tag.clone(), local.to_string()))
-                        .collect(),
-                },
-                None => Frame::Error {
-                    reason: "room not open".into(),
-                },
-            }
-        }
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view
@@ -2633,6 +3041,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 local_name,
                 passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
             })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
+        Request::Leave { channel_id } => match handle
+            .apply(crate::node::api::NodeCommand::LeaveChannel { channel_id })
             .await
         {
             crate::node::api::Outcome::Done => Frame::Ok,
@@ -2946,6 +3363,45 @@ impl IpcClient {
                         return Err(Error::MalformedIpc("ipc rows page did not advance"));
                     }
                     *marker = Some(last.entry_hash);
+                    all.extend(rows);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// A room's structured posts of `types`, and those whose operation id is in `ops`, however
+    /// many replies that takes ([`Request::Structured`], V210-120). Rows matched by an id's hash
+    /// alone are included: filter on the id.
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn read_structured(
+        &mut self,
+        channel_id: Digest32,
+        types: &[&str],
+        ops: &[String],
+    ) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            match self
+                .request(&Request::Structured {
+                    channel_id,
+                    types: types.iter().map(|t| (*t).to_owned()).collect(),
+                    ops: ops.to_vec(),
+                    since: cursor,
+                })
+                .await?
+            {
+                Frame::Rows { rows } => {
+                    let Some(last) = rows.last() else {
+                        return Ok(Frame::Rows { rows: all });
+                    };
+                    if cursor == Some(last.entry_hash) {
+                        return Err(Error::MalformedIpc("ipc rows page did not advance"));
+                    }
+                    cursor = Some(last.entry_hash);
                     all.extend(rows);
                 }
                 other => return Ok(other),

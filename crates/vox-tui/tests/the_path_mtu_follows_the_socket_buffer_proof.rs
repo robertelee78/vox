@@ -35,20 +35,24 @@
 //!   `vox: UDP receive buffer <grant / 1024> KiB: path-MTU ceiling 1452 bytes, not 8192`, the
 //!   KiB being the grant this test read back itself.
 //!
-//! On a Mac (`kern.ipc.maxsockbuf` 8 MiB by default) the grant is full, and a short one there is
-//! CANNOT MEASURE rather than a pass, so the no-notice arm is always the one measured. On CI's
-//! ubuntu runner the grant is short and the notice arm is measured; a Linux host that grants the
-//! full buffer is CANNOT MEASURE too, so the Linux arm can never pass silently on the no-notice
-//! path, which the always-8192 mutant would also pass. Both arms are in CI's release
-//! `--ignored` job, which runs on both runners.
+//! **Both arms run on a Mac.** Its grant is full (`kern.ipc.maxsockbuf` 8 MiB by default; a
+//! short one is CANNOT MEASURE), so the no-notice arm is measured first. Then the short arm is
+//! staged without root: every `vox` runs with the test-only DYLD interposer
+//! (`crates/vox-test-interpose`) and `VOX_INTERPOSE_RCVBUF_CAP` = [`CAP`], which makes each
+//! `setsockopt(SO_RCVBUF, 4 MiB)` ask for 1 MiB instead. The kernel really grants 1 MiB and the
+//! product reads it back, exactly as on a host whose `maxsockbuf` is small; the binary is
+//! unchanged. Each process's own clamp is checked in the interposer's log, so a process the
+//! interposer did not reach is CANNOT MEASURE, never a product verdict. On CI's ubuntu runner the
+//! grant is short and the notice arm is measured; a Linux host that grants the full buffer is
+//! CANNOT MEASURE, so the Linux arm can never pass silently on the no-notice path, which the
+//! always-8192 mutant would also pass. All arms are in CI's release `--ignored` job, which runs on
+//! both runners.
 //!
 //! **Mutations that must turn it red.**
 //! - The ceiling ignores the buffer and is always 8192 (`mtu_ceiling_for` returns
 //!   `MAX_UDP_PAYLOAD` whatever `effective` is; v0.2.9's first-tag rule): the compiler removes the
 //!   notice's branch, so on Linux's short grant every process is silent and this goes red at the
-//!   first one. **The product has no knob that forces a small buffer**, and raising or lowering
-//!   `kern.ipc.maxsockbuf` needs root, so on a Mac this mutant stays green: the Linux arm, in CI,
-//!   is what catches it.
+//!   first one; on a Mac the staged 1 MiB arm goes red the same way.
 //! - The ceiling ignores the buffer and is always 1452: a Mac's full grant prints the notice, and
 //!   this goes red there.
 //! - The threshold drops back to 4 MiB on Linux (Linux's doubled read-back taken as the grant):
@@ -62,6 +66,10 @@ mod watchdog;
 
 #[path = "support/world.rs"]
 mod world;
+
+#[cfg(target_os = "macos")]
+#[path = "support/syscalls.rs"]
+mod syscalls;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -77,17 +85,24 @@ const FULL_READ_BACK: usize = 8 * 1024 * 1024;
 #[cfg(not(target_os = "linux"))]
 const FULL_READ_BACK: usize = 4 * 1024 * 1024;
 
+/// What the staged short arm on a Mac caps each `SO_RCVBUF` request at
+/// (`VOX_INTERPOSE_RCVBUF_CAP`): 1 MiB, a quarter of what the product asks for.
+#[cfg(target_os = "macos")]
+const CAP: usize = 1024 * 1024;
+
 /// The substring every fallback notice carries, and nothing else the product prints does.
 const NOTICE: &str = "path-MTU ceiling";
 
-/// Ask the OS for the buffer a Vox endpoint asks for, on the same kind of socket, and read back
-/// what it granted.
-fn granted_receive_buffer() -> usize {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a loopback UDP socket");
+/// Ask the OS for `asked` bytes of receive buffer, on the same kind of socket a Vox endpoint
+/// uses, and read back what it granted.
+fn granted_receive_buffer(asked: usize) -> usize {
+    let socket =
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind a loopback UDP socket");
     let sock = socket2::SockRef::from(&socket);
-    sock.set_recv_buffer_size(ASKED)
-        .expect("ask for a 4 MiB receive buffer");
-    sock.recv_buffer_size().expect("read SO_RCVBUF back")
+    sock.set_recv_buffer_size(asked)
+        .unwrap_or_else(|e| panic!("APPARATUS: ask for a {asked}-byte receive buffer: {e}"));
+    sock.recv_buffer_size()
+        .expect("APPARATUS: read SO_RCVBUF back")
 }
 
 /// Kill `proc` by its PID and read everything it said, to EOF on both pipes.
@@ -100,7 +115,7 @@ fn everything_said(mut proc: VoxProc) -> Vec<String> {
         let left = deadline.saturating_duration_since(Instant::now());
         assert!(
             !left.is_zero(),
-            "CANNOT MEASURE: {}'s output did not reach EOF within 30 s of its exit, so a notice \
+            "APPARATUS, CANNOT MEASURE: {}'s output did not reach EOF within 30 s of its exit, so a notice \
              could still be unread. It said:\n{}",
             proc.name,
             said.join("\n")
@@ -113,34 +128,11 @@ fn everything_said(mut proc: VoxProc) -> Vec<String> {
     }
 }
 
-#[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
-fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
-    watchdog::arm();
-
-    let granted = granted_receive_buffer();
-    let short = granted < FULL_READ_BACK;
-    eprintln!(
-        "[proof] asked {ASKED} bytes, SO_RCVBUF read back {granted} ({} KiB), full reads back \
-         {FULL_READ_BACK}: the grant is {}",
-        granted / 1024,
-        if short { "short" } else { "full" }
-    );
-    if cfg!(target_os = "macos") {
-        assert!(
-            !short,
-            "CANNOT MEASURE: this Mac granted {granted} bytes of the 4 MiB asked for \
-             (kern.ipc.maxsockbuf below 8 MiB?); the macOS arm of this proof is the full grant"
-        );
-    }
-    if cfg!(target_os = "linux") {
-        assert!(
-            short,
-            "CANNOT MEASURE: this Linux host granted the full {granted} bytes read back \
-             (net.core.rmem_max at least 4 MiB?); the Linux arm of this proof is the short grant, \
-             and a full one here would pass without ever measuring the 1452 notice"
-        );
-    }
+/// Run one arm: a world, an echo through its forward, then every long-running process killed and
+/// read. `granted` is what each process's socket was granted, as this test read it back; `short`
+/// whether that is short of a full grant. `staged`, on a Mac's short arm, is the interposer's log,
+/// in which each process must have recorded its own clamp.
+fn run_arm(granted: usize, short: bool, staged: Option<&std::path::Path>) {
     let expected_notice = format!(
         "vox: UDP receive buffer {} KiB: path-MTU ceiling 1452 bytes, not 8192",
         granted / 1024
@@ -148,27 +140,43 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
 
     let mut w = World::new(echo_service(), true);
     let guest_dir = w.guest_dir.clone();
-    let (forward, at) = w.forward("forward", &guest_dir);
+    let (mut forward, at) = w.forward("forward", &guest_dir);
     // 64 KiB: enough to fill several datagrams at either ceiling, so every endpoint has carried
-    // traffic when it is read.
+    // traffic when it is read. A forward that cannot carry it is the product failing at the very
+    // thing the ceiling is for, so it is a PRODUCT red, quoting both ends.
     let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
-    let back = round_trip(at, &payload, Duration::from_secs(120))
-        .expect("CANNOT MEASURE: the forward did not carry a connection through the world");
+    let back = match round_trip(at, &payload, Duration::from_secs(120)) {
+        Ok(back) => back,
+        Err(e) => panic!(
+            "PRODUCT: the forward did not carry a 64 KiB echo within 120 s: {e}\n\
+             vox forward said:\n{}\nvox serve said:\n{}",
+            forward.transcript(),
+            w.host.as_mut().map(|h| h.transcript()).unwrap_or_default()
+        ),
+    };
     assert!(
         back == payload,
-        "CANNOT MEASURE: the echo came back altered ({} bytes)",
-        back.len()
+        "PRODUCT: the echo came back altered ({} of {} bytes)\nvox forward said:\n{}",
+        back.len(),
+        payload.len(),
+        forward.transcript()
     );
     eprintln!("[proof] echoed {} bytes through the forward", back.len());
 
-    let host = w.host.take().expect("the world's host");
+    let host = w
+        .host
+        .take()
+        .expect("APPARATUS: the world has no host process");
     // Moved out (the temp dir stays with `w`) so it is killed last, after everything that
     // reaches through it.
     let anchor = w.anchor;
-    let mut checked = 0;
     for proc in [forward, host, anchor] {
         let name = proc.name.clone();
+        let pid = proc.child.id();
         let said = everything_said(proc);
+        if let Some(log) = staged {
+            staged_for(log, pid, &name);
+        }
         let notices: Vec<&String> = said.iter().filter(|l| l.contains(NOTICE)).collect();
         eprintln!(
             "[proof] {name}: {} lines, {} path-MTU ceiling notice(s)",
@@ -179,20 +187,20 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
             assert_eq!(
                 notices.len(),
                 1,
-                "{name}: the OS granted {granted} bytes, short of {FULL_READ_BACK}, so {name} must \
-                 run the 1452 ceiling and say so once. It said:\n{}",
+                "PRODUCT: {name}: the OS granted {granted} bytes, short of {FULL_READ_BACK}, so \
+                 {name} must run the 1452 ceiling and say so once. It said:\n{}",
                 said.join("\n")
             );
             let line = notices[0].strip_prefix("! ").unwrap_or(notices[0]);
             assert!(
                 line.starts_with(&expected_notice),
-                "{name}: the notice must read {expected_notice:?}…, got {line:?}"
+                "PRODUCT: {name}: the notice must read {expected_notice:?}…, got {line:?}"
             );
         } else {
             assert!(
                 notices.is_empty(),
-                "{name}: the OS granted the full {granted} bytes, so {name} must run the 8192 \
-                 ceiling and print no fallback notice. It printed:\n{}",
+                "PRODUCT: {name}: the OS granted the full {granted} bytes, so {name} must run the \
+                 8192 ceiling and print no fallback notice. It printed:\n{}",
                 notices
                     .iter()
                     .map(|s| s.as_str())
@@ -200,15 +208,104 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
                     .join("\n")
             );
         }
-        checked += 1;
     }
-    assert_eq!(checked, 3, "anchor, host and forward were each read");
+}
+
+/// The staged short arm reached `pid`: the interposer's log holds a clamp of its `SO_RCVBUF`
+/// request to [`CAP`]. Without it the process ran on the full grant, and its silence would be no
+/// verdict on the product.
+#[cfg(target_os = "macos")]
+fn staged_for(log: &std::path::Path, pid: u32, name: &str) {
+    let text = std::fs::read_to_string(log).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS, CANNOT MEASURE: no interposer log {}: {e}",
+            log.display()
+        )
+    });
+    let clamped = syscalls::parse(&text).iter().any(|e| {
+        e.pid == pid
+            && e.ret == 0
+            && matches!(e.call, syscalls::Call::RcvBuf { asked, set }
+                if asked > CAP as u64 && set == CAP as u64)
+    });
+    assert!(
+        clamped,
+        "APPARATUS, CANNOT MEASURE: {name} (pid {pid}) recorded no SO_RCVBUF request \
+         clamped to {CAP} bytes, so the interposer did not stage its short grant"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn staged_for(_log: &std::path::Path, _pid: u32, _name: &str) {
+    unreachable!("APPARATUS: the staged arm runs only on a Mac");
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
+    watchdog::arm();
+
+    let granted = granted_receive_buffer(ASKED);
+    let short = granted < FULL_READ_BACK;
     eprintln!(
-        "[proof] {checked} processes checked: the {} arm",
+        "[proof] asked {ASKED} bytes, SO_RCVBUF read back {granted} ({} KiB), full reads back \
+         {FULL_READ_BACK}: the grant is {}",
+        granted / 1024,
+        if short { "short" } else { "full" }
+    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            !short,
+            "APPARATUS, CANNOT MEASURE: this Mac granted {granted} bytes of the 4 MiB asked for \
+             (kern.ipc.maxsockbuf below 8 MiB?); the macOS arms of this proof start from a full \
+             grant"
+        );
+    }
+    if cfg!(target_os = "linux") {
+        assert!(
+            short,
+            "APPARATUS, CANNOT MEASURE: this Linux host granted the full {granted} bytes read back \
+             (net.core.rmem_max at least 4 MiB?); the Linux arm of this proof is the short grant, \
+             and a full one here would pass without ever measuring the 1452 notice"
+        );
+    }
+    run_arm(granted, short, None);
+    eprintln!(
+        "[proof] 3 processes checked: the {} arm",
         if short {
             "short-grant (1452 notice)"
         } else {
             "full-grant (8192, no notice)"
         }
     );
+
+    #[cfg(target_os = "macos")]
+    {
+        let clamped = granted_receive_buffer(CAP);
+        assert!(
+            clamped < FULL_READ_BACK,
+            "APPARATUS, CANNOT MEASURE: asking for {CAP} bytes read back {clamped}, not short of \
+             {FULL_READ_BACK}"
+        );
+        let dir = tempfile::tempdir().expect("APPARATUS: no temp dir for the interposer log");
+        let log = dir.path().join("rcvbuf.tsv");
+        // Every `vox` the world starts inherits these, and only these processes are interposed.
+        std::env::set_var("DYLD_INSERT_LIBRARIES", syscalls::interposer());
+        std::env::set_var("VOX_INTERPOSE_RCVBUF_CAP", CAP.to_string());
+        std::env::set_var("VOX_INTERPOSE_LOG", &log);
+        eprintln!(
+            "[proof] staged short arm: each SO_RCVBUF request capped at {CAP} bytes, which reads \
+             back {clamped} ({} KiB)",
+            clamped / 1024
+        );
+        run_arm(clamped, true, Some(&log));
+        for k in [
+            "DYLD_INSERT_LIBRARIES",
+            "VOX_INTERPOSE_RCVBUF_CAP",
+            "VOX_INTERPOSE_LOG",
+        ] {
+            std::env::remove_var(k);
+        }
+        eprintln!("[proof] 3 processes checked: the staged short-grant (1452 notice) arm");
+    }
 }

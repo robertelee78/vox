@@ -1859,12 +1859,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
-
-[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3113,6 +3107,7 @@ version = "0.2.10"
 dependencies = [
  "serde",
  "serde_json",
+ "vox-text",
 ]
 
 [[package]]
@@ -3141,12 +3136,15 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-post-quantum",
+ "serde_json",
  "sha1",
  "sha2",
  "socket2",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "vox-text",
  "x25519-dalek",
  "x509-parser 0.16.0",
  "zeroize",
@@ -3163,6 +3161,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vox-text"
+version = "0.2.10"
+
+[[package]]
 name = "vox-tui"
 version = "0.2.10"
 dependencies = [
@@ -3176,9 +3178,9 @@ dependencies = [
  "hkdf",
  "nix 0.31.3",
  "portable-pty",
- "qrcode",
  "quinn",
  "ratatui",
+ "rcgen",
  "redb",
  "reqwest",
  "rustix 1.1.4",

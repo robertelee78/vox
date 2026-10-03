@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tui_close_room.py <vox> <data_dir> <config_dir> <identity_pass> <room_pass> <tag>
+"""tui_close_room.py <vox> <data_dir> <config_dir> <identity_pass> <room_pass> <tag> [<member>]
 
 Closes a profile's only room through the shipped `vox tui`, as a person would: unlock, open the
 room, `:close`. It is the one way to close a room on purpose (a daemon reopens every room it held
@@ -11,10 +11,10 @@ an unknown command (`:zzz`) first, so "done" afterwards can only be the close's 
 
 Exit 0 = the TUI said "done" to `:close`. 1 = a product red, with its screen: `RED: vox tui
 exited before it asked to unlock`, `RED: the TUI never unlocked`, `RED: no "done" after
-:close`, or `RED: vox tui exited at <stage>`; or `HUNG at <stage>` with the driver's stack (`vox_pty.py`, V210-54) — every wait here is
+:close`, or `RED: vox tui exited at <stage>`, `RED: PRODUCT (staging): the status line still says done after
+:zzz` (an unknown command must replace it, or a later "done" proves nothing); or `HUNG at <stage>` with the driver's stack (`vox_pty.py`, V210-54) — every wait here is
 bounded, so a driver past its budget is a TUI that stopped reading what was typed. 2 = apparatus
-only: pyte missing, the status line not reset by `:zzz` (the staging this driver needs), or the
-driver's own error. The caller confirms the room is closed on its own, with `vox room list`. The
+only: pyte missing, or the driver's own error. The caller confirms the room is closed on its own, with `vox room list`. The
 TUI is killed by its PID, with bounded waits.
 
 **A TUI that never unlocks is the product, not the apparatus** (V210-107). It was reported as
@@ -35,6 +35,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import STAGE, Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, TAG = sys.argv[1:7]
+# Optional: a member, by the first characters of its fingerprint, to select in this room and type
+# `:consent grant` at before the close. There is no such command (V210-148): a key goes only to a
+# member the owner trusts. What the TUI answered, and the member's row after it, are printed for
+# the caller to judge; the close goes on either way, so the caller can also see what the node did.
+GRANT = sys.argv[7] if len(sys.argv) > 7 else None
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "180"))
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
@@ -105,11 +110,60 @@ try:
     if "passphrase" in tui.text().lower():
         # Closed on this node: the TUI asks for the room's passphrase to open it.
         key(ROOMPASS + "\r", 6)
+    if GRANT:
+        stage(":consent grant")
+        key("\t", 0.5)  # timeline -> composer
+        key("\t", 0.5)  # composer -> members
+        members = lambda: [r[100:] if len(r) > 100 else "" for r in tui.display()]
+        def label_of(prefix):
+            rows = members()
+            for i, r in enumerate(rows):
+                if prefix in r:
+                    return (rows[i + 1] if i + 1 < len(rows) else ""), "\u25b6" in r
+            return None, False
+        if not tui.until(lambda: label_of(GRANT)[0] is not None, 60, 1):
+            give(1, f"RED: PRODUCT (staging): {GRANT} is not in the members pane:\n{tui.text()}")
+        for _ in range(8):
+            if label_of(GRANT)[1]:
+                break
+            key("\x1b[B", 0.5)  # Down
+        if not label_of(GRANT)[1]:
+            give(1, f"RED: PRODUCT (staging): Down never put the marker on {GRANT}:\n{tui.text()}")
+        # The TUI's node must be connected before the grant, or a grant that existed could fail for
+        # want of a session and the proof would show nothing: wait for the member it trusts to show
+        # trusted (its key went out, so sessions are up), then 15 s more (V29-19 measured a first
+        # grant failing for want of a session for up to 15 s after a room opened).
+        rows_all = lambda: "\n".join(members())
+        if not tui.until(lambda: "trusted" in rows_all(), 60, 1):
+            give(1, f"RED: PRODUCT (staging): the TUI's node never showed a trusted member, so it never connected:\n{tui.text()}")
+        tui.pump(15)
+        gone_check()
+        if "unknown command" in status():
+            give(2, f"APPARATUS: the status line says unknown command before :consent grant:\n{tui.text()}")
+        key(":consent grant\r", 2)
+        answer = status()
+        tui.pump(5)
+        gone_check()
+        row = label_of(GRANT)[0] or ""
+        print(f"{TAG} :consent grant answered {answer.strip()!r}; {GRANT}'s row then: {row.strip()!r}")
+        if "unknown command" in answer:
+            print(f"{TAG} :consent grant is not a command")
+        # Then a post from the composer, with the TUI's node up long enough to deliver it: what the
+        # caller reads of it shows what the node did with the grant, not only what the TUI drew.
+        stage("post after :consent grant")
+        key("\t", 0.5)  # members -> timeline
+        key("\t", 0.5)  # timeline -> composer
+        key("BOB-AFTER-GRANT\r", 1)
+        key("\t", 0.5)  # composer -> members, where `:` opens the command line again
+        tui.pump(20)
+        gone_check()
+        print(f"{TAG} posted BOB-AFTER-GRANT")
     before = tui.text()
     stage(":close")
     key(":zzz\r", 1.5)
     if "done" in status():
-        give(2, f"APPARATUS: the status line still says done after :zzz:\n{tui.text()}")
+        give(1, f"RED: PRODUCT (staging): the status line still says done after :zzz, an unknown "
+                f"command:\n{tui.text()}")
     key(":close\r", 1)
     closed = tui.until(lambda: tui.closed or "done" in status(), 20)
     gone_check()

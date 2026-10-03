@@ -94,7 +94,7 @@ impl AppError {
 /// What the TUI's status line says while creating or unlocking the identity waits for another
 /// vox holding the profile.
 pub const WAITING_FOR_PROFILE_TUI: &str =
-    "another vox is using this profile — waiting for it to finish (it goes on by itself)";
+    "waiting: another vox holds this profile open, and only one at a time may write it — this goes on by itself";
 
 pub trait CoreHandle {
     /// The latest view model to render (may fold in pending core events).
@@ -229,7 +229,13 @@ impl TerminalIo for CrosstermIo {
         enable_raw_mode()?;
         self.entered = true;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        // Cleared as well: on a terminal without an alternate screen, anything printed before the
+        // TUI started (a wait for the profile, V210-100) would otherwise show through.
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        )?;
         self.terminal = Some(Terminal::new(CrosstermBackend::new(stdout))?);
         Ok(())
     }
@@ -554,7 +560,8 @@ pub fn run_node(
         .bind(vox_core::node::actor::Bind::Addr(listen))
         .anchors(anchors)
         .headless(signer)
-        .anchor_boards(true);
+        .anchor_boards(true)
+        .on_profile_wait(crate::tunnel_cli::say_waiting);
     let cfg = match serve_only {
         Some(creators) => {
             println!(
@@ -571,6 +578,12 @@ pub fn run_node(
     let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
     let fp = vox_core::node::link::b32_encode(&fingerprint);
     println!("vox node: identity {fp}");
+    // An anchor binds as it spawns, before the loop below listens, so a moved port is said here.
+    while let Some(ev) = node.try_next_event() {
+        if let vox_core::node::api::NodeEvent::NodeNote { note } = ev {
+            eprintln!("vox node: {note}");
+        }
+    }
     rt.block_on(async {
         // Addresses are discovered on a task after start-up (a route probe and a
         // gateway request); print the anchor specs once they are known, then serve.
@@ -776,6 +789,9 @@ pub fn run_node(
                                         crate::ident::author_id(&peer)
                                     );
                                 }
+                                vox_core::node::api::NodeEvent::NodeNote { note } => {
+                                    eprintln!("vox node: {note}");
+                                }
                                 _ => {}
                             },
                             vox_core::node::actor::EventStreamItem::Lagged(n) => {
@@ -806,13 +822,34 @@ const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `vox daemon` waits for its node to stop on SIGTERM or Ctrl-C before leaving anyway.
 /// A clean stop takes milliseconds; this is for a node stuck waiting on a peer that vanished.
 /// It must stay longer than the node's own worst-case stop
-/// ([`vox_core::node::actor::STOP_WORST_CASE`], 4.45 s, which names each of its waits), so a stop
+/// ([`vox_core::node::actor::STOP_WORST_CASE`], 4.45 s, the sum of the stop's budget), so a stop
 /// that waits every one of them out still closes its connections before the daemon leaves.
 const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 const _: () = assert!(
     vox_core::node::actor::STOP_WORST_CASE.as_millis() + 500 <= SHUTDOWN_PATIENCE.as_millis(),
     "the daemon gives a stop that waits out every bound at least 0.5 s more"
 );
+
+/// The test-only variable that shortens [`SHUTDOWN_PATIENCE`], in milliseconds (see
+/// [`shutdown_patience`]).
+#[cfg(feature = "test-knobs")]
+const TEST_SHUTDOWN_PATIENCE_ENV: &str = "VOX_TEST_SHUTDOWN_PATIENCE_MS";
+
+/// [`SHUTDOWN_PATIENCE`], or **shorter**, read from `VOX_TEST_SHUTDOWN_PATIENCE_MS` in a build with
+/// the `test-knobs` feature. **Test-only: for proofs; no shipped build reads it** (V210-105). The
+/// node's stop is budgeted to fit the real patience, so no real scene runs past it; a proof stages
+/// a stop that gives up, and what the daemon then says and how it exits, with a shorter one. It
+/// only ever shortens it; unset, empty or unparsable is the real patience.
+fn shutdown_patience() -> std::time::Duration {
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var(TEST_SHUTDOWN_PATIENCE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(ms).min(SHUTDOWN_PATIENCE);
+    }
+    SHUTDOWN_PATIENCE
+}
 
 /// How long one wake may take before it is abandoned.
 const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -829,10 +866,13 @@ fn may_answer(text: &str) -> bool {
     vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|e| e.re.is_some())
 }
 
-/// The interrupt decision for one entry that just landed in `channel_id`: every session
-/// registered for that room that this message both addresses and marks urgent (ADR-020 §6),
-/// while it has hops left (§9), is owed a notice. [`tend`] sends it. Everything else waits for
-/// the session's next turn.
+/// The interrupt decision for one entry that just landed in `channel_id`: when it addresses
+/// this node and is marked urgent (ADR-020 §6), and has hops left (§9), every session registered
+/// on this node but the one that posted it, and but one already in its reply chain (V210-121), is
+/// owed a notice. [`tend`] sends it. Everything else waits for the session's next turn.
+///
+/// `view` is the node's view as the entry is judged: the room's log, for the hop budget and the
+/// reply chain.
 fn judge(
     paths: &vox_core::node::paths::Paths,
     view: &vox_core::node::api::NodeView,
@@ -862,12 +902,37 @@ fn judge(
         );
         return;
     }
+    // **A message wakes the agents of the nodes it addresses** (V210-161): `to` names nodes by
+    // fingerprint, and every session of this node hears every room it holds.
+    let Some(me) = view.identity.as_ref().map(|i| i.fingerprint) else {
+        return;
+    };
+    if !envelope.may_interrupt(&vox_core::node::link::b32_encode(&me)) {
+        return;
+    }
     for session in crate::wake::registered(paths) {
-        if session.room != room
-            || session.name.is_empty()
-            || !envelope.may_interrupt(&session.name)
-            || !crate::wake::wakeable(&session.harness)
-        {
+        if row.author == me && envelope.from == session.session {
+            continue;
+        }
+        // **Not a session already in this conversation** (V210-121): a reply chain that comes
+        // back to a session that spoke in it is two agents keeping each other awake. The hop
+        // budget ends such a chain eventually; this ends it at the first turn back. It queues.
+        if crate::wake::in_chain(&envelope, timeline, &me, &session.session) {
+            eprintln!(
+                "vox daemon: not interrupting session {} for {}: it already spoke in the reply \
+                 chain this answers; it reads it on its next turn",
+                session.session,
+                &vox_core::node::link::b32_encode(&row.entry_hash)[..12]
+            );
+            continue;
+        }
+        // Recorded **before** the notice is sent, so the session's answer with no `--re` replies
+        // to this (V210-121) however soon it comes: recorded after, an answer could beat the
+        // record. A notice that then fails still put the message before the session's next turn.
+        crate::wake::note_woke(paths, &session.session, &room, &row.entry_hash);
+        // **Codex is never woken** (V210-169): nothing is owed it in notices; it reads at its next
+        // turn, and a poster on this node is told so ([`crate::wake::uninterruptible`]).
+        if !crate::wake::wakeable(&session.harness) {
             continue;
         }
         let mut n = crate::wake::notices(paths, &session.session);
@@ -885,11 +950,12 @@ fn judge(
 
 /// Send each session the notice it is owed now, if any (ADR-020 §6; V030-15, V030-20).
 ///
-/// A session is looked at when it is owed an urgent notice, while a reply to it is unread, and
-/// when an answer to anything landed in its room (`answered`). What it is owed is **counted
-/// here, just before sending**, from the room and its cursor, so a message its drain already
-/// read is never announced. [`crate::wake::tend`] has the rules; the notice carries counts and
-/// senders, never a message.
+/// A session hears every room its node holds (V210-163), so it is owed one notice across all of
+/// them. It is looked at when it is owed an urgent notice, while a reply to it is unread, and
+/// when an answer to anything landed in one of its rooms (`answered`). What it is owed is
+/// **counted here, just before sending**, from each room and the session's cursor there, so a
+/// message its drain already read is never announced. [`crate::wake::tend`] has the rules; the
+/// notice carries counts and senders, never a message.
 fn tend(
     paths: &vox_core::node::paths::Paths,
     view: &vox_core::node::api::NodeView,
@@ -910,41 +976,60 @@ fn tend(
     let said_held = &mut t.said_held;
     let me = view.identity.as_ref().map(|i| i.fingerprint);
     let starting = std::mem::take(&mut t.starting);
+    let any_answered = view
+        .open_channels
+        .iter()
+        .any(|d| answered.contains(&d.channel_id));
     for session in crate::wake::registered(paths) {
         if !crate::wake::wakeable(&session.harness) {
             continue;
         }
-        let Ok(cid) = vox_core::node::link::b32_decode(&session.room, "room") else {
-            continue;
-        };
-        let Some(detail) = view.open_channels.iter().find(|d| d.channel_id == cid) else {
-            continue;
-        };
         let mut n = crate::wake::notices(paths, &session.session);
-        // Looked at only when something may be owed: the whole room is read to count it.
-        if !(starting || n.active(&settings) || answered.contains(&cid)) {
+        // Looked at only when something may be owed: every room is read to count it.
+        if !(starting || n.active(&settings) || any_answered) {
             continue;
         }
-        let cursor = crate::agent_hook::load_cursor(paths, &session.room, &session.session);
-        let ahead = crate::agent_hook::delivered_ahead(paths, &session.room, &session.session);
-        let (urgent, replies) = crate::wake::unread(&detail.timeline, me, &session, cursor, &ahead);
+        // Each room's unread, and the session's read position across all of them: the notice
+        // is outstanding until any of its cursors moves.
+        let mut rooms = Vec::new();
+        let mut cursors = Vec::new();
+        for d in &view.open_channels {
+            let room = vox_core::node::link::b32_encode(&d.channel_id);
+            let cursor = crate::agent_hook::load_cursor(paths, &room, &session.session);
+            let ahead = crate::agent_hook::delivered_ahead(paths, &room, &session.session);
+            cursors.push(format!(
+                "{room}={}",
+                cursor
+                    .as_ref()
+                    .map(vox_core::node::link::b32_encode)
+                    .unwrap_or_default()
+            ));
+            let (urgent, replies) = crate::wake::unread(&d.timeline, me, &session, cursor, &ahead);
+            if !urgent.is_empty() || !replies.is_empty() {
+                rooms.push((d, urgent, replies));
+            }
+        }
+        let urgent: usize = rooms.iter().map(|(_, u, _)| u.len()).sum();
+        let newest_reply = rooms
+            .iter()
+            .flat_map(|(_, _, r)| r.iter())
+            .max_by_key(|r| r.arrival)
+            .map(|r| vox_core::node::link::b32_encode(&r.entry_hash));
         let before = n.clone();
-        // **At start every session is counted from its cursor.** This guards one window only: a
+        // **At start every session is counted from its cursors.** This guards one window only: a
         // daemon killed after a row reached its store and before the wake loop looked at it (the
         // next sweep, at most 2 s). Such a row is history to the restarted loop, so nothing new
         // marks it. Rows that land while the daemon is down arrive by sync after it starts and are
         // judged as new without this. The window cannot be staged through the shipped binary
         // (`vox room post` needs a running node), so this is unproven by mutant: a review-only guard.
-        if starting && !urgent.is_empty() {
+        if starting && urgent > 0 {
             n.urgent_due = true;
         }
         let outcome = crate::wake::tend(
             &mut n,
-            cursor.as_ref().map(vox_core::node::link::b32_encode),
-            urgent.len(),
-            replies
-                .last()
-                .map(|r| vox_core::node::link::b32_encode(&r.entry_hash)),
+            Some(cursors.join(" ")),
+            urgent,
+            newest_reply,
             session.idle(now, settings.busy_idle),
             now,
             &settings,
@@ -979,18 +1064,25 @@ fn tend(
                 let name = |r: &&vox_core::node::api::MessageRow| {
                     crate::ident::member_name(&view.trusted, &r.author)
                 };
-                let room_name = view
-                    .channels
+                let owed: Vec<crate::agent_hook::Owed> = rooms
                     .iter()
-                    .find(|c| c.channel_id == cid)
-                    .and_then(|c| c.local_name.clone())
-                    .unwrap_or_default();
-                let text = crate::agent_hook::render_wake(
-                    &session.room[..12.min(session.room.len())],
-                    &room_name,
-                    &urgent.iter().map(name).collect::<Vec<_>>(),
-                    &replies.iter().map(name).collect::<Vec<_>>(),
-                );
+                    .map(|(d, urgent, replies)| {
+                        let label = vox_core::node::link::b32_encode(&d.channel_id);
+                        let room_name = view
+                            .channels
+                            .iter()
+                            .find(|c| c.channel_id == d.channel_id)
+                            .and_then(|c| c.local_name.clone())
+                            .unwrap_or_default();
+                        crate::agent_hook::Owed {
+                            room_label: label[..12.min(label.len())].to_owned(),
+                            room_name,
+                            urgent: urgent.iter().map(name).collect(),
+                            replies: replies.iter().map(name).collect(),
+                        }
+                    })
+                    .collect();
+                let text = crate::agent_hook::render_wake(&owed);
                 let hold = u64::try_from(settings.wake_hold.as_millis()).unwrap_or(u64::MAX);
                 deliver(paths.clone(), session, text, (before, n, hold));
             }
@@ -1088,6 +1180,394 @@ pub(crate) fn say(line: std::fmt::Arguments<'_>) {
     let _ = writeln!(io::stdout(), "{line}");
 }
 
+/// The identity passphrase `vox daemon` unlocks with, and the room lines that follow it.
+type DaemonPassphrases = (zeroize::Zeroizing<String>, Vec<String>);
+
+/// What a start-up wait of `vox daemon` ended with: what it waited for, or a stop.
+enum Asked<T> {
+    Got(T),
+    Stopped(StopSignal),
+}
+
+/// `VOX_IDENTITY_PASSPHRASE`, when set and not empty: how an agent's harness gives a daemon its
+/// identity passphrase (V210-159, decider 2026-10-02, option A).
+fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
+    std::env::var("VOX_IDENTITY_PASSPHRASE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(zeroize::Zeroizing::new)
+}
+
+/// The identity passphrase and the room lines, from the first of: `--passphrase-file`,
+/// `VOX_IDENTITY_PASSPHRASE` (the identity alone), the terminal (asked for without echo, and
+/// **without waiting for end of input**: one line is the passphrase, V210-153), or stdin that is
+/// not a terminal, read to its end. A stop ends any wait for them.
+fn daemon_passphrases(
+    rt: &tokio::runtime::Runtime,
+    stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = StopSignal>>>,
+    passphrase_file: Option<std::path::PathBuf>,
+) -> Result<Asked<DaemonPassphrases>, AppError> {
+    let raw = if let Some(path) = &passphrase_file {
+        crate::tunnel_cli::passphrase_file_text(path)?
+    } else if let Some(identity) = daemon_env_passphrase() {
+        return Ok(Asked::Got((identity, Vec::new())));
+    } else if io::IsTerminal::is_terminal(&io::stdin()) {
+        return Ok(match ask_without_echo(rt, stop, "identity passphrase") {
+            Asked::Got(identity) => Asked::Got((nonempty_identity(identity?)?, Vec::new())),
+            Asked::Stopped(signal) => Asked::Stopped(signal),
+        });
+    } else {
+        match read_piped_stdin(rt, stop) {
+            Asked::Got(raw) => raw?,
+            Asked::Stopped(signal) => return Ok(Asked::Stopped(signal)),
+        }
+    };
+    let mut lines = raw.lines();
+    // Only the line ending is stripped. A passphrase may legitimately begin or end
+    // with a space, so nothing else is trimmed.
+    let identity = zeroize::Zeroizing::new(
+        lines
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('\r')
+            .to_owned(),
+    );
+    // `<room> <passphrase>` opens that room. **A line with no space is a passphrase to
+    // try against every closed room**, and that form exists because the other one was
+    // unusable after a restart.
+    //
+    // A room's local name lives inside the SEK-sealed manifest, so it cannot be read
+    // until the room is open. After a restart every room is closed, so `vox room list`
+    // shows them all as `(unnamed)` — correct, the name is the operator's data and must
+    // not leak from a locked profile, but it means `mission <pass>` answers "nothing
+    // here matches mission". The room *id* does work, and nothing said so; worse,
+    // `room list` needs a running node, so learning the ids meant starting a daemon
+    // bare, listing, stopping it and starting it again. A person setting up a host for
+    // the first time cannot be expected to find that.
+    //
+    // So: one passphrase on a line of its own opens everything it opens. Nothing is
+    // guessed — a room whose passphrase this is not simply stays closed, exactly as it
+    // would have.
+    let rooms: Vec<String> = lines
+        .map(|l| l.trim_end_matches('\r').to_owned())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Ok(Asked::Got((nonempty_identity(identity)?, rooms)))
+}
+
+/// `identity`, or the reason an empty one cannot unlock anything.
+fn nonempty_identity(
+    identity: zeroize::Zeroizing<String>,
+) -> Result<zeroize::Zeroizing<String>, AppError> {
+    if identity.is_empty() {
+        return Err(AppError::Usage(
+            "no identity passphrase. Type it at the terminal, pipe it in (`echo … | vox \
+             daemon`), set VOX_IDENTITY_PASSPHRASE, or pass --passphrase-file."
+                .into(),
+        ));
+    }
+    Ok(identity)
+}
+
+/// How long `vox daemon` reads a stdin that is not a terminal before it says what it is waiting
+/// for: an agent's harness can leave stdin open and write nothing, and a daemon must not wait
+/// there silently (V210-165).
+const PIPED_STDIN_NOTICE: Duration = Duration::from_secs(2);
+
+/// Stdin that is not a terminal, read to its end on a blocking thread, racing `stop`.
+fn read_piped_stdin(
+    rt: &tokio::runtime::Runtime,
+    stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = StopSignal>>>,
+) -> Asked<Result<zeroize::Zeroizing<String>, AppError>> {
+    rt.block_on(async {
+        let reading = tokio::task::spawn_blocking(|| {
+            use std::io::Read as _;
+            let mut buf = zeroize::Zeroizing::new(String::new());
+            io::stdin()
+                .read_to_string(&mut buf)
+                .map(|_| buf)
+                .map_err(|e| AppError::Usage(format!("reading passphrases on stdin: {e}")))
+        });
+        tokio::pin!(reading);
+        let notice = tokio::time::sleep(PIPED_STDIN_NOTICE);
+        tokio::pin!(notice);
+        let mut said = false;
+        loop {
+            tokio::select! {
+                read = &mut reading => {
+                    return Asked::Got(read.unwrap_or_else(|e| {
+                        Err(AppError::Usage(format!("reading passphrases on stdin: {e}")))
+                    }));
+                }
+                signal = &mut *stop => return Asked::Stopped(signal),
+                () = &mut notice, if !said => {
+                    said = true;
+                    eprintln!(
+                        "vox daemon: waiting for stdin to close: the identity passphrase, then \
+                         any room lines.\n\
+                         \x20      No terminal to ask at. Or set VOX_IDENTITY_PASSPHRASE, or \
+                         pass --passphrase-file <path>."
+                    );
+                }
+            }
+        }
+    })
+}
+
+/// How long a prompt whose terminal ended waits for the stop signal that a closed terminal sends.
+/// The kernel sends SIGHUP as it ends the read, so it lands within milliseconds; a second covers a
+/// loaded machine.
+const HANGUP_GRACE: Duration = Duration::from_secs(1);
+
+/// One line typed at the terminal, without echo, racing `stop`. A stop leaves the terminal as it
+/// was: echo comes back whichever ends the wait.
+fn ask_without_echo(
+    rt: &tokio::runtime::Runtime,
+    stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = StopSignal>>>,
+    prompt: &str,
+) -> Asked<Result<zeroize::Zeroizing<String>, AppError>> {
+    let _ = write!(io::stderr(), "{prompt}: ");
+    let _ = io::stderr().flush();
+    let quiet = no_echo::EchoOff::new();
+    let asked = rt.block_on(async {
+        let reading = tokio::task::spawn_blocking(no_echo::read_line);
+        let read = tokio::select! {
+            read = reading => read,
+            signal = &mut *stop => return Asked::Stopped(signal),
+        };
+        let read = match read {
+            Ok(Ok(Some(line))) => return Asked::Got(Ok(line)),
+            Ok(Ok(None)) => Ok(zeroize::Zeroizing::new(String::new())),
+            Ok(Err(e)) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
+            Err(e) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
+        };
+        // **The terminal ended: closed, most likely, and its SIGHUP is on its way** (V210-153).
+        // Closing the terminal ends the read and sends the hangup at the same moment, and the
+        // read nearly always reaches here first: 11 of 13 real hangups then exited 1 with "no
+        // identity passphrase" instead of stopping cleanly. So the stop gets a moment to land.
+        // Only a Ctrl-D typed at the prompt, which no signal follows, waits it out.
+        tokio::select! {
+            signal = &mut *stop => Asked::Stopped(signal),
+            () = tokio::time::sleep(HANGUP_GRACE) => Asked::Got(read),
+        }
+    });
+    drop(quiet);
+    if matches!(asked, Asked::Stopped(_)) {
+        // The prompt's line is left open; the stop's report starts on a line of its own.
+        let _ = writeln!(io::stderr());
+    }
+    asked
+}
+
+/// A daemon stopped before it served: its node, if it had one, is shut down, and it says which
+/// signal, exiting 0 as any stop of a server does (V210-153). The runtime is not waited for: a
+/// thread of it may still be reading the terminal.
+fn stopped_while_starting(
+    rt: tokio::runtime::Runtime,
+    node: Option<&vox_core::node::actor::NodeHandle>,
+    signal: StopSignal,
+) -> Result<(), AppError> {
+    if let Some(node) = node {
+        let _ = rt.block_on(tokio::time::timeout(
+            shutdown_patience(),
+            node.apply(NodeCommand::Shutdown),
+        ));
+    }
+    rt.shutdown_background();
+    say(format_args!("vox daemon: stopped by {}", signal.name()));
+    Ok(())
+}
+
+/// Reading a line at the terminal without echo, and without crossterm's raw mode: the terminal
+/// keeps its line editing, and Ctrl-C stays a SIGINT, which the daemon takes as a clean stop.
+mod no_echo {
+    use std::io;
+
+    /// Echo off on the terminal at stdin until dropped, keeping the newline's echo. Does nothing
+    /// where stdin is not a terminal.
+    pub(super) struct EchoOff {
+        #[cfg(unix)]
+        was: Option<rustix::termios::Termios>,
+    }
+
+    impl EchoOff {
+        pub(super) fn new() -> Self {
+            #[cfg(unix)]
+            {
+                use rustix::termios::{tcgetattr, tcsetattr, LocalModes, OptionalActions};
+                let stdin = io::stdin();
+                let was = tcgetattr(&stdin).ok();
+                if let Some(was) = &was {
+                    let mut quiet = was.clone();
+                    quiet.local_modes.remove(LocalModes::ECHO);
+                    quiet.local_modes.insert(LocalModes::ECHONL);
+                    let _ = tcsetattr(&stdin, OptionalActions::Now, &quiet);
+                }
+                Self { was }
+            }
+            #[cfg(not(unix))]
+            Self {}
+        }
+    }
+
+    impl Drop for EchoOff {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            if let Some(was) = &self.was {
+                let _ = rustix::termios::tcsetattr(
+                    io::stdin(),
+                    rustix::termios::OptionalActions::Now,
+                    was,
+                );
+            }
+        }
+    }
+
+    /// One line from stdin, a byte at a time from the descriptor itself, past std's buffer, so
+    /// nothing past it is taken from the terminal and no copy is left behind (V210-94); into a
+    /// buffer wiped on drop. `None` when the input ended before a newline: a Ctrl-D, or a
+    /// terminal that closed; what came before it is wiped, never taken as a line.
+    pub(super) fn read_line() -> io::Result<Option<zeroize::Zeroizing<String>>> {
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        let mut b = [0u8; 1];
+        loop {
+            #[cfg(unix)]
+            let read = rustix::io::read(io::stdin(), &mut b).map_err(io::Error::from);
+            #[cfg(not(unix))]
+            let read = std::io::Read::read(&mut io::stdin(), &mut b);
+            match read {
+                Ok(0) => {
+                    zeroize::Zeroize::zeroize(&mut b);
+                    return Ok(None);
+                }
+                Ok(_) if b[0] == b'\n' => break,
+                Ok(_) => bytes.push(b[0]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        zeroize::Zeroize::zeroize(&mut b);
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        String::from_utf8(std::mem::take(&mut *bytes))
+            .map(|line| Some(zeroize::Zeroizing::new(line)))
+            .map_err(|e| {
+                let mut v = e.into_bytes();
+                zeroize::Zeroize::zeroize(&mut v);
+                io::Error::new(io::ErrorKind::InvalidData, "the line is not UTF-8")
+            })
+    }
+}
+
+/// Open every closed room `line` opens, as `vox daemon` reads a room line: the whole line as a
+/// passphrase first, then `<room> <passphrase>`.
+async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle, line: &str) {
+    // **Each line is resolved, not parsed.** The obvious split — `<room> <pass>`
+    // on the first space — is ambiguous the moment a passphrase contains a
+    // space, and passphrases contain spaces: this file already notes that one
+    // may legitimately begin or end with one. A first version of this shipped
+    // that split and read the passphrase "channel passphrase" as room "channel",
+    // passphrase "passphrase", so the room never opened and the daemon refused
+    // to start. Found by a proof using an ordinary passphrase.
+    //
+    // So: if the first word names a room this profile holds, the rest is that
+    // room's passphrase. Otherwise the whole line is a passphrase, tried against
+    // every room still closed. Nothing new to learn, and no line that a person
+    // would reasonably write is read as the other thing.
+    // **Try the whole line as a passphrase FIRST.** The `<room> <pass>` form is
+    // still supported below, but it can no longer win by accident.
+    //
+    // The previous version split on the first space and resolved the prefix as a
+    // room id — and `resolve_prefix` takes a *prefix*, so a single letter names a
+    // room whenever exactly one id starts with it. A profile holding one room
+    // called `asmu2miy723t` therefore read the passphrase `a room passphrase` as
+    // room `a`, passphrase `room passphrase`, failed, and **refused to start**.
+    // Any passphrase beginning "a ", "the ", "my " hits this; in English most do.
+    //
+    // That is the same defect the note below already describes, one layer in: the
+    // split was made unambiguous against a *full* id and then handed a prefix.
+    // Trying the line as a passphrase first costs nothing — a room it does not
+    // open stays closed, which is the state it was already in — and a genuine
+    // `<room> <pass>` line cannot open anything as a whole-line passphrase,
+    // because it has the room id in front of it. So each form still works and
+    // neither can be mistaken for the other.
+    let closed_now: Vec<_> = node
+        .view()
+        .channels
+        .iter()
+        .filter(|c| !c.open)
+        .map(|c| c.channel_id)
+        .collect();
+    let mut opened_by_line = false;
+    for channel_id in closed_now {
+        if node
+            .apply(NodeCommand::OpenChannel {
+                channel_id,
+                passphrase: Secret::new(line.as_bytes().to_vec()),
+            })
+            .await
+            .is_done()
+        {
+            opened_by_line = true;
+        }
+    }
+    if opened_by_line {
+        return;
+    }
+    let ids: Vec<_> = node.view().channels.iter().map(|c| c.channel_id).collect();
+    let named = line.split_once(' ').and_then(|(prefix, pass)| {
+        crate::tunnel_cli::resolve_prefix(prefix, &ids)
+            .ok()
+            .map(|id| (id, pass.to_owned()))
+    });
+    if let Some((channel_id, pass)) = named {
+        let outcome = node
+            .apply(NodeCommand::OpenChannel {
+                channel_id,
+                passphrase: Secret::new(pass.as_bytes().to_vec()),
+            })
+            .await;
+        if outcome.is_done() {
+            return;
+        }
+        // **Say so; do not exit.** This branch used to `return Err(..)`, which
+        // killed the daemon over one bad room line — and `7ff0f56` claimed to have
+        // fixed that while leaving this return in place. The case that proves it
+        // is narrow and is exactly the one that was never run: a line whose first
+        // word *does* prefix a room id but whose remainder is the wrong
+        // passphrase. A line that resolves nothing takes the whole-line path
+        // below, which never had a fatal return, which is why four verified cases
+        // all passed and the claim was still false.
+        //
+        // A room that did not open stays closed, which is the state it was already
+        // in, and the summary at the end of this loop names every room still shut.
+        // An operator who mistyped one passphrase wants the other rooms served and
+        // a line telling them which one failed — not a process that refuses to
+        // start.
+        eprintln!("vox daemon: could not open that room: {outcome}");
+        return;
+    }
+    // Neither form opened anything. Nothing to undo — a room this did not open
+    // stays closed — and the report at the end of this loop names what is still
+    // shut, so this is stated rather than silent.
+    let closed: Vec<_> = node
+        .view()
+        .channels
+        .iter()
+        .filter(|c| !c.open)
+        .map(|c| c.channel_id)
+        .collect();
+    for channel_id in closed {
+        let _ = node
+            .apply(NodeCommand::OpenChannel {
+                channel_id,
+                passphrase: Secret::new(line.as_bytes().to_vec()),
+            })
+            .await;
+    }
+}
+
 /// Run this profile's node **without a terminal**, so agent sessions can attach
 /// (ADR-020 §12).
 ///
@@ -1106,11 +1586,11 @@ pub(crate) fn say(line: std::fmt::Arguments<'_>) {
 ///
 /// ## Passphrases
 ///
-/// Read from **stdin**, not from the environment: an environment variable is
-/// visible in `/proc/<pid>/environ` to anything running as the same user, and in
-/// `ps -E` on some systems. Not from argv either, for the same reason.
+/// From `--passphrase-file`, else `VOX_IDENTITY_PASSPHRASE` (the identity's alone: how an agent's
+/// harness starts one, decider 2026-10-02), else asked for at the terminal without echo, else
+/// read from stdin to its end. Never from argv, which every process on the machine can read.
 ///
-/// The format is one passphrase per line, because a room needs **two** keys, not
+/// The format of a file or of stdin is one passphrase per line, because a room needs **two** keys, not
 /// one — ADR-010's double lock means unlocking the identity does not open a room:
 ///
 /// ```text
@@ -1143,8 +1623,6 @@ pub fn run_daemon(
     passphrase_file: Option<std::path::PathBuf>,
     metrics: Option<std::net::SocketAddr>,
 ) -> Result<(), AppError> {
-    use std::io::Read as _;
-
     // Refused before anything is read or unlocked: a metrics endpoint the network can
     // reach names every peer and room this node talks to (PRD-001 R38).
     if let Some(addr) = metrics {
@@ -1155,63 +1633,28 @@ pub fn run_daemon(
             )));
         }
     }
-
-    let raw = match &passphrase_file {
-        Some(path) => std::fs::read_to_string(path)
-            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?,
-        None => {
-            let mut buf = String::new();
-            io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|e| AppError::Usage(format!("reading passphrases on stdin: {e}")))?;
-            buf
-        }
-    };
-    let mut lines = raw.lines();
-    // Only the line ending is stripped. A passphrase may legitimately begin or end
-    // with a space, so nothing else is trimmed.
-    let identity = lines.next().unwrap_or_default().trim_end_matches('\r');
-    if identity.is_empty() {
-        return Err(AppError::Usage(
-            "no identity passphrase. Pipe it in (`echo … | vox daemon`), or pass \
-             --passphrase-file."
-                .into(),
-        ));
-    }
-    // `<room> <passphrase>` opens that room. **A line with no space is a passphrase to
-    // try against every closed room**, and that form exists because the other one was
-    // unusable after a restart.
-    //
-    // A room's local name lives inside the SEK-sealed manifest, so it cannot be read
-    // until the room is open. After a restart every room is closed, so `vox room list`
-    // shows them all as `(unnamed)` — correct, the name is the operator's data and must
-    // not leak from a locked profile, but it means `mission <pass>` answers "nothing
-    // here matches mission". The room *id* does work, and nothing said so; worse,
-    // `room list` needs a running node, so learning the ids meant starting a daemon
-    // bare, listing, stopping it and starting it again. A person setting up a host for
-    // the first time cannot be expected to find that.
-    //
-    // So: one passphrase on a line of its own opens everything it opens. Nothing is
-    // guessed — a room whose passphrase this is not simply stays closed, exactly as it
-    // would have.
-    let rooms: Vec<String> = lines
-        .map(|l| l.trim_end_matches('\r').to_owned())
-        .filter(|l| !l.is_empty())
-        .collect();
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-    // **Every stop signal is a clean stop, taken from the start** (V210-108): SIGINT, SIGTERM,
-    // SIGHUP and SIGQUIT. Taken here, before the profile is opened and unlocked, so a stop sent
-    // while the daemon is still starting is not the default action's silent death either; it is
-    // acted on once the start-up step under way has finished.
-    let stop = {
+    // **Every stop signal is a clean stop, taken from the start** (V210-108, V210-153): SIGINT,
+    // SIGTERM, SIGHUP and SIGQUIT. Taken first, before the passphrase is read: the read came
+    // first, so a daemon closed with its terminal while it waited there died on the default
+    // action. A stop while the daemon waits for a passphrase ends it at once; one sent during a
+    // later start-up step is acted on once that step has finished.
+    let mut stop = Box::pin({
         // Registering needs the runtime's signal driver, not a task.
         let _in_runtime = rt.enter();
         stop_requested("vox daemon")
+    });
+    let interactive = passphrase_file.is_none()
+        && daemon_env_passphrase().is_none()
+        && io::IsTerminal::is_terminal(&io::stdin());
+    let (identity, rooms) = match daemon_passphrases(&rt, &mut stop, passphrase_file)? {
+        Asked::Got(got) => got,
+        Asked::Stopped(signal) => return stopped_while_starting(rt, None, signal),
     };
+    let identity = identity.as_str();
     // **Wait briefly for a profile that is being closed.** redb allows one process per
     // store, and a daemon started the moment another vox finished with the profile could
     // still find the file open: it failed at once with "another vox already has this
@@ -1226,7 +1669,8 @@ pub fn run_daemon(
     let node = loop {
         let cfg = vox_core::node::actor::NodeConfig::new()
             .bind(vox_core::node::actor::Bind::Addr(listen))
-            .anchors(anchors.clone());
+            .anchors(anchors.clone())
+            .on_profile_wait(crate::tunnel_cli::say_waiting);
         match rt.block_on(async { Node::spawn_config(paths.clone(), cfg) }) {
             Err(vox_core::error::Error::ProfileBusy)
                 if started.elapsed() < PROFILE_RELEASE_PATIENCE =>
@@ -1265,14 +1709,15 @@ pub fn run_daemon(
                      `vox daemon` is the identity passphrase; lines after it open rooms."
                         .to_owned()
                 }
-                // Unlocking also brings the node onto the network, so a `--listen` port that
-                // is taken fails here. It said `Failed(Internal)` — a bug report for an
-                // occupied port (PRD-001 R36).
-                Outcome::Failed(Fault::AddressInUse) => format!(
-                    "cannot listen on {listen}: something else already holds that UDP port\n\
-                     \x20      Pick another with --listen, or stop whatever holds it \
-                     (`lsof -i :{}` names it).",
-                    listen.port()
+                // Unlocking also brings the node onto the network, so a `--listen` address
+                // that cannot be bound fails here. It said `Failed(Internal)` — a bug report for
+                // an occupied port (PRD-001 R36) — and then "something else already holds that
+                // UDP port" for every cause, an address this machine does not have included
+                // (V210-134). Now it names the cause and quotes the operating system.
+                Outcome::Failed(fault) if fault.is_bind() => format!(
+                    "cannot listen on {listen}: {}",
+                    crate::tunnel_cli::bind_failure(listen, crate::tunnel_cli::Socket::Udp, fault)
+                        .unwrap_or_default()
                 ),
                 other => format!("could not unlock this profile's identity: {other}"),
             }));
@@ -1282,125 +1727,46 @@ pub fn run_daemon(
         // would answer `room list` and refuse everything else, which is the defect
         // this proof found the first time it ran.
         for line in &rooms {
-            // **Each line is resolved, not parsed.** The obvious split — `<room> <pass>`
-            // on the first space — is ambiguous the moment a passphrase contains a
-            // space, and passphrases contain spaces: this file already notes that one
-            // may legitimately begin or end with one. A first version of this shipped
-            // that split and read the passphrase "channel passphrase" as room "channel",
-            // passphrase "passphrase", so the room never opened and the daemon refused
-            // to start. Found by a proof using an ordinary passphrase.
-            //
-            // So: if the first word names a room this profile holds, the rest is that
-            // room's passphrase. Otherwise the whole line is a passphrase, tried against
-            // every room still closed. Nothing new to learn, and no line that a person
-            // would reasonably write is read as the other thing.
-            // **Try the whole line as a passphrase FIRST.** The `<room> <pass>` form is
-            // still supported below, but it can no longer win by accident.
-            //
-            // The previous version split on the first space and resolved the prefix as a
-            // room id — and `resolve_prefix` takes a *prefix*, so a single letter names a
-            // room whenever exactly one id starts with it. A profile holding one room
-            // called `asmu2miy723t` therefore read the passphrase `a room passphrase` as
-            // room `a`, passphrase `room passphrase`, failed, and **refused to start**.
-            // Any passphrase beginning "a ", "the ", "my " hits this; in English most do.
-            //
-            // That is the same defect the note below already describes, one layer in: the
-            // split was made unambiguous against a *full* id and then handed a prefix.
-            // Trying the line as a passphrase first costs nothing — a room it does not
-            // open stays closed, which is the state it was already in — and a genuine
-            // `<room> <pass>` line cannot open anything as a whole-line passphrase,
-            // because it has the room id in front of it. So each form still works and
-            // neither can be mistaken for the other.
-            let closed_now: Vec<_> = node
-                .view()
-                .channels
-                .iter()
-                .filter(|c| !c.open)
-                .map(|c| c.channel_id)
-                .collect();
-            let mut opened_by_line = false;
-            for channel_id in closed_now {
-                if node
-                    .apply(NodeCommand::OpenChannel {
-                        channel_id,
-                        passphrase: Secret::new(line.as_bytes().to_vec()),
-                    })
-                    .await
-                    .is_done()
-                {
-                    opened_by_line = true;
-                }
-            }
-            if opened_by_line {
-                continue;
-            }
-            let ids: Vec<_> = node.view().channels.iter().map(|c| c.channel_id).collect();
-            let named = line.split_once(' ').and_then(|(prefix, pass)| {
-                crate::tunnel_cli::resolve_prefix(prefix, &ids)
-                    .ok()
-                    .map(|id| (id, pass.to_owned()))
-            });
-            if let Some((channel_id, pass)) = named {
-                let outcome = node
-                    .apply(NodeCommand::OpenChannel {
-                        channel_id,
-                        passphrase: Secret::new(pass.as_bytes().to_vec()),
-                    })
-                    .await;
-                if outcome.is_done() {
-                    continue;
-                }
-                // **Say so; do not exit.** This branch used to `return Err(..)`, which
-                // killed the daemon over one bad room line — and `7ff0f56` claimed to have
-                // fixed that while leaving this return in place. The case that proves it
-                // is narrow and is exactly the one that was never run: a line whose first
-                // word *does* prefix a room id but whose remainder is the wrong
-                // passphrase. A line that resolves nothing takes the whole-line path
-                // below, which never had a fatal return, which is why four verified cases
-                // all passed and the claim was still false.
-                //
-                // A room that did not open stays closed, which is the state it was already
-                // in, and the summary at the end of this loop names every room still shut.
-                // An operator who mistyped one passphrase wants the other rooms served and
-                // a line telling them which one failed — not a process that refuses to
-                // start.
-                eprintln!("vox daemon: could not open that room: {outcome}");
-                continue;
-            }
-            // Neither form opened anything. Nothing to undo — a room this did not open
-            // stays closed — and the report at the end of this loop names what is still
-            // shut, so this is stated rather than silent.
-            let closed: Vec<_> = node
-                .view()
-                .channels
-                .iter()
-                .filter(|c| !c.open)
-                .map(|c| c.channel_id)
-                .collect();
-            for channel_id in closed {
-                let _ = node
-                    .apply(NodeCommand::OpenChannel {
-                        channel_id,
-                        passphrase: Secret::new(line.as_bytes().to_vec()),
-                    })
-                    .await;
-            }
-        }
-        // Say what is actually held, by id, because the names cannot be shown for the
-        // rooms that stayed closed and a silent daemon is how this went unnoticed.
-        let view = node.view();
-        let (open, shut) = (
-            view.channels.iter().filter(|c| c.open).count(),
-            view.channels.iter().filter(|c| !c.open).count(),
-        );
-        if shut > 0 {
-            eprintln!(
-                "vox daemon: {open} room(s) open, {shut} still closed — a closed room \
-                 answers nothing but `room list`"
-            );
+            open_rooms_by_line(&node, line).await;
         }
         Ok(())
     })?;
+    // **At a terminal, the rooms still closed are asked for** (V210-153), one passphrase at a
+    // time, as a piped line would give them; an empty one starts the daemon without them.
+    if interactive {
+        loop {
+            let shut = node.view().channels.iter().filter(|c| !c.open).count();
+            if shut == 0 {
+                break;
+            }
+            let prompt = format!(
+                "passphrase for a closed room ({shut} closed; Enter to start without them)"
+            );
+            let line = match ask_without_echo(&rt, &mut stop, &prompt) {
+                Asked::Got(line) => line?,
+                Asked::Stopped(signal) => {
+                    return stopped_while_starting(rt, Some(&node), signal);
+                }
+            };
+            if line.is_empty() {
+                break;
+            }
+            rt.block_on(open_rooms_by_line(&node, &line));
+        }
+    }
+    // Say what is actually held, by id, because the names cannot be shown for the
+    // rooms that stayed closed and a silent daemon is how this went unnoticed.
+    let view = node.view();
+    let (open, shut) = (
+        view.channels.iter().filter(|c| c.open).count(),
+        view.channels.iter().filter(|c| !c.open).count(),
+    );
+    if shut > 0 {
+        eprintln!(
+            "vox daemon: {open} room(s) open, {shut} still closed — a closed room \
+             answers nothing but `room list`"
+        );
+    }
 
     // **Follow the anchor when it moves.**
     //
@@ -1499,7 +1865,7 @@ pub fn run_daemon(
     // **The interrupt path (ADR-020 §6).** The daemon is the only thing that sees
     // every entry as it lands and also knows which local sessions exist, so it is
     // where "addressed and urgent" turns into a wake. The rule is deliberately
-    // narrow: a message interrupts only if it names this agent *and* is marked
+    // narrow: a message interrupts only if it names this node *and* is marked
     // urgent. Everything else waits for the next turn, because an interrupt that
     // fires on everything is a queue with worse manners.
     //
@@ -1631,17 +1997,20 @@ pub fn run_daemon(
         });
     }
 
-    rt.block_on(async {
+    let stopped = rt.block_on(async {
         // **SIGHUP stops it too** (V210-108). It used to be ignored, on the reading that a daemon
         // has no terminal to lose and a service manager sends SIGHUP to ask for a reload. But this
         // daemon has nothing to reload, and people start it from tmux and ssh sessions, whose
         // closing sends SIGHUP: an ignored hangup left a daemon nobody could see still holding the
         // profile. Each of the four stops it the same way.
-        // A server's stop is its normal end: it says which signal and exits 0, as a service manager
-        // expects of a service it stopped.
+        // A server's stop is its normal end: once its node has stopped it says which signal and
+        // exits 0, as a service manager expects of a service it stopped. A stop that did not
+        // finish says so and exits non-zero (below).
         let signal = stop.await;
-        say(format_args!("vox daemon: stopped by {}", signal.name()));
-        say(format_args!("vox daemon: shutting down"));
+        say(format_args!(
+            "vox daemon: shutting down on {}",
+            signal.name()
+        ));
         // **Bounded.** The node handles one thing at a time, so `Shutdown` waits behind whatever
         // it is doing — and it can be doing a network round trip to a peer that has vanished.
         // Measured: a daemon that had joined a room through an anchor, with the anchor gone,
@@ -1649,21 +2018,34 @@ pub fn run_daemon(
         // node finished publishing to a board nobody was reading. A service manager's SIGTERM
         // has to mean stop. Whatever the node was mid-way through is lost either way; its
         // state on disk is committed per step, so nothing half-written is left by leaving.
-        if tokio::time::timeout(SHUTDOWN_PATIENCE, node.apply(NodeCommand::Shutdown))
+        let patience = shutdown_patience();
+        let finished = tokio::time::timeout(patience, node.apply(NodeCommand::Shutdown))
             .await
-            .is_err()
-        {
-            let _ = writeln!(
-                io::stderr(),
-                "vox daemon: the node did not stop within {}s — it was mid-way through a network \
-                 exchange with a peer that is not answering; stopping anyway",
-                SHUTDOWN_PATIENCE.as_secs()
-            );
-        }
+            .is_ok();
+        (signal, patience, finished)
     });
     // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync
     // session runs on one.
     rt.shutdown_timeout(SHUTDOWN_PATIENCE);
+    let (signal, patience, finished) = stopped;
+    if !finished {
+        // **A stop that gave up is not a stop** (decider, V210-93). The daemon leaves, as it must,
+        // but its node's ordered stop was cut short: the closes it had not yet sent never left,
+        // and those peers learn it went only by their own timeouts. That is a failure, said as
+        // one, with an error status, never "stopped by …" and 0.
+        return Err(AppError::Refused {
+            code: 1,
+            message: format!(
+                "the daemon did not finish stopping on {} within {}s: its node was mid-way \
+                 through a network exchange with a peer that is not answering. It left anyway, so \
+                 a peer it had not yet said goodbye to learns it went only when its connection \
+                 times out",
+                signal.name(),
+                patience.as_secs_f64()
+            ),
+        });
+    }
+    say(format_args!("vox daemon: stopped by {}", signal.name()));
     Ok(())
 }
 
@@ -1709,9 +2091,12 @@ pub fn run_live(
         .worker_threads(2)
         .enable_all()
         .build()?;
+    // Opening the profile happens before the TUI takes the screen, so a wait for another vox
+    // holding it is said on the terminal as a CLI verb says it (V210-100).
     let cfg = vox_core::node::actor::NodeConfig::new()
         .bind(vox_core::node::actor::Bind::Addr(listen))
-        .anchors(anchors);
+        .anchors(anchors)
+        .on_profile_wait(crate::tunnel_cli::say_waiting);
     let node = rt.block_on(async { Node::spawn_config(paths.clone(), cfg) })?;
     // The ADR-020 control socket, so agent sessions on this machine can attach to
     // this node rather than each running one of their own. Held for the life of

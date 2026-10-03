@@ -2,13 +2,12 @@
 //! its guest is a relay circuit is reachable again promptly after it crashes and comes back**, not
 //! after `SILENCE_IS_DEATH` (30s).
 //!
-//! **This gate is red today, on purpose, and that red is its baseline.** Measured on `bdabf39`: the
-//! first echo through the guest's forward arrives ≈29.5s after the crash in 10/10 trials, with
-//! near-identical durations — a fixed window. The restarted host does not reach the guest back
-//! through the anchor any sooner, so the guest keeps its dead connection to the crashed process
-//! until that connection has been silent for 30s. It is the acceptance test for the restart
-//! liveness probe (#40); it turns green when a restarted relayed host is reached within
-//! [`REACHED_AGAIN_WITHIN`].
+//! **Before #40 it was red on every trial**: measured on `bdabf39`, the first echo through the
+//! guest's forward arrived ≈29.5s after the crash in 10/10 trials, with near-identical durations —
+//! a fixed window. The restarted host did not reach the guest back through the anchor any sooner,
+//! so the guest kept its dead connection to the crashed process until that connection had been
+//! silent for 30s. It is the acceptance test for the restart liveness probe (#40): a restarted
+//! relayed host is reached within [`REACHED_AGAIN_WITHIN`].
 //!
 //! **It is also V29-15's (#50) gate**, now that #40 makes the restarted host dial back promptly:
 //! the host's new process reaches the guest over a **second** circuit, which detaches the first,
@@ -30,6 +29,13 @@
 //! back as `vox daemon` on the same family, and times the first echo through the **same** forward.
 //! The bound is asserted on every trial and the times are printed.
 //!
+//! **The apparatus's own time is measured on the same timeline**, so a slow runner is never read
+//! as a slow product: while it waits, the proof records how far each of its 200 ms sleeps
+//! overshot, and once the echo is back it times `/usr/bin/true`, a process that is not vox (a vox
+//! slow even only to start reads as the product's). A trial over the bound
+//! whose apparatus took more than [`APPARATUS_BUDGET`] says `APPARATUS (runner stalled): apparatus took X`;
+//! otherwise an over-bound trial is `PRODUCT: took X (apparatus Y)`.
+//!
 //! `#[ignore]`d: production Argon2id and a real PoW per trial. Run it in release.
 
 #![cfg(unix)]
@@ -43,7 +49,7 @@ mod world;
 #[path = "support/relay.rs"]
 mod relay;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use relay::{RelayWorld, Split};
 use world::{round_trip, VoxProc};
@@ -63,8 +69,32 @@ const ATTEMPT: Duration = Duration::from_secs(3);
 /// reported as such and not as a hang.
 const GIVE_UP: Duration = Duration::from_secs(90);
 
-/// The restarted daemon holding its room, to the first echo.
-fn trial(n: usize) -> Duration {
+/// The most the apparatus may take on a trial's timeline — its sleeps' overshoot plus a no-op
+/// `vox` — before a trial over the bound is the runner's, not the product's.
+const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
+
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
+    let t = Instant::now();
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
+    assert!(
+        ok,
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
+    );
+    t.elapsed()
+}
+
+/// The restarted daemon holding its room, to the first echo; and what the apparatus took on that
+/// timeline.
+fn trial(n: usize) -> (Duration, Duration) {
     let mut w = RelayWorld::new(Split::Families);
     let (ok, took, out, err) = w.join_guest();
     eprintln!("[join] trial {n}: joined = {ok} in {took:.1?}");
@@ -74,7 +104,7 @@ fn trial(n: usize) -> Duration {
         let host = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
         let anchor = w.anchor.proc.transcript();
         panic!(
-            "CANNOT PROVE (trial {n}): the guest could not join over the relay ({took:?}).\n{out}\n\
+            "PRODUCT (staging, trial {n}): the guest could not join over the relay ({took:?}).\n{out}\n\
              {err}\n--- host:\n{host}\n--- anchor:\n{anchor}"
         );
     }
@@ -82,67 +112,96 @@ fn trial(n: usize) -> Duration {
     let before =
         round_trip(at, b"before the crash", Duration::from_secs(120)).unwrap_or_else(|e| {
             panic!(
-                "CANNOT PROVE (trial {n}): no echo before the crash ({e}).\n{}",
-                w.fwd.as_mut().unwrap().transcript()
+                "PRODUCT (staging, trial {n}): no echo before the crash ({e}).\n{}",
+                w.fwd
+                    .as_mut()
+                    .expect("APPARATUS: a process the proof started")
+                    .transcript()
             )
         });
-    assert_eq!(before, b"before the crash");
+    assert_eq!(
+        before, b"before the crash",
+        "PRODUCT (trial {n}): the forward returned other bytes than were sent"
+    );
     w.expect_still_relayed();
     w.assert_relayed("before the crash");
 
     let (crashed, ready) = w.crash_and_restart_host();
     let mut attempts = 0;
+    let mut overshoot = Duration::ZERO;
     loop {
         attempts += 1;
         if let Ok(back) = round_trip(at, b"after the crash", ATTEMPT) {
-            assert_eq!(back, b"after the crash");
+            assert_eq!(
+                back, b"after the crash",
+                "PRODUCT (trial {n}): the forward returned other bytes than were sent"
+            );
             break;
         }
         assert!(
             crashed.elapsed() < GIVE_UP,
-            "trial {n}: the forward never reached the restarted host ({attempts} attempts in \
-             {:?}).\nforward:\n{}",
+            "PRODUCT (trial {n}): the forward never reached the restarted host ({attempts} \
+             attempts in {:?}).\nforward:\n{}",
             crashed.elapsed(),
-            w.fwd.as_mut().unwrap().transcript()
+            w.fwd
+                .as_mut()
+                .expect("APPARATUS: a process the proof started")
+                .transcript()
         );
+        let slept = Instant::now();
         std::thread::sleep(Duration::from_millis(200));
+        overshoot = overshoot.max(slept.elapsed().saturating_sub(Duration::from_millis(200)));
     }
     let (from_crash, from_ready) = (crashed.elapsed(), ready.elapsed());
+    let apparatus = overshoot + apparatus_spawn();
     w.assert_relayed("after the restarted host was reached");
     eprintln!(
         "[test] trial {n}: reached again {:.1}s after the crash, {:.1}s after the daemon held the \
-         room ({attempts} attempts)",
+         room ({attempts} attempts; apparatus {:?})",
         from_crash.as_secs_f64(),
-        from_ready.as_secs_f64()
+        from_ready.as_secs_f64(),
+        apparatus
     );
-    from_ready
+    (from_ready, apparatus)
 }
 
 #[test]
 #[ignore = "5 relayed host crashes on the shipped binary with production Argon2id; run in release"]
 fn a_relayed_host_that_restarts_is_reached_again_through_the_same_forward() {
     watchdog::arm();
-    let from_ready: Vec<Duration> = (0..RESTARTS).map(trial).collect();
-    let over: Vec<String> = from_ready
+    let trials: Vec<(Duration, Duration)> = (0..RESTARTS).map(trial).collect();
+    let over: Vec<&(Duration, Duration)> = trials
         .iter()
-        .filter(|d| **d > REACHED_AGAIN_WITHIN)
-        .map(|d| format!("{:.1}s", d.as_secs_f64()))
+        .filter(|(took, _)| *took > REACHED_AGAIN_WITHIN)
         .collect();
+    let said = |t: &[&(Duration, Duration)]| {
+        t.iter()
+            .map(|(took, app)| format!("took {:.1}s (apparatus {:?})", took.as_secs_f64(), app))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     eprintln!(
         "[test] {RESTARTS} restarts, daemon-ready to first echo: {}; {} over the {:?} bound",
-        from_ready
-            .iter()
-            .map(|d| format!("{:.1}s", d.as_secs_f64()))
-            .collect::<Vec<_>>()
-            .join(", "),
+        said(&trials.iter().collect::<Vec<_>>()),
         over.len(),
         REACHED_AGAIN_WITHIN
     );
+    let stalled: Vec<&(Duration, Duration)> = over
+        .iter()
+        .copied()
+        .filter(|(_, app)| *app > APPARATUS_BUDGET)
+        .collect();
+    assert!(
+        stalled.is_empty(),
+        "APPARATUS (runner stalled): apparatus took over {APPARATUS_BUDGET:?} on {} trial(s) over the bound: {}",
+        stalled.len(),
+        said(&stalled)
+    );
     assert!(
         over.is_empty(),
-        "{}/{RESTARTS} restarts took longer than {REACHED_AGAIN_WITHIN:?} to be reached again \
-         through the relay: {}",
+        "PRODUCT: {}/{RESTARTS} restarts were reached again through the relay only after more \
+         than {REACHED_AGAIN_WITHIN:?}: {}",
         over.len(),
-        over.join(", ")
+        said(&over)
     );
 }
