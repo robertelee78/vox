@@ -32,7 +32,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,6 +60,10 @@ struct State {
     /// The head of the host's last short-header datagram (its first byte and the guest's
     /// connection ID), with the guest it went to: what the spoofer replays.
     last_short: Mutex<Option<(Vec<u8>, SocketAddr)>>,
+    /// Every guest the spoofer sent to.
+    spoofed_to: Mutex<HashSet<SocketAddr>>,
+    /// The guest source of the last datagram carried guest → host.
+    last_from: Mutex<Option<SocketAddr>>,
 }
 
 /// The most of a short-header datagram the spoofer copies: the first byte and a connection ID of
@@ -165,6 +169,9 @@ impl PortForward {
                     });
                     s
                 });
+                *st.last_from
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(from);
                 let delay = Duration::from_micros(st.delay_us.load(Ordering::SeqCst));
                 if !delay.is_zero() {
                     let _ = late.send((Arc::clone(sock), buf[..n].to_vec(), at + delay));
@@ -204,6 +211,24 @@ impl PortForward {
     /// Spoofed datagrams sent to the guest so far.
     pub fn spoofed(&self) -> u64 {
         self.state.spoofed.load(Ordering::SeqCst)
+    }
+
+    /// Every guest the spoofer sent to so far.
+    pub fn spoofed_to(&self) -> HashSet<SocketAddr> {
+        self.state
+            .spoofed_to
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The guest source of the last datagram carried guest → host, if any.
+    pub fn last_from(&self) -> Option<SocketAddr> {
+        *self
+            .state
+            .last_from
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether the host has sent the guest a short-header datagram the spoofer can copy.
@@ -269,6 +294,10 @@ fn spoof(public: &UdpSocket, st: &State) {
         datagram.extend_from_slice(&garbage);
         if public.send_to(&datagram, guest).is_ok() {
             st.spoofed.fetch_add(1, Ordering::SeqCst);
+            st.spoofed_to
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(guest);
         }
     }
 }

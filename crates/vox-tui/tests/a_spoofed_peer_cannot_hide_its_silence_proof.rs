@@ -112,6 +112,12 @@ fn a_spoofed_peer_cannot_hide_a_dead_connection() {
          path the forward gives it, so there was no direct connection to kill.\nup:\n{}",
         up.transcript()
     );
+    // The source that just carried the echo is the guest's `vox up`: the connection the spoofer
+    // must hit.
+    let guest = w
+        .forward
+        .last_from()
+        .unwrap_or_else(|| panic!("APPARATUS: the forward carried an echo but kept no source"));
     assert!(
         w.forward.can_spoof(),
         "APPARATUS: the forward carried the pair's traffic but kept no short-header packet of the \
@@ -158,7 +164,7 @@ fn a_spoofed_peer_cannot_hide_a_dead_connection() {
         .map(|(at, line)| format!("  +{:>6} ms  {line}", at.duration_since(cut).as_millis()))
         .collect();
     eprintln!(
-        "[proof] after the cut the spoofer sent the guest {spoofed} garbage datagram(s); the forward \
+        "[proof] after the cut the spoofer sent the guest at {guest} {spoofed} garbage datagram(s); the forward \
          dropped {} of the pair's own; the first request answered again {}",
         w.forward.dropped() - dropped_at_cut,
         failover.map_or_else(|| format!("NEVER within {GIVE_UP:?}"), |d| format!("{d:?} after the cut"))
@@ -171,6 +177,12 @@ fn a_spoofed_peer_cannot_hide_a_dead_connection() {
     assert!(
         spoofed > 0,
         "APPARATUS: the spoofer sent the guest nothing, so this run tested no spoofing"
+    );
+    let targets = w.forward.spoofed_to();
+    assert!(
+        targets.len() == 1 && targets.contains(&guest),
+        "APPARATUS: the spoofer sent its garbage to {targets:?}, not only to the guest's `vox up` at \
+         {guest}, so this run did not show the garbage reaching the dead connection"
     );
     let failover = failover.unwrap_or_else(|| {
         panic!(
