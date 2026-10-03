@@ -86,7 +86,13 @@ fn a_dial_that_reaches_another_node_names_no_one() {
         l.contains("dialling this anchor failed") || l.contains("could not reach")
     });
     let short = |fp: &str| fp.chars().take(26).collect::<String>();
-    let names = format!("nothing at {b_addr} answers as {}", short(a_fp));
+    // The spec gives B's address as a multiaddr; the dial names the socket address.
+    let at = match b_addr.split('/').collect::<Vec<_>>()[..] {
+        ["", "ip4", ip, "udp", port] => format!("{ip}:{port}"),
+        ["", "ip6", ip, "udp", port] => format!("[{ip}]:{port}"),
+        _ => b_addr.to_owned(),
+    };
+    let names = format!("nothing at {at} answers as {}", short(a_fp));
     eprintln!("[proof] told to reach A at B's address, the host said: {said}");
     assert!(
         said.contains(&names),
