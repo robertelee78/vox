@@ -557,8 +557,8 @@ fn two_members_posting_at_once_are_never_refused() {
             let now = m.busy_refused();
             now.checked_sub(*b).unwrap_or_else(|| {
                 panic!(
-                    "CANNOT MEASURE: {}'s busy_refused went backwards ({b} -> {now}); its daemon \
-                     was restarted or its counters reset",
+                    "PRODUCT: {}'s busy_refused went backwards ({b} -> {now}); this proof never \
+                     restarts a daemon, so vox restarted it or reset its counters",
                     m.name
                 )
             })
