@@ -289,18 +289,9 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
         host_after.1
     );
 
-    // ---- #84: the person's `vox status`, with a tunnel live ----
-    let (tcp_fwd, tcp_at) = w.forward_vox("tcp-forward", &guest, &echo_port.to_string());
-    let mut held = TcpStream::connect(tcp_at)
-        .unwrap_or_else(|e| panic!("PRODUCT (staging): the TCP forward took no connection: {e}"));
-    held.set_read_timeout(Some(Duration::from_secs(60))).ok();
-    held.write_all(b"held")
-        .unwrap_or_else(|e| panic!("PRODUCT (staging): the TCP forward took no bytes: {e}"));
-    let mut back = [0u8; 4];
-    held.read_exact(&mut back)
-        .unwrap_or_else(|e| panic!("PRODUCT (staging): no echo through the TCP forward: {e}"));
+    // ---- #84: the person's `vox status`, first with the UDP flow live ----
     let text = status_text(&host, "the host");
-    eprintln!("[proof] the host's `vox status`:\n{text}");
+    eprintln!("[proof] the host's `vox status` with the UDP flow live:\n{text}");
     let g = &w.guest_fp[..12];
     let anchor_short = w
         .host_anchor
@@ -325,12 +316,6 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
             "the guest {g} as a peer, relayed via {anchor_short}"
         ));
     }
-    if !text
-        .lines()
-        .any(|l| l.starts_with("tunnel ") && l.contains(&format!("from {g}")))
-    {
-        missing.push(format!("a live tunnel from the guest {g}"));
-    }
     if !text.lines().any(|l| {
         l.contains(&sink_port.to_string())
             && l.contains(&format!("with {g}"))
@@ -351,10 +336,29 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
         "PRODUCT: with its guest connected and synced, the host's `vox status` flags something:\n{text}"
     );
 
+    // ---- then with a TCP tunnel live: one vox holds a profile, so the UDP forward goes first ----
+    drop(fwd);
+    let (tcp_fwd, tcp_at) = w.forward_vox("tcp-forward", &guest, &echo_port.to_string());
+    let mut held = TcpStream::connect(tcp_at)
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): the TCP forward took no connection: {e}"));
+    held.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    held.write_all(b"held")
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): the TCP forward took no bytes: {e}"));
+    let mut back = [0u8; 4];
+    held.read_exact(&mut back)
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): no echo through the TCP forward: {e}"));
+    let text = status_text(&host, "the host");
+    eprintln!("[proof] the host's `vox status` with a TCP tunnel live:\n{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("tunnel ") && l.contains(&format!("from {g}"))),
+        "PRODUCT: a TCP connection from the guest {g} is live through the host, yet the host's \
+         `vox status` lists no tunnel from it:\n{text}"
+    );
+
     // ---- the guest goes away: the trusted member it cannot reach is flagged ----
     drop(held);
     drop(tcp_fwd);
-    drop(fwd);
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut text = String::new();
     while Instant::now() < deadline {
