@@ -226,17 +226,9 @@ These are known and not fixed. Each stays until it is fixed, with the fixing com
 | # | Defect or limit | Where | Tracked |
 |---|---|---|---|
 | D1 | An anchor tracks epoch 0 only, so an epoch change is not carried on its board. | `node/anchor.rs:123`, `:154` | #356 |
-| D2 | Member→anchor sessions are proved on a relayed path on loopback only. Whether the `sync failed: transport` seen in the deleted `node_m15_anchor_gate` occurs behind real NATs is not measured. | — | untracked (see the V030-29 report) |
+| D2 | Member→anchor sessions are proved on a relayed path on loopback only. Whether the `sync failed: transport` seen in the deleted `node_m15_anchor_gate` occurs behind real NATs is not measured. | — | untracked |
 | D4 | ADR-008's golden-vector obligation is unmet, including for `0x0012`: no golden-vector test exists. | ADR-008 | open, awaiting the decider (V030-29 question 19) |
 | L1 | A first `ssh` into a fresh room can wait up to `HOST_PATIENCE` (300 s). | `node/up.rs:214` | limit, by design |
-
-Fixed since the old text, with evidence:
-- A cross-process join through an anchor failing about half the time: `cross_process_join_proof` is back in the blocking gate (fb2f3618, V210-19, #192).
-- Opening a stream had no deadline: `OPEN_STREAM_PATIENCE` (2afa020b).
-- A failed join did not name the rung that refused: it prints its steps and what each responder said (79ece6f4, #192).
-- Sessions this node starts were not checked: NR-41 (ce4a55f2, V29-04).
-- Member→anchor sessions failing on a relayed path: measured working through the shipped binary on loopback, with a mutant that turns it red (a568ac2d, V210-139, #358).
-- A member that restarts under the same identity was refused as the same pair while its old session waited: the newcomer's first connection now closes every connection to the old process (`ConnectionManager::file_inner`, V210-57), measured 12 of 12 under 0.15 s (a568ac2d, V210-139, #358).
 
 ## Consequences
 
