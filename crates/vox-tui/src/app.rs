@@ -1213,7 +1213,9 @@ fn daemon_passphrases(
     let raw = if let Some(path) = &passphrase_file {
         crate::tunnel_cli::passphrase_file_text(path)?
     } else if let Some(identity) = daemon_env_passphrase() {
-        return Ok(Asked::Got((identity, Vec::new())));
+        // Said whichever way the passphrase came: an empty one set in the environment goes on
+        // without one, and the person is told so here as on every other path (V030-36).
+        return Ok(Asked::Got((encouraged(identity), Vec::new())));
     } else if io::IsTerminal::is_terminal(&io::stdin()) {
         return Ok(match ask_without_echo(rt, stop, "identity passphrase") {
             Asked::Got(identity) => match identity? {
