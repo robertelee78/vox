@@ -39,7 +39,8 @@
 //! post` is timed as the product's baseline, never as part of that clock. It must answer within
 //! [`PATIENCE`]: a quiet post that fails, or misses the bound while the clock is within
 //! [`APPARATUS_BUDGET`], is `PRODUCT (staging):` (the node is slow with no attack at all). A post
-//! during the attack that misses the bound is followed at once by the clock. If that apparatus
+//! during the attack that vox refuses is `PRODUCT:` whatever the clock. One that misses the bound,
+//! or that the proof's own cap stopped, is followed at once by the clock. If that apparatus
 //! took more than [`APPARATUS_BUDGET`], the red is `CANNOT MEASURE: apparatus took X`; otherwise
 //! it is `PRODUCT: took X (apparatus Y, quiet Z)`. Fixture failures are `APPARATUS:`.
 //!
@@ -436,6 +437,13 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             opened.load(std::sync::atomic::Ordering::SeqCst)
         );
         took.push(t);
+        // A post vox refused, before the proof's own cap stopped it, is the product's whatever
+        // the clock; only a slow post (or one the cap cut) can be the runner's.
+        assert!(
+            ok || t >= PATIENCE * 8,
+            "PRODUCT: post {i} of {POSTS} on the victim failed in {t:?} while a stranger holding \
+             only the room's .vox name held silent Join streams open. It said: {said}"
+        );
         if !(ok && t < PATIENCE) {
             let apparatus = apparatus_spawn();
             assert!(
