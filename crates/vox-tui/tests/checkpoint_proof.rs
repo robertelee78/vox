@@ -334,7 +334,7 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
     attached(alice, "alice");
     let (ok, _, err) = vox(
         alice,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room create: {err}");
@@ -462,7 +462,15 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
     assert!(ok, "vox room invite: {err}");
     let (ok, _, err) = vox(
         bob,
-        &["room", "join", link.trim(), "--name", "r"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "r",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room join: {err}");
@@ -560,7 +568,7 @@ fn room_with_posts(alice: &Path, n: usize, idle_secs: Option<u64>) -> (Daemon, S
     attached(alice, "alice");
     let (ok, _, err) = vox(
         alice,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room create: {err}");

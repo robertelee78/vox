@@ -164,7 +164,7 @@ fn an_always_on_member_is_the_rendezvous_and_relay_for_the_others() {
 
     staged(
         &c_dir,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         &format!("{ROOMPASS}\n"),
     );
     let room = staged(&c_dir, &["room", "list"], "")
@@ -185,7 +185,15 @@ fn an_always_on_member_is_the_rendezvous_and_relay_for_the_others() {
     for d in [&a_dir, &b_dir] {
         staged(
             d,
-            &["room", "join", &link, "--name", "r"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &link,
+                "--name",
+                "r",
+            ],
             &format!("{ROOMPASS}\n"),
         );
     }

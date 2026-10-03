@@ -319,7 +319,7 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
     let c = Daemon::start("c", &k.c);
     ok(
         &k.c,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         &format!("{ROOMPASS}\n"),
     );
     let listed = ok(&k.c, &["room", "list"], "");
@@ -338,7 +338,15 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
     let a = Daemon::start("a", &k.a);
     ok(
         &k.a,
-        &["room", "join", &k.link, "--name", "r"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &k.link,
+            "--name",
+            "r",
+        ],
         &format!("{ROOMPASS}\n"),
     );
     // C first, and consent to it confirmed before anything is posted: C must be able to read
@@ -361,7 +369,15 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
     let d = Daemon::start("d", &k.d);
     ok(
         &k.d,
-        &["room", "join", &k.link, "--name", "r"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &k.link,
+            "--name",
+            "r",
+        ],
         &format!("{ROOMPASS}\n"),
     );
     d.stop();
@@ -379,7 +395,15 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
     let b = Daemon::start("b", &k.b);
     ok(
         &k.b,
-        &["room", "join", &k.link, "--name", "r"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &k.link,
+            "--name",
+            "r",
+        ],
         &format!("{ROOMPASS}\n"),
     );
     ok(&k.b, &["trust", "add", &k.fps[0], "--name", "a"], "");
@@ -590,7 +614,7 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
     let c = Daemon::start("c", &k.c);
     ok(
         &k.c,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         &format!("{ROOMPASS}\n"),
     );
     k.room = ok(&k.c, &["room", "list"], "")
@@ -607,7 +631,15 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
     let join = |dir: &std::path::Path| {
         ok(
             dir,
-            &["room", "join", &k.link, "--name", "r"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &k.link,
+                "--name",
+                "r",
+            ],
             &format!("{ROOMPASS}\n"),
         );
     };

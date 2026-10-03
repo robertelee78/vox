@@ -233,7 +233,11 @@ fn scene(tmp: &tempfile::TempDir, script: &Path, before_alice: impl FnOnce(&Path
     );
     let bob = daemon("bob", &bob_dir, bob_port, &spec, &pass_file, &[]);
 
-    let (ok, out, err) = vox_in(&alice_dir, &["room", "create", "--name", "ops"], ROOM_PASS);
+    let (ok, out, err) = vox_in(
+        &alice_dir,
+        &["room", "create", "--passphrase-file", "-", "--name", "ops"],
+        ROOM_PASS,
+    );
     assert!(ok, "vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
     assert!(ok, "vox room list: {err}");
@@ -249,7 +253,15 @@ fn scene(tmp: &tempfile::TempDir, script: &Path, before_alice: impl FnOnce(&Path
     loop {
         let (ok, out, err) = vox_in(
             &bob_dir,
-            &["room", "join", link.trim(), "--name", "ops"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "ops",
+            ],
             ROOM_PASS,
         );
         if ok {

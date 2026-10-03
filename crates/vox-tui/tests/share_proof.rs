@@ -234,7 +234,14 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
 
     let (ok, out, err) = vox(
         &alice.dir,
-        &["room", "create", "--name", "files"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "files",
+        ],
         Some(&format!("{ROOM_PASS}\n")),
     );
     assert!(ok, "vox room create: {out}{err}");
@@ -251,7 +258,15 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     for who in [&bob, &mallory] {
         let (ok, out, err) = vox(
             &who.dir,
-            &["room", "join", link.trim(), "--name", "files"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "files",
+            ],
             Some(&format!("{ROOM_PASS}\n")),
         );
         assert!(ok, "{} joins files: {out}{err}", who.name);
