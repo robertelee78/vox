@@ -22,7 +22,8 @@
 //! - **End.** Bob, who did not create the room, is refused `vox room admin add`. Alice, its
 //!   creator, makes bob and carol admins and takes carol's back; every member's `vox room admin
 //!   list` says so. Carol is then refused `vox room end`, and bob, an admin, ends the room. Within
-//!   [`GONE`] the room is gone from every member's `vox room list` and store, with no forget. Then
+//!   [`GONE`] the room is gone from every member's `vox room list` and store, and so are the read
+//!   cursors each member's agent session (`vox agent hook`) kept for it, with no forget. Then
 //!   carol joins again with its address and passphrase: she is told the room has ended, not that
 //!   her passphrase is probably wrong.
 //! - **Idle end.** Alice makes a room with `vox room create --idle-end` [`IDLE`]. A message said
@@ -42,7 +43,7 @@
 //!
 //! **Mutations that must turn it red:** a leave that keeps the room (leave, nothing left); a
 //! member that left still synced with (leave); an end that leaves the members' copies (end, idle
-//! end, TUI); a post taken after the end, an admin's end ignored, or a join to an ended room
+//! end, TUI), or their agent cursor files (end); a post taken after the end, an admin's end ignored, or a join to an ended room
 //! refused as a wrong passphrase (end).
 
 #![cfg(unix)]
@@ -135,6 +136,20 @@ fn sessions_with(w: &Worker, room: &str, peer: &str) -> u64 {
 fn holds(w: &Worker, cid: &[u8]) -> bool {
     let bytes = std::fs::read(w.paths.store_file()).unwrap_or_default();
     bytes.windows(cid.len()).any(|x| x == cid)
+}
+
+/// The files under `w`'s agent cursor directory (read cursors and held claims) filed under `room`.
+fn cursors_of(w: &Worker, room: &str) -> Vec<String> {
+    let prefix: String = room.chars().take(8).collect();
+    let dir = w.paths.cursor_dir();
+    [dir.clone(), dir.join("held")]
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|f| f.starts_with(&prefix))
+        .collect()
 }
 
 /// `w`'s line for `room` in `vox room list`, or `None`.
@@ -467,6 +482,18 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
         "PRODUCT: carol, whose admin was taken back, was not refused `vox room end`: {o:?}"
     );
 
+    // Each member's agent session reads the room once, as Claude Code's hook does: that files a
+    // read cursor under the room, which must not outlive it.
+    for w in [alice, bob, carol] {
+        let session = format!(r#"{{"session_id":"end-{}","cwd":"/tmp"}}"#, w.name);
+        let o = w.vox_in(None, &["agent", "hook", "--room", &id[..8]], Some(&session));
+        assert!(
+            o.ok && !cursors_of(w, id).is_empty(),
+            "PRODUCT (staging): {}'s `vox agent hook` left no read cursor for the room: {o:?}",
+            w.name
+        );
+    }
+
     let t = Instant::now();
     let o = bob.vox(None, &["room", "end", id]);
     assert!(
@@ -486,6 +513,13 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
         assert!(
             !holds(w, &room.cid),
             "PRODUCT: the room is off {}'s list, but its store.redb still holds the room's id",
+            w.name
+        );
+        let left = cursors_of(w, id);
+        assert!(
+            left.is_empty(),
+            "PRODUCT: the room is off {}'s list, but the agent cursor files kept for it are still \
+             on disk: {left:?}",
             w.name
         );
         let o = w.vox(None, &["room", "post", id, "said after the end"]);

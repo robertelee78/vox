@@ -3943,7 +3943,8 @@ pub async fn print_identity(paths: &Paths) -> Result<(), AppError> {
 /// `vox room leave` — leave a room (V210-164; the decider, 2026-10-03: "leave deletes it").
 ///
 /// The node writes its departure into the room and answers once another member has it; then
-/// the room is gone from this node, and so are the read cursors agent sessions kept for it here.
+/// the room is gone from this node, and so are the read cursors agent sessions kept for it here
+/// (the node deletes those with the room).
 /// The other members stop listing this identity in the room's roster. Joining again later is an
 /// ordinary join.
 ///
@@ -3966,7 +3967,6 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     };
     match client.request(&Request::Leave { channel_id }).await {
         Ok(Frame::Ok) => {
-            forget_cursors(paths, &channel_id, &name);
             println!("vox: left {which}");
             println!("     its other members see that you left; this node no longer holds it");
             Ok(())
@@ -4000,33 +4000,6 @@ pub async fn end(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
-}
-
-/// Delete the read cursors (and held-claim records) agent sessions kept for a room: each is
-/// filed under the room as the session named it — its id, a prefix of it of 8 characters or
-/// more, or its local name. Returns how many went.
-fn forget_cursors(paths: &Paths, channel_id: &Digest32, name: &str) -> usize {
-    let id = b32_encode(channel_id);
-    let names_it = |file: &str| -> bool {
-        let Some((room, _session)) = file.split_once('-') else {
-            return false;
-        };
-        (room.len() >= 8 && id.starts_with(room))
-            || (!name.is_empty() && file.starts_with(&format!("{name}-")))
-    };
-    let mut gone = 0usize;
-    for dir in [paths.cursor_dir(), paths.cursor_dir().join("held")] {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let file = e.file_name().to_string_lossy().into_owned();
-            if e.path().is_file() && names_it(&file) && std::fs::remove_file(e.path()).is_ok() {
-                gone += 1;
-            }
-        }
-    }
-    gone
 }
 
 /// `vox room admin add|remove|list` — a room's admins (V030-08).

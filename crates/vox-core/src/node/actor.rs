@@ -12714,9 +12714,16 @@ impl Node {
         for reply in overtaken.into_iter().filter_map(|(_, _, reply, _)| reply) {
             let _ = reply.send(Outcome::Failed(Fault::LeaveUndone));
         }
+        let mut name = String::new();
         if let Some(shared) = self.channels.remove(channel_id) {
-            shared.lock().await.lock_now();
+            let mut ch = shared.lock().await;
+            name = ch.local_name().to_owned();
+            ch.lock_now();
         }
+        // The read cursors and held-claim records agent sessions kept for it go too: nothing
+        // filed under the room outlives it.
+        self.paths
+            .remove_room_cursors(&crate::node::link::b32_encode(channel_id), &name);
         self.reopening.remove(channel_id);
         if let Err(e) = self.forget_open(channel_id) {
             return Outcome::Failed(fault_of(&e));

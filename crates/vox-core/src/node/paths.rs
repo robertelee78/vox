@@ -256,6 +256,34 @@ impl Paths {
         self.profile_dir.join(CURSOR_DIR)
     }
 
+    /// Delete the read cursors and held-claim records agent sessions kept for a room this node
+    /// no longer holds — it left the room, or the room ended (V030-08) — so no per-room file
+    /// outlives it. Each is filed under the room as the session named it: its id `room_id`
+    /// (base32), a prefix of it of 8 characters or more, or its local `name`. Returns how many
+    /// went.
+    pub fn remove_room_cursors(&self, room_id: &str, name: &str) -> usize {
+        let names_it = |file: &str| -> bool {
+            let Some((room, _session)) = file.split_once('-') else {
+                return false;
+            };
+            (room.len() >= 8 && room_id.starts_with(room))
+                || (!name.is_empty() && file.starts_with(&format!("{}-", sanitize(name))))
+        };
+        let mut gone = 0usize;
+        for dir in [self.cursor_dir(), self.cursor_dir().join("held")] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let file = e.file_name().to_string_lossy().into_owned();
+                if e.path().is_file() && names_it(&file) && std::fs::remove_file(e.path()).is_ok() {
+                    gone += 1;
+                }
+            }
+        }
+        gone
+    }
+
     /// Where a session records its wake channel.
     #[must_use]
     pub fn session_file(&self, session: &str) -> PathBuf {
