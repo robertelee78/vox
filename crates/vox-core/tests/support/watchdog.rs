@@ -36,8 +36,13 @@
 //!   thread's stack into the log itself: `/usr/bin/sample` on macOS (a few hundred samples per
 //!   thread, so a spinning frame stands out by its count, not a single snapshot); on Linux, a
 //!   census of every thread from `/proc` with its state and the CPU it burned in the last second
-//!   (a spinning thread is the `R` one with ~100 ticks), plus `gdb`'s backtraces where it is
-//!   installed and allowed to attach.
+//!   (a spinning thread is the `R` one with ~100 ticks) and kernel wait channel, plus `gdb`'s
+//!   backtraces where it is installed and allowed to attach. Linux's default
+//!   `kernel.yama.ptrace_scope=1` lets a process be traced only by its ancestors, and the gdb is
+//!   this process's child: so it could attach neither to this process (its parent) nor to a `vox`
+//!   it started (its sibling), and a hung proof's Linux dump showed no stacks (V210-145, #364).
+//!   So this process allows tracing once the watchdog fires, and a `vox` built with `test-knobs`
+//!   allows it from its start.
 //!
 //! It also names the tests still running: every test arms the watchdog, and each arming is
 //! struck off when that test's thread ends, so what is left is the test that hung.
@@ -588,6 +593,7 @@ fn fire(
          To hold it open for a debugger instead: VOX_TEST_WATCHDOG_SECS=0\n\
          ===========================================================\n"
     ));
+    allow_tracing();
     dump_threads(std::process::id());
     dump_descendants(&children);
     say("==================== vox test watchdog: end of thread dump; aborting ====================\n");
@@ -753,29 +759,68 @@ fn dump_threads(pid: u32) {
         say(&format!("(no threads to show: process {pid} is gone)\n"));
         return;
     }
-    let mut out = String::from("threads (tid, state, CPU ticks in the last second, name):\n");
+    // `wchan` is where in the kernel a thread sleeps (`futex_wait_queue`, `do_epoll_wait`, ...).
+    // Unlike a stack, any process of this user may read it, so it is there even where gdb cannot
+    // attach.
+    let mut out = String::from(
+        "threads (tid, state, CPU ticks in the last second, name, kernel wait channel):\n",
+    );
     for (tid, state, ticks, name) in &after {
         let was = before
             .iter()
             .find(|(t, ..)| t == tid)
             .map_or(0, |(_, _, b, _)| *b);
+        let wchan = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/wchan"))
+            .ok()
+            .filter(|w| !w.is_empty() && w != "0")
+            .unwrap_or_else(|| "-".to_owned());
         out.push_str(&format!(
-            "  {tid:>8}  {state}  {:>4}  {name}\n",
+            "  {tid:>8}  {state}  {:>4}  {name:<16}  {wchan}\n",
             ticks.saturating_sub(was)
         ));
     }
     say(&out);
+    // Linux's default `kernel.yama.ptrace_scope=1` lets gdb — this process's child — attach only
+    // to a process that allows it: this one does (`fire`), and a `vox` built with `test-knobs`
+    // does (its `main`). Say so where gdb will be refused, so its refusal is not read as a hang.
+    let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default();
+    if !scope.is_empty() && scope != "0" {
+        say(&format!(
+            "(kernel.yama.ptrace_scope={scope}: gdb can attach only to a process that allows it — \
+             this test process, and a vox built with --features vox-tui/test-knobs; a vox built \
+             without it shows only the threads above)\n"
+        ));
+    }
     let pid = pid.to_string();
-    // Where gdb is installed and the kernel's ptrace policy lets a child attach to its parent.
+    // `debuginfod enabled off`: a dump must not wait on, or ask about, downloading symbols.
     run_bounded(Command::new("gdb").args([
-        "-p",
-        &pid,
         "-batch",
         "-nx",
+        "-iex",
+        "set debuginfod enabled off",
+        "-p",
+        &pid,
         "-ex",
         "thread apply all bt",
     ]));
 }
+
+/// Let any process of this user trace this one, so the gdb the dump runs (a child of this
+/// process) may attach to it under Yama's `ptrace_scope=1`. Only once the watchdog fires: this
+/// process aborts moments later.
+#[cfg(target_os = "linux")]
+fn allow_tracing() {
+    if let Err(e) = rustix::process::set_ptracer(rustix::process::PTracer::Any) {
+        say(&format!(
+            "(PR_SET_PTRACER failed: {e}; gdb may not attach to this process)\n"
+        ));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn allow_tracing() {}
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn dump_threads(_pid: u32) {
