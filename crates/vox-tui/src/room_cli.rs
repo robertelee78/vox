@@ -1592,17 +1592,33 @@ pub async fn claim_resource(
 /// Why members did not agree to a claim, as one line naming each: `me` is the claimant, named
 /// "you".
 fn unagreed_text(me: &Digest32, unagreed: &[(Digest32, String)]) -> String {
-    unagreed
+    let name = |m: &Digest32| {
+        if m == me {
+            "you".to_owned()
+        } else {
+            format!("member {}", crate::ident::author_id(m))
+        }
+    };
+    let mut parts: Vec<String> = unagreed
         .iter()
-        .map(|(m, why)| {
-            if m == me {
-                format!("you {why}")
-            } else {
-                format!("member {} {why}", crate::ident::author_id(m))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+        .filter(|(_, why)| !why.starts_with(STAMPED_AHEAD))
+        .map(|(m, why)| format!("{} {why}", name(m)))
+        .collect();
+    // The authors of posts the claim is stamped before, in one clause: it is one cause.
+    let ahead: Vec<String> = unagreed
+        .iter()
+        .filter(|(_, why)| why.starts_with(STAMPED_AHEAD))
+        .map(|(m, _)| name(m))
+        .collect();
+    if !ahead.is_empty() {
+        parts.push(format!(
+            "your node holds posts by {} stamped more than {} minutes ahead of your clock, and \
+             your claim is stamped before them although it was made after; check the clocks",
+            ahead.join(" and "),
+            vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
+        ));
+    }
+    parts.join("; ")
 }
 
 /// What a claimant must know when clocks are too far apart (V210-168): the room orders claims by
