@@ -14,7 +14,12 @@
 //! 2. **Denied** — a joiner the host never trusted gets no answer, and the service sees
 //!    zero packets.
 //! 3. **Revocation** — a query loop stops being answered within 1 s of `vox trust remove`.
-//! 4. **Oversize** — 1400- and 4000-byte payloads cross intact, in fragments.
+//! 4. **Oversize** — 1400-, 4000- and 9000-byte payloads cross intact; the 9000 bytes are
+//!    above every path's MTU ceiling, and the host's `datagrams.fragmented` rising while they
+//!    cross shows they went in fragments.
+//!
+//! Every red names its side: `PRODUCT:` for what vox did, `CANNOT MEASURE:` for staging this
+//! run did not achieve, `APPARATUS:` for this test's own sockets and tools.
 //! 5. **Relay drops, not stalls** — over a relay leg that loses every 10th datagram, what
 //!    the leg drops stays lost (so nothing waits behind its retransmission); the gaps and
 //!    latencies are recorded. Relayed path only: it is a property of the relay.
@@ -52,11 +57,33 @@ use world::{args, lossy_proxy, vox_once, PathKind, Setup, VoxProc, World};
 /// What the test DNS responder answers every `A` query with.
 const ANSWER: [u8; 4] = [10, 53, 0, 1];
 
+/// Proof 4's payload that must fragment everywhere: above every path's MTU ceiling (8192
+/// bytes at most, `MAX_UDP_PAYLOAD`), and under macOS's 9216-byte default for one UDP send.
+const OVERSIZE: usize = 9000;
+
+/// A step of this test's own machinery — its sockets, threads and tools — whose failure says
+/// nothing about vox: `APPARATUS:`.
+fn apparatus<T, E: std::fmt::Display>(r: Result<T, E>, what: &str) -> T {
+    r.unwrap_or_else(|e| panic!("APPARATUS: {what}: {e}"))
+}
+
+/// A step that waits on vox — a read from or write to the proxy `vox up` bound — whose failure
+/// is vox's: `PRODUCT:`.
+fn product<T, E: std::fmt::Display>(r: Result<T, E>, what: &str) -> T {
+    r.unwrap_or_else(|e| panic!("PRODUCT: {what}: {e}"))
+}
+
+/// A lock on this test's own bookkeeping; poisoned only if another of its threads panicked.
+fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock()
+        .unwrap_or_else(|e| panic!("APPARATUS: a test thread panicked holding a lock: {e}"))
+}
+
 /// A DNS responder on UDP loopback: answers every query with one `A` record, [`ANSWER`].
 /// Returns its port and how many packets it has received.
 fn dns_responder() -> (u16, Arc<AtomicU64>) {
-    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = sock.local_addr().unwrap().port();
+    let sock = apparatus(UdpSocket::bind("127.0.0.1:0"), "bind the DNS responder");
+    let port = apparatus(sock.local_addr(), "the DNS responder's address").port();
     let seen = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&seen);
     std::thread::spawn(move || {
@@ -96,8 +123,8 @@ fn dns_answer(query: &[u8]) -> Option<Vec<u8>> {
 /// Returns the port and the count of UDP packets received.
 fn dual_echo() -> (u16, Arc<AtomicU64>) {
     loop {
-        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
+        let tcp = apparatus(TcpListener::bind("127.0.0.1:0"), "bind the TCP echo");
+        let port = apparatus(tcp.local_addr(), "the TCP echo's address").port();
         let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) else {
             continue;
         };
@@ -148,7 +175,7 @@ fn dig(at: SocketAddr) -> Option<String> {
             "+tries=1",
         ])
         .output()
-        .expect("dig is installed");
+        .unwrap_or_else(|e| panic!("APPARATUS: `dig` could not be run (is it installed?): {e}"));
     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (out.status.success() && !text.is_empty() && !text.starts_with(';')).then_some(text)
 }
@@ -209,8 +236,9 @@ fn check_path(w: &mut World) {
     if w.path == PathKind::Relayed {
         assert!(
             !host_addrs.is_empty() && host_addrs.iter().all(|a| a.starts_with("/ip6/")),
-            "a relayed world's host must advertise IPv6 addresses only, or the guest could \
-             reach it directly: {host_addrs:?} in {}",
+            "CANNOT MEASURE: staging not achieved — a relayed world's host must advertise IPv6 \
+             addresses only, or the guest could reach it directly and nothing here was relayed: \
+             {host_addrs:?} in {}",
             w.address
         );
     }
@@ -219,31 +247,59 @@ fn check_path(w: &mut World) {
 /// SOCKS5 to `proxy`: no-auth greeting, then `UDP ASSOCIATE`. Returns the control
 /// connection (the association lives as long as it does) and the relay address.
 fn socks_associate(proxy: SocketAddr) -> (TcpStream, SocketAddr) {
-    let mut s = TcpStream::connect(proxy).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    s.write_all(&[5, 1, 0]).unwrap();
+    let mut s = product(
+        TcpStream::connect(proxy),
+        &format!("connect to the SOCKS proxy `vox up` bound at {proxy}"),
+    );
+    apparatus(
+        s.set_read_timeout(Some(Duration::from_secs(30))),
+        "a read timeout on the SOCKS control connection",
+    );
+    product(
+        s.write_all(&[5, 1, 0]),
+        "send the SOCKS greeting to `vox up`",
+    );
     let mut hello = [0u8; 2];
-    s.read_exact(&mut hello).unwrap();
-    assert_eq!(hello, [5, 0]);
+    product(s.read_exact(&mut hello), "read `vox up`'s SOCKS greeting");
+    assert_eq!(
+        hello,
+        [5, 0],
+        "PRODUCT: `vox up` must accept a no-auth SOCKS5 greeting"
+    );
     // UDP ASSOCIATE, from "anywhere" (all zeroes, which RFC 1928 allows).
-    s.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+    product(
+        s.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]),
+        "send UDP ASSOCIATE to `vox up`",
+    );
     let mut head = [0u8; 4];
-    s.read_exact(&mut head).unwrap();
+    product(
+        s.read_exact(&mut head),
+        "read `vox up`'s UDP ASSOCIATE reply",
+    );
     assert_eq!(
         head[1], 0,
-        "UDP ASSOCIATE must succeed, got code {}",
+        "PRODUCT: UDP ASSOCIATE must succeed, got code {}",
         head[1]
     );
-    assert_eq!(head[3], 1, "an IPv4 relay address");
+    assert_eq!(
+        head[3], 1,
+        "PRODUCT: `vox up` must name an IPv4 relay address"
+    );
     let mut a = [0u8; 6];
-    s.read_exact(&mut a).unwrap();
+    product(s.read_exact(&mut a), "read `vox up`'s UDP relay address");
     let relay = SocketAddr::from(([a[0], a[1], a[2], a[3]], u16::from_be_bytes([a[4], a[5]])));
     (s, relay)
 }
 
 /// An RFC 1928 §7 datagram to `name:port`.
 fn socks_udp(frag: u8, name: &str, port: u16, data: &[u8]) -> Vec<u8> {
-    let mut d = vec![0, 0, frag, 3, u8::try_from(name.len()).unwrap()];
+    let mut d = vec![
+        0,
+        0,
+        frag,
+        3,
+        apparatus(u8::try_from(name.len()), "a SOCKS name length"),
+    ];
     d.extend_from_slice(name.as_bytes());
     d.extend_from_slice(&port.to_be_bytes());
     d.extend_from_slice(data);
@@ -252,11 +308,50 @@ fn socks_udp(frag: u8, name: &str, port: u16, data: &[u8]) -> Vec<u8> {
 
 /// Strip an RFC 1928 §7 header off a reply, asserting it names `name:port`.
 fn socks_payload<'a>(reply: &'a [u8], name: &str, port: u16) -> &'a [u8] {
-    assert_eq!(&reply[..4], &[0, 0, 0, 3], "a domain-addressed reply");
+    assert!(
+        reply.len() >= 5 && reply.len() >= 7 + usize::from(reply[4]),
+        "PRODUCT: `vox up` relayed a reply too short for its own SOCKS header: {} bytes",
+        reply.len()
+    );
+    assert_eq!(
+        &reply[..4],
+        &[0, 0, 0, 3],
+        "PRODUCT: `vox up`'s reply must be domain-addressed"
+    );
     let len = usize::from(reply[4]);
-    assert_eq!(&reply[5..5 + len], name.as_bytes(), "from the name asked");
-    assert_eq!(&reply[5 + len..7 + len], &port.to_be_bytes());
+    assert_eq!(
+        &reply[5..5 + len],
+        name.as_bytes(),
+        "PRODUCT: `vox up`'s reply must come from the name asked"
+    );
+    assert_eq!(
+        &reply[5 + len..7 + len],
+        &port.to_be_bytes(),
+        "PRODUCT: `vox up`'s reply must come from the port asked"
+    );
     &reply[7 + len..]
+}
+
+/// `datagrams.fragmented` on the host's connection to `peer`, from the host's own
+/// `vox status --json` — the counter a person can read. Per connection, so on the relayed
+/// path it counts the flow's fragmenting and not the circuit's (that is the host's connection
+/// to the anchor, another peer).
+fn fragmented_toward(w: &World, peer: &str) -> u64 {
+    let (ok, out, err) = vox_once(&w.host_dir, &args(&["status", "--json"]));
+    assert!(
+        ok,
+        "PRODUCT: `vox status --json` on the running host failed: {out}\n{err}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| {
+        panic!("PRODUCT: `vox status --json` printed something that is not JSON ({e}): {out}")
+    });
+    let peers = v["peers"].as_array().cloned().unwrap_or_default();
+    let Some(p) = peers.iter().find(|p| p["id"] == peer) else {
+        panic!("PRODUCT: the host's `vox status --json` lists no connection to the guest {peer}: {out}")
+    };
+    p["datagrams"]["fragmented"].as_u64().unwrap_or_else(|| {
+        panic!("PRODUCT: the host's connection to the guest has no datagrams.fragmented: {p}")
+    })
 }
 
 /// Proofs 1, 4 and 6, and M22.4, in one world.
@@ -290,12 +385,15 @@ fn serves_udp(path: PathKind) {
     assert_eq!(
         answer.as_deref(),
         Some("10.53.0.1"),
-        "dig through `vox forward <room> <host> {dns}/udp` must get the responder's answer"
+        "PRODUCT: dig through `vox forward <room> <host> {dns}/udp` must get the responder's answer"
     );
     // And every later query is answered first time: the flow is up.
     let answered = (0..5).filter(|_| dig(at).is_some()).count();
     eprintln!("[test] proof 1 ({path:?}): {answered}/5 further queries answered");
-    assert_eq!(answered, 5, "a live UDP flow must answer every query");
+    assert_eq!(
+        answered, 5,
+        "PRODUCT: a live UDP flow must answer every query"
+    );
     drop(fwd);
 
     // ---- vox up: TCP and UDP on the same port (proof 6), oversize (proof 4), M22.4 ----
@@ -304,33 +402,58 @@ fn serves_udp(path: PathKind) {
     // the service, and the port a SOCKS request carries is ignored.
     let tcp_name = format!("{dual}.{}.{}.vox", w.host_fp, w.room);
     let name = format!("u{dual}.{}.{}.vox", w.host_fp, w.room);
-    let mut tcp = TcpStream::connect(proxy).unwrap();
-    tcp.set_read_timeout(Some(Duration::from_secs(330)))
-        .unwrap();
-    tcp.write_all(&[5, 1, 0]).unwrap();
+    let mut tcp = product(
+        TcpStream::connect(proxy),
+        &format!("connect to the SOCKS proxy `vox up` bound at {proxy}"),
+    );
+    apparatus(
+        tcp.set_read_timeout(Some(Duration::from_secs(330))),
+        "a read timeout on the SOCKS connection",
+    );
+    product(
+        tcp.write_all(&[5, 1, 0]),
+        "send the SOCKS greeting to `vox up`",
+    );
     let mut hello = [0u8; 2];
-    tcp.read_exact(&mut hello).unwrap();
-    let mut req = vec![5, 1, 0, 3, u8::try_from(tcp_name.len()).unwrap()];
+    product(tcp.read_exact(&mut hello), "read `vox up`'s SOCKS greeting");
+    let mut req = vec![
+        5,
+        1,
+        0,
+        3,
+        apparatus(u8::try_from(tcp_name.len()), "a SOCKS name length"),
+    ];
     req.extend_from_slice(tcp_name.as_bytes());
     req.extend_from_slice(&dual.to_be_bytes());
-    tcp.write_all(&req).unwrap();
+    product(tcp.write_all(&req), "send CONNECT to `vox up`");
     let mut head = [0u8; 10];
-    tcp.read_exact(&mut head).unwrap();
-    assert_eq!(head[1], 0, "the TCP service on port {dual} must be reached");
-    tcp.write_all(b"same port").unwrap();
+    product(tcp.read_exact(&mut head), "read `vox up`'s CONNECT reply");
+    assert_eq!(
+        head[1], 0,
+        "PRODUCT: the TCP service on port {dual} must be reached"
+    );
+    product(
+        tcp.write_all(b"same port"),
+        "write through the SOCKS TCP stream",
+    );
     let mut back = [0u8; 13];
-    tcp.read_exact(&mut back).unwrap();
+    product(
+        tcp.read_exact(&mut back),
+        "read the TCP service's echo through `vox up`",
+    );
 
     let (control, relay) = socks_associate(proxy);
-    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    let client = apparatus(UdpSocket::bind("127.0.0.1:0"), "bind the SOCKS UDP client");
+    apparatus(
+        client.set_read_timeout(Some(Duration::from_secs(10))),
+        "a read timeout on the SOCKS UDP client",
+    );
     let mut buf = vec![0u8; 65_535];
     let mut ask = |data: &[u8]| -> Option<Vec<u8>> {
-        client
-            .send_to(&socks_udp(0, &name, dual, data), relay)
-            .unwrap();
+        apparatus(
+            client.send_to(&socks_udp(0, &name, dual, data), relay),
+            "send a datagram to `vox up`'s UDP relay",
+        );
         let (n, _) = client.recv_from(&mut buf).ok()?;
         Some(socks_payload(&buf[..n], &name, dual).to_vec())
     };
@@ -343,22 +466,39 @@ fn serves_udp(path: PathKind) {
     );
     assert_eq!(
         &back, b"TCP:same port",
-        "TCP {dual} answers as the TCP service"
+        "PRODUCT: TCP {dual} answers as the TCP service"
     );
     assert_eq!(
         first.as_deref(),
         Some(&b"UDP:same port"[..]),
-        "UDP {dual} answers as the UDP service, through UDP ASSOCIATE"
+        "PRODUCT: UDP {dual} answers as the UDP service, through UDP ASSOCIATE"
     );
 
     // Proof 4: payloads larger than one datagram, byte for byte.
+    //
+    // **One of them must fragment on every machine.** A path's datagrams are capped by its
+    // MTU ceiling: on macOS, with the 4 MiB socket buffer, that is the 8192-byte
+    // `MAX_UDP_PAYLOAD`, so 1400 and 4000 bytes each fit one datagram there and only prove
+    // fragmentation where the ceiling is 1452 (Linux with `rmem_max` capped). 9000 bytes is
+    // above every ceiling and still under macOS's 9216-byte default for one UDP send, so
+    // the test's sockets and the product's need no larger buffers to carry it.
+    //
+    // **And it is checked that it did**: the host's `datagrams.fragmented` on its connection
+    // to the guest must rise while the 9000 bytes cross (the echo comes back the same size).
+    // A payload that arrived intact without fragmenting proved nothing about R26 —
+    // `CANNOT MEASURE`, not a pass.
     let mut intact = 0;
-    for size in [1400usize, 4000] {
-        let payload: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    let mut fragmented = (0, 0);
+    for size in [1400usize, 4000, OVERSIZE] {
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let before = (size == OVERSIZE).then(|| fragmented_toward(&w, &w.guest_fp));
         let got = ask(&payload);
+        if let Some(before) = before {
+            fragmented = (before, fragmented_toward(&w, &w.guest_fp));
+        }
         let ok = got
             .as_ref()
-            .is_some_and(|g| g[..4] == *b"UDP:" && g[4..] == payload[..]);
+            .is_some_and(|g| g.len() >= 4 && g[..4] == *b"UDP:" && g[4..] == payload[..]);
         eprintln!(
             "[test] proof 4 ({path:?}): {size}-byte payload came back {}",
             match &got {
@@ -369,13 +509,30 @@ fn serves_udp(path: PathKind) {
         );
         intact += usize::from(ok);
     }
-    assert_eq!(intact, 2, "both oversize payloads must cross intact");
+    eprintln!(
+        "[test] proof 4 ({path:?}): the host's connection to the guest fragmented {} \
+         datagram(s) before the {OVERSIZE}-byte payload and {} after",
+        fragmented.0, fragmented.1
+    );
+    assert_eq!(
+        intact, 3,
+        "PRODUCT: all three oversize payloads (1400, 4000 and {OVERSIZE} bytes) must cross intact"
+    );
+    assert!(
+        fragmented.1 > fragmented.0,
+        "CANNOT MEASURE: the {OVERSIZE}-byte payload crossed without the host's connection to the \
+         guest fragmenting anything ({} before, {} after), so this run never exercised \
+         fragmentation",
+        fragmented.0,
+        fragmented.1
+    );
 
     // M22.4: FRAG ≠ 0 is dropped, and never reaches the service.
     let before = dual_udp_seen.load(Ordering::Relaxed);
-    client
-        .send_to(&socks_udp(1, &name, dual, b"a fragment"), relay)
-        .unwrap();
+    apparatus(
+        client.send_to(&socks_udp(1, &name, dual, b"a fragment"), relay),
+        "send a FRAG=1 datagram to `vox up`'s UDP relay",
+    );
     std::thread::sleep(Duration::from_secs(2));
     let after = dual_udp_seen.load(Ordering::Relaxed);
     eprintln!(
@@ -384,7 +541,7 @@ fn serves_udp(path: PathKind) {
     );
     assert_eq!(
         after, before,
-        "a SOCKS datagram with FRAG ≠ 0 must be dropped"
+        "PRODUCT: a SOCKS datagram with FRAG ≠ 0 must be dropped"
     );
 
     // M22.4: the association dies with its TCP control connection.
@@ -401,9 +558,12 @@ fn serves_udp(path: PathKind) {
     );
     assert_eq!(
         after, before,
-        "the association must end with its control connection"
+        "PRODUCT: the association must end with its control connection"
     );
-    assert!(late.is_none(), "nothing may answer on a closed association");
+    assert!(
+        late.is_none(),
+        "PRODUCT: nothing may answer on a closed association"
+    );
 
     check_path(&mut w);
 }
@@ -433,10 +593,13 @@ fn denied(path: PathKind) {
         "[test] proof 2 ({path:?}): {tries} dig(s), answer {answer:?}, the service saw {seen} \
          packet(s)"
     );
-    assert!(answer.is_none(), "an untrusted joiner must get no answer");
+    assert!(
+        answer.is_none(),
+        "PRODUCT: an untrusted joiner must get no answer"
+    );
     assert_eq!(
         seen, 0,
-        "the host's service must see zero packets from an untrusted joiner"
+        "PRODUCT: the host's service must see zero packets from an untrusted joiner"
     );
     // A missing refusal has two sides; the forward's alone cannot say which one went quiet,
     // so a failure prints what the host and the anchor said too.
@@ -445,7 +608,7 @@ fn denied(path: PathKind) {
     }) else {
         let host = w.host.as_mut().map(VoxProc::transcript).unwrap_or_default();
         panic!(
-            "proof 2 ({path:?}): no refusal on the forward's stderr within 10s.\nThe forward \
+            "PRODUCT: proof 2 ({path:?}): no refusal on the forward's stderr within 10s.\nThe forward \
              said:\n{}\nThe host said:\n{host}\nThe anchor said:\n{}",
             fwd.transcript(),
             w.anchor.transcript()
@@ -479,13 +642,18 @@ fn revocation(path: PathKind) {
     let (answer, _) = dig_until(at, Duration::from_secs(180));
     assert!(
         answer.is_some(),
-        "the flow must answer before trust is withdrawn"
+        "PRODUCT (staging): the flow must answer before trust is withdrawn"
     );
 
     // One client socket, one flow, a query every 50 ms, and every answer timestamped.
-    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-    sock.set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
+    let sock = apparatus(
+        UdpSocket::bind("127.0.0.1:0"),
+        "bind the query loop's socket",
+    );
+    apparatus(
+        sock.set_read_timeout(Some(Duration::from_millis(50))),
+        "a read timeout on the query loop's socket",
+    );
     let answers: Arc<Mutex<Vec<Instant>>> = Arc::default();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let looper = {
@@ -496,36 +664,41 @@ fn revocation(path: PathKind) {
             while !stop.load(Ordering::Relaxed) {
                 let _ = sock.send_to(&query, at);
                 if sock.recv_from(&mut buf).is_ok() {
-                    answers.lock().unwrap().push(Instant::now());
+                    held(&answers).push(Instant::now());
                 }
             }
         })
     };
     let deadline = Instant::now() + Duration::from_secs(60);
-    while answers.lock().unwrap().len() < 10 && Instant::now() < deadline {
+    while held(&answers).len() < 10 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    let before = answers.lock().unwrap().len();
+    let before = held(&answers).len();
     assert!(
         before >= 10,
-        "the loop must be answered before the revocation: {before}"
+        "PRODUCT (staging): the loop must be answered before the revocation: {before}"
     );
 
     let asked = Instant::now();
     let (ok, out, err) = vox_once(&w.host_dir, &args(&["trust", "remove", &w.guest_fp]));
     let removed = Instant::now();
-    let last_before = answers.lock().unwrap().last().copied();
+    let last_before = held(&answers).last().copied();
     eprintln!(
         "[test] proof 3 ({path:?}): `vox trust remove` took {:?} (it checks the identity \
          passphrase); the last answer before it returned came {:?} after it was typed",
         removed.duration_since(asked),
         last_before.map(|t| t.saturating_duration_since(asked))
     );
-    assert!(ok, "`vox trust remove` on the running host: {out}\n{err}");
+    assert!(
+        ok,
+        "PRODUCT: `vox trust remove` on the running host failed: {out}\n{err}"
+    );
     std::thread::sleep(Duration::from_secs(3));
     stop.store(true, Ordering::Relaxed);
-    looper.join().unwrap();
-    let all = answers.lock().unwrap().clone();
+    looper
+        .join()
+        .unwrap_or_else(|_| panic!("APPARATUS: the query loop's thread panicked"));
+    let all = held(&answers).clone();
     let after: Vec<Duration> = all
         .iter()
         .filter(|t| **t > removed)
@@ -539,7 +712,7 @@ fn revocation(path: PathKind) {
     );
     assert!(
         last.is_none_or(|l| l <= Duration::from_secs(1)),
-        "answers must stop within 1 s of `vox trust remove`; the last came {last:?} after"
+        "PRODUCT: answers must stop within 1 s of `vox trust remove`; the last came {last:?} after"
     );
     check_path(&mut w);
 }
@@ -548,7 +721,7 @@ fn revocation(path: PathKind) {
 fn hex_query() -> Vec<u8> {
     let mut q = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
     for label in ["proof", "vox", "test"] {
-        q.push(u8::try_from(label.len()).unwrap());
+        q.push(apparatus(u8::try_from(label.len()), "a DNS label length"));
         q.extend_from_slice(label.as_bytes());
     }
     q.extend_from_slice(&[0, 0, 1, 0, 1]);
@@ -585,8 +758,8 @@ const CARRIER_SLACK: usize = 16;
 fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
     watchdog::arm();
     // The sink: records each numbered datagram's arrival.
-    let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let sink_port = sink.local_addr().unwrap().port();
+    let sink = apparatus(UdpSocket::bind("127.0.0.1:0"), "bind the sink");
+    let sink_port = apparatus(sink.local_addr(), "the sink's address").port();
     let arrivals: Arc<Mutex<Vec<(u32, Instant)>>> = Arc::default();
     {
         let arrivals = Arc::clone(&arrivals);
@@ -595,7 +768,7 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
             while let Ok((n, _)) = sink.recv_from(&mut buf) {
                 if n >= 4 {
                     let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                    arrivals.lock().unwrap().push((seq, Instant::now()));
+                    held(&arrivals).push((seq, Instant::now()));
                 }
             }
         });
@@ -610,29 +783,37 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
         path: PathKind::Relayed,
         guest_leg: Some(Box::new(move |anchor| {
             let (addr, count, knob, sizes) = lossy_proxy(anchor, Duration::from_millis(20));
-            *lossy_in.lock().unwrap() = Some((count, knob, sizes));
+            *held(&lossy_in) = Some((count, knob, sizes));
             Some(addr)
         })),
     });
     let guest = w.guest_dir.clone();
     let (_fwd, at) = w.forward_service("forward", &guest, &format!("{sink_port}/udp"));
 
-    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let client = apparatus(UdpSocket::bind("127.0.0.1:0"), "bind the blaster");
     // Open the flow: seq 0 until the sink hears one.
     let deadline = Instant::now() + Duration::from_secs(300);
-    while arrivals.lock().unwrap().is_empty() && Instant::now() < deadline {
-        client.send_to(&0u32.to_be_bytes(), at).unwrap();
+    while held(&arrivals).is_empty() && Instant::now() < deadline {
+        apparatus(
+            client.send_to(&0u32.to_be_bytes(), at),
+            "send to the forward's local port",
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
+    // The forward is up — it printed its bound address — so a flow that never carries a
+    // datagram to the service is vox's.
     assert!(
-        !arrivals.lock().unwrap().is_empty(),
-        "the flow never opened"
+        !held(&arrivals).is_empty(),
+        "PRODUCT: the UDP flow never opened: in 300 s nothing sent to the forward at {at} \
+         reached the service"
     );
-    arrivals.lock().unwrap().clear();
+    held(&arrivals).clear();
     // The loss starts now, not during setup: joining over a lossy leg is its own open
     // defect (ADR-018, a joining node holding its actor for 30 s), and this proof is about
     // what the relay does to traffic, not about joining.
-    let (dropped, knob, sizes) = lossy.lock().unwrap().clone().unwrap();
+    let (dropped, knob, sizes) = held(&lossy).clone().unwrap_or_else(|| {
+        panic!("CANNOT MEASURE: staging not achieved — the lossy leg was never built")
+    });
     knob.store(10, Ordering::Relaxed);
     // And congestion control is given the loss to settle on before anything is measured:
     // both connections' windows fall to their floor within the first second or so of a new
@@ -643,31 +824,31 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
     for seq in 0..300u32 {
         let mut d = u32::MAX.to_be_bytes().to_vec();
         d.resize(200, 0);
-        client.send_to(&d, at).unwrap();
+        apparatus(client.send_to(&d, at), "send to the forward's local port");
         if let Some(wait) = (warm + BLAST_EVERY * (seq + 1)).checked_duration_since(Instant::now())
         {
             std::thread::sleep(wait);
         }
     }
     std::thread::sleep(Duration::from_millis(500));
-    arrivals.lock().unwrap().clear();
+    held(&arrivals).clear();
     let proxy_drops_before = dropped.load(Ordering::Relaxed);
-    let sizes_before = sizes.lock().unwrap().len();
+    let sizes_before = held(&sizes).len();
 
     let start = Instant::now();
     for seq in 1..=BLAST_COUNT {
         let mut d = seq.to_be_bytes().to_vec();
         d.resize(200, 0);
-        client.send_to(&d, at).unwrap();
+        apparatus(client.send_to(&d, at), "send to the forward's local port");
         let next = start + BLAST_EVERY * seq;
         if let Some(wait) = next.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);
         }
     }
     std::thread::sleep(Duration::from_secs(2));
-    let got = arrivals.lock().unwrap().clone();
+    let got = held(&arrivals).clone();
     let proxy_drops = dropped.load(Ordering::Relaxed) - proxy_drops_before;
-    let window: Vec<(usize, bool)> = sizes.lock().unwrap()[sizes_before..].to_vec();
+    let window: Vec<(usize, bool)> = held(&sizes)[sizes_before..].to_vec();
     // Every numbered datagram is the same 200 bytes, so every packet that carries one on
     // the leg is the same size: the commonest size the leg passed in the window.
     let mut passed: std::collections::BTreeMap<usize, usize> = Default::default();
@@ -741,7 +922,7 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
     check_path(&mut w);
     assert!(
         proxy_drops > 0,
-        "the lossy leg must actually have dropped something, or this measured nothing"
+        "CANNOT MEASURE: the lossy leg dropped nothing in the window, so this measured nothing"
     );
     assert!(
         carrier >= 200,
@@ -772,7 +953,7 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
     );
     assert!(
         lost as u64 >= carrying_drops,
-        "a relay must lose what the lossy leg drops, not recover it: {lost} lost for \
+        "PRODUCT: a relay must lose what the lossy leg drops, not recover it: {lost} lost for \
          {carrying_drops} datagram-carrying packets dropped on the leg"
     );
 }

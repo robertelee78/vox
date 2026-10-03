@@ -1330,6 +1330,9 @@ where
 ///   epoch 7 past the entry's own, so it classifies as governance and does not bind;
 /// - `old-row-ids` (V210-74): a room it reopens resumes its row ids from the log rows alone, as
 ///   before V210-73, so its own store gets the collision that lost received messages.
+/// - `refuse-sessions` (PRD-001 R36, #85): it refuses every sync session a peer opens to it, with
+///   the coded reason `EpochMismatch`, so the peer's session ends as the peer's refusal and the
+///   correct node's log is what a proof reads.
 ///
 /// Any other value, or none, sends correctly. The first session announces the build and the mode
 /// on stderr, [`MARKER`](mutant::MARKER), which the proofs require before they measure anything.
@@ -1350,6 +1353,7 @@ pub mod mutant {
         AuthorUnclassifiable,
         OldRowIds,
         AuthorMisbound,
+        RefuseSessions,
     }
 
     fn mode() -> Mode {
@@ -1364,6 +1368,7 @@ pub mod mutant {
                 "author-unclassifiable" => Mode::AuthorUnclassifiable,
                 "old-row-ids" => Mode::OldRowIds,
                 "author-misbound" => Mode::AuthorMisbound,
+                "refuse-sessions" => Mode::RefuseSessions,
                 _ => Mode::Correct,
             };
             eprintln!(
@@ -1407,6 +1412,13 @@ pub mod mutant {
         Ok((shown, hidden))
     }
 
+    /// `refuse-sessions` (#85): the coded reason this build refuses every inbound sync session
+    /// with.
+    #[must_use]
+    pub fn refuses() -> Option<WireError> {
+        (mode() == Mode::RefuseSessions).then_some(WireError::EpochMismatch)
+    }
+
     /// `serve-slowly` (V210-71): the gap before each served frame, with the serve budget ignored,
     /// so the peer's drain runs past its own budget.
     #[must_use]
@@ -1421,7 +1433,8 @@ pub mod mutant {
             | Mode::ServeSlowly
             | Mode::AuthorUnclassifiable
             | Mode::OldRowIds
-            | Mode::AuthorMisbound => asked,
+            | Mode::AuthorMisbound
+            | Mode::RefuseSessions => asked,
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
             Mode::StripPayload => asked

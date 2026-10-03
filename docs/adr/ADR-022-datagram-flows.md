@@ -1,421 +1,240 @@
 # ADR-022: Datagram flows — UDP tunnels, relays that behave like UDP, and the app API
 
-**Status**: **Accepted by the decider — 2026-09-25** (the design, including the corrections recorded below
-during implementation). **Implementation is not yet on `main`.**
-- M22.1–M22.5 are built and gated on feature branches: `prd1/datagram-seam`, `prd1/app-api`,
-  `prd1/udp-tunnels` and `prd1/naming`.
-- They are to ship in v0.3.0.
-- A `DONE` mark below names the gate that proved the milestone on its branch.
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status**: accepted by the decider (2026-09-25). M22.1–M22.5 are built on integrate/v0.3.0
+(`transport::{datagram, router}`, `node::circuitstream`, `tunnel::udp`, `node::{app, appipc}`,
+`vox app`, `crates/vox-ffi`), to ship in v0.3.0. Calls (decision 8) are an app, not Vox code.
+- **Not built:** per-flow counters in `vox status` (6.9; #383, V030-34); the Kotlin binding (7.13;
+  #78). Per-connection counters are built: `vox status --json` `datagrams` and the metrics endpoint
+  (`42597826`).
+- **No proof on integrate/v0.3.0:** the unknown-flow and unknown-context drops (2.2, 3.2) and
+  `CIRCUIT_DATAGRAM_MAX` (5.4), whose in-process gates (`datagram_flows_gate`,
+  `relay_drops_not_stalls`) were deleted when v0.2.10 merged into v0.3.0 (`a1d01323`, #226) and
+  await conversion (#227, V030-02); the 120 s idle close (6.3), the 32-per-peer eviction and the
+  256 total (6.4) (#72); and a UDP flow cut by service removal (6.5; the untrust half is proved,
+  and service removal is proved for TCP by `tunnel_honesty_proof`) (#68).
+- **Proved short of the decision:** P8's bound (see P8), and the proofs' paths and substitutions
+  listed under Proofs.
 **Date**: 2026-09-24
 **Deciders**: Robert E. Lee
 **Tags**: datagrams, udp, relay, app-api, calls
-**Depends on**: 011, 012, 013, 016, 017, 020 — and PRD-001 (R25–R32)
 
 ## Context
 
-PRD-001 asks for four things that all need the same missing piece:
+PRD-001 asks for four things that need the same missing piece: carrying any UDP traffic between
+members, fragmenting packets that do not fit one datagram (R25–R26); relayed UDP that behaves like
+UDP, dropping late packets instead of stalling behind them (R27); an app API through which a separate
+program opens a live stream or datagram flow to a member node (R29–R30); and calls, 1:1 first, then a
+small-group mesh (R32). Before this ADR, datagrams carried no flow identifier and had one reader, and
+a relay circuit carried its ends' QUIC packets on a reliable outer stream, so one lost outer packet
+stalled every inner packet behind it. The tunnel stream (ADR-013) already had a named request, a
+uniform `Denied` refusal, a keyring-and-author gate and teardown on withdrawn reach (`Reachers`).
+This ADR builds datagram flows once and puts UDP tunnels, relay circuits and the app API on them.
 
-- **R25–R26:** carry any UDP traffic between members, fragmenting packets that don't fit in one
-  datagram.
-- **R27:** relayed UDP must behave like UDP, dropping late packets rather than stalling behind them.
-- **R29–R30:** an app API through which a separate program (the decider's chat and calls app) opens
-  a live stream or datagram flow to a member node.
-- **R32:** calls, 1:1 first, then a small-group mesh.
+## Requirements
 
-What exists today (read on `origin/main` 96c47ed):
+### Decision 1 — a datagram flow is bound to a stream
 
-- `VoxConnection::send_datagram` / `recv_datagram` (`transport/quic.rs`) frame each datagram as
-  `seq(8) ‖ payload` behind a 1024-packet replay window (`transport/datagram.rs`). **No product code
-  calls them.** The frame has no field saying which flow a datagram belongs to, and `recv_datagram`
-  is the connection's only reader.
-- A relay circuit (`node/circuitstream.rs`) carries the two ends' QUIC packets as `DATAGRAM` frames
-  on a **reliable outer stream**. One lost outer packet stalls every inner packet queued behind it
-  until it is retransmitted. That is what makes relayed UDP, and any future call, stall instead of
-  drop.
-- The tunnel stream (`StreamKind::Tunnel`, `tunnel/session.rs`) already provides most of what a flow
-  needs:
-  - a request that names a room and a service label;
-  - a uniform `Denied` refusal;
-  - a gate: the opener must be in the host's keyring **and** a current author of the room;
-  - teardown when reach is withdrawn (the `Reachers` watch).
+1.1. Every flow MUST be opened by a bidirectional stream: `Tunnel` for UDP, `Circuit` for a relay,
+     `App` for the app API. The flow MUST live exactly as long as that stream; when either side ends
+     or resets the stream, the flow ends and datagrams still arriving for it MUST be dropped.
+1.2. The flow ID MUST be the control stream's full QUIC stream ID. It MUST NOT be RFC 9297's Quarter
+     Stream ID: both ends of a Vox connection open bidirectional streams, so quarter IDs collide.
+1.3. A binding that takes the stream (`bind_flow`) MUST leave the stream carrying no bytes, and a
+     watcher MUST end the flow on both sides when the stream ends in either direction.
+1.4. An `App` stream carries the app's bytes as well as its flow, so its binding shares the stream
+     (`bind_shared_flow`, crate-private). Its only caller, `node::app::AppStream`, MUST hold the
+     stream and the flow in one object whose drop ends both.
+1.5. Authorization MUST happen once, on the stream, through that stream kind's gate. A datagram MUST
+     be accepted only for a flow whose stream was authorized.
 
-This ADR builds the missing piece once and puts all three consumers on it: UDP tunnels, relay
-circuits, and the app API.
+### Decision 2 — the datagram frame
 
-## Decision
+2.1. A datagram MUST be:
+     ```
+     datagram := varint flow_id ‖ varint context ‖ body
+     context 0 := body is one whole packet
+     context 1 := body is a fragment: varint packet_id ‖ u8 index ‖ u8 count ‖ bytes
+     context ≥2 := reserved
+     ```
+2.2. A datagram with an unknown context MUST be dropped and counted.
+2.3. Vox MUST NOT carry a datagram sequence number or replay window: QUIC rejects replayed and
+     duplicated packets (RFC 9000 §12.3), a relay's inner QUIC de-duplicates for itself, and a
+     window wrongly drops packets that arrive far out of order.
 
-### 1. A datagram flow is bound to a stream
+### Decision 3 — one reader per connection routes datagrams
 
-Every flow is opened by a bidirectional stream: a `Tunnel` stream for UDP, a `Circuit` stream for a
-relay, an `App` stream for the app API. The flow **lives exactly as long as that stream**. When
-either side ends or resets the stream, the flow is gone, and datagrams still arriving for it are
-dropped.
+3.1. A per-connection `DatagramRouter` MUST be the only caller of the connection's datagram receive.
+     It MUST hand each datagram to its flow's bounded inbox.
+3.2. It MUST drop and count datagrams for unknown flows and datagrams whose flow inbox is full. A
+     slow consumer MUST lose packets and MUST NOT stall another flow.
+3.3. Counters are read with `VoxConnection::datagram_stats`. They SHOULD be surfaced in
+     `vox status`. Built: `vox status --json` carries them per peer and for the node, and the
+     metrics endpoint as `vox_datagrams_*_total` (`42597826`).
 
-The flow's identifier is the **control stream's full QUIC stream ID**. It is already unique on the
-connection and already known to both sides, so nothing has to be allocated and nothing can collide.
+### Decision 4 — oversize packets are fragmented inside Vox (R26)
 
-*(Corrected while building M22.1. This decision first said the stream ID divided by 4, RFC 9297's
-Quarter Stream ID. That is unique in HTTP/3 only because only the client opens request streams. On a
-Vox connection both ends open bidirectional streams — a relay opens its circuit stream to a target
-that may have dialled it — and the client's stream 0 and the server's stream 1 share quarter 0, so two
-flows would collide. The full ID costs one more varint byte only past stream 63.)*
+4.1. A packet that fits `max_datagram_payload()` after the header MUST go as context 0. A larger one
+     MUST be split into context-1 fragments, at most 255, so at most 64 KiB, the largest UDP payload.
+4.2. The receiver MUST reassemble per `(flow, packet_id)` and MUST drop a packet, whole, whose
+     fragments are not all present within 500 ms.
+4.3. At most 32 partial packets per flow and 1 MiB of partial data per connection; past either
+     bound the oldest partial packet MUST be dropped.
+4.4. Fragments MUST NOT be retransmitted. A lost fragment loses the packet.
 
-The binding **takes** the stream: from then it carries no bytes, and a watcher ends the flow on both
-sides the moment the stream ends in either direction. Nothing else can hold the stream open, so
-unregistering is not something a caller can forget. That fits the `Circuit` and `Tunnel` streams, which carry
-nothing once the flow is up. An `App` stream carries the app's bytes as well as its flow (decision
-7), so M22.5 added a binding that **shares** the stream (`bind_shared_flow`, crate-private) and keeps
-the rule by construction instead: the only caller, `node::app::AppStream`, holds the stream and the
-flow in one object whose drop ends both.
+### Decision 5 — relays carry datagrams, not a stream (R27)
 
-Authorization happens **once, on the stream**, through the gate that stream kind already has. A
-datagram is accepted only for a flow whose stream was authorized, so a datagram cannot reach anything
-the stream could not.
+5.1. The circuit stream MUST keep its handshake verbs (`OPEN`, `INCOMING`, `OPENED`, `REFUSED`) and
+     its bounds (64 circuits in total, 4 per asker, a 5-minute idle close).
+5.2. Inner QUIC packets MUST travel as datagram flows: the initiator's circuit stream is a flow on
+     the initiator–relay connection, the target's on the relay–target connection, and the relay MUST
+     forward datagrams between the two flows without reading them.
+5.3. The relay MUST forward fragments as they come and MUST NOT reassemble.
+5.4. Each end MUST send no circuit datagram larger than `CIRCUIT_DATAGRAM_MAX` = 1100 bytes, since
+     neither end can see the other leg's datagram size.
+5.5. The relay MUST stay ciphertext-only.
 
-### 2. The datagram frame
+### Decision 6 — UDP tunnels (R25)
 
-```
-datagram := varint flow_id ‖ varint context ‖ body
-context 0 := body is one whole packet
-context 1 := body is a fragment: varint packet_id ‖ u8 index ‖ u8 count ‖ bytes
-context ≥2 := reserved; a datagram with an unknown context is dropped and counted
-```
+6.1. **Labels.** A UDP service MUST be served as `udp/<port>`; a bare `<port>` stays TCP, so TCP and
+     UDP on one port are two services.
+6.2. **Opening.** The dialer opens a `Tunnel` stream with `TunnelRequest{channel_id, "udp/<port>"}`.
+     The host MUST run the existing tunnel gate unchanged, then bind an ephemeral UDP socket connected
+     to the service address and reply `Accepted`. The stream then carries no payload and is the
+     flow's lifetime.
+6.3. **Idle.** A flow with no traffic in either direction for 120 s (RFC 9298's floor, `UDP_IDLE`)
+     MUST be closed.
+6.4. **Limits.** A node MUST hold at most 32 flows per peer (`FLOWS_PER_PEER`), evicting that peer's
+     longest-idle flow, and at most 256 in total (`FLOWS_TOTAL`), counting both roles. At the total,
+     a new flow MUST be refused with the uniform `Denied` and MUST NOT evict another peer's flow.
+6.5. **Teardown.** Untrusting the peer or removing the service MUST end the flow at once, through
+     the TCP tunnel's watch (the reacher set and the live offer, R22).
+6.6. **Surfaces.** The host: `vox serve <port>/udp`, or `vox serve <port> <port>/udp` for TCP and
+     UDP on one port (`--at` applies to every spec); on an existing room,
+     `vox service add <room> <port>/udp <addr>`. The dialer:
+     `vox forward <service>.<node>.<room>.vox <port>/udp <local-port>`, one flow per distinct client source address.
+6.7. **SOCKS5 UDP ASSOCIATE** in `vox up` (RFC 1928 §7): a loopback relay socket; every destination
+     MUST be a `service.node.room.vox` name (ADR-017); one flow per (association, destination); a datagram with `FRAG ≠ 0` MUST
+     be dropped; the association MUST end with its TCP control connection.
+6.8. **Backpressure.** Sending MUST NOT block: when the send buffer is full the oldest queued datagram
+     is dropped. Congestion control on the outer connection MUST stay on (RFC 9298).
+6.9. Per-flow counters (to the peer, from the peer, dropped) are read with `UdpFlows::snapshot`. They
+     SHOULD be surfaced in `vox status`; *not built*.
 
-The 8-byte sequence number and the replay window are **removed**. They protect nothing:
+### Decision 7 — the app API (R29–R30)
 
-- QUIC already rejects a replayed or duplicated packet (RFC 9000 §12.3; packet protection).
-- A relay carries inner QUIC packets that the inner connection de-duplicates for itself.
-- The window could *wrongly* drop legitimate packets that arrived badly out of order.
+7.1. **Stream kind `App = 9`.** The first frame after the kind MUST be
+     `[1, channel_id, [labels…≤8], flags]`; `flags` bit 0 asks for a datagram flow bound to the
+     stream. The responder MUST pick the first label it serves and answer `[1, label]`, or
+     `[0, reason]`.
+7.2. Labels are libp2p-style `name/vN`, at most 64 ASCII bytes, with no registry. An incompatible
+     change MUST be a new label. Stream kinds MUST stay reserved for Vox's own machinery.
+7.3. **Gate, both directions.** The responder MUST accept only an opener that is in its keyring and a
+     current author of the room. The opener's node MUST refuse to open unless the target is in its
+     keyring. Untrusting either side MUST tear the stream down through the `Reachers` watch.
+7.4. **Refusal, two tiers.** A peer that is not trusted MUST get the same reset as an unknown or
+     forbidden stream kind (`Reset(5)` on read, `Stopped(5)` on write; `streams::refuse`), so it
+     cannot tell whether an app is running. A mutually trusted peer MUST get the reason:
+     `no-listener`, `busy` or `refused`. A trusted stream nobody accepts in time MUST be told
+     `refused`.
+7.5. App streams MUST be live only; nothing is queued.
+7.6. **Local IPC** (introduced in IPC protocol 6; `0600` socket, as ADR-020 §7; request tags
+     2201–2212). A connection whose first request is an app request MUST stay an app connection for
+     life.
+     - `AppListen{room|any, label}` registers a listener, exclusive per (room, label), ending when
+       the connection closes.
+     - The node announces each incoming stream as `AppIncoming{id, room, peer, label}`.
+     - `AppAccept{id}` on a fresh connection, and `AppOpen{room, peer, labels, datagrams}`, turn that
+       connection into a raw splice of the stream. A datagram flow travels on the same connection as
+       length-prefixed frames marked stream-or-datagram.
+     - An incoming stream nobody accepts within 5 s MUST be refused (`refused`, as 7.4).
+7.7. In the raw splice the node MUST shut its write side when the peer finishes, and MUST close the
+     whole connection when the stream fails.
+7.8. **Limits.** 16 app streams per peer, counted at the responder from admission to end; an
+     open-rate bucket of burst 10, refilling 10 a second, per peer; the `AppOpen` frame MUST arrive
+     within 5 s. `busy` MUST cover both the stream limit and the open rate.
+7.9. App streams MUST run at a lower priority than sync, join and pairwise traffic (built: `-1`,
+     below their default 0). `max_concurrent_bidi_streams` MUST be set explicitly, replacing quinn's
+     default of 100 (built: 1024).
+7.10. **Teardown.** A guardian per `AppStream` watches the live set and MUST reset both halves with
+      `APP_WITHDRAWN_CODE` (`0x2207`). Every call on the stream MUST race the same watch, and whichever
+      notices first MUST tear down before returning. A stream dropped after withdrawal MUST reset,
+      not finish.
+7.11. **CLI.** `vox app listen <room> <label>` and
+      `vox app open <room> <peer> <label>… [--datagrams]` pipe stdin and stdout; with `--datagrams`
+      each stdin line is one datagram and each datagram received is one line. A cut stream MUST exit
+      non-zero and say so.
+7.12. **In-process library API.** The same operations MUST be exposed from `vox-core` for a mobile
+      app that embeds the node (R30). Packaging for Swift and Kotlin belongs to the app.
+7.13. Swift is built (`crates/vox-ffi`, UniFFI: `appListen`, `appOpen`, stream and datagram calls;
+      ADR-014 "The embedded node"). Kotlin is *not built*.
 
-Removing them saves 8 bytes on every packet.
+### Decision 8 — calls sit on the app API (R32)
 
-### 3. One reader per connection routes datagrams
+8.1. A call MUST be an app (label such as `call/v1`): an app stream for signalling, a datagram flow
+     for media. 1:1 calls need nothing more from Vox.
+8.2. A small-group mesh opens one flow per other participant.
+8.3. A forwarding node kept from seeing the media needs SFrame (RFC 9605) inside the app; that is
+     out of scope for Vox.
 
-A per-connection `DatagramRouter` task is the only caller of the connection's datagram receive. It:
+### Proofs
 
-1. parses the flow ID and hands the datagram to that flow's bounded inbox;
-2. drops (and counts) datagrams for unknown flows;
-3. drops (and counts) datagrams whose flow inbox is full. A slow consumer loses packets and never
-   stalls another flow.
+Each proof MUST drive the shipped binary, MUST be mutation-checked and MUST print its counts, and
+each MUST run on a direct path and on a forced-relay path.
 
-Flows register with the router when their stream is authorized and unregister when it ends.
+P1. **DNS.** `dig` through a `53/udp` forward to a real DNS server gets the answer. Mutation: the
+    host drops context-0 datagrams, and the proof goes red.
+P2. **Denied.** A peer outside the host's keyring gets no answer, and the host's service sees zero
+    packets.
+P3. **Revocation.** A `dig` loop stops within 1 s of `vox trust remove`.
+P4. **Oversize.** 1400- and 4000-byte UDP payloads arrive intact via fragmentation. Mutation:
+    disable fragmentation, and they are dropped and counted.
+P5. **Relay drops, not stalls.** `iperf3 -u` over the relay with induced loss shows loss and no
+    head-of-line stalls; jitter is recorded. Mutation: stream carriage, and the jitter signature
+    flips.
+P6. **TCP and UDP on the same port** both answer.
+P7. **App API.** A 1 MiB app stream round trip with SHA-256; 1000 app datagrams delivered; an opener
+    outside the responder's keyring gets 0 incoming notices at the listener; an untrusted
+    no-listener reset is byte-identical to an unknown-kind reset.
+P8. **Load.** 200 stalled app streams, and a chat message still arrives in under 1 s.
 
-### 4. Oversize packets are fragmented inside Vox (R26)
+**What is built** (`crates/vox-tui/tests/udp_tunnel_proof.rs` for P1–P6 and 6.7;
+`crates/vox-tui/tests/app_api_proof.rs` for P7, P8 and 7.3, 7.4 and 7.10), and where it falls short
+of the above:
+- **Paths.** P1–P4 and P6 run on both paths. P5 runs on the forced-relay path only (it is a
+  property of the relay). P7 and P8 run on a direct path only.
+- **P1.** No real DNS server is installed: the responder is in the test (`dig` is real). Mutation:
+  the host drops what the flow delivers.
+- **P4.** Mutation: fragmentation disabled, and the 4000-byte payload does not arrive; the drop
+  counter is not read.
+- **P5.** No `iperf3` is installed: the blaster and sink are in the test. Loss is asserted (what the
+  lossy leg drops stays lost); latency and gaps are recorded, not bounded. Mutation: stream
+  carriage restored, and nothing is lost. The loss is switched on after setup, so P5 measures the
+  relay's carriage, not a join over a lossy leg. The actor stall the proof's comment cites
+  (V29-08, #43) is closed; a join over a lossy leg is not measured by P5.
+- **P8.** Proved only to **1.5 s**: a local append is pushed within one 1 s actor tick, so the same
+  message takes 30 ms to 1.03 s with no app streams at all, and the gate bounds it at 1.5 s. The
+  decided bound is under 1 s; which one holds is the decider's to rule.
 
-A packet that fits `max_datagram_payload()` after the header goes as context 0. A larger one is split
-into as many context-1 fragments as it needs, at most 255, and so at most 64 KiB, which is the
-largest UDP payload. The receiver reassembles per `(flow, packet_id)`:
+### Milestones
 
-- **Timeout:** a packet whose fragments are not all present within **500 ms** is dropped, whole.
-- **Bounds:** at most 32 partial packets per flow, and at most 1 MiB of partial data per connection.
-  Past either bound the oldest partial packet is dropped.
-- **Never retransmitted.** A lost fragment loses the packet, as a lost IP fragment does. Loss is
-  amplified roughly by the fragment count, which is why fragmenting is the exception, not the norm.
-
-Fragmentation is what lets inner QUIC (whose minimum is 1200 bytes), WireGuard at MTU 1420, and
-game traffic cross a path whose datagrams hold only about 1150 bytes.
-
-### 5. Relays carry datagrams, not a stream (R27)
-
-The circuit stream keeps its handshake verbs (`OPEN`, `INCOMING`, `OPENED`, `REFUSED`) and its
-bounds (64 circuits in total, 4 per asker, a 5-minute idle close). The `DATAGRAM` verb **moves off
-the stream** and onto datagram flows:
-
-- the initiator's circuit stream is a flow on the initiator–relay connection;
-- the target's circuit stream is a flow on the relay–target connection;
-- the relay forwards datagrams between the two flows without reading them. They are inner QUIC
-  packets, as today.
-
-Inner packets larger than the outer datagram limit are fragmented per decision 4. The relay forwards
-fragments as they come and **never reassembles**. *(Found building M22.2:)* since the relay forwards a
-datagram as it is and each end sees only its own leg, the ends must size datagrams for the smaller
-leg, which neither can see. They send nothing larger than `CIRCUIT_DATAGRAM_MAX` = 1100 bytes, under
-what every QUIC path carries; without that cap a leg grown to 1452 bytes by path-MTU discovery sends
-datagrams a leg still at the 1200-byte floor drops, and the inner handshake never completes. A lost outer packet now loses one inner packet,
-which the inner QUIC connection retransmits on its own schedule; it no longer stalls every packet
-behind it.
-
-What does not change: the relay is still ciphertext-only by construction.
-
-### 6. UDP tunnels (R25)
-
-- **Service label.** A UDP service is served as `udp/<port>`; a bare `<port>` stays TCP. So TCP 53
-  and UDP 53 are two different services and never collide.
-- **Opening a flow.** The dialer opens a `Tunnel` stream with `TunnelRequest{channel_id,
-  "udp/<port>"}`. The host runs the existing gate unchanged. When authorized, it binds an ephemeral
-  UDP socket connected to the service address and replies `Accepted`. The stream then carries no
-  payload; it **is** the flow's lifetime.
-- **Idle and limits.** A flow with no traffic in either direction for **120 s** is closed (the
-  RFC 9298 floor). A node holds at most **32 flows per peer**, evicting the oldest idle one like a NAT
-  table, and **256 in total**.
-- **Teardown.** Untrusting the peer or removing the service resets the stream (R22). Resetting the
-  stream ends the flow at once.
-- **Surfaces**, in build order:
-  1. `vox serve <room> 53/udp [--at addr]` on the host.
-  2. `vox forward <name>.vox 53/udp <local-port>` on the dialer: a loopback UDP socket, one flow per
-     distinct client source address.
-  3. **SOCKS5 UDP ASSOCIATE** in `vox up` (RFC 1928 §7):
-     - a loopback relay socket;
-     - every destination must be a `.vox` name;
-     - one flow per (association, destination);
-     - `FRAG ≠ 0` dropped;
-     - the association dies with its TCP control connection.
-- **Backpressure and loss.** Sending never blocks: `send_datagram` drops the oldest queued datagram
-  when the send buffer is full, so a stalled flow cannot stall its reader. Congestion control stays
-  on (RFC 9298 forbids disabling it on the outer connection).
-
-*Built (M22.3, M22.4), and where the build had to decide what this left open:*
-
-- **Code.** `tunnel::udp` (labels, the flow table, both pumps); `tunnel::session::accept_reporting`
-  serves a `udp/<port>` request after the unchanged gate by binding the stream as the flow on the
-  connection it arrived on (`UdpHost`); `node::up::open_flow` is the dialer's side;
-  `node::tunnel::Forward::bind_udp`; SOCKS5 `UDP ASSOCIATE` in `node::up`.
-- **The surfaces differ from the list above in syntax, not in shape.** `vox serve` still creates the
-  room (ADR-017's `vox serve <room>` is unbuilt), so it takes port specs: `vox serve 53/udp`, or
-  `vox serve 53 53/udp` for TCP and UDP on one port, with `--at` applying to every spec. On an existing
-  room, `vox service add <room> 53/udp <addr>`. The dialer's form is as written,
-  `vox forward <name>.vox 53/udp <local-port>`: the `.vox` name gives the room and its host (the
-  genesis creator), so the positionals shift left by one.
-- **At `FLOWS_TOTAL` a new flow is refused, not given another's place.** Per peer, the longest-idle
-  flow is evicted as decided above; across peers, eviction would let one peer empty the table for the
-  rest. A refusal is the uniform `Denied`. The table is one per node and counts flows in both roles.
-- **Teardown** is the TCP tunnel's watch (`withdrawn`: the reacher set and the live offer); when it
-  fires the pump returns and dropping the flow ends the stream, which ends the flow at the dialer.
-  quinn finishes a dropped stream rather than resetting it; for a flow that carries no bytes the two
-  are the same event.
-- **Per-flow counters** (to the peer, from the peer, dropped) live on each flow and are read with
-  `UdpFlows::snapshot`. They are not yet surfaced in `vox status`.
-- **Not proved by a gate:** the 120 s idle close, the 32-per-peer eviction and the 256 total, and a UDP
-  flow cut by *service removal* (the same watch as untrust, which is proved; service removal is proved
-  for TCP by `tunnel_honesty_proof`).
-
-### 7. The app API (R29–R30)
-
-- **New stream kind `App = 9`** (8 at first; v0.2.10 took 8 for its stopping node's goodbye, V210-93).
-  - The first frame after the kind is `[1, channel_id, [labels…≤8], flags]`.
-  - The responder picks the first label it serves and answers `[1, label]`, or `[0, reason]`.
-  - Labels are libp2p-style `name/vN`, at most 64 ASCII bytes, with no registry. An incompatible
-    change is a new label.
-  - Kinds stay reserved for Vox's own machinery.
-  - `flags` bit 0 asks for a datagram flow bound to the stream.
-- **The gate runs in both directions**, because each side gives the other data:
-  - the responder accepts only an opener that is in **its** keyring and a current author of the room;
-  - the opener's node refuses to open unless the target is in **its** keyring.
-  - Untrusting either side tears the stream down through the `Reachers` watch.
-- **Refusal has two tiers:**
-  - A peer that is not trusted gets the same reset as a forbidden stream kind, so it cannot tell
-    whether an app is running.
-  - A mutually trusted peer gets the reason: `no-listener`, `busy` or `refused`.
-- **App streams are live only.** Nothing is queued; anything durable belongs in the log.
-- **Local IPC** (protocol 6, `0600` socket, as ADR-020 §7):
-  - `AppListen{room|any, label}` turns the connection into a listener registration. A registration is
-    exclusive per (room, label) and ends when the connection closes.
-  - The node announces each incoming stream as `AppIncoming{id, room, peer, label}`.
-  - `AppAccept{id}`, sent on a **fresh** connection, turns that connection into a raw splice of the
-    stream. `AppOpen{room, peer, labels, datagrams}` does the same for an outbound stream.
-  - A datagram flow travels on the same connection as length-prefixed frames after the splice
-    handshake, marked stream-or-datagram.
-  - An incoming stream nobody accepts within **5 s** is reset.
-- **In-process library API.** The same operations are exposed from `vox-core` for a mobile app that
-  embeds the node (R30). Packaging for Swift and Kotlin belongs to the app, not here.
-  *Built for Swift (2026-09-25):* `crates/vox-ffi` exposes the app API over UniFFI
-  (`appListen`/`appOpen`, stream and datagram calls), proved from a Swift program against a real
-  daemon's `vox app listen` (ADR-014 §"The embedded node"). Kotlin is not built.
-- **Limits:**
-  - 16 app streams per peer;
-  - an open-rate bucket of about 10 per second per peer;
-  - the `AppOpen` frame must arrive within 5 s;
-  - app streams get a lower `set_priority` than sync, join and pairwise traffic;
-  - `max_concurrent_bidi_streams` is set explicitly, replacing quinn's default of 100.
-
-*Built (M22.5), and where the build had to decide what this left open:*
-
-- **The refusals really are identical, which took a change outside the app layer.** An unknown stream
-  kind used to be *dropped* — finished, and stopped with code 0 — while a forbidden kind was *reset*
-  with the coded rejection. So "the same reset as a forbidden kind" was distinguishable from "no such
-  kind". `accept_typed` now refuses an unknown kind with the same reset (`streams::refuse`), and an
-  untrusted app stream gets it too: all three are `Reset(5)` on read and `Stopped(5)` on write.
-- **A trusted peer that nobody accepts in time is told `refused`**, not reset: only a trusted peer
-  ever reaches a listener, and that tier is told reasons.
-- **`busy` covers both limits** — 16 live app streams per peer, counted at the responder from
-  admission to end, and the open-rate bucket (burst 10, refill 10 a second).
-- **Priority** is `-1`, below the default 0 every other stream runs at. **The stream limit** is 1024.
-- **Teardown** is a guardian per `AppStream` watching the live set; it resets both halves with
-  `APP_WITHDRAWN_CODE` (`0x2207`) so the peer learns it was a decision, and every call on the stream
-  races the same watch. **Whichever notices first tears down** (corrected 2026-09-25): a call used to
-  return its error and leave the reset to the guardian, and when the IPC splice then dropped the
-  stream the drop aborted the guardian first — the stream was *finished*, the peer read a clean end
-  and stayed open. 6 of 30 runs of `withdrawing_trust_tears_down_a_live_app_stream` on the v0.3.0
-  integration, each with one side cut in ~18 ms, the other still running 5 s later, `withdrawn: 0`.
-  Every call now tears down before returning, and a stream dropped after withdrawal resets rather
-  than finishes: 30/30 green; the old code again 5/30 red.
-- **IPC.** App requests use tags 2201–2212, away from the sequential range; a connection whose first
-  request is one becomes an app connection for life. In the raw splice the node shuts down its write
-  side when the peer finishes and closes the whole connection when the stream fails, and
-  `vox app` tells the two apart with a zero-byte write (it succeeds on a half-closed connection and
-  fails on a closed one), so a cut stream exits non-zero and says so.
-- **The CLI**, `vox app listen <room> <label>` and `vox app open <room> <peer> <label>… [--datagrams]`,
-  pipes stdin and stdout, `nc`-style; with `--datagrams` each stdin line is one datagram and each
-  datagram received is one line.
-
-### 8. Calls sit on the app API (R32)
-
-A call is an app (label e.g. `call/v1`) using an app stream for signalling and a datagram flow for
-media.
-
-- **1:1 calls** need nothing more from Vox.
-- **Small-group mesh:** each participant opens one flow per other participant.
-- **Beyond a mesh:** a forwarding node that must not see the media needs SFrame (RFC 9605) inside the
-  app. That is out of scope here.
+- **M22.1** The datagram seam: decisions 2–4 and `VoxConnection::datagram_stats`. Built.
+- **M22.2** Relay circuits on datagram flows: decision 5. Built.
+- **M22.3** UDP tunnels: `vox serve … /udp`, then `vox forward … /udp` (decision 6). Built.
+- **M22.4** SOCKS5 UDP ASSOCIATE in `vox up` (requirement 6.7). Built.
+- **M22.5** The app API: decision 7. Built.
 
 ## Consequences
 
-**Positive.**
+- **Positive.** One mechanism serves UDP, relays and calls on stream gates that already exist.
+  Relayed traffic stops head-of-line blocking. Every datagram is 8 bytes smaller.
+- **Negative.** Fragmentation amplifies loss roughly by the fragment count, so it is the exception.
+  Nested congestion control (inner QUIC over outer QUIC datagrams) is harder to reason about: on a
+  lossy relay leg both windows sit at their floor, and at high datagram rates the inner one holds
+  datagrams back for tens of milliseconds. Calls are to be sized against this.
 
-- One mechanism serves UDP, relays and calls, and it rests on stream gates that already exist and are
-  already proven.
-- Relayed traffic stops head-of-line blocking.
-- Every packet is 8 bytes smaller.
+## Related ADRs
 
-**Negative.**
-
-- Fragmentation amplifies loss.
-- Nested congestion control (inner QUIC over outer QUIC datagrams) is harder to reason about than a
-  stream. MASQUE and Tailscale accept the same trade. *Measured building M22.2:* with every 10th
-  datagram lost on one relay leg, the inner and outer congestion windows both sit at their 2904-byte
-  floor, and at 200 small datagrams a second the inner one holds datagrams back for up to ~85 ms on
-  its own — a stall that is congestion control, not carriage. At 100 a second it never binds. Calls
-  (M22.5, R32) are to be sized against this.
-
-**Neutral.**
-
-- The replay window code is deleted.
-- `StreamKind` gains `App = 9`.
-
-## Proofs (each drives the shipped binary, each mutation-checked, each prints counts)
-
-Each proof runs on a direct path **and** on a forced-relay path.
-
-1. **DNS:** `dig` through a `53/udp` forward to a real DNS server gets the answer. Mutation: the host
-   drops context-0 datagrams, and the proof goes red.
-2. **Denied:** a peer outside the host's keyring gets no answer, and the host's service sees zero
-   packets.
-3. **Revocation:** a `dig` loop stops within 1 s of `vox trust remove`.
-4. **Oversize:** 1400- and 4000-byte UDP payloads arrive intact via fragmentation. Mutation: disable
-   fragmentation, and they are dropped and counted.
-5. **Relay drops, not stalls:** `iperf3 -u` over the relay with induced loss shows loss and **no**
-   head-of-line stalls; jitter is recorded. Mutation: stream carriage, and the jitter signature
-   flips.
-6. **TCP and UDP on the same port** both answer.
-7. **App API:**
-   - a 1 MiB app stream round trip with SHA-256;
-   - 1000 app datagrams delivered;
-   - an opener outside the responder's keyring gets **0** incoming notices at the listener;
-   - an untrusted no-listener reset is byte-identical to an unknown-kind reset.
-8. **Load:** 200 stalled app streams, and a chat message still arrives in under 1 s.
-
-## Implementation plan
-
-- **M22.1** The datagram seam — **DONE** (`transport::{datagram, router}`):
-  - the frame (decision 2), deleting the replay window;
-  - `DatagramRouter`;
-  - fragmentation and reassembly;
-  - counters (`VoxConnection::datagram_stats`; not yet surfaced in `vox status`).
-
-  Proved by `crates/vox-core/tests/datagram_flows_gate.rs`:
-  `oversize_packets_cross_a_small_path_in_fragments` (proof 4 at the seam, direct path only: 1400-
-  and 4000-byte packets over a 1280-byte-MTU path; mutation — fragmentation disabled — drops all 40,
-  and the sender's drop counter reads 40) and `unknown_and_ended_flows_drop_and_count` (unknown flow
-  IDs, an unknown context, and a flow ended by its stream are dropped and counted; the flow ends at the
-  far side by itself; mutations — the watcher no longer ending the flow, the unknown-flow counter
-  removed — each go red). Proofs 1–6 through `vox serve … /udp` remain M22.3's.
-- **M22.2** Relay circuits on datagram flows (decision 5) — **DONE**. Proved by
-  `crates/vox-core/tests/relay_drops_not_stalls.rs`:
-  `a_lossy_relay_leg_loses_packets_instead_of_stalling_them` (proof 5's property on real node network
-  surfaces over a forced relay, 20 ms per link and about one datagram in ten on one leg lost at
-  random: datagrams are lost, and once the loss rate is established no datagram arrives more than
-  40 ms later than the fastest — a retransmission cannot cost less than that round trip. 3.4–32.8 ms
-  over 40 runs at load 93–256; mutation — the stream carriage restored — flips it: 400/400 arrive,
-  105–170 ms late, 177–193 datagrams late. In the first second after loss begins the outer congestion
-  window falling to its floor holds datagrams once for up to ~80 ms; that is reported, not bounded.
-  *Corrected 2026-09-25:* the gate first bounded the gap between arrivals and lost every 10th
-  datagram exactly. It went red 2 runs in 40 because that period phase-locked with the packet mix —
-  63 outer datagrams lost, all of them acknowledgements, 400/400 app datagrams delivered — and once
-  loss was random, consecutive losses made 30–35 ms gaps that are losses, not stalls. Loss is now
-  random with a fixed seed and the bound is on lateness, which is what a stall is) and `a_circuit_crosses_legs_of_different_datagram_sizes` (mutation — the
-  `CIRCUIT_DATAGRAM_MAX` cap removed — the inner handshake never completes). The relay gates the
-  milestone names stayed green on every run: `relayed_path_is_retried` (4/4),
-  `nat_holepunch_through_nat` (8/8, 4 rounds), `mux_circuit_addressing` and
-  `retire_keeps_carried_paths` (4 rounds each). **Two are not green, and not because of this change:**
-  `node_m15_anchor_gate` passed 3 of 5 runs here and 1 of 3 on the ADR-022 base commit, and
-  `service_rehearsal_proof` failed on this branch and on the base with the same messages (the stranger's
-  `vox connect` failing, line 490; the first CONNECT refused, line 437 — the latter is ADR-012's open
-  finding of 2026-09-22). Both are to be investigated as their own defects.
-- **M22.3** UDP tunnels: `vox serve … /udp`, then `vox forward … /udp` (decision 6) — **DONE**.
-- **M22.4** SOCKS5 UDP ASSOCIATE in `vox up` — **DONE**.
-
-  Both proved by `crates/vox-tui/tests/udp_tunnel_proof.rs`: the shipped binary, a real `dig`, and
-  real UDP sockets, on a **direct** path (everyone on IPv4 loopback) and a **forced-relay** path (the
-  host on IPv6 loopback only, the guest on IPv4 only, the anchor dual-stack, so only a circuit can
-  join them; the gate checks the host advertises IPv6 addresses only). No real DNS server or `iperf3`
-  is installed, so the DNS responder and proof 5's blaster and sink are in the test. Seven tests, 3 of 3
-  runs green (7/7 each) at the end; every mutation below was run and went red for the reason named.
-  - **1 DNS.** `dig` through `vox forward <room>.vox <port>/udp` gets `10.53.0.1`, then 5 of 5 further
-    queries. Direct: the first answer after 2 asks (~4.8 s, the first flow waiting on its tunnel);
-    relayed: first ask, 6–28 ms. Mutation (host drops what the flow delivers): no answer in 40 asks
-    over 120 s, the responder saw 0 packets.
-  - **2 Denied.** An untrusted joiner: 5 `dig`s, no answer, the service saw 0 packets, and the forward
-    printed `the host refused udp/<port>`. Mutation (the gate and the teardown watch both skipped):
-    answered on the first `dig`. *(Skipping the gate alone stayed quiet: the teardown watch then cut
-    the flow at once, since the dialer is not in the reacher set. Both layers deny.)*
-  - **3 Revocation.** A query every 50 ms on one flow: 194–522 answers before `vox trust remove`, **0**
-    after it returned. The command takes ~0.3 s (it checks the identity passphrase), and answers stop
-    while it runs. Mutation (the teardown watch never fires): 133 340 answers after, the last 3.0 s
-    later.
-  - **4 Oversize.** 1400- and 4000-byte payloads through `UDP ASSOCIATE`, echoed byte for byte on both
-    paths. Mutation (fragmentation disabled): the 1400-byte payload still crosses the loopback path
-    whole, the 4000-byte one does not arrive.
-  - **5 Relay drops, not stalls.** Relayed path only: a proxy on the guest's leg to the anchor, 20 ms
-    each way, dropping every 10th datagram once setup is done; 3 s of unmeasured traffic for congestion
-    control to settle, then 400 numbered datagrams every 10 ms. Every run lost what the leg dropped
-    (41–61 lost for 47–51 dropped) — nothing retransmitted, so nothing could wait behind a
-    retransmission. Mutation (the pre-ADR-022 stream carriage restored): **400 of 400** arrive, 0 lost
-    for 38 dropped (and 0 of 43 and 0 of 47 in two earlier mutation runs); latency p99 82–309 ms.
-    **Recorded, not bounded:** across the final runs the longest gap was 21, 115 and 132 ms. In the two
-    long ones arrivals also bunched (median gap ~5 µs, against ~10 ms, the sender's pace, in the
-    third) — outer and inner congestion control at their floor holding and releasing datagrams, the
-    cost this ADR's *Negative* section already records. It is not a stream: the loss shows nothing
-    was recovered.
-  - **6 TCP and UDP on the same port.** `vox serve P P/udp` over one service bound on both: through one
-    `vox up`, CONNECT gets `TCP:…` and `UDP ASSOCIATE` gets `UDP:…`. Mutation (ASSOCIATE asks for the
-    bare port): no UDP answer.
-  - **M22.4.** A `FRAG=1` datagram reaches the service 0 times (mutation: 1); after the control
-    connection closes the service sees 0 packets and nothing answers (mutation: the service saw the
-    datagram and the client got a reply).
-  - **Setup fragility, not these properties:** early versions of proof 5 applied the loss from the
-    start and failed 2 of 2 in parallel runs at `vox connect`, with the joining node's actor busy 30 s
-    (ADR-018's open joining defect). The loss is now switched on after setup.
-- **M22.5** The app API: `StreamKind::App`, both gates, IPC protocol 6, the library API, and the
-  limits and priorities (decision 7) — **DONE** (`node::{app, appipc}`, `vox app`). Proved by
-  `crates/vox-tui/tests/app_api_proof.rs`, the shipped binary against real nodes, each case
-  mutation-checked:
-  - `a_mebibyte_round_trips_and_a_thousand_datagrams_arrive` — 1 MiB through both nodes and back,
-    SHA-256 equal; 1000 of 1000 datagrams intact. Mutation (responder binds no flow): 0 of 1000.
-  - `an_opener_outside_the_responders_ring_reaches_no_listener` — the listener is told of 0 streams.
-    Mutation (responder gate skipped): 1.
-  - `a_target_outside_the_openers_ring_is_refused_locally` — the opener's node refuses; the target sees
-    0 streams. Mutation (opener gate skipped): the open goes out.
-  - `an_untrusted_refusal_is_the_unknown_kind_refusal` — a raw QUIC client with a real member's
-    identity: the untrusted app refusal and an unknown kind are both `Reset(5)`/`Stopped(5)`, after
-    asserting the app stream really reached the app gate; a trusted member is told `no-listener`.
-    Mutation (untrusted told the reason): the bytes differ.
-  - `withdrawing_trust_tears_down_a_live_app_stream` — both ends exit non-zero ~45 ms after the untrust.
-    Mutation (the watch never fires): both still running 5 s later.
-  - `stalled_app_streams_do_not_hold_up_a_room_message` — 200 app streams opened at once to a listener
-    that never accepts: at most 16 wait, the rest are refused `busy`, and a room message sent a second
-    later arrives. Mutation (per-peer limits removed and quinn's default stream limit restored): the
-    message has not arrived after 10 s. **Proof 8's "under 1 s" is not a bound anything can meet:** a
-    local append is pushed within one actor tick (1 s), so the same message takes 30 ms to 1.03 s with
-    no app streams at all (measured). The gate bounds it at 1.5 s.
-
-  Not built: the counters are not in `vox status`.
+- **Depends on:** ADR-011, ADR-012, ADR-013, ADR-016, ADR-017, ADR-020; PRD-001 R25–R32.
+- **ADR-014** (the embedded node) carries the Swift binding.
