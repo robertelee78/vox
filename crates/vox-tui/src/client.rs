@@ -479,7 +479,8 @@ pub async fn events(at: &NodeSocket) -> Result<IpcClient, AppError> {
 
 // ---- vox node create | attach | detach | list ---------------------------------------------------
 
-/// `vox node create <name>`: write the node's files here (C-5), sending nothing over the socket.
+/// `vox node create <name> [--headless]`: write the node's files here (C-5), sending nothing over
+/// the socket.
 /// Its passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the terminal
 /// (asked twice); an empty one is allowed (V030-36).
 ///
@@ -489,6 +490,7 @@ pub fn node_create(
     args: &NodeArgs,
     name: &str,
     passphrase_file: Option<PathBuf>,
+    headless: bool,
 ) -> Result<(), AppError> {
     let name = NodeName::parse(name)?;
     let account = args.account()?;
@@ -502,6 +504,23 @@ pub fn node_create(
         args.data_dir.as_deref(),
         args.config_dir.as_deref(),
     )?;
+    // **A headless node is an anchor's** (ADR-026 N-5, ADR-016): a key file and no vault, so it
+    // runs with nobody at a keyboard; it holds no room and can read nothing.
+    if headless {
+        if passphrase_file.is_some() {
+            return Err(AppError::Usage(
+                "a headless node has no passphrase: its key is a file only you can read".into(),
+            ));
+        }
+        let fp = vox_core::identity::composite::RootSigner::fingerprint(
+            &vox_core::node::headless::load_or_create_identity(&paths)?,
+        );
+        println!(
+            "vox: created headless node {name}; `vox node --node {name}` runs it as an anchor"
+        );
+        println!("{}", vox_core::node::link::b32_encode(&fp));
+        return Ok(());
+    }
     let passphrase = Zeroizing::new(crate::tunnel_cli::identity_passphrase_for(
         &paths,
         None,

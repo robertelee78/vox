@@ -1197,6 +1197,10 @@ pub enum NodeCmd {
         /// Read the new identity's passphrase from this file (first line; `-` reads stdin).
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
+        /// Make a headless node, an anchor's: a key file with no passphrase, which holds no room
+        /// and can read nothing. `vox node --node <name>` runs it.
+        #[arg(long)]
+        headless: bool,
         #[command(flatten)]
         account: AccountArgs,
     },
@@ -1236,8 +1240,9 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
         NodeCmd::Create {
             name,
             passphrase_file,
+            headless,
             account,
-        } => crate::client::node_create(&account.as_node_args(), &name, passphrase_file),
+        } => crate::client::node_create(&account.as_node_args(), &name, passphrase_file, headless),
         NodeCmd::Attach {
             name,
             keep,
@@ -1853,18 +1858,15 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let anchors = match args.anchor_set_lenient() {
-                Ok((a, None)) => a,
-                // An anchor may run with no anchor of its own, but it says why it has none.
-                Ok((a, Some(unusable))) => {
-                    eprintln!("vox node: {unusable}; running with no anchor of its own");
-                    a
-                }
-                Err(e) => {
+            // Checked here, so a malformed one is refused before the daemon starts; the daemon
+            // attaches the anchor with them, beside the node's anchors file.
+            let mut checked = vox_core::nat::bootstrap::BootstrapSet::new();
+            for spec in args.anchor_specs() {
+                if let Err(e) = vox_core::node::link::merge_anchor_spec(&mut checked, &spec) {
                     eprintln!("vox node: --anchor: {e}");
                     return ExitCode::FAILURE;
                 }
-            };
+            }
             let serve_only = match node_args.serve_only(&paths) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1879,7 +1881,7 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match run_node(paths, args.listen, anchors, serve_only) {
+            match run_node(paths, args.listen, args.anchor_specs(), serve_only) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox node: {e}");
