@@ -28,9 +28,8 @@ agent; Vox has no typed agent/human distinction and no room types.
 
 Agent comms exists so that agents and the operator can divide up work (who does what) and work
 through hard problems together, across machines and NATs, with no SSH tunnels or pairwise peer
-configuration. It is not a mirror of agent activity: in the decider's words, n agents "chattering
-away like they do in ctm" would be "such a wall of shit that I would not be able to keep up". The
-room is for planning, assignment of work and higher-order discussion. Progress (attempts, proofs,
+configuration. It is not a mirror of agent activity: a room carrying every agent's running chatter
+could not be followed by the person in it. The room is for planning, assignment of work and higher-order discussion. Progress (attempts, proofs,
 verdicts, delivery) is recorded on GitHub through awa, not in the room (ADR-021).
 
 The design rests on three findings from prior art: addressing must be a structured field, never
