@@ -157,11 +157,12 @@ pub fn identity_passphrase_for(
     }
     // **Without a terminal there is nobody to ask twice.**
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(AppError::Usage(format!(
+        return Err(AppError::Usage(
             "this profile has no identity yet, and there is no terminal to ask at.\n\
-             \x20      Make one interactively:  vox id\n\
-             \x20      Or give the passphrase:  {GIVE_IDENTITY_PASSPHRASE}"
-        )));
+             \x20      Make one at a terminal with `vox id`, or give its new passphrase with \
+             --identity-passphrase-file <path> (`-` reads stdin) or VOX_IDENTITY_PASSPHRASE."
+                .into(),
+        ));
     }
     println!("vox: this profile has no identity yet; creating one.");
     let first = prompt_passphrase("new identity passphrase")?;
