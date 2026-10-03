@@ -32,8 +32,10 @@
 //! 2026-10-02). A run with no restart reached on its first attempt is CANNOT MEASURE.
 //!
 //! Mutations: make the ladder's circuit rung wait (or remove it) and every sample either exceeds
-//! [`R42`] or never connects; stop superseding another process's connections and the restart
-//! samples exceed [`RESTART_WITHIN`], with no supersede said.
+//! [`R42`] or never connects; stop superseding another process's connections and the anchor says
+//! no supersede and weighs the restarts in tie-breaks (run 2026-10-02: "superseded the guest's
+//! previous process 0 time(s) in 4 restarts", 2 tie-breaks; the restarts themselves took
+//! 261–292 ms, inside [`RESTART_WITHIN`]).
 
 // Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
 // `--features optional-proofs` a stand-in takes its place and says it was not run
@@ -218,13 +220,13 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
     );
     assert!(
         superseded >= SAMPLES - 1,
-        "the anchor superseded the guest's previous process {superseded} time(s) in {} restarts:\n{}",
+        "PRODUCT: the anchor superseded the guest's previous process {superseded} time(s) in {} restarts:\n{}",
         SAMPLES - 1,
         anchor_said.join("\n")
     );
     assert!(
         weighed.is_empty(),
-        "the anchor put a restarted guest to a tie-break against its predecessor:\n{}",
+        "PRODUCT: the anchor put a restarted guest to a tie-break against its predecessor:\n{}",
         anchor_said.join("\n")
     );
 }
