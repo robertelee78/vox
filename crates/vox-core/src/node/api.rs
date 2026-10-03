@@ -804,6 +804,14 @@ pub enum Fault {
     /// (V210-92). **Not [`Fault::Refused`]**, which a joiner reads as a wrong passphrase: this one
     /// was never checked.
     MembersBusy,
+    /// A member answered and checked the passphrase, and the room already holds as many members as
+    /// a room can, so it could not admit the joiner. **Not [`Fault::Refused`]**, which reads as a
+    /// wrong passphrase, and never a success: this was told it had joined, and exited 0.
+    RoomFull,
+    /// A member accepted the passphrase and then could not admit the joiner: it was locked or
+    /// closing mid-join, or its store refused the write (V210-128). **Not [`Fault::Refused`]**,
+    /// whose advice is "usually the passphrase is wrong": this one was accepted.
+    NotAdmittedAfterJoin,
     /// The remote refused: a join was refused, or a record was rejected.
     Refused,
     /// A consent named a member this node has not admitted to the room (yet): it holds no
@@ -924,6 +932,12 @@ impl Fault {
             Fault::MembersBusy => {
                 "a member answered, but it is busy answering other joins\n       your passphrase was never checked — this is not a verdict on it\n       try the join again shortly"
             }
+            Fault::RoomFull => {
+                "the room is full, so you were not admitted\n       your passphrase was accepted; the room takes no more members"
+            }
+            Fault::NotAdmittedAfterJoin => {
+                "a member accepted your passphrase, then could not admit you, so you were not admitted\n       the member may have been locking or closing; run the join again while it is running"
+            }
             Fault::Refused => "the other side refused",
             Fault::NotAdmitted => {
                 "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
@@ -1022,6 +1036,8 @@ fault_names!(
     Unreachable,
     SolveTooSlow,
     MembersBusy,
+    RoomFull,
+    NotAdmittedAfterJoin,
     Refused,
     NotAdmitted,
     NotConsented,

@@ -1856,7 +1856,7 @@ impl NodeNet {
     ) -> Result<JoinOutcome>
     where
         F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
-        Fut: std::future::Future<Output = ()>,
+        Fut: std::future::Future<Output = Result<()>>,
     {
         let cfg = ResponderConfig {
             ctx,

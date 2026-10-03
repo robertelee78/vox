@@ -1044,9 +1044,11 @@ enum NetEvent {
         channel_id: Digest32,
         /// The joiner's proven identity.
         identity: Box<crate::identity::composite::CompositePublicKey>,
-        /// Answered once the admission is applied, which releases the acceptance frame. A dropped
-        /// sender answers too — the slot must never wait on an actor that has moved on.
-        ack: tokio::sync::oneshot::Sender<()>,
+        /// Answered with whether the admission was applied: `Ok` releases the acceptance frame, an
+        /// error refuses the joiner instead (a full room says so). A dropped sender answers too —
+        /// the slot must never wait on an actor that has moved on — and is a refusal: nothing
+        /// admitted the joiner.
+        ack: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
     },
     /// A joiner's task dialled a peer: adopt the connection now, so its streams are served while
     /// the join is still running over it.
@@ -3012,6 +3014,8 @@ const fn worth_another_responder(fault: Fault) -> bool {
             // This device's speed, against a wait every member derives the same way: another
             // member would cost another grind as long and end the same (V210-87).
             | Fault::SolveTooSlow
+            // Every member holds the same room: another would refuse it as full too.
+            | Fault::RoomFull
     )
 }
 
@@ -5383,28 +5387,40 @@ impl Node {
                 // The join proved this identity; admit it as an author so its entries — and its
                 // records on this node's board — are accepted. Reading still needs consent.
                 let now = self.now();
-                if let (Some(profile), Some(shared)) = (
-                    self.profile.as_ref(),
+                // **Test-only** (`test-knobs`): this node fails every joiner's admission as a node
+                // locked mid-join does — admitting nothing — so a proof can see what the joiner is
+                // told.
+                #[cfg(feature = "test-knobs")]
+                let fails = std::env::var_os(TEST_ADMISSION_FAILS_ENV).is_some();
+                #[cfg(not(feature = "test-knobs"))]
+                let fails = false;
+                let admitted = match (
+                    self.profile.as_ref().filter(|_| !fails),
                     self.channels.get(&channel_id).map(Arc::clone),
                 ) {
-                    let _ = shared
+                    (Some(profile), Some(shared)) => shared
                         .lock()
                         .await
-                        .admit_author(profile.store(), &identity, now);
+                        .admit_author(profile.store(), &identity, now)
+                        .map(|_| ()),
+                    (None, _) => Err(Error::Profile("locked")),
+                    (_, None) => Err(Error::Profile("no such channel in this profile")),
+                };
+                // **Not admitted, not accepted.** This was dropped, and the joiner was told it was
+                // in whatever happened: a room already full took nobody, and its joiner exited 0.
+                if admitted.is_ok() {
+                    // And into the view the board and the stream gate read, before the joiner is
+                    // answered: an author only the room knows is still a stranger to the board,
+                    // which refused the newcomer's records until something else refreshed it
+                    // (V210-80).
+                    self.refresh_network_view().await;
+                    // No longer waiting to join, so its pre-join record goes, and this node's
+                    // board stops counting it as pending (V210-102).
+                    if let Some(net) = self.net.as_ref() {
+                        net.forget_prejoin(&channel_id, &identity.fingerprint());
+                    }
                 }
-                // And into the view the board and the stream gate read, before the joiner is
-                // answered: an author only the room knows is still a stranger to the board, which
-                // refused the newcomer's records until something else refreshed it (V210-80).
-                self.refresh_network_view().await;
-                // No longer waiting to join, so its pre-join record goes, and this node's board
-                // stops counting it as pending (V210-102).
-                if let Some(net) = self.net.as_ref() {
-                    net.forget_prejoin(&channel_id, &identity.fingerprint());
-                }
-                // Answered whatever happened: a joiner waiting on this must not be left holding a
-                // stream because the room closed or this node has no profile. It will find out from
-                // the join's own outcome, which is the right place for it to learn.
-                let _ = ack.send(());
+                let _ = ack.send(admitted);
             }
             NetEvent::Dialed {
                 conn,
@@ -6440,6 +6456,8 @@ impl Node {
                     // this task, so the actor is never the thing waiting — which is the whole point
                     // of the slot. See `NetEvent::JoinAdmit`.
                     |identity| async move {
+                        #[cfg(feature = "test-knobs")]
+                        test_admission_gate().await;
                         let (ack, wait) = tokio::sync::oneshot::channel();
                         if admit_tx
                             .send(NetEvent::JoinAdmit {
@@ -6451,8 +6469,14 @@ impl Node {
                             .is_ok()
                         {
                             // A dropped sender resolves this too, so a shutting-down actor cannot
-                            // strand a joiner mid-exchange.
-                            let _ = wait.await;
+                            // strand a joiner mid-exchange; nothing admitted it, so it is refused.
+                            wait.await.unwrap_or(Err(Error::JoinRefused(
+                                "the member stopped before it admitted the joiner",
+                            )))
+                        } else {
+                            Err(Error::JoinRefused(
+                                "the member stopped before it admitted the joiner",
+                            ))
                         }
                     },
                 )
@@ -7193,6 +7217,7 @@ impl Node {
                 &set.bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
+                self.net.as_deref(),
             )
             .await;
         }
@@ -8130,6 +8155,7 @@ impl Node {
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
+                self.net.as_deref(),
             )
             .await;
         }
@@ -8786,6 +8812,7 @@ impl Node {
                                     &set.bundles,
                                     ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                                     now,
+                                    Some(&net),
                                 )
                                 .await;
                                 // What the peer's board holds is filed on this node's own, so its board
@@ -9324,6 +9351,7 @@ impl Node {
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now,
+                self.net.as_deref(),
             )
             .await;
             return shared.lock().await.is_author(peer);
@@ -11415,6 +11443,7 @@ async fn admit_board_records(
     records: &[crate::nat::record::MemberBundleRecord],
     quota: usize,
     now: u64,
+    net: Option<&NodeNet>,
 ) -> usize {
     // **Only records for keys not yet admitted are verified, and outside the room's lock**
     // (V210-71). Every record on a board was verified again on every outbound session, under the
@@ -11462,6 +11491,22 @@ async fn admit_board_records(
             match channel.admit_from_board(store, key, &record.admission, now) {
                 Ok(true) => {
                     admitted += 1;
+                    // **Past the cap only when another member admitted it on its own view**
+                    // (V210-128): said, so a room that went past its cap shows how.
+                    let (members, cap) =
+                        (channel.author_count(), crate::node::channel::max_authors());
+                    if members > cap {
+                        if let Some(net) = net {
+                            net.manager().note(
+                                key.fingerprint(),
+                                format!(
+                                    "admitted to room {} past its cap of {cap}, now {members} \
+                                     members: another member admitted it",
+                                    crate::node::network::short_id(channel.channel_id())
+                                ),
+                            );
+                        }
+                    }
                     false
                 }
                 // Already admitted: nothing to do and nothing to retry.
@@ -11476,6 +11521,36 @@ async fn admit_board_records(
         }
     }
     admitted
+}
+
+/// **Test-only**: set, this node fails every joiner's admission after the exchange, as a node
+/// locked or closing mid-join does (V210-128), so a proof can see what the joiner is told. Not
+/// compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_ADMISSION_FAILS_ENV: &str = "VOX_TEST_ADMISSION_FAILS";
+
+/// **Test-only**: a path. While no file is there, every joiner this node answers waits at its
+/// admission, with `<path>.reached.<pid>` written to say so, so a proof can hold joins answered by
+/// two members until both are about to admit, then let them go at once (V210-128's race). Bounded
+/// at a minute. Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_ADMISSION_GATE_ENV: &str = "VOX_TEST_ADMISSION_GATE";
+
+#[cfg(feature = "test-knobs")]
+async fn test_admission_gate() {
+    let Some(gate) = std::env::var_os(TEST_ADMISSION_GATE_ENV).map(std::path::PathBuf::from) else {
+        return;
+    };
+    if gate.exists() {
+        return;
+    }
+    let mut reached = gate.clone().into_os_string();
+    reached.push(format!(".reached.{}", std::process::id()));
+    let _ = std::fs::write(&reached, b"");
+    let t0 = std::time::Instant::now();
+    while !gate.exists() && t0.elapsed() < std::time::Duration::from_secs(60) {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 fn fault_of(e: &Error) -> Fault {
@@ -11500,6 +11575,8 @@ fn fault_of(e: &Error) -> Fault {
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
         Error::JoinSolveTooSlow { .. } => Fault::SolveTooSlow,
         Error::JoinResponderBusy | Error::JoinEndedForNewcomer => Fault::MembersBusy,
+        Error::RoomFull { .. } => Fault::RoomFull,
+        Error::JoinNotAdmitted => Fault::NotAdmittedAfterJoin,
         Error::Path {
             op: crate::node::profile::VAULT_WRITE,
             ..
