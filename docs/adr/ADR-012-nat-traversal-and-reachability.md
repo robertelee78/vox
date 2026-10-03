@@ -216,13 +216,12 @@ relay circuit.
     - `MAX_CLOCK_SKEW_SECS` (300 s) of future timestamp;
     - one current record per `(author_id, channelID, epoch)`;
     - `MAX_AUTHORS_PER_BUCKET` (1024).
-  - Member and bundle records MUST be bucketed by `(channelID, epoch)`, so that a passphrase rotation
-    (new epoch, ADR-007) invalidates every earlier record.
+  - Member and bundle records MUST be bucketed by `(channelID, epoch)`. No operation advances a
+    room's epoch (passphrase rotation is removed, ADR-007 G-21), so every record is in epoch 0.
   - Pre-join records convey no log authority and MUST be used only as join-bootstrap material
     (ADR-004/ADR-005).
-  - Swarm presence is not consent-gated. A party whose message consent was revoked stays present at
-    the ciphertext level until the epoch rotates; there is no per-member rendezvous revocation
-    (ADR-007).
+  - Swarm presence is not consent-gated. A party removed from a member's keyring stays present at the
+    ciphertext level; there is no per-member rendezvous revocation (ADR-007).
 - **N-28. Refresh floor.** A record whose claim matches the one held, inside `MIN_REFRESH_SECS`
   (60 s), MUST be answered as a no-op success and leave the held record untouched. A record whose claim
   changed MUST be accepted as soon as it strictly advances `(seq, timestamp)`. A non-advancing record
@@ -249,12 +248,12 @@ relay circuit.
     `join::rendezvous::channel_rendezvous`). Status: defined and unused, because no DHT is built and
     boards are reached directly.
   - Vox MUST NOT treat any external or public DHT as a security dependency.
-  - Because the key is `(channelID, epoch)`-derived, a leaked key stops locating the swarm at the next
-    epoch. Unlinkability against a global observer is not provided here; it belongs to the metadata
+  - The key is `(channelID, epoch)`-derived, and no operation advances the epoch, so a leaked key
+    keeps locating the swarm. Unlinkability against a global observer is not provided here; it belongs to the metadata
     privacy phase of ADR-001.
 - **N-32. Join abuse.** Join-attempt abuse MUST be bounded by ADR-005's layered controls: the
   per-sender consent gate, `(channelID, epoch)`-bound proof-of-work join tokens, and identity-bound
-  log acceptance. The per-author quotas once listed here were removed (PRD-001 R3). There is no admin
+  log acceptance. There MUST be no per-author quota (PRD-001 R3). There is no admin
   admission step (ADR-007).
 - **N-33. Stream-kind gate (M14.4).** A node that serves rendezvous MUST accept any authenticated
   identity and gate by stream kind (`PeerPolicy::allows`):

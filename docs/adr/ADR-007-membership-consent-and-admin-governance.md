@@ -4,8 +4,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status:** accepted. Built in `crates/vox-core/src/governance/` (M6), `node::channel`, `node::trust` and
 `node::actor` (ADR-016 M14.5, ADR-017 M17.6, M17.14, M18.1, ADR-020 M19.2), except:
-- The genesis service grant, `bind:`/`dial:` and `ServiceGrantExclusion` (`governance/servicegrant.rs`)
-  are removed under R44 (#94); the strict member cap (G-22) is V030-30 (#366).
+- The strict member cap (G-22) is not built: V030-30 (#366).
 - G-10's golden-vector suite does not exist on this tree, and the known gaps listed at the end are open.
 
 **Date:** 2026-06-19
@@ -49,7 +48,7 @@ only room governance is who sets the room's retention. This builds on identity (
   ending the room (G-5), and only the creator or an admin it delegated MAY do either. The capabilities are `admin` and `policy`; every
   other capability token (`delegate`, `invite`, `passphrase-rotate`, `#role`, `bind:`, `dial:`) MUST be
   refused as unknown. Policy updates beyond retention, passphrase rotation, invite modes and the
-  capability lattice are removed (#380; `bind:`/`dial:` under #94, see Status).
+  capability lattice are removed, as are `bind:` and `dial:` (PRD-001 R44).
 - **G-7.** A member that is not an admin MAY set a lower retention for its own node only, for one room;
   it MUST NOT set a retention higher than the room's. A node's retention value above the room's MUST be
   ignored (the effective retention is the shorter of the two, ADR-010 AR-30), with a warning (#380).
@@ -68,8 +67,8 @@ only room governance is who sets the room's retention. This builds on identity (
   - consent grant (`0x0004`): `{ target_id(composite fpr), skdm_ref(32 B hash of the SKDM delivered over
     ADR-004), history_mode_at_grant }`; the SKDM itself travels in the pairwise session;
   - consent revocation (`0x0005`): `{ target_id(composite fpr), new_chain_id }`;
-  - policy update (`0x0006`): `{ ttl }`. **Planned (#380):** it still also carries `history_mode` and
-    `min_suite` (raise-only) on this tree.
+  - policy update (`0x0006`): `{ ttl }`. The wire layout keeps the `history_mode` and `min_suite`
+    presence flags, always written as absent; an update carrying either MUST be refused.
 
 ### §"Canonical encoding & evaluator"
 
@@ -175,8 +174,6 @@ only room governance is who sets the room's retention. This builds on identity (
 - The golden-vector suite is in-process Rust assertions, not language-neutral fixtures with pinned bytes
   (the "two independent implementations" gate needs the latter). Since V29-17 (`df850734`) there is no
   suite at all (G-10).
-- Role-tag ABAC is not evaluated, `Invite` has no wire encoding, and any `delegate`-holder may revoke any
-  delegation: each goes with the capabilities #380 removes; only the creator removes an admin under #319.
 
 ## Consequences
 

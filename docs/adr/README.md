@@ -70,7 +70,7 @@ planned. This is the roll-up.
 | 004 | accepted; built (`pairwise/`) |
 | 005 | accepted; built (`join/`, `node::joinstream`) except where marked |
 | 006 | accepted; built (`group/`) except the known gaps it lists |
-| 007 | accepted; cut to V030-32: only the creator or an admin sets the room's retention; the rest of the governance is removed, its code removal pending (#380, #94) |
+| 007 | accepted; governance is only the creator or an admin setting the room's retention and ending the room, built; the strict member cap (G-22) is not built |
 | 008 | accepted; built (`log/`); range reconciliation over the network and the self-channel are planned; golden vectors are open |
 | 009 | **withdrawn** (R43); the deniable code is removed (b0f82185) |
 | 010 | accepted; built (`atrest/`, `node/`) except where marked planned |
@@ -80,16 +80,16 @@ planned. This is the roll-up.
 | 014 | proposed; only the embedded node over FFI (`crates/vox-ffi`) is built |
 | 015 | implemented in part (`crates/vox-tui`), each requirement marked |
 | 016 | accepted; M13–M15.2c and M18.1 built; open defects listed in the ADR |
-| 017 | accepted; `service.node.room.vox` addressing is being built (#339) |
+| 017 | accepted; built, including `service.node.room.vox` addressing (#339); `vox serve` into an existing room is not |
 | 018 | accepted, in force: only real use of the shipped binary proves a claim; tests run on demand |
 | 019 | proposed; nothing built |
 | 020 | accepted; built (`vox-agentcomms`, the hook, wake and claims) except where marked |
 | 021 | accepted; M21.1–M21.10 built |
 | 022 | accepted; M22.1–M22.5 built; calls are an app |
-| 023 | accepted; M23.1–M23.6 built except where marked |
+| 023 | accepted; M23.1–M23.6 and leaving and ending a room (RL-8) built, except where marked |
 | 024 | accepted, speed only; M24.1–M24.5 built, the taper is the default controller |
 | 025 | accepted; built as V210-34 (#209) |
-| 026 | accepted 2026-10-03, **not built** (#397); amends 005, 007, 010, 011, 012, 013, 014, 015, 016, 017, 020, 021, 023 |
+| 026 | accepted 2026-10-03, **not built** (#397); amends 005, 008, 010, 011, 012, 013, 014, 015, 016, 017, 020, 021 |
 
 ## Conformance-vector obligations
 

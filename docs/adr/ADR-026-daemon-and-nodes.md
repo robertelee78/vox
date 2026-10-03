@@ -8,6 +8,7 @@ own control socket (`<profile>/node.sock`) and its own port file; some verbs hos
 process; a node can be locked and unlocked; `vox node` runs a headless anchor as a separate process;
 the TLS leaf carries the node's identity (ADR-011). Every requirement below is planned until its
 Status line says otherwise.
+**Date**: 2026-10-03
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: daemon, node, identity, control-plane, lifecycle, layout
 

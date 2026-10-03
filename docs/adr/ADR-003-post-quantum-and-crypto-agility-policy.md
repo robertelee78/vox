@@ -80,8 +80,8 @@ stay non-goals (ADR-001).
 - **F3.** A channel's minimum suite MUST be the `min_suite` field of its signed genesis policy
   (ADR-007, tag `0x000D`) and MUST name a registered suite. New channels MUST default to
   `vox-suite-1` (`SuiteFloor::DAY_ONE`).
-- **F4.** The floor is fixed at creation. Since ADR-007's 2026-10-02 amendment (V030-32) a policy update
-  carries retention only, and an update carrying `min_suite` MUST be refused.
+- **F4.** The floor is fixed at creation. A policy update carries retention only (ADR-007 G-6), and an
+  update carrying `min_suite` MUST be refused.
 - **F5.** The floor MUST be enforced in every handshake that carries a suite:
   `pairwise::pqxdh::{initiate, accept}` (and so `Session::{initiate, accept}`), and the ADR-005 join
   (`JoinContext::new`, `join_initiate`, `join_accept`), before any PoW or CPace work. `SuiteFloor`

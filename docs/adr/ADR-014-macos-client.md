@@ -143,9 +143,8 @@ the client presents it.
 8.2. Chat membership MUST NOT grant tunnel reach (ADR-017 decision 3). A room MAY carry chat and
      tunnels at once.
 8.3. The app's tunneling surface MUST follow ADR-017. Per-member `bind:`/`dial:` grants and a
-     privileged TUN `vox up` are withdrawn by policy (ADR-017's third revision). Removing the
-     withdrawn capability model's remaining code (`governance::capability`'s `bind:`/`dial:`
-     prefixes and its evaluator) is *planned* (PRD-001 R44, #94).
+     privileged TUN `vox up` are withdrawn (ADR-017 decision 3); the capability model's
+     `bind:`/`dial:` code is removed (PRD-001 R44).
 
 ### 9. Notifications
 

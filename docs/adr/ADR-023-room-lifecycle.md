@@ -2,12 +2,11 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted by the decider, 2026-09-25. Built on integrate/v0.3.0 (M23.1–M23.6), except
+**Status**: Accepted. Built on integrate/v0.3.0 (M23.1–M23.6), including `vox room admin` and
+leaving and ending a room (RL-8, with the lifecycle tags `0x0019`–`0x001B`, ADR-008 LS-21), except
 where a requirement says otherwise. Not built: a room created with a retention (RL-2.1), the
-`vox status` line for a room with no always-on member (RL-4.9), pruning a key-package once its
-recipient acknowledges it (RL-4.7), and `vox room admin` (RL-2.1). Leaving and ending a room
-(RL-8) are built (V210-164, V030-08), with the lifecycle tags `0x0019`–`0x001B` (ADR-008 LS-21). On this tree the retention check
-is still the `policy` capability, whose removal is V030-32 (#380).
+`vox status` line for a room with no always-on member (RL-4.9), and pruning a key-package once its
+recipient acknowledges it (RL-4.7).
 **Date**: 2026-09-24
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, ordering, retention, sender-keys, anchors
@@ -28,9 +27,7 @@ PRD-001 sets the room's lifecycle:
 - **R33–R34:** any always-on node can be an anchor, and an anchor stores nothing for rooms it is not
   a member of.
 
-Before this ADR, a room's order was arrival order, retention could not be switched on, old sender
-keys were kept, keys travelled only on direct pairwise streams, and anchors kept a ciphertext log of
-rooms they were not in. Each skeleton costs about 3.5 KB (a 3,373-byte composite signature), so a
+Each skeleton costs about 3.5 KB (a 3,373-byte composite signature), so a
 million-message room holds about 3.5 GB of skeletons after every body has expired.
 
 ## Requirements
@@ -69,12 +66,12 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
 - **RL-2.1. The room's policy.** The room's retention MUST be the ADR-007 policy-update `ttl`: `0`
   means forever, any other value is disappearing after that many seconds. A room MUST default to
   forever (R6). Only the room's creator, or an admin the creator delegated with `vox room admin`,
-  MAY set it (V030-32). The UI MUST offer 1 hour, 1 week, 1 month or a custom value (`vox room
+  MAY set it (ADR-007 G-6). The UI MUST offer 1 hour, 1 week, 1 month or a custom value (`vox room
   retention <room> 1h|1w|1m|<secs>|forever`, where `1m` is a month). A non-admin's change MUST be
   refused, saying that the change is the admin's (`Fault::NotAdmin`).
-  *Status:* built, with the check on the `policy` capability (the creator). Planned: `vox room admin`
-  (V030-13, #319); the capability's removal (V030-32, #380); a room created with a retention
-  (creation writes `ttl` 0, and `vox room retention` sets it after).
+  *Status:* built, the check being the `policy` capability that the creator and a delegated admin
+  hold (ADR-007 G-5). Not built: a room created with a retention (creation writes `ttl` 0, and
+  `vox room retention` sets it after).
 - **RL-2.2. The node's policy.** A node's own retention MUST be local configuration (the `retention`
   file in its config directory), per room or as a default. A member MAY set a lower retention for
   its own node only; it MUST NOT raise the room's retention for its node.
@@ -101,8 +98,6 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
   progress is recorded in GitHub through the accountability skill (ADR-020 §5).
 
 ### Decision 3. Skeleton growth: checkpoints (R1)
-
-Decided 2026-09-25: build checkpoints now (M23.6).
 
 - **RL-3.1. Only the author checkpoints, and only its own feed.** A checkpoint MUST be the payload of
   an ordinary signed entry in the author's own feed (struct tag `0x0016`, `vox/checkpoint/v1`, body

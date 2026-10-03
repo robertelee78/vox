@@ -98,17 +98,14 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 
 ### 6. Room create and join
 
-6.1. Create MUST set policy up front (ADR-007): authorship attributable, history full, TTL never,
-     each changeable as ADR-007 allows. Creating mints the genesis; `channelID = SHA-256(genesis)`.
+6.1. Create MUST set policy up front (ADR-007): authorship attributable, history full, TTL never.
+     Only the retention MAY change later, by the creator or an admin (ADR-007 G-6). Creating mints the genesis; `channelID = SHA-256(genesis)`.
      *Built.* Deniable authorship is not offered: deniable mode is removed (PRD-001 R43).
-6.2. Two invite modes MUST be supported (ADR-007): an identity-bound invite (the default), which
-     names the newcomer's expected identity, after which the TUI shows "expecting `<safety code>`"
-     and flags a joiner who doesn't match; and an open passphrase join, whose joiner is shown
-     unverified until a member verifies them. *The core supports both (`governance::invite`); the TUI
-     shows neither expectation yet: planned.*
+6.2. There MUST be one way in: the room's link and its passphrase (ADR-005 J-1). Invite modes are
+     removed (ADR-007 G-6): an invite names no expected identity. A joiner reads nothing until
+     members trust it (ADR-007 G-15). *Built.*
 6.3. The passphrase MUST always be shared out of band and MUST NOT be in the invite. *Built.*
-6.4. The invite QR MUST encode the channel ID (and the expected identity for an identity-bound
-     invite) at ECC level M with a quiet zone, Unicode half-block by default with an ASCII fallback,
+6.4. The invite QR MUST encode the room's link (ADR-005 J-6) at ECC level M with a quiet zone, Unicode half-block by default with an ASCII fallback,
      check the terminal size (else show only the copyable string), and always show the copyable
      string beside it. *The renderer is built (`qr`); showing it in the TUI is planned.*
 6.5. The client MUST say that joining grants nothing readable until members consent (ADR-007).
@@ -150,8 +147,7 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
      runs. *Planned.*
 9.4. `vox daemon` MUST pass every node event through the one failure reporter the CLI uses
      (`tunnel_cli::say_if_it_explains_a_failure`), so it reports an unreachable peer, a refused
-     publish or a stall as `vox node` does. *Built: the daemon reported no failures at all until
-     `f3f8a94e` fixed it.* Under ADR-026 the reporter runs per node in the daemon.
+     publish or a stall as `vox node` does. *Built.* Under ADR-026 the reporter runs per node in the daemon.
 
 ### 10. Tunneling
 
@@ -159,10 +155,9 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
       nothing reachable until the user turns it on. *Built (`vox serve`, `vox up`, `vox forward`).*
 10.2. Room membership MUST NOT grant tunnel reach (ADR-017 decision 3). *Built.*
 10.3. The TUI's tunneling surface MUST follow ADR-017. Per-member `bind:`/`dial:` grants and a
-      privileged TUN `vox up` are withdrawn by policy (ADR-017's third revision). `vox up` is an
-      unprivileged SOCKS5 proxy (ADR-017 decision 5): *built*. Removing the withdrawn capability
-      model's remaining code (`governance::capability`'s `bind:`/`dial:` prefixes and its evaluator)
-      is *planned* (PRD-001 R44, #94).
+      privileged TUN `vox up` are withdrawn (ADR-017 decision 3). `vox up` is an unprivileged SOCKS5
+      proxy (ADR-017 decision 5). *Built; the capability model's `bind:`/`dial:` code is removed
+      (PRD-001 R44).*
 
 ### 11. At rest, lock and screen
 
@@ -273,8 +268,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
       elsewhere MUST abort.
 17.7. Size and SHA-256 MUST both be verified before anything is renamed into place, and the transfer
       MUST be bounded by the record's `size`.
-17.8. A candidate binary MUST be closed before anything executes it. (`vox update` never worked on
-      Linux until `4ea10789` fixed this: `execve` returned `ETXTBSY` on the still-open candidate.)
+17.8. A candidate binary MUST be closed before anything executes it; on Linux, `execve` of a binary
+      still open for writing fails with `ETXTBSY`.
 17.9. Publishing MUST be atomic: write the candidate beside the destination on the same filesystem,
       keep the active binary as `.previous`, then rename. `--rollback` MUST restore the previous one.
 17.10. Only an install this installer made MAY be updated in place, identified by

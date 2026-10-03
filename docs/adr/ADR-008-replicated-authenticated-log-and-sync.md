@@ -161,7 +161,7 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
 - **LS-22.** New struct types MUST be appended, versioned, and a tag MUST NOT be reused. `0x000B`
   and `0x0010` belong to removed deniable mode: they stay registered and MUST NOT be produced.
   `0x0006` carries only a room's retention; policy updates beyond retention and passphrase rotation
-  are removed (V030-32, #380).
+  are removed (ADR-007 G-6).
 - **LS-23.** This tag space is disjoint from the ADR-003 ciphersuite-ID space. The two never
   co-occur on the wire, so a numeric overlap (`0x0001` here and there) is not a collision.
 
