@@ -169,6 +169,22 @@ const C: f64 = 0.4;
 /// quinn's default initial window: 14,720 bytes clamped to 2-10 base datagrams (1200 bytes).
 const INITIAL_WINDOW: u64 = 12_000;
 
+/// The window a fresh controller starts at: ten packets of the size the path carries now, and never
+/// less than [`INITIAL_WINDOW`].
+///
+/// A new connection sends 1,200-byte packets, and there 12,000 bytes is ten of them. An idle restart
+/// builds a fresh controller on a connection whose packets have grown, to 8,192 bytes on loopback,
+/// and there 12,000 bytes is one packet. quinn sends no ACK on its own while it has data waiting
+/// that the window does not allow, so two ends that each had one packet out and more to send held
+/// back the ACK the other was waiting for, and both sat until a probe timeout (V210-80). Measured
+/// on two members dialling each other through a relay anchor that had been paused for 1.5 s: the
+/// anchor's connection to one member went silent both ways for 1.1–2.0 s, once or twice, and the
+/// members read each other 1.6–3.8 s after the release in 4 of 19 runs instead of 0.55 s; 0 of 16
+/// with this.
+fn fresh_window(mtu: u64) -> u64 {
+    INITIAL_WINDOW.max(10 * mtu)
+}
+
 // RFC 9406 §4.3 recommended values.
 /// The fewest round-trip samples in a round before a delay increase is judged.
 const N_RTT_SAMPLE: u32 = 8;
@@ -249,7 +265,7 @@ pub(crate) struct VoxCubic {
 impl VoxCubic {
     pub(crate) fn new(_now: Instant, current_mtu: u16) -> Self {
         Self {
-            window: INITIAL_WINDOW,
+            window: fresh_window(u64::from(current_mtu)),
             ssthresh: u64::MAX,
             recovery_start_time: None,
             state: CubicState::default(),
