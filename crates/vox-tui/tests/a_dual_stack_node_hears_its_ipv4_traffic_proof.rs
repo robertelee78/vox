@@ -22,8 +22,8 @@
 //! `0.0.0.0:P` and starts `vox node --listen [::]:P`. The node must not run, and must say that IPv4
 //! traffic to P reaches another program.
 //!
-//! The pinned-identity mismatch naming who answered is proved by
-//! `a_dial_that_reaches_another_node_says_who_answered_proof` (V210-143).
+//! What a dial that reaches another node says is proved by
+//! `a_dial_that_reaches_another_node_names_no_one_proof` (ADR-011 38a, which replaced V210-143).
 //!
 //! Every red says PRODUCT, quoting the node, or CANNOT MEASURE, naming the staging not achieved.
 //!

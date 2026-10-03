@@ -45,8 +45,9 @@ pub enum StructTag {
     RendezvousRecord = 0x0007,
     /// `0x0008` — pre-join record (ADR-012).
     PreJoinRecord = 0x0008,
-    /// `0x0009` — TLS identity extension (ADR-011).
-    TlsIdentityExtension = 0x0009,
+    // `0x0009` is RESERVED. It was the TLS identity extension (ADR-011 requirement 6), which
+    // carried a node's identity in its certificate; since the identity exchange (requirement 37)
+    // no certificate carries one. Never reused; `from_u16` refuses it like any unknown tag.
     /// `0x000A` — file chunk manifest (ADR-014).
     ChunkManifest = 0x000A,
     // `0x000B` is RESERVED. It was the DGKA setup entry of deniable mode (ADR-009), which
@@ -111,7 +112,7 @@ pub enum StructTag {
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 27] = [
+    pub const ALL: [StructTag; 26] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -120,7 +121,6 @@ impl StructTag {
         StructTag::PolicyRotation,
         StructTag::RendezvousRecord,
         StructTag::PreJoinRecord,
-        StructTag::TlsIdentityExtension,
         StructTag::ChunkManifest,
         StructTag::SelfChannelEntry,
         StructTag::GenesisRecord,
@@ -149,7 +149,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 27-element table: trivial and avoids an
+        // Linear scan over a 26-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -171,7 +171,6 @@ impl StructTag {
             StructTag::PolicyRotation => "vox/policy-rotation/v1",
             StructTag::RendezvousRecord => "vox/rendezvous-record/v1",
             StructTag::PreJoinRecord => "vox/pre-join-record/v1",
-            StructTag::TlsIdentityExtension => "vox/tls-identity-extension/v1",
             StructTag::ChunkManifest => "vox/chunk-manifest/v1",
             StructTag::SelfChannelEntry => "vox/self-channel-entry/v1",
             StructTag::GenesisRecord => "vox/genesis/v1",

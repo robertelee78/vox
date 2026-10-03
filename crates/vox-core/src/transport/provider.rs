@@ -39,15 +39,11 @@ use crate::error::{Error, Result};
 /// `TLS_X25519MLKEM768`). Recorded in every session-establishment entry.
 pub const X25519MLKEM768_CODE_POINT: u16 = 0x11EC;
 
-/// The ALPN protocol identifier for the Vox transport. Pinning an ALPN ensures a
-/// Vox endpoint never completes a handshake with a non-Vox QUIC service that
-/// happened to share the port.
-pub const VOX_ALPN: &[u8] = b"vox/1";
-
-/// The ALPN of the neutral handshake followed by the identity exchange (ADR-011 requirement
-/// 27). A `vox/1` peer, which expects its identity in the certificate, never completes a
-/// handshake with it. Replaces [`VOX_ALPN`] when the endpoint switches to the exchange.
-pub const VOX_ALPN_V2: &[u8] = b"vox/2";
+/// The ALPN of the Vox transport: the neutral handshake followed by the identity exchange
+/// (ADR-011 requirement 27). Pinning it means a Vox endpoint never completes a handshake with a
+/// non-Vox QUIC service that happened to share the port, and a `vox/1` peer — which expected
+/// its identity in the certificate — never completes one either.
+pub const VOX_ALPN: &[u8] = b"vox/2";
 
 /// Build the Vox crypto provider: the `aws-lc-rs` provider with `kx_groups`
 /// restricted to exactly the X25519MLKEM768 hybrid group, so there is no classical
@@ -83,23 +79,9 @@ fn assert_pq_only(provider: &CryptoProvider) -> Result<()> {
     }
 }
 
-/// Build a rustls [`ClientConfig`] over the PQ-only provider: TLS 1.3 only, the
-/// supplied Vox server-cert verifier, our own client leaf for mutual auth, ALPN
-/// pinned, and 0-RTT off.
-///
-/// The single-group invariant is asserted (`assert_pq_only`) before the provider
-/// is used, so there is no classical downgrade target.
-pub fn client_config(
-    verifier: Arc<dyn ServerCertVerifier>,
-    client_cert_chain: Vec<CertificateDer<'static>>,
-    client_key: PrivateKeyDer<'static>,
-) -> Result<ClientConfig> {
-    client_config_for(verifier, client_cert_chain, client_key, VOX_ALPN)
-}
-
 /// The client config of a **neutral** handshake (ADR-011 requirement 27): the daemon's neutral
 /// leaf offered as the client certificate, the server held only to a neutral leaf, ALPN
-/// [`VOX_ALPN_V2`]. Which node answers is proved afterwards by the identity exchange.
+/// [`VOX_ALPN`]. Which node answers is proved afterwards by the identity exchange.
 pub fn neutral_client_config(
     leaf: &crate::transport::identity_cert::NeutralLeaf,
 ) -> Result<ClientConfig> {
@@ -110,7 +92,7 @@ pub fn neutral_client_config(
         )),
         leaf.cert_chain(),
         leaf.private_key(),
-        VOX_ALPN_V2,
+        VOX_ALPN,
     )
 }
 
@@ -135,23 +117,9 @@ fn client_config_for(
     Ok(cfg)
 }
 
-/// Build a rustls [`ServerConfig`] over the PQ-only provider: TLS 1.3 only, the
-/// supplied Vox client-cert verifier (mutual auth mandatory), our own server leaf,
-/// ALPN pinned, and 0-RTT off (no early data, no session tickets).
-///
-/// The single-group invariant is asserted (`assert_pq_only`) before the provider
-/// is used, so there is no classical downgrade target.
-pub fn server_config(
-    verifier: Arc<dyn ClientCertVerifier>,
-    server_cert_chain: Vec<CertificateDer<'static>>,
-    server_key: PrivateKeyDer<'static>,
-) -> Result<ServerConfig> {
-    server_config_for(verifier, server_cert_chain, server_key, VOX_ALPN)
-}
-
 /// The server config of a **neutral** handshake (ADR-011 requirement 27): the daemon's neutral
 /// leaf, a client certificate still mandatory but held only to a neutral leaf (the listener
-/// needs the dialler's leaf for its process identity), ALPN [`VOX_ALPN_V2`]. One config serves
+/// needs the dialler's leaf for its process identity), ALPN [`VOX_ALPN`]. One config serves
 /// every connection of the daemon run: there is no per-connection verifier output any more.
 pub fn neutral_server_config(
     leaf: &crate::transport::identity_cert::NeutralLeaf,
@@ -163,7 +131,7 @@ pub fn neutral_server_config(
         )),
         leaf.cert_chain(),
         leaf.private_key(),
-        VOX_ALPN_V2,
+        VOX_ALPN,
     )
 }
 

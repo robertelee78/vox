@@ -86,8 +86,10 @@ async fn host() {
     // The dialer names this channel; the host checks the dialer against its reachers.
     let channel_id = genesis.channel_id();
 
-    let host_signer = SoftwareRootSigner::from_component_seeds(&[1u8; 32], &[2u8; 32]).unwrap();
-    let ep = VoxEndpoint::bind(&host_signer, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let host_signer = std::sync::Arc::new(
+        SoftwareRootSigner::from_component_seeds(&[1u8; 32], &[2u8; 32]).unwrap(),
+    );
+    let ep = VoxEndpoint::bind(host_signer.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
     println!("ADDR={}", ep.local_addr().unwrap());
     println!("ID={}", hex(ep.local_id()));
     eprintln!("host: tunnel ready (dark echo service), waiting for a client process…");
@@ -122,11 +124,13 @@ async fn client(addr: &str, id_hex: &str) {
     let expected = parse_id(id_hex);
     // The client IS the channel admin → holds dial:echo. It rebuilds the same genesis
     // to name the channel it claims that capability under.
-    let signer = SoftwareRootSigner::from_component_seeds(&ADMIN_SEED_A, &ADMIN_SEED_B).unwrap();
+    let signer = std::sync::Arc::new(
+        SoftwareRootSigner::from_component_seeds(&ADMIN_SEED_A, &ADMIN_SEED_B).unwrap(),
+    );
     let channel_id = Genesis::create_with_nonce(&signer, GENESIS_CREATED, policy(), [9u8; 16])
         .unwrap()
         .channel_id();
-    let ep = VoxEndpoint::bind(&signer, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let ep = VoxEndpoint::bind(signer.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
     let conn = ep
         .connect(addr.parse().unwrap(), expected, now())
         .await

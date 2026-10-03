@@ -168,8 +168,8 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
         .parse()
         .expect("APPARATUS: a socket address the proof wrote");
     let rt = Rt::new();
-    let (_b, bravo_a) = rt.block_on(connect(&*bravo, anchor_addr, anchor_id));
-    let (_c, charlie_a) = rt.block_on(connect(&*charlie, anchor_addr, anchor_id));
+    let (_b, bravo_a) = rt.block_on(connect(&bravo, anchor_addr, anchor_id));
+    let (_c, charlie_a) = rt.block_on(connect(&charlie, anchor_addr, anchor_id));
     let offered = answer_circuits(&rt, charlie_a);
     let served = board_has(&rt, &bravo_a, &room);
     println!("[proof] the anchor's board serves the trusted room's genesis: {served:?}");

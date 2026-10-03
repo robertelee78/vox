@@ -664,7 +664,7 @@ async fn as_member(
         .signer_arc()
         .expect("CANNOT MEASURE: the author's signer");
     let ep = vox_core::transport::quic::VoxEndpoint::bind(
-        &*signer,
+        signer.clone(),
         "127.0.0.1:0".parse().expect("APPARATUS: an address"),
     )
     .expect("CANNOT MEASURE: the author's endpoint did not bind");

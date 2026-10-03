@@ -829,7 +829,7 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
             .signer_arc()
             .expect("CANNOT MEASURE: mallory's signer");
         let ep = vox_core::transport::quic::VoxEndpoint::bind(
-            &*signer,
+            signer.clone(),
             "127.0.0.1:0".parse().expect("APPARATUS: an address"),
         )
         .expect("CANNOT MEASURE: the attacker's endpoint binds");

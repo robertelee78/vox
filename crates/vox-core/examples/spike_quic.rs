@@ -44,8 +44,10 @@ async fn main() {
 }
 
 async fn server() {
-    let signer = SoftwareRootSigner::from_component_seeds(&[1u8; 32], &[2u8; 32]).unwrap();
-    let ep = VoxEndpoint::bind(&signer, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let signer = std::sync::Arc::new(
+        SoftwareRootSigner::from_component_seeds(&[1u8; 32], &[2u8; 32]).unwrap(),
+    );
+    let ep = VoxEndpoint::bind(signer.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
     // Print on lines the harness greps for, flushed immediately.
     println!("ADDR={}", ep.local_addr().unwrap());
     println!("ID={}", hex(ep.local_id()));
@@ -69,8 +71,10 @@ async fn server() {
 
 async fn client(addr: &str, id_hex: &str) {
     let expected = parse_id(id_hex);
-    let signer = SoftwareRootSigner::from_component_seeds(&[3u8; 32], &[4u8; 32]).unwrap();
-    let ep = VoxEndpoint::bind(&signer, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let signer = std::sync::Arc::new(
+        SoftwareRootSigner::from_component_seeds(&[3u8; 32], &[4u8; 32]).unwrap(),
+    );
+    let ep = VoxEndpoint::bind(signer.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
     let conn = ep
         .connect(addr.parse().unwrap(), expected, now())
         .await

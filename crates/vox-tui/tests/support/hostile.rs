@@ -64,15 +64,17 @@ impl Drop for Rt {
 }
 
 /// A fresh identity, deterministic from `seed`.
-pub fn stranger(seed: u8) -> SoftwareRootSigner {
-    SoftwareRootSigner::from_component_seeds(&[seed; 32], &[seed ^ 0x5A; 32])
-        .expect("APPARATUS: build the stand-in peer's signer")
+pub fn stranger(seed: u8) -> Arc<SoftwareRootSigner> {
+    Arc::new(
+        SoftwareRootSigner::from_component_seeds(&[seed; 32], &[seed ^ 0x5A; 32])
+            .expect("APPARATUS: build the stand-in peer's signer"),
+    )
 }
 
 /// Connect to the node at `addr`, pinned to its fingerprint `id`, as `signer`. The endpoint
 /// is returned too: dropping it ends the connection.
-pub async fn connect<S: vox_core::identity::composite::RootSigner>(
-    signer: &S,
+pub async fn connect<S: vox_core::identity::composite::RootSigner + Send + Sync + 'static>(
+    signer: &Arc<S>,
     addr: std::net::SocketAddr,
     id: Digest32,
 ) -> (VoxEndpoint, Arc<VoxConnection>) {
@@ -84,7 +86,7 @@ pub async fn connect<S: vox_core::identity::composite::RootSigner>(
         "127.0.0.1:0"
     };
     let endpoint = VoxEndpoint::bind(
-        signer,
+        Arc::clone(signer) as Arc<_>,
         local
             .parse()
             .expect("APPARATUS: a socket address the proof wrote"),
