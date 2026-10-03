@@ -2596,10 +2596,16 @@ async fn serve_requests(
             crate::node::status::serve(&mut stream, handle).await?;
             continue;
         }
-        // V030-11: `vox tunnel close`. The live tunnels are this process's, so it is answered
-        // here, and the connection serves on.
+        // V030-11: `vox tunnel close`. The live tunnels are kept in this process, so it is
+        // answered here, and the connection serves on.
         if let Some(which) = crate::node::status::close_request(&body) {
-            crate::node::status::serve_close(&mut stream, &which).await?;
+            // Only this node's own tunnels: a process may host several (ADR-026 P-1).
+            let me = handle
+                .view()
+                .identity
+                .map(|i| i.fingerprint)
+                .unwrap_or_default();
+            crate::node::status::serve_close(&mut stream, &me, &which).await?;
             continue;
         }
         // Protocol 6: an app request turns the connection into an app connection for

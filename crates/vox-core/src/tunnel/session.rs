@@ -19,7 +19,6 @@
 //! topology.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use quinn::{RecvStream, SendStream};
@@ -519,34 +518,63 @@ pub async fn splice_watched(
 pub const ACK_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Tunnels in this process that have finished their stream and are waiting for the peer to
-/// acknowledge the last bytes (see [`all_acknowledged`]).
-static FINISHING: AtomicUsize = AtomicUsize::new(0);
+/// acknowledge the last bytes (see [`all_acknowledged`]), counted per node (ADR-026 P-1): a
+/// node that stops waits for its own, never for another node's. A splice with no
+/// [`TunnelWatch`] is no node's, and only [`all_acknowledged_any`] waits for it.
+static FINISHING: std::sync::Mutex<std::collections::BTreeMap<Option<Digest32>, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn finishing() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<Option<Digest32>, usize>>
+{
+    FINISHING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// One tunnel between its `finish` and the peer's acknowledgement of everything it sent.
-struct Finishing;
+struct Finishing(Option<Digest32>);
 
 impl Finishing {
-    fn start() -> Self {
-        FINISHING.fetch_add(1, Ordering::SeqCst);
-        Self
+    fn start(owner: Option<Digest32>) -> Self {
+        *finishing().entry(owner).or_default() += 1;
+        Self(owner)
     }
 }
 
 impl Drop for Finishing {
     fn drop(&mut self) {
-        FINISHING.fetch_sub(1, Ordering::SeqCst);
+        let mut all = finishing();
+        if let Some(n) = all.get_mut(&self.0) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                all.remove(&self.0);
+            }
+        }
     }
 }
 
-/// Wait, up to `bound`, until no tunnel in this process is waiting for its last bytes to be
+/// Wait, up to `bound`, until `pending` says nothing is left.
+async fn finishing_until(bound: std::time::Duration, pending: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while pending() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Wait, up to `bound`, until no tunnel of the node `owner` is waiting for its last bytes to be
 /// acknowledged. A node calls this before it closes its connections: `finish` only queues the
 /// end of the stream, and a close drops whatever the peer has not acknowledged, so a node
 /// stopped just after a reply was finished cut that reply short at the far end (V210-81).
-pub async fn all_acknowledged(bound: std::time::Duration) {
-    let deadline = tokio::time::Instant::now() + bound;
-    while FINISHING.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+/// Another node's tunnels are not waited for: its stop is its own (ADR-026 P-1).
+pub async fn all_acknowledged(owner: &Digest32, bound: std::time::Duration) {
+    let owner = Some(*owner);
+    finishing_until(bound, || finishing().contains_key(&owner)).await;
+}
+
+/// [`all_acknowledged`] for every node in this process, and for splices no node owns: what a
+/// process that is stopping as a whole waits for.
+pub async fn all_acknowledged_any(bound: std::time::Duration) {
+    finishing_until(bound, || !finishing().is_empty()).await;
 }
 
 /// How one direction of a splice ended.
@@ -562,10 +590,10 @@ enum Leg {
     ClosedThere,
     /// The other end closed the tunnel as stuck ([`TUNNEL_STUCK_CODE`]).
     StuckClosedThere,
-    /// Bytes waited [`stuck_after`] to go to the other end, and it took none.
+    /// Bytes waited the node's stuck-after to go to the other end, and it took none.
     /// …for this long, measured from when the write began.
     StuckThere(std::time::Duration),
-    /// Bytes waited [`stuck_after`] to go to this side's application, and it read none.
+    /// Bytes waited the node's stuck-after to go to this side's application, and it read none.
     /// …for this long, measured from when the write began.
     StuckHere(std::time::Duration),
 }
@@ -580,26 +608,13 @@ pub const TUNNEL_CLOSED_CODE: u32 = 0x1713;
 pub const TUNNEL_STUCK_CODE: u32 = 0x1714;
 
 /// How long bytes may wait to be taken, by the far end or by this side's application, before
-/// the tunnel counts as stuck and is closed (V030-11). 10 minutes unless the profile's
-/// `tunnel-stuck-after` file says otherwise ([`set_stuck_after`]).
+/// the tunnel counts as stuck and is closed (V030-11). 10 minutes unless the node's
+/// `tunnel-stuck-after` file says otherwise
+/// ([`LocalNode::set_stuck_after`](crate::transport::quic::LocalNode::set_stuck_after)).
 ///
 /// Only a write that waits counts: an idle tunnel, with nothing to send either way, is never
 /// closed, so an idle `ssh` session lasts as long as its owner wants it.
 pub const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// [`STUCK_AFTER`], or what the node was configured with.
-static STUCK_AFTER_SECS: AtomicU64 = AtomicU64::new(STUCK_AFTER.as_secs());
-
-/// Use `after` as this process's [`stuck_after`].
-pub fn set_stuck_after(after: std::time::Duration) {
-    STUCK_AFTER_SECS.store(after.as_secs().max(1), Ordering::Relaxed);
-}
-
-/// How long a tunnel's bytes may wait before it is closed as stuck ([`STUCK_AFTER`]).
-#[must_use]
-pub fn stuck_after() -> std::time::Duration {
-    std::time::Duration::from_secs(STUCK_AFTER_SECS.load(Ordering::Relaxed))
-}
 
 /// `after` in the words `vox status` uses: whole minutes when it is some, else whole seconds,
 /// rounded down, so a wait is never said longer than it was.
@@ -624,7 +639,9 @@ async fn splice_until(
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     const CHUNK: usize = 16 * 1024;
-    let stuck = stuck_after();
+    // The tunnel's own node's setting; a splice no node owns gets the default.
+    let stuck = watch.as_ref().map_or(STUCK_AFTER, TunnelWatch::stuck_after);
+    let owner = watch.as_ref().map(TunnelWatch::owner);
     let mark = |watch: &Option<TunnelWatch>| {
         if let Some(w) = watch {
             w.mark_moved();
@@ -648,7 +665,7 @@ async fn splice_until(
                         // until the peer has them, this task keeps its connection carried
                         // (so a retired connection is not closed under it), and a node that
                         // is stopping waits for it (`all_acknowledged`).
-                        let _finishing = Finishing::start();
+                        let _finishing = Finishing::start(owner);
                         let _ = tokio::time::timeout(ACK_BOUND, send.stopped()).await;
                         return Leg::Clean;
                     }

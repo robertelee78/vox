@@ -426,9 +426,14 @@ impl LiveCore {
             locking: nv.locking,
             mlock_active: nv.mlock_active,
             has_identity: nv.identity.is_some(),
-            // The tunnels this node carries are this process's (V030-11).
-            tunnels: vox_core::transport::quic::live_tunnels(),
-            closed_tunnels: vox_core::transport::quic::closed_tunnels(),
+            // The tunnels this node carries are kept in this process (V030-11), under its node
+            // (ADR-026 P-1).
+            tunnels: me
+                .map(|me| vox_core::transport::quic::live_tunnels(&me))
+                .unwrap_or_default(),
+            closed_tunnels: me
+                .map(|me| vox_core::transport::quic::closed_tunnels(&me))
+                .unwrap_or_default(),
         }
     }
 }
@@ -543,10 +548,21 @@ impl CoreHandle for LiveCore {
                     id: Some(id),
                     ..Default::default()
                 };
-                // By number, so it names one tunnel and is never refused as ambiguous.
-                if vox_core::transport::quic::close_tunnels(&which, "closed by a person in the TUI")
-                    .unwrap_or_default()
-                    .is_empty()
+                // By number, so it names one tunnel and is never refused as ambiguous; and only
+                // this node's (ADR-026 P-1).
+                let me = self
+                    .node
+                    .view()
+                    .identity
+                    .map(|i| i.fingerprint)
+                    .unwrap_or_default();
+                if vox_core::transport::quic::close_tunnels(
+                    &me,
+                    &which,
+                    "closed by a person in the TUI",
+                )
+                .unwrap_or_default()
+                .is_empty()
                 {
                     CommandStatus::Failed(UiError::NoSuchTunnel)
                 } else {

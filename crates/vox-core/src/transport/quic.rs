@@ -84,10 +84,77 @@ pub struct VoxEndpoint {
     supported: rustls::crypto::WebPkiSupportedAlgorithms,
     /// This endpoint's own identity fingerprint.
     local_id: Digest32,
+    /// The node this endpoint is, with the state the process keeps per node (ADR-026 P-1).
+    local: Arc<LocalNode>,
     /// The largest UDP payload this endpoint advertises and path-MTU discovery searches up to:
     /// [`MAX_UDP_PAYLOAD`] when the socket's receive buffer can take its bursts, else quinn's
     /// Ethernet default. See [`mtu_ceiling_for`].
     mtu_ceiling: u16,
+}
+
+/// **One node this process hosts, and what the process keeps for it alone** (ADR-026 P-1).
+///
+/// A process may host several nodes, so nothing a node configures or a peer could learn from may
+/// sit in a process-wide value: each tunnel, count and setting is filed under the node it is
+/// for, and every reader asks by node. This is the per-node half that is not a registry entry:
+/// how long the node gives a stuck tunnel, the secret its relay keys origin tags with, and the
+/// per-attach `instance` its identity exchange signs (ADR-011), so a node that comes back is seen
+/// as a new process of itself.
+#[derive(Debug)]
+pub struct LocalNode {
+    id: Digest32,
+    instance: [u8; 16],
+    stuck_after_secs: AtomicU64,
+    origin_key: [u8; 32],
+}
+
+impl LocalNode {
+    /// A node with a fresh `instance` and origin key, giving stuck tunnels the default
+    /// ([`crate::tunnel::session::STUCK_AFTER`]).
+    ///
+    /// # Errors
+    /// If the OS CSPRNG is unavailable: the origin key and the instance are drawn from it, and a
+    /// guessable origin key would let a target work a relayed asker's address back out.
+    pub fn new(id: Digest32) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            id,
+            instance: crate::identity::rng::random_array()?,
+            stuck_after_secs: AtomicU64::new(crate::tunnel::session::STUCK_AFTER.as_secs()),
+            origin_key: crate::identity::rng::random_array()?,
+        }))
+    }
+
+    /// The node's identity fingerprint.
+    #[must_use]
+    pub fn id(&self) -> Digest32 {
+        self.id
+    }
+
+    /// This attach of the node: new each time it is made (ADR-011).
+    #[must_use]
+    pub fn instance(&self) -> [u8; 16] {
+        self.instance
+    }
+
+    /// Give this node's tunnels `after` before one whose bytes wait is closed as stuck
+    /// (V030-11): the node's `tunnel-stuck-after` setting. At least a second.
+    pub fn set_stuck_after(&self, after: std::time::Duration) {
+        self.stuck_after_secs
+            .store(after.as_secs().max(1), Ordering::Relaxed);
+    }
+
+    /// How long this node's tunnels' bytes may wait before the tunnel is closed as stuck.
+    #[must_use]
+    pub fn stuck_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.stuck_after_secs.load(Ordering::Relaxed))
+    }
+
+    /// The secret this node, as a relay, keys the origin tags it tells a target with
+    /// (`circuitstream::origin_tags`). Never sent.
+    #[must_use]
+    pub fn origin_key(&self) -> &[u8; 32] {
+        &self.origin_key
+    }
 }
 
 /// Transport-layer admission for an *inbound* connection, evaluated **after** the
@@ -677,7 +744,7 @@ impl VoxEndpoint {
         peer: &Digest32,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach(peer, None, carrier)
+        self.mux.attach(&self.local_id, peer, None, carrier)
     }
 
     /// Attach an **inbound** circuit from `peer`, carried by `relay`, as
@@ -693,7 +760,8 @@ impl VoxEndpoint {
         origin: crate::transport::mux::CircuitOrigin,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach_via(peer, relay, Some(origin), carrier)
+        self.mux
+            .attach_via(&self.local_id, peer, relay, Some(origin), carrier)
     }
 
     /// [`VoxEndpoint::attach_circuit`], recording `relay` as the peer carrying it.
@@ -706,13 +774,14 @@ impl VoxEndpoint {
         relay: &Digest32,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach_via(peer, relay, None, carrier)
+        self.mux
+            .attach_via(&self.local_id, peer, relay, None, carrier)
     }
 
     /// The relay carrying `peer`'s live circuit, if one is recorded.
     #[must_use]
     pub fn circuit_relay_of(&self, peer: &Digest32) -> Option<Digest32> {
-        self.mux.circuit_relay_of(peer)
+        self.mux.circuit_relay_of(&self.local_id, peer)
     }
 
     /// Whether `addr` is a **live circuit** on this endpoint's socket — answered from the
@@ -726,13 +795,13 @@ impl VoxEndpoint {
     /// allocated, so this is the only way to get from a peer to its circuit.
     #[must_use]
     pub fn circuit_addr_of(&self, peer: &Digest32) -> Option<std::net::SocketAddr> {
-        self.mux.circuit_addr_of(peer)
+        self.mux.circuit_addr_of(&self.local_id, peer)
     }
 
-    /// How many relay circuits are attached.
+    /// How many relay circuits are attached for this node.
     #[must_use]
     pub fn circuit_count(&self) -> usize {
-        self.mux.circuit_count()
+        self.mux.circuit_count(&self.local_id)
     }
 
     /// The shared body of the constructors: build this node's leaf credentials and
@@ -775,6 +844,7 @@ impl VoxEndpoint {
             leaf_key,
             supported,
             local_id: leaf.identity_fingerprint(),
+            local: LocalNode::new(leaf.identity_fingerprint())?,
             mtu_ceiling,
         })
     }
@@ -797,6 +867,12 @@ impl VoxEndpoint {
     #[must_use]
     pub fn local_id(&self) -> Digest32 {
         self.local_id
+    }
+
+    /// The node this endpoint is ([`LocalNode`]).
+    #[must_use]
+    pub fn local(&self) -> &Arc<LocalNode> {
+        &self.local
     }
 
     /// Dial `addr`, requiring the peer to authenticate as `expected_peer`.
@@ -836,7 +912,13 @@ impl VoxEndpoint {
         let connection = connecting
             .await
             .map_err(|e| handshake_failed(e, &verified))?;
-        let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
+        let mut conn = finish_connection(
+            connection,
+            &verified,
+            now_secs,
+            via_circuit,
+            Arc::clone(&self.local),
+        )?;
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
     }
@@ -908,6 +990,18 @@ impl VoxEndpoint {
         now_secs: u64,
         mut admission: Admission,
     ) -> Result<VoxConnection> {
+        // **A circuit is answered only by the node it was attached for** (ADR-026 P-1): never by
+        // another node sharing the socket, or one node's circuit would tell its relay whether
+        // another is hosted here.
+        if !self
+            .mux
+            .serves_on(incoming.remote_address(), &self.local_id)
+        {
+            incoming.refuse();
+            return Err(Error::Handshake(
+                "a circuit was asked for a node it does not carry".to_owned(),
+            ));
+        }
         // Read before this end answers anything: see [`VoxConnection::via_circuit`].
         let via_circuit = self.mux.is_circuit(incoming.remote_address());
         let circuit_origin = self.mux.origin_of(incoming.remote_address());
@@ -939,7 +1033,13 @@ impl VoxEndpoint {
                 ))
             })?
             .map_err(|e| handshake_failed(e, &verified))?;
-        let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
+        let mut conn = finish_connection(
+            connection,
+            &verified,
+            now_secs,
+            via_circuit,
+            Arc::clone(&self.local),
+        )?;
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
         conn.carrier = carrier.filter(|_| via_circuit);
 
@@ -1057,6 +1157,7 @@ fn finish_connection(
     verified: &VerifiedPeer,
     now_secs: u64,
     via_circuit: bool,
+    local: Arc<LocalNode>,
 ) -> Result<VoxConnection> {
     // The verifier authenticated the peer during the handshake; its fingerprint is
     // in the slot. Absence means the handshake completed without our verifier
@@ -1080,6 +1181,7 @@ fn finish_connection(
         .ok_or(Error::SignatureInvalid)?;
     Ok(VoxConnection {
         serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
+        local,
         peer_id,
         peer_process,
         session,
@@ -1132,6 +1234,9 @@ pub struct VoxConnection {
     /// This connection's name in this process, never given to another (see [`Self::serial`]).
     serial: u64,
     connection: Connection,
+    /// The node this end is: whose tunnels this connection's are, in a process hosting several
+    /// nodes (ADR-026 P-1).
+    local: Arc<LocalNode>,
     peer_id: Digest32,
     /// Which process of `peer_id` this connection is to: the digest of its per-process leaf
     /// certificate (see [`Self::peer_process`]).
@@ -1199,10 +1304,14 @@ impl Drop for TunnelCredit {
         // stuck, closed at its other end — is kept on the closed list with that reason.
         if let Some(why) = lock(&self.watch.why).clone() {
             let mut closed = lock(&CLOSED);
-            if closed.len() == CLOSED_KEPT {
-                closed.pop_front();
+            // Kept per node: one node's busy day must not push another's history off the list.
+            if closed.iter().filter(|t| t.owner == live.owner).count() >= CLOSED_KEPT {
+                if let Some(oldest) = closed.iter().position(|t| t.owner == live.owner) {
+                    closed.remove(oldest);
+                }
             }
             closed.push_back(ClosedTunnel {
+                owner: live.owner,
                 id: self.id,
                 peer: live.peer,
                 service: live.service,
@@ -1222,15 +1331,34 @@ pub struct TunnelWatch {
     moved: Arc<AtomicU64>,
     close: Arc<tokio::sync::Notify>,
     why: Arc<Mutex<Option<String>>>,
+    /// The node this end of the tunnel is (ADR-026 P-1): whose stop waits for its last bytes.
+    owner: Digest32,
+    /// How long its owner gives it with bytes waiting before it is closed as stuck, as the
+    /// owner had it when the tunnel opened.
+    stuck_after: std::time::Duration,
 }
 
 impl TunnelWatch {
-    fn new(now: u64) -> Self {
+    fn new(now: u64, owner: Digest32, stuck_after: std::time::Duration) -> Self {
         Self {
             moved: Arc::new(AtomicU64::new(now)),
             close: Arc::new(tokio::sync::Notify::new()),
             why: Arc::new(Mutex::new(None)),
+            owner,
+            stuck_after,
         }
+    }
+
+    /// The node this end of the tunnel is.
+    #[must_use]
+    pub fn owner(&self) -> Digest32 {
+        self.owner
+    }
+
+    /// How long this tunnel's bytes may wait before it is closed as stuck: its node's setting.
+    #[must_use]
+    pub fn stuck_after(&self) -> std::time::Duration {
+        self.stuck_after
     }
 
     /// Mark that the tunnel moved a byte just now.
@@ -1264,6 +1392,8 @@ impl TunnelWatch {
 /// (V030-11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosedTunnel {
+    /// The node it was this end of (ADR-026 P-1).
+    pub owner: Digest32,
     /// Its number while it ran ([`LiveTunnel::id`]).
     pub id: u64,
     /// The member at the other end.
@@ -1280,17 +1410,21 @@ pub struct ClosedTunnel {
     pub why: String,
 }
 
-/// How many ended tunnels [`closed_tunnels`] keeps, newest last.
+/// How many ended tunnels [`closed_tunnels`] keeps for each node, newest last.
 const CLOSED_KEPT: usize = 32;
 
 /// The tunnels that ended for a reason, newest last ([`ClosedTunnel`]).
 static CLOSED: Mutex<std::collections::VecDeque<ClosedTunnel>> =
     Mutex::new(std::collections::VecDeque::new());
 
-/// The tunnels that ended for a reason a person should see, oldest first.
+/// The tunnels of the node `owner` that ended for a reason a person should see, oldest first.
 #[must_use]
-pub fn closed_tunnels() -> Vec<ClosedTunnel> {
-    lock(&CLOSED).iter().cloned().collect()
+pub fn closed_tunnels(owner: &Digest32) -> Vec<ClosedTunnel> {
+    lock(&CLOSED)
+        .iter()
+        .filter(|t| t.owner == *owner)
+        .cloned()
+        .collect()
 }
 
 /// Which live tunnels to close (V030-11): one by its number, or a member's — all of them, or
@@ -1335,14 +1469,19 @@ impl TunnelSelector {
 /// than one member's tunnels match: "a person closes one member's tunnels" (V030-11), and a
 /// short or mistyped prefix must not close several members' at once.
 pub fn close_tunnels(
+    owner: &Digest32,
     which: &TunnelSelector,
     why: &str,
 ) -> std::result::Result<Vec<LiveTunnel>, String> {
     let live = lock(&LIVE);
+    // Only the node's own: a process may host several (ADR-026 P-1), and one node closing
+    // another's tunnel by its number or its member is the leak this filter exists to stop.
+    let live: std::collections::BTreeMap<&u64, &Live> =
+        live.iter().filter(|(_, t)| t.owner == *owner).collect();
     if let Some(prefix) = &which.member {
         let members: std::collections::BTreeSet<String> = live
             .iter()
-            .filter(|(id, t)| which.matches(**id, t))
+            .filter(|(id, t)| which.matches(***id, t))
             .map(|(_, t)| crate::node::link::b32_encode(&t.peer))
             .collect();
         if members.len() > 1 {
@@ -1355,10 +1494,10 @@ pub fn close_tunnels(
     }
     Ok(live
         .iter()
-        .filter(|(id, t)| which.matches(**id, t))
+        .filter(|(id, t)| which.matches(***id, t))
         .map(|(id, t)| {
             t.watch.ask_to_close(why);
-            t.listed(*id)
+            t.listed(**id)
         })
         .collect())
 }
@@ -1383,6 +1522,8 @@ pub struct LiveTunnel {
 
 /// A live tunnel's entry in [`LIVE`].
 struct Live {
+    /// The node this end of the tunnel is (ADR-026 P-1).
+    owner: Digest32,
     peer: Digest32,
     service: String,
     outbound: bool,
@@ -1403,8 +1544,8 @@ impl Live {
     }
 }
 
-/// Every tunnel this process carries now, by a number of its own. A process runs one node, so
-/// this is the node's list.
+/// Every tunnel this process carries now, by a number of its own. A process may host several
+/// nodes (ADR-026 P-1), so each entry names its node, and every reader filters by it.
 static LIVE: Mutex<std::collections::BTreeMap<u64, Live>> =
     Mutex::new(std::collections::BTreeMap::new());
 
@@ -1419,17 +1560,28 @@ pub fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Every tunnel this node carries now, oldest first.
+/// Every tunnel the node `owner` carries now, oldest first.
 #[must_use]
-pub fn live_tunnels() -> Vec<LiveTunnel> {
-    lock(&LIVE).iter().map(|(id, t)| t.listed(*id)).collect()
+pub fn live_tunnels(owner: &Digest32) -> Vec<LiveTunnel> {
+    lock(&LIVE)
+        .iter()
+        .filter(|(_, t)| t.owner == *owner)
+        .map(|(id, t)| t.listed(*id))
+        .collect()
 }
 
 /// What a person is told when a tunnel is refused at the cap: how many are open to this member,
 /// to which services, and how to free one (decider, 2026-10-01).
-fn limit_said(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> String {
+fn limit_said(
+    live: &std::collections::BTreeMap<u64, Live>,
+    owner: &Digest32,
+    peer: &Digest32,
+) -> String {
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for t in live.values().filter(|t| t.peer == *peer) {
+    for t in live
+        .values()
+        .filter(|t| t.owner == *owner && t.peer == *peer)
+    {
         *counts.entry(t.service.clone()).or_default() += 1;
     }
     let services: Vec<String> = counts
@@ -1460,8 +1612,15 @@ fn set_tunnel_window(connection: &Connection, tunnels: u32) {
 
 /// Whether `peer` already has as many live tunnels with this node as it may, on whatever
 /// connections they run.
-fn at_tunnel_cap(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> bool {
-    live.values().filter(|t| t.peer == *peer).count() >= TUNNELS_PER_PEER as usize
+fn at_tunnel_cap(
+    live: &std::collections::BTreeMap<u64, Live>,
+    owner: &Digest32,
+    peer: &Digest32,
+) -> bool {
+    live.values()
+        .filter(|t| t.owner == *owner && t.peer == *peer)
+        .count()
+        >= TUNNELS_PER_PEER as usize
 }
 
 /// The next [`VoxConnection::serial`].
@@ -1482,17 +1641,22 @@ impl VoxConnection {
     pub fn carry_tunnel(&self, service: &str, outbound: bool) -> Result<TunnelCredit> {
         let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
         let opened = unix_now();
-        let watch = TunnelWatch::new(opened);
+        let watch = TunnelWatch::new(opened, self.local.id, self.local.stuck_after());
         {
             // Counted and taken under one lock, so two tunnels asked for at once cannot both
             // take the last place.
             let mut live = lock(&LIVE);
-            if at_tunnel_cap(&live, &self.peer_id) {
-                return Err(Error::TunnelLimit(limit_said(&live, &self.peer_id)));
+            if at_tunnel_cap(&live, &self.local.id, &self.peer_id) {
+                return Err(Error::TunnelLimit(limit_said(
+                    &live,
+                    &self.local.id,
+                    &self.peer_id,
+                )));
             }
             live.insert(
                 id,
                 Live {
+                    owner: self.local.id,
                     peer: self.peer_id,
                     service: service.to_owned(),
                     outbound,
@@ -1522,8 +1686,12 @@ impl VoxConnection {
     /// [`Error::TunnelLimit`], saying what it holds and how to free one.
     pub fn room_for_a_tunnel(&self) -> Result<()> {
         let live = lock(&LIVE);
-        if at_tunnel_cap(&live, &self.peer_id) {
-            return Err(Error::TunnelLimit(limit_said(&live, &self.peer_id)));
+        if at_tunnel_cap(&live, &self.local.id, &self.peer_id) {
+            return Err(Error::TunnelLimit(limit_said(
+                &live,
+                &self.local.id,
+                &self.peer_id,
+            )));
         }
         Ok(())
     }
@@ -1532,7 +1700,7 @@ impl VoxConnection {
     /// (`TunnelStatus::Full`): the member's live tunnels here are the same ones it counted.
     #[must_use]
     pub fn tunnel_limit(&self) -> Error {
-        Error::TunnelLimit(limit_said(&lock(&LIVE), &self.peer_id))
+        Error::TunnelLimit(limit_said(&lock(&LIVE), &self.local.id, &self.peer_id))
     }
 
     /// **A name for this connection that no other connection in this process is ever given.**
@@ -1544,6 +1712,18 @@ impl VoxConnection {
     #[must_use]
     pub fn serial(&self) -> u64 {
         self.serial
+    }
+
+    /// The node this end of the connection is: whose tunnels and counts its are (ADR-026 P-1).
+    #[must_use]
+    pub fn local_id(&self) -> Digest32 {
+        self.local.id
+    }
+
+    /// The node this end is ([`LocalNode`]).
+    #[must_use]
+    pub fn local(&self) -> &Arc<LocalNode> {
+        &self.local
     }
 
     /// The authenticated peer identity fingerprint.
