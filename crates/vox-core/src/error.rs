@@ -616,6 +616,14 @@ pub enum IpcHandshake {
         /// How long the ping was given.
         secs: u64,
     },
+    /// The daemon answered the connection's `Use` with a refusal (ADR-026 C-2): the node is not
+    /// attached for a one-shot verb, there is no such node, a wrong passphrase. Its words say what
+    /// to do.
+    #[error("{reason}")]
+    Refused {
+        /// The daemon's refusal, for a person.
+        reason: String,
+    },
 }
 
 /// Why a local address could not be bound, read from the operating system's error (V210-134).
