@@ -151,11 +151,30 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 .map_err(|e| AppError::Usage(e.to_string()))?;
         }
     }
+    // **The daemon's one presence** (ADR-026 D-3, ADR-012 N-41–N-45): one socket and endpoint
+    // for every node it attaches, on the data root's kept port (`.daemon/port`), with the relay
+    // limits of `.daemon/config`.
+    let limits = vox_core::node::circuitstream::RelayLimits::read(&account.daemon_config_file())
+        .map_err(AppError::Usage)?;
+    let presence = rt
+        .block_on(async {
+            let (shared, moved) = vox_core::node::presence::NetPresence::bind_kept(
+                args.profile.listen,
+                &account.port_file(),
+                None,
+            )?;
+            if let Some(moved) = moved {
+                eprintln!("vox daemon: {moved}");
+            }
+            Ok::<_, vox_core::error::Error>(vox_core::node::presence::NetPresence::start(shared))
+        })
+        .map_err(|e| AppError::Usage(format!("listen on {}: {e}", args.profile.listen)))?;
+    presence.ledger().set_limits(limits);
     let router = Router::new(
         account.clone(),
         rt.handle().clone(),
         Defaults {
-            bind: listen_once(args.profile.listen),
+            bind: shared_presence(&presence),
             anchors,
             anchor_specs: args.profile.anchors.clone(),
             listen: args.profile.listen.to_string(),
@@ -246,7 +265,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             () = idle => None,
         }
     });
-    stop_daemon(rt, &router, signal)
+    stop_daemon(rt, &router, &presence, signal)
 }
 
 /// The node `vox daemon` was named (C-3's first step): `--node` / `VOX_NODE`, or a `--profile`
@@ -272,25 +291,12 @@ fn resolve(account: &Account, named: Option<NodeName>) -> Option<NodeName> {
     }
 }
 
-/// Where each node binds: the daemon's `--listen` for the first node attached, and the same
-/// address on a port of its own for every later one. **Interim** until the daemon's one shared
-/// presence (ADR-026 D-3, #403) replaces it.
-fn listen_once(listen: std::net::SocketAddr) -> crate::host::BindFor {
-    let owner: Arc<Mutex<Option<NodeName>>> = Arc::default();
-    Arc::new(move |node: &NodeName| {
-        let mut o = owner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let addr = match o.as_ref() {
-            None => {
-                *o = Some(node.clone());
-                listen
-            }
-            Some(first) if first == node => listen,
-            Some(_) => std::net::SocketAddr::new(listen.ip(), 0),
-        };
-        Some(Bind::Addr(addr))
-    })
+/// Where each node binds: **the daemon's one presence**, for every node (ADR-026 D-3). Every
+/// attached node is answered at the same ip:port, by the identity exchange; none binds a socket of
+/// its own.
+fn shared_presence(presence: &Arc<vox_core::node::presence::NetPresence>) -> crate::host::BindFor {
+    let presence = Arc::clone(presence);
+    Arc::new(move |_: &NodeName| Some(Bind::Shared(Arc::clone(&presence))))
 }
 
 /// Write this daemon's pid into the lock file, so a person (or a proof) can see which process
@@ -419,6 +425,7 @@ fn refusal_words(r: &Refusal, account: &Account, node: &NodeName) -> String {
 fn stop_daemon(
     rt: tokio::runtime::Runtime,
     router: &Router,
+    presence: &vox_core::node::presence::NetPresence,
     signal: Option<crate::app::StopSignal>,
 ) -> Result<(), AppError> {
     let why = signal.map_or_else(|| "request".to_owned(), |s| s.name().to_owned());
@@ -427,9 +434,13 @@ fn stop_daemon(
     }
     let patience = shutdown_patience();
     let finished = rt.block_on(async {
-        tokio::time::timeout(patience + Duration::from_millis(500), router.stop_all())
-            .await
-            .unwrap_or(false)
+        let finished =
+            tokio::time::timeout(patience + Duration::from_millis(500), router.stop_all())
+                .await
+                .unwrap_or(false);
+        // Every node is detached: the presence goes, and with it the port mapping (N-43).
+        presence.close().await;
+        finished
     });
     // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync
     // session runs on one.
