@@ -20,13 +20,13 @@
 //! not by the signal, and say which signal stopped it and that it is shutting down.
 //!
 //! **A red names its side.** An anchor that never wrote its anchors file is PRODUCT (staging),
-//! unless the runner stalled through that wait (CANNOT MEASURE); a `kill` that failed is CANNOT
-//! MEASURE (the scene was not staged). Anything after the signal is the product's: it
+//! unless the runner stalled through that wait (APPARATUS); a `kill` that failed is APPARATUS
+//! (the scene was not staged). Anything after the signal is the product's: it
 //! did not exit, died by the signal, or exited without saying why. The wait for each exit is
 //! polled every 50 ms, and the proof measures its own clock on the same timeline: how far the
 //! deschedule's sleep overshot, and the longest gap between two polls. An anchor still running
 //! while that apparatus stalled past [`APPARATUS_BUDGET`] cannot be told from a runner that
-//! stalled, and reads `CANNOT MEASURE: apparatus took X`; otherwise it reads `PRODUCT: … (apparatus
+//! stalled, and reads `APPARATUS (runner stalled): … apparatus X`; otherwise it reads `PRODUCT: … (apparatus
 //! Y)`.
 //!
 //! Mutations: the listener made inside the `select!` again → red (13 of 20 anchors never exited);
@@ -103,7 +103,7 @@ fn signal(pid: u32, sig: &str) {
         .args([sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(sent, "CANNOT MEASURE: `kill {sig} {pid}` failed");
+    assert!(sent, "APPARATUS: the proof's `kill {sig} {pid}` failed");
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
         let mut anchor =
             VoxProc::spawn("anchor", &dir, &args(&["node", "--listen", "127.0.0.1:0"]));
         // Staging the product performs: an anchor that never writes its file in time, or exits
-        // first, is PRODUCT (staging); a runner that stalled through the wait is CANNOT MEASURE.
+        // first, is PRODUCT (staging); a runner that stalled through the wait is APPARATUS.
         if let Err(why) = anchor.try_expect_within(
             LINE_PATIENCE,
             &format!("the anchors file written (anchor {trial})"),
@@ -198,7 +198,7 @@ fn an_anchor_stops_on_ctrl_c_when_a_tick_is_due() {
     );
     assert!(
         stalled.is_empty(),
-        "CANNOT MEASURE: {} of {TRIALS} anchors were still running {STOP_WITHIN:?} after the \
+        "APPARATUS (runner stalled): {} of {TRIALS} anchors were still running {STOP_WITHIN:?} after the \
          signal, but the apparatus stalled past {APPARATUS_BUDGET:?} meanwhile, so a slow anchor \
          cannot be told from a stalled runner:\n{}",
         stalled.len(),
@@ -240,7 +240,7 @@ fn staged<T>(what: &str, step: impl FnOnce() -> T) -> T {
         {
             panic!("{why} ({what})")
         } else {
-            panic!("APPARATUS: staging not achieved — {what}: {why}")
+            panic!("APPARATUS: this proof's own step failed with no label — {what}: {why}")
         }
     })
 }
