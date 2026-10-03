@@ -90,7 +90,8 @@ R-numbers are PRD-001's.
 
 - **AR-27 (R6).** A room's retention MUST default to forever.
 - **AR-28 (R7).** A room's retention MUST be its ADR-007 policy-update `ttl`, set with `vox room retention <room> 1h|1w|1m|<secs>|forever`.
-  - Only a holder of `policy` MAY set it.
+  - Only the room's creator, or an admin the creator delegated with `vox room admin`, MAY set it (ADR-007). **Planned:** `vox room admin` is V030-13 (#319), and on this tree the check is the `policy` capability, which V030-32 (#380) removes.
+  - A member MAY set a lower retention for its own node only (AR-29); it MUST NOT raise a room's retention for its node.
   - Over the control socket the request MUST be gated on the identity passphrase, because shortening it deletes history.
   - **Planned:** a genesis carries `ttl` 0 (forever) at creation; a room's retention is set only after it is created.
 - **AR-29 (R8).** A node MUST also honour its own retention: the `retention` file in its config directory, with `default <dur>` and `<room-prefix> <dur>` lines. It MUST re-read the file every `RETENTION_REREAD_SECS`. If the file is unreadable, it MUST keep the last policy it read.
@@ -104,7 +105,7 @@ R-numbers are PRD-001's.
 - **AR-32.** An entry's age MUST run from its author's claimed time, clamped to no later than first sight. An entry this node cannot read MUST age from first sight. The first-seen time MUST be kept per entry in a sealed `Index` segment.
 - **AR-33.** On reload, a body-less entry MUST be kept: it verifies and links the feed. A body that arrives already expired MUST be pruned and MUST NOT be rendered.
 - **AR-34.** Retention is honoured by clients, not enforced: a malicious client can keep data. This is stated plainly, not implied to be a guarantee.
-- **AR-35. Planned.** An anchor's log store keeps bodies regardless of retention, until ADR-023 decision 6 removes that store.
+- **AR-35.** An anchor MUST NOT keep pages of a room it is not a member of (ADR-023 decision 6), so retention has nothing to prune there. An anchor upgraded from a release that kept them MUST delete them (ADR-016 NR-46).
 
 ### Gates
 

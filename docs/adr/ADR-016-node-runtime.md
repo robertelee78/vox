@@ -122,6 +122,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
   - The joiner MUST open with `WANT {channelID, epoch}`.
   - Routes MUST be tried in this order: the link's anchors, the configured anchors, any anchor already connected.
   - A board with no address record for the responder MUST be re-read until `JOIN_ADDRESS_PATIENCE` (20 s) runs out, not treated as unreachable at once.
+  - Joining a room this node already holds MUST update the room's stored address (and anchors) from the new link. **Planned:** decider ruling of 2026-10-03; not built on this tree.
 - **NR-28a.** An identity with no live pre-join record MUST be classed `Unknown`, and MUST reach the board and nothing else.
 - **NR-29.** The joiner side of a join MUST run off the actor (V29-08).
 - **NR-30.** Joining grants log authorship only.
@@ -153,7 +154,8 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 - **NR-35.** Streams MUST be typed by their first frame (ADR-011, typed streams): `sync` 1, `join` 2, `pairwise` 3, `rendezvous` 4, `tunnel` 5, `coord` 6, `circuit` 7, `goodbye` 8, `app` 9. A `sync`, `join` or `pairwise` stream MUST name its room.
 - **NR-36 (M14.8–M14.10, M15.1b, V210-122).** `NodeNet::reach` MUST climb the whole ADR-012 ladder: a live connection, a direct dial, a hole punch over a coordinator's `coord` stream, then a relayed circuit.
   - It MUST race the rungs and adopt whichever lands first.
-  - A circuit MUST wait `DIRECT_HEAD_START` (250 ms) and yield to a direct path that lands in that time.
+  - A pair that can only be relayed MUST take its relay circuit at once. A dial-back MAY race the circuit, and MUST NOT hold it or delay it. **Planned:** decider ruling of 2026-10-03. On this tree a circuit still waits `DIRECT_HEAD_START` (500 ms, `node/network.rs:108`) and, after a join, the dial-back (V030-27, 17b262ed).
+  - A pair that is not relay-only MAY give a direct path up to `DIRECT_HEAD_START` before asking a relay, and MUST yield to a direct path that lands in that time.
   - A relayed connection MUST then try to upgrade (`NetEvent::BetterPath`).
   - Candidates the socket cannot address MUST be dropped before dialling.
   - A hole punch MAY be coordinated by any connected peer that will relay signalling. An inbound punch MUST be answered on its own task.
@@ -191,13 +193,10 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 
 ### The anchor
 
-- **NR-45 (M15.2b).** A node run as an anchor (`NodeConfig::anchor_logs(true)`, set by `vox node`) MUST keep a ciphertext log for every room whose genesis lands on its board.
-  - The log holds the genesis, the vouched authors and the entries, with no SEK, no chains and no timeline.
-  - The pages MUST be sealed under `HKDF(factor_id, "vox/anchor-log-sek/v1")`, in segment kinds `AnchorLog` and `AnchorMeta`.
-  - After a restart, an anchor MUST reopen what its store holds and republish each genesis.
-  - An anchor MUST reconcile each room with its known members, and members MUST sync with their anchors.
+- **NR-45 (M15.2b, ADR-023 decision 6).** An anchor MUST NOT keep pages of a room it is not a member of. It serves the board (genesis, address and bundle records) and bridges hosts that cannot otherwise reach each other (ADR-012). Segment kind codes `AnchorLog=6` and `AnchorMeta=7` stay reserved and MUST NOT be reused.
+  - After a restart, an anchor MUST republish the records on its board.
 - **NR-45a.** `vox node` MUST print the `<fingerprint>@<multiaddr>` a client gives as `--anchor`. `NodeView::anchoring` MUST report only the rooms it serves and how many members it knows of each.
-- **NR-46. Planned.** ADR-023 decision 6 is to remove the anchor's log store.
+- **NR-46 (R45, M23.5).** An anchor started on a store written by an older release MUST delete the room pages it kept (`Store::delete_retired_anchor_pages`), with no migration and no copy kept. Proof: `crates/vox-tui/tests/an_upgraded_anchor_drops_the_pages_it_kept_proof.rs`.
 
 ### Reporting
 
@@ -226,8 +225,7 @@ These are known and not fixed. Each stays until it is fixed, with the fixing com
 | # | Defect or limit | Where | Tracked |
 |---|---|---|---|
 | D1 | An anchor tracks epoch 0 only, so an epoch change is not carried on its board. | `node/anchor.rs:123`, `:154` | #356 |
-| D2 | The member→anchor session failed every time in the deleted `node_m19_untrust_lock_gate` (`sync failed: transport`). No proof isolates it now, and its state is unknown. | old gate, deleted (V29-17) | #358 |
-| D3 | A member that restarts under the same identity while its old session still waits is refused as the same pair until that session ends. 582f18a0 closes the dead held connection when the newcomer is filed; no proof isolates the waiting case. | `node/net.rs` | #358 |
+| D2 | Member→anchor sessions are proved on a relayed path on loopback only. Whether the `sync failed: transport` seen in the deleted `node_m15_anchor_gate` occurs behind real NATs is not measured. | — | untracked (see the V030-29 report) |
 | D4 | ADR-008's golden-vector obligation is unmet, including for `0x0012`: no golden-vector test exists. | ADR-008 | open, awaiting the decider (V030-29 question 19) |
 | L1 | A first `ssh` into a fresh room can wait up to `HOST_PATIENCE` (300 s). | `node/up.rs:214` | limit, by design |
 
@@ -236,6 +234,8 @@ Fixed since the old text, with evidence:
 - Opening a stream had no deadline: `OPEN_STREAM_PATIENCE` (2afa020b).
 - A failed join did not name the rung that refused: it prints its steps and what each responder said (79ece6f4, #192).
 - Sessions this node starts were not checked: NR-41 (ce4a55f2, V29-04).
+- Member→anchor sessions failing on a relayed path: measured working through the shipped binary on loopback, with a mutant that turns it red (a568ac2d, V210-139, #358).
+- A member that restarts under the same identity was refused as the same pair while its old session waited: the newcomer's first connection now closes every connection to the old process (`ConnectionManager::file_inner`, V210-57), measured 12 of 12 under 0.15 s (a568ac2d, V210-139, #358).
 
 ## Consequences
 
