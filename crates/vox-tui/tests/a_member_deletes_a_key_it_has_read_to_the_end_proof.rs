@@ -15,6 +15,14 @@
 //!   restarts, so deleting the key took no message he had read; and he reads a seventh post, so
 //!   the live generation was kept.
 //!
+//! - **PRODUCT:** alice then trusts carol again and posts: carol reads it within 90 s, and
+//!   neither alice's own count of generations nor bob's received count grows back. A re-offer
+//!   after R14 deleted a generation skips it and does not fail (V210-118).
+//!
+//! **Not driven here:** a generation kept because an entry under it is **not received yet**
+//! (V030-10). Its body is still to come and its generation unknown until it does, so the prune
+//! keeps every generation from that entry on (`ChannelState::prune_superseded_receivers`).
+//!
 //! Mutation (red): receiver pruning disabled leaves bob's count at 2.
 
 #![cfg(unix)]
@@ -121,7 +129,7 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
     while !vox(dir, &["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: {tag}'s daemon never answered `vox room list` in 90 s: {}",
+            "PRODUCT (staging): {tag}'s daemon never answered `vox room list` in 90 s: {}",
             std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -134,7 +142,7 @@ fn identity(tmp: &Path, name: &str) -> (PathBuf, String) {
     std::fs::create_dir_all(dir.join("cfg"))
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make {name}'s profile dir: {e}"));
     let (ok, out, err) = vox(&dir, &["id"], None);
-    assert!(ok, "PRODUCT: {name}'s `vox id` failed: {err}");
+    assert!(ok, "PRODUCT (staging): {name}'s `vox id` failed: {err}");
     (dir, out.trim().to_owned())
 }
 
@@ -173,32 +181,54 @@ fn read_until(
 
 fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
-    assert!(ok, "PRODUCT: `vox room post {text:?}` failed: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox room post {text:?}` failed: {err}"
+    );
 }
 
 fn trust(dir: &Path, fp: &str, name: &str) {
     let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-    assert!(ok, "PRODUCT: `vox trust add {name}` failed: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox trust add {name}` failed: {err}"
+    );
 }
 
 fn join(creator: &Path, joiner: &Path, room: &str) {
     let (ok, link, err) = vox(creator, &["room", "invite", room], None);
-    assert!(ok, "PRODUCT: `vox room invite` failed: {err}");
+    assert!(ok, "PRODUCT (staging): `vox room invite` failed: {err}");
     let (ok, _, err) = vox(
         joiner,
-        &["room", "join", link.trim(), "--name", "r"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "r",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "PRODUCT: `vox room join` failed: {err}");
+    assert!(ok, "PRODUCT (staging): `vox room join` failed: {err}");
+}
+
+/// `key_generations` (this node's own sender keys) for the room, from `vox status --json`.
+fn generations(dir: &Path) -> Option<u64> {
+    status(dir)["rooms"][0]["key_generations"].as_u64()
+}
+
+fn status(dir: &Path) -> serde_json::Value {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
+    serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON ({e}): {out}"))
 }
 
 /// `received_key_generations` for the room, from `vox status --json`.
 fn received(dir: &Path) -> Option<u64> {
-    let (ok, out, err) = vox(dir, &["status", "--json"], None);
-    assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
-    let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON ({e}): {out}"));
-    v["rooms"][0]["received_key_generations"].as_u64()
+    status(dir)["rooms"][0]["received_key_generations"].as_u64()
 }
 
 #[test]
@@ -216,15 +246,15 @@ fn a_member_deletes_another_members_key_once_it_has_read_everything_sealed_under
 
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "PRODUCT: `vox room create` failed: {err}");
+    assert!(ok, "PRODUCT (staging): `vox room create` failed: {err}");
     let (_, listed, _) = vox(&alice, &["room", "list"], None);
     let room = listed
         .split_whitespace()
         .next()
-        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room after create"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` shows no room after create"))
         .to_owned();
     join(&alice, &bob, &room);
     join(&alice, &carol, &room);
@@ -239,11 +269,14 @@ fn a_member_deletes_another_members_key_once_it_has_read_everything_sealed_under
     let (ok, c) = read_until(&carol, &room, 90, |t| count(t, "first ") == 3);
     assert!(
         ok,
-        "PRODUCT: carol, trusted, never read alice's first 3 posts in 90 s: {c:?}"
+        "PRODUCT (staging): carol, trusted, never read alice's first 3 posts in 90 s: {c:?}"
     );
     // Removing carol rotates alice's sender key: the later posts are under a new generation.
     let (ok, _, err) = vox(&alice, &["trust", "remove", &carol_fp], None);
-    assert!(ok, "PRODUCT: `vox trust remove carol` failed: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox trust remove carol` failed: {err}"
+    );
     for i in 1..=3 {
         post(&alice, &room, &format!("later {i}"));
     }
@@ -293,5 +326,31 @@ fn a_member_deletes_another_members_key_once_it_has_read_everything_sealed_under
         "PRODUCT: bob never read alice's post under the live generation in 90 s: {t:?}"
     );
     println!("[proof] bob read 3 + 3 before and after the restart, and the later post");
+
+    // ---- A re-offer after the deletion sends nothing retired and does not fail -----------
+    // Alice trusting carol again offers carol every generation she is entitled to (V210-118),
+    // and carol's key arriving fresh at alice re-offers alice's: generations retired and
+    // deleted by now must be skipped, not fail the round. What a person sees: carol reads what
+    // alice posts next, and no deleted key comes back on either side.
+    let alice_held = generations(&alice);
+    trust(&alice, &carol_fp, "carol");
+    post(&alice, &room, "again");
+    let (ok, c) = read_until(&carol, &room, 90, |t| count(t, "again") == 1);
+    println!("[proof] carol, trusted again, shows {c:?}");
+    assert!(
+        ok,
+        "PRODUCT: carol, trusted again, never read alice's next post in 90 s: the re-offer after \
+         R14's deletion did not get through: {c:?}"
+    );
+    let (alice_after, bob_after) = (generations(&alice), received(&bob));
+    println!(
+        "[proof] after the re-offer: alice holds {alice_after:?} generation(s) (was \
+         {alice_held:?}), bob {bob_after:?} received"
+    );
+    assert!(
+        alice_after.is_some() && alice_after <= alice_held && bob_after == Some(1),
+        "PRODUCT: a re-offer brought a deleted key back: alice holds {alice_after:?} (was \
+         {alice_held:?}), bob holds {bob_after:?} received (want 1)"
+    );
     drop(b);
 }

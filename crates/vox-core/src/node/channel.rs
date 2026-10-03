@@ -4752,10 +4752,13 @@ impl ChannelState {
     /// A generation `c` of `author` is no longer needed once this node holds `author`'s feed
     /// without a gap up to an entry under a later generation, and every entry under `c` in that
     /// stretch is rendered. A sender only moves forward, so no entry under `c` can follow one
-    /// under a later generation: none can still arrive. An entry whose body is gone (pruned by
-    /// retention) needs no key. Kept: the newest generation held, and every generation with an
-    /// entry not yet rendered — no consent on the log yet, say — or that may still be followed
-    /// by one (a gap, or no later generation yet). Returns how many generations went.
+    /// under a later generation: none can still arrive. An entry whose body has expired here
+    /// (PRD-001 R10) needs no key. **An entry whose body has not arrived and has not expired is
+    /// not received yet** (V030-10): it fills in later, and which generation it is under is
+    /// unknown until it does, so it counts as a gap. Kept: the newest generation held, and every
+    /// generation with an entry not yet rendered — no consent on the log yet, say — or that may
+    /// still be followed by one (a gap, a body still to come, or no later generation yet).
+    /// Returns how many generations went.
     pub fn prune_superseded_receivers(&mut self, store: &Store) -> Result<usize> {
         if self.poisoned {
             return Ok(0);
@@ -4783,7 +4786,12 @@ impl ChannelState {
                     break;
                 };
                 let Some(payload) = entry.payload.as_deref() else {
-                    continue;
+                    // Expired: its key is needed by nothing. Not expired: a body still to come,
+                    // under a generation not known yet — every generation from here on stays.
+                    if self.body_expired(entry.skeleton.claimed_ms, self.now_hint) {
+                        continue;
+                    }
+                    break;
                 };
                 if !matches!(classify_payload(payload), Ok(EntryKind::Content)) {
                     continue;
