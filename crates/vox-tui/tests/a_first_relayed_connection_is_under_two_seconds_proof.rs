@@ -24,8 +24,12 @@
 //! restart (samples 1–4 at 250–258 ms against sample 0's 6–30 ms, both trees), and could keep it:
 //! CI run 36418572653 had a sample at 30065 ms after the anchor closed the restarted process's
 //! connection. The anchor now supersedes another process's connections outright, so every restart
-//! sample is asserted under [`RESTART_WITHIN`], and the anchor must say it superseded the previous
-//! process on each restart and never put the restarted guest to a tie-break.
+//! sample reached on its first attempt is asserted under [`RESTART_WITHIN`], and the anchor must
+//! say it superseded the previous process on each restart and never put the restarted guest to a
+//! tie-break. A sample whose first attempt found no anchor connected yet ("no peer is connected to
+//! carry a circuit") waited on its own start-up, not on its predecessor, and `vox forward` retries
+//! it 500 ms later: it is held to R42 and not to the restart bound (seen at 861 ms, 2 attempts, on
+//! 2026-10-02). A run with no restart reached on its first attempt is CANNOT MEASURE.
 //!
 //! Mutations: make the ladder's circuit rung wait (or remove it) and every sample either exceeds
 //! [`R42`] or never connects; stop superseding another process's connections and the restart
@@ -66,6 +70,8 @@ const SAMPLES: usize = 5;
 /// fixed 150 ms read every restart as a wait on its predecessor.
 const RESTART_WITHIN: Duration =
     vox_core::node::network::DIRECT_HEAD_START.saturating_add(Duration::from_millis(150));
+/// What `vox forward` says of an attempt made before its node had any anchor connected.
+const NO_HELPER_YET: &str = "no peer is connected to carry a circuit";
 /// What the anchor says when a newcomer supersedes another process of its identity.
 const SUPERSEDED: &str = "a new connection is from a new process of this identity";
 
@@ -105,6 +111,8 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
     // Only what the anchor says from the first forward on counts for the restart claims.
     let mark = w.anchor.proc.transcript().lines().count();
     let mut samples: Vec<(u64, String)> = Vec::new();
+    // Per sample: an attempt before the one that got through found no anchor connected yet.
+    let mut before_its_anchor: Vec<bool> = Vec::new();
     for n in 0..SAMPLES {
         // A fresh `vox forward` each time: the previous one's process is killed by its PID first.
         drop(w.fwd.take());
@@ -127,6 +135,11 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
         let sample = reached(&said).unwrap_or_else(|| {
             panic!("sample {n}: the forward never said how long reaching the host took:\n{said}")
         });
+        before_its_anchor.push(
+            said.lines()
+                .take_while(|l| !l.contains("vox: reached "))
+                .any(|l| l.contains(NO_HELPER_YET)),
+        );
         samples.push(sample);
     }
     w.assert_relayed("after the samples");
@@ -181,14 +194,28 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
         SAMPLES - 1,
         weighed.len()
     );
+    let mut judged = 0;
     for (n, (m, line)) in samples.iter().enumerate().skip(1) {
+        if before_its_anchor[n] {
+            eprintln!(
+                "[proof] restart {n}: {m} ms, not held to {RESTART_WITHIN:?}: an attempt before it \
+                 found no anchor connected yet ({NO_HELPER_YET:?}), a wait on its own start-up"
+            );
+            continue;
+        }
+        judged += 1;
         assert!(
             Duration::from_millis(*m) < RESTART_WITHIN,
-            "restart {n} took {m} ms, over {RESTART_WITHIN:?} — a restarted process waited on its \
+            "PRODUCT: restart {n} took {m} ms, over {RESTART_WITHIN:?} — a restarted process waited on its \
              dead predecessor: {line}\nthe anchor said:\n{}",
             anchor_said.join("\n")
         );
     }
+    assert!(
+        judged > 0,
+        "CANNOT MEASURE: every restart's first attempt found no anchor connected yet, so none \
+         measures a wait on a predecessor"
+    );
     assert!(
         superseded >= SAMPLES - 1,
         "the anchor superseded the guest's previous process {superseded} time(s) in {} restarts:\n{}",
