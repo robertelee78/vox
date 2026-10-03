@@ -336,6 +336,10 @@ pub async fn apply_saying_waits(node: &NodeHandle, cmd: NodeCommand) -> Outcome 
                     eprintln!("{WAITING_FOR_PROFILE}");
                     said = true;
                 }
+                // Said while the verb waits: the node picks its port as it unlocks (V210-167).
+                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::NodeNote { note })) => {
+                    eprintln!("vox: {note}");
+                }
                 Some(_) => {}
                 // The actor is gone; the apply answers for itself.
                 None => said = true,
@@ -1078,6 +1082,7 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
                 crate::ident::author_id(peer)
             );
         }
+        NodeEvent::NodeNote { note } => eprintln!("vox: {note}"),
         _ => {}
     }
 }

@@ -815,6 +815,32 @@ impl ConnectionManager {
         Ok(filed)
     }
 
+    /// Whether `peer` answers at `candidates` (V210-167): `Ok` only if a connection authenticated
+    /// as `peer` is held on one of them, or one dialled there now completes. Unlike
+    /// [`Self::connect_to`], a connection held elsewhere — another port, a relay — does not count:
+    /// the question is whether these addresses are where the peer is.
+    ///
+    /// # Errors
+    /// Why no candidate answered as `peer`.
+    pub async fn answers_at(
+        &self,
+        peer: Digest32,
+        candidates: &[std::net::SocketAddr],
+    ) -> Result<Arc<VoxConnection>> {
+        let same = |a: &std::net::SocketAddr, b: &std::net::SocketAddr| {
+            a.port() == b.port() && a.ip().to_canonical() == b.ip().to_canonical()
+        };
+        if let Some(conn) = self.existing(&peer) {
+            let at = conn.quinn().remote_address();
+            if candidates.iter().any(|c| same(c, &at)) {
+                return Ok(conn);
+            }
+        }
+        let conn =
+            connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
+        Ok(self.file(conn).await)
+    }
+
     /// Accept the next inbound connection under `admission` and file it under the
     /// authenticated peer identity. `Ok(None)` when the endpoint is closed.
     ///
