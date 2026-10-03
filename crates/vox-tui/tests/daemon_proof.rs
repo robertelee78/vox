@@ -180,7 +180,7 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
         "PRODUCT: with no node running, `room list` must fail: {err:?}"
     );
     assert!(
-        err.contains("no node is running"),
+        err.contains("no vox daemon is running"),
         "PRODUCT: with no node running, `room list` must say what is wrong: {err:?}"
     );
 

@@ -89,9 +89,9 @@ impl Account {
         )
     }
 
-    /// Make node `name` with an identity, as a person does: `vox --profile <name> id`.
+    /// Make node `name` with an identity, as a person does: `vox id --node <name>`.
     fn make_node(&self, name: &str) -> String {
-        let (ok, out, err) = self.run(&["id", "--profile", name], "");
+        let (ok, out, err) = self.run(&["id", "--node", name], "");
         assert!(ok, "APPARATUS: vox id for {name}: {out}{err}");
         out.trim().to_owned()
     }
@@ -210,7 +210,7 @@ fn make_room(a: &Account, node: &str) -> String {
         &[
             "room",
             "create",
-            "--profile",
+            "--node",
             node,
             "--passphrase-file",
             "-",
@@ -220,7 +220,7 @@ fn make_room(a: &Account, node: &str) -> String {
         ROOM_PASS,
     );
     assert!(ok, "APPARATUS: room create on {node}: {out}{err}");
-    let (ok, list, err) = a.run(&["room", "list", "--profile", node], "");
+    let (ok, list, err) = a.run(&["room", "list", "--node", node], "");
     assert!(ok, "APPARATUS: room list on {node}: {err}");
     list.lines()
         .find_map(|l| l.split_whitespace().next().map(str::to_owned))
@@ -256,7 +256,7 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
         &[
             "room",
             "post",
-            "--profile",
+            "--node",
             "a",
             &room,
             "this holds BOOM-MARKER",
@@ -269,13 +269,13 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
         Duration::from_secs(20),
         |l| l.starts_with("vox daemon: node a detached (its actor panicked"),
     );
-    let (b_ok, b_out, b_err) = a.run(&["room", "list", "--profile", "b"], "");
+    let (b_ok, b_out, b_err) = a.run(&["room", "list", "--node", "b"], "");
     assert!(
         b_ok,
         "PRODUCT: node b stopped answering after node a's panic: {b_out}{b_err}\ndaemon:\n{}",
         d.said()
     );
-    let (a_ok, _, _) = a.run(&["room", "list", "--profile", "a"], "");
+    let (a_ok, _, _) = a.run(&["room", "list", "--node", "a"], "");
     assert!(
         !a_ok,
         "PRODUCT: node a still answers after its actor panicked"
@@ -339,7 +339,7 @@ fn two_hooks_start_one_daemon_attach_once_and_the_last_end_detaches() {
             next.1,
             next.2
         );
-        let (ok, _, err) = a.run(&["room", "list", "--profile", "agent"], "");
+        let (ok, _, err) = a.run(&["room", "list", "--node", "agent"], "");
         assert!(
             ok,
             "PRODUCT: round {round}: the node is not attached with session s-2 registered: \
