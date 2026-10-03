@@ -169,22 +169,25 @@ connection, bound to the TLS session by its exporter.
 27. **Neutral leaf.** The TLS 1.3 handshake MUST authenticate only the daemon: a self-signed leaf with
     no identity extension, generated once per daemon run and used for every connection of that run.
     The handshake MUST keep requirements 4, 10 and 13. The ALPN MUST be `vox/2`.
-28. **One exchange per connection,** on the first client-opened bidirectional stream, immediately
-    after the handshake, in three flights:
+28. **One exchange per connection,** on the first client-opened bidirectional stream, typed by its
+    first frame as the `identity` stream kind (requirement 19; its number assigned at build time),
+    immediately after the handshake, in three flights:
     1. dialler → `ASK { target_fp }`;
-    2. listener → `PROVE { target_pubkey, sig_target("vox-id/v2/resp" ‖ E ‖ target_fp) }`, or the
-       generic refusal (requirement 32);
+    2. listener → `PROVE { target_pubkey, instance_t, sig_target("vox-id/v2/resp" ‖ E ‖ target_fp ‖
+       instance_t) }`, or the generic refusal (requirement 32);
     3. dialler, only after checking flight 2 against the pinned expected peer →
-       `CLAIM { dialler_pubkey, sig_dialler("vox-id/v2/init" ‖ E ‖ target_fp ‖ dialler_fp) }`.
+       `CLAIM { dialler_pubkey, instance_d, sig_dialler("vox-id/v2/init" ‖ E ‖ target_fp ‖ dialler_fp ‖
+       instance_d) }`.
 
-    Signatures are composite Ed25519+ML-DSA (ADR-002), so authentication stays post-quantum. Flight 3
-    MAY carry the dialler's first application bytes.
+    `instance_t` and `instance_d` MUST each be the signing node's 16-byte random value, drawn anew each
+    time that node attaches (ADR-026 I-3). Signatures are composite Ed25519+ML-DSA (ADR-002), so
+    authentication stays post-quantum. Flight 3 MAY carry the dialler's first application bytes.
 
     **Encoding.** Each flight MUST be one canonical CBOR array (ADR-008) in one length-prefixed frame
     (requirement 18), led by a struct tag from `wire.rs`'s registry:
     - `ASK = [tag_ask, version, target_fp]`;
-    - `PROVE = [tag_prove, version, target_composite_pubkey, sig]`;
-    - `CLAIM = [tag_claim, version, dialler_composite_pubkey, sig]`.
+    - `PROVE = [tag_prove, version, target_composite_pubkey, instance, sig]`;
+    - `CLAIM = [tag_claim, version, dialler_composite_pubkey, instance, sig]`.
 
     The three tags MUST be the next free tags in `wire.rs` when this is built. The highest on the
     land tree is `0x0018`, and the governance work (V030-32) is adding `0x0019` onward, so the
@@ -200,27 +203,37 @@ connection, bound to the TLS session by its exporter.
 31. **Direction labels.** The listener signs `vox-id/v2/resp` and the dialler `vox-id/v2/init`, so a
     flight MUST NOT verify in the other role, including between two nodes of one daemon.
 32. **Generic refusal.** One refusal, byte-identical on the wire, MUST answer: an unknown target, a
-    target attached but locked, a detached target, a malformed or oversize flight, and a
-    rate-limited source. The refusal MUST be the connection closed with one application close code,
+    detached target, a malformed or oversize flight, and a rate-limited source. (There is no locked
+    node, ADR-026 N-2.) The refusal MUST be the connection closed with one application close code,
     a single new `WireError` code meaning "not available" (its number assigned at build time against
     `wire.rs`, after `Superseded` `0x0E`), with no reason text and no flight.
     **Timing.** The listener MUST send every outcome of an `ASK`, a `PROVE` or a refusal, no earlier
     than 50 ms after the `ASK` arrived plus a uniformly random 0–50 ms, so a refusal and a `PROVE` are
     not told apart by timing at the scale an ML-DSA signature takes.
-33. **Nothing before the exchange.** Until flight 3 verifies, any other stream (bidirectional or
-    unidirectional), any datagram, a second `ASK` or `CLAIM`, a malformed flight, or an exchange not
-    finished within 5 s MUST close the connection. Nothing above the transport sees the connection,
-    and no session-establishment record (requirement 12) is written, until then.
-34. **Cost discipline.** The listener MUST sign only after the per-source rate limit and the
-    pre-identity connection cap admit the `ASK`.
+33. **Nothing before the exchange.** QUIC's own limits MUST hold a connection to the exchange until
+    flight 3 verifies: at most 2 client-opened bidirectional streams, 0 unidirectional streams and a
+    64 KiB connection window. The listener MUST raise them to the normal values (requirement 24) only
+    after `CLAIM` verifies. Until then:
+    - a datagram received before the listener has sent `PROVE` MUST close the connection;
+    - a second `ASK` or `CLAIM`, a malformed flight, or an exchange not finished within 5 s MUST close
+      it;
+    - nothing above the transport sees the connection, and no session-establishment record
+      (requirement 12) is written.
+
+    After the exchange, a stream that opens with the `identity` kind MUST close the connection.
+34. **Cost discipline.** The listener MUST apply the per-source rate limit before it looks the target
+    up, and MUST sign only after the rate limit and the pre-identity connection cap admit the `ASK`.
     - The rate limit MUST be 8 `ASK`s per second per source IP address, with a burst of 16. An `ASK`
       over the limit MUST get the refusal (requirement 32).
     - Pre-identity connections MUST share the accept gate's cap of 64 handshakes in flight
-      (`HANDSHAKES_IN_FLIGHT`, requirement 20) and MUST time out after 5 s. The node's long-term key signs once
-    per accepted connection.
+      (`HANDSHAKES_IN_FLIGHT`, requirement 20) and MUST time out after 5 s.
+    - A node's long-term key signs once per accepted connection. A detaching node's signer MUST be
+      unregistered from the exchange before its keys are wiped (ADR-026 L-3).
 35. **After the exchange.** The listener MUST apply admission (trust, join gate; ADR-016) as the
     target node. The result MUST fill the verified-peer slot the handshake verifier fills today, so a
-    connection means (local node, remote node, remote daemon leaf) to everything above the transport.
+    connection means (local node, remote node, remote process) to everything above the transport,
+    where the remote process is `sha256(remote daemon leaf ‖ instance)`: a node that re-attaches is a
+    new process (ADR-026 I-3).
 36. **Everywhere.** The exchange MUST run on every Vox connection: direct dials, hole-punched
     connections, the inner connection of a relay circuit (ADR-012), and between two nodes of one
     daemon over its own address.
@@ -229,10 +242,12 @@ connection, bound to the TLS session by its exporter.
     extension (tag `0x0009`) then apply to nothing; of #382's work (V030-33), only the session
     record's observed group (requirement 12) stays in force.
 38. **Latency.** The exchange adds one round trip before the dialler may send and about 1.5 round
-    trips to the listener's admission. R40 (under 1 s) and R42 (under 2 s) MUST be re-measured with
-    it.
+    trips to the listener's admission. R40 (under 1 s) and R42 (under 2 s), and the hole punch's
+    attempt timeout (ADR-012 `PUNCH_ATTEMPT_TIMEOUT`), MUST be re-measured with it.
+38a. **Diagnostics.** A dialler whose expected node does not answer MUST say "nothing at `<address>`
+    answers as `<expected node>`", and MUST NOT name anyone else (ADR-026 G-1).
 39. **Accepted cost (ADR-026).** A party that knows a node's fingerprint can test, by naming it,
-    whether that node is hosted and unlocked at an address. The generic refusal (requirement 32)
+    whether that node is attached at an address. The generic refusal (requirement 32)
     keeps it from learning anything more.
 40. **Proofs**, by real use of the shipped binary (ADR-018), each with its mutant:
     - path privacy: a UDP proxy records every datagram of setup and no fingerprint appears (mutant:
@@ -242,11 +257,14 @@ connection, bound to the TLS session by its exporter.
     - reflection: a `PROVE` fed back as a `CLAIM` is refused (mutant: one shared label);
     - responder first: a fake listener at a node's address, without its key, never receives the
       dialler's `CLAIM` (mutant: `CLAIM` sent before `PROVE` is checked);
-    - no further oracle: unknown, locked and detached targets get byte-identical refusals in the same
-      timing window (mutant: a distinct refusal for locked);
-    - pre-identity gating: datagrams or extra streams before the exchange close the connection, and a
-      flood of pre-identity connections is capped and times out (mutant: the datagram router started
-      before the exchange).
+    - no further oracle: unknown and detached targets and a rate-limited source get byte-identical
+      refusals in the same timing window (mutant: a distinct refusal for detached);
+    - pre-identity gating: a datagram before `PROVE` closes the connection, a third bidirectional or
+      any unidirectional stream is refused by QUIC's limits, and a flood of pre-identity connections
+      is capped and times out (mutants: the datagram router started before the exchange; the limits
+      raised before `CLAIM` verifies);
+    - re-attach: a node that detaches and re-attaches is seen by its peers as a new process (mutant:
+      the instance left out of the process identity).
 
 ## Known limits
 
