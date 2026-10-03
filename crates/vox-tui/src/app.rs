@@ -1173,7 +1173,7 @@ mod no_echo {
 
 /// Open every closed room `line` opens, as `vox daemon` reads a room line: the whole line as a
 /// passphrase first, then `<room> <passphrase>`.
-async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle, line: &str) {
+pub(crate) async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle, line: &str) {
     // **Each line is resolved, not parsed.** The obvious split — `<room> <pass>`
     // on the first space — is ambiguous the moment a passphrase contains a
     // space, and passphrases contain spaces: this file already notes that one
