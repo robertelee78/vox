@@ -940,6 +940,11 @@ impl World {
 
     /// `vox forward <room> <host> <port>` from `dir`; returns it and the address it bound.
     pub fn forward(&self, name: &str, dir: &Path) -> (VoxProc, SocketAddr) {
+        self.forward_port(name, dir, self.service_port)
+    }
+
+    /// [`World::forward`] to `port` on the host, which need not be a port it offers.
+    pub fn forward_port(&self, name: &str, dir: &Path, port: u16) -> (VoxProc, SocketAddr) {
         let mut fwd = VoxProc::spawn(
             name,
             dir,
@@ -947,7 +952,7 @@ impl World {
                 "forward",
                 &self.room,
                 &self.host_fp,
-                &self.service_port.to_string(),
+                &port.to_string(),
                 "127.0.0.1:0",
                 "--passphrase-file",
                 &self.passphrase_file(),
@@ -998,19 +1003,33 @@ pub fn address_in(p: &mut VoxProc, line: &str, nth: usize) -> SocketAddr {
 /// The proxy is `vox up`, so a proxy that refuses the connection, closes or stalls mid-handshake,
 /// or answers something that is not SOCKS5 is a `PRODUCT:` red quoting every byte it sent.
 pub fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> (u8, TcpStream) {
+    // Longer than the proxy's own patience, so its verdict is what this reports.
+    let patience = vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30);
+    socks5_connect_within(proxy, host, port, patience, None)
+}
+
+/// [`socks5_connect`], reading each part of the reply for at most `patience`. A proof that bounds
+/// how soon the proxy must answer (a refusal is immediate, PRD-001 R23) passes `silent`: the
+/// `PRODUCT:` red it fails with when the proxy is still silent at `patience`, so the bound is
+/// asserted by the proof itself, not left to the watchdog.
+pub fn socks5_connect_within(
+    proxy: SocketAddr,
+    host: &str,
+    port: u16,
+    patience: Duration,
+    silent: Option<&str>,
+) -> (u8, TcpStream) {
     let mut s = TcpStream::connect(proxy).unwrap_or_else(|e| {
         panic!(
             "PRODUCT: the proxy at {proxy}, which said it was listening, refused a connection: {e}"
         )
     });
-    // Longer than the proxy's own patience, so its verdict is what this reports.
-    let patience = vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30);
     s.set_read_timeout(Some(patience)).unwrap_or_else(|e| {
         panic!("APPARATUS: could not set a read timeout on the proxy socket: {e}")
     });
     let mut got = Vec::new();
     socks_write(&mut s, &[0x05, 0x01, 0x00], "its greeting", &got);
-    let hello = socks_read(&mut s, 2, "its method choice", &mut got);
+    let hello = socks_read(&mut s, 2, "its method choice", &mut got, silent);
     assert!(
         hello == [0x05, 0x00],
         "PRODUCT: the proxy refused the no-auth method: it sent {got:02x?}"
@@ -1022,7 +1041,7 @@ pub fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> (u8, TcpStrea
     req.extend_from_slice(host.as_bytes());
     req.extend_from_slice(&port.to_be_bytes());
     socks_write(&mut s, &req, "the CONNECT request", &got);
-    let head = socks_read(&mut s, 4, "its CONNECT reply", &mut got);
+    let head = socks_read(&mut s, 4, "its CONNECT reply", &mut got, silent);
     assert!(
         head[0] == 0x05,
         "PRODUCT: the proxy's CONNECT reply is not SOCKS5: it sent {got:02x?}"
@@ -1040,6 +1059,7 @@ pub fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> (u8, TcpStrea
         skip,
         "the bound address in its CONNECT reply",
         &mut got,
+        silent,
     );
     (head[1], s)
 }
@@ -1056,8 +1076,15 @@ fn socks_write(s: &mut TcpStream, bytes: &[u8], what: &str, got: &[u8]) {
 }
 
 /// Read exactly `n` bytes of the proxy's reply, appending them to `got`, or a `PRODUCT:` red quoting
-/// everything it did send: it closed, reset or went silent mid-handshake.
-fn socks_read(s: &mut TcpStream, n: usize, what: &str, got: &mut Vec<u8>) -> Vec<u8> {
+/// everything it did send: it closed, reset or went silent mid-handshake. Silent past the read
+/// timeout, the red is `silent` when the caller gave one.
+fn socks_read(
+    s: &mut TcpStream,
+    n: usize,
+    what: &str,
+    got: &mut Vec<u8>,
+    silent: Option<&str>,
+) -> Vec<u8> {
     let t0 = Instant::now();
     let mut part = vec![0u8; n];
     let mut have = 0;
@@ -1070,6 +1097,22 @@ fn socks_read(s: &mut TcpStream, n: usize, what: &str, got: &mut Vec<u8>) -> Vec
             ),
             Ok(k) => have += k,
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if let Some(red) = silent {
+                    panic!(
+                        "{red}: no reply within {:?}, {have} of {n} bytes into {what}. Everything \
+                         it sent: {:02x?}",
+                        t0.elapsed(),
+                        [&got[..], &part[..have]].concat()
+                    )
+                }
+                panic!(
+                    "PRODUCT: the proxy went silent during the SOCKS handshake, {have} of {n} \
+                     bytes into {what}, for {:?}. Everything it sent: {:02x?}",
+                    t0.elapsed(),
+                    [&got[..], &part[..have]].concat()
+                )
+            }
             Err(e) => panic!(
                 "PRODUCT: the proxy failed during the SOCKS handshake, {have} of {n} bytes into \
                  {what}, after {:?}: {e} (kind {:?}). Everything it sent: {:02x?}",
@@ -1095,7 +1138,7 @@ pub fn round_trip(at: SocketAddr, payload: &[u8], patience: Duration) -> std::io
 }
 
 /// How a read ended: bytes, an orderly EOF, a reset, or still open when the clock ran out.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ending {
     Eof,
     Reset,

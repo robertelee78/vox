@@ -14,7 +14,13 @@
 //! A line in [`StatusReport::unhealthy`] is something an operator should look at:
 //!
 //! - a room with other members that has not completed a sync in [`STALE_SYNC_SECS`];
-//! - a **trusted** member of an open room this node was connected to and no longer is.
+//! - a **trusted** member of an open room this node was connected to and no longer is;
+//! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_SECS`], while
+//!   this node needs one. An anchor only bridges hosts that cannot otherwise find each other
+//!   (ADR-012), so an anchor this node does not need alarms no one: the line is raised only while
+//!   an open room has a trusted member this node does not hold a direct connection to (one it
+//!   reaches over a relay, or not at all). Every member reached directly, or no member at all,
+//!   and a lost anchor costs nothing now. The line says what it costs and what it does not.
 //!
 //! An untrusted member that is offline is not flagged: nothing this node does depends on
 //! reaching it. A trusted one is who this node reads, and is read by.
@@ -59,6 +65,11 @@ use crate::transport::router::DatagramStats;
 /// A room with other members and no completed sync for this long is flagged.
 pub const STALE_SYNC_SECS: u64 = 10 * 60;
 
+/// An anchor this node keeps and has not reached for this long is flagged (PRD-001 R37). Long
+/// enough that an anchor restarting, which members are back from within seconds (V210-86), never
+/// interrupts anyone.
+pub const ANCHOR_UNREACHABLE_SECS: u64 = 60;
+
 /// The ledgers this module keeps beside the node's own state.
 #[derive(Debug, Default)]
 pub struct StatusBook {
@@ -102,19 +113,21 @@ pub struct RoomStatus {
     /// When a sync this node ran there last completed.
     pub last_sync: Option<u64>,
     /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
-    /// and the node's own (ADR-023 decision 2). `None` when the room was mid-session and could
-    /// not be read without waiting.
-    pub retention: Option<u64>,
+    /// and the node's own (ADR-023 decision 2).
+    ///
+    /// This and the three below come from the room as the node last published it, so they are
+    /// answered while a sync session holds the room. Read from the room itself they were `null`
+    /// for as long as a session ran: a person reading `vox status` saw no retention, "(busy)" for
+    /// the keys held and no frozen member, with no reason (#58, #59).
+    pub retention: u64,
     /// How many generations of this node's own sender key it still holds here (PRD-001
-    /// R14: one, unless a full-history grant is still owed). `None` when the room was
-    /// mid-session and could not be read without waiting.
-    pub key_generations: Option<usize>,
-    /// Authors this node froze here for signing two entries at one position (ADR-008). `None`
-    /// when the room was mid-session and could not be read without waiting.
-    pub frozen: Option<Vec<Digest32>>,
+    /// R14: one, unless a full-history grant is still owed).
+    pub key_generations: usize,
+    /// Authors this node froze here for signing two entries at one position (ADR-008).
+    pub frozen: Vec<Digest32>,
     /// Entries this node refused here as at or below their author's checkpoint since it opened
-    /// the room (ADR-023 decision 3). `None` as for `frozen`.
-    pub refused_below_checkpoint: Option<u64>,
+    /// the room (ADR-023 decision 3).
+    pub refused_below_checkpoint: u64,
     /// Its members.
     pub members: Vec<MemberStatus>,
 }
@@ -178,15 +191,26 @@ pub struct StatusReport {
     pub app: AppStats,
     /// Every live UDP flow, hosted or dialled, with its own counters (ADR-022 6.9, V030-34).
     pub udp_flows: Vec<crate::tunnel::udp::FlowInfo>,
+    /// The anchors this node keeps, and whether it reaches them.
+    pub anchors: Vec<AnchorStatus>,
     /// What needs looking at.
     pub unhealthy: Vec<Unhealthy>,
+}
+
+/// One anchor this node keeps: configured, or named by an open room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorStatus {
+    /// Its identity.
+    pub id: Digest32,
+    /// Since when this node has not reached it (unix seconds); `None` while it is reached.
+    pub unreached_since: Option<u64>,
 }
 
 /// One condition that needs looking at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unhealthy {
-    /// A stable name for the condition — `peer-unreachable:<room>:<peer>` or
-    /// `room-stale:<room>` — the same for as long as the condition holds, so a notifier
+    /// A stable name for the condition — `peer-unreachable:<room>:<peer>`, `room-stale:<room>`
+    /// or `anchor-unreachable:<anchor>` — the same for as long as the condition holds, so a notifier
     /// can tell it starting from it continuing (PRD-001 R37).
     pub key: String,
     /// What a person reads. May change while the condition holds ("last seen 12s ago").
@@ -244,6 +268,33 @@ impl StatusReport {
                 }
             }
         }
+        // Whether this node needs an anchor now (ADR-012: an anchor only bridges): some open room
+        // has a trusted member it holds no direct connection to.
+        let direct = |id: &Digest32| self.peers.iter().any(|p| p.id == *id && p.path == "direct");
+        let needs_a_bridge = self.rooms.iter().any(|room| {
+            room.members
+                .iter()
+                .any(|m| !m.me && m.trusted && !direct(&m.id))
+        });
+        if self.networked && needs_a_bridge {
+            for a in &self.anchors {
+                let Some(since) = a.unreached_since else {
+                    continue;
+                };
+                let for_secs = self.now.saturating_sub(since);
+                if for_secs > ANCHOR_UNREACHABLE_SECS {
+                    out.push(Unhealthy {
+                        key: format!("anchor-unreachable:{}", b32_encode(&a.id)),
+                        message: format!(
+                            "anchor {} unreachable for {for_secs}s: a host that can find this \
+                             node only through it cannot reach it until it is back; peers this \
+                             node reaches directly are unaffected",
+                            short(&a.id)
+                        ),
+                    });
+                }
+            }
+        }
         self.unhealthy = out;
     }
 
@@ -281,19 +332,17 @@ impl StatusReport {
                     opt(m.last_sync)
                 )
             });
+            let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"frozen\":{},\"refused_below_checkpoint\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
                 opt(r.last_sync),
-                opt(r.retention),
-                opt(r.key_generations.map(|n| n as u64)),
-                r.frozen.as_ref().map_or("null".into(), |f| format!(
-                    "[{}]",
-                    list(f.iter().map(|d| q(&b32_encode(d))))
-                )),
-                opt(r.refused_below_checkpoint),
+                r.retention,
+                r.key_generations,
+                frozen,
+                r.refused_below_checkpoint,
                 list(members)
             )
         });
@@ -351,6 +400,16 @@ impl StatusReport {
             )
         });
         let _ = write!(j, "\"udp_flows\":[{}],", list(flows));
+        let _ = write!(
+            j,
+            "\"anchors\":[{}],",
+            list(self.anchors.iter().map(|a| format!(
+                "{{\"id\":{},\"reached\":{},\"unreached_since\":{}}}",
+                q(&b32_encode(&a.id)),
+                a.unreached_since.is_none(),
+                opt(a.unreached_since)
+            )))
+        );
         let _ = write!(
             j,
             "\"unhealthy\":[{}]",
