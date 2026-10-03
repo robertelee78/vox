@@ -725,6 +725,19 @@ enum RoomCmd {
     Tail(RoomTailArgs),
     /// Print the fingerprints of the room's members.
     Roster(RoomRefArgs),
+    /// Ask a member's node which agent sessions it holds, and whether each can be reached
+    /// (V030-16).
+    ///
+    /// The ping is answered by that node's **daemon**, never by a model: it lists each session,
+    /// whether an urgent message interrupts it, and when it last read. Pings and answers are
+    /// never shown to a model and wake no one. A node answers only a member it trusts, so no
+    /// answer cannot tell an offline node and missing trust in either direction apart, and says
+    /// so. Exits 1 when no answer comes within `--wait`.
+    ///
+    /// ```text
+    /// vox room ping <room> carol
+    /// ```
+    Ping(RoomPingArgs),
     /// List the rooms this node holds.
     List(ProfileArgs),
     /// Take a unit of work, so no other agent starts it (ADR-020 §5).
@@ -1145,6 +1158,52 @@ enum AgentCmd {
     /// vox agent trust codex
     /// ```
     Trust(AgentTrustArgs),
+    /// Check that this node's agent sessions are wired up, and say how to fix what is not
+    /// (V030-16).
+    ///
+    /// One line per check, `ok`, `warn` or `fail`, each with a one-line fix: the node answers;
+    /// the room resolves; Claude Code's hook entries exist once at user scope; Codex's hook is
+    /// trusted; the OpenCode plugin is this build's; the drain can read the room and record its
+    /// place; each session's record (first seen, last drained, idle or busy, wake endpoint
+    /// alive); trust in each direction with every member; and the members' versions. `warn` is
+    /// something not set up, `fail` something set up that will not work. Exits 1 on any `fail`.
+    /// It only reads: it starts no harness or model, changes nothing and wakes no one.
+    ///
+    /// ```text
+    /// vox agent doctor --room <room>
+    /// ```
+    Doctor(AgentDoctorArgs),
+}
+
+/// `vox agent doctor`
+#[derive(Args, Debug, Clone)]
+pub struct AgentDoctorArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room to check, or a unique prefix. Falls back to `VOX_ROOM`, then to the node's only
+    /// room.
+    #[arg(long)]
+    pub room: Option<String>,
+    /// One `vox.agent.doctor/1` JSON object instead of lines.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `vox room ping`
+#[derive(Args, Debug, Clone)]
+pub struct RoomPingArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The member to ask: this node's name for it, or its fingerprint.
+    pub member: String,
+    /// How long to wait for an answer, in seconds.
+    #[arg(long, default_value_t = 30)]
+    pub wait: u64,
+    /// One `vox.room.ping/1` JSON object instead of lines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `vox agent skill`
@@ -2060,6 +2119,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Post(a) => &a.profile,
                 RoomCmd::Read(a) => &a.profile,
                 RoomCmd::Roster(a) => &a.profile,
+                RoomCmd::Ping(a) => &a.profile,
                 RoomCmd::Tail(a) => &a.profile,
                 RoomCmd::Board(a) => &a.profile,
                 RoomCmd::List(p) => p,
@@ -2131,6 +2191,16 @@ pub fn run() -> ExitCode {
                             crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
                         }
                         RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
+                        RoomCmd::Ping(a) => {
+                            crate::ping::ping(
+                                &paths,
+                                &a.room,
+                                &a.member,
+                                std::time::Duration::from_secs(a.wait),
+                                a.json,
+                            )
+                            .await
+                        }
                         RoomCmd::List(_) => crate::room_cli::list(&paths).await,
                         RoomCmd::Claim(a) => {
                             crate::room_cli::claim_resource(
@@ -2453,6 +2523,36 @@ pub fn run() -> ExitCode {
                 Err(e) => {
                     use std::io::Write as _;
                     let _ = writeln!(io::stderr(), "vox: {e}");
+                    e.exit_code()
+                }
+            }
+        }
+        Cmd::Agent(AgentCmd::Doctor(args)) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(crate::doctor::doctor(
+                &paths,
+                args.room.as_deref(),
+                args.json,
+            )) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
                     e.exit_code()
                 }
             }

@@ -85,6 +85,56 @@ pub struct Session {
     /// When the harness last said so, in Unix milliseconds.
     #[serde(default)]
     pub state_ms: u64,
+    /// When this session first registered, in Unix milliseconds (V030-16). Kept as every later
+    /// turn rewrites the record.
+    #[serde(default)]
+    pub first_seen_ms: u64,
+    /// When its drain last ran, in Unix milliseconds: the last time it read its rooms.
+    #[serde(default)]
+    pub last_drained_ms: u64,
+}
+
+/// How a registered session can be reached now (V030-16), as `vox agent doctor` and a pong
+/// report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// Its wake endpoint accepts a connection: an urgent message to its node interrupts it.
+    Interrupt,
+    /// It has no wake path (Codex, which Vox never interrupts, or a harness Vox does not know):
+    /// it reads at its next turn.
+    Turn,
+    /// Its wake endpoint is gone: its harness exited or restarted, and nothing reaches it until
+    /// it registers again on its next turn.
+    Gone(String),
+}
+
+impl Reach {
+    /// A short machine token: `interrupt`, `turn` or `gone`.
+    #[must_use]
+    pub fn token(&self) -> &'static str {
+        match self {
+            Reach::Interrupt => "interrupt",
+            Reach::Turn => "turn",
+            Reach::Gone(_) => "gone",
+        }
+    }
+}
+
+/// Whether `session` can be woken now: a connection to its endpoint, closed at once, so nothing
+/// is delivered and nothing is woken.
+pub async fn reach(session: &Session) -> Reach {
+    if !wakeable(&session.harness) {
+        return Reach::Turn;
+    }
+    if session.endpoint.is_empty() {
+        return Reach::Gone("it registered no wake endpoint".into());
+    }
+    let probe = tokio::net::UnixStream::connect(&session.endpoint);
+    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+        Ok(Ok(_)) => Reach::Interrupt,
+        Ok(Err(e)) => Reach::Gone(format!("{}: {e}", session.endpoint)),
+        Err(_) => Reach::Gone(format!("{}: no answer within 2 s", session.endpoint)),
+    }
 }
 
 /// A session whose turn is running: its drain ran and no end of turn has been heard since.
@@ -164,7 +214,7 @@ pub fn reachability(paths: &Paths, session: &str) -> &'static str {
 /// session registered by it would have its wakes sent to the Claude session. Vox never wakes a
 /// Codex session (V210-169); it is registered with no endpoint, so the poster is told so.
 pub fn register(paths: &Paths, session: &str, codex: bool) {
-    let reg = if codex {
+    let mut reg = if codex {
         Session {
             session: session.to_owned(),
             harness: "codex".into(),
@@ -172,6 +222,8 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
             token: String::new(),
             state: BUSY.into(),
             state_ms: now_millis(),
+            first_seen_ms: 0,
+            last_drained_ms: 0,
         }
     } else if let (Ok(endpoint), Ok(token)) = (
         std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -184,6 +236,8 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
             token,
             state: BUSY.into(),
             state_ms: now_millis(),
+            first_seen_ms: 0,
+            last_drained_ms: 0,
         }
     } else if let (Ok(endpoint), Ok(token)) = (
         std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -196,6 +250,8 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
             token,
             state: BUSY.into(),
             state_ms: now_millis(),
+            first_seen_ms: 0,
+            last_drained_ms: 0,
         }
     } else {
         Session {
@@ -205,8 +261,17 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
             token: String::new(),
             state: BUSY.into(),
             state_ms: now_millis(),
+            first_seen_ms: 0,
+            last_drained_ms: 0,
         }
     };
+    // When the session was first seen outlives this turn's rewrite (V030-16).
+    let now = now_millis();
+    reg.first_seen_ms = load(paths, session)
+        .map(|b| b.first_seen_ms)
+        .filter(|&t| t != 0)
+        .unwrap_or(now);
+    reg.last_drained_ms = now;
     let dir = paths.session_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;

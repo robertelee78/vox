@@ -1938,6 +1938,17 @@ pub fn run_daemon(
                                     // The view — every open room's timeline — is copied only
                                     // for a message that could interrupt someone.
                                     if seen.insert(row.entry_hash) {
+                                        // A ping is the daemon's to answer, never a model's
+                                        // (V030-16).
+                                        if crate::ping::is_ping(&row.text) {
+                                            crate::ping::answer(
+                                                &node,
+                                                &paths,
+                                                &node.view(),
+                                                channel_id,
+                                                &row,
+                                            );
+                                        }
                                         if may_wake(&row.text) {
                                             judge(&paths, &node.view(), &channel_id, &row);
                                         }
@@ -1961,6 +1972,7 @@ pub fn run_daemon(
                     // Every unseen row is marked seen; only one that could interrupt
                     // someone is copied out to be judged.
                     let mut fresh = Vec::new();
+                    let mut pings = Vec::new();
                     for d in &view.open_channels {
                         let from = match swept.get(&d.channel_id) {
                             Some(&(n, last))
@@ -1978,6 +1990,9 @@ pub fn run_daemon(
                             if may_wake(&r.text) {
                                 fresh.push((d.channel_id, r.clone()));
                             }
+                            if crate::ping::is_ping(&r.text) {
+                                pings.push((d.channel_id, r.clone()));
+                            }
                             if may_answer(&r.text) {
                                 answered.insert(d.channel_id);
                             }
@@ -1989,6 +2004,9 @@ pub fn run_daemon(
                     }
                     for (cid, row) in fresh {
                         judge(&paths, &view, &cid, &row);
+                    }
+                    for (cid, row) in pings {
+                        crate::ping::answer(&node, &paths, &view, cid, &row);
                     }
                     tend(&paths, &view, &answered, &mut tending);
                     answered.clear();

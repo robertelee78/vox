@@ -324,7 +324,7 @@ async fn members_of(
 /// `--to`, as the envelope carries it (V210-161): each word resolved by the poster, once, to a
 /// member's whole fingerprint, so every reader resolves it to the same node. A word that names
 /// no member is refused, saying why.
-async fn addressees(
+pub(crate) async fn addressees(
     client: &mut IpcClient,
     channel_id: Digest32,
     words: &[String],
