@@ -34,13 +34,12 @@
 //!   with its in-process client's `promptAsync`, which starts a turn when the session is
 //!   idle and is taken at the next step boundary mid-turn. It answers one line, so a
 //!   session OpenCode no longer knows is told apart from one that took the prompt.
-//! - **Codex** — reachable in principle through its app-server: `turn/start` when the
-//!   thread is idle, `turn/steer` with `expectedTurnId` when a turn is running (a
-//!   mid-turn `turn/start` is folded into that turn — ADR-020 M19.12). But
-//!   this build has no verified path to that socket from a hook's environment, so
-//!   it is **named and not implemented**. A registration for it is written and
-//!   waking it reports plainly that it cannot, rather than failing silently or
-//!   pretending.
+//! - **Codex** — **not woken, by decision** (V210-169). Its app-server can start a turn on a
+//!   thread it holds, but it keeps a session's thread loaded for a while after the user quits,
+//!   so a wake sent there would start a model turn in a session nobody is in. Vox never starts
+//!   a model run. A Codex session is registered so that the poster of an urgent message to it
+//!   is told, in one line, that it cannot be interrupted and reads the message at its next
+//!   turn ([`uninterruptible`]).
 
 use std::path::Path;
 
@@ -74,9 +73,22 @@ pub struct Session {
 ///
 /// Best effort on purpose: a session that cannot be woken should still be able to
 /// read its room, so every failure here is silent and leaves the drain working.
-pub fn register(paths: &Paths, session: &str, room: &str) {
+///
+/// `codex` says the hook's input is Codex's ([`codex_input`]). It is checked first: a Codex
+/// started from a Claude Code terminal inherits that terminal's messaging socket, and a Codex
+/// session registered by it would have its wakes sent to the Claude session.
+pub fn register(paths: &Paths, session: &str, room: &str, codex: bool) {
     let name = std::env::var("VOX_AGENT_NAME").unwrap_or_default();
-    let reg = if let (Ok(endpoint), Ok(token)) = (
+    let reg = if codex {
+        Session {
+            session: session.to_owned(),
+            harness: "codex".into(),
+            room: room.to_owned(),
+            name,
+            endpoint: String::new(),
+            token: String::new(),
+        }
+    } else if let (Ok(endpoint), Ok(token)) = (
         std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
         std::env::var("CLAUDE_CODE_MESSAGING_TOKEN"),
     ) {
@@ -117,6 +129,56 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
     if let Ok(body) = serde_json::to_vec(&reg) {
         let _ = vox_core::node::paths::write_private_file(&paths.session_file(session), &body);
     }
+}
+
+/// Whether a hook's input is Codex's: it names a Codex rollout (`rollout-*.jsonl`) as the
+/// transcript, or carries Codex's `turn_id`. Read from the input, not the environment, which a
+/// Codex started from another harness's terminal inherits.
+#[must_use]
+pub fn codex_input(transcript_path: &str, has_turn_id: bool) -> bool {
+    has_turn_id
+        || Path::new(transcript_path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.starts_with("rollout-") && f.ends_with(".jsonl"))
+}
+
+/// What the poster of an urgent message to `to` in `room` is told (V210-169): one line for
+/// each addressee that a session here answers to, by name or session id, and that cannot be
+/// interrupted. A Codex session never can be. An addressee no session here answers to is not
+/// mentioned: it may be another node's.
+#[must_use]
+pub fn uninterruptible(paths: &Paths, room: &str, to: &[String]) -> Vec<String> {
+    let sessions: Vec<Session> = registered(paths)
+        .into_iter()
+        .filter(|s| s.room == room)
+        .collect();
+    let mut lines = Vec::new();
+    for addressee in to {
+        let answering = sessions
+            .iter()
+            .filter(|s| s.session == *addressee || (!s.name.is_empty() && s.name == *addressee));
+        let (codex, other): (Vec<&Session>, Vec<&Session>) =
+            answering.partition(|s| s.harness == "codex");
+        match codex.len() {
+            0 => {}
+            1 => lines.push(format!(
+                "the Codex session here that answers to {addressee} cannot be interrupted; it \
+                 reads this message at its next turn."
+            )),
+            n => lines.push(format!(
+                "the {n} Codex sessions here that answer to {addressee} cannot be interrupted; \
+                 they read this message at their next turn."
+            )),
+        }
+        if !other.is_empty() && other.iter().all(|s| s.endpoint.is_empty()) {
+            lines.push(format!(
+                "{addressee} cannot be interrupted: its session left Vox no way to reach it; it \
+                 reads this message at its next turn."
+            ));
+        }
+    }
+    lines
 }
 
 /// Every session that has registered a wake channel.
@@ -350,9 +412,10 @@ pub async fn wake(session: &Session, entry: &str, text: &str) -> Result<(), Wake
             )
             .await
         }
+        // Never woken (V210-169): Codex keeps a quit session's thread loaded, so a turn started
+        // there could run with nobody in the session.
         "codex" => Err(WakeError::Failed(
-            "codex sessions cannot be interrupted by this build; the message waits for the \
-             session's next turn"
+            "Vox does not interrupt Codex sessions; the message waits for the session's next turn"
                 .into(),
         )),
         other => Err(WakeError::Failed(format!(

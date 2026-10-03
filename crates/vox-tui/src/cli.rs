@@ -1958,18 +1958,25 @@ pub fn run() -> ExitCode {
                 );
                 ExitCode::SUCCESS
             }
+            // The entry is a matcher group holding `hooks`, as Claude Code's is: Codex 0.160
+            // lists a bare `{ "command": … }` entry as no hook at all, so the room never
+            // drained (V210-169).
             "codex" => {
                 println!(
-                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{ \
-                     \"command\": \"vox agent hook\", \"async\": false }}\n    ]\n  \
-                     }}\n}}"
+                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
+                     \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
+                     \"vox agent hook --room <room>\", \"async\": false }}\n        ]\n      \
+                     }}\n    ]\n  }}\n}}"
                 );
                 eprintln!(
-                    "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
-                     — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
-                     an async hook's output is observed and discarded, so the room would \
-                     drain into nothing.\n     Set VOX_ROOM in the session's environment, or \
-                     pass --room to the hook."
+                    "vox: merge that into Codex's hooks.json, with your room in place of <room>, \
+                     then run `vox agent trust codex` — Codex runs a hook only once it is \
+                     trusted.\n     `async` MUST be false: an async hook's output is observed \
+                     and discarded, so the room would drain into nothing.\n     The room goes \
+                     in the command: Codex does not run the hook in the session's environment, \
+                     so VOX_ROOM set there does not reach it.\n     Vox cannot interrupt a \
+                     Codex session: an urgent message to one waits for its next turn, and the \
+                     poster is told so."
                 );
                 ExitCode::SUCCESS
             }
