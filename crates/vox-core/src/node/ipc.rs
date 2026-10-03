@@ -218,6 +218,8 @@ const T_LINK: u64 = 9;
 /// collided with — the decoder then read a trusted list as a bound address and said
 /// "malformed identity bundle", three layers from the cause.
 const T_TRUSTED: u64 = 26;
+/// The services a [`Request::Services`] asked for (V030-24).
+const T_SERVICES: u64 = 28;
 // Client → node.
 const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
@@ -268,6 +270,11 @@ const T_FIND: u64 = 121;
 const T_COUNT_REQ: u64 = 122;
 /// [`Frame::Count`] (V210-120), in the frame and event tag space, far from the others.
 const T_COUNT: u64 = 1200;
+// The services a room offers (V030-24): `vox service list` with a daemon running. `add` and
+// `remove` reached the daemon (V030-06) while `list` still opened the profile, which the daemon
+// holds, so a service just added could not be listed. Not a protocol bump: additive, and a node
+// that does not know it answers with an error.
+const T_SERVICES_REQ: u64 = 18;
 
 /// What a client sends.
 ///
@@ -319,6 +326,11 @@ pub enum Request {
         service_tag: String,
         /// The local endpoint to carry connections to.
         local: String,
+    },
+    /// The services this node offers in a room, answered with [`Frame::Services`] (V030-24).
+    Services {
+        /// The room.
+        channel_id: Digest32,
     },
     /// Stop offering a service.
     RemoveService {
@@ -503,6 +515,9 @@ impl Request {
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
             }
+            Request::Services { channel_id } => {
+                e.array(2).uint(T_SERVICES_REQ).bytes(channel_id);
+            }
             Request::Rooms { after } => {
                 e.array(2)
                     .uint(T_ROOMS_REQ)
@@ -650,6 +665,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
+            }
+            (T_SERVICES_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Services { channel_id })
             }
             // The unpaged form (no `after`), as any release before #189 sends it: read as the first
             // page. Refused, a worker on an older release died at its first room lookup with
@@ -916,6 +937,14 @@ pub enum Frame {
         /// `(channel_id, local name, open)` per room.
         rooms: Vec<(Digest32, String, bool)>,
     },
+    /// The services a [`Request::Services`] asked for: the room's local name, and
+    /// `(service tag, local address)` per service, as the node offers them.
+    Services {
+        /// The room's local name.
+        room: String,
+        /// `(service tag, local address)`, in the node's order.
+        services: Vec<(String, String)>,
+    },
 }
 
 impl Frame {
@@ -983,6 +1012,12 @@ impl Frame {
                 e.array(2).uint(T_TRUSTED).array(entries.len());
                 for (id, petname) in entries {
                     e.array(2).bytes(id).text(petname);
+                }
+            }
+            Frame::Services { room, services } => {
+                e.array(3).uint(T_SERVICES).text(room).array(services.len());
+                for (tag, local) in services {
+                    e.array(2).text(tag).text(local);
                 }
             }
         }
@@ -1358,6 +1393,23 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 rooms.push((id, name, open));
             }
             return Ok(Frame::Rooms { rooms });
+        }
+        (T_SERVICES, 3) => {
+            let room = text(d, "ipc services room")?;
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc services array"))?;
+            let mut services = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let arity = d
+                    .array()
+                    .map_err(|_| Error::MalformedIpc("ipc service row"))?;
+                if arity != 2 {
+                    return Err(Error::MalformedIpc("ipc service row arity"));
+                }
+                services.push((text(d, "ipc service tag")?, text(d, "ipc service address")?));
+            }
+            return Ok(Frame::Services { room, services });
         }
         (T_TRUSTED, 2) => {
             let count = d
@@ -2339,6 +2391,21 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             rows.reverse();
             Frame::Rows { rows }
         }
+        // Open or not by the node's own count, not by whether the view has caught up with an
+        // open (V210-149): the one-shot form asks the same question the same way.
+        Request::Services { channel_id } => match handle.open_detail(channel_id).await {
+            Some(detail) => Frame::Services {
+                room: detail.local_name.clone(),
+                services: detail
+                    .services
+                    .iter()
+                    .map(|(tag, local)| (tag.clone(), local.to_string()))
+                    .collect(),
+            },
+            None => Frame::Error {
+                reason: "room not open".into(),
+            },
+        },
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view

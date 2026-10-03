@@ -984,8 +984,6 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
             "service",
             "list",
             &room,
-            "--passphrase-file",
-            room_pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
             "--identity-passphrase-file",
             alice.p(),
             "--listen",
