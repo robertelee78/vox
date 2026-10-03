@@ -6,7 +6,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`,
 `crates/vox-core/src/node/{network,net,coordstream,circuitstream}.rs`,
 `crates/vox-core/src/transport/mux.rs`). Not built: a DHT (N-31). UPnP-IGD has not yet been checked
-against a real router (N-14).
+against a real router (N-14). **Decided 2026-10-03, not built (#397, ADR-026):** the daemon owns
+the machine's one presence (N-41–N-46); until it is built, each profile's daemon binds, maps and
+self-tests on its own.
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, ipv6, port-mapping, relay, anchor
@@ -85,7 +87,9 @@ fine, sans anchor".
   - It MUST scan the XML for the elements it needs, with no XML parser.
   - The client MUST NOT trust anything a router says beyond the mapping it grants.
   - A router that grants only permanent leases (725) MUST be asked again with lease 0, and that
-    mapping MUST be deleted when the node locks or shuts down.
+    mapping MUST be deleted when the node locks or shuts down. *Decided, not built:* the mapping
+    belongs to the daemon and is deleted when the daemon stops, never when a node locks or detaches
+    (N-43).
 
   Status: built and proved against a specification-faithful in-process gateway; not yet validated on
   a real router.
@@ -168,7 +172,9 @@ fine, sans anchor".
     MUST be promoted in its place (`promote_heard`), or, with none, the silent one MUST be closed. This
     runs on a once-a-second task (`tend_liveness`) and on the next lookup.
   - A newcomer from another process of the same identity MUST supersede every connection to the
-    process before it (V210-57).
+    process before it (V210-57). *Decided, not built:* with one daemon per machine, "process" is the
+    remote daemon's leaf together with the remote node (ADR-011 requirement 35), and "one connection
+    per peer" is per (local node, remote node) (ADR-026 I-3).
   - **Known limit:** liveness is the count of datagrams routed to a connection, taken before
     authentication, so an on-path attacker who knows a connection ID can keep a dead connection
     looking alive. That returns the node to QUIC's 60 s idle timeout, no worse than without the rule.
@@ -286,6 +292,24 @@ fine, sans anchor".
   - A failed round MUST be retried per (room, board) at 1, 2, 4, 8, 16, then 30 s, each shortened
     by up to a quarter at random, until a round finishes (#182).
   - The retry MUST be dropped when the room or the board's connection is gone.
+
+### The daemon's one presence (ADR-026)
+
+*Decided 2026-10-03, not built (#397).*
+
+- **N-41.** The daemon, not a node, MUST bind the one UDP socket and QUIC endpoint of the machine's
+  account, and run the dual-stack self-test once per bind.
+- **N-42.** The port MUST be kept in `<data root>/.daemon/port` and reused on every start, so the
+  address records every node published stay valid.
+- **N-43.** The daemon MUST own the gateway port mapping (N-12–N-14) and the observed (reflexive)
+  address cache. A node's lock or detach MUST NOT unmap; the daemon's stop MUST.
+- **N-44.** LAN discovery (nearby) MUST run once, in the daemon.
+- **N-45.** Relay circuits (N-19) and board service (N-25–N-33) MUST be executed by the daemon and
+  governed per node: a node relays for, and serves the board of, its own rooms' members (PRD-001
+  R33). Limits (`MAX_RELAYED_CIRCUITS`, `MAX_CIRCUITS_PER_ASKER`, board capacities) MUST apply per
+  daemon, configured in `.daemon/config`.
+- **N-46.** Each unlocked node MUST publish its own address record, naming the daemon's shared
+  ip:port. Nodes on one machine are therefore visibly co-hosted (an accepted cost, ADR-026).
 
 ### Limits
 
