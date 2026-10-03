@@ -657,8 +657,9 @@ fn share_refusal(name: &str, room: &ServiceRoom) -> Option<AppError> {
 }
 
 /// How long a node this verb unlocked waits, in a room it has not yet synced, for the share a
-/// name names to arrive on the room's log: see [`forward_address`].
-const SHARE_PATIENCE: Duration = Duration::from_secs(15);
+/// name names to arrive on the room's log: see [`forward_address`]. The same patience a forward has for reaching its host: the first sync is with the room's
+/// members, so it can take as long as reaching one (a relayed path took 18 s).
+const SHARE_PATIENCE: Duration = vox_core::node::up::HOST_PATIENCE;
 
 /// `vox forward` — serves until interrupted.
 pub async fn forward(
