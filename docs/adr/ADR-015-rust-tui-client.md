@@ -178,7 +178,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 11.3. The TUI MUST lock after 5 minutes idle (the default) and on `SIGHUP` or a dropped connection. The
       lock MUST be configurable, including off, with a direct warning. *The 5-minute idle lock, `:lock`
       and `SIGHUP` are built; configuring them is planned.* *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* the idle lock, `:lock` and the
-      `SIGHUP` lock go; `SIGHUP` stops the TUI cleanly and leaves its node attached.
+      `SIGHUP` lock go; `SIGHUP` stops the TUI cleanly, the same as quitting, and the TUI only drops its
+      hold on its node, which detaches if the TUI was its last holder (ADR-026 S-4, L-3).
 11.4. The node MUST track every task it hands a signer handle to and abort them all when it locks,
       before it drops the prekey ring, so no task outlives the lock holding the identity. *Built
       (`Profile::signer_arc`).*

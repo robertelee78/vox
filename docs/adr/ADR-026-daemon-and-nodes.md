@@ -161,8 +161,9 @@ network presence from the start: there is no interim design with one socket per 
 - **S-3.** No verb MUST host its own node: `serve`, `connect`, `up`, `forward`, `service`, `trust` and
   every other verb MUST be clients of the daemon.
 - **S-4. Clients.** The TUI and the macOS app MUST be clients of the daemon (ADR-014, ADR-015); they
-  MUST NOT embed a node. A client has no node lock: SIGHUP MUST stop the client cleanly and leave its
-  node attached. The one exception is the iOS app (v0.4.0), which hosts its own node because iOS runs
+  MUST NOT embed a node. A client has no node lock: SIGHUP MUST stop the client cleanly, the same as
+  quitting, and the client MUST only drop its hold, so a node it attached implicitly detaches if that
+  was its last holder (L-3) and one attached by hand or with `--keep` stays attached. The one exception is the iOS app (v0.4.0), which hosts its own node because iOS runs
   no background daemon.
 - **S-5. `vox lan up`.** The user-side `vox lan up` MUST be a daemon client holding a session (L-7).
   The daemon, as the same uid, MUST ask the root helper (`sudo vox lan helper`) for the device and
