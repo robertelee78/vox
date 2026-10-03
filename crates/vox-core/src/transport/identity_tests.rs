@@ -859,3 +859,114 @@ fn the_rate_limit_is_eight_a_second_burst_sixteen_per_source() {
         "PRODUCT: a source got {next} ASKs a second later, not 8"
     );
 }
+
+/// A [`Table`] that counts its lookups.
+struct Counting(Arc<Table>, std::sync::atomic::AtomicUsize);
+
+impl Hosts for Counting {
+    fn host(&self, target: &Digest32) -> Option<Hosted> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.host(target)
+    }
+}
+
+/// Requirement 34's order: a rate-limited `ASK` is refused **before its target is looked up**, so
+/// a flood costs the listener no lookup (and no signature); an admitted one is looked up once.
+/// Mutant: the limiter checked after the lookup — the refused `ASK` then counts one lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "in-process proof over a loopback quinn pair; run on demand"]
+async fn a_rate_limited_ask_is_refused_before_its_target_is_looked_up() {
+    let (l, d) = (endpoint(), endpoint());
+    let target = Node::new();
+    let mut lookups = Vec::new();
+    for (case, limiter) in [
+        ("rate-limited", AskLimiter::new(0, 0)),
+        ("admitted", AskLimiter::standard()),
+    ] {
+        let (c, s) = pair(&d, &l).await;
+        let hosts = Arc::new(Counting(Table::of(&[&target]), Default::default()));
+        let h = {
+            let (s, hosts) = (s.clone(), Arc::clone(&hosts));
+            tokio::spawn(async move {
+                listen(
+                    &s,
+                    SourceKey::of_addr(s.remote_address()),
+                    None,
+                    &*hosts,
+                    &limiter,
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+        let (_send, _recv) = raw_ask(&c, target.id()).await;
+        let _ = tokio::time::timeout(EXCHANGE_TIMEOUT + Duration::from_secs(2), h).await;
+        let n = hosts.1.load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!("[identity] {case} ASK: {n} lookup(s) of its target");
+        lookups.push((case, n));
+        c.close(0u32.into(), b"");
+    }
+    assert_eq!(
+        lookups[1].1, 1,
+        "APPARATUS: an admitted ASK's lookup was not counted, so a zero for the refused one would \
+         mean nothing: {lookups:?}"
+    );
+    assert_eq!(
+        lookups[0].1, 0,
+        "PRODUCT: a rate-limited ASK looked up its target before it was refused (requirement 34): \
+         {lookups:?}"
+    );
+}
+
+/// Requirement 32's timing: a `PROVE` leaves no earlier than the 50 ms floor after its `ASK`, plus
+/// a **uniformly random** delay up to 50 ms — so its timing is not a constant a prober could learn
+/// a refusal's from. 24 exchanges: each at or past the floor and within the window, and
+/// the draws spread over it (some in its lower half, some in its upper). Mutant: the jitter left
+/// out (`answer_at` = the floor) — every answer lands at the floor plus the signing time, red on the
+/// spread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "in-process proof over a loopback quinn pair; run on demand"]
+async fn every_answer_waits_the_floor_and_a_random_jitter() {
+    const SAMPLES: usize = 24;
+    let (l, d) = (endpoint(), endpoint());
+    let target = Node::new();
+    let table = Table::of(&[&target]);
+    let limiter = Arc::new(AskLimiter::new(1000, 1000));
+    let mut took = Vec::new();
+    for _ in 0..SAMPLES {
+        let (c, s) = pair(&d, &l).await;
+        let h = listen_on(&s, Arc::clone(&table), Arc::clone(&limiter), None);
+        let (_send, mut recv) = raw_ask(&c, target.id()).await;
+        let asked = Instant::now();
+        let _ = read_prove(&mut recv).await;
+        took.push(asked.elapsed());
+        c.close(0u32.into(), b"");
+        let _ = tokio::time::timeout(EXCHANGE_TIMEOUT + Duration::from_secs(2), h).await;
+    }
+    took.sort();
+    let (min, max) = (took[0], took[SAMPLES - 1]);
+    let mid = ANSWER_FLOOR + ANSWER_JITTER / 2;
+    let (low, high) = (
+        took.iter().filter(|t| **t < mid).count(),
+        took.iter().filter(|t| **t >= mid).count(),
+    );
+    eprintln!(
+        "[identity] {SAMPLES} PROVEs after their ASK: min {min:?}, median {:?}, max {max:?}; {low} \
+         in the window's lower half, {high} in its upper",
+        took[SAMPLES / 2]
+    );
+    assert!(
+        min >= ANSWER_FLOOR - Duration::from_millis(2),
+        "PRODUCT: a PROVE left {min:?} after its ASK, under the {ANSWER_FLOOR:?} floor"
+    );
+    assert!(
+        max <= ANSWER_FLOOR + ANSWER_JITTER + Duration::from_millis(150),
+        "PRODUCT: a PROVE left {max:?} after its ASK, past the answer window"
+    );
+    assert!(
+        low >= 2 && high >= 2 && max - min >= Duration::from_millis(20),
+        "PRODUCT: the answers do not spread over the {ANSWER_JITTER:?} jitter (requirement 32): \
+         {low} in the lower half, {high} in the upper, spread {:?}: {took:?}",
+        max - min
+    );
+}
