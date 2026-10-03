@@ -101,6 +101,11 @@
 //! and `VOX_TEST_WATCHDOG_SECS=0` disables it — for attaching a debugger, which is the one
 //! case where an unbounded hang is what you want.
 
+// Every proof includes this module, so it carries the temporary HOME every proof's children get
+// (V210-157, #379); see that module.
+#[path = "temp_home.rs"]
+pub mod temp_home;
+
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -215,6 +220,9 @@ const CENSUS_EVERY: Duration = Duration::from_secs(2);
 
 static ARMED: Once = Once::new();
 
+/// Set once this process has checked that its children get the temporary HOME.
+static HOME_CHECKED: Once = Once::new();
+
 /// Set once [`fire`] begins. From then on a test thread that panics parks instead of finishing
 /// (see [`arm_for`]).
 static FIRING: AtomicBool = AtomicBool::new(false);
@@ -270,6 +278,8 @@ pub fn arm_for(default_budget: Duration) {
             *t = Some(Running(name));
         }
     });
+    // Before any test of this process starts a child: the child must get the temporary HOME.
+    HOME_CHECKED.call_once(temp_home::check);
     ARMED.call_once(|| {
         // An explicit budget is taken as given; otherwise the largest any test asked for, read
         // afresh on every look, since a test may arm after the first did.
