@@ -3,7 +3,7 @@
 //! Two requests, additive to protocol 6 and away from the sequential tags:
 //!
 //! - **Resolve** `<node>.<room>.vox` against the running node's rooms and keyring, which is
-//!   what lets `vox forward nas.family.vox 22` work while a daemon holds the profile.
+//!   what lets `vox forward ssh.nas.family.vox` work while a daemon holds the profile.
 //! - **Up**: bring the SOCKS proxy up inside the running node, across every room it
 //!   holds. The connection then carries one line per refusal or cut session, and the
 //!   proxy stops when the connection closes — so `vox up` stays a foreground command whose

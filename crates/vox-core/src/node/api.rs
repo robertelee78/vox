@@ -1089,7 +1089,7 @@ impl Fault {
                 "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
             }
             Fault::NotAServiceRoom => {
-                "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
+                "that room offers no service by name, so it has no .vox name to resolve\n       reach a shared service by its address, `vox forward <service>.<node>.<room>.vox`"
             }
             Fault::NotAdmin => {
                 "only the room's admin may change that, and this identity is not its admin\n       the admin is whoever created the room; ask them"

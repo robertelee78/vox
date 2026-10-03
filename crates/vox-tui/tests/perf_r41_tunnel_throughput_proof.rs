@@ -891,12 +891,8 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         &guest_dir,
         &[
             "forward",
-            &room,
-            host_fp.trim(),
-            &port_s,
+            &format!("{port_s}.{}.{room}.vox", host_fp.trim()),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &room_pass_file(&guest_dir, &passphrase),
             "--anchor",
             &spec,
             "--listen",

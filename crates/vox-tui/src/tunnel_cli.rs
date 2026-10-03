@@ -589,21 +589,46 @@ pub fn print_services(
     }
 }
 
+/// How long a node this verb unlocked waits for the rooms it holds open to reopen before a
+/// name that matches none of them is final: they reopen off the actor, one at a time (#208).
+const REOPEN_PATIENCE: Duration = Duration::from_secs(20);
+
+/// `vox forward <service>.<node>.<room>.vox [<local>]` on a node this verb unlocked: the name is
+/// resolved against the rooms the profile holds open (reopened at unlock) and its keyring, then
+/// forwarded as the daemon would (V030-25).
+///
+/// # Errors
+/// If the name leads nowhere — with the resolver's reason — or the forward fails.
+pub async fn forward_address(
+    node: &NodeHandle,
+    name: &str,
+    local: SocketAddr,
+) -> Result<(), AppError> {
+    let deadline = Instant::now() + REOPEN_PATIENCE;
+    let room = loop {
+        match node.resolve_name(name).await {
+            Ok(room) => break room,
+            // A room still reopening may be the one named: wait while any is closed.
+            Err(why)
+                if Instant::now() < deadline && node.view().channels.iter().any(|c| !c.open) =>
+            {
+                let _ = why;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(why) => return Err(AppError::Usage(format!("{name}: {why}"))),
+        }
+    };
+    forward(node, room.channel_id, room.host, &room.service, local).await
+}
+
 /// `vox forward` — serves until interrupted.
 pub async fn forward(
     node: &NodeHandle,
     channel_id: Digest32,
-    host_prefix: &str,
+    host: Digest32,
     service: &str,
     local: SocketAddr,
 ) -> Result<(), AppError> {
-    let view = node.view();
-    let detail = view
-        .open_channels
-        .iter()
-        .find(|d| d.channel_id == channel_id);
-    let members: Vec<Digest32> = detail.map(|d| d.members.clone()).unwrap_or_default();
-    let host = resolve_prefix(host_prefix, &members)?;
     // `53/udp` is the service `udp/53`; anything that is not a port spec is a tag as is.
     let label = vox_core::tunnel::udp::service_label(service).unwrap_or_else(|| service.to_owned());
     let tag = label.as_str();

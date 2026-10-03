@@ -20,6 +20,9 @@
 //!    member's own words and who shared it.
 //! 5. a second share under a taken name is refused, naming it; the first still answers.
 //! 6. `vox serve` with a bare port is refused, saying how to name the share.
+//! 7. `vox forward` takes the address and nothing else (decider, 2026-10-03: "address only"):
+//!    `vox forward nas-ssh.nas-box.fam.vox` carries bob to alice's ssh service, and the form that
+//!    names a room, a member and a service is refused.
 //!
 //! **A red names its side.** A `vox` command that fails while the scene is set is PRODUCT
 //! (staging); what this proof claims is PRODUCT, quoting what vox said; the proof's own files,
@@ -484,9 +487,55 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         Ok("ssh"),
         "PRODUCT: after the refused second nas-ssh, nas-ssh must still reach the first"
     );
+    // (7) `vox forward` by the address, through bob's daemon; and the three-word form refused.
+    let mut fwd = VoxProc::spawn(
+        "bob forward",
+        &bob_dir,
+        &args(&["forward", "nas-ssh.nas-box.fam.vox", "127.0.0.1:0"]),
+    );
+    let bound_line = fwd.expect_line("PRODUCT: `vox forward <address>` binds", |l| {
+        l.starts_with("vox: forwarding ")
+    });
+    let bound: SocketAddr = bound_line
+        .split_whitespace()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| panic!("PRODUCT: vox forward said {bound_line:?}"));
+    let forwarded = {
+        let mut s = TcpStream::connect(bound)
+            .unwrap_or_else(|e| panic!("PRODUCT: the forward at {bound} refused: {e}"));
+        s.set_read_timeout(Some(vox_core::node::up::HOST_PATIENCE))
+            .expect("APPARATUS: set a read timeout");
+        s.write_all(b"hello\n")
+            .unwrap_or_else(|e| panic!("PRODUCT: the forward closed before a line: {e}"));
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line)
+            .unwrap_or_else(|e| panic!("PRODUCT: nothing came back through the forward: {e}"));
+        line
+    };
+    let (three_ok, three_out, three_err) = vox(
+        &bob_dir,
+        &["forward", &room, &alice_fp, "nas-ssh", "127.0.0.1:0"],
+        None,
+    );
+    eprintln!(
+        "forward by address: {bound_line:?} answered {forwarded:?}\nthree-word forward: \
+         ok={three_ok} {three_out}{three_err}"
+    );
+    assert!(
+        forwarded.starts_with("ssh:"),
+        "PRODUCT: `vox forward nas-ssh.nas-box.fam.vox` did not carry bob to alice's ssh service: \
+         {forwarded:?}"
+    );
+    assert!(
+        !three_ok,
+        "PRODUCT: `vox forward <room> <member> <service>` must be refused — the address is the only \
+         form: {three_out}{three_err}"
+    );
+    drop(fwd);
     eprintln!(
         "[proof] 2 services reached by 6 addresses through 2 members' own words; 4 shorter names \
-         resolved to nothing; a duplicate name and a bare port refused"
+         resolved to nothing; a duplicate name and a bare port refused; forward by address only"
     );
     let _ = (
         bob_daemon.transcript(),

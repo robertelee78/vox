@@ -144,6 +144,10 @@ is what a person offers. A tunnel is how bytes reach it.
   below 1024, and no resolver entry.
 - **5.5** `vox up` MUST print the `ssh` `ProxyCommand` line for `*.vox`. Tools with no proxy support
   use `vox forward`.
+- **5.7** `vox forward` MUST take only a service's address, `vox forward <service>.<node>.<room>.vox
+  [<local>]`, resolved as 12.1–12.6 by the node holding the profile (the running daemon, else a node
+  the verb unlocks, which reopens the rooms the profile holds open). Any other first argument MUST be
+  refused. There is no form naming a room and a member (decider, 2026-10-03: "address only").
 - **5.6** The proxy MUST bind before it can reach any host. Each request MUST wait for its host for
   up to `HOST_PATIENCE` (300 s), within that request's own task (`up::reach_host_with_patience`).
 - **5.7** A network interface MUST NOT be the primary path. Automap, a transparent proxy or an

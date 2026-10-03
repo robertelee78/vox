@@ -12575,7 +12575,7 @@ impl Node {
         for room in &view.open_channels {
             names.add_room(room.channel_id, &room.local_name, &room.members);
             for share in &room.shares {
-                names.add_share(room.channel_id, share.host, &share.name);
+                names.add_share(room.channel_id, share.host, &share.name, share.udp);
             }
         }
         for (fp, petname) in self.trust.iter() {

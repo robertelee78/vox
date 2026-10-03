@@ -293,18 +293,13 @@ const PATH_CHANGED_WITHIN: Duration = Duration::from_secs(75);
 fn a_forward_keeps_carrying_when_its_path_changes_from_relayed_to_direct() {
     watchdog::arm();
     let mut w = port_forward::ForwardedWorld::new(false);
-    let pass = world::room_pass_file(&w.guest_dir, &w.passphrase);
     let mut fwd = world::VoxProc::spawn(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &w.hostname(),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &pass,
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",

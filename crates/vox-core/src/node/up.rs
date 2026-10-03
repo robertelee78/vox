@@ -556,7 +556,10 @@ where
                             continue;
                         }
                     };
-                    let label = format!("udp/{}", room.service);
+                    let label = format!(
+                        "udp/{}",
+                        crate::node::channel::service_name(&room.service)
+                    );
                     let Some(guard) = flows.admit(room.host, &label) else { continue };
                     let (tx, rx) = tokio::sync::mpsc::channel(udp::CLIENT_QUEUE);
                     let (dialer, relay, refused) =

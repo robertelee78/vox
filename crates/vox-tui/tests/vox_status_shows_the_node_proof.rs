@@ -9,8 +9,8 @@
 //! `vox daemon --metrics 127.0.0.1:0`, so its counters are also served as Prometheus text.
 //!
 //! **#383: each UDP flow's counts, in `vox status --json` and the metrics.** The guest runs
-//! `vox forward <room>.vox <sink>/udp`, opens the flow, and then sends [`SENT`] numbered
-//! datagrams with the loss switched on. Asserted, against the flow's counts before the blast:
+//! `vox forward <sink>.<host>.<room>.vox` (a `<sink>/udp` service), opens the flow, and then
+//! sends [`SENT`] numbered datagrams with the loss switched on. Asserted, against the flow's counts before the blast:
 //! - the guest's `vox status --json` lists the flow, and its `to` grew by exactly [`SENT`] (`N`);
 //! - the host's lists the guest's flow, and its `from` grew by exactly what the sink received:
 //!   `N − M`, where `M` is what the relay leg lost, and `M > 0`;
