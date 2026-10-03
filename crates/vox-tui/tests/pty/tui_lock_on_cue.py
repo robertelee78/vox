@@ -11,9 +11,10 @@ Runs the shipped `vox tui` as a person does and locks it with `:lock` when the p
 
 The TUI runs in a pty at 160x50 and its screen is read through the `pyte` terminal emulator.
 
-Exit 0 = the TUI unlocked, locked on cue and was stopped; 2 = apparatus (pyte missing, no unlock,
-no cue, never showed LOCKED); 1 = the driver hung (`HUNG at <stage>`, with its stack: `vox_pty.py`,
-V210-54). The TUI is killed by its PID, with bounded waits.
+Exit 0 = the TUI unlocked, locked on cue and was stopped; 1 = the TUI failed (`<tag> RED:
+PRODUCT…`, with its screen: no unlock, never showed LOCKED) or the driver hung (`HUNG at <stage>`,
+with its stack: `vox_pty.py`, V210-54); 2 = apparatus, the driver's own machinery only (pyte
+missing, no cue from the proof). The TUI is killed by its PID, with bounded waits.
 """
 import os, sys, time
 
@@ -55,8 +56,8 @@ try:
     tui.key(IDPASS + "\r", 1)
     # Production Argon2id: the unlock takes seconds.
     if not tui.until(lambda: "unlocked" in status(), 60):
-        print(f"{TAG} APPARATUS: the TUI never unlocked:\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT (staging): the TUI never unlocked:\n{tui.text()}")
+        sys.exit(1)
     cue("unlocked")
     stage("wait for the lock cue")
     if not wait_cue(tui, "lock", 180):
@@ -65,8 +66,8 @@ try:
     stage(":lock")
     tui.key(":lock\r", 0.2)
     if not tui.until(lambda: "LOCKED" in tui.text(), 20, 0.1):
-        print(f"{TAG} APPARATUS: the TUI never showed LOCKED after :lock:\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT: the TUI never showed LOCKED after :lock:\n{tui.text()}")
+        sys.exit(1)
     cue("locked")
     stage("wait for the stop cue")
     if not wait_cue(tui, "stop", 180):

@@ -16,9 +16,10 @@ Prints, for the caller to assert on:
   `<tag> locked after <s>s`, `<tag> unlocked again after <s>s` (seconds from the `:lock`),
   `<tag> join ok` or `<tag> join failed: <what vox said>`.
 
-Exit 0 = the steps ran and the join's verdict is printed (whichever it was); 2 = apparatus (pyte
-missing, no unlock, no lock, no second unlock); 1 = the driver hung (`HUNG at <stage>`, with its
-stack: `vox_pty.py`). The TUI is killed by its PID, with bounded waits.
+Exit 0 = the steps ran and the join's verdict is printed (whichever it was); 1 = the TUI failed a
+step (`<tag> RED: PRODUCT (staging): <what>`, with its screen: no unlock, no LOCKED after `:lock`,
+no second unlock) or the driver hung (`HUNG at <stage>`, with its stack: `vox_pty.py`); 2 =
+apparatus, the driver's own machinery only (pyte missing). The TUI is killed by its PID, with bounded waits.
 """
 import os, subprocess, sys, time
 
@@ -54,21 +55,21 @@ try:
     tui.key(IDPASS + "\r", 1)
     # Production Argon2id: the unlock takes seconds.
     if not tui.until(lambda: "unlocked" in status(), 60, 0.1):
-        print(f"{TAG} APPARATUS: the TUI never unlocked:\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT (staging): the TUI never unlocked:\n{tui.text()}")
+        sys.exit(1)
     tui.pump(2)
 
     stage(":lock, then unlock at once")
     t0 = time.time()
     tui.key(":lock\r", 0)
     if not tui.until(lambda: "LOCKED" in status(), 30, 0.05):
-        print(f"{TAG} APPARATUS: the TUI never said LOCKED after :lock:\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT (staging): the TUI never said LOCKED after :lock:\n{tui.text()}")
+        sys.exit(1)
     print(f"{TAG} locked after {time.time() - t0:.2f}s", flush=True)
     tui.key(IDPASS + "\r", 0)
     if not tui.until(lambda: "unlocked" in status(), 60, 0.05):
-        print(f"{TAG} APPARATUS: the TUI never unlocked again:\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT (staging): the TUI never unlocked again:\n{tui.text()}")
+        sys.exit(1)
     print(f"{TAG} unlocked again after {time.time() - t0:.2f}s", flush=True)
 
     stage("hold")

@@ -16,9 +16,11 @@
 //! profile's identity at the same time") and that nothing was created here; afterwards, with both
 //! stopped, `vox id` opens the identity the first made.
 //!
-//! Which side a red is on: the answer, or a profile with no identity after the first TUI made
-//! one, is `PRODUCT:`; a driver that stopped or gave no answer is `APPARATUS:`; a temp dir
-//! this proof could not make is `APPARATUS:`.
+//! Which side a red is on: whatever a `vox tui` did or failed to do is `PRODUCT:` — no first-run
+//! prompt, no identity made, no answer to the second create (the driver's `RED: PRODUCT`), a TUI
+//! that stopped reading what is typed (`HUNG at`), the wrong answer, or a profile with no identity
+//! after the first TUI made one. Only the driver's own machinery (pyte missing, a crash, a `vox tui`
+//! it could not reap) and a temp dir this proof could not make are `APPARATUS:`.
 //!
 //! Mutation that must turn it red: the TUI's create path mapping the race to the generic
 //! `IdentityExists` again — it says "an identity already exists in this profile".
@@ -65,17 +67,23 @@ fn a_tui_that_loses_the_create_race_names_it() {
         out.took, out.code, out.stage
     );
     println!("[proof] tui: {}", said.trim());
-    // A TUI that stopped reading what is typed (`HUNG at`) is the product's; the driver's own
-    // failure is the apparatus.
+    // What a `vox tui` failed to do (the driver's `RED: PRODUCT`), or a TUI that stopped reading
+    // what is typed (`HUNG at`), is the product's; only the driver's own machinery is the
+    // apparatus.
+    assert!(
+        !said.contains("cargo RED: PRODUCT"),
+        "PRODUCT: a `vox tui` in the create race failed (exit {:?}, stage {:?}): {said}",
+        out.code,
+        out.stage
+    );
+    assert!(
+        !said.contains("cargo HUNG at"),
+        "PRODUCT: a `vox tui` in the create race stopped answering (stage {:?}): {said}",
+        out.stage
+    );
     assert!(
         !out.has_verdict("cargo"),
-        "{}: the TUI driver stopped on an apparatus failure or a hang (exit {:?}, stage {:?}): \
-         {said}",
-        if said.contains("cargo HUNG at") {
-            "PRODUCT"
-        } else {
-            "APPARATUS"
-        },
+        "APPARATUS: the TUI driver's own machinery failed (exit {:?}, stage {:?}): {said}",
         out.code,
         out.stage
     );

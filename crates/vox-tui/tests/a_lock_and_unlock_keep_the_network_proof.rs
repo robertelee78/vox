@@ -214,10 +214,10 @@ fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
     assert!(
         out.code == Some(0),
         "{}: the TUI driver did not run its steps (exit {:?}): {said}",
-        if said.contains("cargo APPARATUS") {
-            "APPARATUS"
-        } else {
+        if said.contains("cargo RED: PRODUCT") || said.contains("cargo HUNG at") {
             "PRODUCT (staging)"
+        } else {
+            "APPARATUS"
         },
         out.code
     );

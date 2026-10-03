@@ -116,17 +116,21 @@ fn arm(label: &str, data: &Path, mode: &str, holder_args: &[&str], answer: &[&st
             .find_map(|l| l.strip_prefix(&format!("{label} {p}")))
             .map(str::to_owned)
     };
-    // A TUI that stopped reading what is typed (`HUNG at`) is the product's; the driver's own
-    // failure, or a TUI it could not reap, is the apparatus.
+    // What the TUI failed to do (the driver's `RED: PRODUCT`: no prompt, no answer after the
+    // holder resumed), or a TUI that stopped reading what is typed (`HUNG at`), is the product's;
+    // only the driver's own machinery, or a TUI it could not reap, is the apparatus.
+    assert!(
+        !said.contains(&format!("{label} RED: PRODUCT"))
+            && !said.contains(&format!("{label} HUNG at")),
+        "PRODUCT: the {label} arm's `vox tui` failed or stopped answering (exit {:?}, stage \
+         {:?}): {said}",
+        out.code,
+        out.stage
+    );
     assert!(
         !out.has_verdict(label),
-        "{}: the {label} arm's TUI driver stopped on an apparatus failure, a hang, or a TUI it \
-         could not reap (exit {:?}, stage {:?}): {said}",
-        if said.contains(&format!("{label} HUNG at")) {
-            "PRODUCT"
-        } else {
-            "APPARATUS"
-        },
+        "APPARATUS: the {label} arm's TUI driver's own machinery failed, or it could not reap the \
+         TUI (exit {:?}, stage {:?}): {said}",
         out.code,
         out.stage
     );

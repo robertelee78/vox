@@ -590,6 +590,10 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
             "APPARATUS: the TUI driver hung stopping its processes, after its verdict: {}",
             out.stdout
         ),
+        _ if out.stdout.contains("eq RED: PRODUCT (staging)") => panic!(
+            "PRODUCT (staging): carol's `vox tui` never opened the room: {}",
+            out.stdout
+        ),
         _ if out.stdout.contains("eq HUNG at") => panic!(
             "PRODUCT: carol's `vox tui` did not get past {stage:?} within the driver's budget \
              ({:?}; its stack is above, on stderr): {}",

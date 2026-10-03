@@ -116,7 +116,7 @@ fn a_room_of_many_members_syncs_without_holding_its_lock() {
         });
     }
     let (ok, roster, err) = host.vox(&["room", "roster", &room], None);
-    assert!(ok, "APPARATUS (staging): vox room roster failed: {err}");
+    assert!(ok, "PRODUCT (staging): vox room roster failed: {err}");
     let members = roster.lines().filter(|l| !l.trim().is_empty()).count();
     println!(
         "[proof] staged {MEMBERS} members in {:?}; the host's roster lists {members}",
