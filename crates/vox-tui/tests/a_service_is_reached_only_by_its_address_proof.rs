@@ -23,6 +23,8 @@
 //! 7. `vox forward` takes the address and nothing else (decider, 2026-10-03: "address only"):
 //!    `vox forward nas-ssh.nas-box.fam.vox` carries bob to alice's ssh service, and the form that
 //!    names a room, a member and a service is refused.
+//! 8. An address naming no share in a room bob has synced is refused at once, saying so: within
+//!    [`IMMEDIATE`], PRD-001 R23's bound (#69), with no wait for a share that is not coming.
 //!
 //! **A red names its side.** A `vox` command that fails while the scene is set is PRODUCT
 //! (staging); what this proof claims is PRODUCT, quoting what vox said; the proof's own files,
@@ -43,6 +45,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use world::{after_label, args, VoxProc, IDENTITY, VOX};
+
+/// PRD-001 R23's bound for a refusal (#69's `tunnel_honesty_proof`): it fails at once.
+const IMMEDIATE: Duration = Duration::from_secs(2);
 
 /// How long setting the scene may take at each step.
 const SETUP: Duration = Duration::from_secs(90);
@@ -553,6 +558,40 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
          form: {three_out}{three_err}"
     );
     drop(fwd);
+
+    // (8) No share of that name, in a room bob has synced: refused at once, through his daemon.
+    let t_absent = Instant::now();
+    let mut absent = VoxProc::spawn(
+        "bob forward nas-ftp",
+        &bob_dir,
+        &args(&["forward", "nas-ftp.nas-box.fam.vox", "127.0.0.1:0"]),
+    );
+    let absent_status = loop {
+        match absent.child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if t_absent.elapsed() < Duration::from_secs(30) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => break None,
+            Err(e) => panic!("APPARATUS: wait for the forward to nas-ftp: {e}"),
+        }
+    };
+    let absent_took = t_absent.elapsed();
+    std::thread::sleep(Duration::from_millis(200));
+    let absent_said = absent.transcript();
+    drop(absent);
+    eprintln!("forward to nas-ftp: {absent_status:?} after {absent_took:?}: {absent_said}");
+    assert!(
+        absent_status.is_some_and(|st| !st.success())
+            && absent_said.contains("shares no service called `nas-ftp`"),
+        "PRODUCT: a forward to an address naming no share must be refused, saying so: \
+         {absent_status:?} {absent_said}"
+    );
+    assert!(
+        absent_took <= IMMEDIATE,
+        "PRODUCT: a forward to an address naming no share in a synced room took {absent_took:?} to \
+         be refused; R23 bounds a refusal at {IMMEDIATE:?}"
+    );
     eprintln!(
         "[proof] 2 services reached by 6 addresses through 2 members' own words; 4 shorter names \
          resolved to nothing; a duplicate name and a bare port refused; forward by address only"

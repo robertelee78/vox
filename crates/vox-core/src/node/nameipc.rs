@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::actor::NodeHandle;
 use crate::node::ipc::{read_frame, write_frame, Frame, PROTOCOL_VERSION};
+use crate::node::resolver::{ServiceRoom, ShareState};
 
 const T_RESOLVE: u64 = 2401;
 const T_RESOLVED: u64 = 2402;
@@ -78,11 +79,17 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle, req: NameReques
             let body = match handle.resolve_name(&name).await {
                 Ok(room) => {
                     let mut e = Encoder::new();
-                    e.array(4)
+                    let share = match room.share {
+                        ShareState::Stated => 0,
+                        ShareState::Absent => 1,
+                        ShareState::NotYetKnown => 2,
+                    };
+                    e.array(5)
                         .uint(T_RESOLVED)
                         .bytes(&room.channel_id)
                         .bytes(&room.host)
-                        .text(&room.service);
+                        .text(&room.service)
+                        .uint(share);
                     e.finish()
                 }
                 Err(why) => error(why),
@@ -162,11 +169,12 @@ fn reason(body: &[u8]) -> Error {
     }
 }
 
-/// Resolve `name` with the node at `path`: `(room, member, service)`.
+/// Resolve `name` with the node at `path`: the room, the member, the service's tag, and what the
+/// room's log says of the share.
 ///
 /// # Errors
 /// If no node answers, or the name leads nowhere — with the node's reason.
-pub async fn resolve(path: &Path, name: &str) -> Result<(Digest32, Digest32, String)> {
+pub async fn resolve(path: &Path, name: &str) -> Result<ServiceRoom> {
     let mut stream = connect(path).await?;
     write_frame(
         &mut stream,
@@ -177,7 +185,7 @@ pub async fn resolve(path: &Path, name: &str) -> Result<(Digest32, Digest32, Str
         .await?
         .ok_or(Error::MalformedBundle("ipc closed before reply"))?;
     let mut d = Decoder::new(&body);
-    if let (Ok(4), Ok(T_RESOLVED)) = (d.array(), d.uint()) {
+    if let (Ok(5), Ok(T_RESOLVED)) = (d.array(), d.uint()) {
         let mut digest = || -> Result<Digest32> {
             Digest32::try_from(
                 d.bytes()
@@ -185,12 +193,23 @@ pub async fn resolve(path: &Path, name: &str) -> Result<(Digest32, Digest32, Str
             )
             .map_err(|_| Error::MalformedBundle("ipc naming"))
         };
-        let (room, host) = (digest()?, digest()?);
+        let (channel_id, host) = (digest()?, digest()?);
         let service = d
             .text()
             .map_err(|_| Error::MalformedBundle("ipc naming"))?
             .to_owned();
-        return Ok((room, host, service));
+        let share = match d.uint() {
+            Ok(0) => ShareState::Stated,
+            Ok(1) => ShareState::Absent,
+            Ok(2) => ShareState::NotYetKnown,
+            _ => return Err(Error::MalformedBundle("ipc naming")),
+        };
+        return Ok(ServiceRoom {
+            channel_id,
+            host,
+            service,
+            share,
+        });
     }
     Err(reason(&body))
 }

@@ -454,6 +454,9 @@ pub struct ChannelDetail {
     pub services: Vec<(String, std::net::SocketAddr)>,
     /// The services shared in this channel by every member, as its log says (V030-25).
     pub shares: Vec<crate::node::channel::Share>,
+    /// Whether this node has completed the room's first sync since joining it (V210-164): until
+    /// then its log may not yet hold what the room's members have written, shares included.
+    pub synced: bool,
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
