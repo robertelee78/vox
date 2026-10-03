@@ -9830,7 +9830,14 @@ impl Node {
         if asked || !recent {
             self.member_dialed_at.insert(target, now);
             let tx = self.net_tx.clone();
+            let room = *channel_id;
             tokio::spawn(async move {
+                // Nothing known for it here: read a connected board before bridging (V210-122).
+                let endpoints = if endpoints.is_empty() {
+                    net.member_endpoints(&room, target).await
+                } else {
+                    endpoints
+                };
                 match net.reach(target, &endpoints).await {
                     Ok(conn) => {
                         let _ = tx
@@ -9875,9 +9882,11 @@ impl Node {
         if net.manager().existing(&peer).is_some() || !self.sync_dials.insert(peer) {
             return;
         }
-        let endpoints = net.board_endpoints(channel_id, &peer);
+        let room = *channel_id;
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
+            // This node's board record, or a connected board's when it holds none yet (V210-122).
+            let endpoints = net.member_endpoints(&room, peer).await;
             match net.reach(peer, &endpoints).await {
                 Ok(conn) => {
                     let _ = tx
@@ -10985,6 +10994,12 @@ impl Node {
         // `ForwardDialed` binds the forward. One sender, so the two arrive in that order.
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
+            // Nothing known for the host here: read a connected board before bridging (V210-122).
+            let endpoints = if endpoints.is_empty() {
+                net.member_endpoints(&channel_id, host).await
+            } else {
+                endpoints
+            };
             let result = match net.reach(host, &endpoints).await {
                 Ok(conn) => {
                     // A forward whose every connection would be refused is refused now, in
@@ -11508,7 +11523,8 @@ impl crate::node::up::HostDialer for NodeDialer {
         // ADR-012 ladder, so this is both "give me the connection" and "make one". The
         // endpoint hints come from the board, which is also why this must happen per
         // request: a node that has only just joined has not read the board yet.
-        let endpoints = self.net.board_endpoints(&self.channel_id, host);
+        // A connected board's record when this node's board holds none yet (V210-122).
+        let endpoints = self.net.member_endpoints(&self.channel_id, *host).await;
         self.net.reach(*host, &endpoints).await
     }
 }

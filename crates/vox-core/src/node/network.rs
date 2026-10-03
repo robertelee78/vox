@@ -1424,6 +1424,94 @@ impl NodeNet {
             .unwrap_or_default()
     }
 
+    /// Where to dial `member` of `channel_id`: this node's board record for it, or, when this
+    /// node's board holds none yet, the record a connected board holds (V210-122, as V030-22).
+    ///
+    /// **Read the board before bridging.** A reach that knows no address for its peer has no
+    /// direct rung, so its circuit is asked at once. A `vox forward` reached its host before its
+    /// node had read the host's board record: it asked the anchor for a circuit at 0 ms and was
+    /// carried by it, though the host was directly reachable and its address sat on that same
+    /// anchor's board (1 of 36 forwards at load 81, #321's verdict on candidate 5). Waiting for
+    /// the node's own board read instead cost every relayed restart the whole head start. So the
+    /// connected boards are asked, all at once, for the member's address record, and the first
+    /// answer is used. A board still being dialled is waited for while the dial is under way.
+    ///
+    /// **Bounded by [`DIRECT_HEAD_START`] in all.** A pair that can only be relayed pays one
+    /// board read, which takes milliseconds on a live board, and never more than the head start.
+    /// The identity is pinned, so a stale or wrong address only fails its dial.
+    pub async fn member_endpoints(&self, channel_id: &Digest32, member: Digest32) -> EndpointList {
+        let local = self.board_endpoints(channel_id, &member);
+        if !local.is_empty() || self.manager.existing(&member).is_some() {
+            return local;
+        }
+        let began = tokio::time::Instant::now();
+        let until = began + DIRECT_HEAD_START;
+        let mut boards = self.helpers(member);
+        while boards.is_empty()
+            && self.manager.existing(&member).is_none()
+            && self.manager.any_direct_dial_under_way()
+            && tokio::time::Instant::now() < until
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            boards = self.helpers(member);
+        }
+        if boards.is_empty() {
+            return local;
+        }
+        let mut reads: JoinSet<Option<(Digest32, EndpointList)>> = JoinSet::new();
+        for board in boards {
+            let channel = *channel_id;
+            reads.spawn(async move {
+                let mut client = RendezvousClient::open(&board).await.ok()?;
+                let set = client.get(&channel, 0, RecordKinds::MEMBERS).await;
+                client.finish();
+                let record = set
+                    .ok()?
+                    .members
+                    .into_iter()
+                    .find(|r| r.author_id == member && !r.endpoints.is_empty())?;
+                Some((board.peer_id(), record.endpoints))
+            });
+        }
+        let found = tokio::time::timeout_at(until, async {
+            while let Some(read) = reads.join_next().await {
+                if let Ok(Some(hit)) = read {
+                    return Some(hit);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let ms = began.elapsed().as_millis();
+        match found {
+            Some((board, endpoints)) => {
+                self.manager.note(
+                    member,
+                    format!(
+                        "no address for it on this node's board; read {}'s in {ms} ms: {}",
+                        short_id(board),
+                        endpoints
+                            .addrs()
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                endpoints
+            }
+            None => {
+                self.manager.note(
+                    member,
+                    format!("no address for it on this node's board, nor on a connected board ({ms} ms)"),
+                );
+                local
+            }
+        }
+    }
+
     /// Whether this node's board holds a live member address or bundle record for
     /// `channel_id` — somebody is in the room.
     #[must_use]
