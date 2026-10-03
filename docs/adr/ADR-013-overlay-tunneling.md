@@ -119,7 +119,7 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   member, by member and service, or by number) and from the TUI. The far end MUST be told it was
   closed (`TUNNEL_CLOSED_CODE`, `0x1713`).
 - **T-18. Stuck tunnels (V030-11).** A tunnel whose bytes have waited `STUCK_AFTER` (10 min, or the
-  profile's `tunnel-stuck-after`) for the far end or the local application to take them MUST be closed
+  profile's `tunnel-stuck-after`, under ADR-026 the node's `config`) for the far end or the local application to take them MUST be closed
   as stuck (`TUNNEL_STUCK_CODE`, `0x1714`). An idle tunnel with nothing waiting MUST NOT be closed.
 
 ### Honesty (PRD-001 R22–R24)
@@ -134,7 +134,10 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
     `TUNNEL_ABORT_CODE` (`0x1712`). A reset arriving from the far end MUST close the local socket with
     zero linger, so the kernel sends RST.
   - **Removed services.** Removing a service MUST cut its live sessions. `vox service remove` MUST
-    reach the running node when one holds the profile.
+    reach the running node when one holds the profile. *Decided, not built (ADR-026 S-3):* every
+    tunnel verb (`serve`, `connect`, `up`, `forward`, `service`) is a client of the account's daemon,
+    acting as the node it resolves; tunnels, counters and closes are per node, and one node cannot
+    list or close another's tunnel.
   - **Host restarts.** A forward MUST reach its host afresh for each accepted connection
     (`up::open_tunnel`). It MUST retry a path failure within `HOST_PATIENCE` (300 s), MUST NOT retry a
     refusal, and MUST back off a failed accept (`ACCEPT_BACKOFF`) rather than end or spin.
@@ -177,7 +180,8 @@ proven when the decider runs `sudo scripts/family-lan-proof.sh`. Linux is not bu
   - Root's part MUST be its own process, `sudo vox lan helper`. It serves only the uid that ran
     `sudo` (`getpeereid`), and accepts only a host in `100.64.0.0/10` and one in `fd00::/8`. It
     creates, addresses and routes the `utun`, and hands the descriptor to `vox lan up` (`SCM_RIGHTS`).
-    It MUST keep nothing, open no profile and touch no network.
+    It MUST keep nothing, open no profile and touch no network. Under ADR-026 it stays its own root
+    process and never uses the account's control socket, which does not admit uid 0 (ADR-026 S-5).
   - `vox lan up` MUST run as the person.
   - One `sudo vox lan up` that drops privileges MUST NOT be used: macOS keeps root's supplementary
     groups unless `setgroups` runs, and no safe binding offers it.
