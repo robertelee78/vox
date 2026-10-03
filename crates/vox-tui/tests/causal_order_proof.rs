@@ -86,7 +86,7 @@ impl Daemon {
             .args([sig, &self.0.id().to_string()])
             .status()
             .is_ok_and(|s| s.success());
-        assert!(ok, "kill {sig} {} failed", self.0.id());
+        assert!(ok, "APPARATUS: kill {sig} {} failed", self.0.id());
     }
 
     /// Kill it by its PID and report whether it is gone (reaped): the check that nothing
@@ -106,7 +106,7 @@ fn stop_all(daemons: Vec<Daemon>) {
         "{gone} of {n} daemons stopped by PID; {} left running",
         n - gone
     );
-    assert_eq!(gone, n, "a daemon outlived its test");
+    assert_eq!(gone, n, "PRODUCT: a daemon outlived its test");
 }
 
 /// The claimed times of `question` and `answer` (entry hashes as `vox` prints them) as stored
@@ -114,28 +114,33 @@ fn stop_all(daemons: Vec<Daemon>) {
 /// the signed entry rather than assuming it did.
 fn claimed_times(dir: &Path, question: &str, answer: &str) -> (u64, u64) {
     let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
-        .unwrap();
+        .expect("APPARATUS: resolve the profile's paths");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut profile = loop {
         match vox_core::node::profile::Profile::open(paths.clone()) {
             Ok(p) => break p,
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
-            Err(e) => panic!("the store did not open: {e:?}"),
+            Err(e) => panic!("PRODUCT (staging): the store did not open: {e:?}"),
         }
     };
-    profile.unlock(IDENTITY.as_bytes()).expect("unlock");
-    let cid = profile.store().channels().unwrap()[0];
+    profile
+        .unlock(IDENTITY.as_bytes())
+        .expect("PRODUCT (staging): unlock");
+    let cid = profile
+        .store()
+        .channels()
+        .expect("PRODUCT (staging): the stopped store lists no rooms")[0];
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("APPARATUS: the system clock")
         .as_secs();
     let ch = vox_core::node::channel::ChannelState::open(&profile, &cid, ROOMPASS.as_bytes(), now)
-        .expect("open the room");
+        .expect("PRODUCT (staging): open the room");
     let find = |h: &str| {
         ch.timeline()
             .iter()
             .find(|r| vox_core::node::link::b32_encode(&r.entry_hash) == h)
-            .unwrap_or_else(|| panic!("the stopped store lacks {h}"))
+            .unwrap_or_else(|| panic!("PRODUCT: the stopped store lacks {h}"))
             .created_millis
     };
     (find(question), find(answer))
@@ -155,17 +160,17 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: write stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -176,8 +181,10 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 /// Start `vox daemon` on `dir` at `listen`, optionally with its millisecond clock skewed
 /// (test-only).
 fn daemon(dir: &Path, tag: &str, listen: &str, stdin_lines: &str, skew_ms: Option<i64>) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: daemon stdout file");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: daemon stderr file");
     let mut cmd = Command::new(VOX);
     cmd.args(["daemon", "--listen", listen])
         .env("VOX_DATA_DIR", dir)
@@ -191,9 +198,10 @@ fn daemon(dir: &Path, tag: &str, listen: &str, stdin_lines: &str, skew_ms: Optio
         test_knobs::require(&[vox_core::time::TEST_CLOCK_SKEW_ENV]);
         cmd.env(vox_core::time::TEST_CLOCK_SKEW_ENV, skew.to_string());
     }
-    let mut child = cmd.spawn().expect("spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(stdin_lines.as_bytes()).unwrap();
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox daemon");
+    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(stdin_lines.as_bytes())
+        .expect("APPARATUS: write daemon stdin");
     drop(pipe);
     Daemon(child)
 }
@@ -211,7 +219,7 @@ fn attached(dir: &Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "{tag}'s daemon never answered: {last}\nits stderr: {}",
+        "PRODUCT (staging): {tag}'s daemon never answered: {last}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
     );
 }
@@ -219,7 +227,7 @@ fn attached(dir: &Path, tag: &str) -> String {
 /// `vox room read`: `(entry hash, text)` per row, in the order printed.
 fn read(dir: &Path, room: &str) -> Vec<(String, String)> {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
-    assert!(ok, "vox room read: {err}");
+    assert!(ok, "PRODUCT: vox room read: {err}");
     // `<entry-hash> <author-prefix> <text>`
     out.lines()
         .filter_map(|l| {
@@ -242,11 +250,11 @@ fn order(dir: &Path, room: &str) -> Vec<String> {
 /// `vox room read --hashes` with the clock that placed each entry: `(hash, clock ms)`.
 fn order_clocks(dir: &Path, room: &str) -> Vec<(String, u64)> {
     let (ok, out, err) = vox(dir, &["room", "read", room, "--hashes"], None);
-    assert!(ok, "vox room read --hashes: {err}");
+    assert!(ok, "PRODUCT: vox room read --hashes: {err}");
     out.lines()
         .map(|l| {
-            let (h, c) = l.split_once(' ').expect("`<hash> <clock>`");
-            (h.to_owned(), c.parse().expect("a clock"))
+            let (h, c) = l.split_once(' ').expect("PRODUCT: `<hash> <clock>`");
+            (h.to_owned(), c.parse().expect("PRODUCT: a clock"))
         })
         .collect()
 }
@@ -255,10 +263,10 @@ fn now_ms() -> u64 {
     u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("APPARATUS: the system clock")
             .as_millis(),
     )
-    .unwrap()
+    .expect("APPARATUS: milliseconds fit in u64")
 }
 
 fn texts(rows: &[(String, String)]) -> Vec<&str> {
@@ -267,7 +275,7 @@ fn texts(rows: &[(String, String)]) -> Vec<&str> {
 
 fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
-    assert!(ok, "vox room post {text:?}: {err}");
+    assert!(ok, "PRODUCT (staging): vox room post {text:?}: {err}");
 }
 
 /// Fresh profiles that all trust each other.
@@ -275,9 +283,9 @@ fn members(tmp: &Path, names: &[&str]) -> Vec<PathBuf> {
     let dirs: Vec<PathBuf> = names.iter().map(|n| tmp.join(n)).collect();
     let mut fps = Vec::new();
     for d in &dirs {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: profile directory");
         let (ok, out, err) = vox(d, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         fps.push(out.trim().to_owned());
     }
     for (i, d) in dirs.iter().enumerate() {
@@ -285,7 +293,7 @@ fn members(tmp: &Path, names: &[&str]) -> Vec<PathBuf> {
             if i != j {
                 let name = format!("peer{j}");
                 let (ok, _, err) = vox(d, &["trust", "add", fp, "--name", &name], None);
-                assert!(ok, "vox trust add: {err}");
+                assert!(ok, "PRODUCT (staging): vox trust add: {err}");
             }
         }
     }
@@ -300,15 +308,15 @@ fn room(creator: &Path, joiners: &[&Path]) -> String {
         &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let room = attached(creator, "creator")
         .split_whitespace()
         .next()
-        .expect("a room id")
+        .expect("PRODUCT (staging): a room id")
         .to_owned();
     for joiner in joiners {
         let (ok, link, err) = vox(creator, &["room", "invite", &room], None);
-        assert!(ok, "vox room invite: {err}");
+        assert!(ok, "PRODUCT (staging): vox room invite: {err}");
         let (ok, _, err) = vox(
             joiner,
             &[
@@ -322,7 +330,7 @@ fn room(creator: &Path, joiners: &[&Path]) -> String {
             ],
             Some(&format!("{ROOMPASS}\n")),
         );
-        assert!(ok, "vox room join: {err}");
+        assert!(ok, "PRODUCT (staging): vox room join: {err}");
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -336,7 +344,7 @@ fn room(creator: &Path, joiners: &[&Path]) -> String {
         }
         assert!(
             Instant::now() < deadline,
-            "the joiners never read the creator"
+            "PRODUCT (staging): the joiners never read the creator"
         );
     }
     room
@@ -381,7 +389,7 @@ fn converge(
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {what}; entries held: {}\n{}",
+            "PRODUCT: timed out waiting for {what}; entries held: {}\n{}",
             nodes
                 .iter()
                 .zip(&orders)
@@ -432,11 +440,12 @@ fn is_ordered_subsequence(who: &str, rows: &[(String, String)], seq: &[String]) 
     let position = |h: &String| seq.iter().position(|x| x == h);
     let mut last = None;
     for (h, text) in rows {
-        let at = position(h)
-            .unwrap_or_else(|| panic!("{who}'s timeline shows {text:?}, which it does not hold"));
+        let at = position(h).unwrap_or_else(|| {
+            panic!("PRODUCT: {who}'s timeline shows {text:?}, which it does not hold")
+        });
         assert!(
             last.is_none_or(|l| l < at),
-            "{who}'s timeline shows {text:?} out of the room's order (at {at}, after {last:?})"
+            "PRODUCT: {who}'s timeline shows {text:?} out of the room's order (at {at}, after {last:?})"
         );
         last = Some(at);
     }
@@ -447,7 +456,7 @@ fn is_ordered_subsequence(who: &str, rows: &[(String, String)], seq: &[String]) 
 #[ignore = "three real vox daemons (about two minutes); CI runs it in release"]
 fn three_members_one_offline_for_a_while_show_one_order() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dirs = members(tmp.path(), &["alice", "bob", "carol"]);
     let (alice, bob, carol) = (&dirs[0], &dirs[1], &dirs[2]);
     let alice_d = daemon(
@@ -526,7 +535,7 @@ fn three_members_one_offline_for_a_while_show_one_order() {
         if *o != orders[0] {
             let first = o.iter().zip(&orders[0]).position(|(a, b)| a != b);
             panic!(
-                "{who}'s order differs from alice's ({} vs {} entries, first difference at \
+                "PRODUCT: {who}'s order differs from alice's ({} vs {} entries, first difference at \
                  {first:?}) — the room shows two orders",
                 o.len(),
                 orders[0].len()
@@ -541,7 +550,7 @@ fn three_members_one_offline_for_a_while_show_one_order() {
     }
     assert!(
         orders[0].len() >= posted,
-        "the order holds {} entries for {posted} posts",
+        "PRODUCT: the order holds {} entries for {posted} posts",
         orders[0].len()
     );
     stop_all(vec![alice_d, bob_d, carol_d]);
@@ -551,7 +560,7 @@ fn three_members_one_offline_for_a_while_show_one_order() {
 #[ignore = "three real vox daemons (about a minute); CI runs it in release"]
 fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dirs = members(tmp.path(), &["alice", "bob", "carol"]);
     let (alice, bob, carol) = (&dirs[0], &dirs[1], &dirs[2]);
     let alice_d = daemon(
@@ -584,7 +593,10 @@ fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
     post(alice, &room, "question");
     let deadline = Instant::now() + Duration::from_secs(60);
     while !texts(&read(bob, &room)).contains(&"question") {
-        assert!(Instant::now() < deadline, "bob never read the question");
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): bob never read the question"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     post(bob, &room, "answer");
@@ -597,19 +609,25 @@ fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
     let q = read(alice, &room)
         .into_iter()
         .find(|(_, t)| t == "question")
-        .expect("alice shows her question")
+        .expect("PRODUCT (staging): alice shows her question")
         .0;
     let a = read(bob, &room)
         .into_iter()
         .find(|(_, t)| t == "answer")
-        .expect("bob shows his answer")
+        .expect("PRODUCT (staging): bob shows his answer")
         .0;
     let orders = converge(&nodes, &room, "the answer to reach everyone", 90, |o| {
         o.iter().all(|seq| seq.contains(&a) && seq.contains(&q))
     });
     for ((dir, who), seq) in nodes.iter().zip(&orders) {
-        let qi = seq.iter().position(|h| *h == q).unwrap();
-        let ai = seq.iter().position(|h| *h == a).unwrap();
+        let qi = seq
+            .iter()
+            .position(|h| *h == q)
+            .expect("PRODUCT: the entry is not in the order this node shows");
+        let ai = seq
+            .iter()
+            .position(|h| *h == a)
+            .expect("PRODUCT: the entry is not in the order this node shows");
         println!(
             "{who}: question at {qi}, answer at {ai} of {} (sha256 {})",
             seq.len(),
@@ -617,7 +635,7 @@ fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
         );
         assert!(
             qi < ai,
-            "{who} orders the answer ({ai}) before the question it answered ({qi})"
+            "PRODUCT: {who} orders the answer ({ai}) before the question it answered ({qi})"
         );
         // Where the node reads both, its timeline shows them in that order too.
         let rows = read(dir, &room);
@@ -625,7 +643,7 @@ fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
         let ra = rows.iter().position(|(h, _)| *h == a);
         if let (Some(rq), Some(ra)) = (rq, ra) {
             println!("{who}: timeline shows the question at {rq}, the answer at {ra}");
-            assert!(rq < ra, "{who}'s timeline shows the answer first");
+            assert!(rq < ra, "PRODUCT: {who}'s timeline shows the answer first");
         }
     }
 
@@ -640,7 +658,7 @@ fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
     );
     assert!(
         a_ms + 30 * 60_000 < q_ms,
-        "the answer's claimed time ({a_ms}) is not well behind the question's ({q_ms}): the \
+        "PRODUCT (staging): the answer's claimed time ({a_ms}) is not well behind the question's ({q_ms}): the \
          skew did not reach the entry, so this run proved nothing about clocks"
     );
     stop_all(vec![alice_d, carol_d]);
@@ -650,7 +668,7 @@ fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
 #[ignore = "two real vox daemons (about a minute); CI runs it in release"]
 fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dirs = members(tmp.path(), &["alice", "bob"]);
     let (alice, bob) = (&dirs[0], &dirs[1]);
     let alice_d = daemon(
@@ -681,7 +699,10 @@ fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
         {
             break h;
         }
-        assert!(Instant::now() < deadline, "alice never read bob's post");
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): alice never read bob's post"
+        );
         std::thread::sleep(Duration::from_millis(200));
     };
     // Alice has seen it; what she writes next names it in `seen`.
@@ -690,7 +711,7 @@ fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
     let after = read(alice, &room)
         .into_iter()
         .find(|(_, t)| t == "after it")
-        .expect("alice shows her post")
+        .expect("PRODUCT (staging): alice shows her post")
         .0;
     let deadline = Instant::now() + Duration::from_secs(60);
     let clocks = loop {
@@ -699,13 +720,22 @@ fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
         if b.iter().any(|(h, _)| *h == after) {
             break [("alice", a), ("bob", b)];
         }
-        assert!(Instant::now() < deadline, "bob never received alice's post");
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): bob never received alice's post"
+        );
         std::thread::sleep(Duration::from_millis(200));
     };
     let minutes = |ms: u64| (ms as i64 - posted_at as i64) / 60_000;
     for (who, seq) in &clocks {
-        let ti = seq.iter().position(|(h, _)| *h == tomorrow).unwrap();
-        let ai = seq.iter().position(|(h, _)| *h == after).unwrap();
+        let ti = seq
+            .iter()
+            .position(|(h, _)| *h == tomorrow)
+            .expect("PRODUCT: the entry is not in the order this node shows");
+        let ai = seq
+            .iter()
+            .position(|(h, _)| *h == after)
+            .expect("PRODUCT: the entry is not in the order this node shows");
         let (t_clock, a_clock) = (seq[ti].1, seq[ai].1);
         println!(
             "{who}: `from tomorrow` placed at {} min from now, `after it` at {} min (positions \
@@ -714,10 +744,13 @@ fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
             minutes(a_clock),
             seq.len()
         );
-        assert!(ti < ai, "{who}: the post that saw it must still follow it");
+        assert!(
+            ti < ai,
+            "PRODUCT: {who}: the post that saw it must still follow it"
+        );
         assert!(
             a_clock < posted_at + 15 * 60_000,
-            "{who}: a post written after seeing a day-ahead post was placed {} min ahead of \
+            "PRODUCT: {who}: a post written after seeing a day-ahead post was placed {} min ahead of \
              when it was written — one member dragged the room's clock forward",
             minutes(a_clock)
         );
@@ -734,7 +767,7 @@ fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
     );
     assert!(
         t_ms > posted_at + 20 * 3_600_000,
-        "`from tomorrow` does not claim a time a day ahead ({t_ms} vs {posted_at}): the skew \
+        "PRODUCT (staging): `from tomorrow` does not claim a time a day ahead ({t_ms} vs {posted_at}): the skew \
          did not reach the entry, so this run proved nothing about clocks"
     );
     stop_all(vec![alice_d]);
@@ -743,7 +776,7 @@ fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
 /// `vox room read --late`: the texts of the rows marked late.
 fn late(dir: &Path, room: &str) -> Vec<String> {
     let (ok, out, err) = vox(dir, &["room", "read", room, "--late"], None);
-    assert!(ok, "vox room read --late: {err}");
+    assert!(ok, "PRODUCT: vox room read --late: {err}");
     out.lines()
         .filter_map(|l| l.splitn(3, ' ').nth(2).map(str::to_owned))
         .collect()
@@ -753,7 +786,7 @@ fn late(dir: &Path, room: &str) -> Vec<String> {
 #[ignore = "two real vox daemons (about a minute); CI runs it in release"]
 fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dirs = members(tmp.path(), &["alice", "bob"]);
     let (alice, bob) = (&dirs[0], &dirs[1]);
     let alice_d = daemon(
@@ -775,7 +808,10 @@ fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
         if texts(&read(alice, &room)).contains(&"bob probe") {
             break;
         }
-        assert!(Instant::now() < deadline, "alice never read bob");
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): alice never read bob"
+        );
     }
 
     // ---- posts that cross in flight are ordinary concurrency: nothing is late -------------
@@ -790,7 +826,7 @@ fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
         {
             assert!(
                 Instant::now() < deadline,
-                "{who} never showed all crossing posts"
+                "PRODUCT (staging): {who} never showed all crossing posts"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -802,7 +838,10 @@ fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
             l.len(),
             2 * PER_ROUND
         );
-        assert!(l.is_empty(), "{who} marks crossing posts late: {l:?}");
+        assert!(
+            l.is_empty(),
+            "PRODUCT: {who} marks crossing posts late: {l:?}"
+        );
     }
 
     // ---- a post that did not get out at once is late when it does ------------------------
@@ -814,7 +853,7 @@ fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
         attempt += 1;
         assert!(
             attempt <= 5,
-            "bob's post got out before his node froze, 5 times"
+            "CANNOT MEASURE: bob's post got out before his node froze, 5 times"
         );
         let text = format!("while away {attempt}");
         post(bob, &room, &text);
@@ -836,7 +875,7 @@ fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
     while !texts(&read(alice, &room)).contains(&away.as_str()) {
         assert!(
             Instant::now() < deadline,
-            "alice never received {away:?}\n{}",
+            "PRODUCT: alice never received {away:?}\n{}",
             daemon_logs(&[(alice.as_path(), "alice"), (bob.as_path(), "bob")])
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -845,18 +884,27 @@ fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let at = shown.iter().position(|t| *t == away).unwrap();
-    let meanwhile = shown.iter().position(|t| t == "meanwhile 1").unwrap();
+    let at = shown
+        .iter()
+        .position(|t| *t == away)
+        .expect("PRODUCT: the entry is not in the order this node shows");
+    let meanwhile = shown
+        .iter()
+        .position(|t| t == "meanwhile 1")
+        .expect("PRODUCT: the entry is not in the order this node shows");
     let l = late(alice, &room);
     println!(
         "alice: {away:?} at {at}, above \"meanwhile 1\" at {meanwhile}; marked late: {l:?} \
          (after {attempt} attempt(s))"
     );
-    assert!(at < meanwhile, "the late post is not in its true place");
+    assert!(
+        at < meanwhile,
+        "PRODUCT: the late post is not in its true place"
+    );
     assert_eq!(
         l,
         vec![away.clone()],
-        "exactly the late post is marked late"
+        "PRODUCT: exactly the late post is marked late"
     );
     stop_all(vec![alice_d, bob_d]);
 }
@@ -880,7 +928,7 @@ fn a_late_arrival_is_marked_and_posts_that_cross_are_not() {
 #[ignore = "two real vox daemons (about a minute); CI runs it in release"]
 fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dirs = members(tmp.path(), &["alice", "bob"]);
     let (alice, bob) = (&dirs[0], &dirs[1]);
     let alice_d = daemon(
@@ -901,9 +949,16 @@ fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
         if texts(&read(alice, &room)).contains(&"bob probe") {
             break;
         }
-        assert!(Instant::now() < deadline, "alice never read bob");
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): alice never read bob"
+        );
     }
-    let cursor = read(alice, &room).last().unwrap().0.clone();
+    let cursor = read(alice, &room)
+        .last()
+        .expect("PRODUCT (staging): alice shows no row")
+        .0
+        .clone();
 
     // Bob's post does not get out before his node freezes (retried if the push won the race).
     let mut attempt = 0;
@@ -911,7 +966,7 @@ fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
         attempt += 1;
         assert!(
             attempt <= 5,
-            "bob's post got out before his node froze, 5 times"
+            "CANNOT MEASURE: bob's post got out before his node froze, 5 times"
         );
         let text = format!("while away {attempt}");
         post(bob, &room, &text);
@@ -937,7 +992,7 @@ fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
     while order(alice, &room).len() <= held_before {
         assert!(
             Instant::now() < deadline,
-            "alice never received {away:?}\n{}",
+            "PRODUCT: alice never received {away:?}\n{}",
             daemon_logs(&[(alice.as_path(), "alice"), (bob.as_path(), "bob")])
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -949,7 +1004,10 @@ fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
         if ok && out.contains(&away) {
             break;
         }
-        assert!(Instant::now() < deadline, "alice never rendered {away:?}");
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: alice never rendered {away:?}"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
 
@@ -973,23 +1031,36 @@ fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
     );
     assert!(
         bytes > 2 * 128 * 1024,
-        "the room's text ({bytes} bytes) does not span pages, so this run proved nothing"
+        "CANNOT MEASURE: the room's text ({bytes} bytes) does not span pages, so this run proved nothing"
     );
-    assert_eq!(shown(&away), 1, "the late post must be shown exactly once");
-    assert_eq!(hashes.len(), rows.len(), "every row is shown exactly once");
+    assert_eq!(
+        shown(&away),
+        1,
+        "PRODUCT: the late post must be shown exactly once"
+    );
+    assert_eq!(
+        hashes.len(),
+        rows.len(),
+        "PRODUCT: every row is shown exactly once"
+    );
     for (i, b) in big.iter().enumerate() {
-        assert_eq!(shown(b), 1, "big {} must be shown exactly once", i + 1);
+        assert_eq!(
+            shown(b),
+            1,
+            "PRODUCT: big {} must be shown exactly once",
+            i + 1
+        );
     }
     assert!(
         away_at < big1_at,
-        "the late post is not in its place, above what alice posted while it was away"
+        "PRODUCT: the late post is not in its place, above what alice posted while it was away"
     );
     let checked = is_ordered_subsequence("alice", &rows, &order(alice, &room));
     println!("alice's whole-room read is in the room's order: {checked} rows checked");
 
     // ---- the same rows by arrival ---------------------------------------------------------
     let (ok, out, err) = vox(alice, &["room", "read", &room, "--since", &cursor], None);
-    assert!(ok, "vox room read --since: {err}");
+    assert!(ok, "PRODUCT: vox room read --since: {err}");
     let feed: Vec<&str> = out
         .lines()
         .filter_map(|l| l.splitn(3, ' ').nth(2))
@@ -1004,10 +1075,15 @@ fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
     assert_eq!(
         fed(&away),
         1,
-        "the feed must carry the late post exactly once"
+        "PRODUCT: the feed must carry the late post exactly once"
     );
     for (i, b) in big.iter().enumerate() {
-        assert_eq!(fed(b), 1, "the feed must carry big {} exactly once", i + 1);
+        assert_eq!(
+            fed(b),
+            1,
+            "PRODUCT: the feed must carry big {} exactly once",
+            i + 1
+        );
     }
     stop_all(vec![alice_d, bob_d]);
 }
@@ -1025,7 +1101,7 @@ fn a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place() {
 #[ignore = "two real vox daemons (about a minute); CI runs it in release"]
 fn a_late_arrival_after_a_restart_is_marked() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let dirs = members(tmp.path(), &["alice", "bob"]);
     let (alice, bob) = (&dirs[0], &dirs[1]);
     let alice_d = daemon(
@@ -1046,7 +1122,10 @@ fn a_late_arrival_after_a_restart_is_marked() {
         if texts(&read(alice, &room)).contains(&"bob probe") {
             break;
         }
-        assert!(Instant::now() < deadline, "alice never read bob");
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): alice never read bob"
+        );
     }
     // Killed straight after posting, before the push; retried if the push won the race.
     let mut attempt = 0;
@@ -1054,11 +1133,11 @@ fn a_late_arrival_after_a_restart_is_marked() {
         attempt += 1;
         assert!(
             attempt <= 5,
-            "bob's post got out before his node went down, 5 times"
+            "CANNOT MEASURE: bob's post got out before his node went down, 5 times"
         );
         let text = format!("while away {attempt}");
         post(bob, &room, &text);
-        assert!(bob_d.kill_now(), "bob's daemon did not stop");
+        assert!(bob_d.kill_now(), "APPARATUS: bob's daemon did not stop");
         std::thread::sleep(Duration::from_secs(2));
         if !texts(&read(alice, &room)).contains(&text.as_str()) {
             break text;
@@ -1088,7 +1167,7 @@ fn a_late_arrival_after_a_restart_is_marked() {
     while !texts(&read(alice, &room)).contains(&away.as_str()) {
         assert!(
             Instant::now() < deadline,
-            "alice never received {away:?}\n{}",
+            "PRODUCT: alice never received {away:?}\n{}",
             daemon_logs(&[(alice.as_path(), "alice"), (bob.as_path(), "bob")])
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -1097,18 +1176,27 @@ fn a_late_arrival_after_a_restart_is_marked() {
         .into_iter()
         .map(str::to_owned)
         .collect();
-    let at = shown.iter().position(|t| *t == away).unwrap();
-    let meanwhile = shown.iter().position(|t| t == "meanwhile 1").unwrap();
+    let at = shown
+        .iter()
+        .position(|t| *t == away)
+        .expect("PRODUCT: the entry is not in the order this node shows");
+    let meanwhile = shown
+        .iter()
+        .position(|t| t == "meanwhile 1")
+        .expect("PRODUCT: the entry is not in the order this node shows");
     let l = late(alice, &room);
     println!(
         "alice: {away:?} at {at}, above \"meanwhile 1\" at {meanwhile}; marked late: {l:?} \
          (after {attempt} attempt(s))"
     );
-    assert!(at < meanwhile, "the late post is not in its true place");
+    assert!(
+        at < meanwhile,
+        "PRODUCT: the late post is not in its true place"
+    );
     assert_eq!(
         l,
         vec![away.clone()],
-        "exactly the late post is marked late"
+        "PRODUCT: exactly the late post is marked late"
     );
     stop_all(vec![alice_d, bob_d]);
 }
