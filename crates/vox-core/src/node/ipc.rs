@@ -250,9 +250,10 @@ const T_INVITE: u64 = 13;
 // A person setting up two agents hit "Database already open. Cannot acquire lock." on the
 // one command they could not skip.
 //
-// So the door opens only for someone who can prove they hold the identity passphrase,
-// which the operator does and the agent does not. The socket's file mode is still the
-// outer boundary; this is the inner one.
+// So the keyring is reachable here. The socket's file mode is the boundary: whoever runs as
+// this user is this user. A change needs the identity passphrase once 30 minutes have passed
+// since it was last entered, which the node decides for every client alike (V210-159); a read
+// needs none (V210-165).
 const T_TRUST: u64 = 14;
 const T_UNTRUST: u64 = 15;
 const T_TRUST_LIST: u64 = 16;
@@ -375,25 +376,27 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
-    /// Add an identity to the trust keyring. Requires the identity passphrase.
+    /// Add an identity to the trust keyring. Needs the identity passphrase once more than
+    /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) have passed since it was
+    /// last entered (V210-159).
     Trust {
         /// Who to trust, as a full fingerprint.
         target: Digest32,
         /// The petname to file it under.
         petname: String,
-        /// The identity passphrase, proving this is the operator and not an agent.
+        /// The identity passphrase, or empty for none: within the window none is needed.
         identity_passphrase: String,
     },
-    /// Remove an identity from the trust keyring. Requires the identity passphrase.
+    /// Remove an identity from the trust keyring. Needs the passphrase as [`Request::Trust`] does.
     Untrust {
         /// Who to stop trusting.
         target: Digest32,
-        /// The identity passphrase.
+        /// The identity passphrase, or empty for none.
         identity_passphrase: String,
     },
-    /// Read the trust keyring. Requires the identity passphrase.
+    /// Read the trust keyring. Needs no passphrase (V210-165).
     TrustList {
-        /// The identity passphrase.
+        /// Ignored; kept so the request's shape does not change.
         identity_passphrase: String,
         /// The last fingerprint of the previous page, or `None` for the first.
         after: Option<Digest32>,
@@ -2014,14 +2017,8 @@ async fn serve_requests(
     }
 }
 
-/// Prove the caller holds the identity passphrase, or say why not.
-///
-/// ADR-020 §7 keeps trust-keyring edits off this socket, on the grounds that an agent
-/// session runs model-authored code and the socket is reachable by anything running as
-/// the user. That reasoning is kept; this is the exception that does not weaken it. The
-/// operator knows the identity passphrase and an agent does not, so requiring it here
-/// lets the person who owns the profile use their own daemon without handing the agent
-/// the ability to decide who may read them.
+/// Prove the caller holds the identity passphrase, or say why not. A right one is an entry of it,
+/// so the node's keyring window starts again (V210-159).
 async fn verify_operator(
     handle: &NodeHandle,
     passphrase: String,
@@ -2047,6 +2044,15 @@ async fn verify_operator(
             reason: other.to_string(),
         }),
     }
+}
+
+/// [`verify_operator`] for a passphrase that was given; nothing to check for one that was not
+/// (the empty string), and the node's keyring window decides.
+async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
+    if passphrase.is_empty() {
+        return Ok(());
+    }
+    verify_operator(handle, passphrase).await
 }
 
 /// One page of a collection reply: entries in id order, strictly after `after`, at most
@@ -2104,14 +2110,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        // The keyring, gated on the identity passphrase. The check is first and the
-        // command is only issued if it passes, so a caller who cannot prove they are the
-        // operator changes nothing and learns nothing.
+        // A keyring change (V210-159). A passphrase given is checked first, and the command is
+        // only issued if it passes; a right one is also an entry of it, so the window starts
+        // again. None given is the empty string, and the node then allows the change only
+        // within its window since the passphrase was last entered, and otherwise refuses it
+        // with `Fault::PassphraseNeeded`, which the client answers by asking for it.
         Request::Trust {
             target,
             petname,
             identity_passphrase,
-        } => match verify_operator(handle, identity_passphrase).await {
+        } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
                 .apply(crate::node::api::NodeCommand::Trust {
@@ -2129,7 +2137,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::Untrust {
             target,
             identity_passphrase,
-        } => match verify_operator(handle, identity_passphrase).await {
+        } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
                 .apply(crate::node::api::NodeCommand::Untrust {
@@ -2143,16 +2151,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
-        Request::TrustList {
-            identity_passphrase,
-            after,
-        } => match verify_operator(handle, identity_passphrase).await {
-            Err(f) => f,
-            Ok(()) => Frame::Trusted {
-                entries: page(handle.view().trusted, after, |(id, petname)| {
-                    (*id, petname.len())
-                }),
-            },
+        // **A read needs no passphrase** (V210-165): the keyring is read from the running node,
+        // which has it open, and reading it changes nothing. A passphrase sent is ignored.
+        Request::TrustList { after, .. } => Frame::Trusted {
+            entries: page(handle.view().trusted, after, |(id, petname)| {
+                (*id, petname.len())
+            }),
         },
         Request::Post { channel_id, text } => {
             match handle
