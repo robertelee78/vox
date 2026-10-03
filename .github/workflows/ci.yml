@@ -5,15 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# A newer run on an integrate/* branch covers the one before it, so it cancels it: three runs at
+# once on integrate/v0.2.10 for successive merges had to be cancelled by hand (#301). Those runs
+# are its pull request's, so the branch is `head_ref`. Every other run (main, tags, release, any
+# other PR) gets a group of its own, `run_id`: a shared group would still cancel a *pending* run.
+concurrency:
+  group: ${{ startsWith(github.head_ref || github.ref_name, 'integrate/') && format('ci-{0}', github.head_ref || github.ref_name) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ startsWith(github.head_ref || github.ref_name, 'integrate/') }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # The one gap ADR-018 §3 accepts, named so that accepting it is a visible decision. `opencode`:
-  # the five live-model proofs need an OpenCode install and a model account, which CI runners do
-  # not have. The decider (2026-09-26) chose that they run on the local macOS release gate, with
-  # the decider's account, and must be green there before every tag; CI keeps this one exception.
-  # Removing it MUST make those proofs fail on CI. `fish` is NOT here: the runners install it.
-  VOX_PROOF_ALLOW_UNPROVEN: "opencode"
 
 jobs:
   # **Every commit must build, not merely the tip.** `git bisect` compiles the commit it
@@ -37,11 +39,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check each commit in this push or pull request
-        # The workflow's `-D warnings` is the tip's business (build-test runs clippy); this job asks
-        # whether each commit builds. Inherited, one historical commit's warning on one platform
-        # failed every later push that carried it (v0.3.0's merge, #257).
-        env:
-          RUSTFLAGS: ""
         run: |
           set -eu
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -66,151 +63,42 @@ jobs:
           for c in $commits; do
             echo "::group::$c $(git log -1 --format=%s "$c")"
             git checkout --quiet --detach "$c"
-            # RUSTFLAGS is cleared for this step (above): a commit that builds with warnings still
-            # builds, and clippy/fmt are the tip's business. This asks one question only.
+            # RUSTFLAGS is not set here: a commit that builds with warnings still builds,
+            # and clippy/fmt are the tip's business. This asks one question only.
             cargo check --workspace --all-targets
             echo "::endgroup::"
           done
 
-  build-test:
-    name: build · clippy · fmt · test
-    # ADR-015 scopes clients to macOS + Linux; the core is checked on both.
+  build-lint:
+    name: build · clippy · fmt
+    # No tests run in CI (decider, 2026-10-02): "I hate gates ... even the tests that test how a user
+    # would use a product should be done ad hoc on demand as opposed to be part of the normal build or
+    # CI process". CI compiles Vox and checks formatting and common code mistakes, nothing more. The
+    # checks that drive the shipped `vox` as a person would are run by hand, when someone asks.
+    # ADR-015 scopes clients to macOS + Linux; both compile.
     strategy:
-      # Both platforms report. Without this, one failure cancels the other and the second
-      # platform's state is never learned — which is how a red ubuntu hid macOS for ten runs.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # 120, not 45: both platforms were cancelled at 45 minutes on v0.2.9's merge with nothing red;
-    # the suite now includes the R41/R42 transport proofs.
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
-      # proofs run: on a fresh runner it took R41's emulator to 74-90% of the link, and to a clean
-      # 98% with indexing off (diag run 36228035025). The runner is a throwaway VM.
-      - name: Stop Spotlight indexing (macOS)
-        if: runner.os == 'macOS'
-        run: sudo mdutil -a -i off
       # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
-      # `shell_setup_proof` measures real shells. A shell that is absent is reported unproven and
-      # FAILS (ADR-018 §3), so the runners install the ones it proves against rather than the
-      # proof being excused. ubuntu-latest ships neither zsh nor fish; macOS ships zsh only.
-      - name: Install the shells the proofs measure
-        run: |
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update && sudo apt-get install -y zsh fish
-          else
-            brew install fish
-          fi
-          zsh --version && fish --version && bash --version | head -1
-      # `codex_trust_proof` asks Codex itself whether Vox's hook is trusted and refuses to pass
-      # without `codex` on PATH (an absent Codex is not a pass). Pinned to the version it was
-      # measured on: the app-server's `hooks/list` statuses are Codex's, not Vox's, to change.
-      - name: Install the Codex the trust proof measures
-        run: npm install -g @openai/codex@0.157.0 && codex --version
-      # `tui_member_names_proof` reads the real `vox tui`'s screen through the `pyte` terminal
-      # emulator, and fails as CANNOT MEASURE without it (#198). Pinned to the version it was
-      # measured on, in a venv of its own: the runners' Python is externally managed (PEP 668).
-      - name: Install the terminal emulator the TUI proof reads the screen with
-        run: |
-          python3 -m venv "$RUNNER_TEMP/pyte"
-          "$RUNNER_TEMP/pyte/bin/pip" install --quiet pyte==0.8.2
-          echo "VOX_PYTE_PATH=$("$RUNNER_TEMP/pyte/bin/python" -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
-      - name: Install the Apple targets the Swift FFI proof builds its xcframework for
-        if: runner.os == 'macOS'
-        # scripts/build-xcframework.sh refuses without all four (PRD-001 R30/R31's proof went red
-        # on the runner, not on a Mac that had them: #257).
-        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format check
         run: cargo fmt --all --check
-      # Vox is pure Rust (ADR-001 principle 10): there are no optional native
-      # backends to feature-gate; the default build IS the whole build.
+      - name: Build (release)
+        run: cargo build --release --workspace
+      # `--all-targets` also compiles every check, so one that no longer builds is caught here
+      # without running it.
       - name: Clippy (default, pure-Rust)
         run: cargo clippy --all-targets -- -D warnings
-      # The mutant sender (vox-core's `mutant-sender` feature, ADR-025 P9/P10) is never in a
-      # default build, so it is linted and documented on its own here.
       - name: Clippy (mutant sender)
         run: cargo clippy -p vox-core --features mutant-sender -- -D warnings
-      # The test-only knobs (`test-knobs`, V210-105) are in no shipped build either; the proofs
-      # build with them, and refuse a `vox` without them as CANNOT MEASURE.
       - name: Clippy (test knobs)
         run: cargo clippy --all-targets --features vox-tui/test-knobs -- -D warnings
-      - name: Test (default, pure-Rust)
-        run: cargo test --workspace --no-fail-fast --features vox-tui/test-knobs
-        env:
-          # `update_proof` asks GitHub which releases exist, to find one to update *from*.
-          GH_TOKEN: ${{ github.token }}
-      - name: Docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-      - name: Docs (mutant sender)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc -p vox-core --no-deps --features mutant-sender
-      - name: Docs (test knobs)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features vox-tui/test-knobs
-      # The proofs that drive the shipped `vox` with production parameters (Argon2id, real
-      # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
-      # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
-      # product is a test", 2026-09-26). Run here in release.
-      # Excluded here, and run in their own job below: the PRD-001 transport proofs (`r40_`, `r41_`),
-      # the slowest part of the suite, so they run in parallel with this job instead of after it.
-      # No proof is excluded by name any more (V210-19, #192): `cross_process_join_proof`, excused
-      # as a flake since v0.2.2, passed 20 of 20 on integrate/v0.2.10 and is back in this gate.
-      # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
-      # ADR-025's P9 and P10 proofs run a deliberately misbehaving sync sender as the faulty peer
-      # (no `vox` command makes a correct node misbehave). It is built here from this commit, into
-      # its own path, and named to them by VOX_MUTANT_SENDER; the script rebuilds the shipped
-      # binary with the default features afterwards and checks that it does not carry the mutant.
-      # Without this both proofs fail as CANNOT MEASURE (run 36389831839).
-      - name: Build the mutant sender (ADR-025 P9, P10)
-        run: |
-          path=$(scripts/build-mutant-sender.sh)
-          echo "VOX_MUTANT_SENDER=$path" >> "$GITHUB_ENV"
-      - name: Real-parameter gates (release)
-        # Two causal_order_proof proofs are excluded here, **for a cause that is not the order**:
-        # `three_members_one_offline_for_a_while_show_one_order` (ADR-023 M23.2 proof 1), excluded
-        # from 2026-09-25. On v0.2.8 the second joiner of three daemons is cut off from the first
-        # post onward in about half of runs: 5 red of 9 with M23.2, and 1 of 4 on 3cac220 without it.
-        # In each of the four reds whose logs were captured, the second joiner's restarted daemon logs
-        # "the board holds a newer record from that author". Whenever the three converged, their
-        # orders were identical. The order is proven in the blocking set by `one_order_gate` (three
-        # in-process nodes) and by proof 2 through the daemons. This exclusion is to be removed when
-        # the v0.2.9 connectivity defect is fixed.
-        # `a_late_arrival_after_a_restart_is_marked`, for the same cause, V29-23 (#104): a restarted
-        # daemon's board record restarts its sequence and is refused, so its peer never receives what
-        # it held (2 of 5 runs). The frozen-daemon variant, in the blocking set, carries the
-        # late-arrival claim meanwhile.
-        run: |
-          cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored \
-            --skip r40_ --skip r41_
-
-  # **The PRD-001 transport proofs, in parallel with the rest.** They are blocking — a release
-  # publishes only a commit whose whole CI run passed (release.yml `ci-passed`) — but they are
-  # the slowest part of the suite, so they get their own runner instead of a place in line.
-  transport-gates:
-    name: transport proofs (R40 · R41)
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
-      # proofs run: on a fresh runner it took R41's emulator to 74-90% of the link, and to a clean
-      # 98% with indexing off (diag run 36228035025). The runner is a throwaway VM.
-      - name: Stop Spotlight indexing (macOS)
-        if: runner.os == 'macOS'
-        run: sudo mdutil -a -i off
-      - name: Show toolchain
-        run: rustc --version && cargo --version
-      - name: Transport gates (release)
-        # R41's WAN link is reported, not gated, on the macOS runner only (decider, 2026-09-26): the
-        # 3-core VM stalls its processes and the same build measures 29-106% of raw there. WAN is
-        # gated here on ubuntu and on real Mac hardware by the local macOS gate before a tag.
-        env:
-          VOX_PERF_REPORT_ONLY: ${{ runner.os == 'macOS' && 'WAN' || '' }}
-        run: cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored r40_ r41_
+      - name: Clippy (optional proofs)
+        run: cargo clippy -p vox-tui --all-targets --features optional-proofs -- -D warnings
