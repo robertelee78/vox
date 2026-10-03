@@ -2622,14 +2622,38 @@ async fn receive(bound: &str, mut file: std::fs::File, offer: &Offer) -> Result<
     Ok(total)
 }
 
-/// Read a passphrase from stdin, stripping exactly one trailing newline.
+/// A room passphrase from `--passphrase-file` (`-` reads stdin), stripping exactly one trailing
+/// newline; else asked for at the terminal, twice when `confirm`.
 ///
-/// Stdin rather than an argument: argv is visible to anything that can run `ps`.
-fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(|e| AppError::Usage(format!("reading {what} on stdin: {e}")))?;
+/// Never an argument: argv is visible to anything that can run `ps`. **Never stdin unasked**
+/// (V210-165): this read stdin to its end whenever there was no `--passphrase-file`, and an
+/// agent's harness leaves stdin open and writes nothing, so the command waited for ever, saying
+/// nothing. Without a terminal and without the flag it fails at once, saying how to give it.
+fn room_passphrase(
+    file: Option<&std::path::Path>,
+    what: &str,
+    confirm: bool,
+) -> Result<String, AppError> {
+    let Some(path) = file else {
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return Err(AppError::Usage(format!(
+                "this needs {what}, and there is no terminal to ask at.\n\
+                 \x20      {}",
+                crate::tunnel_cli::GIVE_ROOM_PASSPHRASE
+            )));
+        }
+        let first = crate::tunnel_cli::prompt_passphrase("room passphrase")?;
+        if first.is_empty() {
+            return Err(AppError::Usage(format!("no {what} was given")));
+        }
+        if confirm && crate::tunnel_cli::prompt_passphrase("again")? != first {
+            return Err(AppError::Usage(
+                "the two passphrases differ; nothing was done".into(),
+            ));
+        }
+        return Ok(first);
+    };
+    let buf = crate::tunnel_cli::passphrase_file_text(path)?;
     let p = buf
         .strip_suffix('\n')
         .unwrap_or(&buf)
@@ -2637,10 +2661,15 @@ fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
         .unwrap_or_else(|| buf.strip_suffix('\n').unwrap_or(&buf));
     if p.is_empty() {
         // The caller's phrase is a noun phrase ("the room's passphrase", "a passphrase
-        // for the new room"), so it reads as "expected <phrase> on stdin" and never as
-        // "no a passphrase", which is what "no {what}" produced.
+        // for the new room"), so it reads as "expected <phrase>" and never as "no a
+        // passphrase", which is what "no {what}" produced.
         return Err(AppError::Usage(format!(
-            "expected {what} on stdin — pipe it in, e.g. `echo … | vox room join …`"
+            "expected {what} in {}, and it is empty",
+            if path == std::path::Path::new("-") {
+                "stdin".to_owned()
+            } else {
+                path.display().to_string()
+            }
         )));
     }
     Ok(p.to_owned())
@@ -2657,8 +2686,13 @@ fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
 /// If the node cannot be reached, or the join is refused — and the refusal is
 /// reported as the node gave it, because `Unreachable` and a wrong passphrase need
 /// completely different responses from whoever holds the link.
-pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), AppError> {
-    let passphrase = passphrase_from_stdin("the room's passphrase")?;
+pub async fn join(
+    paths: &Paths,
+    link: &str,
+    local_name: &str,
+    passphrase_file: Option<&std::path::Path>,
+) -> Result<(), AppError> {
+    let passphrase = room_passphrase(passphrase_file, "the room's passphrase", false)?;
     let mut client = attach(paths).await?;
     match client
         .request(&Request::Join {
@@ -2694,8 +2728,12 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
 ///
 /// # Errors
 /// If the node cannot be reached or the create is refused.
-pub async fn create(paths: &Paths, local_name: &str) -> Result<(), AppError> {
-    let passphrase = passphrase_from_stdin("a passphrase for the new room")?;
+pub async fn create(
+    paths: &Paths,
+    local_name: &str,
+    passphrase_file: Option<&std::path::Path>,
+) -> Result<(), AppError> {
+    let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
     let mut client = attach(paths).await?;
     match client
         .request(&Request::Create {
@@ -2755,25 +2793,51 @@ pub async fn node_is_running(paths: &Paths) -> bool {
     sock.exists() && IpcClient::open(&sock).await.is_ok()
 }
 
+/// Send a keyring change, giving the identity passphrase only when the node says it needs it
+/// (V210-159): within 30 minutes of its last entry none is needed. `given` is what the command line
+/// gave (`--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`); it is sent at once, and a right
+/// one starts the window again. With none given and the window passed, it is asked for at the
+/// terminal and the change sent again; with no terminal, the node's reason is the answer.
+async fn keyring_change(
+    client: &mut IpcClient,
+    given: Option<String>,
+    request: impl Fn(String) -> Request,
+) -> Result<Frame, AppError> {
+    let asked = given.is_none();
+    let reply = client
+        .request(&request(given.unwrap_or_default()))
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let needed = vox_core::node::api::Fault::PassphraseNeeded.explain();
+    match reply {
+        Frame::Error { reason }
+            if asked && reason == needed && std::io::IsTerminal::is_terminal(&std::io::stdin()) =>
+        {
+            eprintln!("vox: {}", reason.lines().next().unwrap_or_default());
+            let passphrase = crate::tunnel_cli::ask_identity_passphrase()?;
+            client
+                .request(&request(passphrase))
+                .await
+                .map_err(|e| AppError::Usage(e.to_string()))
+        }
+        other => Ok(other),
+    }
+}
+
 /// `vox trust add`, asked of the running node instead of a second one.
-///
-/// The keyring is the one thing an agent session must not be able to change (ADR-020 §7),
-/// so the request carries the identity passphrase and the node checks it before doing
-/// anything. That is what makes this safe to put on a socket an agent can reach.
 pub async fn trust_add(
     paths: &Paths,
     target: Digest32,
     petname: &str,
-    identity_passphrase: &str,
+    given: Option<String>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client
-        .request(&Request::Trust {
-            target,
-            petname: petname.to_owned(),
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
+    match keyring_change(&mut client, given, |identity_passphrase| Request::Trust {
+        target,
+        petname: petname.to_owned(),
+        identity_passphrase,
+    })
+    .await
     {
         Ok(Frame::Ok) => {
             println!(
@@ -2788,7 +2852,7 @@ pub async fn trust_add(
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
+        Err(e) => Err(e),
     }
 }
 
@@ -2796,15 +2860,14 @@ pub async fn trust_add(
 pub async fn trust_remove(
     paths: &Paths,
     target: Digest32,
-    identity_passphrase: &str,
+    given: Option<String>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client
-        .request(&Request::Untrust {
-            target,
-            identity_passphrase: identity_passphrase.to_owned(),
-        })
-        .await
+    match keyring_change(&mut client, given, |identity_passphrase| Request::Untrust {
+        target,
+        identity_passphrase,
+    })
+    .await
     {
         Ok(Frame::Ok) => {
             println!(
@@ -2816,14 +2879,14 @@ pub async fn trust_remove(
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
+        Err(e) => Err(e),
     }
 }
 
-/// `vox trust list`, asked of the running node.
-pub async fn trust_list(paths: &Paths, identity_passphrase: &str) -> Result<(), AppError> {
+/// `vox trust list`, asked of the running node: a read, so no passphrase (V210-165).
+pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    match client.trusted(identity_passphrase).await {
+    match client.trusted("").await {
         Ok(Frame::Trusted { entries }) => {
             if entries.is_empty() {
                 println!("no trusted identities");

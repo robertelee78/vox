@@ -45,17 +45,44 @@ pub fn resolve_prefix(prefix: &str, among: &[Digest32]) -> Result<Digest32, AppE
     }
 }
 
-/// Collect the identity passphrase, asking for confirmation when the profile has no
-/// identity yet and this will therefore *create* one.
-///
-/// The confirmation is not politeness. A profile's identity is unlocked by this
-/// passphrase and by nothing else (ADR-010's double lock), so a typo on first use does
-/// not produce a warning later — it produces an identity nobody can ever open.
-pub fn identity_passphrase_for(
-    paths: &Paths,
+/// The text of a passphrase file, or of stdin when the path is `-`: the explicit way to pipe a
+/// passphrase in. Wiped on drop, so only the copy a caller takes outlives the read.
+pub fn passphrase_file_text(
+    path: &std::path::Path,
+) -> Result<zeroize::Zeroizing<String>, AppError> {
+    use std::io::Read as _;
+    let mut text = zeroize::Zeroizing::new(String::new());
+    if path == std::path::Path::new("-") {
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| AppError::Usage(format!("reading stdin: {e}")))?;
+    } else {
+        std::fs::File::open(path)
+            .and_then(|mut f| f.read_to_string(&mut text))
+            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+    }
+    Ok(text)
+}
+
+/// Where a passphrase file's text came from, for the message when it holds none.
+fn source_name(path: &std::path::Path) -> String {
+    if path == std::path::Path::new("-") {
+        "stdin".to_owned()
+    } else {
+        path.display().to_string()
+    }
+}
+
+/// How to give the identity passphrase without a terminal, for every message that needs one.
+pub const GIVE_IDENTITY_PASSPHRASE: &str =
+    "Use --identity-passphrase-file <path> (`-` reads stdin), or VOX_IDENTITY_PASSPHRASE.";
+
+/// The identity passphrase the command line gave, without asking anyone: `--identity-passphrase-
+/// file`, else `VOX_IDENTITY_PASSPHRASE`. `None` when neither did.
+pub fn identity_passphrase_given(
     given: Option<String>,
     file: Option<std::path::PathBuf>,
-) -> Result<String, AppError> {
+) -> Result<Option<String>, AppError> {
     // **A passphrase on a command line is disclosed to the whole machine.** `ps` and
     // `/proc/<pid>/cmdline` are world-readable while a process runs, so `--identity-
     // passphrase secret` hands the identity to every other process on the box, including
@@ -73,57 +100,68 @@ pub fn identity_passphrase_for(
         ));
     }
     if let Some(path) = file {
-        // The whole file is the passphrase and whatever follows it, so it is wiped on drop like
-        // the copy returned: only that copy should outlive this read.
-        let text = zeroize::Zeroizing::new(
-            std::fs::read_to_string(&path)
-                .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?,
-        );
+        let text = passphrase_file_text(&path)?;
         let first = text.lines().next().unwrap_or_default();
         if first.is_empty() {
             return Err(AppError::Usage(format!(
                 "{} is empty; an identity passphrase cannot be",
-                path.display()
+                source_name(&path)
             )));
         }
-        return Ok(first.to_owned());
+        return Ok(Some(first.to_owned()));
     }
     // Read the variable here rather than through clap's `env`, because clap merges a flag
     // and its variable into one value and the whole point is to tell them apart.
     if let Ok(p) = std::env::var("VOX_IDENTITY_PASSPHRASE") {
         if !p.is_empty() {
-            return Ok(p);
+            return Ok(Some(p));
         }
     }
-    let exists = vox_core::node::profile::Profile::exists(paths);
-    if exists {
-        let p = prompt_passphrase("identity passphrase")?;
-        // Without a terminal `prompt_passphrase` reads a line, and a closed or empty
-        // stdin yields "" — which would otherwise be tried as a passphrase and reported
-        // as a wrong one, sending a person to look at their passphrase instead of at the
-        // fact that they never supplied it.
-        if p.is_empty() {
-            return Err(AppError::Usage(
-                "no identity passphrase: nothing on stdin and no terminal to prompt at.\n\
-                 \x20      Use --identity-passphrase-file <path> or VOX_IDENTITY_PASSPHRASE."
-                    .into(),
-            ));
-        }
+    Ok(None)
+}
+
+/// Ask at the terminal for the identity passphrase of a profile that has one, or, with no
+/// terminal, fail at once saying how to give it (V210-165). Stdin that is not a terminal is never
+/// read for it unasked: an agent's harness leaves stdin open and writes nothing, and a read there
+/// waited for ever, saying nothing.
+pub fn ask_identity_passphrase() -> Result<String, AppError> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(AppError::Usage(format!(
+            "this needs the identity passphrase, and there is no terminal to ask at.\n\
+             \x20      {GIVE_IDENTITY_PASSPHRASE}"
+        )));
+    }
+    let p = prompt_passphrase("identity passphrase")?;
+    if p.is_empty() {
+        return Err(AppError::Usage("no identity passphrase was given".into()));
+    }
+    Ok(p)
+}
+
+/// Collect the identity passphrase, asking for confirmation when the profile has no
+/// identity yet and this will therefore *create* one.
+///
+/// The confirmation is not politeness. A profile's identity is unlocked by this
+/// passphrase and by nothing else (ADR-010's double lock), so a typo on first use does
+/// not produce a warning later — it produces an identity nobody can ever open.
+pub fn identity_passphrase_for(
+    paths: &Paths,
+    given: Option<String>,
+    file: Option<std::path::PathBuf>,
+) -> Result<String, AppError> {
+    if let Some(p) = identity_passphrase_given(given, file)? {
         return Ok(p);
     }
-    // **Without a terminal there is nobody to ask twice.** `prompt_passphrase` falls back
-    // to reading a line, so a closed stdin yielded "" and this printed "creating one",
-    // asked for a confirmation nobody could give, and then said "an empty identity
-    // passphrase" — three lines, none of which say what to do, after announcing a
-    // creation that did not happen.
+    if vox_core::node::profile::Profile::exists(paths) {
+        return ask_identity_passphrase();
+    }
+    // **Without a terminal there is nobody to ask twice.**
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(AppError::Usage(
+        return Err(AppError::Usage(format!(
             "this profile has no identity yet, and there is no terminal to ask at.\n\
              \x20      Make one interactively:  vox id\n\
-             \x20      Or give the passphrase:  --identity-passphrase-file <path>, or \
-             VOX_IDENTITY_PASSPHRASE"
-                .into(),
-        ));
+             \x20      Or give the passphrase:  {GIVE_IDENTITY_PASSPHRASE}"
+        )));
     }
     println!("vox: this profile has no identity yet; creating one.");
     let first = prompt_passphrase("new identity passphrase")?;
@@ -1290,19 +1328,21 @@ where
 const STOP_PATIENCE: Duration = Duration::from_secs(5);
 
 /// Read a passphrase from the terminal without echoing it (ADR-015: a passphrase is
-/// never shown, never in a flag, never in the shell's history). Falls back to a plain
-/// line when stdin is not a terminal, so the verbs remain scriptable through a pipe.
+/// never shown, never in a flag, never in the shell's history).
+///
+/// **Only from a terminal** (V210-165). It fell back to a line of stdin when stdin was not one,
+/// and an agent's harness leaves stdin open and writes nothing: the read waited for ever, saying
+/// nothing. Without a terminal this fails at once; a script names its source instead, a file or
+/// `-` for stdin.
 pub fn prompt_passphrase(what: &str) -> Result<String, AppError> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use std::io::{IsTerminal, Write};
 
     if !std::io::stdin().is_terminal() {
-        let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
-            .map_err(AppError::Io)?;
-        return Ok(line.trim_end_matches(['\n', '\r']).to_owned());
+        return Err(AppError::Usage(format!(
+            "this needs the {what}, and there is no terminal to ask at"
+        )));
     }
     print!("{what}: ");
     std::io::stdout().flush().map_err(AppError::Io)?;
@@ -1331,8 +1371,8 @@ pub fn prompt_passphrase(what: &str) -> Result<String, AppError> {
     result.map(|()| out)
 }
 
-/// The room passphrase: from `--passphrase-file`, else prompted for (a line of stdin when
-/// stdin is not a terminal).
+/// The room passphrase: from `--passphrase-file` (`-` for stdin), else asked for at the terminal;
+/// with no terminal, it fails at once saying how to give it (V210-165).
 ///
 /// **Never from argv or the environment** (V210-72). A command line is readable by every
 /// process on the machine while it runs (`ps`, `/proc/<pid>/cmdline`), and an environment
@@ -1361,19 +1401,27 @@ pub fn room_passphrase_for(
         ));
     }
     if let Some(path) = file {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
+        let text = passphrase_file_text(path)?;
         let first = text.lines().next().unwrap_or_default();
         if first.is_empty() {
             return Err(AppError::Usage(format!(
                 "{} is empty; a room passphrase cannot be",
-                path.display()
+                source_name(path)
             )));
         }
         return Ok(first.to_owned());
     }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(AppError::Usage(format!(
+            "this needs the room passphrase, and there is no terminal to ask at.\n\
+             \x20      {GIVE_ROOM_PASSPHRASE}"
+        )));
+    }
     prompt_passphrase("room passphrase")
 }
+
+/// How to give a room passphrase without a terminal.
+pub const GIVE_ROOM_PASSPHRASE: &str = "Use --passphrase-file <path> (`-` reads stdin).";
 
 /// `vox trust add` — decide that an identity may read this node, and reach its services.
 ///
