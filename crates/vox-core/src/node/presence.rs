@@ -149,10 +149,13 @@ pub struct NetPresence {
     nearby: Mutex<Option<NearbyGroup>>,
 }
 
+/// What the nearby group heard: where from, and the members it named.
+pub type Heard = (IpAddr, Vec<Entry>);
+
 /// The nearby group of a presence: the socket, what it hears, and the task that hears it.
 struct NearbyGroup {
     nearby: Arc<Nearby>,
-    heard: broadcast::Sender<(IpAddr, Vec<Entry>)>,
+    heard: broadcast::Sender<Heard>,
     task: tokio::task::AbortHandle,
 }
 
@@ -433,7 +436,7 @@ impl NetPresence {
 
     /// The nearby group (ADR-012 N-44), opened once for the first node that asks, and what it
     /// hears from now on. `None` if the group cannot be opened here.
-    pub fn nearby(&self) -> Option<(Arc<Nearby>, broadcast::Receiver<(IpAddr, Vec<Entry>)>)> {
+    pub fn nearby(&self) -> Option<(Arc<Nearby>, broadcast::Receiver<Heard>)> {
         let mut group = lock(&self.nearby);
         if group.is_none() {
             let nearby = Arc::new(Nearby::open().ok()?);
