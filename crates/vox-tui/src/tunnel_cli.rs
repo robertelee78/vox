@@ -1393,6 +1393,7 @@ pub async fn trust_add(
     petname: &str,
 ) -> Result<(), AppError> {
     let target = resolve_trust_target(node, fingerprint)?;
+    crate::ident::check_new_name(&node.view().trusted, &target, petname)?;
     let out = node
         .apply(NodeCommand::Trust {
             fingerprint: target,

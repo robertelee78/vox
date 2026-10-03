@@ -57,7 +57,7 @@ async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
     // Each way an attach fails needs a different remedy, so each gets its own sentence
     // (#191): they were one, "nothing answered — the node may have stopped", which is true
     // only of a stale socket, and the actual error was thrown away.
-    IpcClient::open(&sock).await.map_err(|e| {
+    let mut client = IpcClient::open(&sock).await.map_err(|e| {
         let at = sock.display();
         AppError::Usage(match e {
             Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
@@ -74,7 +74,10 @@ async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
                  have stopped without cleaning up. Starting a node again replaces it."
             ),
         })
-    })
+    })?;
+    // Every author this command prints is named as this node names it (V210-162).
+    crate::ident::load_names(&mut client).await;
+    Ok(client)
 }
 
 /// Ask the node for its rooms, as `(id, local name, open)`.
@@ -263,9 +266,9 @@ pub struct PostOpts {
     pub work: Option<String>,
     /// The attempt, carried in `data.attempt`; defaults to this session's claim.
     pub attempt: Option<String>,
-    /// Addressees, by petname.
+    /// Addressees: the poster's names for members, or their fingerprints.
     pub to: Vec<String>,
-    /// May interrupt an addressed session.
+    /// May interrupt the agents of the nodes addressed.
     pub urgent: bool,
     /// Reply-to entry hash.
     pub re: Option<String>,
@@ -290,6 +293,43 @@ impl PostOpts {
             || self.coord.op.is_some()
             || self.coord.json
     }
+}
+
+/// A room's members, as the node holds them.
+async fn members_of(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<Vec<Digest32>, AppError> {
+    match client.request(&Request::Roster { channel_id }).await {
+        Ok(Frame::Members { members }) => Ok(members),
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `--to`, as the envelope carries it (V210-161): each word resolved by the poster, once, to a
+/// member's whole fingerprint, so every reader resolves it to the same node. A word that names
+/// no member is refused, saying why.
+async fn addressees(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    words: &[String],
+) -> Result<Vec<String>, AppError> {
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+    let members = members_of(client, channel_id).await?;
+    let mut to: Vec<String> = Vec::new();
+    for w in words {
+        let fp = crate::ident::resolve_member(w, &members, crate::ident::names())
+            .map_err(|e| AppError::Usage(format!("refusing --to: {e}")))?;
+        let fp = b32_encode(&fp);
+        if !to.contains(&fp) {
+            to.push(fp);
+        }
+    }
+    Ok(to)
 }
 
 /// `vox room post` — append a message.
@@ -324,6 +364,23 @@ pub async fn post_cmd(
             return Err(AppError::Usage(format!("refusing to post it: {e}")));
         }
         if let Ok(env) = Envelope::parse(&body) {
+            // **A raw envelope addresses members by fingerprint** (V210-161), as `--to` writes
+            // them: a name in `to` would read as addressed to nobody on every node.
+            if !env.to.is_empty() {
+                let (mut client, cid, _) = open_room(paths, room).await?;
+                let members = members_of(&mut client, cid).await?;
+                if let Some(bad) = env.to.iter().find(|t| {
+                    vox_core::node::link::b32_decode(t.trim(), "recipient")
+                        .map_or(true, |fp| !members.contains(&fp))
+                }) {
+                    return Err(AppError::Usage(format!(
+                        "refusing to post it: `to` names {:?}, which is not a member's whole \
+                         fingerprint. Use --to, which takes your name for a member or its \
+                         fingerprint",
+                        vox_agentcomms::envelope::shown(bad, vox_agentcomms::envelope::SHOWN_NAME)
+                    )));
+                }
+            }
             if claim::is_claim_protocol(&env) {
                 return Err(AppError::Usage(format!(
                     "refusing a raw `{}`: claim-protocol operations need a session, an \
@@ -439,6 +496,7 @@ pub async fn post_cmd(
         None => coord::new_op()?,
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
+    let to = addressees(&mut client, cid, &opts.to).await?;
     let snap = if work.is_some() {
         coord::participate(&mut client, cid, &room_key, &session).await?
     } else {
@@ -521,7 +579,7 @@ pub async fn post_cmd(
     };
     let draft = Draft {
         kind,
-        to: opts.to.clone(),
+        to,
         urgent: opts.urgent,
         re: re.clone(),
         thread: opts.thread.clone(),
@@ -582,29 +640,23 @@ pub async fn post_cmd(
     Ok(())
 }
 
-/// Messages addressed to this session that its drain has not delivered yet: past its
-/// drain cursor, not its own, naming it in `to` — by `VOX_AGENT_NAME`, the name it is
-/// addressed by, or by its session id. The one just posted is excluded.
+/// Messages addressed to this node that this session's drain has not delivered yet: past its
+/// drain cursor, not its own, naming this node in `to` (V210-161). The one just posted is
+/// excluded.
 fn unread_addressed(
     session: &str,
     posting: &coord::Posting,
     after_cursor: &[vox_core::node::api::MessageRow],
 ) -> Vec<(String, String, String, String)> {
     let snap = &posting.after;
-    let names: Vec<String> = std::iter::once(session.to_owned())
-        .chain(
-            std::env::var("VOX_AGENT_NAME")
-                .ok()
-                .filter(|n| !n.trim().is_empty()),
-        )
-        .collect();
+    let me = b32_encode(&snap.me);
     after_cursor
         .iter()
         .filter(|r| r.entry_hash != posting.entry_hash)
         .filter_map(|r| {
             let env = Envelope::parse(&r.text).ok()?;
             let own = r.author == snap.me && env.from == session;
-            (!own && names.iter().any(|n| env.is_addressed_to(n))).then(|| {
+            (!own && env.is_addressed_to(&me)).then(|| {
                 // Every field is the author's, and this lands on the reporting agent's stderr: each
                 // is shown on one line and cut (V210-123). The body's first line ends at any
                 // character a reader breaks a line at, not only `\n`.
@@ -613,7 +665,7 @@ fn unread_addressed(
                 let first = first.split(breaks_lines).next().unwrap_or("");
                 (
                     claim::b32(&r.entry_hash),
-                    shown(&env.from, SHOWN_NAME),
+                    crate::ident::name_of(&r.author),
                     shown(&env.kind, SHOWN_NAME),
                     shown(first, 160),
                 )
@@ -723,7 +775,8 @@ fn after_cursor(
     }
 }
 
-/// One row as `vox room read` and `tail` print it: `<entry-hash> <author-prefix> <text>`.
+/// One row as `vox room read` and `tail` print it: `<entry-hash> <author> <text>`, the author
+/// by this node's name for it, or its fingerprint when it has none (V210-162).
 ///
 /// **No message can forge a row** (PRD-001 R19). A row starts at the beginning of a line,
 /// so a message carrying a newline followed by `<hash> <author> …` would otherwise print a
@@ -748,14 +801,14 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
     format!(
         "{} {} {}",
         id(&r.entry_hash),
-        crate::ident::author_id(&r.author),
+        crate::ident::name_of(&r.author),
         text
     )
 }
 
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
 ///
-/// Each line is `<entry-hash> <author-prefix> <text>`; with `--json`, one
+/// Each line is `<entry-hash> <author> <text>`; with `--json`, one
 /// `vox.room.row/1` object per line. The entry hash **is** the cursor.
 ///
 /// # Errors
@@ -784,14 +837,13 @@ pub async fn read(
         };
         let held_back = equivocations_in(paths, &channel_id).await;
         let mut out = std::io::stdout().lock();
-        // **A member held back for equivocating is said first** (V210-63), by the same short id
-        // the rows below use: the keyring's names need the identity passphrase, which reading a
-        // room does not ask for. `vox status --json` carries the same, in full, for agents.
+        // **A member held back for equivocating is said first** (V210-63), named as the rows
+        // below name it. `vox status --json` carries the same, in full, for agents.
         for (author, seq) in &held_back {
             let _ = writeln!(
                 out,
                 "! {}",
-                crate::ident::equivocation_notice(&crate::ident::author_id(author), *seq)
+                crate::ident::equivocation_notice(&crate::ident::name_of(author), *seq)
             );
         }
         for r in &rows {
@@ -1349,7 +1401,7 @@ fn report(
 fn who(o: &Owner) -> String {
     format!(
         "{}/{}",
-        crate::ident::author_id(&o.author),
+        crate::ident::name_of(&o.author),
         session_name(&o.session)
     )
 }
@@ -1440,7 +1492,7 @@ pub async fn claim_resource(
             false,
             format!(
                 "{resource} is reserved by a handoff for {}{} — you did not get it",
-                &crate::ident::author_id(to_fp),
+                &crate::ident::name_of(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{}", session_name(s)))
@@ -1547,18 +1599,9 @@ pub async fn handoff_resource(
     // to different owners on different nodes (ADR-021 F2).
     let to_fp = {
         let (mut client, cid, _) = open_room(paths, room).await?;
-        let members = match client.request(&Request::Roster { channel_id: cid }).await {
-            Ok(Frame::Members { members }) => members,
-            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-            Err(e) => return Err(AppError::Usage(e.to_string())),
-        };
-        resolve_prefix(to, &members).map_err(|e| {
-            AppError::Usage(format!(
-                "--to names a room member by fingerprint (a unique prefix of one in \
-                 `vox room roster`): {e}"
-            ))
-        })?
+        let members = members_of(&mut client, cid).await?;
+        crate::ident::resolve_member(to, &members, crate::ident::names())
+            .map_err(|e| AppError::Usage(format!("refusing --to: {e}")))?
     };
     let ttl = ttl_secs.unwrap_or(claim::DEFAULT_HANDOFF_TTL_SECS);
     if ttl == 0 {
@@ -1569,7 +1612,8 @@ pub async fn handoff_resource(
     let mut data = serde_json::Map::new();
     data.insert("resource".into(), resource.into());
     data.insert("to_fp".into(), claim::b32(&to_fp).into());
-    data.insert("to".into(), to.into());
+    // The fingerprint, not the word typed: a name is the poster's own and means nothing elsewhere.
+    data.insert("to".into(), claim::b32(&to_fp).into());
     data.insert("ttl_secs".into(), ttl.into());
     if let Some(s) = to_session.filter(|s| !s.is_empty()) {
         data.insert("to_session".into(), s.into());
@@ -1580,7 +1624,7 @@ pub async fn handoff_resource(
         opts,
         claim::HANDOFF,
         data,
-        format!("handing {resource} to {}", crate::ident::author_id(&to_fp)),
+        format!("handing {resource} to {}", crate::ident::name_of(&to_fp)),
     )
     .await?;
     let (ok, said) = match (&done.outcome, done.posting.after.fold.resources.get(resource)) {
@@ -1588,7 +1632,7 @@ pub async fn handoff_resource(
             true,
             format!(
                 "{resource} is reserved for {}{} until {}; it completes when that session claims it",
-                &crate::ident::author_id(&to_fp),
+                &crate::ident::name_of(&to_fp),
                 to_session.map(|s| format!("/{}", session_name(s))).unwrap_or_default(),
                 millis_as_time(*deadline_millis)
             ),
@@ -1840,7 +1884,7 @@ pub async fn board(
                 "{}\tpending handoff from {} to {}{}{} (lapses in {}s)",
                 name(resource),
                 who(from),
-                &crate::ident::author_id(to_fp),
+                &crate::ident::name_of(to_fp),
                 to_session
                     .as_ref()
                     .map(|s| format!("/{}", session_name(s)))
@@ -2267,7 +2311,7 @@ pub async fn get_file(
     for o in live {
         use std::fmt::Write as _;
         let short = &o.sha256[..o.sha256.len().min(16)];
-        let who = crate::ident::author_id(&o.author);
+        let who = crate::ident::name_of(&o.author);
         if o.sha256 == newest.sha256 {
             let _ = write!(
                 said,
@@ -2767,6 +2811,7 @@ pub async fn trust_add(
     identity_passphrase: &str,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
+    crate::ident::check_new_name(crate::ident::names(), &target, petname)?;
     match client
         .request(&Request::Trust {
             target,
