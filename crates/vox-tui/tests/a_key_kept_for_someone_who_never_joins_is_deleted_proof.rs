@@ -205,7 +205,7 @@ fn a_key_kept_for_someone_who_never_joins_is_deleted_after_thirty_days() {
     let _b = daemon(&bob, "bob", 0);
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room create: {err}");
@@ -215,7 +215,15 @@ fn a_key_kept_for_someone_who_never_joins_is_deleted_after_thirty_days() {
     assert!(ok, "vox room invite: {err}");
     let (ok, _, err) = vox(
         &bob,
-        &["room", "join", link.trim(), "--name", "r"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "r",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room join: {err}");

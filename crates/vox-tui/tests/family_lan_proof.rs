@@ -699,7 +699,18 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         .zip(&ports)
         .map(|((n, d), port)| daemon(n, d, *port, &spec, &pass_file))
         .collect();
-    let (ok, out, err) = vox_in(&dirs[0], &["room", "create", "--name", "family"], ROOM_PASS);
+    let (ok, out, err) = vox_in(
+        &dirs[0],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "family",
+        ],
+        ROOM_PASS,
+    );
     assert!(ok, "vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&dirs[0], &args(&["room", "list"]));
     assert!(ok, "vox room list: {err}");
@@ -716,7 +727,15 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         loop {
             let (ok, out, err) = vox_in(
                 d,
-                &["room", "join", link.trim(), "--name", "family"],
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    link.trim(),
+                    "--name",
+                    "family",
+                ],
                 ROOM_PASS,
             );
             if ok {
