@@ -175,12 +175,6 @@ only room governance is who sets the room's retention. This builds on identity (
 - Role-tag ABAC is not evaluated, `Invite` has no wire encoding, and any `delegate`-holder may revoke any
   delegation: each goes with the capabilities #380 removes; only the creator removes an admin under #319.
 
-Fixed since:
-- Joining released the joiner's sender key to the member that answered (M17.6).
-- `NodeCommand::Consent` released a key without a keyring entry: removed; a key goes only to a trusted
-  member, checked in the core (V210-148, `bb1481b1`; proof `no_consent_without_a_ring_entry_proof.rs`).
-- `Untrust` was forward-looking only and did not change the lock (M17.14, `8894b2b2`).
-
 ## Consequences
 
 - The single-wrong-add exposure is gone by construction: nothing is readable without the reader's trust.
