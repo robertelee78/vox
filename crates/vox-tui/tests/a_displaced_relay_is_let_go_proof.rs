@@ -219,6 +219,13 @@ fn status_holds(dir: &std::path::Path, peer: &str) -> Result<(String, String), S
     }
 }
 
+/// What the host's and the guest's `vox status --json` each say they hold for the other (see
+/// [`status_holds`]).
+type Holds = (
+    Result<(String, String), String>,
+    Result<(String, String), String>,
+);
+
 /// **V29-15: both ends keep the same one of two live connections.**
 ///
 /// **Judged on the end state.** Each end's `vox status --json` names the connection it holds for
@@ -259,10 +266,7 @@ fn both_ends_keep_the_same_connection(
             status_holds(&w.guest_dir, &w.host_fp),
         )
     };
-    let agree = |r: &(
-        Result<(String, String), String>,
-        Result<(String, String), String>,
-    )| { matches!(r, (Ok(h), Ok(g)) if h.0 == g.0) };
+    let agree = |r: &Holds| matches!(r, (Ok(h), Ok(g)) if h.0 == g.0);
     let since = Instant::now();
     let mut last = read(w);
     loop {
