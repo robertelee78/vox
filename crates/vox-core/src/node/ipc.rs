@@ -184,6 +184,8 @@ const T_PUBLISH_REFUSED: u64 = 1717;
 const T_PUBLISH_CURED: u64 = 2091;
 /// `NodeEvent::ConnectionNote` (#229's diagnostics). Additive, beside `T_PUBLISH_CURED`.
 const T_CONNECTION_NOTE: u64 = 2092;
+/// `NodeEvent::NodeNote` (V210-167). Additive, away from the tags beside it.
+const T_NODE_NOTE: u64 = 2392;
 /// `NodeEvent::HandshakesQueued` (V210-86). Additive, away from the tags beside it.
 const T_HANDSHAKES_QUEUED: u64 = 2186;
 /// `NodeEvent::AddressWithheld` (V210-96). Additive, away from the sequential range and the tags
@@ -1126,6 +1128,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::ConnectionNote { peer, note } => {
             e.array(3).uint(T_CONNECTION_NOTE).bytes(peer).text(note);
         }
+        NodeEvent::NodeNote { note } => {
+            e.array(2).uint(T_NODE_NOTE).text(note);
+        }
         NodeEvent::HandshakesQueued {
             waited,
             most_waiting,
@@ -1493,6 +1498,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             note: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc connection note"))?
+                .to_owned(),
+        },
+        (T_NODE_NOTE, 2) => NodeEvent::NodeNote {
+            note: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc node note"))?
                 .to_owned(),
         },
         (T_PUBLISH_CURED, 3) => NodeEvent::PublishCured {

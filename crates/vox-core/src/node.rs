@@ -36,6 +36,7 @@ pub mod ipc;
 pub mod joinslots;
 pub mod joinstream;
 pub mod link;
+pub mod nearby;
 pub mod net;
 pub mod network;
 pub mod open_rooms;

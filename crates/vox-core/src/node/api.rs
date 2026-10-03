@@ -1269,6 +1269,13 @@ pub enum NodeEvent {
         /// What happened, for the operator.
         note: String,
     },
+    /// Something about this node itself an operator should know (V210-167): that its usual port
+    /// was taken and it listens on another this run, or that a member was found on this computer
+    /// or the local network.
+    NodeNote {
+        /// What happened, for the operator.
+        note: String,
+    },
     /// More peers dialled this node at once than it runs handshakes for, and the ones past the
     /// cap waited for a slot or were refused (V210-86): said once per burst, when none is left
     /// waiting, so an operator can see a burst was absorbed, or how many were turned away.
