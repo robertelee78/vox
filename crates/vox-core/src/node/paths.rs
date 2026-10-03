@@ -46,6 +46,9 @@ pub const SERVE_FILE: &str = "serve";
 pub const CURSOR_DIR: &str = "cursors";
 /// Where a harness session records how it can be woken (ADR-020 §6).
 pub const SESSION_DIR: &str = "sessions";
+/// The file inside a profile directory holding the UDP port this node first bound, so it binds
+/// the same one on every start and members find it where they last saw it (V210-167).
+pub const PORT_FILE: &str = "port";
 /// The default profile name.
 pub const DEFAULT_PROFILE: &str = "default";
 
@@ -151,6 +154,12 @@ impl Paths {
         }
         name.push_str(".sock");
         socket_fallback_dir().join(name)
+    }
+
+    /// `<profile_dir>/port` ([`PORT_FILE`]).
+    #[must_use]
+    pub fn port_file(&self) -> PathBuf {
+        self.profile_dir.join(PORT_FILE)
     }
 
     /// The anchors file for this profile ([`ANCHORS_FILE`]).

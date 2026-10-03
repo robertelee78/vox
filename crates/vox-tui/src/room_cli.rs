@@ -2660,6 +2660,46 @@ fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
 pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), AppError> {
     let passphrase = passphrase_from_stdin("the room's passphrase")?;
     let mut client = attach(paths).await?;
+    // A room this node holds open is not joined again: its address is taken as where the room's
+    // host is now, and the host is dialled there (V210-167).
+    let held = match vox_core::node::link::InviteLink::parse(link) {
+        Ok(parsed) => rooms_of(&mut client)
+            .await?
+            .into_iter()
+            .find(|(id, _, open)| *id == parsed.channel_id && *open)
+            .map(|(id, name, _)| {
+                if name.is_empty() {
+                    b32_encode(&id)
+                } else {
+                    name
+                }
+            }),
+        Err(_) => None,
+    };
+    if let Some(name) = held {
+        return match client
+            .request(&Request::Join {
+                link: link.to_owned(),
+                local_name: local_name.to_owned(),
+                passphrase,
+            })
+            .await
+        {
+            Ok(Frame::Ok) => {
+                println!(
+                    "vox: this node already holds {name}; it took the address as where the \
+                     room's host is now, and reached the host there"
+                );
+                Ok(())
+            }
+            Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+                "this node already holds {name}, and nobody answered at the address given{}",
+                crate::tunnel_cli::join_detail(&reason)
+            ))),
+            Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => Err(AppError::Usage(e.to_string())),
+        };
+    }
     match client
         .request(&Request::Join {
             link: link.to_owned(),
