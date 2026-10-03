@@ -67,10 +67,9 @@ pub enum StructTag {
     /// `0x0012` — member prekey-bundle rendezvous record (ADR-016 M14): a
     /// member's root-signed prekey bundle on the rendezvous board.
     MemberBundleRecord = 0x0012,
-    /// `0x0013` — service-grant exclusion (ADR-007/ADR-017): withdraws the genesis
-    /// service grant from one member, which is the only way to take back a
-    /// capability nobody was ever issued a certificate for.
-    ServiceGrantExclusion = 0x0013,
+    // `0x0013` is RESERVED. It was the service-grant exclusion of the withdrawn capability
+    // model (ADR-017 M17.7, PRD-001 R44): a genesis service grant confers nothing, so there
+    // is nothing to exclude anyone from. No release ever posted one. Never reused.
     /// `0x0014` — join witness (ADR-016 M17.6): the member that actually verified a
     /// joiner's ADR-005 passphrase proof signs that it did so. A key becomes an author
     /// only on such evidence, which is what makes "no member can add another member"
@@ -91,7 +90,7 @@ pub enum StructTag {
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 21] = [
+    pub const ALL: [StructTag; 20] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -108,7 +107,6 @@ impl StructTag {
         StructTag::ServiceAdvertisement,
         StructTag::SessionEstablishment,
         StructTag::MemberBundleRecord,
-        StructTag::ServiceGrantExclusion,
         StructTag::JoinWitness,
         StructTag::Presence,
         StructTag::Checkpoint,
@@ -123,7 +121,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 21-element table: trivial and avoids an
+        // Linear scan over a 20-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -142,7 +140,6 @@ impl StructTag {
             StructTag::AdminCert => "vox/admin-cert/v1",
             StructTag::ConsentGrant => "vox/consent-grant/v1",
             StructTag::ConsentRevocation => "vox/consent-revocation/v1",
-            StructTag::ServiceGrantExclusion => "vox/service-grant-exclusion/v1",
             StructTag::PolicyRotation => "vox/policy-rotation/v1",
             StructTag::RendezvousRecord => "vox/rendezvous-record/v1",
             StructTag::PreJoinRecord => "vox/pre-join-record/v1",

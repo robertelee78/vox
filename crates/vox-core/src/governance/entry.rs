@@ -41,7 +41,6 @@ use crate::governance::genesis::Genesis;
 use crate::governance::policy::PolicyUpdate;
 use crate::governance::presence::Presence;
 use crate::governance::rotation::PassphraseRotation;
-use crate::governance::servicegrant::ServiceGrantExclusion;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::log::entry::Entry;
@@ -63,9 +62,6 @@ pub enum GovBody {
     ConsentGrant(Box<ConsentGrant>),
     /// A per-sender consent revocation (tag `0x0005`).
     ConsentRevocation(Box<ConsentRevocation>),
-    /// A service-grant exclusion (tag `0x0013`) — withdraws the genesis service
-    /// grant from one member (ADR-017).
-    ServiceGrantExclusion(Box<ServiceGrantExclusion>),
     /// A policy-update (tag `0x0006`, body kind = policy-update).
     PolicyUpdate(Box<PolicyUpdate>),
     /// A passphrase-rotation / epoch bump (tag `0x0006`, body kind = rotation).
@@ -96,9 +92,6 @@ impl GovBody {
             StructTag::ConsentRevocation => Ok(GovBody::ConsentRevocation(Box::new(
                 ConsentRevocation::from_wire(bytes)?,
             ))),
-            StructTag::ServiceGrantExclusion => Ok(GovBody::ServiceGrantExclusion(Box::new(
-                ServiceGrantExclusion::from_wire(bytes)?,
-            ))),
             StructTag::Presence => Ok(GovBody::Presence(Box::new(Presence::from_wire(bytes)?))),
             StructTag::PolicyRotation => {
                 // 0x0006 is shared: try policy-update, then passphrase-rotation.
@@ -124,7 +117,6 @@ impl GovBody {
             GovBody::AdminRevocation(r) => (r.body.channel_id, r.body.epoch),
             GovBody::ConsentGrant(g) => (g.body.channel_id, g.body.epoch),
             GovBody::ConsentRevocation(r) => (r.body.channel_id, r.body.epoch),
-            GovBody::ServiceGrantExclusion(x) => (x.body.channel_id, x.body.epoch),
             GovBody::PolicyUpdate(p) => (p.body.channel_id, p.body.epoch),
             GovBody::PassphraseRotation(r) => (r.body.channel_id, r.body.old_epoch),
             GovBody::Presence(p) => (p.body.channel_id, p.body.epoch),
@@ -141,7 +133,6 @@ impl GovBody {
             GovBody::AdminRevocation(r) => r.body.issuer_id,
             GovBody::ConsentGrant(g) => g.body.author_id,
             GovBody::ConsentRevocation(r) => r.body.author_id,
-            GovBody::ServiceGrantExclusion(x) => x.body.issuer_id,
             GovBody::PolicyUpdate(p) => p.body.issuer_id,
             GovBody::PassphraseRotation(r) => r.body.issuer_id,
             GovBody::Presence(p) => p.body.author_id,

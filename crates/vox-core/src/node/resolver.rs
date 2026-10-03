@@ -56,9 +56,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::governance::genesis::Genesis;
 use crate::hash::Digest32;
-use crate::node::link::{b32_decode, b32_encode, channel_of_hostname};
+use crate::node::link::{b32_decode, b32_encode};
 
 /// Where a `.vox` name leads: the room whose gate applies, and the member to reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +84,6 @@ struct NamedRoom {
 /// live channel state while answering.
 #[derive(Debug, Clone, Default)]
 pub struct VoxResolver {
-    /// `<room-id>.vox`: rooms with a genesis service grant, to their creator.
-    by_channel: BTreeMap<Digest32, ServiceRoom>,
     /// `<node>.<room>.vox`: every room this machine holds, by id.
     rooms: BTreeMap<Digest32, NamedRoom>,
     /// Trusted identities and this machine's name for each, as a DNS label.
@@ -115,23 +112,6 @@ impl VoxResolver {
         Self::default()
     }
 
-    /// Add a room by its genesis, for the `<room-id>.vox` form, if it is a service room.
-    ///
-    /// Returns whether it was added. A room whose genesis carries no service grant is
-    /// **not** added: its host is not determined by the genesis, so that form has nothing
-    /// to name. Its members are still named by the `<node>.<room>.vox` form.
-    pub fn insert(&mut self, genesis: &Genesis) -> bool {
-        if genesis.body.service_grant.is_empty() {
-            return false;
-        }
-        let room = ServiceRoom {
-            channel_id: genesis.channel_id(),
-            host: genesis.creator_pubkey().fingerprint(),
-        };
-        self.by_channel.insert(room.channel_id, room);
-        true
-    }
-
     /// Add a room this machine holds, under its local name, with its members.
     pub fn add_room(&mut self, channel_id: Digest32, local_name: &str, members: &[Digest32]) {
         self.rooms.insert(
@@ -148,13 +128,6 @@ impl VoxResolver {
         self.names.insert(fingerprint, label_of(petname));
     }
 
-    /// The room a `<room-id>.vox` hostname names, or `None`.
-    #[must_use]
-    pub fn resolve(&self, hostname: &str) -> Option<&ServiceRoom> {
-        let channel_id = channel_of_hostname(hostname).ok()?;
-        self.by_channel.get(&channel_id)
-    }
-
     /// Resolve either form, or say why not.
     ///
     /// # Errors
@@ -167,18 +140,8 @@ impl VoxResolver {
         };
         match labels.split('.').collect::<Vec<_>>().as_slice() {
             [room_id] => {
-                let channel_id = b32_decode(room_id, "vox hostname").map_err(|_| {
-                    format!(
-                        "{hostname}: name a node as <node>.<room>.vox — `{room_id}` alone is \
-                         neither a room id nor a node"
-                    )
-                })?;
-                self.by_channel.get(&channel_id).copied().ok_or_else(|| {
-                    format!(
-                        "{hostname}: that room id is not a room on this machine with a host of \
-                         its own; name the member instead, as <node>.<room>.vox"
-                    )
-                })
+                let _ = room_id;
+                Err(format!("{hostname}: name a node as <node>.<room>.vox"))
             }
             [node, room] => {
                 let channel_id = self.room(room)?;
@@ -267,15 +230,4 @@ impl VoxResolver {
         }
     }
 
-    /// How many rooms have a `<room-id>.vox` name here.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.by_channel.len()
-    }
-
-    /// Whether no room has a `<room-id>.vox` name here.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_channel.is_empty()
-    }
 }

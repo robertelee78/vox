@@ -47,7 +47,6 @@ use crate::error::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::governance::capability::CapabilitySet;
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::entry::{GovBody, GovEntry};
 use crate::governance::evaluator::Evaluator;
@@ -93,9 +92,8 @@ const SEG_SENDER: u64 = 1;
 const SEG_ANCHORS: u64 = 4;
 /// The offered-services segment id within [`SegmentKind::KeyMaterial`] (ADR-013,
 /// M16.1): the `service_tag → local address` map this node **binds** for this
-/// channel. Host configuration, not authorization — what a peer may *reach* is the
-/// `dial:` capability in the log, and the two are checked separately
-/// ([`crate::tunnel::session::accept`]).
+/// channel. Host configuration, not authorization — who may *reach* it is the host's
+/// dial gate ([`crate::tunnel::session::accept`]).
 const SEG_SERVICES: u64 = 5;
 
 /// The retained-origins segment id within [`SegmentKind::KeyMaterial`] (M18.1): the
@@ -1180,37 +1178,7 @@ impl ChannelState {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
-        Self::create_with_grant(
-            profile,
-            local_name,
-            channel_passphrase,
-            CapabilitySet::new(),
-            now_secs,
-            argon2,
-        )
-    }
-
-    /// Create a channel whose **genesis confers `service_grant` on every member**
-    /// (ADR-017 decision 3) — the capability-bearing room `vox serve` makes.
-    ///
-    /// Joining such a room *is* the authorization: the joiner already proved it held
-    /// the passphrase and paid the ADR-005 proof of work, and the room's purpose is
-    /// the service, so "may this member dial it" and "is this person a member" are the
-    /// same question. No certificate is issued to anyone, so the host never waits for
-    /// the guest to appear in order to grant them something.
-    ///
-    /// The grant is immutable, being part of the genesis and therefore of the
-    /// channelID — a room cannot silently *become* an access list, and one created as
-    /// an access list cannot stop being one.
-    pub fn create_with_grant(
-        profile: &Profile,
-        local_name: &str,
-        channel_passphrase: &[u8],
-        service_grant: CapabilitySet,
-        now_secs: u64,
-        argon2: Argon2Profile,
-    ) -> Result<Self> {
-        let (genesis, sek) = Self::create_genesis(profile, local_name, service_grant, now_secs)?;
+        let (genesis, sek) = Self::create_genesis(profile, local_name, now_secs)?;
         let signer = profile.signer()?;
         let factor = SignatureIdentityFactor::new(signer);
         let wrap = sek.seal(&factor, &genesis.channel_id(), channel_passphrase, argon2)?;
@@ -1227,7 +1195,7 @@ impl ChannelState {
 
     /// The fast first step of creating a room: its genesis and a fresh room key.
     ///
-    /// Split from [`ChannelState::create_with_grant`] so the slow middle step — sealing the room
+    /// Split from [`ChannelState::create_with_profile`] so the slow middle step — sealing the room
     /// key under the passphrase with production Argon2id, seconds of CPU — can run off the node's
     /// actor, which answers nothing while it works. [`ChannelState::create_from_sealed`] is the
     /// last step.
@@ -1237,7 +1205,6 @@ impl ChannelState {
     pub fn create_genesis(
         profile: &Profile,
         local_name: &str,
-        service_grant: CapabilitySet,
         now_secs: u64,
     ) -> Result<(Genesis, Sek)> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
@@ -1249,7 +1216,7 @@ impl ChannelState {
             ttl: 0,
             min_suite: SuiteFloor::DAY_ONE.id(),
         };
-        let genesis = Genesis::create_with_grant(signer, now_secs, policy, service_grant)?;
+        let genesis = Genesis::create(signer, now_secs, policy)?;
         Ok((genesis, Sek::generate()?))
     }
 
@@ -1851,11 +1818,9 @@ impl ChannelState {
         gov_entries: &[GovEntry],
         now_secs: u64,
     ) -> Result<Evaluator> {
-        // The admitted authors are this node's view of *who is a member*, which is
-        // what a genesis service grant is conferred on (ADR-017 decision 3). It is
-        // local state by ADR-007's design — membership is emergent, there is no
-        // roster — and that is sound here because the decision it feeds is local too:
-        // a host serving its own service consults the keys it verified itself.
+        // The admitted authors are this node's view of *who is a member*: local state by
+        // ADR-007's design (membership is emergent, there is no roster). It confers no
+        // capability (PRD-001 R44).
         Evaluator::build_with_members(
             genesis,
             gov_entries,
@@ -3609,12 +3574,6 @@ impl ChannelState {
             return Err(e);
         }
         Ok(())
-    }
-
-    /// The capabilities this channel's genesis confers on every member (ADR-017).
-    #[must_use]
-    pub fn service_grant(&self) -> &CapabilitySet {
-        &self.genesis.body.service_grant
     }
 
     /// The room's retention, seconds (`0` = forever): the ADR-007 policy-update `ttl` in
