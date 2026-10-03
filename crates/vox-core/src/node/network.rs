@@ -381,12 +381,12 @@ impl Drop for ReachOwner<'_> {
             self.manager.note(
                 self.peer,
                 format!(
-                    "a reach was cancelled {} ms into its ladder; {} waiting for it",
+                    "a reach was cancelled {} ms into its ladder; {}",
                     self.started.elapsed().as_millis(),
                     if woken.is_some() {
-                        "any reach"
+                        "any reach waiting for it now tries on its own"
                     } else {
-                        "nothing"
+                        "nothing was waiting for it"
                     }
                 ),
             );
