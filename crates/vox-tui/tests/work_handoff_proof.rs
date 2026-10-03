@@ -24,16 +24,15 @@
 //! 4. a decline frees the item — it does **not** return to the sender — and a fresh
 //!    claim by a third session then succeeds;
 //! 5. a handoff of a claim that had **no TTL** still lapses at its own deadline;
-//! 6. **the same rows logged in different orders fold to the same board.** Each node logs
-//!    its own post when it is made and a peer's when it arrives, so two claims of one item
-//!    made while the nodes cannot reach each other sit in opposite local orders: bob's
-//!    daemon is down while alice claims, then alice's and the anchor's (it holds the room's
-//!    entries too) are stopped (SIGSTOP) while bob's restarts and bob claims, then all
-//!    resume. Each claim is posted and
-//!    told it is not agreed yet, since the other member cannot be reached (V210-168). The
-//!    earlier claim must hold on both nodes. Precondition (else APPARATUS, CANNOT MEASURE): `room read
-//!    --json` shows the two claims in different orders on the two nodes — without that,
-//!    a fold in local order and the canonical fold give the same board.
+//! 6. **two claims made while the nodes cannot reach each other fold to the same board.**
+//!    bob's daemon is down while alice claims; then alice's and the anchor's (it holds the
+//!    room's entries too) are stopped (SIGSTOP) while bob's restarts and bob claims; then all
+//!    resume. Each claim is posted and told it is not agreed yet, since the other member
+//!    cannot be reached (V210-168). Since v0.3.0 every node reads a room in its one order
+//!    (PRD-001 R13), so `room read --json` must show the two claims in the same order on both
+//!    nodes, and the earlier claim must hold on both. (This case used to require the two
+//!    nodes to show *different* local orders; with one room order nothing shows a local
+//!    order any more.)
 //!
 //! Cases 1–5 depend on no causal order between two authors: every step waits until the
 //! node that acts next has *seen* what it acts on. That is also why they cannot catch a
@@ -414,7 +413,8 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     assert!(
         first.code == Some(5)
             && first.stderr.contains("h-order is not agreed yet")
-            && first.stderr.contains("could not be reached")
+            // Named as alice names bob (V210-162).
+            && first.stderr.contains("member bob-the-builder could not be reached")
             && first.stderr.contains("Your claim is posted"),
         "PRODUCT: alice/a1's claim of h-order, made while bob's daemon was stopped, must be posted \
          and answered \"not agreed yet\" (exit 5) naming the member it could not reach: {first:?}"
@@ -434,18 +434,17 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         .collect();
     let hashes = |v: &[(String, String, u64)]| v.iter().map(|c| c.0.clone()).collect::<Vec<_>>();
     eprintln!(
-        "[proof] (6) local order of the h-order claims: alice {:?}, bob {:?}; bob's claim said: {}{}",
+        "[proof] (6) the h-order claims as each node reads them: alice {:?}, bob {:?}; bob's claim said: {}{}",
         hashes(&orders[0]),
         hashes(&orders[1]),
         second.stdout.trim(),
         second.stderr.trim()
     );
-    assert!(
-        hashes(&orders[0]) != hashes(&orders[1]),
-        "APPARATUS: CANNOT MEASURE (6): both nodes logged the two claims of h-order in the \
-         same order {:?} (bob had alice's claim before he made his), so this case cannot tell \
-         a canonical fold from one in local order",
-        orders[0]
+    assert_eq!(
+        hashes(&orders[0]),
+        hashes(&orders[1]),
+        "PRODUCT (6): alice and bob read the two claims of h-order in different orders; a room \
+         has one order on every node (PRD-001 R13)"
     );
     let by = |author: &str| orders[0].iter().find(|c| c.1 == author).map(|c| c.2);
     assert!(
@@ -473,7 +472,7 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         held[0]
     );
     eprintln!(
-        "[proof] (6) identical h-order on two nodes from opposite local orders: {}",
+        "[proof] (6) identical h-order on two nodes from claims made apart: {}",
         held[0]
     );
 

@@ -218,7 +218,9 @@ fn a_worker_on_another_version_is_refused_by_name() {
     );
     assert!(
         hook.stdout.contains("work coordination refused")
-            && hook.stdout.contains(&format!("worker {} session", bob.name)),
+            && hook
+                .stdout
+                .contains(&format!("worker {} session", bob.name)),
         "PRODUCT: the drain hook must say it plainly: {hook:?}"
     );
 

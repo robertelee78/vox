@@ -263,8 +263,7 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let told = drain(alice, r, "s1");
     assert!(
         told.contains(
-            "You no longer hold `reserved`: your claim lapsed, and it is now reserved for"
-        // The recipient is alice's own node, which she reads as "you" (V210-162).
+            "You no longer hold `reserved`: your claim lapsed, and it is now reserved for" // The recipient is alice's own node, which she reads as "you" (V210-162).
         ) && told.contains("you/s9"),
         "PRODUCT: a lapsed claim now reserved by a handoff must say so and name the recipient: \
          {told:?}"

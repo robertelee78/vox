@@ -256,7 +256,9 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     // It tells the agent so, in one line (V210-163): said on stderr alone, a node that was down
     // read to the agent as a quiet room.
     let told: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
-        panic!("PRODUCT: a hook that cannot read must still print its harness's JSON ({e}): {out:?}")
+        panic!(
+            "PRODUCT: a hook that cannot read must still print its harness's JSON ({e}): {out:?}"
+        )
     });
     let context = told["hookSpecificOutput"]["additionalContext"]
         .as_str()
@@ -386,7 +388,10 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         &["agent", "hook", "--room", "zzzzzzzz"],
         &claude_input("s9"),
     );
-    assert!(ok, "PRODUCT: unknown room: a hook must exit 0; it said {err:?}");
+    assert!(
+        ok,
+        "PRODUCT: unknown room: a hook must exit 0; it said {err:?}"
+    );
     let told: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
         panic!("PRODUCT: unknown room: the hook must print its harness's JSON ({e}): {out:?}")
     });
@@ -619,7 +624,10 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
     let out = turn("lost-session");
     // Said under the room's heading, ahead of its first row (V210-163: every room has one).
     let said_at = out.find("(Your read position in this room was not found");
-    let first_row = out.lines().find(|l| l.starts_with('[')).and_then(|l| out.find(l));
+    let first_row = out
+        .lines()
+        .find(|l| l.starts_with('['))
+        .and_then(|l| out.find(l));
     assert!(
         matches!((said_at, first_row), (Some(a), Some(b)) if a < b),
         "PRODUCT: a replay from the beginning must say so, before what it replays: {out}"

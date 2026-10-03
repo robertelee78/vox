@@ -664,6 +664,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     // `ping-b`, each at a socket of the test's own. Both are on bob's node, so each addresses the
     // other by bob's fingerprint: the node's other sessions are woken, never the poster.
     let mut pinged = Vec::new();
+    let mut ping_socks = Vec::new();
     for session in ["ping-a", "ping-b"] {
         let sock = tmp.path().join(format!("{session}.sock"));
         let rx = listen(&sock);
@@ -681,11 +682,29 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         );
         assert_eq!(
             registered(bob, session),
-            Some(("claude".to_owned(), sock_s)),
+            Some(("claude".to_owned(), sock_s.clone())),
             "PRODUCT (staging): {session} must be registered at the test's own socket"
         );
         pinged.push(rx);
+        ping_socks.push(sock_s);
     }
+    // A ping session's turn, as its harness runs the hook: with its messaging socket, which every
+    // turn registers again. A drain without it re-registered the session with nowhere to wake it.
+    let ping_turn = |i: usize| -> String {
+        let o = hook(
+            bob,
+            &[
+                ("CLAUDE_CODE_MESSAGING_SOCKET", ping_socks[i].as_str()),
+                ("CLAUDE_CODE_MESSAGING_TOKEN", "ping-token"),
+            ],
+            &["agent", "hook", "--room", r, "--format", "text"],
+            Some(&format!(
+                r#"{{"session_id":"{}","hook_event_name":"UserPromptSubmit"}}"#,
+                ["ping-a", "ping-b"][i]
+            )),
+        );
+        o.stdout
+    };
     // Each session answers every wake as an agent would: an urgent post back to the other,
     // with no `--re`. ping-b opens; then whoever is woken answers, for up to ROUNDS wakes.
     const ROUNDS: usize = 12;
@@ -708,13 +727,11 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         }
         wakes += 1;
         let session = sessions[target];
-        let read = drain(bob, r, session);
+        let read = ping_turn(target);
         check(
             &mut failures,
             read.contains(&marker),
-            format!(
-                "(7) PRODUCT: {session}, woken, must read {marker} in its turn: {read:?}"
-            ),
+            format!("(7) PRODUCT: {session}, woken, must read {marker} in its turn: {read:?}"),
         );
         let other = 1 - target;
         // An answer the product refuses ends the conversation as surely as one that wakes
@@ -787,7 +804,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         ),
     );
     // The answer that did not wake ping-b still reaches it, on its next turn.
-    let drained = drain(bob, r, "ping-b");
+    let drained = ping_turn(1);
     let queued = drained.contains("PINGPONG-1.");
     println!("[proof] (7) ping-b, not woken, drains the answer on its next turn: {queued}");
     check(
@@ -816,7 +833,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         );
     }
     // Its turn reads it, which also ends the hold on its next notice (V030-15).
-    let _ = drain(bob, r, "ping-a");
+    let _ = ping_turn(0);
     let raw =
         format!(r#"{{"v":1,"type":"answer","to":["{bob_fp}"],"urgent":true,"body":"RAW-NO-RE"}}"#);
     let o = bob.vox_in(Some("ping-a"), &["room", "post", r, "-"], Some(&raw));

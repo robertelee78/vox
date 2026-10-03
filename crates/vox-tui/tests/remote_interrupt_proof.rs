@@ -887,8 +887,14 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
     // A new session starts behind by everything this room holds, more than one turn's bound
     // (V210-120), so it catches up first: what (9) counts is the one message posted next.
     for _ in 0..10 {
-        let o = bob.vox(
+        // With its harness's variables, as every turn of it runs: a turn without them registers
+        // the session again with nowhere to wake it.
+        let o = bob.vox_env(
             None,
+            &[
+                ("VOX_OPENCODE_WAKE_SOCKET", flaky_s.as_str()),
+                ("VOX_OPENCODE_WAKE_TOKEN", "flaky-token"),
+            ],
             &[
                 "agent",
                 "hook",
@@ -899,6 +905,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
                 "--session",
                 "session-flaky",
             ],
+            None,
         );
         if o.stdout.trim().is_empty() {
             break;

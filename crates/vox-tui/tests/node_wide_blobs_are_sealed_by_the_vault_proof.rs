@@ -201,7 +201,12 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
         })
         .to_owned();
     let link = ok(exe, host, &["room", "invite", &room], None);
-    let join = [&["room", "join"][..], from_stdin, &[link.trim(), "--name", name]].concat();
+    let join = [
+        &["room", "join"][..],
+        from_stdin,
+        &[link.trim(), "--name", name],
+    ]
+    .concat();
     ok(exe, guest, &join, Some("room pass"));
     room
 }
