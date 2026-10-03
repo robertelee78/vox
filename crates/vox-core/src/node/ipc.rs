@@ -2831,6 +2831,10 @@ pub trait Dispatch: Send + Sync + 'static {
 /// # Errors
 /// If the socket cannot be placed.
 pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> Result<IpcServer> {
+    // `.daemon/` is the daemon's own, made private here if the lock has not made it yet.
+    if let Some(dir) = path.parent() {
+        crate::node::paths::create_private_dir(dir)?;
+    }
     let listener = place_socket(&path)?;
     let me = crate::node::paths::my_uid();
     let task = tokio::spawn(async move {
@@ -4188,5 +4192,18 @@ impl IpcClient {
             Some(body) => Ok(Some(Frame::from_bytes(&body)?)),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod account_socket_tests {
+    /// The account socket admits its own user only, and never root, even a daemon run as root
+    /// (ADR-026 C-1, S-5).
+    #[test]
+    fn only_the_same_user_and_never_root() {
+        assert!(super::admitted(Some(501), 501));
+        assert!(!super::admitted(Some(502), 501));
+        assert!(!super::admitted(None, 501));
+        assert!(!super::admitted(Some(0), 0));
     }
 }

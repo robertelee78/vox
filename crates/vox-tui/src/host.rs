@@ -986,3 +986,339 @@ impl Dispatch for Router {
         self.inner.events.subscribe()
     }
 }
+
+/// The router's lifecycle, in one process (ADR-026 §10 proofs 5 and 6, as far as they hold without
+/// the daemon process): concurrent attaches, holders and the implicit detach, a session's end with
+/// its detach, a detach answering connections "node detached", and one node's panic leaving the
+/// other running. Production Argon2id: run in release.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vox_core::node::daemonipc::{AttachMode, Opening};
+    use vox_core::node::ipc::{read_frame, write_frame, Frame};
+
+    const PASS: &str = "identity passphrase";
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// An account in a fresh directory, with a node of each name holding an identity.
+    async fn account(dir: &std::path::Path, names: &[&str]) -> Account {
+        let account = Account::of(Some(&dir.join("d")), Some(&dir.join("c"))).unwrap();
+        for name in names {
+            let paths = account.node_paths(&NodeName::parse(name).unwrap()).unwrap();
+            let (handle, actor) = tokio::task::spawn_blocking(move || {
+                Node::spawn_supervised(paths, NodeConfig::new())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let made = handle
+                .apply(NodeCommand::CreateIdentity {
+                    passphrase: Secret::new(PASS.as_bytes().to_vec()),
+                })
+                .await;
+            assert!(made.is_done(), "APPARATUS: create {name}: {made}");
+            let _ = handle.apply(NodeCommand::Shutdown).await;
+            drop(handle);
+            let _ = actor.await;
+        }
+        account
+    }
+
+    fn router(account: Account) -> Router {
+        Router::new(
+            account,
+            Handle::current(),
+            Defaults {
+                bind: Arc::new(|_| None),
+                anchors: BootstrapSet::new(),
+                anchor_specs: Vec::new(),
+                listen: String::new(),
+                patience: Duration::from_secs(5),
+            },
+        )
+    }
+
+    fn n(s: &str) -> NodeName {
+        NodeName::parse(s).unwrap()
+    }
+
+    fn pass() -> Option<Zeroizing<String>> {
+        Some(Zeroizing::new(PASS.into()))
+    }
+
+    fn hold(node: &str) -> UseNode {
+        UseNode {
+            node: n(node),
+            attach: AttachMode::Hold,
+            passphrase: pass(),
+            anchors: Vec::new(),
+        }
+    }
+
+    fn state(r: &Router, node: &str) -> NodeState {
+        r.nodes()
+            .into_iter()
+            .find(|i| i.name.as_str() == node)
+            .map_or(NodeState::Detached, |i| i.state)
+    }
+
+    async fn settle(r: &Router, node: &str, want: NodeState) {
+        let t0 = std::time::Instant::now();
+        while state(r, node) != want && t0.elapsed() < Duration::from_secs(20) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            state(r, node),
+            want,
+            "PRODUCT: node {node} never became {want:?}"
+        );
+    }
+
+    /// Two clients holding one node at the same moment both get it, from one attach; the node
+    /// stays while either holds it, and detaches when the last lets go (L-2, L-3).
+    #[test]
+    fn two_holders_share_one_attach_and_the_last_to_go_detaches_it() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let r = router(account(dir.path(), &["alice"]).await);
+            let (a, b) = tokio::join!(r.use_node(hold("alice")), r.use_node(hold("alice")));
+            let (a, b) = (a.expect("PRODUCT: first"), b.expect("PRODUCT: second"));
+            assert_eq!(
+                r.inner.next_generation.load(Ordering::Relaxed),
+                2,
+                "PRODUCT: two attaches for one node"
+            );
+            assert_eq!(r.metrics().nodes_attached.load(Ordering::Relaxed), 1);
+            drop(a);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                state(&r, "alice"),
+                NodeState::Attached,
+                "PRODUCT: detached with a holder left"
+            );
+            drop(b);
+            settle(&r, "alice", NodeState::Detached).await;
+            assert_eq!(r.metrics().nodes_attached.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    /// A one-shot `Use` of a node not attached is refused and attaches nothing (L-2); a wrong
+    /// passphrase is refused and leaves the node detached.
+    #[test]
+    fn a_one_shot_use_never_attaches_and_a_wrong_passphrase_is_refused() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let r = router(account(dir.path(), &["alice"]).await);
+            let once = r
+                .use_node(UseNode {
+                    attach: AttachMode::No,
+                    ..hold("alice")
+                })
+                .await;
+            assert!(matches!(once, Err(Refusal::NotAttached { .. })), "PRODUCT");
+            let wrong = r
+                .use_node(UseNode {
+                    passphrase: Some(Zeroizing::new("wrong".into())),
+                    ..hold("alice")
+                })
+                .await;
+            assert!(
+                matches!(wrong, Err(Refusal::WrongPassphrase { .. })),
+                "PRODUCT"
+            );
+            assert_eq!(state(&r, "alice"), NodeState::Detached);
+            let none = r.use_node(hold("bob")).await;
+            assert!(matches!(none, Err(Refusal::NoSuchNode { .. })), "PRODUCT");
+        });
+    }
+
+    /// An agent session holds its node; the session's end is its last holder going, and the node
+    /// detaches in the same decision (L-3, ADR-020 6.10). A node attached by hand stays.
+    #[test]
+    fn a_sessions_end_detaches_its_implicit_node_and_not_a_kept_one() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let r = router(account(dir.path(), &["agent", "person"]).await);
+            let s = crate::wake::Session::from_env("s-1", true);
+            r.session_register(&n("agent"), s, pass(), Vec::new())
+                .await
+                .expect("PRODUCT: register");
+            let lease = r.use_node(hold("agent")).await.unwrap();
+            drop(lease);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                state(&r, "agent"),
+                NodeState::Attached,
+                "PRODUCT: a registered session did not hold its node"
+            );
+            let (was, detached) = r.session_end(&n("agent"), "s-1").await;
+            assert!(was && detached, "PRODUCT: end said {was} {detached}");
+            assert_eq!(state(&r, "agent"), NodeState::Detached);
+
+            r.attach(&n("person"), pass(), None, Vec::new(), Vec::new())
+                .await
+                .unwrap();
+            let s = crate::wake::Session::from_env("s-2", true);
+            r.session_register(&n("person"), s, None, Vec::new())
+                .await
+                .unwrap();
+            let (_, detached) = r.session_end(&n("person"), "s-2").await;
+            assert!(
+                !detached,
+                "PRODUCT: a node attached by hand detached with a session"
+            );
+            assert_eq!(state(&r, "person"), NodeState::Attached);
+        });
+    }
+
+    /// Over the account socket: a connection acting as a node is told "node detached" when the
+    /// node is detached under it, and the connection ends (L-3, L-7).
+    #[test]
+    fn a_connection_is_told_its_node_detached() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let account = account(dir.path(), &["alice"]).await;
+            let sock = account.socket();
+            let r = router(account);
+            let _server =
+                vox_core::node::ipc::bind_account(Arc::new(r.clone()), sock.clone()).unwrap();
+            let mut s = tokio::net::UnixStream::connect(&sock).await.unwrap();
+            let hello = read_frame(&mut s).await.unwrap().unwrap();
+            assert!(matches!(
+                DaemonFrame::from_bytes(&hello).unwrap(),
+                DaemonFrame::Hello { .. }
+            ));
+            write_frame(&mut s, &Opening::Use(hold("alice")).to_bytes())
+                .await
+                .unwrap();
+            let using = read_frame(&mut s).await.unwrap().unwrap();
+            assert!(
+                matches!(
+                    DaemonFrame::from_bytes(&using).unwrap(),
+                    DaemonFrame::Using { .. }
+                ),
+                "PRODUCT: the Use was not taken"
+            );
+            r.detach(&n("alice"), DetachCause::Requested).await.unwrap();
+            let told = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut s))
+                .await
+                .expect("PRODUCT: nothing said within 10 s")
+                .unwrap()
+                .map(|b| Frame::from_bytes(&b).unwrap());
+            assert_eq!(
+                told,
+                Some(Frame::NodeDetached { node: n("alice") }),
+                "PRODUCT: the connection was not told its node detached"
+            );
+            assert!(
+                read_frame(&mut s).await.unwrap().is_none(),
+                "PRODUCT: still open"
+            );
+        });
+    }
+
+    /// A panic in one node's actor detaches that node only, reports it, and counts it; the other
+    /// node goes on answering (L-6).
+    #[cfg(feature = "test-knobs")]
+    #[test]
+    fn one_nodes_panic_leaves_the_other_running() {
+        std::env::set_var(vox_core::node::actor::TEST_PANIC_ON_TEXT_ENV, "BOOM-MARKER");
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let r = router(account(dir.path(), &["a", "b"]).await);
+            let mut events = r.inner.events.subscribe();
+            for node in ["a", "b"] {
+                r.attach(&n(node), pass(), None, Vec::new(), Vec::new())
+                    .await
+                    .unwrap();
+            }
+            let a = r
+                .use_node(UseNode {
+                    attach: AttachMode::No,
+                    ..hold("a")
+                })
+                .await
+                .unwrap();
+            let _ = a
+                .handle
+                .apply(NodeCommand::SendText {
+                    channel_id: [0u8; 32],
+                    text: "this holds BOOM-MARKER".into(),
+                })
+                .await;
+            let ev = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(DaemonEvent::Detached { node, cause }) = events.recv().await {
+                        return (node, cause);
+                    }
+                }
+            })
+            .await
+            .expect("PRODUCT: no detach event after the panic");
+            assert_eq!(ev.0, n("a"));
+            assert!(
+                matches!(ev.1, DetachCause::Panicked(_)),
+                "PRODUCT: {:?}",
+                ev.1
+            );
+            assert_eq!(r.metrics().node_panics.load(Ordering::Relaxed), 1);
+            settle(&r, "a", NodeState::Detached).await;
+            assert_eq!(state(&r, "b"), NodeState::Attached);
+            let b = r
+                .use_node(UseNode {
+                    attach: AttachMode::No,
+                    ..hold("b")
+                })
+                .await
+                .unwrap();
+            assert!(
+                b.handle.status().await.is_ok(),
+                "PRODUCT: b stopped answering"
+            );
+            // The panicked node attaches again.
+            r.attach(&n("a"), pass(), None, Vec::new(), Vec::new())
+                .await
+                .expect("PRODUCT: the panicked node could not attach again");
+        });
+    }
+
+    /// `--keep` records a node with its passphrase source; a new router attaches it from the file;
+    /// a detach by hand forgets it (L-4).
+    #[test]
+    fn a_kept_node_is_attached_again_and_forgotten_when_detached() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let account = account(dir.path(), &["alice"]).await;
+            let file = dir.path().join("pass");
+            std::fs::write(&file, format!("{PASS}\n")).unwrap();
+            {
+                let r = router(account.clone());
+                r.attach(
+                    &n("alice"),
+                    pass(),
+                    Some(KeepSource::File(file.clone())),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+                r.stop_all().await;
+            }
+            let kept = std::fs::read_to_string(account.attach_file()).unwrap();
+            assert_eq!(kept, format!("alice\tfile:{}\n", file.display()), "PRODUCT");
+            let r = router(account.clone());
+            r.attach_kept();
+            settle(&r, "alice", NodeState::Attached).await;
+            r.detach(&n("alice"), DetachCause::Requested).await.unwrap();
+            let kept = std::fs::read_to_string(account.attach_file()).unwrap();
+            assert_eq!(kept, "", "PRODUCT: a node detached by hand stayed kept");
+        });
+    }
+}
