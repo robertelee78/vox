@@ -161,7 +161,7 @@ fn an_anchor_that_restarts_is_redialled_promptly() {
     if carried >= BACK_WITHIN {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
              forward carried again only {carried:?} after its anchor was back"
         );
         panic!(
@@ -242,13 +242,13 @@ fn forward(fwd: &mut Option<world::VoxProc>) -> &mut world::VoxProc {
         .expect("APPARATUS: the proof reads the forward before it started it")
 }
 
-/// Send `sig` to `pid`. A signal that cannot be sent leaves the scene unstaged: CANNOT MEASURE.
+/// Send `sig` to `pid`. A signal that cannot be sent leaves the scene unstaged: APPARATUS.
 fn kill<const N: usize>(args: [&str; N]) {
     let sent = std::process::Command::new("kill")
         .args(args)
         .status()
         .is_ok_and(|s| s.success());
-    assert!(sent, "CANNOT MEASURE: `kill {}` failed", args.join(" "));
+    assert!(sent, "APPARATUS: `kill {}` failed", args.join(" "));
 }
 
 /// The anchor's identity, from its `--anchor` spec.
@@ -341,7 +341,7 @@ fn an_anchor_stopped_by_sigterm_is_noticed_at_once() {
 /// **Optional, and why.** Whether the forward holds that relayed connection as its host's — rather
 /// than keep redialling the host directly, with "dialling this anchor failed … no direct
 /// candidates" — is not settled by anything the proof controls (a filing question of its own,
-/// reported apart from V210-93). Held, the claim is measured; not held, the arm says CANNOT MEASURE.
+/// reported apart from V210-93). Held, the claim is measured; not held, the arm says PRODUCT (staging).
 ///
 /// Mutation: the relay's stop not carried to the connections over its circuits (the reason left to
 /// the probe) → red on the host's line, with the probe's verdict.
@@ -395,7 +395,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
         // relay; and once it holds that connection as the host's, it stops redialling it — the
         // last "dialling this anchor failed …; the next try is in N s" goes N s and more without a
         // "dialling this anchor again". Until then the host is not held as an anchor and there is
-        // nothing of it for the stop to end: CANNOT MEASURE, not a verdict.
+        // nothing of it for the stop to end: PRODUCT (staging), not a verdict.
         let about_host = format!("connection to {host12} — dialling this anchor");
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -489,7 +489,7 @@ fn stopped_for_good(signal: &str, within: Duration, carrying: bool, host_too: bo
             "{}the anchor did not exit within 10 s of SIG{signal}",
             // SIGKILL is the kernel's to carry out; any other stop is the product's to obey.
             if signal == "KILL" {
-                "CANNOT MEASURE: "
+                "APPARATUS: the kernel did not carry out SIGKILL: "
             } else {
                 "PRODUCT: `vox node` did not obey a stop: "
             }

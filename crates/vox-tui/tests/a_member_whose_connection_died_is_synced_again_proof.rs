@@ -26,15 +26,15 @@
 //! never synced.
 //!
 //! **The dead connection is observed, not assumed**: bob's `SIGSTOP` took (`ps` reports him
-//! stopped) and he stayed frozen past the 30 s silence line on this proof's clock (else CANNOT
-//! MEASURE), and carol's own `vox status --json` shows a session to bob that failed while he was
+//! stopped) and he stayed frozen past the 30 s silence line on this proof's clock (else
+//! APPARATUS), and carol's own `vox status --json` shows a session to bob that failed while he was
 //! frozen (else PRODUCT (staging)). The product exposes no line or counter for the close itself, so
 //! the premise rests on those three.
 //!
 //! **Apparatus clock.** From carol's `SIGCONT`, a thread of this process sleeps 10 ms at a time and
 //! keeps the most it overslept: the runner's own stall, which vox cannot move. If it overslept more
-//! than [`APPARATUS_BUDGET`] and the rows were late, the runner owned the time: `CANNOT MEASURE:
-//! the runner stalled`. Otherwise a late sync is `PRODUCT: took X (runner stalled at most Y)`. The
+//! than [`APPARATUS_BUDGET`] and the rows were late, the runner owned the time: `APPARATUS
+//! (runner stalled)`. Otherwise a late sync is `PRODUCT: took X (runner stalled at most Y)`. The
 //! slowest poll (two `vox room read`s) and when carol first answered after `SIGCONT` are vox's own
 //! timing: printed, never the clock.
 //!
@@ -362,7 +362,7 @@ fn a_member_whose_connection_died_is_synced_again() {
     while anchor.child.try_wait().ok().flatten().is_none() {
         assert!(
             stopping.elapsed() < Duration::from_secs(20),
-            "CANNOT MEASURE: the anchor did not stop"
+            "PRODUCT (staging): the anchor did not stop"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -376,7 +376,7 @@ fn a_member_whose_connection_died_is_synced_again() {
     println!("[proof] bob was frozen for {bob_frozen:.1?}");
     assert!(
         bob_frozen > SILENCE_LINE,
-        "CANNOT MEASURE: bob was frozen only {bob_frozen:.1?}, not past the {SILENCE_LINE:?} \
+        "APPARATUS: bob was frozen only {bob_frozen:.1?}, not past the {SILENCE_LINE:?} \
          silence line"
     );
     let carol_frozen = Instant::now();
@@ -395,7 +395,7 @@ fn a_member_whose_connection_died_is_synced_again() {
         .unwrap_or_else(|e| panic!("PRODUCT: bob, continued, cannot read his room: {e}"));
     assert_eq!(
         early, 0,
-        "CANNOT MEASURE: bob already read {early}/{POSTS} of carol's rows before they could sync"
+        "PRODUCT (staging): bob already read {early}/{POSTS} of carol's rows before they could sync"
     );
 
     // ---- 4. carol continued: each holds rows the other lacks ------------------------------------
@@ -445,7 +445,7 @@ fn a_member_whose_connection_died_is_synced_again() {
     if read < POSTS {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by {apparatus:?} \
+            "APPARATUS (runner stalled): the runner stalled: it overslept a 10 ms sleep by {apparatus:?} \
              (budget {APPARATUS_BUDGET:?}) while bob read {bob_has}/{POSTS} and carol \
              {carol_has}/{POSTS} within {BACK_WITHIN:?}"
         );

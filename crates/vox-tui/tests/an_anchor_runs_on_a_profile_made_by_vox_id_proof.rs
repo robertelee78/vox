@@ -163,10 +163,7 @@ fn an_anchor_runs_and_serves_on_a_profile_made_by_vox_id() {
     // ---- 2. it serves: a guest joins a host's room through it --------------------------------
     for (who, dir) in [("host", &host_dir), ("guest", &guest_dir)] {
         let (ok, _, err) = vox_once(dir, &args(&["id"]));
-        assert!(
-            ok,
-            "PRODUCT (staging):`vox id` ({who}) failed: {err}"
-        );
+        assert!(ok, "PRODUCT (staging):`vox id` ({who}) failed: {err}");
     }
     let port = echo_service();
     let mut host = VoxProc::spawn(

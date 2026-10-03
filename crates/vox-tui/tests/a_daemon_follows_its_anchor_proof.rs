@@ -327,7 +327,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         .to_owned();
     assert!(
         !dead_ports.iter().any(|p| p.to_string() == real_port),
-        "CANNOT MEASURE: the specs must differ by address, or this gate measures nothing"
+        "APPARATUS: the specs must differ by address, or this gate measures nothing"
     );
     let started = std::time::Instant::now();
     let mut last = String::new();
@@ -378,7 +378,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     );
     assert!(
         link.contains(&format!("a={anchor_id}")) && link.contains(&format!("/udp/{real_port}")),
-        "CANNOT MEASURE: the stripped link does not name the anchor at its new address: \
+        "PRODUCT (staging): the stripped link does not name the anchor at its new address: \
          {link:?} (from {issued:?})"
     );
     // **Replaced, not accumulated** (V210-75): the anchor's entry names the address it has now,
@@ -427,7 +427,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     // Bob has no anchors file and no --anchor: the link is the only way to the room.
     assert!(
         !anchors_file_for(&bob_cfg).exists(),
-        "CANNOT MEASURE: bob has an anchor of his own, so the link would not be the only way in"
+        "PRODUCT (staging): bob has an anchor of his own, so the link would not be the only way in"
     );
     let bob_err = tmp.path().join("bob.daemon.err");
     let mut bob = Command::new(VOX)

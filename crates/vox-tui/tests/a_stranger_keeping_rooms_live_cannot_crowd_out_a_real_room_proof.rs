@@ -46,7 +46,7 @@
 //!
 //! A board that never filled, a record the anchor would not take, a member record the victim's
 //! republish renewed rather than left as it was (the no-op path not exercised), or a setup step
-//! that did not happen is `CANNOT MEASURE`. Every other red says what the product did.
+//! that did not happen is `PRODUCT (staging)`. Every other red says what the product did.
 //!
 //! **Mutations that must turn it red.** `eviction_candidate` returning c3's rule (1, 2); crediting
 //! a record to whoever put it (3); crediting a record only when it stored something new (4).
@@ -154,7 +154,7 @@ fn lo0_scope() -> u32 {
         .find(|l| l.contains("fe80::1%lo0"))
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE (precondition unmet): no fe80::1 on lo0, so the stranger has no \
+                "APPARATUS (precondition not met): no fe80::1 on lo0, so the stranger has no \
                  second network:\n{text}"
             )
         });
@@ -226,7 +226,7 @@ async fn connect_from(
     let conn = endpoint
         .connect(addr, id, hostile::now())
         .await
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: connect {local} -> {addr}: {e:?}"));
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): connect {local} -> {addr}: {e:?}"));
     (endpoint, Arc::new(conn))
 }
 
@@ -240,7 +240,7 @@ fn fetch(rt: &Rt, anchor: SocketAddr, id: Digest32, room: Digest32) -> Held {
         let (_ep, conn) = hostile::connect(&reader, anchor, id).await;
         let mut client = RendezvousClient::open(&conn)
             .await
-            .expect("CANNOT MEASURE: a rendezvous stream to the anchor");
+            .expect("PRODUCT (staging): a rendezvous stream to the anchor");
         let set = client
             .get(
                 &room,
@@ -250,7 +250,7 @@ fn fetch(rt: &Rt, anchor: SocketAddr, id: Digest32, room: Digest32) -> Held {
                     .or(RecordKinds::BUNDLES),
             )
             .await
-            .expect("CANNOT MEASURE: the anchor answered a GET");
+            .expect("PRODUCT (staging): the anchor answered a GET");
         client.finish();
         (
             set.genesis.map(|g| g.to_wire()),
@@ -291,7 +291,7 @@ fn live_flood(rt: &Rt, anchor: SocketAddr, id: Digest32, skew_secs: u64) -> (usi
         let (_ep, conn) = hostile::connect(&inventor, anchor, id).await;
         let mut client = RendezvousClient::open(&conn)
             .await
-            .expect("CANNOT MEASURE: a rendezvous stream to the anchor");
+            .expect("PRODUCT (staging): a rendezvous stream to the anchor");
         let (mut geneses, mut records) = (0usize, 0usize);
         for i in 0..ROOMS {
             let mut nonce = [0u8; 16];
@@ -414,9 +414,9 @@ fn flood(
         let (_e2, cll) = connect_from(onll_signer, nets.local_ll, nets.anchor_ll, id).await;
         let mut on6 = RendezvousClient::open(&c6)
             .await
-            .expect("CANNOT MEASURE: a rendezvous stream from [::1]");
+            .expect("PRODUCT (staging): a rendezvous stream from [::1]");
         let mut onll = RendezvousClient::open(&cll).await.unwrap_or_else(|e| {
-            panic!("CANNOT MEASURE: no rendezvous stream from {SECOND}: {e:?}")
+            panic!("PRODUCT (staging): no rendezvous stream from {SECOND}: {e:?}")
         });
         let mut answers = Vec::new();
         for wire in first {
@@ -440,7 +440,7 @@ fn flood(
 fn assert_full(geneses: usize, others: usize) {
     assert!(
         geneses >= FULL && others >= FULL,
-        "CANNOT MEASURE: the anchor's board was never full of the stranger's rooms ({geneses} \
+        "PRODUCT (staging): the anchor's board was never full of the stranger's rooms ({geneses} \
          geneses, {others} records taken)"
     );
 }
@@ -468,7 +468,7 @@ fn signal(proc: &VoxProc, sig: &str) {
         .args([sig, &pid])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "CANNOT MEASURE: kill {sig} {pid} failed");
+    assert!(ok, "APPARATUS: kill {sig} {pid} failed");
 }
 
 #[test]
@@ -569,7 +569,7 @@ fn a_room_whose_members_are_away_is_not_crowded_out() {
     );
     assert!(
         held == (true, 0, 0),
-        "CANNOT MEASURE: the anchor should hold the away room's genesis and no live record \
+        "PRODUCT (staging): the anchor should hold the away room's genesis and no live record \
          (it holds {held:?})"
     );
 
@@ -624,7 +624,7 @@ fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
     );
     assert!(
         answers.len() >= 2 && answers.iter().all(|a| a == "Ok(())"),
-        "CANNOT MEASURE: the anchor did not take the re-sent records ({answers:?}), so a credit \
+        "PRODUCT (staging): the anchor did not take the re-sent records ({answers:?}), so a credit \
          for them cannot be measured"
     );
     assert_full(geneses, taken);
@@ -682,7 +682,7 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
         let (_e, c) = connect_from(&reseeder, nets.local6, nets.anchor6, anchor_id).await;
         let mut client = RendezvousClient::open(&c)
             .await
-            .expect("CANNOT MEASURE: a rendezvous stream from [::1]");
+            .expect("PRODUCT (staging): a rendezvous stream from [::1]");
         let mut out = Vec::new();
         for wire in &seed {
             out.push(format!("{:?}", client.put(wire).await));
@@ -697,7 +697,7 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
     );
     assert!(
         answers.len() >= 3 && answers.iter().all(|a| a == "Ok(())"),
-        "CANNOT MEASURE: the restarted anchor did not take the room the stranger put back \
+        "PRODUCT (staging): the restarted anchor did not take the room the stranger put back \
          ({answers:?})"
     );
     signal(&victim, "-CONT");
@@ -710,7 +710,7 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
     );
     assert!(
         members_now.first() == seeded_member.as_ref(),
-        "CANNOT MEASURE: the victim's republish renewed its member record, so the republish of a \
+        "PRODUCT (staging): the victim's republish renewed its member record, so the republish of a \
          record the board already holds was not exercised"
     );
 
@@ -831,7 +831,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
         let (_e, c) = connect_from(&reseeder, nets.local6, nets.anchor6, anchor_id).await;
         let mut client = RendezvousClient::open(&c)
             .await
-            .expect("CANNOT MEASURE: a rendezvous stream from [::1]");
+            .expect("PRODUCT (staging): a rendezvous stream from [::1]");
         let mut out = Vec::new();
         for wire in &seed {
             out.push(format!("{:?}", client.put(wire).await));
@@ -846,7 +846,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     );
     assert!(
         answers.len() >= 4 && answers.iter().all(|a| a == "Ok(())"),
-        "CANNOT MEASURE: the restarted anchor did not take the room the stranger put back \
+        "PRODUCT (staging): the restarted anchor did not take the room the stranger put back \
          ({answers:?})"
     );
     // Only the member comes back; the creator stays away, so no genesis re-put by its creator can
@@ -862,7 +862,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     );
     assert!(
         held_unchanged,
-        "CANNOT MEASURE: a member's republish renewed its record rather than being a no-op the \
+        "PRODUCT (staging): a member's republish renewed its record rather than being a no-op the \
          board already held, so the re-send path was not exercised"
     );
 

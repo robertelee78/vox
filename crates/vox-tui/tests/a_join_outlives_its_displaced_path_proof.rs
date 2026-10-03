@@ -19,11 +19,11 @@
 //! its own grind (inert when unset), standing in for a slow device. The forward is closed when the
 //! join starts and opened 10s in, so a direct path appears while the guest is still grinding.
 //!
-//! **Observed, never assumed** (CANNOT MEASURE otherwise): the host reports its *relayed*
+//! **Observed, never assumed** (PRODUCT (staging) otherwise): the host reports its *relayed*
 //! connection to the guest displaced at least 75s before the grind ends — its 60s grace and the
 //! tick that closes it fit inside the grind — and the forward carried datagrams to the host. A run
 //! in which that path closed mid-grind and the join still got in was not measuring it (the join had
-//! gone direct), and is CANNOT MEASURE.
+//! gone direct), and is PRODUCT (staging).
 //!
 //! **Asserted:** the guest's `vox connect` joins, and the host reports no join that did not
 //! complete.
@@ -160,7 +160,7 @@ fn a_join_outlives_its_displaced_path() {
     while anchor.circuits(Duration::from_secs(1)) == 0 {
         assert!(
             t0.elapsed() < RELAYED_WITHIN,
-            "CANNOT MEASURE: the guest never reached the host through the anchor's circuit\n\
+            "PRODUCT (staging): the guest never reached the host through the anchor's circuit\n\
              guest:\n{}",
             guest.transcript()
         );
@@ -242,7 +242,7 @@ fn a_join_outlives_its_displaced_path() {
     assert!(
         displaced_at.is_some_and(|d| d + GRACE_AND_TICK <= Duration::from_millis(GRIND_MS))
             && forward.to_host() > 0,
-        "CANNOT MEASURE: the host's relayed path to the guest was not displaced early enough for \
+        "PRODUCT (staging): the host's relayed path to the guest was not displaced early enough for \
          its grace to end mid-grind (displaced {displaced}, grind {}s, forward to host {} B)\n\
          host:\n{host_said}\nguest:\n{guest_said}",
         GRIND_MS / 1000,
@@ -250,7 +250,7 @@ fn a_join_outlives_its_displaced_path() {
     );
     assert!(
         !(status.success() && closed_under_the_join),
-        "CANNOT MEASURE: the displaced relayed path was closed mid-grind and the join got in anyway, \
+        "PRODUCT (staging): the displaced relayed path was closed mid-grind and the join got in anyway, \
          so the join was not on it\nhost:\n{host_said}"
     );
     assert!(
@@ -261,7 +261,7 @@ fn a_join_outlives_its_displaced_path() {
     );
     assert!(
         took >= Duration::from_millis(GRIND_MS),
-        "CANNOT MEASURE: the join took {:.1}s, under the {}s grind floor",
+        "PRODUCT (staging): the join took {:.1}s, under the {}s grind floor",
         took.as_secs_f64(),
         GRIND_MS / 1000
     );

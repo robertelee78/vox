@@ -21,7 +21,7 @@
 //! A warm-up exchange that reads a truncated reply with nothing stopped is the same data loss,
 //! and is a PRODUCT red too, as is a `vox connect` that fails.
 //!
-//! ## Preconditions (else CANNOT MEASURE)
+//! ## Preconditions (else PRODUCT (staging))
 //! The tunnel crossed the relay, and when the host was interrupted the relay had not yet carried
 //! the whole reply toward the guest (else the close came too late to test anything).
 //!
@@ -337,7 +337,7 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
         }
         assert!(
             warm_start.elapsed() < Duration::from_secs(100),
-            "CANNOT MEASURE: after {warm} exchanges in {:?} the tunnel still did not ride the relay",
+            "PRODUCT (staging): after {warm} exchanges in {:?} the tunnel still did not ride the relay",
             warm_start.elapsed()
         );
         std::thread::sleep(Duration::from_secs(2));
@@ -352,7 +352,7 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
     let reader = exchange(at);
     let closed_at = closed_rx
         .recv_timeout(Duration::from_secs(120))
-        .expect("CANNOT MEASURE: the backend never finished its reply");
+        .expect("PRODUCT (staging): the backend never finished its reply");
     std::thread::sleep(AFTER_CLOSE.saturating_sub(closed_at.elapsed()));
     let crossed = to_guest.load(Ordering::Relaxed) - before;
     let pid = host.child.id();
@@ -384,13 +384,13 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
     );
     assert!(
         total > 0 && total >= got.len() as u64,
-        "CANNOT MEASURE: the measured reply did not ride the relay ({total} bytes carried, {} \
+        "PRODUCT (staging): the measured reply did not ride the relay ({total} bytes carried, {} \
          read)",
         got.len()
     );
     assert!(
         crossed < REPLY as u64,
-        "CANNOT MEASURE: the whole reply had crossed the relay ({crossed} bytes) before the host \
+        "PRODUCT (staging): the whole reply had crossed the relay ({crossed} bytes) before the host \
          was interrupted, so the close came too late to test anything"
     );
     let first_wrong = got.iter().enumerate().position(|(i, b)| *b != byte(i));

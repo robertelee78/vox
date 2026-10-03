@@ -124,7 +124,7 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     assert_eq!(
         vault_version(&carol),
         1,
-        "CANNOT MEASURE: v0.2.9 wrote no version-1 vault"
+        "APPARATUS (precondition not met): v0.2.9 wrote no version-1 vault"
     );
     let (migrated, out, err, events) = recorded(&new, &carol, &["trust", "list"], None, IDENTITY);
     assert!(
@@ -190,7 +190,7 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     );
     assert!(
         !wrote,
-        "CANNOT MEASURE: the blocked vault write was not staged — the unlock succeeded with the \
+        "PRODUCT (staging): the blocked vault write was not staged — the unlock succeeded with the \
          temporary file's path occupied: {out}{err}"
     );
     assert!(

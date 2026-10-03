@@ -28,7 +28,7 @@
 //! member has vouched for it, and the only other member is paused.) Then the host resumes and
 //! the echo is checked.
 //!
-//! **Asserted:** the forward process has no configured anchor (else CANNOT MEASURE); the path is
+//! **Asserted:** the forward process has no configured anchor (else PRODUCT (staging)); the path is
 //! relayed (the guest's `still relayed`); before the restart the anchor held both members'
 //! records (else PRODUCT (staging)); after the restart the echo carries again within
 //! [`BACK_WITHIN`]; the forward said the connection to its anchor was gone; and the restarted
@@ -37,14 +37,14 @@
 //! **Which side a red is on.** A red that names the product begins `PRODUCT:` and quotes what
 //! vox said; a step of the setup the product did not do (a join, an echo before the restart, a
 //! record the anchor never held) begins `PRODUCT (staging):`; a precondition that was not met (an
-//! anchors file, the store's place) begins `CANNOT MEASURE:`; a fault of this proof's own (a signal that did not take,
+//! anchors file, the store's place) begins `PRODUCT (staging):`; a fault of this proof's own (a signal that did not take,
 //! a `vox` that cannot be started) begins `APPARATUS:`. The host's pause is confirmed, not
 //! assumed: `ps` must show it stopped after SIGSTOP and running after SIGCONT, or a host that was
 //! never paused could restore its own record and pass the republish claim for it. The two bounds
 //! are read against an **apparatus clock** on the same timeline: how long this machine takes to
 //! start `/usr/bin/true` (a process that is not vox, so a slow vox reads as the product's), and
 //! the republish poll's slowest turn. A bound missed while the
-//! apparatus was over [`APPARATUS_BUDGET`] is CANNOT MEASURE; otherwise it is the product's.
+//! apparatus was over [`APPARATUS_BUDGET`] is APPARATUS (runner stalled); otherwise it is the product's.
 //!
 //! **Mutations that must turn it red:**
 //! - Redial only the configured set (`kept_anchors` in `actor.rs` returns `self.anchors` alone,
@@ -102,7 +102,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     let anchors_file = w.guest_dir.join("cfg").join("anchors");
     assert!(
         !anchors_file.exists(),
-        "CANNOT MEASURE: the guest has an anchors file ({}), so its anchor would be configured",
+        "PRODUCT (staging): the guest has an anchors file ({}), so its anchor would be configured",
         anchors_file.display()
     );
     let pass_file = w.passphrase_file();
@@ -194,7 +194,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     let store = anchor_dir.join("default").join("store.redb");
     assert!(
         std::fs::remove_file(&store).is_ok(),
-        "CANNOT MEASURE: the anchor's store is not at {}",
+        "PRODUCT (staging): the anchor's store is not at {}",
         store.display()
     );
     std::thread::sleep(DOWN);
@@ -232,7 +232,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     if republished.is_none() {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
              republish was timed, so a missed {REPUBLISHED_WITHIN:?} may be this machine's"
         );
         panic!(
@@ -277,7 +277,7 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     if carried >= BACK_WITHIN {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (budget {APPARATUS_BUDGET:?}) while the \
              forward carried again only {carried:?} after its anchor's return"
         );
         panic!(

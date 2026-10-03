@@ -290,7 +290,7 @@ fn restarted_responder() -> World {
     let mut carol = member(tmp.path(), "carol");
     assert!(
         key(&bob) < key(&alice),
-        "CANNOT MEASURE: the joiner's fingerprint is not the lower"
+        "APPARATUS (precondition not met): the joiner's fingerprint is not the lower"
     );
 
     let (anchor, spec) = spawn_anchor(tmp.path());

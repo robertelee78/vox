@@ -25,9 +25,9 @@
 //! required posts arrived (a late history release must be caught): bob reads **0** of posts 1–20
 //! and exactly posts 21–30. A TUI that does not close C as a person does (exits, never unlocks,
 //! never answers `:close`) is a `PRODUCT (staging)` red; the TUI driver's own apparatus is
-//! `CANNOT MEASURE`. Preconditions the product must meet, or `PRODUCT (staging)`: C was closed at
+//! `APPARATUS`. Preconditions the product must meet, or `PRODUCT (staging)`: C was closed at
 //! the decision and open after; alice reads all 30 posts; bob reads post 30 (without it, 0
-//! pre-trust posts would say nothing). The attack's own staging, or `CANNOT MEASURE`: the row
+//! pre-trust posts would say nothing). The attack's own staging, or `PRODUCT (staging)`: the row
 //! existed and was deleted, with every vox process of alice's stopped.
 //!
 //! **Every participant is the shipped binary.** One step is not a `vox` command, because it is the
@@ -203,11 +203,11 @@ fn ranges(seen: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
 /// The profile's `store.redb`, under `<data>/<profile>/`.
 fn store_file(dir: &Path) -> PathBuf {
     std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: cannot list the profile dir {dir:?}: {e}"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot list the profile dir {dir:?}: {e}"))
         .filter_map(Result::ok)
         .map(|e| e.path().join("store.redb"))
         .find(|p| p.is_file())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: no <profile>/store.redb under {dir:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no <profile>/store.redb under {dir:?}"))
 }
 
 /// The attack: delete the counter's row from a stopped node's store. Returns the rows the `meta`
@@ -217,7 +217,7 @@ fn delete_counter(dir: &Path) -> (Vec<String>, Option<usize>) {
     // Opening fails while any vox process still holds the store: the staging (every process of
     // alice's stopped) was not achieved.
     let db = redb::Database::open(store_file(dir)).unwrap_or_else(|e| {
-        panic!("CANNOT MEASURE: store still held, or unreadable, when it should be stopped: {e}")
+        panic!("PRODUCT (staging): store still held, or unreadable, when it should be stopped: {e}")
     });
     let tx = db
         .begin_write()
@@ -310,7 +310,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     );
     assert!(
         out.has_verdict("cargo"),
-        "CANNOT MEASURE: the TUI driver was stopped before it gave a verdict — by its faulthandler \
+        "APPARATUS: the TUI driver was stopped before it gave a verdict — by its faulthandler \
          backstop, or from outside — at stage {:?} (exit {:?}): {said}",
         out.stage.as_deref().unwrap_or("(before its first stage)"),
         out.code
@@ -318,7 +318,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     println!("[proof] tui: {}", said.trim());
     assert!(
         !said.contains("cargo APPARATUS"),
-        "CANNOT MEASURE: the TUI driver's own apparatus failed (exit {:?}): {said}",
+        "APPARATUS: the TUI driver's own apparatus failed (exit {:?}): {said}",
         out.code
     );
     // Closing the room is staging for this claim, but a TUI that does not do it — exits, never
@@ -339,7 +339,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     );
     assert!(
         removed.is_some(),
-        "CANNOT MEASURE: alice's store holds no {COUNTER_ROW:?} row to delete (rows: {rows:?})"
+        "PRODUCT (staging): alice's store holds no {COUNTER_ROW:?} row to delete (rows: {rows:?})"
     );
 
     // ---- alice trusts bob while C is closed -----------------------------------------------------

@@ -32,7 +32,7 @@
 //!
 //! The staging — that the burst met the anchor's cap of 64 handshakes — is something only the
 //! anchor can see, and it says so to its operator: "N connection attempt(s) waited for a handshake
-//! slot … M refused". A run where it never says so measured nothing, and says CANNOT MEASURE. The
+//! slot … M refused". A run where it never says so measured nothing, and says PRODUCT (staging). The
 //! cap itself is unchanged and rests on review: how many handshakes run at once is not something a
 //! user sees. What each member said about its anchor is printed for the last to return.
 //!
@@ -54,7 +54,7 @@
 //! holds its port, as a stale address held by somebody else is (V210-17's trigger): every dial
 //! reaches a node that is not the anchor and fails as soon as it answers, so every member's backoff
 //! grows as far as it can. Then the anchor comes back on its port. **Asserted:** every member's
-//! dials failed at least 3 times while it was away (else CANNOT MEASURE), and all [`MEMBERS`] are
+//! dials failed at least 3 times while it was away (else PRODUCT (staging)), and all [`MEMBERS`] are
 //! connected again within [`BACK_WITHIN`] of the anchor listening — its own count, as above.
 //!
 //! **Then a busy anchor.** Waiting is bounded (5 s), so an anchor whose every slot is held still
@@ -64,7 +64,7 @@
 //! as members whose machines froze mid-handshake: each attempt it takes from them holds a slot until
 //! it gives up on it (30 s). The other members are frozen while it restarts and let go a second
 //! after it goes on, so every slot is held when they dial. **Asserted:** the anchor refused some
-//! (its own report; else CANNOT MEASURE); no refused member was told of a bad signature; at least
+//! (its own report; else PRODUCT (staging)); no refused member was told of a bad signature; at least
 //! one was told the anchor is busy ([`BUSY`]); every refused member retried and was connected within
 //! [`BUSY_BACK_WITHIN`] of the anchor going on; and once the frozen members go on, all [`MEMBERS`]
 //! are connected within [`BACK_WITHIN`].
@@ -76,7 +76,7 @@
 //! takes its place, so a run is never silent about it: a listing shows it, a run shows it ignored
 //! with the reason, and a run of the ignored tests prints that the proof did not run, and passes.
 //!
-//! Every red says which it is: `PRODUCT:` quotes what the product said or did, `CANNOT MEASURE:`
+//! Every red says which it is: `PRODUCT:` quotes what the product said or did, `PRODUCT (staging):`
 //! names staging that was not achieved, `APPARATUS:` names a fault of the proof's own; the
 //! watchdog says it is the watchdog.
 //!
@@ -197,7 +197,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     let (first, _) = wait_for_peers(&mut anchor, MEMBERS, Instant::now(), SETTLE);
     assert!(
         first >= MEMBERS,
-        "CANNOT MEASURE: only {first} of {MEMBERS} members connected to the anchor within \
+        "PRODUCT (staging): only {first} of {MEMBERS} members connected to the anchor within \
          {SETTLE:?} of starting, before any restart\n{}",
         anchor.transcript()
     );
@@ -339,7 +339,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     );
     assert!(
         waited + refused > 0,
-        "CANNOT MEASURE: the anchor never said attempts waited for a handshake slot or were \
+        "PRODUCT (staging): the anchor never said attempts waited for a handshake slot or were \
          refused, so the burst never reached its cap\n{}",
         anchor.transcript()
     );
@@ -474,7 +474,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     eprintln!("[proof] busy anchor: it says it refused {refused} attempt(s)");
     assert!(
         refused > 0,
-        "CANNOT MEASURE: the busy anchor refused nobody, so no member could be told why\n{}",
+        "PRODUCT (staging): the busy anchor refused nobody, so no member could be told why\n{}",
         anchor.transcript()
     );
     assert!(
@@ -612,7 +612,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     }
     assert!(
         fewest >= 3,
-        "CANNOT MEASURE: a member's dials failed only {fewest} time(s) while its anchor was away, \
+        "PRODUCT (staging): a member's dials failed only {fewest} time(s) while its anchor was away, \
          so its backoff never grew"
     );
     assert!(

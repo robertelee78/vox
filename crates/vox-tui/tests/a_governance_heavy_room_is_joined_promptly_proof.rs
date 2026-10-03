@@ -244,10 +244,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         .collect();
 
     let (ok, out, err) = vox_in(&host_dir, &["room", "create", "--name", "team"], ROOM_PASS);
-    assert!(
-        ok,
-        "PRODUCT (staging): room create: {out}\n{err}"
-    );
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, list, _) = vox_once(&host_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
@@ -273,10 +270,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let join = |data: &Path, who: &str| attempts(data, who).is_some();
     let t_setup = Instant::now();
     for (name, d, fp) in &members {
-        assert!(
-            join(d, name),
-            "PRODUCT (staging): {name} could not join"
-        );
+        assert!(join(d, name), "PRODUCT (staging): {name} could not join");
         assert!(
             trust(d, "add", &host_fp, "host"),
             "PRODUCT (staging): {name} could not trust the host"

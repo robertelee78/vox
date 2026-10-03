@@ -548,10 +548,7 @@ fn stage(
     for r in 0..rooms {
         let name = format!("r{r}");
         let (ok, out, err) = alice.vox(&["room", "create", "--name", &name], Some(ROOM_PASS));
-        assert!(
-            ok,
-            "PRODUCT (staging): room create failed: {out}{err}"
-        );
+        assert!(ok, "PRODUCT (staging): room create failed: {out}{err}");
         let list = alice.vox(&["room", "list"], None).1;
         let id = list
             .lines()

@@ -60,8 +60,8 @@
 //! Each verdict at (1), (2) and (4) is read from what the plugin logged on that turn and what
 //! `vox agent hook` handed it (recorded by the `VOX_BIN` the plugin runs), not from the answer
 //! alone: the drain's text missing the row, or the plugin injecting nothing, is PRODUCT; the
-//! model not repeating what it was given, or OpenCode never calling the hook, is CANNOT
-//! MEASURE.
+//! model not repeating what it was given, or OpenCode never calling the hook, is
+//! APPARATUS.
 //!
 //! - Make `vox agent hook` inject nothing (the drain returns before printing what is
 //!   unread): red at (1) as PRODUCT, the plugin said "nothing to inject".
@@ -230,11 +230,11 @@ fn turn(
 /// plugin text without the row that matters.
 ///
 /// - injected, the drain's text holding `target`, and the answer holding it: green;
-/// - injected and the drain's text holding `target`, but not the answer: CANNOT MEASURE (the
+/// - injected and the drain's text holding `target`, but not the answer: APPARATUS (the
 ///   model chose not to repeat it);
 /// - injected without `target` in the drain's text, or "nothing to inject", "threw" or "no
 ///   text part": PRODUCT, whatever the answer;
-/// - VOX_ROOM unset: APPARATUS; no `chat.message` at all: CANNOT MEASURE.
+/// - VOX_ROOM unset: APPARATUS; no `chat.message` at all: APPARATUS.
 fn judge(t: &Turn, target: &str, step: &str, answer_has: bool) {
     let hooked: Vec<&str> = t
         .plugin_log
@@ -251,7 +251,7 @@ fn judge(t: &Turn, target: &str, step: &str, answer_has: bool) {
         );
         assert!(
             answer_has,
-            "CANNOT MEASURE: {step}: the plugin injected the room with {target:?}, and the model \
+            "APPARATUS (the model, not vox): {step}: the plugin injected the room with {target:?}, and the model \
              did not repeat it. The answer: {:?}",
             t.answer
         );
@@ -266,7 +266,7 @@ fn judge(t: &Turn, target: &str, step: &str, answer_has: bool) {
         );
     } else {
         panic!(
-            "CANNOT MEASURE: {step}: OpenCode never called the plugin's chat.message on this \
+            "APPARATUS (OpenCode, not vox): {step}: OpenCode never called the plugin's chat.message on this \
              turn ({}). OpenCode printed: {:?}",
             if hooked.is_empty() {
                 "no chat.message line".to_owned()
@@ -299,7 +299,7 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     }
     assert!(
         which("opencode").is_some(),
-        "CANNOT MEASURE: the rehearsal needs `opencode` on PATH"
+        "APPARATUS (precondition not met): the rehearsal needs `opencode` on PATH"
     );
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -514,7 +514,7 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     );
     assert!(
         a,
-        "CANNOT MEASURE: session s1's first drain did not show the operator's post {mark}: \
+        "PRODUCT (staging): session s1's first drain did not show the operator's post {mark}: \
          {s1_first:?}"
     );
     assert!(

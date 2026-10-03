@@ -35,7 +35,7 @@
 //! and a case that looked for just its own passphrase, whole, could not see it.
 //!
 //! **Asserted,** with no tolerance: after the lock, no passphrase is anywhere in the process's
-//! written memory, live or freed, **whole or as any 6-byte piece** (the scanner's `+pieces`). Preconditions, or `CANNOT MEASURE`: the work had not finished
+//! written memory, live or freed, **whole or as any 6-byte piece** (the scanner's `+pieces`). Preconditions, or `PRODUCT (staging)`: the work had not finished
 //! when the lock was asked for; the scan saw the work's copy before the lock.
 //!
 //! Not "no more copies than before the work": the identity passphrase typed at unlock is in memory
@@ -132,10 +132,10 @@ const SAID_LOCKING_AFTER: Duration = Duration::from_secs(2);
 const MASK: u8 = 0xA5;
 
 /// **Every red names which it is** (the decider's rule 1). A step of the proof's own staging that
-/// fails — a file, a process, a parse — is `CANNOT MEASURE (harness error)` at its line; what the
+/// fails — a file, a process, a parse — is `APPARATUS (harness error)` at its line; what the
 /// product did wrong is `PRODUCT:`. Nothing here unwraps bare.
 trait Staged<T> {
-    /// The value, or `CANNOT MEASURE (harness error)` naming this line and what failed.
+    /// The value, or `APPARATUS (harness error)` naming this line and what failed.
     fn staged(self) -> T;
 }
 
@@ -143,7 +143,7 @@ impl<T, E: std::fmt::Debug> Staged<T> for Result<T, E> {
     #[track_caller]
     fn staged(self) -> T {
         let at = std::panic::Location::caller();
-        self.unwrap_or_else(|e| panic!("CANNOT MEASURE (harness error) at {at}: {e:?}"))
+        self.unwrap_or_else(|e| panic!("APPARATUS (harness error) at {at}: {e:?}"))
     }
 }
 
@@ -151,7 +151,7 @@ impl<T> Staged<T> for Option<T> {
     #[track_caller]
     fn staged(self) -> T {
         let at = std::panic::Location::caller();
-        self.unwrap_or_else(|| panic!("CANNOT MEASURE (harness error) at {at}: nothing there"))
+        self.unwrap_or_else(|| panic!("APPARATUS (harness error) at {at}: nothing there"))
     }
 }
 
@@ -258,13 +258,13 @@ struct Scan {
 impl Scan {
     fn of(&self, label: &str) -> usize {
         self.counts.get(label).copied().unwrap_or_else(|| {
-            panic!("CANNOT MEASURE (harness error): the scan reported no count for {label}")
+            panic!("APPARATUS (harness error): the scan reported no count for {label}")
         })
     }
 
     fn pieces_of(&self, label: &str) -> usize {
         self.pieces.get(label).copied().unwrap_or_else(|| {
-            panic!("CANNOT MEASURE (harness error): the scan reported no pieces for {label}")
+            panic!("APPARATUS (harness error): the scan reported no pieces for {label}")
         })
     }
 }
@@ -291,7 +291,7 @@ impl Scanner {
         std::fs::write(self.dir.join("go"), b"").staged();
         assert!(
             cue(&result, Duration::from_secs(60)),
-            "CANNOT MEASURE: the TUI's scanner never answered (is the interposer loaded?)"
+            "APPARATUS: the TUI's scanner never answered (is the interposer loaded?)"
         );
         let text = std::fs::read_to_string(&result).staged();
         let mut scan = Scan {
@@ -301,9 +301,8 @@ impl Scanner {
             scanned: String::new(),
         };
         let number = |v: Option<&&str>| -> usize {
-            v.and_then(|n| n.parse().ok()).unwrap_or_else(|| {
-                panic!("CANNOT MEASURE (harness error): the scanner wrote {text:?}")
-            })
+            v.and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("APPARATUS (harness error): the scanner wrote {text:?}"))
         };
         for line in text.lines() {
             let f: Vec<&str> = line.split('\t').collect();
@@ -316,18 +315,18 @@ impl Scanner {
                 }
                 Some("hit") => scan.hits.push(f[1..].join(" ")),
                 Some("scanned") => scan.scanned = f[1..].join(" "),
-                _ => panic!("CANNOT MEASURE (harness error): the scanner said {line:?}"),
+                _ => panic!("APPARATUS (harness error): the scanner said {line:?}"),
             }
         }
         assert!(
             !scan.scanned.is_empty(),
-            "CANNOT MEASURE: a scan with no total:\n{text}"
+            "APPARATUS: a scan with no total:\n{text}"
         );
         scan
     }
 
     /// Scan until `label` shows more copies than `before`, for up to [`SHOWS_UP`].
-    /// `CANNOT MEASURE (staging not achieved)` if it never does: the work the case locks during never
+    /// `PRODUCT (staging)` if it never does: the work the case locks during never
     /// held the passphrase where the scan could see it.
     fn until_more(&self, label: &str, before: usize) -> Scan {
         let t0 = Instant::now();
@@ -339,7 +338,7 @@ impl Scanner {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!(
-            "CANNOT MEASURE (staging not achieved): the {label} passphrase never showed up in the \
+            "PRODUCT (staging): the {label} passphrase never showed up in the \
              TUI's memory within {SHOWS_UP:?} of the work starting"
         )
     }
@@ -382,7 +381,7 @@ impl Tui {
     fn pid(&self) -> u32 {
         assert!(
             cue(&self.cues.join("pid"), Duration::from_secs(60)),
-            "CANNOT MEASURE: {}'s TUI never started",
+            "PRODUCT (staging): {}'s TUI never started",
             self.tag
         );
         std::fs::read_to_string(self.cues.join("pid"))
@@ -400,7 +399,7 @@ impl Tui {
         std::fs::write(self.cues.join("stop"), b"").staged();
         let driven = self.driver.take().staged().join().staged();
         panic!(
-            "CANNOT MEASURE: {}'s TUI never unlocked; its driver said:\n{}",
+            "PRODUCT (staging): {}'s TUI never unlocked; its driver said:\n{}",
             self.tag, driven.stdout
         );
     }
@@ -429,7 +428,7 @@ impl Tui {
     fn wait_locked(&self, t0: Instant, hup: bool) -> Duration {
         assert!(
             cue(&self.cues.join("locked"), Duration::from_secs(150)),
-            "CANNOT MEASURE: {}'s TUI never showed itself locked",
+            "PRODUCT (staging): {}'s TUI never showed itself locked",
             self.tag
         );
         let took = t0.elapsed();
@@ -460,12 +459,17 @@ impl Tui {
             "[proof] {}'s TUI driver exited {:?} after {:?} at {:?}",
             self.tag, driven.code, driven.took, driven.stage
         );
-        assert!(
-            driven.has_verdict(&self.tag) && driven.code == Some(0),
-            "CANNOT MEASURE: {}'s TUI driver did not finish cleanly:\n{}",
-            self.tag,
-            driven.stdout
-        );
+        if !(driven.has_verdict(&self.tag) && driven.code == Some(0)) {
+            // A driver with no verdict, or one naming its own apparatus, failed on its own; any
+            // other verdict (RED, HUNG at) is what the TUI did.
+            let own = !driven.has_verdict(&self.tag)
+                || driven.stdout.contains(&format!("{} APPARATUS", self.tag));
+            let side = if own { "APPARATUS" } else { "PRODUCT" };
+            panic!(
+                "{side}: {}'s TUI driver did not finish cleanly (exit {:?}):\n{}",
+                self.tag, driven.code, driven.stdout
+            );
+        }
     }
 }
 
@@ -489,12 +493,12 @@ fn new_profile(dir: &Path, identity: &str) {
     );
 }
 
-/// Whether `work` is still running; `CANNOT MEASURE` if it already finished.
+/// Whether `work` is still running; `PRODUCT (staging)` if it already finished.
 fn still_running(work: &mut Proc, what: &str) {
     let early = work.0.try_wait().staged();
     assert!(
         early.is_none(),
-        "CANNOT MEASURE: {what} finished ({early:?}) before the lock, so nothing was in flight"
+        "PRODUCT (staging): {what} finished ({early:?}) before the lock, so nothing was in flight"
     );
 }
 
@@ -585,7 +589,7 @@ fn a_lock_waits_for_a_room_seal_and_leaves_no_passphrase() {
     );
     assert!(
         !settled_first,
-        "CANNOT MEASURE: the lock settled before the probe answered, so nothing was waited on"
+        "PRODUCT (staging): the lock settled before the probe answered, so nothing was waited on"
     );
     assert!(
         probe_took < ANSWERS,
@@ -668,7 +672,7 @@ fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
     let during = scanner.until_more("room", before.of("room"));
     assert!(
         !tui.cues.join("unlocked").exists(),
-        "CANNOT MEASURE: the TUI finished unlocking, so the reopening was not in flight"
+        "PRODUCT (staging): the TUI finished unlocking, so the reopening was not in flight"
     );
     let took = tui.lock(true);
     let after = scanner.scan();
@@ -696,7 +700,7 @@ fn line_from(child: &mut Proc, what: &str, wanted: impl Fn(&str) -> bool) -> Str
             }
         }
     }
-    panic!("CANNOT MEASURE: {what} never printed what was waited for");
+    panic!("PRODUCT (staging): {what} never printed what was waited for");
 }
 
 #[test]

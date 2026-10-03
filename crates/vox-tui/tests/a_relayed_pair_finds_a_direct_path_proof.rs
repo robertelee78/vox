@@ -119,7 +119,9 @@ fn relayed_reach_ms(w: &ForwardedWorld) -> (u128, world::VoxProc) {
         .nth(1)
         .and_then(|r| r.split(" ms").next())
         .and_then(|n| n.trim().parse().ok())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: no duration in `vox forward`'s line {line:?}"));
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): no duration in `vox forward`'s line {line:?}")
+        });
     (ms, fwd)
 }
 
@@ -167,21 +169,21 @@ fn a_relayed_pair_finds_a_direct_path_once_one_becomes_possible() {
     assert_eq!(
         code,
         0,
-        "CANNOT MEASURE: the guest's first request to {hostname} was refused (SOCKS {code}), so \
+        "PRODUCT (staging): the guest's first request to {hostname} was refused (SOCKS {code}), so \
          there is no relayed pair to watch.\nup:\n{}",
         up.transcript()
     );
     let sent = w.forward.to_host();
     assert!(
         echo_over(&mut s, &payload, Duration::from_secs(60)),
-        "CANNOT MEASURE: no echo over the relayed path.\nup:\n{}",
+        "PRODUCT (staging): no echo over the relayed path.\nup:\n{}",
         up.transcript()
     );
     drop(s);
     assert_eq!(
         w.forward.to_host() - sent,
         0,
-        "CANNOT MEASURE: the first request crossed the forward while it was closed"
+        "APPARATUS: the first request crossed the forward while it was closed"
     );
     w.anchor.assert_relayed("after the first request");
 
@@ -195,7 +197,7 @@ fn a_relayed_pair_finds_a_direct_path_once_one_becomes_possible() {
     let dropped = w.forward.dropped();
     assert!(
         dropped > 0,
-        "CANNOT MEASURE: the guest said `still relayed` but never sent the forward a datagram — \
+        "PRODUCT (staging): the guest said `still relayed` but never sent the forward a datagram — \
          the direct path this proof opens was never the one being tried"
     );
 

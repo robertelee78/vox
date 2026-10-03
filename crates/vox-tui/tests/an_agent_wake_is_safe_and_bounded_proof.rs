@@ -219,8 +219,8 @@ fn check(failures: &mut Vec<String>, ok: bool, what: String) {
     }
 }
 
-/// **Every red names its kind** (decider rule 1). A product verdict says `PRODUCT:`; a staging,
-/// precondition or harness failure says `CANNOT MEASURE` or `APPARATUS`. Anything else that
+/// **Every red names its kind** (decider rule 1). A product verdict says `PRODUCT:`; a vox step
+/// that stages a claim and fails says `PRODUCT (staging)`; a harness failure says `APPARATUS`. Anything else that
 /// panics — an `unwrap` or `expect` on a socket, a file, a process — is this proof's own failure,
 /// and this hook says so before its message.
 fn label_reds() {
@@ -298,13 +298,13 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     assert_eq!(
         registered(bob, "session-bob"),
         Some(("claude".to_owned(), sock_s.clone())),
-        "CANNOT MEASURE: bob's session must be registered at the test's own socket, never a \
+        "PRODUCT (staging): bob's session must be registered at the test's own socket, never a \
          real session's"
     );
     assert_eq!(
         registered(bob, "session-dead"),
         Some(("claude".to_owned(), dead_s.clone())),
-        "CANNOT MEASURE: the ended session must be registered at the test's own socket"
+        "PRODUCT (staging): the ended session must be registered at the test's own socket"
     );
 
     // ---- (1) and (2): a wake is attributed and framed; an ended session is forgotten ----
@@ -326,7 +326,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .find(|c| c.contains("OPERATOR-OBEYED"))
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: bob's session was never woken for the urgent message; got \
+                "PRODUCT (staging): bob's session was never woken for the urgent message; got \
                  {got:?}; bob's daemon:\n{}",
                 daemon_err()
             )
@@ -373,7 +373,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         .find(|c| c.contains("POSING-AS-ALICE"))
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: bob's session was never woken for carol's message; got \
+                "PRODUCT (staging): bob's session was never woken for carol's message; got \
                  {got:?}; bob's daemon:\n{}",
                 daemon_err()
             )
@@ -404,7 +404,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     assert_eq!(
         registered(bob, "bob-s2"),
         Some(("claude".to_owned(), sock2_s.clone())),
-        "CANNOT MEASURE: bob-s2 must be registered at the test's own socket"
+        "PRODUCT (staging): bob-s2 must be registered at the test's own socket"
     );
     post(
         bob,
@@ -588,7 +588,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         assert_eq!(
             registered(bob, session),
             Some(("claude".to_owned(), sock_s)),
-            "CANNOT MEASURE: {session} must be registered at the test's own socket"
+            "PRODUCT (staging): {session} must be registered at the test's own socket"
         );
         pinged.push(rx);
     }
@@ -710,7 +710,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     });
     assert!(
         got.iter().any(|f| content(f).contains("RAW-WAKE")),
-        "CANNOT MEASURE: ping-a was never woken by alice's RAW-WAKE; bob's daemon:\n{}",
+        "PRODUCT (staging): ping-a was never woken by alice's RAW-WAKE; bob's daemon:\n{}",
         daemon_err()
     );
     let raw = r#"{"v":1,"type":"answer","to":["pingb"],"urgent":true,"body":"RAW-NO-RE"}"#;
@@ -746,7 +746,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     });
     assert!(
         got.iter().any(|f| content(f).contains("SECOND-WAKE")),
-        "CANNOT MEASURE: ping-a was never woken by alice's SECOND-WAKE; bob's daemon:\n{}",
+        "PRODUCT (staging): ping-a was never woken by alice's SECOND-WAKE; bob's daemon:\n{}",
         daemon_err()
     );
     let o = bob.vox_in(
@@ -890,7 +890,7 @@ fn http(base: &str, method: &str, path: &str, body: Option<&str>) -> String {
     use std::io::Write as _;
     let addr = base.trim_start_matches("http://").trim_end_matches('/');
     let mut s = std::net::TcpStream::connect(addr)
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: cannot reach `opencode serve` at {addr}: {e}"));
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot reach `opencode serve` at {addr}: {e}"));
     s.set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap_or_else(|e| panic!("APPARATUS: cannot set a read timeout: {e}"));
     let body = body.unwrap_or("");
@@ -900,7 +900,7 @@ fn http(base: &str, method: &str, path: &str, body: Option<&str>) -> String {
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
-    .unwrap_or_else(|e| panic!("CANNOT MEASURE: cannot send `opencode serve` a request: {e}"));
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot send `opencode serve` a request: {e}"));
     let mut raw = Vec::new();
     let _ = s.read_to_end(&mut raw);
     let raw = String::from_utf8_lossy(&raw).into_owned();
@@ -1008,7 +1008,7 @@ fn live(
     }
     assert!(
         which("opencode").is_some(),
-        "CANNOT MEASURE: the live case needs `opencode` on PATH"
+        "APPARATUS (precondition not met): the live case needs `opencode` on PATH"
     );
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
@@ -1094,13 +1094,13 @@ fn live(
     });
     let base = rx
         .recv_timeout(Duration::from_secs(60))
-        .expect("CANNOT MEASURE: `opencode serve` never said where it listens");
+        .expect("APPARATUS: `opencode serve` never said where it listens");
     println!("[proof] (6) `opencode serve`, sandboxed, listens at {base}");
     let created: serde_json::Value =
         serde_json::from_str(&http(&base, "POST", "/session", Some("{}"))).unwrap_or_default();
     let ses = created["id"]
         .as_str()
-        .expect("CANNOT MEASURE: OpenCode created no session")
+        .expect("APPARATUS: OpenCode created no session")
         .to_owned();
 
     // The session registers the way every OpenCode session does: its first turn's drain, in
@@ -1128,7 +1128,7 @@ fn live(
     assert!(
         reg.as_ref()
             .is_some_and(|(h, e)| h == "opencode" && e.ends_with("/wake.sock")),
-        "CANNOT MEASURE: the live session's plugin never registered it with bob's daemon as \
+        "PRODUCT (staging): the live session's plugin never registered it with bob's daemon as \
          OpenCode's wake socket: {reg:?}"
     );
 
@@ -1159,7 +1159,7 @@ fn live(
         })
     else {
         panic!(
-            "CANNOT MEASURE: the live session never received the urgent message; its user \
+            "PRODUCT (staging): the live session never received the urgent message; its user \
              messages {seen:?}; bob's daemon:\n{}",
             daemon_err()
         );

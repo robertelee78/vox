@@ -20,7 +20,7 @@
 //! **Apparatus clock.** While each post is awaited, a thread of this process sleeps 10 ms at a time
 //! and keeps the most it overslept: the runner's own stall, which vox cannot move. If it overslept
 //! more than [`APPARATUS_BUDGET`] while a late post was awaited, the runner owned that time:
-//! `CANNOT MEASURE: the runner stalled`. Otherwise a late post is `PRODUCT: took X (runner stalled
+//! `APPARATUS (runner stalled)`. Otherwise a late post is `PRODUCT: took X (runner stalled
 //! at most Y)`. The slowest `vox room read` is vox's own timing: printed, never the clock.
 //!
 //! Mutation: key the session guard by room again (the pre-fix behaviour), and posts wait behind
@@ -423,7 +423,7 @@ fn a_dead_member_does_not_stall_the_room() {
         .collect();
     assert!(
         stalled.is_empty(),
-        "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by more than \
+        "APPARATUS (runner stalled): the runner stalled: it overslept a 10 ms sleep by more than \
          {APPARATUS_BUDGET:?} while a late post was awaited: {stalled:?}"
     );
     let late: Vec<String> = took

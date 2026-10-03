@@ -322,7 +322,9 @@ fn a_member_holding_silent_pairwise_streams_does_not_stop_the_node() {
                 raw_sync::now(),
             )
             .await
-            .expect("PRODUCT (staging): the victim did not take a connection from mallory's identity");
+            .expect(
+                "PRODUCT (staging): the victim did not take a connection from mallory's identity",
+            );
         (endpoint, Arc::new(conn))
     });
     let _answered = raw_sync::answer_victim(Arc::clone(&conn));

@@ -36,7 +36,7 @@
 //! after the sample began, holds **that** process's address for the guest. A sample whose forward
 //! says neither — no cure, no refusal left uncured — while the anchor holds its address at once was
 //! never refused, so it cannot measure the republish: it is counted apart and is neither green nor
-//! red, and fewer than [`MIN_REFUSED`] refused samples is CANNOT MEASURE. (A refusal that is never
+//! red, and fewer than [`MIN_REFUSED`] refused samples is PRODUCT (staging). (A refusal that is never
 //! cured cannot hide there: the anchor would go on holding A's address, and the forward says the
 //! refusal once its grace is over.)
 //!
@@ -169,7 +169,7 @@ fn a_fresh_process_is_taken_by_its_board() {
             }
             assert!(
                 Instant::now() < deadline,
-                "CANNOT MEASURE: sample {n}'s previous process was never held by the anchor"
+                "PRODUCT (staging): sample {n}'s previous process was never held by the anchor"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -237,7 +237,7 @@ fn a_fresh_process_is_taken_by_its_board() {
     );
     assert!(
         refusals >= MIN_REFUSED.min(samples),
-        "CANNOT MEASURE: only {refusals} of {samples} samples were refused (B's clock not far enough \
+        "PRODUCT (staging): only {refusals} of {samples} samples were refused (B's clock not far enough \
          behind its predecessor's), so the republish was exercised too seldom"
     );
     assert!(

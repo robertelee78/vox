@@ -17,7 +17,7 @@
 //! stopped, `vox id` opens the identity the first made.
 //!
 //! Which side a red is on: the answer, or a profile with no identity after the first TUI made
-//! one, is `PRODUCT:`; a driver that stopped or gave no answer is `CANNOT MEASURE:`; a temp dir
+//! one, is `PRODUCT:`; a driver that stopped or gave no answer is `APPARATUS:`; a temp dir
 //! this proof could not make is `APPARATUS:`.
 //!
 //! Mutation that must turn it red: the TUI's create path mapping the race to the generic
@@ -65,16 +65,23 @@ fn a_tui_that_loses_the_create_race_names_it() {
         out.took, out.code, out.stage
     );
     println!("[proof] tui: {}", said.trim());
+    // A TUI that stopped reading what is typed (`HUNG at`) is the product's; the driver's own
+    // failure is the apparatus.
     assert!(
         !out.has_verdict("cargo"),
-        "CANNOT MEASURE: the TUI driver stopped on an apparatus failure or a hang (exit {:?}, \
-         stage {:?}): {said}",
+        "{}: the TUI driver stopped on an apparatus failure or a hang (exit {:?}, stage {:?}): \
+         {said}",
+        if said.contains("cargo HUNG at") {
+            "PRODUCT"
+        } else {
+            "APPARATUS"
+        },
         out.code,
         out.stage
     );
     assert!(
         out.code == Some(0) && said.contains("cargo SAID:"),
-        "CANNOT MEASURE: the TUI driver gave no answer to the create (exit {:?}, stage {:?}): {said}",
+        "APPARATUS: the TUI driver gave no answer to the create (exit {:?}, stage {:?}): {said}",
         out.code,
         out.stage
     );

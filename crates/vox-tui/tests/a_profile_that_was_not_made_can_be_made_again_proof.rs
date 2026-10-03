@@ -28,7 +28,7 @@
 //! 4. **The vault lands but its directory will not flush** (macOS): `vox id` runs under the
 //!    test interposer with `VOX_INTERPOSE_FAIL_DIR_SYNC` naming the profile directory, so the
 //!    vault's rename succeeds and the flush of the directory after it fails with `EIO`. The
-//!    recorded calls must show exactly that (else CANNOT MEASURE). `vox id` must leave nothing —
+//!    recorded calls must show exactly that (else PRODUCT (staging)). `vox id` must leave nothing —
 //!    no vault, no store, nothing kept aside — or, over a leftover store, that store back in
 //!    place byte for byte and no vault; and the next `vox id` must make an identity a daemon
 //!    unlocks.
@@ -312,7 +312,7 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
         );
         assert!(
             !o.ok,
-            "CANNOT MEASURE: vox id made an identity with vault.tmp a directory: {}",
+            "PRODUCT (staging): vox id made an identity with vault.tmp a directory: {}",
             o.stdout.trim()
         );
         assert!(
@@ -450,7 +450,7 @@ fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
     );
     assert!(
         staged,
-        "CANNOT MEASURE: the vault's rename did not land before a failed flush of the directory; \
+        "PRODUCT (staging): the vault's rename did not land before a failed flush of the directory; \
          vox said: {}",
         said.trim()
     );
@@ -506,7 +506,7 @@ fn a_vault_whose_directory_will_not_flush_leaves_nothing() {
     );
     assert!(
         staged,
-        "CANNOT MEASURE: the leftover staging did not fail after the vault's rename; vox said: {}",
+        "PRODUCT (staging): the leftover staging did not fail after the vault's rename; vox said: {}",
         said.trim()
     );
     assert!(

@@ -12,7 +12,7 @@
 //! **Apparatus clock.** While Bob's roster is polled, a thread of this process sleeps 10 ms at a
 //! time and keeps the most it overslept: the runner's own stall, which vox cannot move. If it
 //! overslept more than [`APPARATUS_BUDGET`] and Bob listed Carol late, the runner owned the time:
-//! `CANNOT MEASURE: the runner stalled`. Otherwise a late listing is `PRODUCT: took X (runner
+//! `APPARATUS (runner stalled)`. Otherwise a late listing is `PRODUCT: took X (runner
 //! stalled at most Y)`, with the daemons' stderr. The slowest `vox room roster` is vox's own
 //! timing: printed, never the clock.
 //!
@@ -390,7 +390,7 @@ fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
     if seen.is_none_or(|d| d > BOUND) {
         assert!(
             runner <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by {runner:?} (budget \
+            "APPARATUS (runner stalled): the runner stalled: it overslept a 10 ms sleep by {runner:?} (budget \
              {APPARATUS_BUDGET:?}) while bob listed carol after {seen:?}"
         );
         let stderr =

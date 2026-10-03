@@ -34,7 +34,7 @@
 //!
 //! **Which side a red is on.** What vox said or did, read back through Codex's own API, is
 //! `PRODUCT:`. Codex not answering, not listing an entry this proof wrote, or not seeing a
-//! staged change is `CANNOT MEASURE:` (Codex is the instrument here). A fault of this proof's own
+//! staged change is `APPARATUS:` (Codex is the instrument here). A fault of this proof's own
 //! (a file, a symlink, a leaked variable) is `APPARATUS:`.
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -105,7 +105,7 @@ fn trust_status(home: &Path) -> Vec<(String, String)> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: cannot start codex app-server: {e}"));
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start codex app-server: {e}"));
     let mut stdin = child
         .stdin
         .take()
@@ -126,14 +126,14 @@ fn trust_status(home: &Path) -> Vec<(String, String)> {
                     serde_json::json!({"clientInfo": {"name": "proof", "version": "0"}})
                 } else { serde_json::json!({}) }})
         )
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: cannot write to codex app-server: {e}"));
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write to codex app-server: {e}"));
         loop {
             let line = lines
                 .next()
                 .unwrap_or_else(|| {
-                    panic!("CANNOT MEASURE: codex app-server closed before answering {method}")
+                    panic!("APPARATUS: codex app-server closed before answering {method}")
                 })
-                .unwrap_or_else(|e| panic!("CANNOT MEASURE: cannot read codex app-server: {e}"));
+                .unwrap_or_else(|e| panic!("APPARATUS: cannot read codex app-server: {e}"));
             let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
             if v["id"] == id {
                 return v["result"].clone();
@@ -167,7 +167,7 @@ fn status_of(home: &Path, command: &str) -> String {
         .find(|(c, _)| c == command)
         .map(|(_, s)| s)
         .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: Codex does not list the hook {command:?} this proof wrote")
+            panic!("APPARATUS: Codex does not list the hook {command:?} this proof wrote")
         })
 }
 
@@ -229,7 +229,7 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     let stub_s = stub.to_str().expect("APPARATUS: a temp path is not UTF-8");
     let _ = vox_trust_with(home, &["--codex", stub_s]);
     let via_vox = std::fs::read_to_string(&probe).unwrap_or_else(|_| {
-        panic!("CANNOT MEASURE: `vox agent trust codex --codex` never started the stub")
+        panic!("PRODUCT (staging): `vox agent trust codex --codex` never started the stub")
     });
     let via_vox = via_vox.trim();
     println!("[proof] (0) {SENTINEL} in the codex `vox agent trust codex` starts is: {via_vox}");
@@ -241,7 +241,7 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
 
     assert!(
         codex_present(home),
-        "CANNOT MEASURE: this proof needs `codex` on PATH — an absent Codex is not a pass"
+        "APPARATUS (precondition not met): this proof needs `codex` on PATH — an absent Codex is not a pass"
     );
     const HOOK: &str = "vox agent hook";
 
@@ -268,12 +268,12 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     assert_eq!(
         status_of(home, HOOK),
         "untrusted",
-        "CANNOT MEASURE: Codex trusts Vox's entry before vox did anything"
+        "APPARATUS (precondition not met): Codex trusts Vox's entry before vox did anything"
     );
     assert_eq!(
         status_of(home, "echo another-tool"),
         "untrusted",
-        "CANNOT MEASURE: Codex trusts the other tool's entry before vox did anything"
+        "APPARATUS (precondition not met): Codex trusts the other tool's entry before vox did anything"
     );
 
     // ---- (2) vox trusts its own entry, and only its own ----
@@ -340,7 +340,7 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     assert_eq!(
         status_of(home, changed),
         "modified",
-        "CANNOT MEASURE: Codex must see the changed entry as needing review again, or this step \
+        "APPARATUS (precondition not met): Codex must see the changed entry as needing review again, or this step \
          proves nothing"
     );
     let (ok, said) = vox_trust(home);
@@ -360,7 +360,7 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     assert_eq!(
         status_of(home, tampered),
         "modified",
-        "CANNOT MEASURE: Codex must list the tampered entry as modified, or this step proves nothing"
+        "APPARATUS (precondition not met): Codex must list the tampered entry as modified, or this step proves nothing"
     );
     let (_, said) = vox_trust(home);
     assert_eq!(
@@ -385,7 +385,7 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     assert_eq!(
         status_of(home, &evil),
         "modified",
-        "CANNOT MEASURE: Codex must list the retargeted entry as modified, or this step proves \
+        "APPARATUS (precondition not met): Codex must list the retargeted entry as modified, or this step proves \
          nothing"
     );
     let _ = vox_trust(home);

@@ -25,7 +25,7 @@
 //!    running out, which is the refusing side naming the gate.
 //!
 //! Expected values are hard-coded (480s, 150s, 485s), not read from the product, so a changed
-//! patience goes red here. A grind the floor did not lengthen is CANNOT MEASURE, never green.
+//! patience goes red here. A grind the floor did not lengthen is PRODUCT (staging), never green.
 //!
 //! **Mutations that must turn it red.**
 //! - `SOLVE_BUDGET_PER_EXPECTED_SOLVE` back to 30s in `joinstream.rs` (the cause): case 1 red,
@@ -305,7 +305,7 @@ fn a_joiner_slower_than_the_old_patience_gets_in() {
     );
     assert!(
         took >= Duration::from_millis(SLOW_GRIND_MS),
-        "CANNOT MEASURE: the join took {:.1}s, under the {}s grind floor — the floor did not apply",
+        "PRODUCT (staging): the join took {:.1}s, under the {}s grind floor — the floor did not apply",
         took.as_secs_f64(),
         SLOW_GRIND_MS / 1000
     );
@@ -357,7 +357,7 @@ fn a_joiner_slower_than_the_patience_is_told_why() {
     );
     assert!(
         took >= Duration::from_millis(TOO_SLOW_GRIND_MS),
-        "CANNOT MEASURE: the join ended after {:.1}s, under the {}s grind floor: {said}",
+        "PRODUCT (staging): the join ended after {:.1}s, under the {}s grind floor: {said}",
         took.as_secs_f64(),
         TOO_SLOW_GRIND_MS / 1000
     );

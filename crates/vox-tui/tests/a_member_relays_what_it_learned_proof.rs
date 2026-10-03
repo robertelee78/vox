@@ -29,8 +29,8 @@
 //! ## Apparatus clock
 //! From carol's `SIGCONT`, a thread of this process sleeps 10 ms at a time and keeps the most it
 //! overslept: the runner's own stall, which vox cannot move. If carol fell short and the runner
-//! overslept more than [`APPARATUS_BUDGET`], the runner, not bob, owned the window: `CANNOT
-//! MEASURE: the runner stalled`. Otherwise the red is `PRODUCT: took X (runner stalled at most
+//! overslept more than [`APPARATUS_BUDGET`], the runner, not bob, owned the window:
+//! `APPARATUS (runner stalled)`. Otherwise the red is `PRODUCT: took X (runner stalled at most
 //! Y)`. When carol's socket first answered after `SIGCONT` is vox's own timing: printed, never the
 //! clock.
 //!
@@ -232,7 +232,7 @@ fn a_member_relays_what_it_learned() {
         go += Duration::from_millis(250);
         assert!(
             go < now + TICK,
-            "CANNOT MEASURE: no {window:?} window clear of both ticks"
+            "APPARATUS: no {window:?} window clear of both ticks"
         );
     }
     println!(
@@ -311,14 +311,14 @@ fn a_member_relays_what_it_learned() {
     anchor.signal("-CONT");
     assert!(
         ended == 0,
-        "CANNOT MEASURE: carol ended {ended} session(s) with alice, so bob was not her only source"
+        "PRODUCT (staging): carol ended {ended} session(s) with alice, so bob was not her only source"
     );
     // The staging held (bob holds all of them, carol ended nothing with alice, no tick in the
     // window), so a short count is the product's: bob did not relay what he learned. Both sides'
     // sessions and connections are printed, so the red says which event was lost.
     assert!(
         have == POSTS || runner <= APPARATUS_BUDGET,
-        "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by {runner:?} (budget \
+        "APPARATUS (runner stalled): the runner stalled: it overslept a 10 ms sleep by {runner:?} (budget \
          {APPARATUS_BUDGET:?}) while carol read {have}/{POSTS} within {BOUND:?}"
     );
     assert!(

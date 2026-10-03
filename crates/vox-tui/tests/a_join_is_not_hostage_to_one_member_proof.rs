@@ -207,10 +207,7 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         ],
         None,
     );
-    assert!(
-        ok,
-        "PRODUCT (staging): {name}: vox id: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): {name}: vox id: {err}");
     m.fp = out.trim().to_owned();
     assert_eq!(
         m.fp.len(),
@@ -289,11 +286,7 @@ fn posts_until_read(
     while Instant::now() < deadline {
         n += 1;
         let (ok, _, e) = author.vox(&["room", "post", room, &format!("{tag} {n}")], None);
-        assert!(
-            ok,
-            "PRODUCT (staging): {} posts: {e}",
-            author.name
-        );
+        assert!(ok, "PRODUCT (staging): {} posts: {e}", author.name);
         std::thread::sleep(Duration::from_secs(1));
         if reader.reads(room, &format!("{tag} ")) {
             return Some(n);
@@ -399,9 +392,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         JOIN_BOUND.as_secs()
     );
     if !ok && format!("{o}{e}").contains("authenticator invalid") {
-        panic!(
-            "PRODUCT: carol's join hit #217 (`authenticator invalid`): {o}{e}"
-        );
+        panic!("PRODUCT: carol's join hit #217 (`authenticator invalid`): {o}{e}");
     }
     assert!(
         ok,

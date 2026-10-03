@@ -263,7 +263,7 @@ fn stop(mut p: VoxProc) {
     while p.child.try_wait().ok().flatten().is_none() {
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: anchor {pid} did not stop within 10 s of SIGINT"
+            "PRODUCT (staging): anchor {pid} did not stop within 10 s of SIGINT"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -374,7 +374,7 @@ fn idle_then_join(churn: bool) {
     assert_eq!(
         causes.values().sum::<u64>(),
         rounds,
-        "CANNOT MEASURE: alice's rounds by cause {causes:?} do not add up to her {rounds} rounds"
+        "PRODUCT: alice's rounds by cause {causes:?} do not add up to her {rounds} rounds"
     );
 
     // ---- Carol, who has only the anchor ----------------------------------------------------
@@ -390,7 +390,7 @@ fn idle_then_join(churn: bool) {
         anchor_only = without_endpoint_of(&anchor_only, b_fp);
         assert!(
             !anchor_only.contains(b_fp),
-            "CANNOT MEASURE: anchor B is still in the address: {anchor_only}"
+            "APPARATUS: anchor B is still in the address: {anchor_only}"
         );
         // B came back as often as asked, and Alice reached it again each time: otherwise there
         // were no rounds to B alone to put anything off.
@@ -421,13 +421,13 @@ fn idle_then_join(churn: bool) {
         );
         assert!(
             reached >= 8 && widest < (ttl / 2) as f64,
-            "CANNOT MEASURE: alice reached anchor B {reached} time(s) while idle, at most \
+            "PRODUCT (staging): alice reached anchor B {reached} time(s) while idle, at most \
              {widest:.1}s apart; the arm needs rounds to B alone closer than half a lifetime"
         );
     }
     assert!(
         !anchor_only.contains(&format!("a={alice_fp}&b=")),
-        "CANNOT MEASURE: Alice's endpoint is still in the address: {anchor_only}"
+        "APPARATUS: Alice's endpoint is still in the address: {anchor_only}"
     );
     let carol = daemon("carol", &carol_dir, &spec, &idpass, &ttl_s);
     let t = Instant::now();

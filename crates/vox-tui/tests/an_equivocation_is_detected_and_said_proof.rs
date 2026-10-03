@@ -103,7 +103,7 @@ fn signal(p: &VoxProc, sig: &str) {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    assert!(ok, "CANNOT MEASURE: `kill {sig}` of {} failed", p.name);
+    assert!(ok, "APPARATUS: `kill {sig}` of {} failed", p.name);
 }
 
 /// Stop a process by its PID with SIGTERM, so it closes its connections, and reap it.
@@ -392,7 +392,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     ] {
         assert!(
             !reads(d, &room, text),
-            "CANNOT MEASURE: {who} already reads {text}, so its message continued the first side \
+            "PRODUCT (staging): {who} already reads {text}, so its message continued the first side \
              instead of forking it"
         );
     }
@@ -574,11 +574,11 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
             out.stdout
         ),
         Some(2) => panic!(
-            "CANNOT MEASURE: the TUI apparatus failed at stage {stage:?}: {}",
+            "APPARATUS: the TUI apparatus failed at stage {stage:?}: {}",
             out.stdout
         ),
         _ if !out.has_verdict("eq") => panic!(
-            "CANNOT MEASURE: the TUI driver was stopped from outside before it gave a verdict, at \
+            "APPARATUS: the TUI driver was stopped from outside before it gave a verdict, at \
              stage {stage:?} after {:?} (exit {:?}; its stack is above, on stderr): {}",
             out.took, out.code, out.stdout
         ),

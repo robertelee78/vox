@@ -35,7 +35,7 @@
 //! error naming the connection), never by stalling and never with a clean end. With the daemon
 //! frozen, `vox room send` exits within [`STOP_WITHIN`] of SIGTERM, saying [`FROZEN_SAID`].
 //!
-//! ## Preconditions (else CANNOT MEASURE)
+//! ## Preconditions (else PRODUCT (staging))
 //! Each collector had received bytes, and not the whole file, when the offer was stopped.
 //!
 //! ## Mutation
@@ -230,7 +230,7 @@ fn a_cut_session_is_reset_not_hung() {
                 break if status.success() {
                     // The whole file arrived before the cut took effect.
                     panic!(
-                        "CANNOT MEASURE: round {round}: the collector finished before the cut \
+                        "PRODUCT (staging): round {round}: the collector finished before the cut \
                          ({held} bytes at the cut)"
                     );
                 } else if text.contains("stalled") {

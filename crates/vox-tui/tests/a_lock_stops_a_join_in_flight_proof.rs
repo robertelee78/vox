@@ -15,7 +15,7 @@
 //!
 //! **Asserted,** with hard-coded bounds: bob's `vox room join` fails, and within [`ANSWERED`] of
 //! the lock, and what it prints names the lock (not "run `vox id`", V210-94); and alice's roster, read [`SETTLE`] after she is resumed, does not name bob.
-//! Preconditions, or `CANNOT MEASURE`: the join had not returned when bob locked. Alice's roster
+//! Preconditions, or `PRODUCT (staging)`: the join had not returned when bob locked. Alice's roster
 //! names alice, or `PRODUCT (staging)`.
 //!
 //! **What separates the fix from the defect is the answer time.** The lock also closes the node's
@@ -27,7 +27,7 @@
 //! **Apparatus clock.** The answer time is read on the same timeline as the runner's own stall: the
 //! largest gap between two of the test's 100 ms polls of the join (a `waitpid` and a sleep, which
 //! vox cannot slow). If the answer was late and that gap exceeded [`POLL_GAP_BUDGET`], the runner
-//! stalled and the red is `CANNOT MEASURE: the runner stalled`; otherwise it is `PRODUCT: took X
+//! stalled and the red is `APPARATUS (runner stalled)`; otherwise it is `PRODUCT: took X
 //! (apparatus Y)`. How long the TUI took to show LOCKED is vox's own timing: printed, never the
 //! clock.
 //!
@@ -236,7 +236,7 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
             !said.contains("the TUI never unlocked"),
             "PRODUCT (staging): bob's TUI never unlocked with his identity passphrase; {said}"
         );
-        panic!("CANNOT MEASURE: bob's TUI driver never got as far as the unlock; {said}");
+        panic!("PRODUCT (staging): bob's TUI driver never got as far as the unlock; {said}");
     }
 
     // ---- a join that cannot finish yet, and a lock while it runs --------------------------
@@ -262,7 +262,7 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
     signal(alice_pid, "-CONT");
     assert!(
         early.is_none(),
-        "CANNOT MEASURE: bob's join returned before he locked ({early:?}), so no join was in \
+        "PRODUCT (staging): bob's join returned before he locked ({early:?}), so no join was in \
          flight"
     );
     if !locked {
@@ -288,7 +288,7 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
             "PRODUCT: bob typed `:lock` while his join was in flight, and his TUI never showed \
              LOCKED; {said}"
         );
-        panic!("CANNOT MEASURE: bob's TUI driver never typed `:lock` to completion; {said}");
+        panic!("PRODUCT (staging): bob's TUI driver never typed `:lock` to completion; {said}");
     }
 
     // ---- what the join came to ------------------------------------------------------------
@@ -332,11 +332,16 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
         driven.took,
         driven.stage
     );
-    assert!(
-        driven.has_verdict("bob") && driven.code == Some(0),
-        "CANNOT MEASURE: bob's TUI driver did not finish cleanly:\n{}",
-        driven.stdout
-    );
+    if !(driven.has_verdict("bob") && driven.code == Some(0)) {
+        // A driver with no verdict, or one naming its own apparatus, failed on its own; any other
+        // verdict (RED, HUNG at) is what the TUI did.
+        let own = !driven.has_verdict("bob") || driven.stdout.contains("bob APPARATUS");
+        let side = if own { "APPARATUS" } else { "PRODUCT" };
+        panic!(
+            "{side}: bob's TUI driver did not finish cleanly (exit {:?}):\n{}",
+            driven.code, driven.stdout
+        );
+    }
     assert!(
         names(&alice_fp),
         "PRODUCT (staging): alice's roster does not name alice:\n{roster}"
@@ -355,7 +360,7 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
     let Some((status, took)) = answered else {
         assert!(
             !stalled,
-            "CANNOT MEASURE: the runner stalled ({apparatus}), and bob's `vox room join` did not answer \
+            "APPARATUS (runner stalled): the runner stalled ({apparatus}), and bob's `vox room join` did not answer \
              within {SETTLE:?} of the lock"
         );
         panic!(
@@ -380,7 +385,7 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
     if took >= ANSWERED {
         assert!(
             !stalled,
-            "CANNOT MEASURE: the runner stalled ({apparatus}), and bob's join answered {took:?} after the \
+            "APPARATUS (runner stalled): the runner stalled ({apparatus}), and bob's join answered {took:?} after the \
              lock"
         );
         panic!(

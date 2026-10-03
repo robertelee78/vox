@@ -28,7 +28,7 @@
 //! read 25 to a page) **blocks**; [`a_newcomer_trusted_before_every_post_reads_all_of_them`] (1,500
 //! posts read 500 to a page, across the rotation at 1,000) is **optional** for its staging time.
 //! Alice's own paged read must show every post she made once each in order, or it is a `PRODUCT`
-//! red: each was accepted. The one precondition, or `CANNOT MEASURE`: bob renders alice's post made
+//! red: each was accepted. The one precondition, or `PRODUCT (staging)`: bob renders alice's post made
 //! *after* his join (so his log and his key did arrive).
 //!
 //! **Every participant is the shipped binary.** Nothing in this process runs a node, opens a
@@ -383,7 +383,7 @@ fn newcomer_reads_the_whole_history(posts: usize, page: usize) {
     );
     assert!(
         order.contains(&after_join),
-        "CANNOT MEASURE: bob never read alice's post {after_join}, made after his join, within \
+        "PRODUCT (staging): bob never read alice's post {after_join}, made after his join, within \
          {took:?}: his log or his key never arrived, so what he reads of the history says \
          nothing\nbob's daemon said: {}\nalice's daemon said: {}",
         said(&bob, "bob"),

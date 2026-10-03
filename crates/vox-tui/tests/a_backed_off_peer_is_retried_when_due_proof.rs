@@ -36,13 +36,13 @@
 //! The pair read each other before the freeze, and Alice's session to Bob failed while Bob was
 //! frozen (`failed` rose within 28 s): each is the product's, so a miss is `PRODUCT (staging)`.
 //! Her `opened` counter did not go backwards (a restarted node starts it again at 0), else
-//! CANNOT MEASURE: nothing in the proof restarts a node.
+//! PRODUCT: nothing in the proof restarts a node.
 //!
 //! ## Apparatus clock
 //! (1) is timed from `SIGCONT`. On the same timeline a thread of this process sleeps 10 ms at a
 //! time and keeps the most it overslept: the runner's own stall, which vox cannot move. If it
 //! overslept more than [`APPARATUS_BUDGET`] and Bob read late, the runner owned the window:
-//! `CANNOT MEASURE: the runner stalled`. Otherwise a late read is `PRODUCT: took X (runner
+//! `APPARATUS (runner stalled)`. Otherwise a late read is `PRODUCT: took X (runner
 //! stalled at most Y)`. When Bob first answered after `SIGCONT`, and the largest gap between
 //! polls of his room, are vox's own timing: printed, never the clock.
 //! (2) reads Alice's own counters before Bob is continued, so it needs no clock.
@@ -219,7 +219,7 @@ fn a_backed_off_peer_is_retried_when_due() {
         );
         l.checked_sub(e).unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: {who}'s `opened` counter went backwards ({e} -> {l}): the node \
+                "PRODUCT: {who}'s `opened` counter went backwards ({e} -> {l}): the node \
                  was restarted under the proof"
             )
         })
@@ -254,7 +254,7 @@ fn a_backed_off_peer_is_retried_when_due() {
     if read_at > BOUND {
         assert!(
             apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: the runner stalled: it overslept a 10 ms sleep by {apparatus:?} \
+            "APPARATUS (runner stalled): the runner stalled: it overslept a 10 ms sleep by {apparatus:?} \
              (budget {APPARATUS_BUDGET:?}) while bob read alice's post {read_at:?} after being \
              continued"
         );

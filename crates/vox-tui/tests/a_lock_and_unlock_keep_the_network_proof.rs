@@ -16,7 +16,7 @@
 //! whenever a queue happens to be full. Unset, the knob changes nothing.
 //!
 //! **Asserted,** with hard-coded numbers: the join through the re-unlocked node succeeds.
-//! Preconditions, or `CANNOT MEASURE`: the TUI locked, and unlocked again within
+//! Preconditions, or `PRODUCT (staging)`: the TUI locked, and unlocked again within
 //! [`UNLOCK_BEFORE_MS`] of the lock — sooner than the old network's word arrives, which is what
 //! puts that word after the new network; and the join ran after the word arrived.
 //!
@@ -206,20 +206,26 @@ fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
     println!("[proof] tui: {}", said.trim().replace('\n', " / "));
     assert!(
         out.has_verdict("cargo") || said.contains("cargo join "),
-        "CANNOT MEASURE: the TUI driver was stopped before it gave a verdict, at stage {:?} (exit \
+        "APPARATUS: the TUI driver was stopped before it gave a verdict, at stage {:?} (exit \
          {:?}): {said}",
         out.stage.as_deref().unwrap_or("(before its first stage)"),
         out.code
     );
     assert!(
         out.code == Some(0),
-        "CANNOT MEASURE: the TUI driver did not run its steps (exit {:?}): {said}",
+        "{}: the TUI driver did not run its steps (exit {:?}): {said}",
+        if said.contains("cargo APPARATUS") {
+            "APPARATUS"
+        } else {
+            "PRODUCT (staging)"
+        },
         out.code
     );
-    let locked = seconds_after(&said, "locked")
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: the driver never said the TUI locked: {said}"));
+    let locked = seconds_after(&said, "locked").unwrap_or_else(|| {
+        panic!("PRODUCT (staging): the driver never said the TUI locked: {said}")
+    });
     let unlocked = seconds_after(&said, "unlocked again").unwrap_or_else(|| {
-        panic!("CANNOT MEASURE: the driver never said the TUI unlocked again: {said}")
+        panic!("PRODUCT (staging): the driver never said the TUI unlocked again: {said}")
     });
     println!(
         "[proof] locked at +{locked:.2}s, unlocked again at +{unlocked:.2}s; the old network says \
@@ -228,7 +234,7 @@ fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
     );
     assert!(
         unlocked * 1000.0 < UNLOCK_BEFORE_MS as f64,
-        "CANNOT MEASURE: the unlock took {unlocked:.2}s after the lock, not under {:.1}s, so the \
+        "PRODUCT (staging): the unlock took {unlocked:.2}s after the lock, not under {:.1}s, so the \
          old network's word may have landed before the new network existed",
         UNLOCK_BEFORE_MS as f64 / 1000.0
     );

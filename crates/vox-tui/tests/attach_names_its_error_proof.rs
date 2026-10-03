@@ -90,7 +90,10 @@ fn check(case: &str, dir: &Path, said: &[&str], unsaid: &[&str]) -> (usize, usiz
         unsaid.len()
     );
     for w in said {
-        assert!(err.contains(w), "PRODUCT: {case}: the message must say {w:?}: {err}");
+        assert!(
+            err.contains(w),
+            "PRODUCT: {case}: the message must say {w:?}: {err}"
+        );
     }
     for w in unsaid {
         assert!(

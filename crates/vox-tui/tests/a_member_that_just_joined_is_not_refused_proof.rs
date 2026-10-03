@@ -17,7 +17,7 @@
 //!
 //! 3. **the window was reached**: at least one joiner was told "not a member of the room yet"
 //!    (`NotYetMember`), the honest name for it, which the push retry resolves. A run in which none
-//!    was is `CANNOT MEASURE: staging not achieved`, never a pass: it would have passed with the
+//!    was is `PRODUCT (staging)`, never a pass: it would have passed with the
 //!    defect present (V210-106).
 //!
 //! **How the window is forced.** It is a race between the joiner's first session with its anchor
@@ -350,7 +350,7 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     // have passed too.
     assert!(
         not_yet > 0,
-        "CANNOT MEASURE (staging not achieved): no joiner's sync was told \"not a member yet\", so \
+        "PRODUCT (staging): no joiner's sync was told \"not a member yet\", so \
          no joiner synced with the anchor while it knew it only by its pre-join record, though each \
          held its address record back for {HOLD_ADDRESS_MS} ms"
     );

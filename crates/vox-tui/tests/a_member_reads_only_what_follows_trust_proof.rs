@@ -19,7 +19,7 @@
 //! **Asserted,** with hard-coded numbers, after each arm keeps reading 45–60 s past the moment
 //! its required posts arrived (a late history release must be caught): in arm A bob reads
 //! exactly posts 1,101–1,110; in arm B exactly 1,101–2,050, all 950 of them; in neither any of
-//! posts 1–1,100. Precondition, or `CANNOT MEASURE`: alice's own paged reads show every post she
+//! posts 1–1,100. Precondition, or `PRODUCT (staging)`: alice's own paged reads show every post she
 //! made in both rooms.
 //!
 //! **The clock-step attack cannot be staged here** (it needs clock control, and sudo is
@@ -332,7 +332,7 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
         let (mine, rows, _) = read_posts(&alice, room);
         assert!(
             mine.len() == total && rows == total,
-            "CANNOT MEASURE: alice herself reads {} distinct posts in {rows} rows of {room}, not \
+            "PRODUCT (staging): alice herself reads {} distinct posts in {rows} rows of {room}, not \
              {total}",
             mine.len()
         );
@@ -388,7 +388,7 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
     );
     assert!(
         a_post.contains(&1_110),
-        "CANNOT MEASURE: in arm A bob never read post 1110, made after alice trusted him, so his \
+        "PRODUCT (staging): in arm A bob never read post 1110, made after alice trusted him, so his \
          key never arrived{}",
         daemons()
     );

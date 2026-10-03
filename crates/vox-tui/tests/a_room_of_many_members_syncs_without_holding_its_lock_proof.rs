@@ -124,7 +124,7 @@ fn a_room_of_many_members_syncs_without_holding_its_lock() {
     );
     assert!(
         members >= MEMBERS + 2,
-        "APPARATUS (staging not achieved): the host's roster lists {members} members, not {} \
+        "PRODUCT (staging): the host's roster lists {members} members, not {} \
          (host, bob and {MEMBERS})",
         MEMBERS + 2
     );

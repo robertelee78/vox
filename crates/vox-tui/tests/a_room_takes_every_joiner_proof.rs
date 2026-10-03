@@ -23,8 +23,8 @@
 //!
 //! **Asserted:** every one of the 301 joins succeeds. A red names each failed joiner, what its
 //! `vox connect` said, and what the anchor and the host said of their connection to it — a
-//! product verdict. Apparatus faults say so: a `vox id` or a staging line that never came is
-//! `CANNOT MEASURE`, and the watchdog names itself.
+//! product verdict. A `vox id` or a staging line that never came is `PRODUCT (staging)`; the
+//! proof's own faults say `APPARATUS`, and the watchdog names itself.
 //!
 //! **Mutation that must turn it red:** an unanswered probe closing the held connection again
 //! (`ConnectionManager::file_inner`): joins fail `closed by the peer` again, at the 1–2% the defect

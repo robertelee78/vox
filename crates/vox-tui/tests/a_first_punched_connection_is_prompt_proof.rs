@@ -34,7 +34,7 @@
 //! **Control, same run:** both NATs made **symmetric** (a new mapping per destination, so the
 //! observed address is useless to the peer and no punch can work). The pair must stay relayed —
 //! answered, but not one payload byte peer to peer — or the emulator leaks and this proof reports
-//! CANNOT MEASURE.
+//! APPARATUS.
 //!
 //! **The mutation that must turn it red:** drop the punch rung from `NodeNet::upgrade` (no
 //! coordinator is asked). The pair is answered over the circuit and never reaches a direct path.
@@ -188,7 +188,7 @@ impl NatWorld {
         );
         assert!(
             ok,
-            "CANNOT MEASURE ({kind:?}): the guest could not join through its NAT (after {:?}).\n\
+            "PRODUCT (staging) ({kind:?}): the guest could not join through its NAT (after {:?}).\n\
              stdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
             t0.elapsed(),
             host.transcript()
@@ -304,7 +304,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         let first = request(&w, proxy, &payload);
         assert!(
             first.is_some(),
-            "CANNOT MEASURE: behind symmetric NATs the guest's request was not answered at all — \
+            "PRODUCT (staging): behind symmetric NATs the guest's request was not answered at all — \
              the anchor's circuit, the one path that must exist, did not carry it.\nup:\n{}",
             up.transcript()
         );
@@ -326,7 +326,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         );
         assert!(
             w.nats.p2p_to_host() == 0 && w.nats.p2p_to_guest() == 0,
-            "CANNOT MEASURE: behind symmetric NATs the pair still moved {} B peer to peer — a path \
+            "APPARATUS: behind symmetric NATs the pair still moved {} B peer to peer — a path \
              leaks around the emulator, so a direct path behind the cone NATs would prove nothing",
             w.nats.p2p_to_host() + w.nats.p2p_to_guest()
         );
@@ -456,7 +456,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         if direct_at.is_some() {
             assert!(
                 filtered >= 1,
-                "CANNOT MEASURE (sample {i}): the pair went direct and no NAT dropped a single \
+                "APPARATUS (sample {i}): the pair went direct and no NAT dropped a single \
                  unsolicited datagram — the filter this proof depends on was not in the way"
             );
         }

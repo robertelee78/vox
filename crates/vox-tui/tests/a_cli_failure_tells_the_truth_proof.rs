@@ -26,7 +26,7 @@
 //!    stream socket holds at most its sender's 208 KiB `wmem_default`, a pipe 64 KiB, and the
 //!    tail one frame. Six posts (360 KB) fitted on Linux, and the tail printed all six
 //!    (V210-125). After the kill the output is read again, and the tail meets a length, part of
-//!    a body, then EOF. If the tail printed every one, no frame was cut: CANNOT MEASURE.
+//!    a body, then EOF. If the tail printed every one, no frame was cut: PRODUCT (staging).
 //! 4. **A service removal that fails names its cause**, not a hard-coded "was not offered". The
 //!    one cause a person can stage is a tag that is not offered, and its wording is asserted
 //!    here; the others (a store that failed, a node with no identity) cannot be staged through
@@ -38,7 +38,7 @@
 //!    non-zero within 45 s (the product checks every 10 s and gives a greeting 10 s; the bound
 //!    here is hard-coded) saying the node stopped answering while the request waited. If it
 //!    says instead that the node never greeted, the suspension came before the request was sent:
-//!    CANNOT MEASURE. The control: after SIGCONT the same daemon answers `vox status`. A node
+//!    PRODUCT (staging). The control: after SIGCONT the same daemon answers `vox status`. A node
 //!    whose actor is stuck while it still greets cannot be staged through any command; that
 //!    half (the ping each check sends through the actor) rests on code review.
 //! 7. **A request whose node is killed mid-request names the hang-up** (V210-101, #305). Staged as
@@ -46,7 +46,7 @@
 //!    going quiet. The join must exit non-zero within the proof's bound, saying the node closed
 //!    the connection before replying and is no longer running, and never call it a "malformed
 //!    control-socket message": nothing arrived to be malformed. If it says the node closed the
-//!    connection before greeting, the kill came before the request was sent: CANNOT MEASURE.
+//!    connection before greeting, the kill came before the request was sent: PRODUCT (staging).
 //! 6. **A holder whose control socket cannot be bound runs on, and says why** (separate test,
 //!    `a_holder_runs_without_its_control_socket`). A profile path too long for a socket puts the
 //!    socket in `$TMPDIR/vox-<uid>`, and there a plain file stands where that directory should be
@@ -61,7 +61,7 @@
 //! 8. **A `vox connect` stopped at a passphrase prompt says why, and hands the terminal back**
 //!    (V210-85; separate test, `a_connect_stopped_at_a_passphrase_prompt_says_why`).
 //!
-//! Each of 7 and 8 says on its own test what it stages, which reds are CANNOT MEASURE, and which
+//! Each of 7 and 8 says on its own test what it stages, which reds are APPARATUS or PRODUCT (staging), and which
 //! mutations turn it red.
 //!
 //! **Staging.** An anchor (`vox node`), a host (`vox serve` of a loopback echo service), and a
@@ -435,7 +435,7 @@ fn a_cli_failure_tells_the_truth() {
     // after it is asked.
     assert!(
         signal("STOP", host_pid),
-        "CANNOT MEASURE (5): could not SIGSTOP the host"
+        "APPARATUS (5): could not SIGSTOP the host"
     );
     let mut join = Proc::spawn(
         "late join",
@@ -448,7 +448,7 @@ fn a_cli_failure_tells_the_truth() {
         signal("CONT", host_pid);
         std::thread::sleep(Duration::from_millis(100));
         panic!(
-            "CANNOT MEASURE (5): the join ended ({s}) before its node could be suspended \
+            "PRODUCT (staging) (5): the join ended ({s}) before its node could be suspended \
              mid-request: {}\n{}",
             join.stdout().join("\n"),
             join.stderr()
@@ -456,13 +456,13 @@ fn a_cli_failure_tells_the_truth() {
     }
     assert!(
         signal("STOP", late_pid),
-        "CANNOT MEASURE (5): could not SIGSTOP the late joiner's daemon"
+        "APPARATUS (5): could not SIGSTOP the late joiner's daemon"
     );
     let mid_bound = Duration::from_secs(45);
     let ended = join.exit_within(mid_bound);
     assert!(
         signal("CONT", late_pid) && signal("CONT", host_pid),
-        "CANNOT MEASURE (5): could not SIGCONT the daemons"
+        "APPARATUS (5): could not SIGCONT the daemons"
     );
     let Some((status, took)) = ended else {
         panic!(
@@ -480,7 +480,7 @@ fn a_cli_failure_tells_the_truth() {
     );
     assert!(
         !said.contains("did not answer within"),
-        "CANNOT MEASURE (5): the node was suspended before it greeted, so the request was never \
+        "PRODUCT (staging) (5): the node was suspended before it greeted, so the request was never \
          sent: {said}"
     );
     assert!(
@@ -523,7 +523,7 @@ fn a_cli_failure_tells_the_truth() {
     // is killed. A kill, not a suspension: the connection ends, it does not go quiet.
     assert!(
         signal("STOP", host_pid),
-        "CANNOT MEASURE (7): could not SIGSTOP the host"
+        "APPARATUS (7): could not SIGSTOP the host"
     );
     let mut join = Proc::spawn(
         "gone join",
@@ -535,7 +535,7 @@ fn a_cli_failure_tells_the_truth() {
     if let Some(s) = join.child.try_wait().expect("APPARATUS: harness: wait") {
         signal("CONT", host_pid);
         panic!(
-            "CANNOT MEASURE (7): the join ended ({s}) before its node could be killed \
+            "PRODUCT (staging) (7): the join ended ({s}) before its node could be killed \
              mid-request: {}\n{}",
             join.stdout().join("\n"),
             join.stderr()
@@ -543,13 +543,13 @@ fn a_cli_failure_tells_the_truth() {
     }
     assert!(
         signal("KILL", gone_pid),
-        "CANNOT MEASURE (7): could not SIGKILL the joiner's daemon"
+        "APPARATUS (7): could not SIGKILL the joiner's daemon"
     );
     let _ = gone.child.wait();
     let ended = join.exit_within(bound);
     assert!(
         signal("CONT", host_pid),
-        "CANNOT MEASURE (7): could not SIGCONT the host"
+        "APPARATUS (7): could not SIGCONT the host"
     );
     let Some((status, took)) = ended else {
         panic!(
@@ -567,7 +567,7 @@ fn a_cli_failure_tells_the_truth() {
     );
     assert!(
         !said.contains("closed the connection before greeting"),
-        "CANNOT MEASURE (7): the node was gone before it greeted, so no request was in flight: \
+        "PRODUCT (staging) (7): the node was gone before it greeted, so no request was in flight: \
          {said}"
     );
     assert!(
@@ -615,13 +615,13 @@ fn a_cli_failure_tells_the_truth() {
     let pid = joiner.child.id();
     assert!(
         signal("STOP", pid),
-        "CANNOT MEASURE (2): could not SIGSTOP the daemon"
+        "APPARATUS (2): could not SIGSTOP the daemon"
     );
     let status = vox(&joiner_dir, &["status"], "", bound);
     let list = vox(&joiner_dir, &["room", "list"], "", bound);
     assert!(
         signal("CONT", pid),
-        "CANNOT MEASURE (2): could not SIGCONT the daemon"
+        "APPARATUS (2): could not SIGCONT the daemon"
     );
     for (verb, r) in [("vox status", status), ("vox room list", list)] {
         let Some((ok, said, took)) = r else {
@@ -678,7 +678,7 @@ fn a_cli_failure_tells_the_truth() {
     std::thread::sleep(Duration::from_secs(2));
     assert!(
         signal("KILL", pid),
-        "CANNOT MEASURE (3): could not SIGKILL the daemon"
+        "APPARATUS (3): could not SIGKILL the daemon"
     );
     let _ = joiner.child.wait();
     tail.hold_out.store(false, Ordering::SeqCst);
@@ -710,7 +710,7 @@ fn a_cli_failure_tells_the_truth() {
     eprintln!("[room tail, node killed] printed {printed} of {BIG} big posts");
     assert!(
         printed < BIG,
-        "CANNOT MEASURE (3): the tail printed all {BIG} big posts before its node died, so no \
+        "PRODUCT (staging) (3): the tail printed all {BIG} big posts before its node died, so no \
          frame was cut part-way"
     );
     claims += 1;
@@ -1028,8 +1028,8 @@ fn peers_connected(anchor: &Proc) -> Option<usize> {
 /// own (a new identity), so its announce is one more pending record on the board; the stop is sent
 /// [`LEFT_WAITING`] after that, while the join waits on the frozen host.
 ///
-/// **A red names its side.** CANNOT MEASURE: a `kill` that failed, a join that ended on its own
-/// before the stop (its output is printed). PRODUCT (staging): a `vox id` that failed, a room never
+/// **A red names its side.** APPARATUS: a `kill` that failed. PRODUCT (staging): a join that ended
+/// on its own before the stop (its output is printed), a `vox id` that failed, a room never
 /// published. A connect that exits before it announces is the product's, quoted. Everything after
 /// the signal is the product's.
 ///
@@ -1115,7 +1115,7 @@ fn a_connect_stopped_by_a_signal_says_why() {
     }
     assert!(
         signal("STOP", host.child.id()),
-        "CANNOT MEASURE: `kill -STOP` the host failed"
+        "APPARATUS: `kill -STOP` the host failed"
     );
 
     let host12 = &host_fp[..12];
@@ -1179,7 +1179,7 @@ fn a_connect_stopped_by_a_signal_says_why() {
         if let Ok(Some(status)) = connect.child.try_wait() {
             std::thread::sleep(Duration::from_millis(100));
             panic!(
-                "CANNOT MEASURE ({name}): the join ended on its own ({status}) before it could be \
+                "PRODUCT (staging) ({name}): the join ended on its own ({status}) before it could be \
                  stopped mid-way.\n--- stdout:\n{}\n--- stderr:\n{}",
                 connect.stdout().join("\n"),
                 connect.stderr()
@@ -1193,7 +1193,7 @@ fn a_connect_stopped_by_a_signal_says_why() {
         });
         assert!(
             signal(sig, connect.child.id()),
-            "CANNOT MEASURE ({name}): `kill -{sig}` failed"
+            "APPARATUS ({name}): `kill -{sig}` failed"
         );
         let sent = Instant::now();
         let (mut exited, mut gone) = (None, None);
@@ -1295,11 +1295,11 @@ struct OnTerminal {
 impl OnTerminal {
     /// `vox connect` for `profile`, with no identity passphrase in its environment, and the room
     /// passphrase from `room_file` or else prompted for. Setting up the pty is the scene, not the
-    /// product: a failure there is CANNOT MEASURE.
+    /// product: a failure there is APPARATUS.
     fn start(profile: &std::path::Path, room_file: Option<&std::path::Path>) -> Self {
         use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
         let apparatus = |what: &str, e: &dyn std::fmt::Debug| -> ! {
-            panic!("CANNOT MEASURE: setting up the pty: {what}: {e:?}")
+            panic!("APPARATUS: setting up the pty: {what}: {e:?}")
         };
         let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)
             .unwrap_or_else(|e| apparatus("openpt", &e));
@@ -1429,9 +1429,9 @@ impl OnTerminal {
         let status = self
             .child
             .wait()
-            .unwrap_or_else(|e| panic!("CANNOT MEASURE: reaping vox connect: {e}"));
+            .unwrap_or_else(|e| panic!("APPARATUS: reaping vox connect: {e}"));
         let modes = rustix::termios::tcgetattr(&self.terminal)
-            .unwrap_or_else(|e| panic!("CANNOT MEASURE: reading the terminal's modes: {e}"));
+            .unwrap_or_else(|e| panic!("APPARATUS: reading the terminal's modes: {e}"));
         let ended = Ended {
             status,
             took: self.t0.elapsed(),
@@ -1479,10 +1479,7 @@ fn stopped_at_prompt(
     let (sig, name, code) = stop;
     let mut c = OnTerminal::start(profile, room_file);
     c.until_prompted(prompt);
-    assert!(
-        signal(sig, c.child.id()),
-        "CANNOT MEASURE: `kill -{sig}` failed"
-    );
+    assert!(signal(sig, c.child.id()), "APPARATUS: `kill -{sig}` failed");
     let (e, modes) = c.finish();
     let case = format!("{name} at the {prompt:?} prompt");
     assert_says_stopped(&e, &case, name, code);
@@ -1505,7 +1502,7 @@ fn stopped_at_prompt(
 /// the prompt's raw mode. Ctrl-C typed at the prompt ends with a status and `cancelled`. The prompts
 /// ran before the signal handler was taken, so a stop there died on the signal and said nothing.
 ///
-/// **A red names its side.** CANNOT MEASURE: the pty or a `kill` failed. PRODUCT (staging): `vox
+/// **A red names its side.** APPARATUS: the pty or a `kill` failed. PRODUCT (staging): `vox
 /// id` failed. A connect that never shows its prompt, or anything after the stop, is the
 /// product's, quoted.
 ///
@@ -1547,7 +1544,7 @@ fn a_connect_stopped_at_a_passphrase_prompt_says_why() {
     let mut c = OnTerminal::start(&profile, Some(&room_file));
     c.until_prompted("identity passphrase: ");
     Write::write_all(&mut c.keys, b"\x03")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: typing Ctrl-C on the pty: {e}"));
+        .unwrap_or_else(|e| panic!("APPARATUS: typing Ctrl-C on the pty: {e}"));
     let (e, modes) = c.finish();
     let case = "Ctrl-C at the identity passphrase prompt";
     {

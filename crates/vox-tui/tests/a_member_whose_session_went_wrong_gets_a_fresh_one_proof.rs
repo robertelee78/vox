@@ -267,7 +267,9 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
                 raw_sync::now(),
             )
             .await
-            .expect("PRODUCT (staging): the victim did not take a connection from mallory's identity");
+            .expect(
+                "PRODUCT (staging): the victim did not take a connection from mallory's identity",
+            );
         (endpoint, Arc::new(conn))
     });
 

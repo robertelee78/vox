@@ -27,12 +27,12 @@
 //! Mutations: the flush of a copy removed → red on (1); the directory flush between the two
 //! renames removed → red on (2).
 //!
-//! Every red says which it is: `PRODUCT:` quotes what `vox` said or did; `CANNOT MEASURE:` is
+//! Every red says which it is: `PRODUCT:` quotes what `vox` said or did; `PRODUCT (staging):` is a step vox did not take, `APPARATUS:` is
 //! staging or the recorder not seeing what it must (each recorded run must show at least one
 //! `open` by `vox`, so a recorder that recorded nothing never passes for "vox did nothing");
 //! `APPARATUS:` is the proof's own I/O. The two 20 s bounds are read beside `/usr/bin/true`, a
 //! process that is not vox, timed on the same timeline: over the bound with the apparatus over its budget is
-//! `CANNOT MEASURE: apparatus took X`.
+//! `APPARATUS (runner stalled): apparatus took X`.
 
 #![cfg(target_os = "macos")]
 
@@ -173,7 +173,7 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
     );
     assert!(
         recorder_saw_vox(&events),
-        "CANNOT MEASURE: the recorder saw no open by vox ({} calls recorded)",
+        "APPARATUS: the syscall recorder saw no open by vox ({} calls recorded)",
         events.len()
     );
     assert_eq!(
@@ -207,8 +207,8 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
     );
     let (Some(first), Some(second)) = (first_rename, second_rename) else {
         panic!(
-            "CANNOT MEASURE: the recorder did not see both renames ({first_rename:?}, \
-             {second_rename:?}) in {} calls:\n{events:#?}",
+            "PRODUCT (staging): the rollback did not make both renames this proof reads \
+             ({first_rename:?}, {second_rename:?}) in {} calls:\n{events:#?}",
             events.len()
         );
     };
@@ -271,7 +271,7 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
     eprintln!("[proof] {} of 3 claims failed", failures.len());
     assert!(
         unmeasured.is_empty(),
-        "CANNOT MEASURE: {}",
+        "PRODUCT (staging): {}",
         unmeasured.join("\n")
     );
     assert!(
@@ -461,7 +461,10 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("APPARATUS: cannot make the private HOME");
     let mut failures: Vec<String> = Vec::new();
+    // The proof's own machinery (the runner, the staged leftovers) failing.
     let mut unmeasured: Vec<String> = Vec::new();
+    // A vox step this proof reads not happening, with the recorder working.
+    let mut unstaged: Vec<String> = Vec::new();
     // Each staged leftover records the PIDs of the children it starts, so what they leave
     // running is found by PID, never by a name pattern.
     let pids = tmp.path().join("leftover-children");
@@ -593,7 +596,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
                 "(6a) the rollback that finishes an interrupted swap failed: {said}"
             ));
         } else if !recorder_saw_vox(&events) || renamed.is_none() {
-            unmeasured.push(format!(
+            unstaged.push(format!(
                 "(6a) the recorder saw {} calls and no rename of the leftover: {said}",
                 events.len()
             ));
@@ -634,7 +637,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
                 "(6b) the rollback over a leftover copy failed: {said}"
             ));
         } else if !recorder_saw_vox(&events) || refilled.is_none() {
-            unmeasured.push(format!(
+            unstaged.push(format!(
                 "(6b) the recorder saw {} calls and no refill of the leftover's name: {said}",
                 events.len()
             ));
@@ -716,8 +719,13 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
         failures.join("\n")
     );
     assert!(
+        unstaged.is_empty(),
+        "PRODUCT (staging): {}",
+        unstaged.join("\n")
+    );
+    assert!(
         unmeasured.is_empty(),
-        "CANNOT MEASURE: {}",
+        "APPARATUS: {}",
         unmeasured.join("\n")
     );
 }

@@ -12,7 +12,7 @@
 //! a governance body nor a sender-key message. It used to be taken, logged, and refused only then:
 //! the refusal poisoned the room's sync until a reopen, and after a restart the room did not open.
 //! Asserted:
-//! 1. Bob refused it (`refused` in `vox status --json` — else CANNOT MEASURE: it never reached him);
+//! 1. Bob refused it (`refused` in `vox status --json` — else PRODUCT (staging): it never reached him);
 //! 2. Alice's post made after it reaches Bob;
 //! 3. Bob's daemon restarts and still holds the room, with Alice's post in it;
 //! 4. nothing was set aside when it reopened: the entry was refused before it was stored.
@@ -33,7 +33,7 @@
 //! entries too) are stopped and Bob resumed, so Bob's only copy is Mallory's. Asserted:
 //! 1. Bob reads Alice's posts, the first one included (Mallory may serve that one too);
 //! 2. once Alice is back, Bob reads the post he first got from Mallory, and he refused her copy
-//!    (precondition, else CANNOT MEASURE: Bob had a session with Mallory while Alice was stopped);
+//!    (precondition, else PRODUCT (staging): Bob had a session with Mallory while Alice was stopped);
 //! 3. and still does after his daemon restarts.
 //!
 //! ## A message lost before V210-73 is reported ([`a_message_lost_to_the_old_row_ids_is_reported`])
@@ -42,7 +42,7 @@
 //! cannot be undone (its message key was used up when it was read), so it is reported. Bob's store
 //! is damaged the old way: his daemon is the mutant build as `old-row-ids` while he receives
 //! Alice's posts, restarts, and posts. Then the shipped daemon opens it. Asserted: `vox status`
-//! reports exactly one message lost that way, and Bob reads one post fewer (else CANNOT MEASURE:
+//! reports exactly one message lost that way, and Bob reads one post fewer (else APPARATUS (the mutant peer):
 //! nothing was lost).
 //!
 //! ## Mutations
@@ -190,12 +190,12 @@ fn an_unclassifiable_entry_is_refused_and_the_room_syncs_on() {
     let refused = refused_by(&bob, None, since);
     assert!(
         announced(&mallory_d, MODE),
-        "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
+        "APPARATUS (the mutant peer): mallory's daemon never announced {MODE:?}:\n{}",
         mallory_d.transcript()
     );
     assert!(
         refused >= 1,
-        "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
+        "PRODUCT (staging): bob never refused mallory's entry (it never reached him)\nbob's status: {}",
         bob.status()
     );
     let after = "alice, after mallory's entry";
@@ -310,17 +310,17 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     let served = sessions(&mallory).saturating_sub(with_mallory);
     assert!(
         announced(&mallory_d, MODE),
-        "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
+        "APPARATUS (the mutant peer): mallory's daemon never announced {MODE:?}:\n{}",
         mallory_d.transcript()
     );
     assert!(
         served >= 1,
-        "CANNOT MEASURE: bob had no session with mallory while alice was stopped\nbob's status: {}",
+        "PRODUCT (staging): bob had no session with mallory while alice was stopped\nbob's status: {}",
         bob.status()
     );
     assert!(
         refused >= 1,
-        "CANNOT MEASURE: mallory's stripped copy never reached bob: he had {served} session(s) \
+        "PRODUCT (staging): mallory's stripped copy never reached bob: he had {served} session(s) \
          with her while alice was stopped and refused nothing\nbob's status: {}",
         bob.status()
     );
@@ -382,7 +382,7 @@ fn a_message_lost_to_the_old_row_ids_is_reported() {
     bob.post(&room, "bob, after the restart");
     assert!(
         announced(&bob_d, MODE),
-        "CANNOT MEASURE: bob's daemon never announced {MODE:?}:\n{}",
+        "APPARATUS (the mutant peer): bob's daemon never announced {MODE:?}:\n{}",
         bob_d.transcript()
     );
     drop(bob_d);
@@ -412,7 +412,7 @@ fn a_message_lost_to_the_old_row_ids_is_reported() {
     );
     assert!(
         kept < hers.len(),
-        "CANNOT MEASURE: the old row ids lost nothing (bob reads {kept} of 3)"
+        "APPARATUS (the mutant peer): the old row ids lost nothing (bob reads {kept} of 3)"
     );
     assert_eq!(
         lost.len(),
@@ -458,12 +458,12 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
     let refused = refused_by(&bob, None, since);
     assert!(
         announced(&mallory_d, MODE),
-        "CANNOT MEASURE: mallory's daemon never announced {MODE:?}:\n{}",
+        "APPARATUS (the mutant peer): mallory's daemon never announced {MODE:?}:\n{}",
         mallory_d.transcript()
     );
     assert!(
         refused >= 1,
-        "CANNOT MEASURE: bob never refused mallory's entry (it never reached him)\nbob's status: {}",
+        "PRODUCT (staging): bob never refused mallory's entry (it never reached him)\nbob's status: {}",
         bob.status()
     );
     let after = "alice, after mallory's entry";

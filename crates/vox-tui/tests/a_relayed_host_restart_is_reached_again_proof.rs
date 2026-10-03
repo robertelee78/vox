@@ -33,7 +33,7 @@
 //! as a slow product: while it waits, the proof records how far each of its 200 ms sleeps
 //! overshot, and once the echo is back it times `/usr/bin/true`, a process that is not vox (a vox
 //! slow even only to start reads as the product's). A trial over the bound
-//! whose apparatus took more than [`APPARATUS_BUDGET`] says `CANNOT MEASURE: apparatus took X`;
+//! whose apparatus took more than [`APPARATUS_BUDGET`] says `APPARATUS (runner stalled): apparatus took X`;
 //! otherwise an over-bound trial is `PRODUCT: took X (apparatus Y)`.
 //!
 //! `#[ignore]`d: production Argon2id and a real PoW per trial. Run it in release.
@@ -193,7 +193,7 @@ fn a_relayed_host_that_restarts_is_reached_again_through_the_same_forward() {
         .collect();
     assert!(
         stalled.is_empty(),
-        "CANNOT MEASURE: apparatus took over {APPARATUS_BUDGET:?} on {} trial(s) over the bound: {}",
+        "APPARATUS (runner stalled): apparatus took over {APPARATUS_BUDGET:?} on {} trial(s) over the bound: {}",
         stalled.len(),
         said(&stalled)
     );

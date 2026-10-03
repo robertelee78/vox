@@ -102,13 +102,21 @@ fn cbor_bytes(buf: &[u8], at: &mut usize) -> Vec<u8> {
 
 fn parse_vault(buf: &[u8]) -> Vault {
     let mut at = 0;
-    assert_eq!(cbor_head(buf, &mut at, 4), 5, "PRODUCT (staging): the vault `vox id` wrote has the wrong arity");
+    assert_eq!(
+        cbor_head(buf, &mut at, 4),
+        5,
+        "PRODUCT (staging): the vault `vox id` wrote has the wrong arity"
+    );
     let version = cbor_head(buf, &mut at, 0);
     let profile_id = cbor_head(buf, &mut at, 0);
     let salt = cbor_bytes(buf, &mut at);
     let nonce = cbor_bytes(buf, &mut at);
     let ciphertext = cbor_bytes(buf, &mut at);
-    assert_eq!(at, buf.len(), "PRODUCT (staging): the vault `vox id` wrote has trailing bytes");
+    assert_eq!(
+        at,
+        buf.len(),
+        "PRODUCT (staging): the vault `vox id` wrote has trailing bytes"
+    );
     Vault {
         version,
         profile_id,

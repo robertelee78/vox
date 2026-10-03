@@ -116,16 +116,23 @@ fn arm(label: &str, data: &Path, mode: &str, holder_args: &[&str], answer: &[&st
             .find_map(|l| l.strip_prefix(&format!("{label} {p}")))
             .map(str::to_owned)
     };
+    // A TUI that stopped reading what is typed (`HUNG at`) is the product's; the driver's own
+    // failure, or a TUI it could not reap, is the apparatus.
     assert!(
         !out.has_verdict(label),
-        "CANNOT MEASURE: the {label} arm's TUI driver stopped on an apparatus failure, a hang, or a \
-         TUI it could not reap (exit {:?}, stage {:?}): {said}",
+        "{}: the {label} arm's TUI driver stopped on an apparatus failure, a hang, or a TUI it \
+         could not reap (exit {:?}, stage {:?}): {said}",
+        if said.contains(&format!("{label} HUNG at")) {
+            "PRODUCT"
+        } else {
+            "APPARATUS"
+        },
         out.code,
         out.stage
     );
     assert!(
         out.code == Some(0) && line("AFTER:").is_some(),
-        "CANNOT MEASURE: the {label} arm's TUI driver did not run to the end (exit {:?}, stage \
+        "APPARATUS: the {label} arm's TUI driver did not run to the end (exit {:?}, stage \
          {:?}): {said}",
         out.code,
         out.stage
@@ -196,7 +203,7 @@ fn a_tui_waiting_for_the_profile_keeps_its_screen() {
             .expect("APPARATUS: run a process");
         assert!(
             out.status.success(),
-            "CANNOT MEASURE: v0.2.9 `vox {argv:?}` failed: {}",
+            "APPARATUS (precondition not met): v0.2.9 `vox {argv:?}` failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()

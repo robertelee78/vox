@@ -30,7 +30,7 @@
 //! that session's drain to omit that post while showing a message from H′.
 //!
 //! Each red of the live half names its side: the model never running the command is
-//! CANNOT MEASURE (the apparatus); `vox` refusing it is PRODUCT, quoting the refusal; and a
+//! APPARATUS (the model, not vox); `vox` refusing it is PRODUCT, quoting the refusal; and a
 //! post `vox` accepted that never lands is PRODUCT.
 
 #![cfg(unix)]
@@ -168,7 +168,7 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
     let r = room.id.as_str();
     assert!(
         which("opencode").is_some(),
-        "CANNOT MEASURE: the live half needs `opencode` on PATH"
+        "APPARATUS (precondition not met): the live half needs `opencode` on PATH"
     );
     // **The model runs confined** (support/oc_sandbox.rs): a throwaway HOME, a fixed
     // environment, a whitelist of readable paths, a canary in the real HOME it must never see.
@@ -248,7 +248,7 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
     // `$VOX_ROOM`'s value. A shared fixture used to add false ones (two trees overwriting
     // each other's `vox`), which the per-tree fixture removed. Neither says anything about the drain, so
     // neither is reported as a product red — and neither is retried until green. It
-    // fails as CANNOT MEASURE, by name.
+    // fails as APPARATUS (the model, not vox), by name.
     // **Vox refusing the model's post is the product failing** (a plugin that names no
     // session gets "no session: … set VOX_SESSION"), and is a PRODUCT red quoting the refusal,
     // not a wait for a row that can never land.
@@ -298,7 +298,7 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
                 .to_owned()
         };
         panic!(
-            "CANNOT MEASURE (apparatus, not product): model {}: {what}. Its reply:\n{reply}",
+            "APPARATUS (the model, not vox): model {}: {what}. Its reply:\n{reply}",
             model()
         );
     }

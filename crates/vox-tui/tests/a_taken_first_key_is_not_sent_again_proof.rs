@@ -33,7 +33,7 @@
 //!
 //! **Which side a red is on.** A key sent again, or a daemon that would not stop on SIGTERM, is
 //! `PRODUCT:`; a `vox` step of the setup that failed, or a key the node owed that never came, is
-//! `PRODUCT (staging):`; mallory's own connection not made is `CANNOT MEASURE:`; a fault of this proof's own (a runtime,
+//! `PRODUCT (staging):`; mallory's own connection not made is `PRODUCT (staging):`; a fault of this proof's own (a runtime,
 //! a file, a signal it could not send) is `APPARATUS:`. Mallory joins **once**: a join turned away
 //! is the product's red, not something to retry past.
 //!
@@ -377,7 +377,9 @@ fn taken_first_key_after(halt: Halt) {
                         let _ = e;
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
-                    Err(e) => panic!("CANNOT MEASURE: mallory's identity did not connect: {e:?}"),
+                    Err(e) => {
+                        panic!("PRODUCT (staging): mallory's identity did not connect: {e:?}")
+                    }
                 }
             }
         })

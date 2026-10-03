@@ -15,7 +15,7 @@
 //! Alice posts until bob reads her. Bob's daemon stops and his real `vox tui` opens C, consents to
 //! carol in it (`:consent grant`, a per-room consent without trust) and `:close`s it
 //! (`tests/pty/tui_close_room.py`). Bob's daemon starts with C closed (`[closed]`, or
-//! `CANNOT MEASURE`), bob removes alice from his ring, and his daemon restarts with C's
+//! `PRODUCT (staging)`), bob removes alice from his ring, and his daemon restarts with C's
 //! passphrase, which opens C.
 //!
 //! **Asserted:**

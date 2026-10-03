@@ -19,8 +19,8 @@
 //! [`SAYS_WITHIN`], exactly once, and is still running [`STOPPED_FOR`] later (it waits; it does not
 //! fail). After SIGCONT to A, both finish within [`FINISHES_WITHIN`]: at least one exits 0, and
 //! any that does not refuses with a reason that names the other vox (the concurrent creation, or
-//! a vox holding the profile) — never anything else. A run that never saw A take the lock is CANNOT
-//! MEASURE.
+//! a vox holding the profile) — never anything else. A run that never saw A take the lock is
+//! PRODUCT (staging).
 //!
 //! Mutation that must turn it red: the waiting notice removed from the lock helper — B waits in
 //! silence.
@@ -210,7 +210,7 @@ fn a_vox_waiting_for_the_profile_says_so() {
             .expect("APPARATUS: run a process");
         assert!(
             out.status.success(),
-            "CANNOT MEASURE: v0.2.9 `vox {argv:?}` failed: {}",
+            "APPARATUS (precondition not met): v0.2.9 `vox {argv:?}` failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()

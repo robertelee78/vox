@@ -129,18 +129,18 @@ fn forward_once(w: &ForwardedWorld) -> (String, u64) {
 /// from its `vox status --json` (`reach[].circuits`, counted where every circuit is asked for).
 ///
 /// **Never a silent 0.** A status that does not answer, or answers without its `reach` section,
-/// measured nothing: `CANNOT MEASURE`, naming `who`. A `reach` section with no row for `peer` is
+/// measured nothing: `PRODUCT (staging)`, naming `who`. A `reach` section with no row for `peer` is
 /// a measured 0 — a row is there for every peer this node ran a ladder to or asked a circuit for.
 fn circuits_asked(dir: &std::path::Path, peer: &str, who: &str) -> u64 {
     let (ok, out, err) = world::vox_once(dir, &world::args(&["status", "--json"]));
     assert!(
         ok,
-        "CANNOT MEASURE: {who}'s `vox status --json` did not answer, so how many circuits it asked \
+        "PRODUCT (staging): {who}'s `vox status --json` did not answer, so how many circuits it asked \
          for is unknown.\nstdout:\n{out}\nstderr:\n{err}"
     );
     let Some(reach) = out.split("\"reach\":[").nth(1) else {
         panic!(
-            "CANNOT MEASURE: {who}'s `vox status --json` has no `reach` section, so how many \
+            "PRODUCT (staging): {who}'s `vox status --json` has no `reach` section, so how many \
              circuits it asked for is unknown:\n{out}"
         );
     };
@@ -153,7 +153,7 @@ fn circuits_asked(dir: &std::path::Path, peer: &str, who: &str) -> u64 {
         .and_then(|n| n.split(|c: char| !c.is_ascii_digit()).next())
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: {who}'s `reach` row for {peer} has no circuit count: {row}")
+            panic!("PRODUCT (staging): {who}'s `reach` row for {peer} has no circuit count: {row}")
         })
 }
 
@@ -260,7 +260,7 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         };
         assert!(
             first_dgram.is_some(),
-            "CANNOT MEASURE (sample {i}): this `vox up` never sent the forward a datagram, so the \
+            "PRODUCT (staging) (sample {i}): this `vox up` never sent the forward a datagram, so the \
              direct path this proof counts was never tried — the staging is not what it claims.\n\
              up:\n{}",
             up.transcript()
@@ -300,7 +300,7 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
     let direct_max = stats("on the direct path", &direct);
     assert!(
         w.forward.to_host() > 0 && w.forward.to_guest() > 0,
-        "CANNOT MEASURE: the forward carried nothing, so there was no direct path to time"
+        "PRODUCT (staging): the forward carried nothing, so there was no direct path to time"
     );
     // **A side that can reach directly never asks for a circuit** (V210-122, ADR-012). Every reach
     // raced a circuit through the anchor against the direct dial; the circuit lost, was retired,

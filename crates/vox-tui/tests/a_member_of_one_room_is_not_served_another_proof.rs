@@ -69,7 +69,7 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
 }
 
 /// A port that was free a moment ago. Another process can take it before the daemon binds it
-/// (a bind-and-release race), which [`daemon`] reports as CANNOT MEASURE, never as the product.
+/// (a bind-and-release race), which [`daemon`] reports as APPARATUS, never as the product.
 fn free_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
         .and_then(|s| s.local_addr())
@@ -99,10 +99,19 @@ fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) -> V
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    // The port taken by another process after it was found free is the staging's race, and the
+    // daemon says so when it cannot listen; any other silence is the daemon's.
+    let said = p.transcript();
+    let side = if said.contains("Address already in use")
+        || said.contains("something else already holds that UDP port")
+    {
+        "APPARATUS: port 127.0.0.1:{port} was taken after it was found free, so"
+    } else {
+        "PRODUCT (staging):"
+    };
     panic!(
-        "CANNOT MEASURE: {name}'s daemon never answered `vox room list` within {TIMEOUT:?} (its \
-         port 127.0.0.1:{port} may have been taken after it was found free):\n{}",
-        p.transcript()
+        "{} {name}'s daemon never answered `vox room list` within {TIMEOUT:?}:\n{said}",
+        side.replace("{port}", &port.to_string())
     );
 }
 
@@ -246,7 +255,7 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
     )
     .expect("APPARATUS: write the victim's passphrase file");
     // On the same port, so the attacker reaches the restarted victim: a port taken meanwhile
-    // reads as CANNOT MEASURE in `daemon`.
+    // reads as APPARATUS in `daemon`.
     let mut victim = daemon("victim", &victim_dir, victim_port, &spec, &rooms);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -270,7 +279,7 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
                 .await
                 .unwrap_or_else(|e| {
                     panic!(
-                        "CANNOT MEASURE: xavier's identity could not connect to the victim, so \
+                        "PRODUCT (staging): xavier's identity could not connect to the victim, so \
                          nothing below is measured: {e}\nvictim:\n{}",
                         victim.transcript()
                     )
@@ -291,7 +300,7 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
         println!("control: asked for alpha as its member → {control:?}");
         assert!(
             control.hello && control.entries >= POSTS,
-            "CANNOT MEASURE: the CONTROL failed, so a zero below would prove nothing: alpha's \
+            "PRODUCT (staging): the CONTROL failed, so a zero below would prove nothing: alpha's \
              member was not served alpha's posts — {control:?}\nvictim:\n{}",
             victim.transcript()
         );
@@ -329,7 +338,7 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
         .await;
         assert!(
             a_pushed.is_ok(),
-            "CANNOT MEASURE: the push CONTROL failed: the victim never pushed alpha to its member \
+            "PRODUCT (staging): the push CONTROL failed: the victim never pushed alpha to its member \
              on a fresh connection, so a zero for bravo would prove nothing — {:?}\nvictim:\n{}",
             pushed.lock().expect("APPARATUS: a lock the proof holds was poisoned"),
             victim.transcript()
