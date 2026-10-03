@@ -21,14 +21,18 @@
 //! 5. **Withdrawing trust tears a live stream down**, on both ends.
 //! 6. **Stalled app streams cannot starve the room.** 200 app streams held open waiting,
 //!    and a message still crosses in under a second.
+//! 7. **A datagram that cannot be delivered is dropped and counted.** One for a flow that
+//!    does not exist, one with a context this version does not define, and one on a flow
+//!    whose stream has ended each reach no program and each show in the node's
+//!    `vox status --json` — sent by a raw QUIC client holding a trusted member's identity.
 //!
 //! **A red names its side.** A claim's assertion is PRODUCT. A `vox` command that fails while
 //! the scene is set (an identity, a daemon, a room, a join, a trust, a listener, a status
 //! report) is the product failing: PRODUCT (staging). CANNOT MEASURE is kept for what the test
 //! itself could not arrange: the attacker's own profile, endpoint, connection and frames in
-//! case 4. The test's own processes, pipes, locks, runtime and clock are APPARATUS.
+//! cases 4 and 7. The test's own processes, pipes, locks, runtime and clock are APPARATUS.
 //!
-//! **One participant is not the product, deliberately: the attacker in case 4.** mallory
+//! **One participant is not the product, deliberately: the attacker in cases 4 and 7.** mallory
 //! is a real member — her identity is made by `vox id`, and she joins with her own
 //! `vox daemon` and `vox room join` — but what probes alice is a raw QUIC endpoint holding
 //! her identity, which opens a stream of a kind that does not exist. No product
@@ -1155,4 +1159,242 @@ fn stalled_app_streams_do_not_hold_up_a_room_message() {
         None,
         "PRODUCT: every `vox app open` must end within 30 s of the message: {outcomes:?}"
     );
+}
+
+/// alice's datagram counters for her connection to `peer`, from `vox status --json`
+/// (`peers[].datagrams`); `None` while she holds no connection to it.
+fn datagrams_from(alice: &Member, peer: &str) -> Option<Value> {
+    alice.status()["peers"]
+        .as_array()?
+        .iter()
+        .find(|p| p["id"] == peer)
+        .map(|p| p["datagrams"].clone())
+}
+
+fn dn(v: &Value, k: &str) -> u64 {
+    v.get(k)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("PRODUCT: the status report has no datagrams.{k}: {v}"))
+}
+
+/// Wait up to 20 s for alice's counters for `peer` to satisfy `done`; the last report
+/// either way.
+fn datagrams_until(alice: &Member, peer: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let now = datagrams_from(alice, peer).unwrap_or(Value::Null);
+        if done(&now) || Instant::now() >= until {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// **(7) A datagram that names no flow, or a context this version does not define, is
+/// dropped and counted** (ADR-022 2.2, 3.2), and so is one sent on a flow whose stream has
+/// ended (1.1). None of them reaches the program; each shows in the node's own
+/// `vox status --json`.
+///
+/// No product participant ever sends such a datagram, so the sender is the attacker: a raw
+/// QUIC client holding bob's real identity (bob's daemon is stopped first), which alice
+/// trusts. It opens a real app stream with a datagram flow to alice's `vox app listen`,
+/// proves the flow live with one good datagram the listener prints, then sends 20 for a
+/// flow that does not exist, 20 with context 2 on the live flow, ends the stream, and
+/// sends 20 more on the ended flow.
+#[test]
+#[ignore = "real vox daemons and a raw QUIC client; CI runs it in release"]
+fn a_datagram_for_no_flow_or_an_unknown_context_is_dropped_and_counted() {
+    use vox_core::transport::datagram::{frame_packet, put_varint};
+    const N: u64 = 20;
+
+    watchdog::arm();
+    let mut s = scene();
+    mutual(&mut s);
+    let mut listen = s.alice.vox(&["app", "listen", &s.room, LABEL]);
+    listen.listening();
+    let printed = Arc::new(Mutex::new(String::new()));
+    drain_into(listen.child.stdout.take(), &printed);
+    let printed_now = || printed.lock().map(|p| p.clone()).unwrap_or_default();
+
+    let report = s.alice.status();
+    let alice_addr = report["listening"]
+        .as_array()
+        .expect("PRODUCT (staging): alice's report lists where she listens")
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|m| vox_core::nat::multiaddr::Multiaddr::parse(m).ok())
+        .filter_map(|m| m.socket_addr())
+        .find(|a| a.ip().is_loopback())
+        .expect("PRODUCT (staging): alice listens on loopback");
+    let room_id = report["rooms"]
+        .as_array()
+        .and_then(|rs| rs.iter().find(|r| r["name"] == "calls"))
+        .and_then(|r| r["id"].as_str())
+        .map(|id| {
+            vox_core::node::link::b32_decode(id, "room id")
+                .expect("PRODUCT (staging): the room id in alice's report")
+        })
+        .unwrap_or_else(|| panic!("PRODUCT (staging): alice's report lists the room: {report}"));
+    let alice_id = vox_core::node::link::b32_decode(&s.alice.fp, "fingerprint")
+        .expect("PRODUCT (staging): `vox id` prints the whole fingerprint");
+    let bob_fp = s.bob.fp.clone();
+    let bob_data = s.bob.data.clone();
+    stop(s.bob.daemon);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a tokio runtime");
+    let (conn, mut send, _recv) = rt.block_on(async {
+        let paths = vox_core::node::paths::Paths::resolve(
+            "default",
+            Some(&bob_data),
+            Some(&bob_data.join("cfg")),
+        )
+        .expect("CANNOT MEASURE: bob's profile paths");
+        let mut profile = vox_core::node::profile::Profile::open(paths)
+            .expect("CANNOT MEASURE: bob's profile opens once his daemon is gone");
+        profile
+            .unlock(IDENTITY.as_bytes())
+            .expect("CANNOT MEASURE: bob's identity unlocks");
+        let signer = profile.signer_arc().expect("CANNOT MEASURE: bob's signer");
+        let ep = vox_core::transport::quic::VoxEndpoint::bind(
+            &*signer,
+            "127.0.0.1:0".parse().expect("APPARATUS: an address"),
+        )
+        .expect("CANNOT MEASURE: the attacker's endpoint binds");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("APPARATUS: the clock")
+            .as_secs();
+        let conn = ep
+            .connect(alice_addr, alice_id, now)
+            .await
+            .unwrap_or_else(|e| panic!("CANNOT MEASURE: the attacker could not reach alice: {e}"));
+        let (mut send, mut recv) = conn
+            .open_stream()
+            .await
+            .expect("CANNOT MEASURE: the attacker could not open a stream");
+        let mut kind = vox_core::cbor::Encoder::new();
+        kind.array(1)
+            .uint(u64::from(vox_core::transport::streams::StreamKind::App.as_u8()));
+        let open = vox_core::node::app::AppOpen {
+            channel_id: room_id,
+            labels: vec![LABEL.to_owned()],
+            flags: 1,
+        };
+        for frame in [kind.finish(), open.to_bytes()] {
+            vox_core::transport::framing::write_frame(&mut send, &frame)
+                .await
+                .expect("CANNOT MEASURE: the attacker could not write its frames");
+        }
+        let answer = vox_core::transport::framing::read_frame(&mut recv, 4096)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| vox_core::node::app::AppAnswer::from_bytes(&b).ok());
+        assert!(
+            matches!(answer, Some(vox_core::node::app::AppAnswer::Accepted(_))),
+            "PRODUCT (staging): alice's listener must accept bob's app stream: {answer:?}"
+        );
+        (conn, send, recv)
+    });
+    let flow = u64::from(send.id());
+    let paced = |datagrams: Vec<Vec<u8>>| {
+        for d in datagrams {
+            conn.quinn()
+                .send_datagram(d.into())
+                .expect("CANNOT MEASURE: the attacker could not send a datagram");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let unknown_context = |body: &[u8]| {
+        let mut d = Vec::new();
+        put_varint(&mut d, flow);
+        put_varint(&mut d, 2);
+        d.extend_from_slice(body);
+        d
+    };
+
+    // The control: one good datagram reaches the program, so the probe reaches a live flow.
+    let before = datagrams_until(&s.alice, &bob_fp, |v| !v.is_null());
+    assert!(
+        !before.is_null(),
+        "PRODUCT (staging): alice's report must list her connection to bob: {}",
+        s.alice.status()
+    );
+    paced(vec![frame_packet(flow, b"live")]);
+    let until = Instant::now() + Duration::from_secs(20);
+    while !printed_now().contains("live") && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        printed_now().contains("live"),
+        "PRODUCT (staging): a good datagram on the flow must reach the listener: printed {:?}, \
+         listener said {}",
+        printed_now(),
+        listen.said()
+    );
+
+    // 20 for a flow nobody opened, and 20 with a context this version does not define.
+    paced((0..N).map(|i| frame_packet(flow + 4 * (1000 + i), b"nobody")).collect());
+    paced((0..N).map(|_| unknown_context(b"context two")).collect());
+    let mid = datagrams_until(&s.alice, &bob_fp, |v| {
+        !v.is_null()
+            && dn(v, "unknown_flow") >= dn(&before, "unknown_flow") + N
+            && dn(v, "malformed") >= dn(&before, "malformed") + N
+    });
+
+    // End the stream, wait until the program has seen it end, then send on the ended flow.
+    send.reset(0u32.into())
+        .expect("CANNOT MEASURE: the attacker could not reset its stream");
+    let ended = listen.exited_within(TIMEOUT);
+    paced((0..N).map(|_| frame_packet(flow, b"after the end")).collect());
+    let after = datagrams_until(&s.alice, &bob_fp, |v| {
+        !v.is_null() && dn(v, "unknown_flow") >= dn(&mid, "unknown_flow") + N
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let out = printed_now();
+    eprintln!(
+        "alice's datagrams for bob: before {before}\nafter unknown flow and context {mid}\nafter \
+         the end {after}\nthe listener printed {out:?}, exited {ended:?}, said {}",
+        listen.said()
+    );
+    assert!(
+        !mid.is_null() && !after.is_null(),
+        "PRODUCT: alice's report must keep listing the connection: {mid} / {after}"
+    );
+    assert_eq!(
+        dn(&mid, "unknown_flow") - dn(&before, "unknown_flow"),
+        N,
+        "PRODUCT: each datagram for a flow that does not exist must be dropped and counted"
+    );
+    assert_eq!(
+        dn(&mid, "malformed") - dn(&before, "malformed"),
+        N,
+        "PRODUCT: each datagram with an unknown context must be dropped and counted"
+    );
+    assert!(
+        ended.is_some(),
+        "PRODUCT: the listener must see the stream end: {}",
+        listen.said()
+    );
+    assert_eq!(
+        dn(&after, "unknown_flow") - dn(&mid, "unknown_flow"),
+        N,
+        "PRODUCT: each datagram on a flow whose stream ended must be dropped and counted"
+    );
+    assert_eq!(
+        dn(&after, "delivered") - dn(&before, "delivered"),
+        1,
+        "PRODUCT: of all 61 datagrams only the good one may be delivered"
+    );
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["live"],
+        "PRODUCT: the program must see only the good datagram"
+    );
+    drop(conn);
+    drop(rt);
 }
