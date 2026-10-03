@@ -414,8 +414,8 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   the silent one is closed — by a once-a-second task of its own (`tend_liveness`; not the actor's tick,
   which a dead connection can stall for the whole idle timeout) or on the next lookup (`existing`). That second half is what a restart needs: the
   restarted process's connection usually arrives while the old one has been silent only seconds, so it
-  goes to the tie-break and loses it half the time. Liveness is the count of datagrams quinn has routed
-  to the connection, sampled every second. A live connection cannot cross the line: quinn re-arms its
+  goes to the tie-break and loses it half the time. Liveness is the count of frames quinn has received
+  on the connection in packets that authenticated, sampled every second. A live connection cannot cross the line: quinn re-arms its
   keep-alive on every received packet, so each end of an idle live connection hears the other at most
   about 20 s apart, and the 10 s margin covers a round trip, a lost PING and the 1 s sampling. A dead one
   cannot vote, so both ends agree without a protocol: the restarted end holds only the new connection.
@@ -433,9 +433,11 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   actor's tick, which the dead connection stalled — that gate asserts only its 300 s patience, so the
   timing is measured, not gated) and
   `a_live_duplicate_is_decided_alike` (a member whose NAT rebinds dials the anchor twice: 0 of 24
-  trials disagree; with the address rule, 12 of 24). Residual: the datagram count is taken before
-  authentication, so an on-path attacker that knows a connection ID can keep a dead connection looking
-  alive — which returns the node to the 60 s idle timeout, no worse than before.)* *(Amended again for #40,
+  trials disagree; with the address rule, 12 of 24). Only authenticated packets count (V210-140,
+  #359): the count was of datagrams routed to the connection, taken before authentication, so an
+  on-path attacker that knew a connection ID could keep a dead connection looking alive with garbage
+  until the 60 s idle timeout. The same count decides the newcomer probe and the anchor's loss
+  probe.)* *(Amended again for #40,
   the active probe: silence alone left a restarted peer unreachable for up to 30 s, because its new
   connection arrives seconds after the crash and loses the tie-break to the dead one half the time. So
   before a newcomer is filed, **every** connection held for that peer — the primary and any retired one —

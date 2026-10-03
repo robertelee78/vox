@@ -343,11 +343,47 @@ pub const RETIRE_GRACE_SECS: u64 = 60;
 /// ends agree on the new one. Two **live** connections both keep hearing keep-alives, so a
 /// live duplicate still goes to `tie_key`, which both ends compute identically.
 ///
-/// **Residual, stated rather than implied:** the count is of datagrams routed to the
-/// connection, before authentication, so an on-path attacker that knows a connection ID can
-/// keep a dead connection looking alive. That only returns the node to the idle timeout it had
-/// before this rule; it cannot make a live connection look dead.
+/// **Only what authenticates is heard** (V210-140, #359): see [`heard_count`]. The count was of
+/// datagrams routed to the connection, before authentication, so an on-path attacker that knew a
+/// connection ID could keep a dead connection looking alive with garbage, until the idle timeout.
 pub const SILENCE_IS_DEATH: Duration = Duration::from_secs(KEEP_ALIVE.as_secs() * 3 / 2);
+
+/// How much `quic` has received **that authenticated**: the frames of every packet that decrypted
+/// on it and was not a replay (V210-140, #359). Every liveness verdict here reads this, never the
+/// datagram count, which quinn takes before it decrypts anything: a datagram that carries a known
+/// connection ID and garbage counted there, so anyone on the path could keep a dead connection
+/// looking alive. A live peer's every packet carries at least an ACK or a PING.
+fn heard_count(quic: &quinn::Connection) -> u64 {
+    let f = quic.stats().frame_rx;
+    [
+        f.acks,
+        f.ack_frequency,
+        f.crypto,
+        f.connection_close,
+        f.data_blocked,
+        f.datagram,
+        u64::from(f.handshake_done),
+        f.immediate_ack,
+        f.max_data,
+        f.max_stream_data,
+        f.max_streams_bidi,
+        f.max_streams_uni,
+        f.new_connection_id,
+        f.new_token,
+        f.path_challenge,
+        f.path_response,
+        f.ping,
+        f.reset_stream,
+        f.retire_connection_id,
+        f.stream_data_blocked,
+        f.streams_blocked_bidi,
+        f.streams_blocked_uni,
+        f.stop_sending,
+        f.stream,
+    ]
+    .iter()
+    .fold(0u64, |sum, n| sum.wrapping_add(*n))
+}
 
 /// The one byte a liveness probe carries. Too short to be a framed datagram (which starts with an
 /// 8-byte sequence number), so the far end drops it unread; what matters is that the frame is
@@ -373,11 +409,11 @@ fn probe_patience(rtt: Duration) -> Duration {
 ///
 /// `None` is an answer, or a connection that cannot be probed (no datagram support) or that
 /// closed on its own meanwhile — none of which is evidence that a live peer is absent.
-/// `Some(before)` is no answer, with the received-datagram count the probe started from, so the
+/// `Some(before)` is no answer, with the [`heard_count`] the probe started from, so the
 /// verdict can be re-checked at the moment it is acted on (see [`ConnectionManager::file_inner`]).
 async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     let quic = conn.quinn();
-    let before = quic.stats().udp_rx.datagrams;
+    let before = heard_count(quic);
     if quic
         .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
         .is_err()
@@ -386,7 +422,7 @@ async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     }
     let deadline = tokio::time::Instant::now() + probe_patience(quic.rtt());
     loop {
-        if quic.stats().udp_rx.datagrams != before || !is_live(conn) {
+        if heard_count(quic) != before || !is_live(conn) {
             return None;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -396,7 +432,7 @@ async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     }
 }
 
-/// Connections a probe found unanswered, each with the received-datagram count its probe started
+/// Connections a probe found unanswered, each with the [`heard_count`] its probe started
 /// from. Closed only inside [`ConnectionManager::file_inner`], under the connection lock.
 type Unanswered = Vec<(Arc<VoxConnection>, u64)>;
 
@@ -407,7 +443,7 @@ pub struct ConnectionManager {
     /// Connections a better path displaced, with the time each may be closed. They
     /// keep serving what is already on them; nothing new is opened on them.
     retiring: Mutex<Vec<(Arc<VoxConnection>, u64)>>,
-    /// Per connection (by [`VoxConnection::serial`]): how many datagrams it had received when
+    /// Per connection (by [`VoxConnection::serial`]): its [`heard_count`] when
     /// last sampled, and when that count last moved. The evidence [`SILENCE_IS_DEATH`] reads.
     /// Not keyed by quinn's stable id, which a new connection can reuse from a freed one and
     /// so inherit its silence.
@@ -580,10 +616,10 @@ impl ConnectionManager {
         Some(conn)
     }
 
-    /// How long `conn` has received nothing, sampling its datagram count now. A connection
+    /// How long `conn` has received nothing, sampling its [`heard_count`] now. A connection
     /// never sampled before counts as heard this instant: the first sample is the baseline.
     fn silent_for(&self, conn: &VoxConnection) -> Duration {
-        let received = conn.quinn().stats().udp_rx.datagrams;
+        let received = heard_count(conn.quinn());
         let now = Instant::now();
         let mut heard = lock(&self.heard);
         let entry = heard.entry(conn.serial()).or_insert((received, now));
@@ -963,7 +999,7 @@ impl ConnectionManager {
         // connection leaves the newcomer's way exactly as a close did, and what it carries
         // finishes; [`Self::retire_expired`] closes it once nothing does.
         for (dead, before) in unanswered {
-            if is_live(&dead) && dead.quinn().stats().udp_rx.datagrams == before {
+            if is_live(&dead) && heard_count(dead.quinn()) == before {
                 let held = map.get(&peer).is_some_and(|c| Arc::ptr_eq(c, &dead));
                 if held {
                     map.remove(&peer);
