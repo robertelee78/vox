@@ -667,7 +667,7 @@ fn d_a_join_asks_every_board_the_address_names() {
     );
     assert!(
         knocked.is_some(),
-        "PRODUCT (staging):the guest's join never sent the host's (closed) forward a \
+        "PRODUCT (staging): the guest's join never sent the host's (closed) forward a \
          datagram, so its board search never had the host as a route and the fallback was not \
          staged. `vox connect` said:\n{out}\n{err}"
     );
@@ -680,7 +680,7 @@ fn d_a_join_asks_every_board_the_address_names() {
     );
     assert!(
         err.contains("another board"),
-        "PRODUCT (staging):the join got in, but its steps do not say another board \
+        "PRODUCT (staging): the join got in, but its steps do not say another board \
          was asked, so the first board it took held the room and the fallback was never needed \
          (the forward was closed for {FORWARD_OPENS:?} after the guest first knocked). `vox \
          connect` said:\n{err}"
@@ -722,7 +722,7 @@ fn e_an_address_that_would_lead_nowhere_is_withheld_and_why_is_said() {
         let address = after_label(&said, "address");
         assert!(
             !address.contains(&format!("a={host_fp}")),
-            "PRODUCT (staging):the address names the host as a route, so it knew \
+            "PRODUCT (staging): the address names the host as a route, so it knew \
              an address of its own (`VOX_TEST_ADVERTISE` had no effect): {address}"
         );
         panic!(
@@ -873,7 +873,7 @@ fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
     );
     assert!(
         err.contains("the link's address"),
-        "PRODUCT (staging):the join neither polled the board nor dialled the \
+        "PRODUCT (staging): the join neither polled the board nor dialled the \
          link's address, so the board it used still held the host's address (or was the host). \
          `vox connect` said:\n{err}"
     );

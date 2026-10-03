@@ -123,7 +123,7 @@ fn host_says(host: &mut VoxProc, anchor: &mut VoxProc, label: &str) -> String {
     match wait_for(host, SERVE_BOUND, |l| l.starts_with(&format!("{label} "))) {
         Ok(line) => after_label(&line, label),
         Err(missed) => panic!(
-            "PRODUCT (staging):the host's `vox serve` never printed its {label} \
+            "PRODUCT (staging): the host's `vox serve` never printed its {label} \
              ({missed:?} within {SERVE_BOUND:?}).\nthe host said:\n{}\nthe anchor said:\n{}",
             host.transcript(),
             anchor.transcript()
@@ -147,12 +147,12 @@ fn an_anchor_runs_and_serves_on_a_profile_made_by_vox_id() {
     let (ok, fp, err) = vox_once(&anchor_dir, &args(&["id"]));
     assert!(
         ok,
-        "PRODUCT (staging):`vox id` in the anchor's profile failed: {err}"
+        "PRODUCT (staging): `vox id` in the anchor's profile failed: {err}"
     );
     let vault = anchor_dir.join("default").join("vault.cbor");
     assert!(
         vault.is_file(),
-        "PRODUCT (staging):`vox id` printed {fp:?} but left no vault at {}",
+        "PRODUCT (staging): `vox id` printed {fp:?} but left no vault at {}",
         vault.display()
     );
     println!("[proof] vox id made the anchor profile's identity");
@@ -163,7 +163,7 @@ fn an_anchor_runs_and_serves_on_a_profile_made_by_vox_id() {
     // ---- 2. it serves: a guest joins a host's room through it --------------------------------
     for (who, dir) in [("host", &host_dir), ("guest", &guest_dir)] {
         let (ok, _, err) = vox_once(dir, &args(&["id"]));
-        assert!(ok, "PRODUCT (staging):`vox id` ({who}) failed: {err}");
+        assert!(ok, "PRODUCT (staging): `vox id` ({who}) failed: {err}");
     }
     let port = echo_service();
     let mut host = VoxProc::spawn(
