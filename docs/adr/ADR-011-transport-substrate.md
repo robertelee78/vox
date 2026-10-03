@@ -148,14 +148,14 @@ pair streams themselves.
 
 ## Known limits
 
-- **A small receive buffer on macOS.** With the granted receive buffer forced to 256 KiB, macOS
-  black-holed even at 1452 bytes (2 of 3 runs, 2026-09-25). That is below any OS default, and was
-  recorded, not bounded. It has not been re-measured since quinn-proto 0.11.18 (#206), which stopped
-  reading overflow loss as a black hole. Tracked: #381 (V210-158).
 - **The PEN placeholder** (requirement 6) and **the session record's constant group**
   (requirement 12) are open: #382 (V030-33).
 - **The interop matrix** (requirement 14) is an open release gate, awaiting the decider (V030-29
   decider question 32).
+
+Fixed since the old text: macOS black-holing at 1452 bytes with a 256 KiB receive buffer was
+quinn-proto 0.11.14 reading overflow loss as a black hole. quinn-proto 0.11.18 (7c14ec60, #206) fixed
+it; re-measured through `vox forward`, 0 of 10 runs black-holed (#381, V210-158, closed).
 
 ## Consequences
 

@@ -210,8 +210,9 @@ of the above:
   counter is not read.
 - **P5.** No `iperf3` is installed: the blaster and sink are in the test. Loss is asserted (what the
   lossy leg drops stays lost); latency and gaps are recorded, not bounded. Mutation: stream
-  carriage restored, and nothing is lost. The loss is switched on after setup, because a join over
-  a lossy leg hits ADR-018's open defect (a joining node answers nobody for 30 s).
+  carriage restored, and nothing is lost. The loss is switched on after setup, so P5 measures the
+  relay's carriage, not a join over a lossy leg. The actor stall the proof's comment cites
+  (V29-08, #43) is closed; a join over a lossy leg is not measured by P5.
 - **P8.** Proved only to **1.5 s**: a local append is pushed within one 1 s actor tick, so the same
   message takes 30 ms to 1.03 s with no app streams at all, and the gate bounds it at 1.5 s. The
   decided bound is under 1 s; which one holds is the decider's to rule.
