@@ -352,7 +352,9 @@ impl DaemonCore {
             Err(_) => return CommandStatus::Failed(UiError::Storage),
         };
         let pass = Zeroizing::new(passphrase.expose_secret().to_owned());
-        let had = vox_core::node::profile::Profile::exists(&paths);
+        // Whether it had one when this TUI looked (at start, or at `:node`): one there now that was
+        // not then was made by another vox meanwhile (V210-100).
+        let had = self.has_identity;
         let (said_tx, said_rx) = mpsc::channel::<()>();
         let made = {
             let pass = pass.clone();
@@ -394,6 +396,8 @@ impl DaemonCore {
             // **Another vox made it first** (V210-100): this node had no identity when the TUI
             // asked, so one that exists now was made elsewhere.
             Ok(Err(vox_core::error::Error::Profile(_))) if !had => {
+                // It has one now: what is left is to attach it with its passphrase.
+                self.has_identity = true;
                 CommandStatus::Failed(UiError::IdentityMadeElsewhere)
             }
             Ok(Err(vox_core::error::Error::Profile(_))) => {
