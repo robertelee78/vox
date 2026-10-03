@@ -146,7 +146,14 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     let (ok, _, err) = vox(
         &data,
         &cfg,
-        &["room", "create", "--name", "agents"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "agents",
+        ],
         Some("channel passphrase"),
     );
     assert!(ok, "vox room create: {err}");
@@ -303,7 +310,14 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
     let (ok, _, err) = vox(
         &data,
         &cfg,
-        &["room", "create", "--name", "made-in-debug"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "made-in-debug",
+        ],
         Some("channel passphrase"),
     );
     assert!(

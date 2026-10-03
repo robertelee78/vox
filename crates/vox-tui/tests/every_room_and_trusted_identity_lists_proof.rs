@@ -92,7 +92,7 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
                 for name in chunk {
                     let o = alice.vox_in(
                         None,
-                        &["room", "create", "--name", name],
+                        &["room", "create", "--passphrase-file", "-", "--name", name],
                         Some("page room passphrase"),
                     );
                     assert!(o.ok, "room create {name}: {o:?}");

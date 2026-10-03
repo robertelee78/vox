@@ -199,7 +199,7 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
     }
     let (ok, _, err) = vox(
         alice_dir,
-        &["room", "create", "--name", "late"],
+        &["room", "create", "--passphrase-file", "-", "--name", "late"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "room create: {err}");
@@ -214,7 +214,15 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,
-            &["room", "join", link.trim(), "--name", "late"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "late",
+            ],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "CANNOT MEASURE: a join failed: {err}");

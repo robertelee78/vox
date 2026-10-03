@@ -274,7 +274,11 @@ pub fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) 
 
 /// Create room `name` on the daemon at `data`; returns its id and an invite link.
 pub fn create_room(data: &Path, name: &str, pass: &str) -> (Digest32, String) {
-    let (ok, out, err) = vox_in(data, &["room", "create", "--name", name], pass);
+    let (ok, out, err) = vox_in(
+        data,
+        &["room", "create", "--passphrase-file", "-", "--name", name],
+        pass,
+    );
     assert!(ok, "CANNOT MEASURE: vox room create {name}: {out}{err}");
     let (ok, list, err) = vox_once(data, &args(&["room", "list"]));
     assert!(ok, "CANNOT MEASURE: vox room list: {err}");

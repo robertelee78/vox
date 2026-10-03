@@ -772,6 +772,10 @@ pub enum Fault {
     ChannelNotOpen,
     /// An input exceeded its bound (name or text length).
     TooLong,
+    /// A trust add or remove needs the identity passphrase again: it was last entered more than
+    /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) ago (V210-159). Not
+    /// [`Fault::WrongPassphrase`]: none was given, and the client asks for it and tries again.
+    PassphraseNeeded,
     /// The trust keyring already holds its maximum number of identities
     /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too
     /// long, and "longer than this field allows" sent them looking at the petname.
@@ -890,6 +894,8 @@ impl Fault {
     const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
     // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
     const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
+    // `Fault::PassphraseNeeded`'s explanation names the window in words.
+    const _KEYRING_WINDOW_NAMED: () = assert!(crate::node::actor::KEYRING_WINDOW_SECS == 30 * 60);
 
     /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
     /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,
@@ -906,6 +912,9 @@ impl Fault {
                 "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
             }
             Fault::WrongPassphrase => "the passphrase is wrong",
+            Fault::PassphraseNeeded => {
+                "changing who you trust needs your identity passphrase again: it was last entered more than 30 minutes ago\n       give it, and the change is made: `vox trust` asks at a terminal, or takes --identity-passphrase-file or VOX_IDENTITY_PASSPHRASE"
+            }
             Fault::UnknownChannel => {
                 "no such room in this profile\n       `vox room list` shows the rooms it holds"
             }
@@ -1034,6 +1043,7 @@ fault_names!(
     IdentityExists,
     Locked,
     WrongPassphrase,
+    PassphraseNeeded,
     UnknownChannel,
     ChannelNotOpen,
     TooLong,

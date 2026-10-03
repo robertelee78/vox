@@ -424,7 +424,14 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     }
     let (ok, _, err) = vox(
         alice_dir,
-        &["room", "create", "--name", "crossed"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "crossed",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: room create: {err}");
@@ -439,7 +446,15 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,
-            &["room", "join", link.trim(), "--name", "crossed"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "crossed",
+            ],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "CANNOT MEASURE: a join failed: {err}");

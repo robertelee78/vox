@@ -329,7 +329,14 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
     let (ok, _, err) = vox(
         &data,
         &cfg,
-        &["room", "create", "--name", "agents"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "agents",
+        ],
         Some("channel passphrase\n"),
     );
     assert!(ok, "PRODUCT: `vox room create` refused: {err}");

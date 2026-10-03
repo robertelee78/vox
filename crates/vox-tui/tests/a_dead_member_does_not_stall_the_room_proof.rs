@@ -211,7 +211,17 @@ fn a_dead_member_does_not_stall_the_room() {
         .map(|m| m.daemon(&spec, &root.join(format!("{}.err", m.name))))
         .collect();
     let [alice, bob, carol] = &members;
-    let (ok, _, err) = alice.vox(&["room", "create", "--name", "mission"], Some(ROOM_PASS));
+    let (ok, _, err) = alice.vox(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
+        Some(ROOM_PASS),
+    );
     assert!(ok, "create: {err}");
     let room = alice
         .vox(&["room", "list"], None)
@@ -229,7 +239,15 @@ fn a_dead_member_does_not_stall_the_room() {
         let mut joined = false;
         for attempt in 1..=6 {
             if m.vox(
-                &["room", "join", &link, "--name", "mission"],
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    &link,
+                    "--name",
+                    "mission",
+                ],
                 Some(ROOM_PASS),
             )
             .0

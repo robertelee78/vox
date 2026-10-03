@@ -251,7 +251,7 @@ fn race(lose_hellos: bool) {
     }
     let (ok, _, err) = vox(
         alice_dir,
-        &["room", "create", "--name", "race"],
+        &["room", "create", "--passphrase-file", "-", "--name", "race"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "room create: {err}");
@@ -266,7 +266,15 @@ fn race(lose_hellos: bool) {
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,
-            &["room", "join", link.trim(), "--name", "race"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "race",
+            ],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "CANNOT MEASURE: a join failed: {err}");

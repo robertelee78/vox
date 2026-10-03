@@ -222,7 +222,7 @@ fn two_backlogs_that_meet_both_cross() {
 
     let (ok, out, err) = vox_in(
         &alice_dir,
-        &["room", "create", "--name", "big"],
+        &["room", "create", "--passphrase-file", "-", "--name", "big"],
         "room pass",
     );
     assert!(ok, "vox room create: {out}{err}");
@@ -239,7 +239,15 @@ fn two_backlogs_that_meet_both_cross() {
     for (name, d) in [("bob", &bob_dir), ("carol", &carol_dir)] {
         let (ok, out, err) = vox_in(
             d,
-            &["room", "join", link.trim(), "--name", "big"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "big",
+            ],
             "room pass",
         );
         assert!(ok, "{name} joins: {out}{err}");

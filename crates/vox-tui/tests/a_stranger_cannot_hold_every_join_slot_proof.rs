@@ -315,7 +315,15 @@ impl Who {
             None => Stdio::null(),
         };
         let mut child = self
-            .command(&["room", "join", link, "--name", name])
+            .command(&[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link,
+                "--name",
+                name,
+            ])
             .stdin(Stdio::piped())
             .stdout(to())
             .stderr(to())
@@ -537,7 +545,10 @@ fn stage(
     let mut links = Vec::new();
     for r in 0..rooms {
         let name = format!("r{r}");
-        let (ok, out, err) = alice.vox(&["room", "create", "--name", &name], Some(ROOM_PASS));
+        let (ok, out, err) = alice.vox(
+            &["room", "create", "--passphrase-file", "-", "--name", &name],
+            Some(ROOM_PASS),
+        );
         assert!(
             ok,
             "APPARATUS, CANNOT MEASURE: room create failed: {out}{err}"
@@ -793,7 +804,15 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
 
         let t = Instant::now();
         let (ok, out, err) = s.carol.vox(
-            &["room", "join", &s.links[0], "--name", "real"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &s.links[0],
+                "--name",
+                "real",
+            ],
             Some(ROOM_PASS),
         );
         let took = t.elapsed();
@@ -996,7 +1015,15 @@ fn a_join_ended_for_another_is_told_the_member_is_busy() {
     std::thread::sleep(HOLD_SETTLE);
     let t = Instant::now();
     let (ok, out, err) = s.carol.vox(
-        &["room", "join", &s.links[SLOTS], "--name", "real"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &s.links[SLOTS],
+            "--name",
+            "real",
+        ],
         Some(ROOM_PASS),
     );
     let took = t.elapsed();
@@ -1161,7 +1188,15 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
     let admitted = loop {
         let at = first_worked.elapsed();
         let (ok, out, err) = s.carol.vox(
-            &["room", "join", &s.links[SLOTS], "--name", "real"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &s.links[SLOTS],
+                "--name",
+                "real",
+            ],
             Some(ROOM_PASS),
         );
         let said = format!("{out}{err}");

@@ -188,7 +188,7 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
     let _a = daemon(&alice, "alice");
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "kept"],
+        &["room", "create", "--passphrase-file", "-", "--name", "kept"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
@@ -205,7 +205,15 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
     let b = daemon(&bob, "bob-start");
     let (ok, _, err) = vox(
         &bob,
-        &["room", "join", link.trim(), "--name", "kept"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "kept",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join failed: {err}");
