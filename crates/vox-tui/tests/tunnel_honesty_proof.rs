@@ -37,6 +37,18 @@
 //!   reply — a lie a client cannot detect.
 //! - **Removing a service cuts the sessions it is carrying** (R22). Only untrusting a
 //!   member used to; removing the service changed the stored offer and nothing else.
+//! - **A refusal is immediate** (R23): once the path to the host is up, a refused connection
+//!   fails for the application within [`IMMEDIATE`], through `vox forward` and through `vox up`.
+//!   Each is read for at most a few times that, so a refusal that is slow or never comes is
+//!   red on the proof's own line, not on the watchdog's.
+//! - **A refusal tells the refused side nothing new** (R23, ADR-013 dark services): to a
+//!   stranger, a port the host offers and one it does not are refused the same way — the same
+//!   ending, no bytes, the same SOCKS reply and the same words on its own terminal.
+//! - **A refusal this node makes itself sends the host nothing** (R23, "the remote side learns
+//!   nothing new", read the other way): a CONNECT that `vox up` refuses on its own — a name that
+//!   is not `.vox`, a room this machine does not have, a node it has not trusted — is refused
+//!   with the reason on this node's terminal, and the host logs no attempt. The host is first
+//!   shown to log a refusal it made, so its silence afterwards is a measurement.
 //! - **A tunnel can be closed by itself, from either end, and nothing else changes** (V030-11).
 //!   On the host, `vox tunnel close <member> <service>` closes that member's session to the
 //!   service; on the guest, `vox tunnel close --id N` closes one session its `vox forward`
@@ -134,8 +146,19 @@ use std::time::{Duration, Instant};
 
 use world::{
     args, counting_echo_service, echo_service, read_to_end_within, resetting_service, round_trip,
-    socks5_connect, vox_once, Ending, VoxProc, World, PARTIAL,
+    socks5_connect, socks5_connect_within, vox_once, Ending, VoxProc, World, PARTIAL,
 };
+
+/// How soon a refused connection must fail for its application once the path to the host is
+/// up (PRD-001 R23, "immediately"): one round trip to the host and its answer. ADR-013 measured
+/// 1.6–18 ms on loopback; this is a bound under ordinary load, not a measurement.
+const IMMEDIATE: Duration = Duration::from_secs(2);
+
+/// How long the first connection may wait for the forward or proxy to reach its host at all,
+/// before the refusal can be timed.
+fn first_reach() -> Duration {
+    vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30)
+}
 
 /// How long the idle session says nothing: past quinn's 30 s default idle timeout and past
 /// Vox's own 60 s one, so the session survives only if something keeps its connection alive.
@@ -615,10 +638,7 @@ fn a_refused_forward_resets_the_application_and_says_why() {
     // look like a reset and this proof pass against the defect — its first mutation check
     // stayed green for exactly that reason. A server-speaks-first client (`ssh`) is the case
     // that matters anyway: it reads before it writes.
-    let (got, ending) = read_to_end_within(
-        &mut s,
-        vox_core::node::up::HOST_PATIENCE + Duration::from_secs(30),
-    );
+    let (got, ending) = read_to_end_within(&mut s, first_reach());
     let waited = t0.elapsed();
     eprintln!(
         "[test] the untrusted forward's application saw {ending:?} after {waited:?}, {} bytes",
@@ -639,10 +659,19 @@ fn a_refused_forward_resets_the_application_and_says_why() {
         fwd.transcript()
     );
     // And this node, which is the operator's own, says why.
-    let why = fwd.expect_within(Duration::from_secs(10), "the reason, on stderr", |l| {
-        l.starts_with("! ") && l.contains("the host refused")
-    });
+    let why = refusal_line(&mut fwd, "the forward");
     eprintln!("[test] the forward said: {why}");
+
+    // **Immediately** (R23): the path to the host is up now, so the next refusal is one round
+    // trip, not a wait.
+    let (ending, took) = refused_within(at);
+    eprintln!("[test] a second connection was refused ({ending:?}) after {took:?}");
+    assert!(
+        ending == Ending::Reset && took <= IMMEDIATE,
+        "PRODUCT: a refused connection must fail for the application immediately (PRD-001 R23): \
+         the second one, with the path to the host already up, ended {ending:?} after {took:?} \
+         (at most {IMMEDIATE:?})"
+    );
     drop(fwd);
     drop(w);
 }
@@ -678,10 +707,216 @@ fn a_refused_socks_connect_is_refused_in_the_reply_and_says_why() {
     );
     eprintln!("[test] and the socket then ended {ending:?}");
     // And this node, the operator's own, says why.
-    let why = up.expect_within(Duration::from_secs(10), "the reason, on stderr", |l| {
-        l.starts_with("! ") && l.contains("the host refused")
-    });
+    let why = refusal_line(&mut up, "vox up");
     eprintln!("[test] vox up said: {why}");
+
+    // **Immediately** (R23): with the path to the host up, the next CONNECT's refusal is one
+    // round trip. Its reply is read for at most a few times the bound, so a proxy that does not
+    // answer is red here, on this claim, not at the watchdog.
+    let t1 = Instant::now();
+    let (code, _s) = socks5_connect_within(
+        at,
+        &hostname,
+        w.service_port,
+        IMMEDIATE * 5,
+        Some(
+            "PRODUCT: a refused CONNECT must be answered immediately (PRD-001 R23): the second \
+             one, with the path to the host already up, got",
+        ),
+    );
+    let took = t1.elapsed();
+    eprintln!("[test] a second CONNECT got SOCKS reply code {code} after {took:?}");
+    assert!(
+        code == 0x02 && took <= IMMEDIATE,
+        "PRODUCT: a refused CONNECT must be answered immediately (PRD-001 R23): the second one, \
+         with the path to the host already up, got reply {code} after {took:?} (code 2 within \
+         {IMMEDIATE:?}). `vox up` said:\n{}",
+        up.transcript()
+    );
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
+fn a_refusal_tells_the_refused_side_nothing_new() {
+    watchdog::arm();
+    // A stranger: joined with the address and the passphrase, never trusted. It asks for the
+    // port the host offers and for one it does not. If the answers differ, the refusal has told
+    // it which ports the host serves (ADR-013 dark services; PRD-001 R23, "the remote side
+    // learns nothing new").
+    let w = World::new(echo_service(), false);
+    let guest_dir = w.guest_dir.clone();
+    let unoffered = unoffered_port(w.service_port);
+    let mut seen = Vec::new();
+    for (label, port) in [("offered", w.service_port), ("unoffered", unoffered)] {
+        let (mut fwd, at) = w.forward_port(&format!("{label}-forward"), &guest_dir, port);
+        let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
+            panic!("PRODUCT (staging): the forward at {at} refused a connection: {e}")
+        });
+        let (got, ending) = read_to_end_within(&mut s, first_reach());
+        // Whatever it says on its terminal about this connection, compared below; not only the
+        // words this build says, or a different answer would stop the run before the comparison
+        // could name it.
+        let said = fwd
+            .line_within(Duration::from_secs(10), |l| {
+                l.starts_with("! ") && l.contains("tunnel refused or cut")
+            })
+            .unwrap_or_else(|| "(nothing within 10 s)".to_owned())
+            .replace(&port.to_string(), "<port>");
+        eprintln!(
+            "[test] {label} port {port}: the application saw {ending:?}, {} bytes; the forward \
+             said: {said}",
+            got.len()
+        );
+        seen.push((label, got.len(), ending, said));
+    }
+    let mut codes = Vec::new();
+    let (_up, proxy) = w.up("stranger-up", &guest_dir);
+    let hostname = format!("{}.vox", w.room);
+    for (label, port) in [("offered", w.service_port), ("unoffered", unoffered)] {
+        let (code, _s) = socks5_connect(proxy, &hostname, port);
+        eprintln!("[test] {label} port {port}: SOCKS reply code {code}");
+        codes.push((label, code));
+    }
+    let (a, b) = (&seen[0], &seen[1]);
+    assert!(
+        a.1 == 0 && b.1 == 0,
+        "PRODUCT: a refused stranger was carried bytes: {} from the offered port, {} from the \
+         unoffered",
+        a.1,
+        b.1
+    );
+    assert_eq!(
+        (a.2, &a.3),
+        (b.2, &b.3),
+        "PRODUCT: the refusal told a stranger which port the host offers: the offered port \
+         ended {:?} and said {:?}; the unoffered ended {:?} and said {:?}",
+        a.2,
+        a.3,
+        b.2,
+        b.3
+    );
+    assert_eq!(
+        codes[0].1, codes[1].1,
+        "PRODUCT: the SOCKS reply told a stranger which port the host offers: {codes:?}"
+    );
+}
+
+#[test]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
+fn a_local_refusal_sends_the_host_nothing() {
+    watchdog::arm();
+    // A stranger, so that anything that does reach the host is refused there and logged.
+    let mut w = World::new(echo_service(), false);
+    let guest_dir = w.guest_dir.clone();
+    let (mut up, proxy) = w.up("stranger-up", &guest_dir);
+    let room = w.room.clone();
+    let host_heard = |w: &World, since: Instant| -> Vec<String> {
+        let host = w.host.as_ref().expect("APPARATUS: the world has no host");
+        host.timed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(at, l)| *at >= since && l.contains("a tunnel"))
+            .map(|(_, l)| l.clone())
+            .collect()
+    };
+
+    // The control: a CONNECT the host refuses is one the host logs. Without it, the host's
+    // silence below would prove nothing.
+    let t0 = Instant::now();
+    let (code, _s) = socks5_connect(proxy, &format!("{room}.vox"), w.service_port);
+    let mut logged = Vec::new();
+    while logged.is_empty() && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+        logged = host_heard(&w, t0);
+    }
+    eprintln!("[test] control: SOCKS reply {code}; the host logged {logged:?}");
+    assert!(
+        code == 0x02 && !logged.is_empty(),
+        "CANNOT MEASURE: the host did not log the refusal it made itself (reply {code}, logged \
+         {logged:?}), so its silence for a local refusal would prove nothing"
+    );
+    let host_line = refusal_line(&mut up, "vox up");
+    eprintln!("[test] control: vox up said: {host_line}");
+
+    // Each refusal this node makes on its own: the name, what it is, and the reason it says.
+    let stranger = format!("stranger.{room}.vox");
+    let cases = [
+        (
+            "printer.example.com",
+            "not a .vox name",
+            "is not a .vox name",
+        ),
+        (
+            "nosuchroom.vox",
+            "a room this machine does not have",
+            "neither a room id nor a node",
+        ),
+        (
+            "nas.nosuchroom.vox",
+            "a room name this machine does not have",
+            "no room on this machine is called",
+        ),
+        (
+            stranger.as_str(),
+            "a node this machine has not trusted",
+            "no node you trust is called",
+        ),
+    ];
+    for (name, what, reason) in cases {
+        let t = Instant::now();
+        let (code, _s) = socks5_connect(proxy, name, w.service_port);
+        let said = up.expect_within(
+            Duration::from_secs(10),
+            &format!("vox up to say why it refused {what}"),
+            |l| l.starts_with("! ") && l.contains(reason),
+        );
+        // Long enough for anything sent to reach the host and be logged: the control was
+        // logged within its first round trip.
+        std::thread::sleep(Duration::from_secs(3));
+        let heard = host_heard(&w, t);
+        eprintln!(
+            "[test] {what} ({name}): SOCKS reply {code}; vox up said: {said}; the host logged \
+             {heard:?}"
+        );
+        assert_ne!(
+            code, 0x00,
+            "PRODUCT: vox up told the application that a CONNECT to {what} ({name}) succeeded"
+        );
+        assert!(
+            heard.is_empty(),
+            "PRODUCT: vox up refused {what} ({name}) on its own, and the host still heard of it: \
+             {heard:?}"
+        );
+    }
+    drop(up);
+    drop(w.host.take());
+}
+
+/// A port the host does not offer: `offered`'s neighbour.
+fn unoffered_port(offered: u16) -> u16 {
+    offered.checked_add(1).unwrap_or(offered - 1)
+}
+
+/// The refusal `p` said for this node's operator: a `! … the host refused …` line.
+fn refusal_line(p: &mut VoxProc, who: &str) -> String {
+    p.expect_within(
+        Duration::from_secs(10),
+        &format!("{who} to say, on its own terminal, that the host refused"),
+        |l| l.starts_with("! ") && l.contains("the host refused"),
+    )
+}
+
+/// Connect to the forward at `at`, write nothing, and see how and how soon the connection ends:
+/// read for at most a few times [`IMMEDIATE`], so a refusal that never comes is red on the
+/// caller's own line.
+fn refused_within(at: std::net::SocketAddr) -> (Ending, Duration) {
+    let t = Instant::now();
+    let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): the forward at {at} refused a connection: {e}")
+    });
+    let (_, ending) = read_to_end_within(&mut s, IMMEDIATE * 5);
+    (ending, t.elapsed())
 }
 
 /// What `vox status --json` on the node holding `dir`'s profile says, parsed.
