@@ -133,54 +133,47 @@ fn a_leave_and_an_end_take_their_records_off_the_anchor() {
             );
         }
     }
-    // Carol, an admin no longer, runs the faulty build: it takes the room off boards anyway.
-    // The anchor prints `holding <addr> for <member>` each time a member's node puts its record;
-    // the faulty build's withdraw goes to the anchors it is connected to, so it waits for one.
-    let carol_on_anchor = {
-        let tag = format!(" for {}", &room.workers[2].b32()[..26]);
-        move |text: &str| {
-            text.lines()
-                .filter(|l| l.contains(" holding ") && l.contains(&tag))
-                .count()
-        }
-    };
-    let before = carol_on_anchor(&anchor());
+    // Carol, an admin no longer, runs the faulty build: it takes the room off boards anyway. Its
+    // withdraw goes to the anchors it is connected to when it ends the room, so the end is asked
+    // again until the faulty node says it put the withdraw to one. Not waited for on the anchor's
+    // `holding` line: a node restarted on the port it kept (V210-167) puts the same address, and
+    // the board prints nothing new.
     let carol_err = tmp.path().join("carol.mutant.err");
     room.workers[2].restart_daemon_as(
         &mutant,
         &[("VOX_MUTANT_SENDER_MODE", "withdraw-unentitled")],
         &carol_err,
     );
-    let deadline = Instant::now() + WITHIN;
-    while carol_on_anchor(&anchor()) <= before && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    assert!(
-        carol_on_anchor(&anchor()) > before,
-        "APPARATUS: carol's faulty node did not reach the anchor within {WITHIN:?} of its \
-         restart, so its withdraw would not be put there.\nanchor:\n{}",
-        anchor()
-    );
     let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
-    let o = carol.vox(None, &["room", "end", id]);
-    assert!(
-        !o.ok,
-        "PRODUCT: carol, whose admin was taken back, was not refused `vox room end`: {o:?}"
-    );
-    let said = std::fs::read_to_string(&carol_err).unwrap_or_default();
-    let put_to = said
-        .lines()
-        .find_map(|l| {
-            l.split_once("put a room withdraw for ")?
-                .1
-                .split(" to ")
-                .nth(1)
-        })
-        .and_then(|rest| rest.split(' ').next()?.parse::<usize>().ok());
+    let deadline = Instant::now() + WITHIN;
+    let put_to = loop {
+        let o = carol.vox(None, &["room", "end", id]);
+        assert!(
+            !o.ok,
+            "PRODUCT: carol, whose admin was taken back, was not refused `vox room end`: {o:?}"
+        );
+        let said = std::fs::read_to_string(&carol_err).unwrap_or_default();
+        let put_to = said
+            .lines()
+            .filter_map(|l| {
+                l.split_once("put a room withdraw for ")?
+                    .1
+                    .split(" to ")
+                    .nth(1)
+            })
+            .filter_map(|rest| rest.split(' ').next()?.parse::<usize>().ok())
+            .max();
+        if put_to.is_some_and(|n| n > 0) || Instant::now() >= deadline {
+            break put_to;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
     assert!(
         put_to.is_some_and(|n| n > 0),
-        "APPARATUS: carol's faulty node did not put its room withdraw to an anchor (anchors: \
-         {put_to:?}), so a board's refusal of it was not staged. It said:\n{said}"
+        "APPARATUS: carol's faulty node did not put its room withdraw to an anchor within \
+         {WITHIN:?} (anchors: {put_to:?}), so a board's refusal of it was not staged. It \
+         said:\n{}",
+        std::fs::read_to_string(&carol_err).unwrap_or_default()
     );
     // The faulty node says what the board answered its put: an answer is what makes the board's
     // count below a verdict on the board rather than on a put that never arrived.
