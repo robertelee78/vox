@@ -98,11 +98,20 @@ pub enum StructTag {
     /// `0x001B` — admin roster (V030-14): a room's current admins as its creator signed them, so
     /// a board can tell a current admin's room withdraw from a removed admin's.
     AdminRoster = 0x001B,
+    /// `0x001C` — identity exchange flight 1, `ASK` (ADR-011 requirement 28): the dialler names
+    /// the node it wants, `[0x001C, 2, target_fp]`. Never signed.
+    IdentityAsk = 0x001C,
+    /// `0x001D` — identity exchange flight 2, `PROVE` (ADR-011 requirement 28): the named node's
+    /// composite key, its per-attach instance and its signature under `vox-id/v2/resp`.
+    IdentityProve = 0x001D,
+    /// `0x001E` — identity exchange flight 3, `CLAIM` (ADR-011 requirement 28): the dialler's
+    /// composite key, its per-attach instance and its signature under `vox-id/v2/init`.
+    IdentityClaim = 0x001E,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 24] = [
+    pub const ALL: [StructTag; 27] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -127,6 +136,9 @@ impl StructTag {
         StructTag::RoomLifecycle,
         StructTag::BoardWithdraw,
         StructTag::AdminRoster,
+        StructTag::IdentityAsk,
+        StructTag::IdentityProve,
+        StructTag::IdentityClaim,
     ];
 
     /// The 2-byte tag value.
@@ -137,7 +149,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 24-element table: trivial and avoids an
+        // Linear scan over a 27-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -175,6 +187,12 @@ impl StructTag {
             StructTag::RoomLifecycle => "vox/room-lifecycle/v1",
             StructTag::BoardWithdraw => "vox/board-withdraw/v1",
             StructTag::AdminRoster => "vox/admin-roster/v1",
+            // The identity flights are version 2 and carry their own direction labels (ADR-011
+            // requirement 31): `transport::identity` signs under exactly these strings. `ASK` is
+            // never signed; its label exists so no other struct can take it.
+            StructTag::IdentityAsk => "vox-id/v2/ask",
+            StructTag::IdentityProve => "vox-id/v2/resp",
+            StructTag::IdentityClaim => "vox-id/v2/init",
         }
     }
 }
@@ -361,6 +379,13 @@ pub enum WireError {
     /// closes carried `0x05` too.
     #[error("a duplicate connection was retired")]
     Superseded = 0x0E,
+    /// `0x0F` — **not available**: the one refusal of the identity exchange (ADR-011 requirement
+    /// 32). A listener closes a connection with it, with no reason text and no flight, whether the
+    /// node asked for is unknown or detached, the flight was malformed or oversize, the source was
+    /// over its rate limit, or the exporter could not be read — so a dialler learns only that the
+    /// node it named does not answer here.
+    #[error("not available")]
+    NotAvailable = 0x0F,
 }
 
 impl WireError {
@@ -386,6 +411,7 @@ impl WireError {
             0x0C => Some(WireError::NotYetMember),
             0x0D => Some(WireError::ShuttingDown),
             0x0E => Some(WireError::Superseded),
+            0x0F => Some(WireError::NotAvailable),
             _ => None,
         }
     }

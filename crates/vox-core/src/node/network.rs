@@ -826,6 +826,14 @@ impl NodeNet {
             StreamKind::Pairwise => Ok(Inbound::Pairwise { peer, send, recv }),
             StreamKind::Sync => Ok(Inbound::Sync { peer, send, recv }),
             StreamKind::Agree => Ok(Inbound::Agree { peer, send, recv }),
+            // The exchange is over by the time a stream is dispatched: one more identity stream is
+            // a second exchange on one connection, which closes it (ADR-011 requirement 33).
+            StreamKind::Identity => {
+                conn.close(crate::wire::WireError::NotAvailable);
+                Err(Error::MalformedBundle(
+                    "an identity stream after the identity exchange",
+                ))
+            }
             StreamKind::Coord => {
                 // The answer to `WHOAMI` is this connection's source address as *this*
                 // node sees it — the peer's reflexive address (ADR-012 rung 3).
