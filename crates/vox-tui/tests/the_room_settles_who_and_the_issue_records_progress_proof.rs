@@ -210,3 +210,38 @@ fn the_skill_and_the_drain_say_the_room_settles_who_and_the_issue_records_progre
     );
     eprintln!("[proof] the drain carries the split:\n{told}");
 }
+
+/// R17 (#19), as the decider restated it: there is no hard lock, and a takeover is a written rule
+/// an agent reads in the skill, not code. `vox agent skill` must say that another agent may take
+/// over a claimed item only after **three** unanswered status asks to the holder, the **last
+/// urgent**, spread over **at least 30 minutes**, and that a holder who answers keeps it.
+#[test]
+#[ignore = "on demand: drives the shipped binary"]
+fn the_skill_says_when_a_silent_holder_may_be_taken_over() {
+    watchdog::arm();
+    let (ok, text, said) = skill(None);
+    assert!(ok, "PRODUCT: `vox agent skill` failed: {said}");
+    let missing = missing_split(
+        &text,
+        &[
+            ("no lock", "Nobody locks an item"),
+            (
+                "a holder who answers keeps it",
+                "nobody may take one from\na holder who answers",
+            ),
+            ("three asks", "three times"),
+            ("none answered", "of the three was answered"),
+            ("the last urgent", "the **last** of the three was urgent"),
+            ("at least 30 minutes", "at least 30 minutes"),
+            (
+                "the holder answering ends it",
+                "If the holder answers at any point",
+            ),
+        ],
+    );
+    assert!(
+        missing.is_empty(),
+        "PRODUCT: the skill's takeover rule (R17) leaves out: {missing:?}\n{text}"
+    );
+    eprintln!("[proof] R17: the skill states the takeover rule: three unanswered asks, the last urgent, over 30 minutes");
+}
