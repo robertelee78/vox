@@ -39,10 +39,10 @@ which lacks per-stream backpressure — but QUIC is primary.)
   Ed25519+ML-DSA key, ADR-002) — a proof-of-possession that binds the ephemeral TLS certificate key
   to the long-term Vox identity. The PoP string `"vox-tls-handshake:" ‖ cert_public_key` is a
   **TLS-layer signed string, deliberately outside** the ADR-008 CBOR struct-domain regime (it is not a
-  log struct). **Extension layout (concrete):** OID **`1.3.6.1.4.1.<VOX-PEN>.1.1`** where `<VOX-PEN>` is
-  a **Vox-owned IANA Private Enterprise Number** (registration pending; until assigned, builds use the
-  documented provisional arc and the interop matrix pins the exact OID — Vox does **not** squat on
-  libp2p's PEN 53594), `critical = false`, value = canonical-CBOR (ADR-008, tag `0x0009`)
+  log struct). **Extension layout (concrete):** OID **`2.25.<UUID>.1.1`**, under the UUID arc (X.667) of
+  `14b7e534-e0b1-494d-8cb6-b81f37787c27`, which Vox generated once and owns without registration
+  (V030-33) — Vox does **not** use libp2p's PEN 53594 or any other organisation's arc,
+  `critical = false`, value = canonical-CBOR (ADR-008, tag `0x0009`)
   `{ composite_pubkey, pop_sig }` (ADR-003 `0x03/0x04` composite encodings). The verifier derives the Vox
   identity from the extension and **MUST require it to match the expected peer, aborting on mismatch**
   (ADR-008 error `0x05`). This authenticates Vox identities without a CA and without RFC-7250's
@@ -147,13 +147,14 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   is public so any flow can reset its stream with the ADR-008 code. M5 sync opens a **typed** `sync`
   stream via `node::syncstream::open_sync` (M14.6); `QuicStreamTransport::open/accept` remain for
   callers that pair streams themselves.
-- **Known gaps (recorded 2026-09-19).** `confirm_hybrid_group` checks only ALPN `vox/1`, and
-  `SessionEstablishment::new` **hardcodes** the group code point `0x11EC`, so the "downgrade
-  auditability" record documents a constant rather than an observation — the real guarantee is
-  `assert_pq_only` on both providers plus TLS transcript binding, which is sound but should be what
-  the record reports. All connect/accept failures collapse to `SignatureInvalid` (unreachable vs
-  handshake vs identity are indistinguishable to callers). The identity-extension OID uses the
-  placeholder PEN `1234567`. `VoxEndpoint::accept*` returns `Err` on a single failed handshake, so a
+- **Group and OID (V030-33, 2026-10-03).** `confirm_handshake` checks ALPN `vox/1` and reads the
+  key-exchange group rustls negotiated (quinn-proto's `__rustls-post-quantum-test` feature exposes
+  it); `SessionEstablishment::observed` records it and MUST refuse any group but X25519MLKEM768.
+  `vox status --json` names each peer's group (`tls_group`). The identity-extension OID is
+  `2.25.27539399102012846121714982791979498535.1.1`, under UUID
+  `14b7e534-e0b1-494d-8cb6-b81f37787c27` (X.667), generated once; it MUST NOT be regenerated.
+- **Known gaps (recorded 2026-09-19).** All connect/accept failures collapse to `SignatureInvalid` (unreachable vs
+  handshake vs identity are indistinguishable to callers). `VoxEndpoint::accept*` returns `Err` on a single failed handshake, so a
   server loop must catch-and-continue. Gate obligation: the cross-version interop matrix
   (handshake + identity-PoP) does not exist — no second implementation, no version-pinned matrix, no
   CI job; the PoP is over the raw subject-public-key bits (not SPKI DER), which such a matrix must pin.
