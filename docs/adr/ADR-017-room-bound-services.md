@@ -870,36 +870,46 @@ most dangerous omission in the first draft, and it is. The rule:
 
 M17.13 covers this, and it is the one item that must ship in the same release as M17.7 rather than after it.
 
-### 12. Names are this machine's own words (fourth revision, 2026-09-24)
+### 12. A shared service is reached as `<service>.<node>.<room>.vox`, and only that way (fifth revision, 2026-10-02)
 
-`ssh nas.family.vox` reaches **the node this machine calls `nas`**, through **the room this machine calls
-`family`**:
+There are rooms and nodes. A node is a person or an agent, never a computing device. A node **shares a
+service with a room**. Every node, room and service has a fingerprint.
 
-- **`nas`** is the petname this node gave that identity in its trust keyring when it trusted it
-  (`vox trust add <fp> --name nas`, changed with `vox trust rename`). Only trusted identities have names,
-  so a node that is not trusted cannot be named at all — and untrusting a node takes its name away.
-- **`family`** is this machine's local name for the room, the one given when it was created or joined.
-  A room's id works in its place (`nas.<room-id>.vox`).
-- Both are lowercased and anything a DNS label cannot hold becomes `-`, so `My NAS` is `my-nas`.
+- A service **MUST** be reached as `<service>.<node>.<room>.vox`, and by no other `.vox` name.
+  - `<service>` is the name the sharing node gave the service, or the service's fingerprint:
+    `SHA-256("vox/service-fingerprint/v1" ‖ room id ‖ sharer fingerprint ‖ name)`.
+  - `<node>` is the **resolving** node's alias for the sharer (the name it gave the sharer in its trust
+    keyring), or the sharer's fingerprint.
+  - `<room>` is the **resolving** node's alias for the room (its local name), or the room id.
+  - Aliases are local pointers to a fingerprint, like a CNAME. They are lowercased, and anything a DNS
+    label cannot hold becomes `-`.
+- `<room>.vox`, `<node>.<room>.vox` and `<room-id>.vox` **MUST** resolve to nothing: no connection, no
+  refusal text naming a service, no listing. A room or a node is never a destination.
+- A three-part name whose words match nothing on this node, or more than one thing, **MUST** be refused
+  with a sentence saying which, to this node's operator only. Only the SOCKS reply code reaches the tool.
+- The SOCKS request's port **MUST NOT** select the service; the name does.
+- Resolving grants nothing. Whether the service is offered, and to whom, is the sharing node's decision
+  (decision 3).
+- Every share **MUST** be named. `vox serve <name>=<port>[/tcp|/udp]` names it; `vox serve` with a bare
+  port **MUST** be refused, saying how to name the share. A name is one DNS label, at most 63 characters.
+- A node **MUST NOT** share two services under one name in one room, over either transport. A second
+  share under a taken name **MUST** be refused, naming it. A service moves by being removed and shared
+  again.
+- A share **MUST** be stated on the room's log: a `0x0018` service-share statement
+  (`vox/service-share/v1`), signed by its sharer, naming the service, its transport, and whether it is
+  shared or withdrawn. The last statement a sharer made about a name wins; a member that has left the room
+  shares nothing. A transient offer (a file being handed over) is not a share and **MUST NOT** be stated.
+- A member **MUST** be able to list the services shared in its rooms (`vox service list <room>`), each with
+  its address rendered in that member's own aliases (fingerprints where it has none) and who shared it.
+- `vox serve` **MUST** print each share's address with the service's name and the fingerprints in the node
+  and room places, so any member can use it as printed or with its own aliases.
 
-The name resolves to **that member**, and the tunnel goes to that member's services in that room. So any
-member's services are reachable, not only the room creator's, and the same node reached through two rooms
-has two names. Nothing is published, registered or global: two machines may call the same node different
-things, or different nodes the same thing, and neither is wrong.
+**Surfaces.** `vox up` resolves names against every room the node holds, as they are when each connection
+asks. `vox forward <service>.<node>.<room>.vox [<local>]` resolves the same way.
 
-**Refusals say why**, because the words are this machine's own and saying which one failed discloses
-nothing: no room called that (listing this machine's rooms), no trusted node called that, a trusted node
-that is not a member of that room, or a name that matches more than one room or node. Only the SOCKS reply
-code reaches the tool; the sentence goes to the operator.
-
-**Surfaces.** `vox up` with no room runs the proxy inside the node already holding the profile (`vox
-daemon`) and resolves names against every room it holds, as they are when each connection asks — so a room
-joined or a node renamed a moment ago resolves. `vox forward <node>.<room>.vox <service> [<local>]` resolves
-the same way. The control socket gains two additive requests (resolve, and up).
-
-**Kept:** `<room-id>.vox` still resolves to a `vox serve` room's creator (decision 4's form), so nothing
-already written stops working. **Accepted:** a tool configured for plain `socks5` asks the system resolver
-about a `.vox` name first, which leaks the name (PRD-001 R21).
+**Removed.** `<room-id>.vox` resolving to a room's creator is removed, with the genesis `dial:` grant behind
+it (PRD-001 R44). **Accepted:** a tool configured for plain `socks5` asks the system resolver about a
+`.vox` name first, which leaks the name (PRD-001 R21).
 
 ## Non-goals
 
