@@ -38,6 +38,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [023](ADR-023-room-lifecycle.md) | Room Lifecycle (one order, retention, key delivery through members, dumb anchors) | 006, 007, 008, 010, 012, 016 |
 | [024](ADR-024-tapered-congestion-control.md) | Tapered Congestion Control (Cubic → loss-aware Cubic → BBR, both ways) | 011 |
 | [025](ADR-025-sync-scheduling-switch-not-hub.md) | Sync Is Scheduled Like a Switch, Not a Hub (full duplex, receive classes, backoff kinds) | 008, 011, 016 |
+| [026](ADR-026-daemon-and-nodes.md) | The Daemon and the Nodes That Use It (one presence per account, nodes attach and detach) | 002, 010, 011, 012, 016 |
 
 ## Tiers
 
@@ -47,7 +48,8 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 - **Tier 3 — Differentiator + data:** 008, 007, 010 (log before consent); 009 is withdrawn
 - **Tier 4 — Network & overlay:** 011, 012, 013
 - **Tier 5 — App / platform:** 014, 015
-- **Tier 6 — Integration:** 016 (the runtime that composes Tiers 1–5 into a running node)
+- **Tier 6 — Integration:** 016 (the runtime that composes Tiers 1–5 into a running node), 026 (the
+  daemon that hosts an account's nodes on one network presence)
 - **Tier 7 — Product surface:** 017 (what a person actually does with the overlay), 018 (how a
   capability is proved to work)
 - **Tier 8 — Applications on the layer:** 020 (agent comms), 021 (the work-item interop contract an
@@ -87,6 +89,7 @@ planned. This is the roll-up.
 | 023 | accepted; M23.1–M23.6 built except where marked |
 | 024 | accepted, speed only; M24.1–M24.5 built, the taper is the default controller |
 | 025 | accepted; built as V210-34 (#209) |
+| 026 | accepted 2026-10-03, **not built** (#397); amends 005, 010, 011, 012, 013, 015, 016, 017, 020, 021 |
 
 ## Conformance-vector obligations
 
