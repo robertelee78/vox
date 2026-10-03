@@ -25,11 +25,11 @@ use tokio::sync::{broadcast, mpsc, watch, Semaphore};
 
 use crate::error::Result;
 use crate::hash::Digest32;
+use crate::identity::composite::RootSigner;
 use crate::nat::multiaddr::{EndpointList, Multiaddr};
 use crate::nat::portmap::PortMapping;
 use crate::node::circuitstream::CircuitLedger;
 use crate::node::nearby::{Entry, Nearby};
-use crate::identity::composite::RootSigner;
 use crate::transport::quic::{unix_now, SharedEndpoint, VoxConnection, VoxEndpoint};
 
 /// How many inbound handshakes — the TLS handshake and the identity exchange after it — may run
@@ -135,6 +135,9 @@ pub struct NetPresence {
     mapper: Mutex<Option<tokio::task::AbortHandle>>,
     /// Wakes the mapper for a discovery now.
     rediscover: Arc<tokio::sync::Notify>,
+    /// How many discoveries the presence has run: one at start and one per renewal or
+    /// rediscovery, never one per node.
+    discoveries: std::sync::atomic::AtomicU64,
     /// What each peer reports as this presence's source address, by (the local node it reported
     /// to, the reporter): one socket, so every node's reporters describe the same address
     /// (ADR-012 rung 3, N-43). Never published.
@@ -292,6 +295,7 @@ impl NetPresence {
             mapping: Mutex::new(Mapping::default()),
             mapper: Mutex::new(None),
             rediscover: Arc::new(tokio::sync::Notify::new()),
+            discoveries: std::sync::atomic::AtomicU64::new(0),
             observed: Mutex::new(BTreeMap::new()),
             ledger: Arc::new(CircuitLedger::default()),
             nearby: Mutex::new(None),
@@ -371,6 +375,13 @@ impl NetPresence {
     #[must_use]
     pub fn port_mappings(&self) -> Vec<PortMapping> {
         lock(&self.mapping).held.clone()
+    }
+
+    /// How many discoveries (the ladder's publish side, with its gateway requests) this presence
+    /// has run.
+    #[must_use]
+    pub fn discoveries(&self) -> u64 {
+        self.discoveries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Run the ladder's publish side again now (a node's network changed).
@@ -553,6 +564,8 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
                     leased = m.leased(now);
                     due
                 };
+                p.discoveries
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 p.advertised.send_replace(Some(list));
                 due
             };
