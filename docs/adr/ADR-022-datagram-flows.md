@@ -112,7 +112,7 @@ This ADR builds datagram flows once and puts UDP tunnels, relay circuits and the
      the TCP tunnel's watch (the reacher set and the live offer, R22).
 6.6. **Surfaces.** The host: `vox serve <name>=<port>/udp`, or `vox serve <a>=<port> <b>=<port>/udp`
      for TCP and UDP on one port (`--at` applies to every spec); on an existing room,
-     `vox service add <room> udp/<name> <addr>`. The dialer names only the address,
+     `vox service add <room> <name>/udp <addr>` (recorded as `udp/<name>`). The dialer names only the address,
      `vox forward <service>.<node>.<room>.vox [<local-port>]`, and the share says it is UDP; one
      flow per distinct client source address.
 6.7. **SOCKS5 UDP ASSOCIATE** in `vox up` (RFC 1928 §7): a loopback relay socket; every destination
