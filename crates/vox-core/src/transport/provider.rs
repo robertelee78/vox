@@ -58,11 +58,10 @@ pub fn vox_crypto_provider() -> CryptoProvider {
 /// Assert the single-group invariant on a provider before it is wired into a TLS
 /// config: its `kx_groups` MUST be exactly `[X25519MLKEM768]`.
 ///
-/// Because quinn/rustls does not surface the *negotiated* named group to the
-/// application, the audit record cannot independently observe which group a session
-/// used (see [`crate::transport::session`]); the security guarantee instead rests
-/// on (a) offering only the hybrid group — checked here — and (b) TLS 1.3's
-/// Finished MAC binding the negotiated group. Calling this at **every** config
+/// The session record observes the group a session negotiated and refuses any but the
+/// hybrid (see [`crate::transport::session`], V030-33); beneath that the guarantee rests
+/// on (a) offering only the hybrid group — checked here — and (b) TLS 1.3's Finished MAC
+/// binding the negotiated group. Calling this at **every** config
 /// construction boundary means a future regression that widened the offered groups
 /// (e.g. dropping the explicit `kx_groups` override) fails loudly here rather than
 /// silently shipping a classical downgrade target. A non-panicking hard error

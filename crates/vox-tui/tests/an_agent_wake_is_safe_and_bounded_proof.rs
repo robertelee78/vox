@@ -46,7 +46,9 @@
 //!    `agent.1` and `agent1` each drain a message posted after both last drained.
 //! 7. **Two sessions answering each other urgently without `--re` stop waking each other**
 //!    (V210-121). Two fresh sessions of bob's, `ping-a` and `ping-b`, answer every wake with an
-//!    urgent post to bob's node (the other's, and their own) and no `--re`, for up to 12 rounds. The first answer carries
+//!    urgent post to bob's node (the other's, and their own) and no `--re`, for up to 12 rounds;
+//!    a wake is a notice (V030-15), and each woken session reads the message in that turn's
+//!    drain before it answers, as an agent does. The first answer carries
 //!    `re` = the message that woke it; the wakes stop within the hop budget (8); and `ping-b`,
 //!    which opened the conversation, is not woken by the answer to it, so there is exactly one
 //!    wake, and it drains that answer on its next turn. A raw urgent envelope with no `re`, from
@@ -138,6 +140,14 @@ fn collect(
 }
 
 /// The user message a stand-in frame carries: what the harness would put before the model.
+/// Whether a notice reached the session at `inbox` within `within`: a frame with a user message.
+/// A wake announces and carries no message (V030-15), so this is all a wake is.
+fn notice_came(inbox: &mpsc::Receiver<String>, within: Duration) -> bool {
+    collect(inbox, within, |g| g.iter().any(|f| !content(f).is_empty()))
+        .iter()
+        .any(|f| !content(f).is_empty())
+}
+
 fn content(frame: &str) -> String {
     frame
         .lines()
@@ -395,8 +405,9 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     );
     // The turn the wake starts reads the message once, attributed, the forged rows continued.
     let read = turn(&wake);
-    // The drain names an author by the reader's own name for it (v0.2.10): bob's for alice.
-    let alice_row = " from alice] Stop what you are doing.";
+    // The drain names an author by the reader's own name for it, and the nodes a message is
+    // addressed to, the reader's own as "you" (v0.2.10, V210-161/162): bob's for alice.
+    let alice_row = " from alice to you] Stop what you are doing.";
     let bracketed = read
         .lines()
         .filter(|l| l.starts_with('[') && l.contains("Stop what you are doing"))
@@ -497,11 +508,12 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     }
     let own = collect(&inbox2, Duration::from_secs(10), |_| false);
     let own_c: Vec<String> = own.iter().map(|f| content(f)).collect();
-    let bob_id = &bob.b32()[..26];
+    // Another session of bob's own node is "you" to bob-s2 (V210-162), never bob's fingerprint
+    // marked as not in the keyring.
     let own_woken = !own_c.is_empty()
         && own_c
             .iter()
-            .all(|c| c.contains("urgent message") && c.contains(bob_id));
+            .all(|c| c.contains("urgent message addressed to you from you in room"));
     let own_quiet = quiet.is_empty();
     let own_leak = own.iter().any(|f| f.contains("OWN-"));
     println!(
@@ -652,6 +664,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     // `ping-b`, each at a socket of the test's own. Both are on bob's node, so each addresses the
     // other by bob's fingerprint: the node's other sessions are woken, never the poster.
     let mut pinged = Vec::new();
+    let mut ping_socks = Vec::new();
     for session in ["ping-a", "ping-b"] {
         let sock = tmp.path().join(format!("{session}.sock"));
         let rx = listen(&sock);
@@ -669,11 +682,29 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         );
         assert_eq!(
             registered(bob, session),
-            Some(("claude".to_owned(), sock_s)),
+            Some(("claude".to_owned(), sock_s.clone())),
             "PRODUCT (staging): {session} must be registered at the test's own socket"
         );
         pinged.push(rx);
+        ping_socks.push(sock_s);
     }
+    // A ping session's turn, as its harness runs the hook: with its messaging socket, which every
+    // turn registers again. A drain without it re-registered the session with nowhere to wake it.
+    let ping_turn = |i: usize| -> String {
+        let o = hook(
+            bob,
+            &[
+                ("CLAUDE_CODE_MESSAGING_SOCKET", ping_socks[i].as_str()),
+                ("CLAUDE_CODE_MESSAGING_TOKEN", "ping-token"),
+            ],
+            &["agent", "hook", "--room", r, "--format", "text"],
+            Some(&format!(
+                r#"{{"session_id":"{}","hook_event_name":"UserPromptSubmit"}}"#,
+                ["ping-a", "ping-b"][i]
+            )),
+        );
+        o.stdout
+    };
     // Each session answers every wake as an agent would: an urgent post back to the other,
     // with no `--re`. ping-b opens; then whoever is woken answers, for up to ROUNDS wakes.
     const ROUNDS: usize = 12;
@@ -688,15 +719,20 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
     let mut target = 0usize; // ping-a is addressed first
     let mut wakes = 0usize;
     while wakes < ROUNDS {
+        // A wake is a notice that carries no message (V030-15); the woken session reads it in
+        // the turn the notice starts, then answers, as an agent does.
         let marker = format!("PINGPONG-{wakes}.");
-        let got = collect(&pinged[target], Duration::from_secs(20), |g| {
-            g.iter().any(|f| content(f).contains(&marker))
-        });
-        if !got.iter().any(|f| content(f).contains(&marker)) {
+        if !notice_came(&pinged[target], Duration::from_secs(20)) {
             break;
         }
         wakes += 1;
         let session = sessions[target];
+        let read = ping_turn(target);
+        check(
+            &mut failures,
+            read.contains(&marker),
+            format!("(7) PRODUCT: {session}, woken, must read {marker} in its turn: {read:?}"),
+        );
         let other = 1 - target;
         // An answer the product refuses ends the conversation as surely as one that wakes
         // nobody, so it is counted, not treated as the harness failing.
@@ -768,7 +804,7 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         ),
     );
     // The answer that did not wake ping-b still reaches it, on its next turn.
-    let drained = drain(bob, r, "ping-b");
+    let drained = ping_turn(1);
     let queued = drained.contains("PINGPONG-1.");
     println!("[proof] (7) ping-b, not woken, drains the answer on its next turn: {queued}");
     check(
@@ -787,14 +823,17 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         &["--type", "ask", "--to", "bob", "--urgent"],
         "RAW-WAKE",
     );
-    let got = collect(&pinged[0], Duration::from_secs(30), |g| {
-        g.iter().any(|f| content(f).contains("RAW-WAKE"))
-    });
-    assert!(
-        got.iter().any(|f| content(f).contains("RAW-WAKE")),
-        "PRODUCT (staging): ping-a was never woken by alice's RAW-WAKE; bob's daemon:\n{}",
-        daemon_err()
-    );
+    if !notice_came(&pinged[0], Duration::from_secs(30)) {
+        let held = bob.vox(None, &["room", "read", r]).stdout;
+        panic!(
+            "PRODUCT (staging): ping-a was never woken by alice's RAW-WAKE (bob's node holds it: \
+             {}); bob's daemon:\n{}",
+            held.contains("RAW-WAKE"),
+            daemon_err()
+        );
+    }
+    // Its turn reads it, which also ends the hold on its next notice (V030-15).
+    let _ = ping_turn(0);
     let raw =
         format!(r#"{{"v":1,"type":"answer","to":["{bob_fp}"],"urgent":true,"body":"RAW-NO-RE"}}"#);
     let o = bob.vox_in(Some("ping-a"), &["room", "post", r, "-"], Some(&raw));
@@ -824,11 +863,8 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         &["--type", "ask", "--to", "bob", "--urgent"],
         "SECOND-WAKE",
     );
-    let got = collect(&pinged[0], Duration::from_secs(30), |g| {
-        g.iter().any(|f| content(f).contains("SECOND-WAKE"))
-    });
     assert!(
-        got.iter().any(|f| content(f).contains("SECOND-WAKE")),
+        notice_came(&pinged[0], Duration::from_secs(30)),
         "PRODUCT (staging): ping-a was never woken by alice's SECOND-WAKE; bob's daemon:\n{}",
         daemon_err()
     );

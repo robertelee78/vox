@@ -787,10 +787,10 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
          follow {}",
         first_row.contains("CANARY-AHEAD-1"),
         bulk(&turn1),
-        turn1.contains("more unread message(s) not shown")
+        turn1.contains("more unread message(s) in this room not shown")
     );
     assert!(
-        turn1.contains("more unread message(s) not shown"),
+        turn1.contains("more unread message(s) in this room not shown"),
         "PRODUCT (staging) (8): the first read must be bounded, or nothing is shown ahead of the cursor: \
          {turn1}"
     );
@@ -884,6 +884,33 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         ("opencode".to_owned(), flaky_s.clone()),
         "PRODUCT (staging): session-flaky must be registered at the test's own socket"
     );
+    // A new session starts behind by everything this room holds, more than one turn's bound
+    // (V210-120), so it catches up first: what (9) counts is the one message posted next.
+    for _ in 0..10 {
+        // With its harness's variables, as every turn of it runs: a turn without them registers
+        // the session again with nowhere to wake it.
+        let o = bob.vox_env(
+            None,
+            &[
+                ("VOX_OPENCODE_WAKE_SOCKET", flaky_s.as_str()),
+                ("VOX_OPENCODE_WAKE_TOKEN", "flaky-token"),
+            ],
+            &[
+                "agent",
+                "hook",
+                "--room",
+                &room,
+                "--format",
+                "text",
+                "--session",
+                "session-flaky",
+            ],
+            None,
+        );
+        if o.stdout.trim().is_empty() {
+            break;
+        }
+    }
     post(
         alice,
         &room,

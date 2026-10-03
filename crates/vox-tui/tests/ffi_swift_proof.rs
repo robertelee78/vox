@@ -91,11 +91,33 @@ impl Daemon {
 
 /// Build the xcframework and the harness, exactly as a person would.
 fn build_harness(out: &Path) -> PathBuf {
-    let status = Command::new(root().join("scripts/build-xcframework.sh"))
-        .env("OUT", out)
-        .status()
-        .expect("run build-xcframework.sh");
-    assert!(status.success(), "build-xcframework.sh failed");
+    // The script runs rustup and cargo: they get the operator's toolchain homes. Under the
+    // proof's temporary HOME the rustup proxy found no toolchain, downloaded a bare one, and the
+    // script refused for want of the iOS targets the operator's toolchain has.
+    let built = watchdog::temp_home::real_toolchain(
+        Command::new(root().join("scripts/build-xcframework.sh")).env("OUT", out),
+    )
+    .output()
+    .expect("APPARATUS: could not start build-xcframework.sh");
+    if !built.status.success() {
+        // A red names its reason and its side: a toolchain this machine lacks is the machine's,
+        // anything else the script (shipped with vox) did is the product's.
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&built.stdout),
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let side = if said.contains("is not installed; run: rustup target add") {
+            "CANNOT MEASURE (precondition unmet): this machine lacks a Rust target the \
+             xcframework needs"
+        } else {
+            "PRODUCT (staging)"
+        };
+        panic!(
+            "{side}: build-xcframework.sh exited {}; it said:\n{said}",
+            built.status
+        );
+    }
     let lib = out.join("VoxFFI.xcframework/macos-arm64_x86_64");
     let harness = out.join("harness");
     let swiftc = Command::new("swiftc")

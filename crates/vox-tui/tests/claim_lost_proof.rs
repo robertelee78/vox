@@ -201,7 +201,6 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
         &["room", "claim", r, "taken", "--ttl", "600"],
         |o: &Out| o.ok,
     );
-    let bob_fp = bob.b32();
     until(
         alice,
         Some("s1"),
@@ -215,7 +214,8 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let told = drain(alice, r, "s1");
     assert!(
         told.contains("You no longer hold `taken`: your claim lapsed, and it is now held by")
-            && told.contains(&format!("{}/b1", &bob_fp[..26])),
+            // Named as the reader names it: alice's name for bob (V210-162).
+            && told.contains(&format!("{}/b1", bob.name)),
         "PRODUCT: a claim someone else now holds must name the holder: {told:?}"
     );
 
@@ -263,8 +263,8 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     let told = drain(alice, r, "s1");
     assert!(
         told.contains(
-            "You no longer hold `reserved`: your claim lapsed, and it is now reserved for"
-        ) && told.contains(&format!("{}/s9", &alice_fp[..26])),
+            "You no longer hold `reserved`: your claim lapsed, and it is now reserved for" // The recipient is alice's own node, which she reads as "you" (V210-162).
+        ) && told.contains("you/s9"),
         "PRODUCT: a lapsed claim now reserved by a handoff must say so and name the recipient: \
          {told:?}"
     );
@@ -441,12 +441,13 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
         NAME_BREAKERS.len()
     );
 
-    // (a2) What a result reports unread: bob addresses alice's session twice. One message's
-    // type carries the payload; the stock CLI refuses to post it, so it is forged on bob's node.
-    // The other's body is led by U+2028, which the stock CLI posts. Alice's `--type result`
+    // (a2) What a result reports unread: bob addresses alice's node twice (`to` names nodes by
+    // whole fingerprint, V210-161). One message's type carries the payload; the stock CLI
+    // refuses to post it, so it is forged on bob's node. The other's body is led by U+2028,
+    // which the stock CLI posts. Alice's `--type result`
     // lists what is addressed to her and unread, on stderr — her model's input.
     let bad_type = serde_json::json!({
-        "v": 1, "type": format!("ask{PAYLOAD}"), "from": "b1", "to": ["s1"], "body": "hi"
+        "v": 1, "type": format!("ask{PAYLOAD}"), "from": "b1", "to": [alice_fp], "body": "hi"
     })
     .to_string();
     let o = bob.vox_in(Some("b1"), &["room", "post", r, "-"], Some(&bad_type));
@@ -457,7 +458,8 @@ fn the_drain_says_once_when_a_claim_was_lost_and_why() {
     );
     rt.block_on(post_raw(bob, room.cid, &bad_type));
     let ls_body = serde_json::json!({
-        "v": 1, "type": "ask", "from": "b1", "to": ["s1"], "body": format!("hi{PAYLOAD_LS}")
+        "v": 1, "type": "ask", "from": "b1", "to": [alice_fp],
+        "body": format!("hi{PAYLOAD_LS}")
     })
     .to_string();
     bob.vox_in(Some("b1"), &["room", "post", r, "-"], Some(&ls_body))

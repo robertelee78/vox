@@ -3,8 +3,8 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: built (M9, `crates/vox-core/src/transport/`), except where a requirement says
-otherwise: the Vox IANA Private Enterprise Number (requirement 6), the session record's observed
-group (requirement 12) and the interop matrix (requirement 14) are not built. A TCP fallback
+otherwise: the interop matrix (requirement 14) is not built. The OID's UUID arc (requirement 6)
+and the observed group (requirement 12) are built (V030-33, #382). A TCP fallback
 (requirement 2) does not exist.
 **Decided 2026-10-03, not built (#397, ADR-026):** the identity exchange (requirements 27–40)
 replaces identity in the TLS handshake (requirements 5–8) and ALPN `vox/1`. Until it is built, the
@@ -51,11 +51,12 @@ requirements 27–40 and MUST be removed from the code when those are built.
    (ADR-002), binding the ephemeral certificate key to the long-term identity. `cert_public_key` is
    the certificate's raw subject-public-key bytes, not the SPKI DER. This signing string is a
    TLS-layer string, deliberately outside ADR-008's CBOR struct-domain regime.
-6. **Extension layout.** OID `1.3.6.1.4.1.<VOX-PEN>.1.1`, where `<VOX-PEN>` MUST be a Vox-owned IANA
-   Private Enterprise Number; Vox MUST NOT use libp2p's PEN 53594. `critical = false`. The value is
-   canonical CBOR (ADR-008, tag `0x0009`) `{ composite_pubkey, pop_sig }` in ADR-003's `0x03`/`0x04`
-   composite encodings. *Not built:* the PEN is unregistered and builds use the placeholder
-   `1234567` (`identity_cert.rs`); the interop matrix (requirement 14) MUST pin the exact OID.
+6. **Extension layout.** OID `2.25.27539399102012846121714982791979498535.1.1`: the X.667 UUID arc
+   of `14b7e534-e0b1-494d-8cb6-b81f37787c27`, generated once for Vox (V030-33), which needs no
+   registration. The UUID MUST NOT be regenerated. Vox MUST NOT use libp2p's PEN 53594 or any other
+   organisation's arc. `critical = false`. The value is canonical CBOR (ADR-008, tag `0x0009`)
+   `{ composite_pubkey, pop_sig }` in ADR-003's `0x03`/`0x04` composite encodings; the interop
+   matrix (requirement 14) MUST pin the exact OID.
 7. The verifier MUST derive the Vox identity from the extension and MUST require it to match the
    expected peer, aborting on mismatch (ADR-008 error `0x05`). A missing or duplicated extension
    MUST be rejected.
@@ -74,15 +75,15 @@ requirements 27–40 and MUST be removed from the code when those are built.
 11. **No Vox replay window.** Each datagram is `varint flow_id ‖ varint context ‖ body` on a flow
     bound to a stream (ADR-022). Replay and duplication are QUIC's concern (RFC 9000 §12.3); Vox
     MUST NOT add its own datagram sequence number or replay window.
-12. **Downgrade auditability.** The negotiated suite MUST be recorded in a session-establishment entry (ADR-008
-    canonical struct, tag `0x0011`, body `{ peer_id, suite_id, negotiated_group, ts }`). *Gap:*
-    quinn 0.11 does not expose the negotiated group, so `SessionEstablishment::new` fills
-    `negotiated_group` from the constant this build offers, not from the handshake. The guarantee
-    rests on requirement 4 and on TLS 1.3 binding the negotiated parameters into the Finished MAC.
-    The post-handshake check confirms only the ALPN `vox/1` (`confirm_vox_alpn`), and MUST NOT be
-    described as confirming the group. *Decided, not built:* the ALPN becomes `vox/2`
-    (requirement 27), and the record is written only after the identity exchange completes
-    (requirement 33).
+12. **Downgrade auditability.** The negotiated suite and group MUST be recorded in a
+    session-establishment entry (ADR-008 canonical struct, tag `0x0011`, body
+    `{ peer_id, suite_id, negotiated_group, ts }`). `negotiated_group` MUST be the group rustls
+    negotiated, read from the handshake (`confirm_handshake`, through quinn-proto's
+    `__rustls-post-quantum-test` feature, which only adds that field), never a constant;
+    `SessionEstablishment::observed` MUST refuse a session under any group but X25519MLKEM768.
+    `vox status --json` names each peer's group (`tls_group`).
+    *Decided, not built (#397):* the ALPN becomes `vox/2` (requirement 27), and the record is
+    written only after the identity exchange completes (requirement 33).
 13. **Hard failure.** A peer or library that cannot negotiate the required hybrid group MUST fail to
     connect with a clear, surfaced error and MUST NOT silently downgrade. A failure of
     authentication is reported as `SignatureInvalid`; any other handshake failure (refused, timed
@@ -224,9 +225,9 @@ connection, bound to the TLS session by its exporter.
     connections, the inner connection of a relay circuit (ADR-012), and between two nodes of one
     daemon over its own address.
 37. **Where the identity is carried.** After this change no certificate carries a Vox identity: the
-    composite public key travels only in `PROVE` and `CLAIM`. Requirement 6's OID and PEN, and the
-    identity extension (tag `0x0009`), then apply to nothing; of #382 (V030-33), only the session
-    record's group (requirement 12) remains.
+    composite public key travels only in `PROVE` and `CLAIM`. Requirement 6's OID and the identity
+    extension (tag `0x0009`) then apply to nothing; of #382's work (V030-33), only the session
+    record's observed group (requirement 12) stays in force.
 38. **Latency.** The exchange adds one round trip before the dialler may send and about 1.5 round
     trips to the listener's admission. R40 (under 1 s) and R42 (under 2 s) MUST be re-measured with
     it.
@@ -249,8 +250,6 @@ connection, bound to the TLS session by its exporter.
 
 ## Known limits
 
-- **The PEN placeholder** (requirement 6) and **the session record's constant group**
-  (requirement 12) are open: #382 (V030-33).
 - **The interop matrix** (requirement 14) is an open release gate, awaiting the decider (V030-29
   decider question 32).
 

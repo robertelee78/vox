@@ -46,7 +46,7 @@ use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
 use crate::transport::identity_cert::build_leaf_certificate;
 use crate::transport::mux::{CircuitPort, MuxSocket};
-use crate::transport::provider::{client_config, server_config, X25519MLKEM768_CODE_POINT};
+use crate::transport::provider::{client_config, server_config};
 use crate::transport::router::{
     DatagramFlow, DatagramRouter, DatagramStats, FlowMode, MAX_PACKET_HEADER,
 };
@@ -392,7 +392,30 @@ fn bind_udp(addr: SocketAddr) -> Result<std::net::UdpSocket> {
             .port();
         let missed = match hears_ipv4(&socket, port) {
             Ok(()) => return Ok(socket),
-            Err(missed) => missed,
+            Err(Missed::Routable(missed)) => {
+                // **Said as it was observed** (V030-33's finding): only the datagram to this
+                // machine's own routable address went missing. A program holding the port on
+                // `0.0.0.0` takes the loopback datagram too, and that one arrived; what stops only
+                // the routable one is, almost always, a firewall that filters this binary's incoming
+                // traffic (macOS's application firewall leaves loopback alone), or rarely a program
+                // bound to that one address. Both are named; another port would meet the same
+                // firewall, so none is tried.
+                return Err(Error::LocalBind {
+                    addr,
+                    cause: crate::error::BindCause::Other,
+                    reason: format!(
+                        "IPv4 traffic to this machine's own address on port {port} never reached \
+                         this node, though traffic to 127.0.0.1 did ({missed}). Either this \
+                         machine's firewall blocks incoming traffic to this vox (on macOS: System \
+                         Settings › Network › Firewall › Options, allow {}), or another program \
+                         holds port {port} on that address",
+                        std::env::current_exe()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "vox".to_owned())
+                    ),
+                });
+            }
+            Err(Missed::Loopback(missed)) => missed,
         };
         if addr.port() != 0 {
             return Err(Error::LocalBind {
@@ -440,25 +463,48 @@ fn routable_ipv4() -> Option<std::net::Ipv4Addr> {
 /// Whether a datagram sent over IPv4 to each address a node advertises — `127.0.0.1` and the
 /// routable IPv4 address — on `port` reaches `socket` (see [`bind_udp`]). Everything the test sent
 /// that arrived is drained, so none of it reaches QUIC.
-fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<(), String> {
+fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<(), Missed> {
     let started = std::time::Instant::now();
     let mut targets = vec![std::net::Ipv4Addr::LOCALHOST];
     targets.extend(routable_ipv4());
     let Ok(probe) = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) else {
         return Ok(()); // no test is possible; never refuse a bind for that
     };
+    // **A control for each address: an IPv4 socket of this test's own.** A machine can drop what
+    // it sends to its own routable address (a VPN that blocks the local network does): measured
+    // 2026-10-03, every datagram to the LAN address was lost, to an IPv4-only socket as much as
+    // to a dual-stack one, and the node refused every port it was given as "held by another
+    // program". So an address whose control datagram does not arrive tests nothing, and is left
+    // out of the verdict rather than read as a collision.
+    let Ok(control) = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) else {
+        return Ok(());
+    };
+    let Ok(control_port) = control.local_addr().map(|a| a.port()) else {
+        return Ok(());
+    };
+    let nonce = |what: &[u8]| -> Option<Vec<u8>> {
+        let mut n = [0u8; 16];
+        getrandom::fill(&mut n).ok()?;
+        let mut text = what.to_vec();
+        text.extend_from_slice(&n);
+        Some(text)
+    };
     let mut owed: Vec<(std::net::Ipv4Addr, Vec<u8>)> = Vec::new();
+    let mut controls: Vec<(std::net::Ipv4Addr, Vec<u8>)> = Vec::new();
     for target in targets {
-        let mut nonce = [0u8; 16];
-        if getrandom::fill(&mut nonce).is_err() {
+        let (Some(text), Some(check)) = (
+            nonce(b"vox dual-stack self-test "),
+            nonce(b"vox dual-stack control "),
+        ) else {
             return Ok(());
-        }
-        let mut text = b"vox dual-stack self-test ".to_vec();
-        text.extend_from_slice(&nonce);
-        if probe.send_to(&text, (target, port)).is_err() {
+        };
+        if probe.send_to(&text, (target, port)).is_err()
+            || probe.send_to(&check, (target, control_port)).is_err()
+        {
             return Ok(());
         }
         owed.push((target, text));
+        controls.push((target, check));
     }
     let deadline = std::time::Instant::now() + DUAL_STACK_SELF_TEST;
     let mut buf = [0u8; 64];
@@ -486,14 +532,39 @@ fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<()
     if owed.is_empty() {
         return Ok(());
     }
-    Err(format!(
+    // The controls of the addresses still owed: each had the whole wait to arrive.
+    if control.set_nonblocking(true).is_ok() {
+        while let Ok((n, _)) = control.recv_from(&mut buf) {
+            controls.retain(|(_, t)| buf[..n] != t[..]);
+        }
+    }
+    owed.retain(|(at, _)| !controls.iter().any(|(c, _)| c == at));
+    if owed.is_empty() {
+        return Ok(());
+    }
+    let said = format!(
         "port {port}: nothing sent to {} arrived within {} ms",
         owed.iter()
             .map(|(at, _)| at.to_string())
             .collect::<Vec<_>>()
             .join(" or "),
         started.elapsed().as_millis()
-    ))
+    );
+    if owed.iter().any(|(at, _)| at.is_loopback()) {
+        Err(Missed::Loopback(said))
+    } else {
+        Err(Missed::Routable(said))
+    }
+}
+
+/// Which of [`hears_ipv4`]'s datagrams went missing, and what to say of it.
+enum Missed {
+    /// The one to `127.0.0.1`: another program holds the port on IPv4 (loopback is never
+    /// firewalled).
+    Loopback(String),
+    /// Only the one to this machine's routable address: a firewall filtering this binary, or a
+    /// program bound to that address alone.
+    Routable(String),
 }
 
 impl VoxEndpoint {
@@ -969,11 +1040,10 @@ fn finish_connection(
     // running, which must not happen — treat as an auth failure.
     let peer_id = verified.fingerprint().ok_or(Error::SignatureInvalid)?;
 
-    // Confirm the negotiated named group is the hybrid PQ group. quinn exposes the
-    // negotiated group via the rustls handshake data attached to the connection.
-    confirm_vox_alpn(&connection)?;
-
-    let session = SessionEstablishment::new(peer_id, now_secs);
+    // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
+    // actually negotiated; a session under any group but the post-quantum hybrid is refused.
+    let group = confirm_handshake(&connection)?;
+    let session = SessionEstablishment::observed(peer_id, group, now_secs)?;
     // The peer's leaf certificate is generated per endpoint — per process — and bound to the
     // identity by a signature (`identity_cert`), so its digest says which *process* of the
     // identity this connection is to (V210-57).
@@ -1005,29 +1075,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Confirm this handshake ran under the Vox TLS configuration, by its ALPN.
+/// Confirm this handshake ran under the Vox TLS configuration, by its ALPN, and return the
+/// key-exchange group it **negotiated**, read from rustls through quinn's handshake data
+/// (V030-33).
 ///
-/// **It does not observe the negotiated key-exchange group, and it is named for what
-/// it checks because it used to be named for what it does not.** It was
-/// `confirm_hybrid_group`, documented as confirming X25519MLKEM768 and as surfacing
-/// "a clear error if a future config regression ever widened the offered groups" —
-/// which it would not have done. Widening `kx_groups` leaves this function passing,
-/// since the ALPN is unchanged. The defence in depth the old name promised was not
-/// there, and a reader auditing the connection path had every reason to believe it
-/// was.
-///
-/// What actually guarantees the group is upstream of here and is sound: the provider
-/// offers exactly one `kx_group`, so there is no downgrade target to negotiate to;
-/// `provider::assert_pq_only` enforces that at every config
-/// boundary; and TLS 1.3 binds the negotiated parameters into the Finished MAC, so a
-/// mismatch breaks the handshake rather than passing quietly. The group cannot be
-/// checked *here* because quinn 0.11 gates rustls's
-/// `negotiated_key_exchange_group` behind a test-only cfg, so the value rustls holds
-/// is not reachable from the connection.
-///
-/// The ALPN check is still worth keeping: it confirms a Vox-configured handshake
-/// completed, and a non-Vox config would not carry this protocol.
-fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
+/// It used to check only the ALPN while the session record wrote the group from a constant, so
+/// the downgrade-auditability record restated the configuration rather than observing the
+/// handshake. Now the record carries what rustls negotiated, and
+/// [`SessionEstablishment::observed`] refuses a session under any group but X25519MLKEM768 —
+/// defence in depth beneath the provider, which offers no other group
+/// (`provider::assert_pq_only`), and TLS 1.3, which binds the group into the Finished MAC.
+fn confirm_handshake(connection: &Connection) -> Result<u16> {
     let Some(hd) = connection.handshake_data() else {
         return Err(Error::SignatureInvalid);
     };
@@ -1035,7 +1093,9 @@ fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
         return Err(Error::SignatureInvalid);
     };
     match &hd.protocol {
-        Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => Ok(()),
+        Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => {
+            Ok(u16::from(hd.negotiated_key_exchange_group))
+        }
         _ => Err(Error::SignatureInvalid),
     }
 }
@@ -1517,11 +1577,10 @@ impl VoxConnection {
         &self.session
     }
 
-    /// The negotiated TLS group code point recorded for this session
-    /// (X25519MLKEM768 = `0x11EC`).
+    /// The TLS key-exchange group this session negotiated, as rustls observed it in the
+    /// handshake (X25519MLKEM768 = `0x11EC`; nothing else is accepted).
     #[must_use]
     pub fn negotiated_group(&self) -> u16 {
-        debug_assert_eq!(self.session.negotiated_group, X25519MLKEM768_CODE_POINT);
         self.session.negotiated_group
     }
 

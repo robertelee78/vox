@@ -510,12 +510,28 @@ pub struct Setup {
     pub guest_leg: Option<Box<dyn Fn(SocketAddr) -> Option<SocketAddr>>>,
 }
 
-/// A UDP port free on the dual-stack wildcard, for an anchor that must be reachable over
-/// both IPv4 and IPv6 loopback.
+/// A UDP port free on the dual-stack wildcard **and on IPv4**, for an anchor that must be
+/// reachable over both IPv4 and IPv6 loopback.
+///
+/// macOS hands an ephemeral `[::]:0` a port another program holds on IPv4 (about one in six
+/// under load), and a node told to listen on it then rightly refuses: its IPv4 traffic would
+/// reach the other program. A port picked that way made the anchor exit, a red that was the
+/// harness's pick, not the product. So the pick is kept only when IPv4 binds of it succeed too.
 #[must_use]
 pub fn free_dual_stack_port() -> u16 {
-    let s = std::net::UdpSocket::bind("[::]:0").expect("bind [::]:0");
-    s.local_addr().unwrap().port()
+    for _ in 0..64 {
+        let port = std::net::UdpSocket::bind("[::]:0")
+            .and_then(|s| s.local_addr())
+            .unwrap_or_else(|e| panic!("APPARATUS (harness error): no free UDP port: {e}"))
+            .port();
+        let v4_free = ["0.0.0.0", "127.0.0.1"]
+            .iter()
+            .all(|ip| std::net::UdpSocket::bind((*ip, port)).is_ok());
+        if v4_free {
+            return port;
+        }
+    }
+    panic!("APPARATUS (harness error): 64 UDP ports picked on [::] were all held on IPv4")
 }
 
 /// The socket address in an `--anchor` spec (`<fp>@/ip4/<ip>/udp/<port>`).
@@ -846,6 +862,12 @@ impl World {
     /// Kill the host's `vox serve` and bring the same identity and room back as
     /// `vox daemon`, on a **new** port — a restart and a path change at once.
     pub fn restart_host_as_daemon(&mut self) {
+        self.restart_host_as_daemon_with(&[]);
+    }
+
+    /// [`Self::restart_host_as_daemon`], with `extra` added to the daemon's arguments
+    /// (`--metrics 127.0.0.1:0`, say).
+    pub fn restart_host_as_daemon_with(&mut self, extra: &[&str]) {
         let old_pid = self.host.as_ref().map(|h| h.child.id());
         drop(self.host.take());
         if let Some(pid) = old_pid {
@@ -866,7 +888,10 @@ impl World {
                 &self.host_anchor,
                 "--listen",
                 self.path.host_listen(),
-            ]),
+            ])
+            .into_iter()
+            .chain(args(extra))
+            .collect::<Vec<_>>(),
         );
         let room = self.room.clone();
         daemon.expect_line("the daemon to hold the room open", |l| {
