@@ -25,7 +25,13 @@
 //! ## Asserted
 //! 1. Bob reads "p9 visible" (the pair syncs; precondition, else PRODUCT (staging));
 //! 2. Bob **never** reads "p9 hidden", over [`WATCH`];
-//! 3. Bob's `vox status --json` names the violation as the last failure with Alice.
+//! 3. Bob's `vox status --json` names the violation as the last failure with Alice;
+//! 4. **Bob's daemon logs it** (PRD-001 R36, #85): the failed session is in the background, with no
+//!    command waiting on it, so a log line naming the sync that did not complete and its specific
+//!    cause is the only place it is said.
+//!
+//! **A red names its side:** (2)–(4) are `PRODUCT:`; the mutant not announcing its mode, or Bob
+//! never reading the warm-up or "p9 visible", is `CANNOT MEASURE:` (the scene was not staged).
 //!
 //! **(2) is a negative claim, so every read it rests on must have worked.** The harness's read
 //! returns no rows when the control socket fails, which would read as "never stored". Once Bob has
@@ -35,7 +41,17 @@
 //!
 //! ## Mutation
 //! Remove the coverage check in the receiver (`Coverage::admit` always true): Bob stores and
-//! reads "p9 hidden", and (2) goes red.
+//! reads "p9 hidden", and (2) goes red. A daemon that does not log a failed sync goes red at (4).
+
+//! ## A peer that refuses is logged as refusing (PRD-001 R36, #85)
+//!
+//! `a_peer_that_refuses_every_session_is_logged_as_refusing` stages the other end: Alice runs the
+//! mutant sender with `VOX_MUTANT_SENDER_MODE=refuse-sessions`, which refuses every sync session
+//! a peer opens to it with the coded reason `EpochMismatch`; Bob runs the shipped `vox daemon` and
+//! posts. Bob's sessions to Alice end as her refusal, in the background, so **Bob's daemon log**
+//! must say a sync did not complete and why: "sync failed: the peer refused: epoch mismatch".
+//! Every red there is `PRODUCT:`, except the mutant not announcing its mode (`CANNOT MEASURE:`).
+//! Mutation: a daemon that does not log a failed sync goes red there and at (4) above.
 
 #![cfg(unix)]
 
@@ -159,6 +175,67 @@ fn an_entry_that_was_not_asked_for_is_refused() {
         "PRODUCT: bob's sessions with the mutant sender did not fail as a protocol violation \
          ({VIOLATION:?}); his last failures: {:?}\nbob:\n{}",
         failures(&st),
+        bob_d.transcript()
+    );
+    let said = bob_d.transcript();
+    let logged = said
+        .lines()
+        .find(|l| l.contains("did not complete") && l.contains(VIOLATION));
+    println!("[proof] P9 (4): bob's daemon logged: {logged:?}");
+    assert!(
+        logged.is_some(),
+        "PRODUCT: (4) bob's sessions with alice failed in the background, and his daemon logged no \
+         line saying a sync did not complete because {VIOLATION:?}; it logged:\n{said}"
+    );
+}
+
+/// What a refused session reads as in the refused node's log (#85).
+const REFUSED: &str = "sync failed: the peer refused: epoch mismatch";
+
+#[test]
+#[ignore = "a real daemon against the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
+fn a_peer_that_refuses_every_session_is_logged_as_refusing() {
+    watchdog::arm();
+    let sender = mutant_sender();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
+    let root = tmp.path();
+    let alice = Member::new(root, "alice");
+    let bob = Member::new(root, "bob");
+    alice.trust(&bob);
+    bob.trust(&alice);
+    let alice_d = alice.daemon_mutant(&sender, "refuse-sessions", None);
+    let bob_d = bob.daemon(None);
+    let room = alice.create("pair");
+    bob.join(&alice.invite(&room), "pair");
+
+    // Bob posts, so his node opens sessions to Alice to carry them; she refuses each.
+    let start = Instant::now();
+    let mut n = 0;
+    let logged = loop {
+        let said = bob_d.transcript();
+        if let Some(l) = said
+            .lines()
+            .find(|l| l.contains("did not complete") && l.contains(REFUSED))
+        {
+            break Some(l.to_owned());
+        }
+        if start.elapsed() > Duration::from_secs(90) {
+            break None;
+        }
+        n += 1;
+        bob.post(&room, &format!("refused {n}"));
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    assert!(
+        announced(&alice_d, "refuse-sessions"),
+        "CANNOT MEASURE: alice's daemon never announced the mutant mode \"refuse-sessions\"\nalice:\n{}",
+        alice_d.transcript()
+    );
+    println!("[proof] R36: after {n} post(s), bob's daemon logged: {logged:?}");
+    assert!(
+        logged.is_some(),
+        "PRODUCT: alice refused bob's sync sessions, and over 90 s and {n} post(s) bob's daemon \
+         logged no line saying a sync did not complete because {REFUSED:?}; it logged:\n{}",
         bob_d.transcript()
     );
 }

@@ -57,7 +57,8 @@ see this layer; they see only the channel.
   zeroizing buffer.
 - **W6.** A session created by `Session::accept` has no sending chain until it receives the
   initiator's first message, so after an ADR-005 join the joiner MUST send first. The node MUST do
-  this as part of joining (ADR-007 step 2: the newcomer broadcasts its own sender key).
+  this as part of joining with `PairwiseFrame::Open`, one sealed message with an empty plaintext
+  that releases no sender key (ADR-007 G-15 step 2, M17.6).
 
 ### §Prekey Publication (serverless)
 
