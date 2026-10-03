@@ -326,6 +326,98 @@ fn both_ends_keep_the_same_connection(
     }
 }
 
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "production Argon2id + a real PoW, a relayed pair upgraded and a 60 s grace watched; run in release"]
+fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {
+    watchdog::arm();
+    let mut w = ForwardedWorld::new(false);
+    eprintln!(
+        "[proof] guest joined through the relay in {:?}; forward {} (closed) for the host at {}",
+        w.joined_in, w.forward.public, w.forward.host
+    );
+    let hostname = w.hostname();
+    let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
+    let (mut up, proxy, _) = w.up("up");
+
+    let request = |w: &ForwardedWorld| -> Option<bool> {
+        let (code, mut s) = socks5_connect(proxy, &hostname, w.service_port);
+        if code != 0 {
+            return None;
+        }
+        let sent = w.forward.to_host();
+        echo_over(&mut s, &payload, Duration::from_secs(10))
+            .then(|| w.forward.to_host() - sent >= PAYLOAD as u64)
+    };
+
+    // Relayed first, observed.
+    let first = request(&w);
+    assert_eq!(
+        first,
+        Some(false),
+        "CANNOT MEASURE: the first request, with the forward closed, should have been answered over \
+         the anchor's circuit (Some(false)); it was {first:?}.\nup:\n{}",
+        up.transcript()
+    );
+    w.anchor.assert_relayed("after the first request");
+
+    // A direct path becomes possible; the pair's retry finds it.
+    w.forward.open();
+    let opened = Instant::now();
+    let mut direct_at = None;
+    while opened.elapsed() < UPGRADE_WITHIN {
+        std::thread::sleep(Duration::from_millis(500));
+        if request(&w) == Some(true) {
+            direct_at = Some(Instant::now());
+            break;
+        }
+    }
+    let Some(direct_at) = direct_at else {
+        panic!(
+            "CANNOT MEASURE: {UPGRADE_WITHIN:?} after the forward opened, no request rode it — there \
+             is no displaced relayed path to watch.\nup:\n{}",
+            up.transcript()
+        );
+    };
+    eprintln!(
+        "[proof] a request rode the direct path {:?} after the forward opened",
+        direct_at - opened
+    );
+
+    // The displaced circuit must be let go: the anchor's count falls to 0. Requests keep going
+    // meanwhile, each checked to ride the forward, so nothing is carried on the circuit.
+    let mut n = w.anchor.circuits(Duration::from_secs(1));
+    let mut requests = 0usize;
+    let mut over_circuit = 0usize;
+    while n > 0 && direct_at.elapsed() < LET_GO_WITHIN {
+        match request(&w) {
+            Some(true) => requests += 1,
+            Some(false) => over_circuit += 1,
+            None => {}
+        }
+        n = w.anchor.circuits(Duration::from_secs(1));
+    }
+    let took = direct_at.elapsed();
+    eprintln!(
+        "[proof] anchor circuits {n} at {took:?} after the direct path took over; {requests} requests \
+         rode the forward meanwhile, {over_circuit} the circuit"
+    );
+    assert_eq!(
+        over_circuit, 0,
+        "a request rode the circuit after the direct path took over — the displaced path was still \
+         in use, so letting it go is not what is being measured"
+    );
+    assert_eq!(
+        n,
+        0,
+        "NOT LET GO: the anchor still carries {n} circuit(s) {took:?} after the direct path took over, \
+         past the 60 s grace — a pair that went direct keeps its relay for good.\nanchor:\n{}",
+        w.anchor.proc.transcript()
+    );
+    interrupt(&mut up, Duration::from_secs(15));
+    drop(up);
+}
+
 /// RP-26 (#133) — **a better path displacing a worse one cuts nothing it carries**, through the
 /// shipped `vox`, on the staging above.
 ///
