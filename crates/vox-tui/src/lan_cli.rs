@@ -155,6 +155,8 @@ pub async fn up(
     _socket: std::path::PathBuf,
     _stats_file: Option<std::path::PathBuf>,
     _allow: std::collections::BTreeSet<u16>,
+    _say: &(dyn Fn(String) + Send + Sync),
+    _stop: impl std::future::Future<Output = ()>,
 ) -> Result<(), AppError> {
     Err(AppError::Usage(NOT_HERE.into()))
 }
@@ -540,8 +542,9 @@ mod mac {
     }
 
     /// Bring this node onto `channel_id`'s LAN through the helper on `socket`, and run it
-    /// until interrupted. With `stats_file`, the plan, the links and the counters are
-    /// written there as JSON twice a second.
+    /// until `stop`. With `stats_file`, the plan, the links and the counters are written there
+    /// as JSON twice a second. Run by the daemon as the node (ADR-026 S-5): what it has to say
+    /// goes to `say`, which carries it to the `vox lan up` that asked.
     ///
     /// # Errors
     /// If the node has no identity, the helper refuses, or the LAN cannot start.
@@ -551,12 +554,14 @@ mod mac {
         socket: PathBuf,
         stats_file: Option<PathBuf>,
         allow: std::collections::BTreeSet<u16>,
+        say: &(dyn Fn(String) + Send + Sync),
+        stop: impl std::future::Future<Output = ()>,
     ) -> Result<(), AppError> {
         let me = node
             .view()
             .identity
             .map(|i| i.fingerprint)
-            .ok_or_else(|| AppError::Usage("this profile has no identity".into()))?;
+            .ok_or_else(|| AppError::Usage("this node has no identity".into()))?;
         let plan = LanPlan::new(channel_id, &members(node, &channel_id));
         let mine = *plan
             .of(&me)
@@ -578,46 +583,43 @@ mod mac {
             || "no IPv4 (past 254 members)".to_owned(),
             |a| a.to_string(),
         );
-        println!(
+        say(format!(
             "vox lan up on {name} — this node is {v4} and {}; the room's LAN is {}/24 and {}/64",
             mine.v6, plan.subnet_v4, plan.prefix_v6
-        );
+        ));
         if allow.is_empty() {
-            println!(
+            say(format!(
                 "nothing on this machine is reachable over the LAN (discovery still flows); \
                  `--allow <port>,…` opens ports"
-            );
+            ));
         } else {
             let ports: Vec<String> = allow.iter().map(u16::to_string).collect();
-            println!("reachable over the LAN: ports {}", ports.join(", "));
+            say(format!("reachable over the LAN: ports {}", ports.join(", ")));
         }
-        println!("Ctrl-C to stop; the interface goes with it");
+        say("Ctrl-C to stop; the interface goes with it".to_owned());
         let mut linked: Vec<Digest32> = Vec::new();
         let mut moved_said = false;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
-        // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
-        // lands in the same turn as another arm (see `app::run_node`).
-        let interrupted = tokio::signal::ctrl_c();
-        tokio::pin!(interrupted);
+        tokio::pin!(stop);
         loop {
             tokio::select! {
-                _ = &mut interrupted => break,
+                () = &mut stop => break,
                 _ = tick.tick() => {
                     let s = lan.stats();
                     for m in s.links.iter().filter(|m| !linked.contains(m)) {
-                        println!("vox lan: linked with {}", b32_encode(m));
+                        say(format!("vox lan: linked with {}", b32_encode(m)));
                     }
                     for m in linked.iter().filter(|m| !s.links.contains(m)) {
-                        println!("vox lan: link to {} ended", b32_encode(m));
+                        say(format!("vox lan: link to {} ended", b32_encode(m)));
                     }
                     linked = s.links;
                     let now = lan.plan().of(&me).copied();
                     if now != Some(mine) && !moved_said {
                         moved_said = true;
-                        println!(
+                        say(format!(
                             "vox lan: a member joined whose address took precedence over this \
                              node's; restart `vox lan up` to take the new one"
-                        );
+                        ));
                     }
                     if let Some(p) = &stats_file {
                         write_stats(p, &stats_json(&name, &me, &lan, &allow));
@@ -626,22 +628,230 @@ mod mac {
             }
         }
         drop(lan);
-        println!("vox lan: down");
+        say("vox lan: down".to_owned());
         Ok(())
     }
 }
 
-/// `vox lan up <room>` as a client of the daemon (ADR-026 S-5).
+// ---- `vox lan up` through the daemon (ADR-026 S-5) ------------------------------------------
+
+/// A node's connection asks its daemon to run the LAN: `[T_LAN_UP, room, helper socket, stats
+/// file or "", allowed ports as "p,p"]`. Tags away from every IPC range.
+const T_LAN_UP: u64 = 4600;
+/// The daemon's line for the person: `[T_LAN_SAID, text]`.
+const T_LAN_SAID: u64 = 4601;
+/// The LAN could not start, and why: `[T_LAN_FAILED, text]`; the connection then closes.
+const T_LAN_FAILED: u64 = 4602;
+
+/// What `vox lan up` asks of the daemon.
+struct LanRequest {
+    channel_id: vox_core::hash::Digest32,
+    helper: std::path::PathBuf,
+    stats_file: Option<std::path::PathBuf>,
+    allow: std::collections::BTreeSet<u16>,
+}
+
+impl LanRequest {
+    fn to_bytes(&self) -> Vec<u8> {
+        let allow: Vec<String> = self.allow.iter().map(u16::to_string).collect();
+        let mut e = vox_core::cbor::Encoder::new();
+        e.array(5)
+            .uint(T_LAN_UP)
+            .bytes(&self.channel_id)
+            .text(&self.helper.to_string_lossy())
+            .text(
+                &self
+                    .stats_file
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .text(&allow.join(","));
+        e.finish()
+    }
+
+    fn parse(body: &[u8]) -> Option<Self> {
+        let mut d = vox_core::cbor::Decoder::new(body);
+        let (Ok(5), Ok(T_LAN_UP)) = (d.array(), d.uint()) else {
+            return None;
+        };
+        let channel_id = vox_core::hash::Digest32::try_from(d.bytes().ok()?).ok()?;
+        let helper = std::path::PathBuf::from(d.text().ok()?);
+        let stats = d.text().ok()?;
+        let allow = d
+            .text()
+            .ok()?
+            .split(',')
+            .filter(|p| !p.is_empty())
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        d.finish().ok()?;
+        Some(Self {
+            channel_id,
+            helper,
+            stats_file: (!stats.is_empty()).then(|| std::path::PathBuf::from(stats)),
+            allow,
+        })
+    }
+}
+
+/// One `[tag, text]` frame, length-prefixed as every control-socket frame is.
+fn line_frame(tag: u64, text: &str) -> Vec<u8> {
+    let mut e = vox_core::cbor::Encoder::new();
+    e.array(2).uint(tag).text(text);
+    let body = e.finish();
+    let mut framed = u32::try_from(body.len()).unwrap_or(0).to_be_bytes().to_vec();
+    framed.extend_from_slice(&body);
+    framed
+}
+
+/// The daemon's side of `vox lan up` (ADR-026 S-5): it asks the root helper for the device as
+/// this user, and runs the LAN as the node until the client's connection closes. The helper is
+/// unchanged; the account socket never admits root (C-1).
+pub struct LanUp;
+
+impl vox_core::node::ipc::Extension for LanUp {
+    fn claims(&self, body: &[u8]) -> bool {
+        let mut d = vox_core::cbor::Decoder::new(body);
+        matches!((d.array(), d.uint()), (Ok(5), Ok(T_LAN_UP)))
+    }
+
+    fn serve(
+        &self,
+        body: Vec<u8>,
+        stream: tokio::net::UnixStream,
+        handle: vox_core::node::actor::NodeHandle,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (mut r, mut w) = stream.into_split();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let writer = tokio::spawn(async move {
+                while let Some(frame) = rx.recv().await {
+                    if w.write_all(&frame).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let Some(req) = LanRequest::parse(&body) else {
+                let _ = tx.send(line_frame(T_LAN_FAILED, "that is not a LAN request"));
+                drop(tx);
+                let _ = writer.await;
+                return;
+            };
+            let said = tx.clone();
+            let say = move |line: String| {
+                let _ = said.send(line_frame(T_LAN_SAID, &line));
+            };
+            // The LAN lives exactly as long as the client's connection.
+            let stop = async move {
+                let mut b = [0u8; 1];
+                while matches!(r.read(&mut b).await, Ok(n) if n > 0) {}
+            };
+            let out = up(
+                &handle,
+                req.channel_id,
+                req.helper,
+                req.stats_file,
+                req.allow,
+                &say,
+                stop,
+            )
+            .await;
+            if let Err(e) = out {
+                let _ = tx.send(line_frame(T_LAN_FAILED, &e.to_string()));
+            }
+            drop(say);
+            drop(tx);
+            let _ = writer.await;
+        })
+    }
+}
+
+/// `vox lan up <room>`, a client of the daemon holding this node (ADR-026 S-5, L-7): it opens the
+/// room if a passphrase is given and it is closed, asks the daemon to run the LAN, and prints what
+/// the daemon says until it is stopped, or non-zero when the daemon goes.
 ///
 /// # Errors
-/// Always, until the daemon carries the LAN.
+/// The node not held, the room not open, or the LAN not started, with why.
 pub async fn up_held(
     paths: &vox_core::node::paths::Paths,
     args: &crate::cli::LanUpArgs,
     waiting: &crate::tunnel_cli::Waiting,
 ) -> Result<(), AppError> {
-    let _ = (paths, args, waiting);
-    Err(AppError::Usage(
-        "vox lan up is not carried by the vox daemon yet (ADR-026 S-5)".into(),
-    ))
+    if args.metrics.is_some() {
+        eprintln!(
+            "vox lan: --metrics is served by the vox daemon for every node: vox daemon --metrics \
+             <addr>"
+        );
+    }
+    let room = &args.room;
+    let room_pp = match &room.passphrase_file {
+        Some(f) => {
+            let text = crate::tunnel_cli::passphrase_file_text(f)?;
+            Some(text.lines().next().unwrap_or_default().to_owned())
+        }
+        None => None,
+    };
+    let mut held = crate::client::hold(
+        paths,
+        &room.profile,
+        crate::client::Pass {
+            flag: room.identity_passphrase.clone(),
+            file: room.identity_passphrase_file.clone(),
+        },
+        false,
+        Some(waiting),
+    )
+    .await?;
+    let channel_id =
+        crate::tunnel_cli::open_named_room(&mut held.client, &room.room, room_pp.as_deref())
+            .await?;
+    waiting.on("the daemon to bring the LAN up");
+    let (mut stream, _) = vox_core::node::ipc::open_as(&held.at)
+        .await
+        .map_err(|e| crate::client::said(&held.at, e))?;
+    let request = LanRequest {
+        channel_id,
+        helper: args.helper_socket.clone(),
+        stats_file: args.stats_file.clone().map(|p| {
+            if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir().map_or(p.clone(), |d| d.join(&p))
+            }
+        }),
+        allow: args.allow.iter().copied().collect(),
+    };
+    vox_core::node::ipc::write_frame(&mut stream, &request.to_bytes()).await?;
+    let closed = crate::client::hold_until_closed(&mut held.client);
+    tokio::pin!(closed);
+    loop {
+        tokio::select! {
+            why = &mut closed => return Err(why),
+            frame = vox_core::node::ipc::read_frame(&mut stream) => {
+                let Ok(Some(body)) = frame else {
+                    return Err((&mut closed).await);
+                };
+                let mut d = vox_core::cbor::Decoder::new(&body);
+                match (d.array(), d.uint(), d.text()) {
+                    (Ok(2), Ok(T_LAN_SAID), Ok(line)) => println!("{line}"),
+                    (Ok(2), Ok(T_LAN_FAILED), Ok(why)) => {
+                        return Err(AppError::Usage(why.to_owned()))
+                    }
+                    _ => match vox_core::node::ipc::Frame::from_bytes(&body) {
+                        Ok(vox_core::node::ipc::Frame::Error { reason }) => {
+                            return Err(AppError::Usage(reason))
+                        }
+                        _ => {
+                            return Err(AppError::Usage(
+                                "the daemon answered `vox lan up` with something else".into(),
+                            ))
+                        }
+                    },
+                }
+            }
+        }
+    }
 }

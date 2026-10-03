@@ -2646,7 +2646,7 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) {
     )
     .await;
     if greeted.is_ok() {
-        let _ = serve_requests(stream, &handle, &mut held, None).await;
+        let _ = serve_requests(stream, &handle, &mut held, None, None).await;
     }
     held.release(&handle).await;
 }
@@ -2676,6 +2676,7 @@ async fn serve_requests(
         crate::node::paths::NodeName,
         tokio::sync::watch::Receiver<bool>,
     )>,
+    extension: Option<std::sync::Arc<dyn Extension>>,
 ) -> Result<()> {
     let (node, mut watch) = match detached.take() {
         Some((node, rx)) => (Some(node), Some(rx)),
@@ -2706,6 +2707,15 @@ async fn serve_requests(
         // a join is the end of the join — it was still there when the lock reported done.
         // Measured through the shipped binary both times: one copy of a join's room passphrase.
         let body = zeroize::Zeroizing::new(body);
+        // ADR-026 S-5: a request the daemon serves itself takes the connection for good.
+        if let Some(ext) = extension.as_ref().filter(|e| e.claims(&body)) {
+            let serving = ext.serve(body.to_vec(), stream, handle.clone());
+            tokio::select! {
+                () = serving => {}
+                () = node_detached(&mut watch) => {}
+            }
+            return Ok(());
+        }
         // PRD-001 R20: resolving a `.vox` name serves on; `vox up` holds the connection.
         if let Some(req) = crate::node::nameipc::NameRequest::parse(&body) {
             let served = tokio::select! {
@@ -2812,6 +2822,23 @@ pub struct Lease {
     /// What the connection holds of the node (L-3, L-7): dropped when the connection ends, after
     /// what it opened is withdrawn, which may detach a node attached implicitly.
     pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
+    /// A request the daemon serves itself, beyond the node's vocabulary, if it has one.
+    pub extension: Option<std::sync::Arc<dyn Extension>>,
+}
+
+/// A request the daemon's own build serves on a node's connection, beyond what this crate knows:
+/// `vox lan up`, whose device comes from a root helper the daemon asks as its user (ADR-026 S-5).
+/// It takes the connection for the rest of its life, as an app request does.
+pub trait Extension: Send + Sync + 'static {
+    /// Whether `body`, a frame the client sent, is this extension's request.
+    fn claims(&self, body: &[u8]) -> bool;
+    /// Serve the request in `body` on `stream` as the node `handle`, until the client goes.
+    fn serve(
+        &self,
+        body: Vec<u8>,
+        stream: UnixStream,
+        handle: NodeHandle,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 }
 
 /// What the account socket asks of the daemon: implemented by its router.
@@ -2933,6 +2960,7 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
         handle,
         detached,
         hold,
+        extension,
     } = lease;
     let using = crate::node::daemonipc::DaemonFrame::Using {
         node: node.clone(),
@@ -2941,7 +2969,14 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
     let wrote = write_frame(&mut stream, &using.to_bytes()).await;
     let mut held = Held::default();
     if wrote.is_ok() {
-        let _ = serve_requests(stream, &handle, &mut held, Some((node, detached.clone()))).await;
+        let _ = serve_requests(
+            stream,
+            &handle,
+            &mut held,
+            Some((node, detached.clone())),
+            extension,
+        )
+        .await;
     }
     // A detached node has nothing left to withdraw from: its actor has stopped.
     if !*detached.borrow() {

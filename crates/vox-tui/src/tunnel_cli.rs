@@ -1163,7 +1163,7 @@ pub async fn up(
 }
 
 /// Open the room `prefix` names among the node's rooms with its passphrase, if it is closed.
-async fn open_named_room(
+pub(crate) async fn open_named_room(
     client: &mut IpcClient,
     prefix: &str,
     room_passphrase: Option<&str>,
