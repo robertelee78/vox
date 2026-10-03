@@ -27,9 +27,14 @@
 //! Everything runs as the shipped binary: the trusted member is another profile made with
 //! `vox id`, and its 32 bytes are only the printed fingerprint decoded, to search files for.
 //!
-//! **Mutation that must turn it red.** In `node::actor`'s `spawn_config`, open the profile's
-//! vault for a headless node again (`Profile::exists` without the `headless.is_none()` guard).
-//! The start fails with "another vox already has this profile open".
+//! **Mutations that must turn it red.** `vox node --serve trusted` writing the fingerprints it
+//! serves into its node directory in the clear: red on (2), naming the file.
+//!
+//! The one this proof was written for — `spawn_config` opening the vault for a headless node (no
+//! `headless.is_none()` guard) — **no longer turns it red** (measured 2026-10-03): since ADR-026
+//! a headless key and a vault are two nodes, and `vox node` runs as `nodes/default-anchor/`, which
+//! holds no vault, so there is nothing for that guard to keep it from opening. Assertion (1) still
+//! holds the start to its words.
 
 #![cfg(unix)]
 
