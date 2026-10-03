@@ -63,10 +63,6 @@ pub struct Defaults {
     pub listen: String,
     /// How long a node's stop may take before it is left (the daemon's shutdown patience).
     pub patience: Duration,
-    /// Also serve each attached node's own control socket (`nodes/<name>/node.sock`), as the
-    /// clients before ADR-026's account socket expect. **Interim**: removed once every client
-    /// speaks to the account socket (#406, ADR-026 C-1 says per-node sockets MUST NOT exist).
-    pub node_sockets: bool,
 }
 
 /// The daemon's router. Cheap to clone; every clone is the same router.
@@ -121,8 +117,6 @@ struct Attached {
     /// Turned `true` when its actor has ended, however.
     ended: watch::Receiver<bool>,
     fingerprint: Option<Digest32>,
-    /// The node's own control socket, while [`Defaults::node_sockets`] says to serve one.
-    _node_socket: Option<vox_core::node::ipc::IpcServer>,
 }
 
 /// How a node is wanted, and so how its attach counts.
@@ -743,17 +737,6 @@ impl Router {
             self.inner.defaults.anchor_specs.clone(),
         );
         let fingerprint = handle.view().identity.map(|i| i.fingerprint);
-        let node_socket = if self.inner.defaults.node_sockets {
-            match vox_core::node::ipc::bind(handle.clone(), &paths) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    stop_actor(&handle, ended.clone(), self.inner.defaults.patience).await;
-                    return Err(failed(format!("control socket: {e}")));
-                }
-            }
-        } else {
-            None
-        };
         Ok(Box::new(Attached {
             handle,
             paths,
@@ -766,7 +749,6 @@ impl Router {
             detached: watch::channel(false).0,
             ended,
             fingerprint,
-            _node_socket: node_socket,
         }))
     }
 
@@ -1134,7 +1116,6 @@ mod tests {
                 anchor_specs: Vec::new(),
                 listen: String::new(),
                 patience: Duration::from_secs(5),
-                node_sockets: false,
             },
         )
     }

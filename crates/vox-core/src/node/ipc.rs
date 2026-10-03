@@ -2960,7 +2960,12 @@ async fn serve_account<D: Dispatch>(
             let mut events = dispatch.events();
             write_frame(&mut stream, &DaemonFrame::Ok.to_bytes()).await?;
             loop {
-                match events.recv().await {
+                // Noticed even with no event to send (see `pump`).
+                let next = tokio::select! {
+                    next = events.recv() => next,
+                    () = subscriber_gone(&stream) => return Ok(()),
+                };
+                match next {
                     Ok(ev) => {
                         write_frame(&mut stream, &DaemonFrame::Event(ev).to_bytes()).await?;
                     }
@@ -3895,7 +3900,18 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
 /// stops. Any write failure ends **this** connection and nothing else — a client
 /// that died mid-stream shows up as `BrokenPipe` here (measured).
 async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
-    while let Some(item) = events.next().await {
+    loop {
+        // **A subscriber that hangs up is noticed on a quiet node too**: waiting only on events
+        // left its connection — and the hold it carries on its node (ADR-026 L-3) — open until
+        // the node next said something, which on a quiet node is never, so an auto-started daemon
+        // never reached its idle exit (L-8).
+        let item = tokio::select! {
+            item = events.next() => item,
+            () = subscriber_gone(&stream) => return Ok(()),
+        };
+        let Some(item) = item else {
+            return Ok(());
+        };
         let frame = match item {
             EventStreamItem::Event(ev) => Frame::Event(ev),
             EventStreamItem::Lagged(missed) => Frame::Lagged { missed },
@@ -3904,7 +3920,23 @@ async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
             return Ok(());
         }
     }
-    Ok(())
+}
+
+/// Resolves once the client of a subscription has gone: its end of `stream` is closed or failed.
+/// A subscriber sends nothing after subscribing; anything it does send is read and dropped.
+pub(crate) async fn subscriber_gone(stream: &UnixStream) {
+    let mut buf = [0u8; 256];
+    loop {
+        if stream.readable().await.is_err() {
+            return;
+        }
+        match stream.try_read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return,
+        }
+    }
 }
 
 // ---- client ----------------------------------------------------------------
