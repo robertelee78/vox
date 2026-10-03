@@ -20,7 +20,7 @@ use vox_core::node::daemonipc::{
     AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, Refusal, UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, Request};
-use vox_core::node::paths::{Account, NodeName, DEFAULT_PROFILE};
+use vox_core::node::paths::{Account, NodeName};
 use zeroize::Zeroizing;
 
 use crate::app::{
@@ -170,6 +170,13 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 return Ok(());
             }
         }
+        None if !args.as_detached && account.nodes_on_disk().is_empty() => {
+            eprintln!(
+                "vox daemon: no node here yet, so it runs with none; nodes attach to it as they \
+                 are made and used"
+            );
+            println!("vox daemon: control socket {}", account.socket().display());
+        }
         None if !args.as_detached => {
             let nodes = account.nodes_on_disk();
             eprintln!(
@@ -215,7 +222,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             () = idle => None,
         }
     });
-    stop_daemon(rt, &router, signal)
+    stop_daemon(rt, &router, &serving.presence, signal)
 }
 
 /// What a daemon that holds its account runs: its router, its account socket and its lock, each
@@ -223,6 +230,8 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
 pub(crate) struct Serving {
     /// The router.
     pub router: Router,
+    /// The daemon's one presence, closed when it stops (N-43).
+    pub presence: Arc<vox_core::node::presence::NetPresence>,
     _socket: vox_core::node::ipc::IpcServer,
     _lock: Arc<Mutex<std::fs::File>>,
 }
@@ -264,11 +273,30 @@ pub(crate) fn take_account(
                 .map_err(|e| AppError::Usage(e.to_string()))?;
         }
     }
+    // **The daemon's one presence** (ADR-026 D-3, ADR-012 N-41–N-45): one socket and endpoint
+    // for every node it attaches, on the data root's kept port (`.daemon/port`), with the relay
+    // limits of `.daemon/config`.
+    let limits = vox_core::node::circuitstream::RelayLimits::read(&account.daemon_config_file())
+        .map_err(AppError::Usage)?;
+    let presence = rt
+        .block_on(async {
+            let (shared, moved) = vox_core::node::presence::NetPresence::bind_kept(
+                listen,
+                &account.port_file(),
+                None,
+            )?;
+            if let Some(moved) = moved {
+                eprintln!("vox daemon: {moved}");
+            }
+            Ok::<_, vox_core::error::Error>(vox_core::node::presence::NetPresence::start(shared))
+        })
+        .map_err(|e| AppError::Usage(format!("listen on {listen}: {e}")))?;
+    presence.ledger().set_limits(limits);
     let router = Router::new(
         account.clone(),
         rt.handle().clone(),
         Defaults {
-            bind: listen_once(listen),
+            bind: shared_presence(&presence),
             anchors,
             anchor_specs: anchor_specs.to_vec(),
             listen: listen.to_string(),
@@ -283,6 +311,7 @@ pub(crate) fn take_account(
         .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
     Ok(Some(Serving {
         router,
+        presence,
         _socket: socket,
         _lock: lock,
     }))
@@ -297,39 +326,26 @@ fn named_node(args: &DaemonArgs) -> Result<Option<NodeName>, AppError> {
         .transpose()
 }
 
-/// The foreground node (C-3): the named one, else the only node on disk, else `default` when
-/// there is none (its attach then says to make an identity), else none.
+/// The foreground node (C-3): the named one, else the only node on disk, else none. **A daemon
+/// runs with zero nodes** (ADR-026 D-2): an empty data root, or several nodes and none named,
+/// starts it with none, and nothing is asked for; a passphrase is read only for a node it attaches.
 fn resolve(account: &Account, named: Option<NodeName>) -> Option<NodeName> {
     if named.is_some() {
         return named;
     }
     let mut on_disk = account.nodes_on_disk();
     match on_disk.len() {
-        0 => NodeName::parse(DEFAULT_PROFILE).ok(),
         1 => on_disk.pop(),
         _ => None,
     }
 }
 
-/// Where each node binds: the daemon's `--listen` for the first node attached, and the same
-/// address on a port of its own for every later one. **Interim** until the daemon's one shared
-/// presence (ADR-026 D-3, #403) replaces it.
-fn listen_once(listen: std::net::SocketAddr) -> crate::host::BindFor {
-    let owner: Arc<Mutex<Option<NodeName>>> = Arc::default();
-    Arc::new(move |node: &NodeName| {
-        let mut o = owner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let addr = match o.as_ref() {
-            None => {
-                *o = Some(node.clone());
-                listen
-            }
-            Some(first) if first == node => listen,
-            Some(_) => std::net::SocketAddr::new(listen.ip(), 0),
-        };
-        Some(Bind::Addr(addr))
-    })
+/// Where each node binds: **the daemon's one presence**, for every node (ADR-026 D-3). Every
+/// attached node is answered at the same ip:port, by the identity exchange; none binds a socket of
+/// its own.
+fn shared_presence(presence: &Arc<vox_core::node::presence::NetPresence>) -> crate::host::BindFor {
+    let presence = Arc::clone(presence);
+    Arc::new(move |_: &NodeName| Some(Bind::Shared(Arc::clone(&presence))))
 }
 
 /// Write this daemon's pid into the lock file, so a person (or a proof) can see which process
@@ -362,6 +378,14 @@ fn attach_foreground(
     router: &Router,
     node: &NodeName,
 ) -> Result<Option<crate::app::StopSignal>, AppError> {
+    // Named and not here: refused before any passphrase is asked for.
+    if !account.nodes_on_disk().contains(node) {
+        return Err(AppError::Usage(format!(
+            "there is no node {node} here, so there is nothing to attach.\n\
+             \x20      Make one:  vox node create {node}\n\
+             \x20      Then start the daemon again."
+        )));
+    }
     let interactive = args.passphrase_file.is_none()
         && daemon_env_passphrase().is_none()
         && io::IsTerminal::is_terminal(&io::stdin());
@@ -458,6 +482,7 @@ fn refusal_words(r: &Refusal, account: &Account, node: &NodeName) -> String {
 pub(crate) fn stop_daemon(
     rt: tokio::runtime::Runtime,
     router: &Router,
+    presence: &vox_core::node::presence::NetPresence,
     signal: Option<crate::app::StopSignal>,
 ) -> Result<(), AppError> {
     let why = signal.map_or_else(|| "request".to_owned(), |s| s.name().to_owned());
@@ -466,9 +491,13 @@ pub(crate) fn stop_daemon(
     }
     let patience = shutdown_patience();
     let finished = rt.block_on(async {
-        tokio::time::timeout(patience + Duration::from_millis(500), router.stop_all())
-            .await
-            .unwrap_or(false)
+        let finished =
+            tokio::time::timeout(patience + Duration::from_millis(500), router.stop_all())
+                .await
+                .unwrap_or(false);
+        // Every node is detached: the presence goes, and with it the port mapping (N-43).
+        presence.close().await;
+        finished
     });
     // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync
     // session runs on one.

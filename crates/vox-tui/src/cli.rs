@@ -1641,25 +1641,32 @@ enum Cmd {
     ///
     /// Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Node(AnchorArgs),
-    /// Run this profile's node without a terminal, so agent sessions can attach
-    /// (ADR-020 §12).
+    /// Run this data root's daemon in the foreground: the machine's Vox presence, which the
+    /// nodes in this data root attach to (ADR-026).
     ///
-    /// The TUI is the only other thing that serves the agent-comms control socket,
-    /// and it needs a terminal and locks the node when that terminal goes away. A
-    /// `vox node` is an anchor: it holds no room and can read nothing. This is the
-    /// third shape — an unlocked node holding this profile's rooms, serving the
-    /// socket, with nothing attached to a tty.
+    /// There is one daemon per data root (`VOX_DATA_DIR`). It holds the one UDP port, the
+    /// control socket every other `vox` command talks to (`<data root>/.daemon/vox.sock`) and
+    /// the nodes that are attached. It is not a node itself and can run with none attached.
+    /// A node is an identity; while attached it runs in full, and it stops only when it is
+    /// detached (`vox node detach`) or the daemon stops.
     ///
-    /// At a terminal it asks for the identity passphrase, without echo, and serves once
-    /// it is typed. Otherwise it takes it from `VOX_IDENTITY_PASSPHRASE`, or
-    /// `--passphrase-file`, or stdin:
+    /// With `--node`, or when the data root holds exactly one node, that node is attached in
+    /// the foreground once its passphrase is given: from `--passphrase-file`, else
+    /// `VOX_IDENTITY_PASSPHRASE`, else asked for at the terminal without echo, else read from
+    /// stdin:
     ///
     /// ```text
-    /// echo 'my passphrase' | vox daemon
+    /// echo 'my passphrase' | vox daemon --node alice
     /// ```
     ///
-    /// Unlike the TUI it does not lock on SIGHUP: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each
-    /// stops it cleanly.
+    /// `--keep` attaches that node again whenever the daemon starts. When a daemon already runs
+    /// for this data root, a `vox daemon --node <name>` attaches the node to it instead.
+    ///
+    /// You rarely need to start it by hand: `vox serve`, `connect`, `up`, `forward`,
+    /// `lan up`, `vox node attach` and the TUI start one in the background when none runs, and
+    /// that one exits when it has no node and no client left. One started here runs until
+    /// stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each detaches every node cleanly
+    /// and stops it.
     Daemon(DaemonArgs),
     /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
     ///

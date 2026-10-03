@@ -820,7 +820,7 @@ pub fn run_node(
     });
     println!("vox node: stopped by {}", signal.name());
     println!("vox node: shutting down");
-    let stopped = crate::daemon::stop_daemon(rt, &router, Some(signal));
+    let stopped = crate::daemon::stop_daemon(rt, &router, &serving.presence, Some(signal));
     drop(serving);
     stopped
 }

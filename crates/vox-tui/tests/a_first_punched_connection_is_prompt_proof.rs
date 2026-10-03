@@ -208,6 +208,14 @@ impl NatWorld {
     }
 
     fn up(&self, name: &str) -> (VoxProc, SocketAddr, Instant) {
+        // **A port of its own, given explicitly**, so each sample is cold behind a new NAT mapping.
+        // Asked for port 0, the guest binds the port its data root kept (V210-167, ADR-012 N-42):
+        // every `vox up` then came from the same inside address as the staging's `vox connect`, so
+        // its NAT mapping — and the host NAT's filter for it — were the ones the join had already
+        // opened, the pair went direct with nothing dropped, and this proof's own check said the
+        // filter was not in the way (on the base too). An explicit port is bound as given and not
+        // recorded.
+        let listen = format!("[::1]:{}", fresh_v6_port());
         let mut up = VoxProc::spawn(
             name,
             &self.guest_dir,
@@ -221,7 +229,7 @@ impl NatWorld {
                 "--anchor",
                 &self.guest_spec,
                 "--listen",
-                "[::1]:0",
+                &listen,
             ]),
         );
         let line = up.expect_line("the proxy's bound address", |l| l.starts_with("vox up on "));
@@ -260,6 +268,14 @@ fn free_in_both_families() -> u16 {
         }
     }
     panic!("APPARATUS: no UDP port was free in both families in 64 tries");
+}
+
+/// A UDP port on `[::1]` free now, for one sample's `vox up`.
+fn fresh_v6_port() -> u16 {
+    UdpSocket::bind("[::1]:0")
+        .and_then(|s| s.local_addr())
+        .unwrap_or_else(|e| panic!("APPARATUS: bind a UDP socket on [::1]:0: {e}"))
+        .port()
 }
 
 fn interrupt(p: &mut VoxProc) {
@@ -423,7 +439,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
             },
             direct_at.map_or_else(|| "NEVER".to_owned(), |_| format!("{d:?}"))
         );
-        if direct_at.is_none() {
+        if direct_at.is_none() || filtered == 0 {
             // Say which side sent what, so a red names its cause rather than a timeout.
             let ev: Vec<_> = w
                 .nats
@@ -437,14 +453,19 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
                     .count()
             };
             eprintln!(
-                "[proof] sample {i} never punched: host → guest {} delivered / {} dropped; guest → \
+                "[proof] sample {i} ({}): host → guest {} delivered / {} dropped; guest → \
                  host {} delivered / {} dropped",
+                if direct_at.is_none() {
+                    "never punched"
+                } else {
+                    "direct with nothing dropped"
+                },
                 count(true, true),
                 count(true, false),
                 count(false, true),
                 count(false, false)
             );
-            for e in ev.iter().take(12) {
+            for e in ev.iter().take(40) {
                 eprintln!(
                     "[proof]   +{:?} {} {} → {} {} ({} B)",
                     e.at.duration_since(ready),

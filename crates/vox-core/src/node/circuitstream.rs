@@ -280,10 +280,73 @@ pub struct CircuitLedger {
     inner: Mutex<LedgerInner>,
 }
 
+/// The relay limits of one presence (ADR-012 N-45): how many circuits it carries in all, and for
+/// any one asker. Read from the daemon's `.daemon/config` (ADR-026 F-2) as `relay-circuits = N`
+/// and `relay-circuits-per-asker = N`; either one missing keeps its default
+/// ([`MAX_RELAYED_CIRCUITS`], [`MAX_CIRCUITS_PER_ASKER`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayLimits {
+    /// Circuits carried at once, in all.
+    pub total: usize,
+    /// Circuits carried at once for any one asker.
+    pub per_asker: usize,
+}
+
+impl Default for RelayLimits {
+    fn default() -> Self {
+        Self {
+            total: MAX_RELAYED_CIRCUITS,
+            per_asker: MAX_CIRCUITS_PER_ASKER,
+        }
+    }
+}
+
+impl RelayLimits {
+    /// The limits a `.daemon/config` text sets: `key = value` lines, `#` comments; other keys
+    /// belong to other settings and are left alone.
+    ///
+    /// # Errors
+    /// A relay key whose value is not a whole number, in words naming the key and the value.
+    pub fn parse(text: &str) -> std::result::Result<Self, String> {
+        let mut limits = Self::default();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            let slot = match key {
+                "relay-circuits" => &mut limits.total,
+                "relay-circuits-per-asker" => &mut limits.per_asker,
+                _ => continue,
+            };
+            *slot = value.parse().map_err(|_| {
+                format!(
+                    "{key} = {value:?} in the daemon's config is not a whole number of circuits"
+                )
+            })?;
+        }
+        Ok(limits)
+    }
+
+    /// The limits in the file at `path`; the defaults when there is no such file.
+    ///
+    /// # Errors
+    /// As [`Self::parse`], with the file named.
+    pub fn read(path: &std::path::Path) -> std::result::Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(_) => Ok(Self::default()),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct LedgerInner {
     total: usize,
     per_asker: BTreeMap<Digest32, usize>,
+    /// The limits set for this ledger; `None` is the default.
+    limits: Option<RelayLimits>,
 }
 
 /// One relayed circuit's place in the ledger.
@@ -299,7 +362,8 @@ impl CircuitLedger {
     pub fn take(self: &Arc<Self>, asker: Digest32) -> Option<CircuitSlot> {
         let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let mine = g.per_asker.get(&asker).copied().unwrap_or(0);
-        if g.total >= MAX_RELAYED_CIRCUITS || mine >= MAX_CIRCUITS_PER_ASKER {
+        let limits = g.limits.unwrap_or_default();
+        if g.total >= limits.total || mine >= limits.per_asker {
             return None;
         }
         g.total += 1;
@@ -308,6 +372,24 @@ impl CircuitLedger {
             asker,
             ledger: Arc::clone(self),
         })
+    }
+
+    /// Hold this ledger to `limits` from now on (circuits already carried stay).
+    pub fn set_limits(&self, limits: RelayLimits) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .limits = Some(limits);
+    }
+
+    /// The limits this ledger holds to.
+    #[must_use]
+    pub fn limits(&self) -> RelayLimits {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .limits
+            .unwrap_or_default()
     }
 
     /// How many circuits are being carried right now.
