@@ -219,7 +219,7 @@ fn lost_claims(
     now: &std::collections::BTreeSet<String>,
 ) -> Vec<String> {
     use vox_agentcomms::claim::{self, State};
-    let own_last = |resource: &str| {
+    let own_ops = |resource: &str| -> Vec<&vox_agentcomms::claim::Posted> {
         snap.posted
             .iter()
             .filter(|p| {
@@ -228,8 +228,29 @@ fn lost_claims(
                     && p.envelope.data.get("resource").and_then(|v| v.as_str()) == Some(resource)
                     && claim::is_claim_protocol(&p.envelope)
             })
+            .collect()
+    };
+    let own_last = |resource: &str| {
+        own_ops(resource)
+            .into_iter()
             .max_by_key(|p| (p.created_millis, p.entry_hash))
             .map(|p| p.envelope.kind.clone())
+    };
+    // **Lost to a claim that crossed it**, not lapsed (V210-168): no claim this session made on
+    // it since it last let it go (released or handed it off) applied, because another was ordered first
+    // in the room's order. One that applied and then ran out lapsed, even if the session claimed
+    // it again while it held it (that repeat folds `Lost`: it found the resource held, by itself).
+    // A holding the session ended itself says nothing about the claims it made after.
+    let crossed = |resource: &str| {
+        let mut ops = own_ops(resource);
+        ops.sort_by_key(|p| (p.created_millis, p.entry_hash));
+        let since = ops
+            .iter()
+            .rposition(|p| matches!(p.envelope.kind.as_str(), claim::RELEASE | claim::HANDOFF))
+            .map_or(0, |i| i + 1);
+        ops[since..]
+            .iter()
+            .all(|p| snap.fold.outcomes.get(&p.entry_hash) != Some(&claim::Outcome::Applied))
     };
     use vox_agentcomms::envelope::{shown, MAX_RESOURCE, SHOWN_NAME};
     // Sessions and resources are the authors' own text: on one line and cut, so none can
@@ -248,11 +269,24 @@ fn lost_claims(
                 Some(claim::RELEASE | claim::HANDOFF)
             )
         })
-        .map(|r| (shown(r, MAX_RESOURCE), snap.fold.resources.get(r.as_str())))
-        .map(|(r, state)| match state {
+        .map(|r| (crossed(r), r))
+        .map(|(crossed, r)| {
+            (
+                crossed,
+                shown(r, MAX_RESOURCE),
+                snap.fold.resources.get(r.as_str()),
+            )
+        })
+        .map(|(crossed, r, state)| match state {
             // Only the holder can release or hand off, and those were filtered out
             // above, so a claim that is gone and not by this session's own act LAPSED
-            // first; what state it is in now is the rest of the news.
+            // first, or never applied because one that crossed it was ordered first; what state
+            // it is in now is the rest of the news.
+            Some(State::Held { owner, .. }) if crossed => format!(
+                "You do not hold `{r}`: {} claimed it too, and the room orders their claim \
+                 before yours, so they hold it. Stop work on it.",
+                who(&owner.author, &owner.session)
+            ),
             Some(State::Held { owner, .. }) => format!(
                 "You no longer hold `{r}`: your claim lapsed, and it is now held by {}. \
                  Stop work on it.",
