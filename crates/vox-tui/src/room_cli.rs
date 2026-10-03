@@ -633,9 +633,32 @@ pub async fn post_cmd(
             Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
             Err(e) => return Err(AppError::Usage(e.to_string())),
         };
+        // When each last posted as an agent: the room's structured posts, by author.
+        use vox_agentcomms::envelope::{work, SAY};
+        let kinds = [
+            SAY,
+            work::ASSIGN,
+            work::ACCEPT,
+            work::DECLINE,
+            work::WORKING,
+            work::BLOCKED,
+            work::STATUS,
+            work::RESULT,
+            work::FAILED,
+            work::ASK,
+            work::ANSWER,
+        ];
+        let rows = coord::structured(&mut client, cid, &kinds, &[]).await?;
         others
             .iter()
-            .map(|fp| reach_of(&posting.after, fp, draft.urgent, &outbound, &inbound))
+            .map(|fp| {
+                let last = rows
+                    .iter()
+                    .filter(|r| r.author == *fp)
+                    .map(|r| r.created_millis)
+                    .max();
+                reach_of(&posting.after, fp, last, draft.urgent, &outbound, &inbound)
+            })
             .collect()
     };
     // **A `result` says what it has not read** (ADR-021 M21.10). A redirect addressed
@@ -695,7 +718,7 @@ pub async fn post_cmd(
 
 /// What a sender can expect of one other node it addressed (V030-17): whether any of its
 /// sessions has announced itself in this room, whether an urgent message can interrupt one, when
-/// it last took part in work, and trust in each direction. Only what this node can see: it never
+/// it last posted as an agent, and trust in each direction. Only what this node can see: it never
 /// says a reply is overdue, because it cannot see another node's reads.
 struct Reach {
     /// The node, as this node names it.
@@ -703,7 +726,7 @@ struct Reach {
     /// The `data.wake` of each of its sessions' `hello`s still in force (no later `bye`): `""`
     /// for a hello that did not say. Empty when none announced itself.
     wakes: Vec<String>,
-    /// When it last posted on work coordination, ms since the epoch.
+    /// When it last posted as an agent (a structured post), ms since the epoch.
     last_posted: Option<u64>,
     /// Whether this identity consents to it reading, and it to this identity.
     you_trust: bool,
@@ -737,11 +760,13 @@ fn ago(now: u64, then: u64) -> String {
     }
 }
 
-/// [`Reach`] for the node `fp`, from `snap`, the room after the post, and this identity's
+/// [`Reach`] for the node `fp`, from `snap`, the room after the post, when it `last_posted`, and
+/// this identity's
 /// consents in the room in each direction.
 fn reach_of(
     snap: &coord::Snapshot,
     fp: &Digest32,
+    last_posted: Option<u64>,
     urgent: bool,
     outbound: &[Digest32],
     inbound: &[Digest32],
@@ -767,10 +792,6 @@ fn reach_of(
                 .to_owned()
         })
         .collect();
-    let last_posted = theirs()
-        .filter(|p| p.envelope.kind != HELLO && p.envelope.kind != BYE)
-        .map(|p| p.created_millis)
-        .max();
     let mut parts = Vec::new();
     if wakes.is_empty() {
         parts.push("none of its sessions has announced itself in this room".to_owned());
@@ -808,7 +829,7 @@ fn reach_of(
         .to_owned(),
     );
     if let Some(t) = last_posted {
-        parts.push(format!("last posted on work {} ago", ago(snap.now_millis, t)));
+        parts.push(format!("last posted {} ago", ago(snap.now_millis, t)));
     }
     Reach {
         name: crate::ident::name_of(fp),

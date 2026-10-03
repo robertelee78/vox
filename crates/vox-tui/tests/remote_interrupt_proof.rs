@@ -1524,7 +1524,7 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
 ///
 /// 1. the `hello` alice reads says `data.wake` is `turn`;
 /// 2. alice is told, for bob, "urgent will not interrupt it", that each side trusts the other,
-///    and when it last posted on work;
+///    and when it last posted;
 /// 3. for carol, "none of its sessions has announced itself in this room";
 /// 4. nothing she is told says "overdue": her node cannot see another node's reads.
 ///
@@ -1566,8 +1566,9 @@ fn a_sender_is_told_how_each_addressee_can_be_reached() {
     );
 
     // ---- (1) alice's node reads bob's hello, which says how that session is reached ----
-    let is_hello =
-        |row: &serde_json::Value| row["envelope"]["type"] == "hello" && row["envelope"]["from"] == "codex-thread-1";
+    let is_hello = |row: &serde_json::Value| {
+        row["envelope"]["type"] == "hello" && row["envelope"]["from"] == "codex-thread-1"
+    };
     let read = until(
         alice,
         None,
@@ -1593,12 +1594,14 @@ fn a_sender_is_told_how_each_addressee_can_be_reached() {
     let o = alice.vox_in(
         Some("alice-session"),
         &[
-            "room", "post", &room, "--type", "ask", "--to", "bob", "--to", "carol", "--urgent",
-            "-",
+            "room", "post", &room, "--type", "ask", "--to", "bob", "--to", "carol", "--urgent", "-",
         ],
         Some("can you look at this now?"),
     );
-    assert!(o.ok, "PRODUCT: alice's urgent `vox room post --to` failed: {o:?}");
+    assert!(
+        o.ok,
+        "PRODUCT: alice's urgent `vox room post --to` failed: {o:?}"
+    );
     let told = |name: &str| {
         o.stderr
             .lines()
@@ -1625,8 +1628,8 @@ fn a_sender_is_told_how_each_addressee_can_be_reached() {
          {to_bob}"
     );
     assert!(
-        to_bob.contains("last posted on work "),
-        "PRODUCT: bob's session posted on work, and alice must be told when: {to_bob}"
+        to_bob.contains("last posted "),
+        "PRODUCT: bob's session posted, and alice must be told when: {to_bob}"
     );
     assert!(
         to_carol.contains("none of its sessions has announced itself in this room"),
