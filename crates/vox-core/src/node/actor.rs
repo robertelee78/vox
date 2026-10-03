@@ -210,6 +210,7 @@ fn summary_of(ch: &ChannelState) -> ChannelSummary {
 /// added since when it has (V210-120). A room's timeline only grows at its end, so the published
 /// one is a prefix of it: rebuilding it whole made every message cost the room's whole history.
 fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
+    let (frozen, refused_below_checkpoint) = ch.fork_watch();
     // A room with a message not received yet (V030-10) is shown with it in place, rebuilt each
     // time: filling one in changes a row inside the timeline, so the published one is no longer
     // a prefix of it. Only a timeline with none on either side may be shared or extended.
@@ -264,6 +265,10 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         creator: ch.genesis().creator_pubkey().fingerprint(),
         consented: ch.consented().into_iter().collect(),
         consenting: ch.consenting().into_iter().collect(),
+        retention: ch.effective_retention(),
+        key_generations: ch.key_generations(),
+        frozen,
+        refused_below_checkpoint,
     }
 }
 
@@ -3508,6 +3513,9 @@ pub struct Node {
     /// happens, not only when it is next redialled (#229's diagnostics). The connection, not
     /// only the anchor: one lost and replaced between two looks is still a loss (V210-93).
     anchors_up: BTreeMap<Digest32, Arc<VoxConnection>>,
+    /// Per anchor this node keeps and did not hold a connection to at the last look: since when
+    /// (unix seconds). What `vox status` and the notifier read (PRD-001 R37).
+    anchor_unreached_since: BTreeMap<Digest32, u64>,
     /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
     sync_dials: BTreeSet<Digest32>,
     /// When the granted mappings must be renewed (unix seconds), or `None` when there
@@ -4024,6 +4032,7 @@ impl Node {
             anchor_window: BTreeMap::new(),
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeMap::new(),
+            anchor_unreached_since: BTreeMap::new(),
             sync_dials: BTreeSet::new(),
             renew_mappings_at: None,
             records_renew_at: BTreeMap::new(),
@@ -5491,6 +5500,14 @@ impl Node {
             self.say_anchor_lost(&net, id, &conn, silent.get(&id).copied());
         }
         self.anchors_up = watched;
+        let me = net.local_id();
+        self.anchor_unreached_since
+            .retain(|id, _| known.iter().any(|(k, _)| k == id) && !up.contains_key(id));
+        for (id, _) in &known {
+            if *id != me && !up.contains_key(id) {
+                self.anchor_unreached_since.entry(*id).or_insert(now);
+            }
+        }
         for (id, candidates) in known {
             if id == net.local_id() || up.contains_key(&id) {
                 continue;
@@ -10153,6 +10170,13 @@ impl Node {
         recv: quinn::RecvStream,
     ) {
         use crate::node::syncstream::accept_sync;
+        // The mutant build's `refuse-sessions` (#85): every inbound session refused, with a reason.
+        #[cfg(feature = "mutant-sender")]
+        if let Some(code) = crate::log::sync::mutant::refuses() {
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream_because(&mut send, &mut recv, code);
+            return;
+        }
         // **Full duplex** (ADR-025 D4, the decider's option C): an inbound session is admitted
         // beside this side's own outbound one for the same room and peer, so two members that post
         // at once no longer refuse each other and retry at random (a hub's CSMA/CD). Up to
@@ -12789,25 +12813,17 @@ impl Node {
                     last_sync: self.status.member_synced.get(m).copied(),
                 })
                 .collect();
-            let watch = self
-                .channels
-                .get(&room.channel_id)
-                .and_then(|shared| shared.try_lock().ok().map(|c| c.fork_watch()));
+            // From the room as last published, never its lock: a sync session holds that lock
+            // while it runs, and a status read must not wait on it or come back blank (#58).
             report.rooms.push(RoomStatus {
                 id: room.channel_id,
                 name: room.local_name.clone(),
                 epoch: room.epoch,
                 last_sync: self.status.room_synced.get(&room.channel_id).copied(),
-                retention: self
-                    .channels
-                    .get(&room.channel_id)
-                    .and_then(|shared| shared.try_lock().ok().map(|c| c.effective_retention())),
-                key_generations: self
-                    .channels
-                    .get(&room.channel_id)
-                    .and_then(|shared| shared.try_lock().ok().map(|c| c.key_generations())),
-                frozen: watch.as_ref().map(|(f, _)| f.clone()),
-                refused_below_checkpoint: watch.map(|(_, n)| n),
+                retention: room.retention,
+                key_generations: room.key_generations,
+                frozen: room.frozen.clone(),
+                refused_below_checkpoint: room.refused_below_checkpoint,
                 members,
             });
         }
@@ -12842,6 +12858,16 @@ impl Node {
                 host: f.host,
                 service_tag: f.service_tag.clone(),
                 local: f.local,
+            })
+            .collect();
+        let me_net = self.net.as_ref().map(|n| n.local_id());
+        report.anchors = self
+            .kept_anchors()
+            .into_iter()
+            .filter(|(id, _)| Some(*id) != me_net)
+            .map(|(id, _)| crate::node::status::AnchorStatus {
+                id,
+                unreached_since: self.anchor_unreached_since.get(&id).copied(),
             })
             .collect();
         report.diagnose();
@@ -12975,6 +13001,9 @@ impl Node {
         };
         let mut pruned = 0usize;
         let mut checkpointed: Vec<Digest32> = Vec::new();
+        // A node retention applied here changes what `vox status` reports from the published
+        // view, so it is published even when it prunes nothing yet.
+        let mut applied = false;
         for (cid, shared) in &self.channels {
             // A room mid-session is skipped, not waited for: the actor must not park behind a
             // sync, and the next tick comes round in a second.
@@ -12983,6 +13012,7 @@ impl Node {
             };
             if self.retention_dirty.remove(cid) {
                 ch.set_node_retention(self.node_retention.for_room(cid));
+                applied = true;
             }
             let here = ch.sweep_retention(&store, now).unwrap_or(0);
             pruned += here;
@@ -13005,7 +13035,7 @@ impl Node {
         for cid in &checkpointed {
             self.note_local_append(cid);
         }
-        pruned > 0 || !checkpointed.is_empty()
+        pruned > 0 || !checkpointed.is_empty() || applied
     }
 
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {

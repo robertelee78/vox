@@ -36,7 +36,8 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
 
 - **T-1. Per-stream forward and SOCKS, primary.**
   - A node MUST offer `vox forward`, which forwards one local port to one member's service, and
-    `vox up`, a SOCKS5 proxy that resolves `.vox` names (ADR-017 decision 5).
+    `vox up`, a SOCKS5 proxy that resolves `.vox` names (ADR-017 decision 5). Only
+    `service.node.room.vox` connects; `node.room.vox` and `room.vox` resolve to nothing (ADR-017).
   - Both MUST work without privilege.
   - The port in a `.vox` request is a Vox-layer identifier that the host MUST translate to the local
     endpoint it declared. It binds nothing on the host.
@@ -98,7 +99,7 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   priority.
 - **T-12. UDP.** A UDP service MUST be tunneled as `udp/<port>`: a datagram flow bound to its tunnel
   stream after the same gate (ADR-022 decision 6, M22.3/M22.4). This covers `vox serve 53/udp`,
-  `vox forward <name>.vox 53/udp <port>` and SOCKS5 `UDP ASSOCIATE` in `vox up`.
+  `vox forward <service>.<node>.<room>.vox 53/udp <port>` and SOCKS5 `UDP ASSOCIATE` in `vox up`.
 - **T-13. The request names its room (M16.1).** A tunnel request MUST be `[channel_id, service_tag]`,
   and the host MUST resolve services per `(room, tag)`. A host MUST answer an unauthorized peer, an
   unknown room, an unknown service and a failed local connect with the same `TunnelStatus::Denied`,
