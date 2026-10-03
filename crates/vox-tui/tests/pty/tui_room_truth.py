@@ -225,13 +225,15 @@ try:
     # Bob's node releases its key to Alice on its own (he trusts her): wait for that before
     # judging Carol.
     ALICE, CAROL = "trusted · reads you", "not trusted · you don't read each other"
-    alice_ok = tui.until(lambda: (label_of("alice")[0] or "").strip() == ALICE, 60, 1)
+    # The pane's border is part of the row: the label is what sits between its edges.
+    bare = lambda row: (row or "").strip().strip("│").strip()
+    alice_ok = tui.until(lambda: bare(label_of("alice")[0]) == ALICE, 60, 1)
     if label_of("carol")[0] is None: apparatus("carol is not in bob's members pane:\n" + "\n".join(pane()))
     if not alice_ok:
         apparatus(f"bob's pane never showed alice {ALICE!r}, so carol's label shows nothing: "
                   + repr(label_of("alice")[0]))
     carol_label = label_of("carol")[0]
-    claim("consent", carol_label.strip() == CAROL,
+    claim("consent", bare(carol_label) == CAROL,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
 
     stage("unknown")
