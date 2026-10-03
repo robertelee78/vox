@@ -77,8 +77,16 @@ pub struct Session {
 /// `codex` says the hook's input is Codex's ([`codex_input`]). It is checked first: a Codex
 /// started from a Claude Code terminal inherits that terminal's messaging socket, and a Codex
 /// session registered by it would have its wakes sent to the Claude session.
+///
+/// **A Codex session gets no name** (V210-169). Codex runs every session's hook in one shared
+/// app-server, whose environment is that of the session that started it, so `VOX_AGENT_NAME`
+/// there is another session's name. A Codex session is known by its session id only.
 pub fn register(paths: &Paths, session: &str, room: &str, codex: bool) {
-    let name = std::env::var("VOX_AGENT_NAME").unwrap_or_default();
+    let name = if codex {
+        String::new()
+    } else {
+        std::env::var("VOX_AGENT_NAME").unwrap_or_default()
+    };
     let reg = if codex {
         Session {
             session: session.to_owned(),
@@ -143,42 +151,41 @@ pub fn codex_input(transcript_path: &str, has_turn_id: bool) -> bool {
             .is_some_and(|f| f.starts_with("rollout-") && f.ends_with(".jsonl"))
 }
 
-/// What the poster of an urgent message to `to` in `room` is told (V210-169): one line for
-/// each addressee that a session here answers to, by name or session id, and that cannot be
-/// interrupted. A Codex session never can be. An addressee no session here answers to is not
-/// mentioned: it may be another node's.
+/// What the poster of an urgent message to `to` in `room` is told (V210-169), when any
+/// addressee cannot be interrupted on this node: one line, or `None` when every addressee can.
+///
+/// An addressee can be interrupted here only if a session of this node in `room` answers to it
+/// by name and left Vox a way to reach it, because that is all the daemon wakes. A Codex
+/// session never can be: it has no name and is never woken. This says nothing of other nodes:
+/// a session there is woken, or not, by its own node.
 #[must_use]
-pub fn uninterruptible(paths: &Paths, room: &str, to: &[String]) -> Vec<String> {
+pub fn uninterruptible(paths: &Paths, room: &str, to: &[String]) -> Option<String> {
     let sessions: Vec<Session> = registered(paths)
         .into_iter()
         .filter(|s| s.room == room)
         .collect();
-    let mut lines = Vec::new();
-    for addressee in to {
-        let answering = sessions
-            .iter()
-            .filter(|s| s.session == *addressee || (!s.name.is_empty() && s.name == *addressee));
-        let (codex, other): (Vec<&Session>, Vec<&Session>) =
-            answering.partition(|s| s.harness == "codex");
-        match codex.len() {
-            0 => {}
-            1 => lines.push(format!(
-                "the Codex session here that answers to {addressee} cannot be interrupted; it \
-                 reads this message at its next turn."
-            )),
-            n => lines.push(format!(
-                "the {n} Codex sessions here that answer to {addressee} cannot be interrupted; \
-                 they read this message at their next turn."
-            )),
-        }
-        if !other.is_empty() && other.iter().all(|s| s.endpoint.is_empty()) {
-            lines.push(format!(
-                "{addressee} cannot be interrupted: its session left Vox no way to reach it; it \
-                 reads this message at its next turn."
-            ));
-        }
+    let missed: Vec<&str> = to
+        .iter()
+        .filter(|addressee| {
+            !sessions.iter().any(|s| {
+                s.harness != "codex"
+                    && !s.name.is_empty()
+                    && s.name == **addressee
+                    && !s.endpoint.is_empty()
+            })
+        })
+        .map(String::as_str)
+        .collect();
+    if missed.is_empty() {
+        return None;
     }
-    lines
+    let who = if missed.len() == 1 { "it" } else { "them" };
+    Some(format!(
+        "{} cannot be interrupted from this node: no session here that Vox can reach by name \
+         answers to {who}, and Vox never interrupts a Codex session. A session here reads the \
+         message at its next turn.",
+        missed.join(", "),
+    ))
 }
 
 /// Every session that has registered a wake channel.

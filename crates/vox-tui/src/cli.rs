@@ -1973,10 +1973,11 @@ pub fn run() -> ExitCode {
                      then run `vox agent trust codex` — Codex runs a hook only once it is \
                      trusted.\n     `async` MUST be false: an async hook's output is observed \
                      and discarded, so the room would drain into nothing.\n     The room goes \
-                     in the command: Codex does not run the hook in the session's environment, \
-                     so VOX_ROOM set there does not reach it.\n     Vox cannot interrupt a \
-                     Codex session: an urgent message to one waits for its next turn, and the \
-                     poster is told so."
+                     in the command: Codex runs every session's hook in one shared app-server, \
+                     with the environment of the session that started it.\n     Vox never \
+                     interrupts a Codex session, and a Codex session has no name in Vox: it is \
+                     addressed by its session id. An urgent message to one waits for its next \
+                     turn, and a poster on the same node is told so."
                 );
                 ExitCode::SUCCESS
             }

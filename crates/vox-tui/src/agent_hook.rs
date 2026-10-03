@@ -681,12 +681,14 @@ pub async fn run(
             "vox agent hook: no room. Pass --room <id>, or set VOX_ROOM, in the hook's \
              environment."
         );
-        // Codex runs hooks in its shared app-server, whose environment is not the session's
-        // (V210-169): VOX_ROOM set where `codex` was started does not reach the hook.
+        // Codex runs every session's hook in one shared app-server, with the environment of the
+        // session that started it (V210-169): VOX_ROOM set for a later session does not reach
+        // its hook.
         if input.codex {
             eprintln!(
-                "vox agent hook: in Codex, put --room in the hook's command in hooks.json; Codex \
-                 does not run the hook in the session's environment."
+                "vox agent hook: in Codex, put --room in the hook's command in hooks.json. Codex \
+                 runs every session's hook in one shared app-server, with the environment of the \
+                 session that started it."
             );
         }
         return Ok(());

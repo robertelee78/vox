@@ -1013,10 +1013,16 @@ Both unknowns are already spiked; neither remains open.
   quits, so a `turn/start` or `turn/steer` sent there can start a model turn in a session nobody is
   in, and Vox **MUST NOT** start a model run. Vox **MUST NOT** send either to Codex. A Codex session
   **MUST** be registered from the hook's input (its rollout `transcript_path` or `turn_id`), before
-  any Claude Code variables a Codex started from a Claude Code terminal inherits. An urgent post
-  addressed to a Codex session of the poster's node, by name or session id, **MUST** tell the poster
-  in one line that it cannot be interrupted and reads the message at its next turn. The message
-  waits in the room, because queueing always is the default and the interrupt is the optimisation.
+  any Claude Code variables a Codex started from a Claude Code terminal inherits. A Codex session
+  **MUST NOT** take a name from the hook's environment: Codex runs every session's hook in one
+  shared app-server, with the environment of the session that started it, so `VOX_AGENT_NAME` there
+  is another session's. A Codex session has no name in Vox and is addressed by its session id. When
+  an urgent post names any addressee that no session of the poster's node can be interrupted for (a
+  Codex session, or no session here that Vox can reach by that name), `vox room post` **MUST** tell
+  the poster in one line that it cannot be interrupted from this node and that a session here reads
+  the message at its next turn. That line speaks only for the poster's node: another node wakes its
+  own sessions, or not, and a poster there is not told. The message waits in the room, because
+  queueing always is the default and the interrupt is the optimisation.
 
   > **Named defect, 2026-09-24 (ADR-021 F17) — measured: the OpenCode half of this milestone never
   > worked for a hand-opened session.** OpenCode 1.18.32 sets no `OPENCODE_SERVER_URL`, and a plain TUI

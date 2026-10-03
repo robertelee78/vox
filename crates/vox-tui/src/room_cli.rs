@@ -534,9 +534,10 @@ pub async fn post_cmd(
     let is_result = draft.kind == vox_agentcomms::envelope::work::RESULT;
     let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
     // **An addressee that cannot be interrupted is named to the poster** (V210-169): the
-    // message is posted, and waits in the room for that session's next turn.
+    // message is posted, and waits in the room for that session's next turn. This node's
+    // sessions only: another node decides for its own.
     if opts.urgent {
-        for line in crate::wake::uninterruptible(paths, &room_key, &opts.to) {
+        if let Some(line) = crate::wake::uninterruptible(paths, &room_key, &opts.to) {
             eprintln!("vox: {line}");
         }
     }
