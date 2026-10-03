@@ -113,9 +113,9 @@ This ADR builds datagram flows once and puts UDP tunnels, relay circuits and the
 6.6. **Surfaces.** The host: `vox serve <port>/udp`, or `vox serve <port> <port>/udp` for TCP and
      UDP on one port (`--at` applies to every spec); on an existing room,
      `vox service add <room> <port>/udp <addr>`. The dialer:
-     `vox forward <name>.vox <port>/udp <local-port>`, one flow per distinct client source address.
+     `vox forward <service>.<node>.<room>.vox <port>/udp <local-port>`, one flow per distinct client source address.
 6.7. **SOCKS5 UDP ASSOCIATE** in `vox up` (RFC 1928 §7): a loopback relay socket; every destination
-     MUST be a `.vox` name; one flow per (association, destination); a datagram with `FRAG ≠ 0` MUST
+     MUST be a `service.node.room.vox` name (ADR-017); one flow per (association, destination); a datagram with `FRAG ≠ 0` MUST
      be dropped; the association MUST end with its TCP control connection.
 6.8. **Backpressure.** Sending MUST NOT block: when the send buffer is full the oldest queued datagram
      is dropped. Congestion control on the outer connection MUST stay on (RFC 9298).
