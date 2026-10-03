@@ -71,7 +71,7 @@ mod test_knobs;
 mod family_split;
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -716,10 +716,9 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
             )
         });
     }
-    let anchor_port = UdpSocket::bind("[::]:0")
-        .and_then(|s| s.local_addr())
-        .unwrap_or_else(|e| panic!("APPARATUS (harness error): no free UDP port: {e}"))
-        .port();
+    // Free on IPv4 too: a `[::]:0` pick can be a port another program holds on IPv4, and the
+    // anchor then refuses it (as it must), which was this harness's red, not the product's.
+    let anchor_port = world::free_dual_stack_port();
     let nats = TwoNats::start(Kind::Symmetric, anchor_port);
     let advertise = format!("{},{}", nats.anchor_for_host, nats.anchor_for_guest);
     let mut anchor = VoxProc::spawn_env(

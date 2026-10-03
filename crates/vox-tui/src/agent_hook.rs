@@ -82,6 +82,16 @@ fn parse_input(raw: &str) -> HookInput {
     }
 }
 
+/// Whether the daemon sent `session` a notice within the wake hold: the turn it starts must
+/// show what it announced first, wherever that lies past the cursor (V030-15).
+fn notice_is_recent(paths: &Paths, session: &str) -> bool {
+    let hold = crate::wake::Settings::load(paths).0.wake_hold;
+    let hold = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX);
+    crate::wake::notices(paths, session)
+        .sent_at
+        .is_some_and(|t| crate::wake::now_millis().saturating_sub(t) < hold)
+}
+
 /// Read this session's cursor for `room`, if it has one: the first line of its cursor file.
 pub(crate) fn load_cursor(paths: &Paths, room: &str, session: &str) -> Option<Digest32> {
     let text = std::fs::read_to_string(paths.cursor_file(room, session)).ok()?;
@@ -932,7 +942,7 @@ pub(crate) fn render_wake(owed: &[Owed]) -> String {
             let mut said = Vec::new();
             if !o.urgent.is_empty() {
                 said.push(format!(
-                    "{} urgent message{} addressed to your node from {}",
+                    "{} urgent message{} addressed to you from {}",
                     o.urgent.len(),
                     if o.urgent.len() == 1 { "" } else { "s" },
                     from(&o.urgent)
@@ -1451,6 +1461,41 @@ async fn read_room(
         },
         _ => 0,
     };
+    // **What a wake announced is shown first even when it lies past the page** (V030-15 with
+    // V210-120): the page holds the oldest unread rows, and an urgent message behind 50 older
+    // ones was announced and then not shown. While a notice to this session is recent (within
+    // the wake hold), the rows past the page are read for the ones that may be owed: urgent and
+    // addressed to this node, or answering something. Only those join the rows (they are later
+    // in the room's order, so the cursor rules hold); the rest stay counted in `beyond`. Outside
+    // that window a session behind by a long history still reads one page a turn.
+    let mut beyond = beyond;
+    if beyond > 0 && notice_is_recent(paths, &input.session_id) {
+        let me_fp = me.map(|m| b32_encode(&m));
+        let mut from = rows.last().map(|r| r.entry_hash);
+        let held: std::collections::HashSet<Digest32> = rows.iter().map(|r| r.entry_hash).collect();
+        let mut extra = Vec::new();
+        while let Some(at) = from {
+            let more = crate::coord::read_upto(client, channel_id, Some(at), page)
+                .await?
+                .unwrap_or_default();
+            let more: Vec<_> = more
+                .into_iter()
+                .filter(|r| !held.contains(&r.entry_hash))
+                .collect();
+            from = if more.len() >= page {
+                more.last().map(|r| r.entry_hash)
+            } else {
+                None
+            };
+            extra.extend(more.into_iter().filter(|r| {
+                vox_agentcomms::envelope::Envelope::parse(&r.text).is_ok_and(|e| {
+                    e.re.is_some() || me_fp.as_deref().is_some_and(|fp| e.may_interrupt(fp))
+                })
+            }));
+        }
+        beyond = beyond.saturating_sub(extra.len());
+        rows.extend(extra);
+    }
 
     // **This session's own messages are not news to it** (ADR-021 F8) — but only when
     // BOTH the author and the session match. The author alone would drop every other

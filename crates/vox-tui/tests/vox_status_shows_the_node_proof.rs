@@ -190,7 +190,7 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
     let host = w.host_dir.clone();
 
     // ---- open the UDP flow, the loss still off ----
-    let (mut fwd, at) = w.forward_vox("udp-forward", &guest, &format!("{sink_port}/udp"));
+    let (mut fwd, at) = w.forward_service("udp-forward", &guest, &format!("{sink_port}/udp"));
     let client = UdpSocket::bind("127.0.0.1:0")
         .unwrap_or_else(|e| panic!("APPARATUS: no UDP port for the client: {e}"));
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -338,7 +338,7 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
 
     // ---- then with a TCP tunnel live: one vox holds a profile, so the UDP forward goes first ----
     drop(fwd);
-    let (tcp_fwd, tcp_at) = w.forward_vox("tcp-forward", &guest, &echo_port.to_string());
+    let (tcp_fwd, tcp_at) = w.forward_service("tcp-forward", &guest, &echo_port.to_string());
     let mut held = TcpStream::connect(tcp_at)
         .unwrap_or_else(|e| panic!("PRODUCT (staging): the TCP forward took no connection: {e}"));
     held.set_read_timeout(Some(Duration::from_secs(60))).ok();

@@ -16,8 +16,9 @@
 //! Three stagings, each its own test:
 //!
 //! 1. **Rotation while running.** The `vox id` that makes the identity, and with it the ring, runs
-//!    with its clock [`LEAD`] seconds short of seven days behind (`VOX_TEST_CLOCK_SKEW_MS`,
-//!    test-only, inert when unset); its daemon runs on the true clock. So the signed prekey falls
+//!    with its clock [`LEAD`] seconds short of seven days behind (`VOX_TEST_CLOCK_STEP_MS`,
+//!    test-only, inert when unset: the step moves the seconds clock, which the ring reads; since
+//!    v0.3.0 `VOX_TEST_CLOCK_SKEW_MS` moves only the milliseconds); its daemon runs on the true clock. So the signed prekey falls
 //!    due [`LEAD`] seconds after `vox id` — after the daemon's unlock, while it runs. Before:
 //!    signed prekey 1, nothing rotated (anything else is CANNOT MEASURE: the rotation came at
 //!    unlock). Within [`ROTATE_WITHIN`]: signed prekey 2, rotated once.
@@ -127,6 +128,7 @@ impl Profile {
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
             .env_remove("VOX_ROOM_PASSPHRASE")
             .env_remove("VOX_TEST_CLOCK_SKEW_MS")
+            .env_remove("VOX_TEST_CLOCK_STEP_MS")
             .env_remove("VOX_TEST_ONE_TIME_PREKEYS");
         if let Some(n) = self.pool {
             c.env("VOX_TEST_ONE_TIME_PREKEYS", n.to_string());
@@ -162,7 +164,7 @@ impl Profile {
     fn id(&self) {
         let mut c = self.command(&["id"]);
         if let Some(s) = &self.skew {
-            c.env("VOX_TEST_CLOCK_SKEW_MS", s);
+            c.env("VOX_TEST_CLOCK_STEP_MS", s);
         }
         let out = c
             .stdin(Stdio::null())
@@ -280,6 +282,7 @@ fn anchor(tmp: &Path) -> (Proc, String) {
             .env("VOX_DATA_DIR", &anchor_dir)
             .env("VOX_CONFIG_DIR", anchor_dir.join("cfg"))
             .env_remove("VOX_TEST_CLOCK_SKEW_MS")
+            .env_remove("VOX_TEST_CLOCK_STEP_MS")
             .env_remove("VOX_TEST_ONE_TIME_PREKEYS")
             .stdout(Stdio::from(
                 std::fs::File::create(&anchor_out).expect("APPARATUS: create a staging file"),
@@ -317,7 +320,7 @@ fn signal(pid: u32, sig: &str) {
 #[test]
 #[ignore = "real binaries and a clock knob; the release gate runs it"]
 fn a_running_node_rotates_its_signed_prekey() {
-    test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
+    test_knobs::require(&["VOX_TEST_CLOCK_STEP_MS"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // The ring is made at `vox id`, on this clock: its signed prekey falls due LEAD seconds on,
@@ -362,7 +365,7 @@ fn a_running_node_rotates_its_signed_prekey() {
 #[test]
 #[ignore = "real binaries, a clock knob, production Argon2id and a PoW; the release gate runs it"]
 fn a_session_started_before_a_rotation_completes_after_it() {
-    test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
+    test_knobs::require(&["VOX_TEST_CLOCK_STEP_MS"]);
     // A join per attempt; 14 unlocks: the guest's `vox id` and daemon, and per attempt the host's
     // `vox id`, daemon and room.
     watchdog::arm_for_setup(WINDOW_TRIES as u32, 2 + 3 * WINDOW_TRIES as u32);

@@ -1021,7 +1021,8 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
         return format!(
             "{} {} {}",
             id(&r.entry_hash),
-            crate::ident::author_id(&r.author),
+            // Named as every other row names its author: by the reader's name (V210-162).
+            crate::ident::name_of(&r.author),
             vox_core::node::api::NOT_RECEIVED_YET
         );
     }
@@ -1938,7 +1939,8 @@ fn unagreed_text(me: &Digest32, unagreed: &[(Digest32, String)]) -> String {
         if m == me {
             "you".to_owned()
         } else {
-            format!("member {}", crate::ident::author_id(m))
+            // By the reader's own name for it, as every other author is (V210-162).
+            format!("member {}", crate::ident::name_of(m))
         }
     };
     let mut parts: Vec<String> = unagreed

@@ -24,6 +24,12 @@ guard args.count == 5 else {
 }
 let (dataDir, link, roomPassphrase, daemon) = (args[1], args[2], args[3], args[4])
 
+/// The harness's own failures, apart from the node's.
+enum HarnessError: Error {
+    /// The room never synced with a member within the minute the post was retried.
+    case notSynced
+}
+
 func say(_ line: String) {
     print(line)
     fflush(stdout)
@@ -58,7 +64,21 @@ do {
     let room = try await node.joinRoom(link: link, name: "calls", passphrase: roomPassphrase)
     say("JOINED \(room)")
     try await node.trust(fingerprint: daemon, name: "daemon")
-    try await node.post(room: room, text: "hello from swift")
+    // A room just joined is written to only once it has synced with a member (V210-164): the
+    // node says RoomNotSynced until then, and asks to be tried again. So the app tries again,
+    // for up to a minute, as an app would.
+    var posted = false
+    for _ in 0..<240 {
+        do {
+            try await node.post(room: room, text: "hello from swift")
+            posted = true
+            break
+        } catch {
+            guard "\(error)".contains("RoomNotSynced") else { throw error }
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+    }
+    guard posted else { throw HarnessError.notSynced }
     say("POSTED")
 
     // The proof trusts this identity on the daemon, and starts its listeners, then says go.
