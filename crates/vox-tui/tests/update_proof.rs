@@ -187,7 +187,8 @@ fn published_version(triple: &str) -> Option<String> {
 /// when it is absent or unauthenticated the journey claim is reported unproven, not skipped.
 fn earlier_release(newest: &str) -> Result<String, String> {
     let asset = format!("vox-{}", target_triple());
-    let out = Command::new("gh")
+    // gh's login is the operator's, not the proof's temporary HOME's (see `watchdog::temp_home`).
+    let out = watchdog::temp_home::real_gh(&mut Command::new("gh"))
         .args([
             "api",
             "--paginate",

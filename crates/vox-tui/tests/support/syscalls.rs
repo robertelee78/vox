@@ -71,7 +71,9 @@ pub fn interposer() -> &'static Path {
         let manifest =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../vox-test-interpose/Cargo.toml");
         let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("vox-test-interpose");
-        let ok = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        // The operator's toolchain, not the proof's temporary HOME (see `watchdog::temp_home`).
+        let ok = crate::watchdog::temp_home::real_toolchain(&mut cargo)
             .args(["build", "--release", "--offline", "--manifest-path"])
             .arg(&manifest)
             .env("CARGO_TARGET_DIR", &target)
