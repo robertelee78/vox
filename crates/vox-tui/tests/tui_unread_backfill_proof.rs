@@ -283,7 +283,14 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     }
     let (ok, _, err) = vox(
         &alice_dir,
-        &["room", "create", "--name", "mission"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
         Some("mission passphrase\n"),
     );
     assert!(ok, "alice creates mission: {err}");
@@ -300,13 +307,21 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
 
     let (ok, _, err) = vox(
         &bob_dir,
-        &["room", "create", "--name", "home"],
+        &["room", "create", "--passphrase-file", "-", "--name", "home"],
         Some("home passphrase\n"),
     );
     assert!(ok, "bob creates home over the TUI's socket: {err}");
     let (ok, _, err) = vox(
         &bob_dir,
-        &["room", "join", link.trim(), "--name", "mission"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "mission",
+        ],
         Some("mission passphrase\n"),
     );
     assert!(

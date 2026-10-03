@@ -302,7 +302,15 @@ fn member(tmp: &Path, name: &str) -> Member {
 fn join(who: &Member, link: &str) {
     let (ok, out, err) = vox_in(
         &who.data,
-        &["room", "join", link, "--name", "calls"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link,
+            "--name",
+            "calls",
+        ],
         ROOM_PASS,
     );
     assert!(ok, "PRODUCT (staging): {} joins: {out}{err}", who.name);
@@ -324,7 +332,14 @@ fn scene() -> Scene {
     let bob = member(tmp.path(), "bob");
     let (ok, out, err) = vox_in(
         &alice.data,
-        &["room", "create", "--name", "calls"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "calls",
+        ],
         ROOM_PASS,
     );
     assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
