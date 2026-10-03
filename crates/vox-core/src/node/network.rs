@@ -418,6 +418,10 @@ impl std::fmt::Debug for NodeNet {
 impl NodeNet {
     /// Count this node's reachability ladders in `book` (`vox status --json`'s `reach`).
     pub fn count_ladders_in(&self, book: crate::node::status::SharedSyncBook) {
+        // And let the same report say which connection this node holds for each peer (#50).
+        book.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read_connections_from(&self.manager);
         *lock(&self.status) = Some(book);
     }
 
