@@ -1296,6 +1296,10 @@ pub struct AgentPluginArgs {
     /// The harness to print an integration for. Only `opencode` needs one today;
     /// Claude Code and Codex are configured with a hook command instead.
     pub harness: String,
+    /// The agent's own node, which the printed hooks act as (`vox agent hook --node <name>`,
+    /// ADR-020 2.1). Required: an agent never uses a person's node.
+    #[arg(long, required = true)]
+    pub node: String,
 }
 
 /// `vox agent hook`
@@ -1303,6 +1307,10 @@ pub struct AgentPluginArgs {
 pub struct AgentHookArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
+    /// The node this hook acts as: the agent's own node (ADR-020 2.1, ADR-026 N-6). Required, and
+    /// never taken from the environment or any other node: a hook without it refuses.
+    #[arg(long, required = true)]
+    pub node: String,
     /// Drain only this room (its id, or a unique prefix). Without it the hook drains every
     /// room the node holds, each under its own heading.
     #[arg(long)]
@@ -2547,12 +2555,35 @@ pub fn run() -> ExitCode {
             }
         }
         Cmd::Agent(AgentCmd::Hook(args)) => {
-            let paths = match args.profile.paths() {
+            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("vox: --node: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let account = match vox_core::node::paths::Account::of(
+                args.profile.data_dir.as_deref(),
+                args.profile.config_dir.as_deref(),
+            ) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let paths = match account.node_paths(&node) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
                 }
+            };
+            let daemon = crate::agent_hook::Daemon {
+                account,
+                node,
+                listen: args.profile.listen,
+                anchors: args.profile.anchors.clone(),
             };
             let format = match args.format.parse() {
                 Ok(f) => f,
@@ -2570,6 +2601,7 @@ pub fn run() -> ExitCode {
             };
             let _ = rt.block_on(crate::agent_hook::run(
                 &paths,
+                &daemon,
                 args.room.as_deref(),
                 format,
                 args.session.as_deref(),
@@ -2680,47 +2712,66 @@ pub fn run() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Cmd::Agent(AgentCmd::Plugin(args)) => match args.harness.to_ascii_lowercase().as_str() {
-            "opencode" => {
-                print!("{}", crate::agent_hook::OPENCODE_PLUGIN);
-                eprintln!(
+        Cmd::Agent(AgentCmd::Plugin(args)) => {
+            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("vox: --node: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let hook = format!("vox agent hook --node {node}");
+            match args.harness.to_ascii_lowercase().as_str() {
+                "opencode" => {
+                    print!(
+                        "{}",
+                        crate::agent_hook::OPENCODE_PLUGIN.replace(
+                            "agent hook --format",
+                            &format!("agent hook --node {node} --format")
+                        )
+                    );
+                    eprintln!(
                     "vox: save that as ${{XDG_CONFIG_HOME:-~/.config}}/opencode/plugin/vox.js, and install the skill \
                      beside it: {}\n     The plugin drains every room the node holds.",
                     skill_install("opencode", skill_dir("opencode").unwrap_or_default())
                 );
-                ExitCode::SUCCESS
-            }
-            // **Print the thing, do not describe it.** These take a hook entry rather than
-            // a plugin file, and this used to answer with a sentence saying so — while its
-            // own `--help` promised "a JSON snippet". So the one command a person runs to
-            // wire an agent in left them to invent the settings shape themselves, for the
-            // feature ADR-020 exists to deliver. The snippet goes to stdout so it can be
-            // redirected or piped to `jq`; where to put it goes to stderr so it does not
-            // land in the file.
-            "claude" | "claude-code" => {
-                // `UserPromptSubmit` drains the room; `Stop` records that a turn ended, so an
-                // unread reply can be announced to an idle session; `SessionEnd` removes the
-                // session's registration (V030-20).
-                print!("{}", crate::agent_hook::CLAUDE_HOOKS);
-                eprintln!(
-                    "vox: merge that into ~/.claude/settings.json (user scope, so a session \
+                    ExitCode::SUCCESS
+                }
+                // **Print the thing, do not describe it.** These take a hook entry rather than
+                // a plugin file, and this used to answer with a sentence saying so — while its
+                // own `--help` promised "a JSON snippet". So the one command a person runs to
+                // wire an agent in left them to invent the settings shape themselves, for the
+                // feature ADR-020 exists to deliver. The snippet goes to stdout so it can be
+                // redirected or piped to `jq`; where to put it goes to stderr so it does not
+                // land in the file.
+                "claude" | "claude-code" => {
+                    // `UserPromptSubmit` drains the room; `Stop` records that a turn ended, so an
+                    // unread reply can be announced to an idle session; `SessionEnd` removes the
+                    // session's registration (V030-20).
+                    print!(
+                        "{}",
+                        crate::agent_hook::CLAUDE_HOOKS
+                            .replace("\"vox agent hook\"", &format!("\"{hook}\""))
+                    );
+                    eprintln!(
+                        "vox: merge that into ~/.claude/settings.json (user scope, so a session \
                      opened in any repository hears its rooms), and install the skill beside \
                      it: {}\n     The hook drains every room the node holds.",
-                    skill_install("claude", skill_dir("claude").unwrap_or_default())
-                );
-                ExitCode::SUCCESS
-            }
-            // The entry is a matcher group holding `hooks`, as Claude Code's is: Codex 0.160
-            // lists a bare `{ "command": … }` entry as no hook at all, so the room never
-            // drained (V210-169).
-            "codex" => {
-                println!(
-                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
+                        skill_install("claude", skill_dir("claude").unwrap_or_default())
+                    );
+                    ExitCode::SUCCESS
+                }
+                // The entry is a matcher group holding `hooks`, as Claude Code's is: Codex 0.160
+                // lists a bare `{ "command": … }` entry as no hook at all, so the room never
+                // drained (V210-169).
+                "codex" => {
+                    println!(
+                        "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
                      \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
-                     \"vox agent hook\", \"async\": false }}\n        ]\n      }}\n    ]\n  \
+                     \"{hook}\", \"async\": false }}\n        ]\n      }}\n    ]\n  \
                      }}\n}}"
-                );
-                eprintln!(
+                    );
+                    eprintln!(
                     "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
                      — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
                      an async hook's output is observed and discarded, so the room would \
@@ -2730,13 +2781,14 @@ pub fn run() -> ExitCode {
                      Install the skill beside it: {}",
                     skill_install("codex", skill_dir("codex").unwrap_or_default())
                 );
-                ExitCode::SUCCESS
+                    ExitCode::SUCCESS
+                }
+                other => {
+                    eprintln!("vox: no integration for {other:?}. Known: claude, codex, opencode.");
+                    ExitCode::FAILURE
+                }
             }
-            other => {
-                eprintln!("vox: no integration for {other:?}. Known: claude, codex, opencode.");
-                ExitCode::FAILURE
-            }
-        },
+        }
         // Ask the running node when there is one, as `vox service remove` does (V030-06): the
         // profile is not ours to open while a daemon holds it, and stopping the daemon to add a
         // service, then starting it again with every room's passphrase, is not something a person

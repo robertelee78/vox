@@ -246,7 +246,7 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let (ok, out, _) = hook(
         &data,
         &cfg,
-        &["agent", "hook", "--room", "aaaa"],
+        &["agent", "hook", "--node", "default", "--room", "aaaa"],
         &claude_input("s1"),
     );
     assert!(
@@ -280,7 +280,7 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let (ok, out, err) = hook(
         &data,
         &cfg,
-        &["agent", "hook", "--room", &room],
+        &["agent", "hook", "--node", "default", "--room", &room],
         &claude_input("claude-session-1"),
     );
     assert!(ok, "PRODUCT: the hook failed: {err}");
@@ -302,7 +302,7 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let (ok, out, err) = hook(
         &data,
         &cfg,
-        &["agent", "hook", "--room", &room],
+        &["agent", "hook", "--node", "default", "--room", &room],
         &claude_input("claude-session-1"),
     );
     assert!(ok, "PRODUCT: the second hook failed: {err}");
@@ -315,7 +315,7 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let (ok, out, err) = hook(
         &data,
         &cfg,
-        &["agent", "hook", "--room", &room],
+        &["agent", "hook", "--node", "default", "--room", &room],
         &claude_input("claude-session-2"),
     );
     assert!(ok, "PRODUCT: the hook for a second session failed: {err}");
@@ -329,7 +329,7 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let (ok, out, err) = hook(
         &data,
         &cfg,
-        &["agent", "hook", "--room", &room],
+        &["agent", "hook", "--node", "default", "--room", &room],
         &codex_input("codex-session-1"),
     );
     assert!(ok, "PRODUCT: the codex-shaped hook failed: {err}");
@@ -346,7 +346,9 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let (ok, out, err) = hook(
         &data,
         &cfg,
-        &["agent", "hook", "--room", &room, "--format", "text"],
+        &[
+            "agent", "hook", "--node", "default", "--room", &room, "--format", "text",
+        ],
         &claude_input("forced-text"),
     );
     assert!(ok, "PRODUCT: the --format text hook failed: {err}");
@@ -357,7 +359,9 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let (ok, out, err) = hook(
         &data,
         &cfg,
-        &["agent", "hook", "--room", &room, "--format", "claude"],
+        &[
+            "agent", "hook", "--node", "default", "--room", &room, "--format", "claude",
+        ],
         &codex_input("forced-claude"),
     );
     assert!(ok, "PRODUCT: the --format claude hook failed: {err}");
@@ -370,7 +374,7 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let (ok, out, err) = hook(
         &data,
         &cfg,
-        &["agent", "hook", "--room", &room],
+        &["agent", "hook", "--node", "default", "--room", &room],
         &claude_input("codex-session-1"),
     );
     assert!(ok, "PRODUCT: the hook on a quiet room failed: {err}");
@@ -385,7 +389,7 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let (ok, out, err) = hook(
         &data,
         &cfg,
-        &["agent", "hook", "--room", "zzzzzzzz"],
+        &["agent", "hook", "--node", "default", "--room", "zzzzzzzz"],
         &claude_input("s9"),
     );
     assert!(
@@ -456,7 +460,9 @@ fn one_author_cannot_forge_another_and_a_backlog_is_bounded() {
         let (ok, out, err) = hook(
             &data,
             &cfg,
-            &["agent", "hook", "--room", &label, "--format", "text"],
+            &[
+                "agent", "hook", "--node", "default", "--room", &label, "--format", "text",
+            ],
             &codex_input(session),
         );
         assert!(ok, "PRODUCT: the hook failed: {err}");
@@ -711,7 +717,9 @@ fn a_turn_spends_its_tokens_on_what_is_for_the_agent() {
         let (ok, out, err) = hook(
             &data,
             &cfg,
-            &["agent", "hook", "--room", &label, "--format", "text"],
+            &[
+                "agent", "hook", "--node", "default", "--room", &label, "--format", "text",
+            ],
             &codex_input(reader),
         );
         assert!(ok, "PRODUCT: the hook failed: {err}");
@@ -1092,7 +1100,9 @@ fn a_reply_shows_what_it_answers_and_cannot_forge_it() {
         let (ok, out, err) = hook(
             &data,
             &cfg,
-            &["agent", "hook", "--room", &label, "--format", "text"],
+            &[
+                "agent", "hook", "--node", "default", "--room", &label, "--format", "text",
+            ],
             &codex_input(session),
         );
         assert!(ok, "PRODUCT: the hook failed: {err}");

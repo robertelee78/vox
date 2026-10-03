@@ -557,6 +557,14 @@ impl Router {
                                 .nodes_attached
                                 .fetch_add(1, Ordering::Relaxed);
                             let _ = tx.send(Some(Ok(())));
+                            eprintln!(
+                                "vox daemon: node {node} attached{}",
+                                if granted.info.implicit {
+                                    " (implicitly)"
+                                } else {
+                                    ""
+                                }
+                            );
                             let _ = self.inner.events.send(DaemonEvent::Attached {
                                 node: node.clone(),
                                 fingerprint,

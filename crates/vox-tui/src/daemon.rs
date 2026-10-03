@@ -227,6 +227,10 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             let mut since: Option<Instant> = None;
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
+                // Its data root deleted under it: nothing it serves exists any more.
+                if !account.daemon_dir().exists() {
+                    return;
+                }
                 if router.idle() {
                     let t = *since.get_or_insert_with(Instant::now);
                     if t.elapsed() >= IDLE_LINGER {

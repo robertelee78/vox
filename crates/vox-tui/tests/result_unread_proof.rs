@@ -29,6 +29,8 @@ fn drain(w: &Worker, r: &str, session: &str) {
         &[
             "agent",
             "hook",
+            "--node",
+            "default",
             "--room",
             r,
             "--format",

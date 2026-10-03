@@ -435,7 +435,7 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         injected(&hook(
             bob,
             &bob_env,
-            &["agent", "hook", "--room", &room],
+            &["agent", "hook", "--node", "default", "--room", &room],
             Some(&hook_json("UserPromptSubmit", "session-bob", Some(prompt))),
         ))
     };
@@ -692,6 +692,8 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         &[
             "agent",
             "hook",
+            "--node",
+            "default",
             "--room",
             &room,
             "--session",
@@ -872,6 +874,8 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         &[
             "agent",
             "hook",
+            "--node",
+            "default",
             "--room",
             &room,
             "--session",
@@ -898,6 +902,8 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
             &[
                 "agent",
                 "hook",
+                "--node",
+                "default",
                 "--room",
                 &room,
                 "--format",
@@ -992,7 +998,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
     }
 
     // ---- (8) the entries a person merges into Claude Code's settings ----
-    let printed = r.workers[1].vox(None, &["agent", "plugin", "claude"]);
+    let printed = r.workers[1].vox(None, &["agent", "plugin", "claude", "--node", "default"]);
     let entries: serde_json::Value =
         serde_json::from_str(&printed.stdout).unwrap_or(serde_json::Value::Null);
     let runs_hook = |event: &str| {
@@ -1026,7 +1032,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         hook(
             bob,
             &env,
-            &["agent", "hook", "--room", &room],
+            &["agent", "hook", "--node", "default", "--room", &room],
             Some(&hook_json(name, "asker", prompt)),
         )
     };
@@ -1327,7 +1333,7 @@ fn an_idle_agent_is_told_when_a_reply_to_it_is_waiting() {
         hook(
             w,
             &late_env,
-            &["agent", "hook", "--room", &room],
+            &["agent", "hook", "--node", "default", "--room", &room],
             Some(&hook_json(
                 name,
                 "late",
@@ -1452,7 +1458,7 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
         hook(
             w,
             &env,
-            &["agent", "hook", "--room", &room],
+            &["agent", "hook", "--node", "default", "--room", &room],
             Some(&hook_json(name, me, prompt)),
         )
     };
