@@ -129,8 +129,9 @@ fn dual_anchor(
         })
         .trim()
         .to_owned();
-    let fp = spec.split('@').next().expect("fp@addr").to_owned();
-    let id = vox_core::node::link::b32_decode(&fp, "anchor fingerprint").expect("fingerprint");
+    let fp = spec.split('@').next().expect("PRODUCT: fp@addr").to_owned();
+    let id =
+        vox_core::node::link::b32_decode(&fp, "anchor fingerprint").expect("PRODUCT: fingerprint");
     (p, format!("{fp}@/ip4/127.0.0.1/udp/{port}"), id)
 }
 
@@ -181,9 +182,13 @@ impl Networks {
         let scope = lo0_scope();
         let ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         Self {
-            anchor6: format!("[::1]:{port}").parse().unwrap(),
+            anchor6: format!("[::1]:{port}")
+                .parse()
+                .expect("APPARATUS: a socket address the proof wrote"),
             anchor_ll: SocketAddr::V6(SocketAddrV6::new(ll, port, 0, scope)),
-            local6: "[::1]:0".parse().unwrap(),
+            local6: "[::1]:0"
+                .parse()
+                .expect("APPARATUS: a socket address the proof wrote"),
             local_ll: SocketAddr::V6(SocketAddrV6::new(ll, 0, 0, scope)),
         }
     }
@@ -193,10 +198,18 @@ impl Networks {
     #[cfg(not(target_os = "macos"))]
     fn to(port: u16) -> Self {
         Self {
-            anchor6: format!("[::1]:{port}").parse().unwrap(),
-            anchor_ll: format!("127.0.0.1:{port}").parse().unwrap(),
-            local6: "[::1]:0".parse().unwrap(),
-            local_ll: "127.0.0.2:0".parse().unwrap(),
+            anchor6: format!("[::1]:{port}")
+                .parse()
+                .expect("APPARATUS: a socket address the proof wrote"),
+            anchor_ll: format!("127.0.0.1:{port}")
+                .parse()
+                .expect("APPARATUS: a socket address the proof wrote"),
+            local6: "[::1]:0"
+                .parse()
+                .expect("APPARATUS: a socket address the proof wrote"),
+            local_ll: "127.0.0.2:0"
+                .parse()
+                .expect("APPARATUS: a socket address the proof wrote"),
         }
     }
 }
@@ -208,7 +221,8 @@ async fn connect_from(
     addr: SocketAddr,
     id: Digest32,
 ) -> (VoxEndpoint, Arc<VoxConnection>) {
-    let endpoint = VoxEndpoint::bind(signer, local).unwrap();
+    let endpoint =
+        VoxEndpoint::bind(signer, local).expect("APPARATUS: bind the stand-in peer's endpoint");
     let conn = endpoint
         .connect(addr, id, hostile::now())
         .await
@@ -265,7 +279,7 @@ fn await_published(rt: &Rt, anchor: SocketAddr, id: Digest32, room: Digest32) {
     println!("[proof] the anchor holds of the room in use: {held:?}");
     assert!(
         held.0 && held.1 >= 1 && held.2 >= 1,
-        "CANNOT MEASURE: the room in use never reached its anchor with its records ({held:?})"
+        "PRODUCT (staging): the room in use never reached its anchor with its records ({held:?})"
     );
 }
 
@@ -282,7 +296,8 @@ fn live_flood(rt: &Rt, anchor: SocketAddr, id: Digest32, skew_secs: u64) -> (usi
         for i in 0..ROOMS {
             let mut nonce = [0u8; 16];
             nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let g = Genesis::create_with_nonce(&inventor, hostile::now(), policy(), nonce).unwrap();
+            let g = Genesis::create_with_nonce(&inventor, hostile::now(), policy(), nonce)
+                .expect("APPARATUS: build the stand-in peer's records");
             if client.put(&g.to_wire()).await.is_ok() {
                 geneses += 1;
             }
@@ -292,12 +307,13 @@ fn live_flood(rt: &Rt, anchor: SocketAddr, id: Digest32, skew_secs: u64) -> (usi
                 &inventor,
                 &g.channel_id(),
                 0,
-                EndpointList::new(Vec::new()).unwrap(),
+                EndpointList::new(Vec::new())
+                    .expect("APPARATUS: build the stand-in peer's records"),
                 1,
                 t,
                 2 * 60 * 60,
             )
-            .unwrap();
+            .expect("APPARATUS: build the stand-in peer's records");
             if client.put(&rec.to_wire()).await.is_ok() {
                 records += 1;
             }
@@ -333,8 +349,11 @@ fn flood(
     // A second identity for the second network: the anchor keeps one connection per peer.
     let carrier = stranger(0x75);
     let t = hostile::now();
-    let ring = PrekeyRing::generate(&carrier, &[0x3E; 32], t).unwrap();
-    let carrier_bundle = ring.bundle(&carrier.public_key()).unwrap();
+    let ring = PrekeyRing::generate(&carrier, &[0x3E; 32], t)
+        .expect("APPARATUS: generate the stand-in peer's prekeys");
+    let carrier_bundle = ring
+        .bundle(&carrier.public_key())
+        .expect("APPARATUS: build the stand-in peer's records");
     // Every room is signed up front, on every core: three post-quantum signatures a room.
     let t0 = Instant::now();
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
@@ -350,12 +369,12 @@ fn flood(
                             nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
                             nonce[8] = 0x5c;
                             let now = hostile::now();
-                            let g =
-                                Genesis::create_with_nonce(inventor, now, policy(), nonce).unwrap();
+                            let g = Genesis::create_with_nonce(inventor, now, policy(), nonce)
+                                .expect("APPARATUS: build the stand-in peer's records");
                             let cid = g.channel_id();
                             let witness =
                                 JoinWitness::build(inventor, &cid, 0, &carrier.fingerprint(), now)
-                                    .unwrap();
+                                    .expect("APPARATUS: build the stand-in peer's records");
                             let rec = MemberBundleRecord::build(
                                 carrier,
                                 &cid,
@@ -366,7 +385,7 @@ fn flood(
                                 2 * 60 * 60,
                                 Admission::Witnessed(Box::new(witness)),
                             )
-                            .unwrap();
+                            .expect("APPARATUS: build the stand-in peer's records");
                             (i, g.to_wire(), rec.to_wire())
                         })
                         .collect::<Vec<_>>()
@@ -375,7 +394,7 @@ fn flood(
             .collect();
         let mut all: Vec<_> = workers
             .into_iter()
-            .flat_map(|w| w.join().unwrap())
+            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
             .collect();
         all.sort_by_key(|(i, _, _)| *i);
         all.into_iter().map(|(_, g, b)| (g, b)).collect()
@@ -456,17 +475,19 @@ fn signal(proc: &VoxProc, sig: &str) {
 #[ignore = "real vox processes with production Argon2id, a flood and a real join; run in release"]
 fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "victim"),
         profile_dir(tmp.path(), "joiner"),
     );
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
     let port = free_port();
     let (_anchor, spec, anchor_id) = dual_anchor("anchor", &anchor_dir, port, &[]);
-    let anchor6: SocketAddr = format!("[::1]:{port}").parse().unwrap();
+    let anchor6: SocketAddr = format!("[::1]:{port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
     fingerprint(&victim_dir);
     fingerprint(&joiner_dir);
     let _victim = daemon("victim", &victim_dir, free_port(), &spec, &pass_file);
@@ -512,13 +533,13 @@ fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
 fn a_room_whose_members_are_away_is_not_crowded_out() {
     test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "victim"),
     );
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
     let port = free_port();
     let skew = AWAY_MS.to_string();
     let (_anchor, spec, anchor_id) = dual_anchor(
@@ -527,7 +548,9 @@ fn a_room_whose_members_are_away_is_not_crowded_out() {
         port,
         &[("VOX_TEST_CLOCK_SKEW_MS", &skew)],
     );
-    let anchor6: SocketAddr = format!("[::1]:{port}").parse().unwrap();
+    let anchor6: SocketAddr = format!("[::1]:{port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
     fingerprint(&victim_dir);
     let _victim = daemon("victim", &victim_dir, free_port(), &spec, &pass_file);
     let (away, _) = create_room(&victim_dir, "away", ROOM_PASS);
@@ -570,14 +593,14 @@ fn a_room_whose_members_are_away_is_not_crowded_out() {
 #[ignore = "real vox processes with production Argon2id, a flood and a real join; run in release"]
 fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "victim"),
         profile_dir(tmp.path(), "joiner"),
     );
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
     let port = free_port();
     let (_anchor, spec, anchor_id) = dual_anchor("anchor", &anchor_dir, port, &[]);
     let nets = Networks::to(port);
@@ -625,14 +648,14 @@ fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
 #[ignore = "real vox processes with production Argon2id, an anchor restart, a flood and a real join; run in release"]
 fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "victim"),
         profile_dir(tmp.path(), "joiner"),
     );
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
     let port = free_port();
     let (anchor, spec, anchor_id) = dual_anchor("anchor", &anchor_dir, port, &[]);
     let nets = Networks::to(port);
@@ -652,7 +675,7 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
     let (_anchor, spec2, id2) = dual_anchor("anchor", &anchor_dir, port, &[]);
     assert!(
         spec2 == spec && id2 == anchor_id,
-        "CANNOT MEASURE: the restarted anchor came back as {spec2}, not {spec}"
+        "PRODUCT (staging): the restarted anchor came back as {spec2}, not {spec}"
     );
     let reseeder = stranger(0x77);
     let answers = rt.block_on(async {
@@ -727,7 +750,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     // credited to no one leaves it; if a put must store something new to credit, the member's
     // re-send credits nothing, the room is credited to no one with the flood, and it is evicted.
     watchdog::arm_for(BUDGET);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, creator_dir, member_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "creator"),
@@ -735,7 +758,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
         profile_dir(tmp.path(), "joiner"),
     );
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
     let port = free_port();
     let (anchor, spec, anchor_id) = dual_anchor("anchor", &anchor_dir, port, &[]);
     let nets = Networks::to(port);
@@ -752,7 +775,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     );
     assert!(
         ok,
-        "CANNOT MEASURE: the member could not join the room: {out}{err}"
+        "PRODUCT (staging): the member could not join the room: {out}{err}"
     );
 
     // Both members' records on the board, and the member's own invite for the final join (the
@@ -769,20 +792,23 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     println!("[proof] the anchor holds of the room, two members expected: {two:?}");
     assert!(
         two.0 && two.1 >= 2,
-        "CANNOT MEASURE: both members' records never reached the anchor ({two:?})"
+        "PRODUCT (staging): both members' records never reached the anchor ({two:?})"
     );
     let (ok, member_link, err) = {
         let (listed, list, _) = world::vox_once(&member_dir, &args(&["room", "list"]));
-        assert!(listed, "CANNOT MEASURE: the member's vox room list failed");
+        assert!(
+            listed,
+            "PRODUCT (staging): the member's vox room list failed"
+        );
         let short = list
             .lines()
             .find(|l| l.contains("first"))
             .and_then(|l| l.split_whitespace().next())
-            .expect("CANNOT MEASURE: the member does not list the room");
+            .expect("PRODUCT (staging): the member does not list the room");
         let (ok, link, err) = world::vox_once(&member_dir, &args(&["room", "invite", short]));
         (ok, link.trim().to_owned(), err)
     };
-    assert!(ok, "CANNOT MEASURE: the member could not invite: {err}");
+    assert!(ok, "PRODUCT (staging): the member could not invite: {err}");
 
     let (genesis, members, bundles) = fetch(&rt, nets.anchor6, anchor_id, room);
     let seeded_members = members.clone();
@@ -798,7 +824,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     let (_anchor, spec2, id2) = dual_anchor("anchor", &anchor_dir, port, &[]);
     assert!(
         spec2 == spec && id2 == anchor_id,
-        "CANNOT MEASURE: the restarted anchor came back as {spec2}, not {spec}"
+        "PRODUCT (staging): the restarted anchor came back as {spec2}, not {spec}"
     );
     let reseeder = stranger(0x77);
     let answers = rt.block_on(async {

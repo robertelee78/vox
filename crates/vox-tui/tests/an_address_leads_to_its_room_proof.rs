@@ -576,7 +576,9 @@ fn d_a_join_asks_every_board_the_address_names() {
     two_identities(&guest_dir, &host_dir);
     // A guest on [::1] can reach A6 and the forward; A4 and the host's own addresses are IPv4.
     let host_port = port_forward::free_v4_udp_port();
-    let host_addr: SocketAddr = format!("127.0.0.1:{host_port}").parse().unwrap();
+    let host_addr: SocketAddr = format!("127.0.0.1:{host_port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
     let forward = port_forward::PortForward::start(host_addr, false);
     let advertise = forward.public.to_string();
     let mut host = VoxProc::spawn_env(

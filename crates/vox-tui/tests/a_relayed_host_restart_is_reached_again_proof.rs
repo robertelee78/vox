@@ -113,7 +113,10 @@ fn trial(n: usize) -> (Duration, Duration) {
         round_trip(at, b"before the crash", Duration::from_secs(120)).unwrap_or_else(|e| {
             panic!(
                 "PRODUCT (staging, trial {n}): no echo before the crash ({e}).\n{}",
-                w.fwd.as_mut().unwrap().transcript()
+                w.fwd
+                    .as_mut()
+                    .expect("APPARATUS: a process the proof started")
+                    .transcript()
             )
         });
     assert_eq!(
@@ -140,7 +143,10 @@ fn trial(n: usize) -> (Duration, Duration) {
             "PRODUCT (trial {n}): the forward never reached the restarted host ({attempts} \
              attempts in {:?}).\nforward:\n{}",
             crashed.elapsed(),
-            w.fwd.as_mut().unwrap().transcript()
+            w.fwd
+                .as_mut()
+                .expect("APPARATUS: a process the proof started")
+                .transcript()
         );
         let slept = Instant::now();
         std::thread::sleep(Duration::from_millis(200));

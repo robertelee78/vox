@@ -137,7 +137,7 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
                     Ok(0) | Err(_) => return,
                     Ok(n) => sink
                         .lock()
-                        .unwrap()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
                         .push_str(&String::from_utf8_lossy(&buf[..n])),
                 }
             }
@@ -145,11 +145,17 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
     }
     let d = Daemon(child, said);
     let deadline = Instant::now() + Duration::from_secs(90);
-    while !d.1.lock().unwrap().contains("control socket") {
+    while !d
+        .1
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .contains("control socket")
+    {
         assert!(
             Instant::now() < deadline,
             "PRODUCT (staging): a daemon never served its control socket within 90 s:\n{}",
-            d.1.lock().unwrap()
+            d.1.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -234,7 +240,7 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
     // Bob trusts carol from the start: a node reads only whom its owner trusts (V210-118), so
     // what this measures is carol's decision alone.
     let (ok, _, err) = vox(bob_dir, &["trust", "add", &fps[2], "--name", "carol"], None);
-    assert!(ok, "bob trusts carol: {err}");
+    assert!(ok, "PRODUCT (staging): bob trusts carol: {err}");
     // Both hold the room and each other's admission before carol decides anything.
     let (ok, _, err) = vox(
         carol_dir,
@@ -297,7 +303,9 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
                     ) = frame
                     {
                         if peer == carol {
-                            sink.lock().unwrap().push((t0.elapsed(), backfilled));
+                            sink.lock()
+                                .expect("APPARATUS: a lock the proof holds was poisoned")
+                                .push((t0.elapsed(), backfilled));
                         }
                     }
                 }
@@ -334,7 +342,11 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
     let read = until("bob reads CAROL-WHILE-UNREACHABLE", 90, || {
         reads(bob_dir, &room, "CAROL-WHILE-UNREACHABLE")
     });
-    for (at, backfilled) in key_events.lock().unwrap().iter() {
+    for (at, backfilled) in key_events
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .iter()
+    {
         eprintln!(
             "[order] carol's key reached bob at +{at:.1?}, rendering {backfilled} held post(s): {}",
             if *backfilled == 0 {
@@ -358,8 +370,14 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
     let said = || {
         format!(
             "\n--- bob's daemon said:\n{}\n--- carol's daemon said:\n{}",
-            bob_d.1.lock().unwrap(),
-            carol_d.1.lock().unwrap()
+            bob_d
+                .1
+                .lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned"),
+            carol_d
+                .1
+                .lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
         )
     };
     assert!(

@@ -81,14 +81,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
+    let out = child.wait_with_output().expect("APPARATUS: vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -99,12 +99,12 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
 /// A node's `vox status --json` publish counters: (rounds started, board news passed on).
 fn publishing(data: &Path) -> (u64, u64) {
     let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
-    assert!(ok, "vox status --json: {err}");
-    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status is JSON");
+    assert!(ok, "PRODUCT (staging): vox status --json: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("PRODUCT: status is JSON");
     let n = |k: &str| {
         v["publish"][k]
             .as_u64()
-            .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.{k}: {out}"))
+            .unwrap_or_else(|| panic!("PRODUCT: status has no publish.{k}: {out}"))
     };
     (n("rounds"), n("board_news"))
 }
@@ -120,7 +120,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + TIMEOUT;
@@ -138,15 +140,15 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
 #[ignore = "real vox processes with production Argon2id; optional, run it in release"]
 fn a_post_answers_promptly_while_a_peer_posts() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, alice_dir, bob_dir) = (dir("anchor"), dir("alice"), dir("bob"));
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write a staging file");
 
     let mut anchor = VoxProc::spawn(
         "anchor",
@@ -162,13 +164,13 @@ fn a_post_answers_promptly_while_a_peer_posts() {
 
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     };
     let (alice_fp, bob_fp) = (fp(&alice_dir), fp(&bob_dir));
     for (d, other, name) in [(&alice_dir, &bob_fp, "bob"), (&bob_dir, &alice_fp, "alice")] {
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", other, "--name", name]));
-        assert!(ok, "vox trust add {name}: {out}{err}");
+        assert!(ok, "PRODUCT (staging): vox trust add {name}: {out}{err}");
     }
 
     let mut alice_d = daemon("alice", &alice_dir, &spec, &idpass);
@@ -182,7 +184,9 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         let said = Arc::clone(&said);
         std::thread::spawn(move || {
             for line in rx {
-                said.lock().unwrap().push((t0.elapsed(), who, line));
+                said.lock()
+                    .expect("APPARATUS: a lock the proof holds was poisoned")
+                    .push((t0.elapsed(), who, line));
             }
         });
     }
@@ -192,23 +196,23 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         &["room", "create", "--name", "busy"],
         "room pass",
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("busy"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT: room not listed: {list}"))
         .to_owned();
     let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
         &["room", "join", link.trim(), "--name", "busy"],
         "room pass",
     );
-    assert!(ok, "bob joins: {out}{err}");
+    assert!(ok, "PRODUCT (staging): bob joins: {out}{err}");
 
     // ---- Bob posts continuously until Alice is done -----------------------------------------
     let stop = Arc::new(AtomicBool::new(false));
@@ -239,7 +243,7 @@ fn a_post_answers_promptly_while_a_peer_posts() {
     while bob_posts.load(Ordering::Relaxed) < BOB_HEAD_START {
         assert!(
             Instant::now() < deadline,
-            "CANNOT PROVE: Bob never got {BOB_HEAD_START} posts in, so the room was never busy"
+            "PRODUCT (staging): Bob's posts failed: {BOB_HEAD_START} never went in, so the room was never busy"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -253,7 +257,7 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT PROVE: none of Bob's posts reached Alice, so her room was not busy"
+            "PRODUCT (staging): none of Bob's posts reached Alice, so her room was not busy"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -268,11 +272,13 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         for (who, dir) in [("alice", &alice_dir), ("bob", &bob_dir)] {
             let (ok, out, _) = vox_once(dir, &args(&["status", "--json"]));
             if ok {
-                said.lock().unwrap().push((
-                    t0.elapsed(),
-                    who,
-                    format!("sync counters ({label}) {}", out.trim()),
-                ));
+                said.lock()
+                    .expect("APPARATUS: a lock the proof holds was poisoned")
+                    .push((
+                        t0.elapsed(),
+                        who,
+                        format!("sync counters ({label}) {}", out.trim()),
+                    ));
             }
         }
     };
@@ -292,7 +298,7 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         let dur = t.elapsed();
         took.push(dur);
         posts.push((i, t.duration_since(t0), dur));
-        assert!(ok, "alice's post {i} failed: {err}");
+        assert!(ok, "PRODUCT: alice's post {i} failed: {err}");
         if dur > LATE {
             snapshot(&format!("after alice {i}, {}ms", dur.as_millis()));
         }
@@ -300,7 +306,9 @@ fn a_post_answers_promptly_while_a_peer_posts() {
     snapshot("after the timed posts");
     let publish_after = [publishing(&alice_dir), publishing(&bob_dir)];
     stop.store(true, Ordering::Relaxed);
-    bob_thread.join().unwrap();
+    bob_thread
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e));
     let bob_total = bob_posts.load(Ordering::Relaxed);
 
     // Bob's posts arrived at Alice during hers: the busy condition held for the measurement.
@@ -309,7 +317,11 @@ fn a_post_answers_promptly_while_a_peer_posts() {
 
     took.sort();
     let pct = |p: usize| took[(took.len() * p / 100).min(took.len() - 1)];
-    let (p50, p95, max) = (pct(50), pct(95), *took.last().unwrap());
+    let (p50, p95, max) = (
+        pct(50),
+        pct(95),
+        *took.last().expect("APPARATUS: no samples"),
+    );
     println!(
         "[proof] alice {POSTS} posts while bob posted {bob_total} ({bob_seen} seen by alice): \
          p50 {}ms, p95 {}ms, max {}ms (bounds p95 {}ms, max {}ms)",
@@ -322,7 +334,10 @@ fn a_post_answers_promptly_while_a_peer_posts() {
     // **The slowest posts name themselves** (a red on one CI runner, p95 148ms, did not): each
     // with when it started, and what either daemon said from a second before it until just after.
     posts.sort_by_key(|p| std::cmp::Reverse(p.2));
-    let said = said.lock().unwrap().clone();
+    let said = said
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .clone();
     for (i, start, dur) in posts.iter().take(SLOWEST) {
         println!(
             "[slow] alice {i}: {}ms, from +{:.3}s",
@@ -354,7 +369,7 @@ fn a_post_answers_promptly_while_a_peer_posts() {
     }
     assert!(
         bob_seen >= BOB_HEAD_START,
-        "CANNOT PROVE: only {bob_seen} of Bob's {bob_total} posts reached Alice"
+        "PRODUCT: only {bob_seen} of Bob's {bob_total} posts reached Alice"
     );
     // **The storm itself, counted** (#179): during the timed posts, how many publish rounds each
     // node started and how many records on its board it took for news and passed on.

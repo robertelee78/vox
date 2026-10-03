@@ -122,8 +122,10 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 
 /// Start `vox daemon` with the identity passphrase on stdin, output to files by the profile.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: create a staging file");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: create a staging file");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -138,7 +140,8 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         .stdin
         .take()
         .expect("APPARATUS (harness): daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
     let d = Daemon(child);
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -197,9 +200,9 @@ fn drive(script: &str, args: &[&str], tag: &str) -> String {
 #[ignore = "optional: drives the TUI and seeds a room; run in release"]
 fn a_post_answers_while_the_node_opens_another_room() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = tmp.path().join("alice");
-    std::fs::create_dir_all(alice.join("cfg")).unwrap();
+    std::fs::create_dir_all(alice.join("cfg")).expect("APPARATUS: create a staging directory");
     let (ok, _, err) = vox(&alice, &["id"], None);
     assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
     let cfg = alice.join("cfg").to_string_lossy().into_owned();
@@ -261,12 +264,21 @@ fn a_post_answers_while_the_node_opens_another_room() {
         let w: Vec<&str> = l.split_whitespace().collect();
         match w.as_slice() {
             ["open", "POST", start, ms, ok] => posts.push((
-                start.parse::<f64>().unwrap(),
-                ms.parse::<f64>().unwrap(),
+                start
+                    .parse::<f64>()
+                    .expect("APPARATUS: the TUI driver printed a time that is not a number"),
+                ms.parse::<f64>()
+                    .expect("APPARATUS: the TUI driver printed a time that is not a number"),
                 *ok == "1",
             )),
             ["open", "OPEN", start, end] => {
-                window = Some((start.parse::<f64>().unwrap(), end.parse::<f64>().unwrap()));
+                window = Some((
+                    start
+                        .parse::<f64>()
+                        .expect("APPARATUS: the TUI driver printed a time that is not a number"),
+                    end.parse::<f64>()
+                        .expect("APPARATUS: the TUI driver printed a time that is not a number"),
+                ));
             }
             _ => {}
         }

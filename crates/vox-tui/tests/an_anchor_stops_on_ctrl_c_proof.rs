@@ -332,13 +332,14 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
     use std::io::{BufRead as _, Read as _};
     let who = format!("`vox {verb}` at its passphrase prompt");
     let pty = staged("a pty of its own", || {
-        let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("openpt");
-        grantpt(&controller).expect("grantpt");
-        unlockpt(&controller).expect("unlockpt");
-        let name = ptsname(&controller, Vec::new()).expect("ptsname");
+        let controller =
+            openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("APPARATUS: openpt");
+        grantpt(&controller).expect("APPARATUS: grantpt");
+        unlockpt(&controller).expect("APPARATUS: unlockpt");
+        let name = ptsname(&controller, Vec::new()).expect("APPARATUS: ptsname");
         (
             controller,
-            name.to_str().expect("the pty's name").to_owned(),
+            name.to_str().expect("APPARATUS: the pty's name").to_owned(),
         )
     });
     let (controller, pty_name) = pty;
@@ -348,7 +349,7 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
                 .read(true)
                 .write(true)
                 .open(&pty_name)
-                .expect("open")
+                .expect("APPARATUS: open")
         })
     };
     let terminal = open();
@@ -377,7 +378,7 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
             .stdout(std::process::Stdio::from(open()))
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("spawn")
+            .expect("APPARATUS: spawn")
     });
     // What it draws on its terminal, read as it arrives: a process whose output nobody reads
     // cannot finish exiting on macOS.

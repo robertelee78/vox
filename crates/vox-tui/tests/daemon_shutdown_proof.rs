@@ -100,7 +100,9 @@ fn collect(stream: impl Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            sink.lock().unwrap().push(line);
+            sink.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
+                .push(line);
         }
     });
     lines
@@ -118,12 +120,13 @@ impl Proc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(stdin.as_bytes()).expect("write stdin");
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn {name}: {e}"));
+        let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+        pipe.write_all(stdin.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(pipe);
-        let out = collect(child.stdout.take().expect("stdout"));
-        let err = collect(child.stderr.take().expect("stderr"));
+        let out = collect(child.stdout.take().expect("APPARATUS: stdout"));
+        let err = collect(child.stderr.take().expect("APPARATUS: stderr"));
         Self {
             name,
             child,
@@ -133,7 +136,10 @@ impl Proc {
     }
 
     fn stdout(&self) -> Vec<String> {
-        self.out.lock().unwrap().clone()
+        self.out
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .clone()
     }
 
     fn expect_out(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
@@ -148,7 +154,10 @@ impl Proc {
             "{}: never printed {what}; stdout {:#?}\nstderr:\n{}",
             self.name,
             self.stdout(),
-            self.err.lock().unwrap().join("\n")
+            self.err
+                .lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
+                .join("\n")
         );
     }
 }
@@ -164,11 +173,12 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: &str) -> (bool, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
-    let mut pipe = child.stdin.take().expect("stdin");
-    pipe.write_all(stdin.as_bytes()).expect("write");
+        .expect("APPARATUS: spawn vox");
+    let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+    pipe.write_all(stdin.as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     (
         out.status.success(),
         format!(
@@ -191,10 +201,10 @@ fn alive(pid: u32) -> bool {
 #[ignore = "three real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, host_dir, joiner_dir) = (dir("anchor"), dir("host"), dir("joiner"));
@@ -214,7 +224,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
         .to_owned();
     for d in [&host_dir, &joiner_dir] {
         let (ok, said) = vox(d, &["id"], "");
-        assert!(ok, "vox id: {said}");
+        assert!(ok, "PRODUCT (staging): vox id: {said}");
     }
     let mut host = Proc::spawn(
         "host",
@@ -225,7 +235,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
             .strip_prefix(label)
-            .unwrap()
+            .expect("APPARATUS: a line matched by its label strips it")
             .trim()
             .to_owned()
     };
@@ -242,7 +252,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
         &["room", "join", &address, "--name", "svc"],
         &format!("{passphrase}\n"),
     );
-    assert!(ok, "CANNOT MEASURE: the join failed: {said}");
+    assert!(ok, "PRODUCT (staging): the join failed: {said}");
 
     // The peers vanish without a word — no close frames, as when a machine loses power.
     let _ = anchor.child.kill();
@@ -256,8 +266,8 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     let sent = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()
-        .expect("send SIGTERM");
-    assert!(sent.success(), "SIGTERM could not be sent");
+        .expect("APPARATUS: send SIGTERM");
+    assert!(sent.success(), "APPARATUS: SIGTERM could not be sent");
     let deadline = started + Duration::from_secs(90);
     while alive(pid) && daemon.child.try_wait().ok().flatten().is_none() {
         if Instant::now() > deadline {
@@ -267,7 +277,11 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     }
     let took = started.elapsed();
     let exited = daemon.child.try_wait().ok().flatten();
-    let said = daemon.err.lock().unwrap().join("\n");
+    let said = daemon
+        .err
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .join("\n");
     eprintln!("[shutdown] SIGTERM -> exit in {took:?}; exit={exited:?}");
     assert!(
         exited.is_some() && took < STOP_WITHIN,
@@ -277,7 +291,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     );
     assert!(
         daemon.stdout().iter().any(|l| l.contains("shutting down")),
-        "it must say it is shutting down"
+        "PRODUCT: it must say it is shutting down"
     );
 
     // The profile is free the moment the daemon has exited: a one-shot verb that opens it
@@ -293,7 +307,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     // Nothing left behind: every process this test started is gone.
     let pids = [anchor.child.id(), host.child.id(), pid];
     let remaining = pids.iter().filter(|p| alive(**p)).count();
-    assert_eq!(remaining, 0, "processes still running: {pids:?}");
+    assert_eq!(remaining, 0, "PRODUCT: processes still running: {pids:?}");
     eprintln!("[shutdown] {remaining} processes remain");
 }
 
@@ -457,7 +471,7 @@ fn attempt(
     while !rb.texts(cb).iter().any(|t| t.contains(&offered)) {
         assert!(
             t0.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: Bob never read the offer"
+            "PRODUCT (staging): Bob never read the offer"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -498,7 +512,7 @@ fn attempt(
         }
         assert!(
             t1.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: Bob's `vox status` never listed the tunnel to {tag}"
+            "PRODUCT (staging): Bob's `vox status` never listed the tunnel to {tag}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

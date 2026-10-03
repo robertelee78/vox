@@ -85,10 +85,12 @@ use std::time::{Duration, Instant};
 /// Write the room passphrase `pass` beside the profile at `dir`, for `--passphrase-file`: a
 /// room passphrase is never taken from argv or the environment (V210-72).
 fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
-    std::fs::create_dir_all(dir).unwrap();
+    std::fs::create_dir_all(dir).expect("APPARATUS: create a staging directory");
     let at = dir.join("room-passphrase");
-    std::fs::write(&at, pass).unwrap();
-    at.to_str().unwrap().to_owned()
+    std::fs::write(&at, pass).expect("APPARATUS: write a staging file");
+    at.to_str()
+        .expect("APPARATUS: a path that is not UTF-8")
+        .to_owned()
 }
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 
@@ -254,7 +256,9 @@ fn udp_direction(
         let mut rng = seed | 1;
         while let Ok(n) = rx.recv(&mut buf) {
             let now = Instant::now();
-            let l = *link.lock().unwrap();
+            let l = *link
+                .lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned");
             let due = match l {
                 None => now,
                 Some(l) => {
@@ -317,16 +321,23 @@ fn udp_shaper(
     bottleneck: Arc<Mutex<Pacer>>,
     seed: u64,
 ) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
-    let front = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the shaper");
-    let back = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the shaper's upstream side");
+    let front = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind the shaper");
+    let back = std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("APPARATUS: bind the shaper's upstream side");
     big_buffers(&front);
     big_buffers(&back);
-    back.connect(upstream).expect("connect the shaper upstream");
-    let addr = front.local_addr().unwrap();
+    back.connect(upstream)
+        .expect("APPARATUS: connect the shaper upstream");
+    let addr = front
+        .local_addr()
+        .expect("APPARATUS: read a socket the proof bound");
     let carried = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     // Toward the host: learn the client from its first packet.
-    let (front_rx, back_tx) = (front.try_clone().unwrap(), back.try_clone().unwrap());
+    let (front_rx, back_tx) = (
+        front.try_clone().expect("APPARATUS: clone a handle"),
+        back.try_clone().expect("APPARATUS: clone a handle"),
+    );
     let learn = Arc::clone(&client);
     let (tx, queue) = mpsc::channel::<(Instant, Vec<u8>, bool)>();
     {
@@ -335,16 +346,26 @@ fn udp_shaper(
             let mut buf = vec![0u8; 65536];
             let mut rng = seed | 1;
             while let Ok((n, from)) = front_rx.recv_from(&mut buf) {
-                *learn.lock().unwrap() = Some(from);
+                *learn
+                    .lock()
+                    .expect("APPARATUS: a lock the proof holds was poisoned") = Some(from);
                 let now = Instant::now();
-                let shaped = link.lock().unwrap().is_some();
-                let due = match *link.lock().unwrap() {
+                let shaped = link
+                    .lock()
+                    .expect("APPARATUS: a lock the proof holds was poisoned")
+                    .is_some();
+                let due = match *link
+                    .lock()
+                    .expect("APPARATUS: a lock the proof holds was poisoned")
+                {
                     None => now,
                     Some(l) => {
                         if l.loss > 0.0 && next_rand(&mut rng) < l.loss {
                             continue;
                         }
-                        let mut pacer = bottleneck.lock().unwrap();
+                        let mut pacer = bottleneck
+                            .lock()
+                            .expect("APPARATUS: a lock the proof holds was poisoned");
                         let backlog = pacer.next_free.saturating_duration_since(now).as_secs_f64()
                             * l.bits_per_sec
                             / 8.0;
@@ -376,7 +397,10 @@ fn udp_shaper(
     udp_direction(
         back,
         move |pkt| {
-            if let Some(to) = *who.lock().unwrap() {
+            if let Some(to) = *who
+                .lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
+            {
                 let _ = front_tx.send_to(pkt, to);
             }
         },
@@ -426,12 +450,13 @@ fn busiest() -> String {
 }
 
 fn calibrate_once(link: Option<Link>) -> f64 {
-    let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let sink = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
     sink.set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
+        .expect("APPARATUS: set a read timeout");
     big_buffers(&sink);
     let (front, _) = udp_shaper(
-        sink.local_addr().unwrap(),
+        sink.local_addr()
+            .expect("APPARATUS: read a socket the proof bound"),
         Arc::new(Mutex::new(link)),
         Arc::new(Mutex::new(Pacer::new())),
         SEED_TUNNEL,
@@ -440,7 +465,7 @@ fn calibrate_once(link: Option<Link>) -> f64 {
     let sender = {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
             big_buffers(&s);
             let pkt = [0x5au8; 1350];
             // 1,350 bytes plus the 28 the emulator charges per datagram, at 1.05x the link's rate,
@@ -492,8 +517,10 @@ const EMULATOR_FIDELITY: f64 = 0.95;
 
 /// A TCP shaper in front of `upstream`, one way (client to upstream): the raw arm's link.
 fn tcp_shaper(upstream: SocketAddr, link: Shared) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the TCP shaper");
-    let addr = listener.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the TCP shaper");
+    let addr = listener
+        .local_addr()
+        .expect("APPARATUS: read a socket the proof bound");
     std::thread::spawn(move || {
         for client in listener.incoming() {
             let Ok(mut client) = client else { continue };
@@ -511,7 +538,10 @@ fn tcp_shaper(upstream: SocketAddr, link: Shared) -> SocketAddr {
                         Ok(n) => n,
                     };
                     let now = Instant::now();
-                    let due = match *link.lock().unwrap() {
+                    let due = match *link
+                        .lock()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
+                    {
                         None => now,
                         // TCP/IP header overhead per 1448-byte segment, as on the wire.
                         Some(l) => pacer.release(&l, now, n + n.div_ceil(1448) * 52),
@@ -573,7 +603,7 @@ impl Proc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn {name}: {e}"));
         let lines = Arc::new(Mutex::new(Vec::new()));
         for stream in [
             child
@@ -591,7 +621,9 @@ impl Proc {
             let sink = Arc::clone(&lines);
             std::thread::spawn(move || {
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                    sink.lock().unwrap().push(line);
+                    sink.lock()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
+                        .push(line);
                 }
             });
         }
@@ -599,7 +631,10 @@ impl Proc {
     }
 
     fn said(&self) -> Vec<String> {
-        self.lines.lock().unwrap().clone()
+        self.lines
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .clone()
     }
 
     fn expect_line(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
@@ -635,7 +670,7 @@ fn vox_once_env(
         .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
         .stdin(Stdio::null())
         .output()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -645,7 +680,7 @@ fn vox_once_env(
 
 fn after_label(line: &str, label: &str) -> String {
     line.strip_prefix(label)
-        .unwrap_or_else(|| panic!("line {line:?} does not start with {label:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT: line {line:?} does not start with {label:?}"))
         .trim()
         .to_owned()
 }
@@ -653,8 +688,11 @@ fn after_label(line: &str, label: &str) -> String {
 /// A sink: counts each connection's bytes and reports two instants, when the first quarter of
 /// `BYTES` has arrived and when the last byte has.
 fn sink() -> (u16, mpsc::Receiver<(Instant, Instant)>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the sink");
-    let port = listener.local_addr().unwrap().port();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the sink");
+    let port = listener
+        .local_addr()
+        .expect("APPARATUS: read a socket the proof bound")
+        .port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -705,23 +743,28 @@ fn sink() -> (u16, mpsc::Receiver<(Instant, Instant)>) {
 /// 55% where the steady state was the question. The first quarter is the allowance for that ramp.
 fn transfer(to: SocketAddr, done: &mpsc::Receiver<(Instant, Instant)>) -> f64 {
     let chunk = vec![0x5au8; CHUNK];
-    let mut s = TcpStream::connect(to).expect("connect for the transfer");
+    let mut s = TcpStream::connect(to).expect("PRODUCT: connect for the transfer");
     let mut sent = 0u64;
     while sent < BYTES {
-        let n = usize::try_from((BYTES - sent).min(CHUNK as u64)).unwrap();
-        s.write_all(&chunk[..n]).expect("write the transfer");
+        let n = usize::try_from((BYTES - sent).min(CHUNK as u64))
+            .expect("APPARATUS: a chunk fits in usize");
+        s.write_all(&chunk[..n])
+            .expect("PRODUCT: write the transfer");
         sent += n as u64;
     }
     let (quarter, end) = done
         .recv_timeout(Duration::from_secs(300))
-        .expect("the sink never received every byte");
+        .expect("PRODUCT: the sink never received every byte");
     let secs = end.duration_since(quarter).as_secs_f64();
     drop(s);
     (BYTES - BYTES / 4) as f64 / secs
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .expect("APPARATUS: a duration that is not a number")
+    });
     v[v.len() / 2]
 }
 
@@ -740,12 +783,12 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         .unwrap_or(MIN_RATIO);
     shown(&format!("uptime at start: {}", uptime()));
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let anchor_dir = tmp.path().join("anchor");
     let host_dir = tmp.path().join("host");
     let guest_dir = tmp.path().join("guest");
     for d in [&anchor_dir, &host_dir, &guest_dir] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let (port, done) = sink();
     let link: Shared = Arc::new(Mutex::new(None));
@@ -765,25 +808,30 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         .to_owned();
 
     let (ok, host_fp, err) = vox_once(&host_dir, &["id"]);
-    assert!(ok, "host id: {err}");
+    assert!(ok, "PRODUCT: host id: {err}");
     let (ok, guest_fp, err) = vox_once(&guest_dir, &["id"]);
-    assert!(ok, "guest id: {err}");
+    assert!(ok, "PRODUCT: guest id: {err}");
     let (ok, _, err) = vox_once(
         &host_dir,
         &["trust", "add", guest_fp.trim(), "--name", "guest"],
     );
-    assert!(ok, "host trusts guest: {err}");
+    assert!(ok, "PRODUCT (staging): host trusts guest: {err}");
 
     // The host listens on a known port behind the UDP shaper, and advertises only the shaper.
     let host_port = {
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
+        probe
+            .local_addr()
+            .expect("APPARATUS: read a socket the proof bound")
+            .port()
     };
     let host_listen = format!("127.0.0.1:{host_port}");
     // The tunnel's queue toward the host: the competing flow of the congested arm shares it.
     let bottleneck = Arc::new(Mutex::new(Pacer::new()));
     let (shaped, carried) = udp_shaper(
-        host_listen.parse().unwrap(),
+        host_listen
+            .parse()
+            .expect("APPARATUS: a socket address the proof wrote"),
         Arc::clone(&link),
         Arc::clone(&bottleneck),
         SEED_TUNNEL,
@@ -818,7 +866,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     );
     assert!(
         address.contains(&format!("/udp/{}", shaped.port())),
-        "CANNOT MEASURE: the host did not advertise the shaper: {address}"
+        "PRODUCT (staging): the host did not advertise the shaper: {address}"
     );
 
     // The guest advertises nothing reachable, so the host cannot open a second, unshaped path.
@@ -837,7 +885,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         ],
         &nowhere,
     );
-    assert!(ok, "CANNOT MEASURE: vox connect failed.\n{out}\n{err}");
+    assert!(ok, "PRODUCT (staging): vox connect failed.\n{out}\n{err}");
     let forward = Proc::spawn(
         "forward",
         &guest_dir,
@@ -862,10 +910,12 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     let tunnel: SocketAddr = line
         .split_whitespace()
         .nth(1)
-        .expect("an address")
+        .expect("PRODUCT: an address")
         .parse()
-        .expect("a socket address");
-    let sink_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        .expect("PRODUCT: a socket address");
+    let sink_addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
     let raw = tcp_shaper(sink_addr, Arc::clone(&link));
 
     // Direct, asserted: the anchor must carry no circuit for the timed transfers.
@@ -937,7 +987,9 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
             );
             continue;
         }
-        *link.lock().unwrap() = Some(l);
+        *link
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned") = Some(l);
         std::thread::sleep(Duration::from_millis(500));
         let drops_before = TAIL_DROPS.load(std::sync::atomic::Ordering::Relaxed);
         let (t, r, rounds) = match measure(tunnel, raw, &done, &carried, Some(l)) {
@@ -1013,7 +1065,9 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         &mut failed,
         &mut cannot,
     );
-    *link.lock().unwrap() = None;
+    *link
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned") = None;
     for line in &report {
         shown(&format!("R41: {line}"));
     }
@@ -1251,8 +1305,9 @@ fn stream_to(
     std::thread::spawn(move || {
         let mut chunk = vec![0x5au8; CHUNK];
         chunk[0] = STREAM_MARK;
-        let mut s = TcpStream::connect(to).expect("connect the stream");
-        s.write_all(&chunk).expect("write the stream's first chunk");
+        let mut s = TcpStream::connect(to).expect("PRODUCT: connect the stream");
+        s.write_all(&chunk)
+            .expect("PRODUCT: write the stream's first chunk");
         chunk[0] = 0x5a;
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             if s.write_all(&chunk).is_err() {
@@ -1477,34 +1532,36 @@ fn competitor_transport() -> Arc<quinn::TransportConfig> {
 }
 
 fn competitor_endpoint() -> quinn::Endpoint {
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the comparison flow");
+    let sock =
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind the comparison flow");
     big_buffers(&sock);
     let mut ecfg = quinn::EndpointConfig::default();
     let _ = ecfg.max_udp_payload_size(8192);
     quinn::Endpoint::new(ecfg, None, sock, Arc::new(quinn::TokioRuntime))
-        .expect("the comparison flow's endpoint")
+        .expect("APPARATUS: the comparison flow's endpoint")
 }
 
 /// The comparison flow's receiver: counts into [`COMPETED`]. Returns its address.
 fn competitor_receiver(rt: &tokio::runtime::Runtime) -> SocketAddr {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let ck = rcgen::generate_simple_self_signed(vec!["comparison".into()]).expect("a certificate");
+    let ck = rcgen::generate_simple_self_signed(vec!["comparison".into()])
+        .expect("APPARATUS: a certificate");
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3")
+        .expect("APPARATUS: TLS 1.3")
         .with_no_client_auth()
         .with_single_cert(vec![ck.cert.der().clone()], key)
-        .expect("the receiver's TLS");
+        .expect("APPARATUS: the receiver's TLS");
     tls.alpn_protocols = vec![b"r41".to_vec()];
     let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("QUIC TLS"),
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("APPARATUS: QUIC TLS"),
     ));
     scfg.transport_config(competitor_transport());
     let _rt = rt.enter();
     let ep = competitor_endpoint();
     ep.set_server_config(Some(scfg));
-    let addr = ep.local_addr().expect("the receiver's address");
+    let addr = ep.local_addr().expect("APPARATUS: the receiver's address");
     rt.spawn(async move {
         while let Some(inc) = ep.accept().await {
             tokio::spawn(async move {
@@ -1532,13 +1589,13 @@ fn competitor_sender(
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3")
+        .expect("APPARATUS: TLS 1.3")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
         .with_no_client_auth();
     tls.alpn_protocols = vec![b"r41".to_vec()];
     let mut ccfg = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC TLS"),
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("APPARATUS: QUIC TLS"),
     ));
     ccfg.transport_config(competitor_transport());
     let _rt = rt.enter();
@@ -1548,7 +1605,9 @@ fn competitor_sender(
             return;
         };
         let Ok(conn) = connecting.await else { return };
-        *COMPARISON_CONN.lock().unwrap() = Some(conn.clone());
+        *COMPARISON_CONN
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned") = Some(conn.clone());
         let Ok(mut tx) = conn.open_uni().await else {
             return;
         };
@@ -1604,7 +1663,7 @@ static COMPARISON_CONN: Mutex<Option<quinn::Connection>> = Mutex::new(None);
 fn comparison_stats() -> String {
     COMPARISON_CONN
         .lock()
-        .unwrap()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
         .as_ref()
         .map_or("the comparison flow's stats: not connected".to_owned(), |c| {
             let p = c.stats().path;
@@ -1650,7 +1709,7 @@ fn taper_arms(
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("the comparison flow's runtime");
+        .expect("APPARATUS: the comparison flow's runtime");
     let receiver = competitor_receiver(&rt);
     let (competitor, _) = udp_shaper(
         receiver,
@@ -1687,7 +1746,9 @@ fn taper_arms(
             );
             break 'clean;
         }
-        *link.lock().unwrap() = Some(CLEAN_LAN);
+        *link
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned") = Some(CLEAN_LAN);
         std::thread::sleep(Duration::from_millis(500));
         let raw_rate = transfer(raw, done) * 8.0;
         let bar = raw_rate * MIN_RATIO;
@@ -1743,7 +1804,9 @@ fn taper_arms(
         if !wanted(lossy.name) && !feeds_changing {
             continue;
         }
-        *link.lock().unwrap() = Some(lossy);
+        *link
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned") = Some(lossy);
         let stop = Arc::new(AtomicBool::new(false));
         let pump = stream_to(tunnel, Arc::clone(&stop));
         let all_v = windows(settle_and_measure, |_| {});
@@ -1852,7 +1915,9 @@ fn taper_arms(
             ..lossy_link
         };
         // The clean bar: raw TCP over the same clean link, as for every gated link above.
-        *link.lock().unwrap() = Some(clean);
+        *link
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned") = Some(clean);
         std::thread::sleep(Duration::from_millis(500));
         let raw_rate = transfer(raw, done) * 8.0;
         let bar = raw_rate * MIN_RATIO;
@@ -1875,7 +1940,9 @@ fn taper_arms(
         let l = Arc::clone(link);
         let all = windows(SETTLE + PHASE * 3, move |t| {
             let lossy = t >= SETTLE + PHASE && t < SETTLE + PHASE * 2;
-            *l.lock().unwrap() = Some(if lossy { lossy_link } else { clean });
+            *l.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned") =
+                Some(if lossy { lossy_link } else { clean });
         });
         stop.store(true, Relaxed);
         let _ = pump.join();
@@ -1997,7 +2064,9 @@ fn taper_arms(
             );
             continue;
         };
-        *link.lock().unwrap() = Some(lossy_link);
+        *link
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned") = Some(lossy_link);
         let stop = Arc::new(AtomicBool::new(false));
         let pump = stream_to(tunnel, Arc::clone(&stop));
         let before = windows(SETTLE + MEASURE, |_| {});
@@ -2071,7 +2140,9 @@ fn taper_arms(
         if !wanted(congested.name) {
             continue;
         }
-        *link.lock().unwrap() = Some(congested);
+        *link
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned") = Some(congested);
         let stop = Arc::new(AtomicBool::new(false));
         competitor_sender(&rt, competitor, Arc::clone(&stop));
         let pump = stream_to(tunnel, Arc::clone(&stop));

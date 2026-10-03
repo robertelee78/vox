@@ -106,19 +106,24 @@ fn flood_batch(
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let mut other = [salt ^ 0x33; 32];
             other[..8].copy_from_slice(&(i as u64).to_be_bytes());
-            let s = SoftwareRootSigner::from_component_seeds(&seed, &other).unwrap();
+            let s = SoftwareRootSigner::from_component_seeds(&seed, &other)
+                .expect("APPARATUS: build the stand-in peer's signer");
             let t = hostile::now();
-            let ring = PrekeyRing::generate(&s, &seed, t).unwrap();
-            let bundle = ring.bundle(&s.public_key()).unwrap();
+            let ring = PrekeyRing::generate(&s, &seed, t)
+                .expect("APPARATUS: generate the stand-in peer's prekeys");
+            let bundle = ring
+                .bundle(&s.public_key())
+                .expect("APPARATUS: build the stand-in peer's records");
             let record = PreJoinRecord::build(
                 &s,
                 &room,
                 bundle,
-                EndpointList::new(Vec::new()).unwrap(),
+                EndpointList::new(Vec::new())
+                    .expect("APPARATUS: build the stand-in peer's records"),
                 1,
                 t,
             )
-            .unwrap();
+            .expect("APPARATUS: build the stand-in peer's records");
             let (ep, conn) = connect(&s, addr, id).await;
             let ok = put(&conn, &record.to_wire()).await.is_ok();
             conn.quinn().close(0u32.into(), b"done");
@@ -147,22 +152,22 @@ fn join(dir: &std::path::Path, link: &str, name: &str) -> (bool, Duration, Strin
 #[ignore = "real vox processes with production Argon2id, a flood and two real joins; run in release"]
 fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),
         profile_dir(tmp.path(), "victim"),
         profile_dir(tmp.path(), "joiner"),
     );
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
 
     let anchor_port = free_port();
     let (_anchor, spec) = hostile::anchor(&anchor_dir, &format!("127.0.0.1:{anchor_port}"));
     let anchor_id = vox_core::node::link::b32_decode(
-        spec.split('@').next().expect("an anchor spec"),
+        spec.split('@').next().expect("PRODUCT: an anchor spec"),
         "anchor fingerprint",
     )
-    .expect("the anchor's fingerprint");
+    .expect("PRODUCT: the anchor's fingerprint");
     let victim_id = fingerprint(&victim_dir);
     fingerprint(&joiner_dir);
     let victim_port = free_port();
@@ -170,8 +175,12 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     let (room, link) = create_room(&victim_dir, "first", ROOM_PASS);
     // The anchor holds the room once the victim has published it there.
     std::thread::sleep(Duration::from_secs(3));
-    let victim_addr = format!("127.0.0.1:{victim_port}").parse().unwrap();
-    let anchor_addr = format!("127.0.0.1:{anchor_port}").parse().unwrap();
+    let victim_addr = format!("127.0.0.1:{victim_port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
+    let anchor_addr = format!("127.0.0.1:{anchor_port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
 
     let rt = Rt::new();
 
@@ -204,7 +213,7 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
                 min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
             };
             Genesis::create_with_nonce(&inventor, hostile::now(), policy, nonce)
-                .unwrap()
+                .expect("APPARATUS: build the stand-in peer's records")
                 .to_wire()
         })
         .collect();
@@ -256,7 +265,7 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     println!("[proof] the anchor still serves the room in use: {first_kept:?}");
     assert!(
         matches!(first_kept, Ok(true)),
-        "strangers' {GENESES} empty rooms displaced a room in use from the anchor ({first_kept:?})"
+        "PRODUCT: strangers' {GENESES} empty rooms displaced a room in use from the anchor ({first_kept:?})"
     );
     let (second, second_link) = create_room(&victim_dir, "second", ROOM_PASS);
     std::thread::sleep(Duration::from_secs(3));

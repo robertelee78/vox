@@ -138,12 +138,18 @@ fn vox(data: &Path, argv: &[&str], stdin: &str) -> (bool, Duration, String, Stri
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     // Read the pipes on their own threads: a full pipe would block the child.
-    let mut out_pipe = child.stdout.take().unwrap();
-    let mut err_pipe = child.stderr.take().unwrap();
+    let mut out_pipe = child
+        .stdout
+        .take()
+        .expect("APPARATUS: a piped stdio handle");
+    let mut err_pipe = child
+        .stderr
+        .take()
+        .expect("APPARATUS: a piped stdio handle");
     let out_t = std::thread::spawn(move || {
         let mut s = Vec::new();
         let _ = std::io::Read::read_to_end(&mut out_pipe, &mut s);
@@ -155,7 +161,7 @@ fn vox(data: &Path, argv: &[&str], stdin: &str) -> (bool, Duration, String, Stri
         s
     });
     let ok = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.try_wait().expect("APPARATUS: poll a child process") {
             break status.success();
         }
         if t0.elapsed() >= VERB_CAP {
@@ -169,8 +175,18 @@ fn vox(data: &Path, argv: &[&str], stdin: &str) -> (bool, Duration, String, Stri
     (
         ok,
         took,
-        String::from_utf8_lossy(&out_t.join().unwrap()).into_owned(),
-        String::from_utf8_lossy(&err_t.join().unwrap()).into_owned(),
+        String::from_utf8_lossy(
+            &out_t
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        )
+        .into_owned(),
+        String::from_utf8_lossy(
+            &err_t
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        )
+        .into_owned(),
     )
 }
 
@@ -214,7 +230,7 @@ fn append_to_visible(
                 after = row
                     .split_whitespace()
                     .next()
-                    .expect("a row starts with its entry hash")
+                    .expect("PRODUCT: a row starts with its entry hash")
                     .to_owned();
                 break;
             }
@@ -347,19 +363,21 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         std::env::set_var("VOX_TEST_WATCHDOG_SECS", "3000");
     }
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("alice");
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: create a staging directory");
     let (ok, _, _, err) = vox(&data, &["id"], "");
     assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
     let daemon_args = args(&[
         "daemon",
         "--listen",
         "127.0.0.1:0",
         "--passphrase-file",
-        pass_file.to_str().unwrap(),
+        pass_file
+            .to_str()
+            .expect("APPARATUS: a path that is not UTF-8"),
     ]);
     let mut daemon = Some(VoxProc::spawn("alice", &data, &daemon_args));
     let deadline = Instant::now() + SETUP;
@@ -396,7 +414,10 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum()
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .sum()
     });
     println!(
         "[proof] staged {posted} of {POSTS} posts of {TEXT_LEN} bytes in {:?}",
@@ -480,8 +501,10 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         &[
             VOX,
             "tuilong",
-            data.to_str().unwrap(),
-            data.join("cfg").to_str().unwrap(),
+            data.to_str().expect("APPARATUS: a path that is not UTF-8"),
+            data.join("cfg")
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
             "long",
             &TUI_POSTS.to_string(),
             IDENTITY,

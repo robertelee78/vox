@@ -200,7 +200,7 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         assert_eq!(
             code,
             0,
-            "sample {i}: the first CONNECT to {hostname} was refused (SOCKS {code}).\nup:\n{}",
+            "PRODUCT: sample {i}: the first CONNECT to {hostname} was refused (SOCKS {code}).\nup:\n{}",
             up.transcript()
         );
         let sent = w.forward.to_host();
@@ -208,7 +208,7 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         let answered = Instant::now();
         assert!(
             echoed,
-            "sample {i}: the first CONNECT succeeded but no whole echo came back.\nup:\n{}",
+            "PRODUCT: sample {i}: the first CONNECT succeeded but no whole echo came back.\nup:\n{}",
             up.transcript()
         );
         requests += 1;

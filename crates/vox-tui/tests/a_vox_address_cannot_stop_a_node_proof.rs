@@ -349,7 +349,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             &stranger,
             &cid,
             bundle,
-            EndpointList::new(Vec::new()).unwrap(),
+            EndpointList::new(Vec::new()).expect("APPARATUS: build the stand-in peer's records"),
             1,
             t,
         )

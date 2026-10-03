@@ -81,14 +81,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
+    let out = child.wait_with_output().expect("APPARATUS: vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -104,7 +104,9 @@ struct Rt(Option<tokio::runtime::Runtime>);
 impl std::ops::Deref for Rt {
     type Target = tokio::runtime::Runtime;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
+        self.0
+            .as_ref()
+            .expect("APPARATUS: a process the proof started")
     }
 }
 
@@ -118,9 +120,9 @@ impl Drop for Rt {
 
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
+        .expect("APPARATUS: bind a socket")
         .local_addr()
-        .unwrap()
+        .expect("APPARATUS: read a socket the proof bound")
         .port()
 }
 
@@ -135,7 +137,9 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -145,7 +149,7 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE: {name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 /// Stop a process with SIGTERM by its PID and reap it.
@@ -165,24 +169,25 @@ fn stop(mut p: VoxProc) {
 
 fn fingerprint(data: &Path) -> [u8; 32] {
     let (ok, out, err) = vox_once(data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id: {err}");
-    vox_core::node::link::b32_decode(out.trim(), "fingerprint")
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: vox id printed no fingerprint ({e:?}): {out}"))
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
+    vox_core::node::link::b32_decode(out.trim(), "fingerprint").unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): vox id printed no fingerprint ({e:?}): {out}")
+    })
 }
 
 #[test]
 #[ignore = "real vox processes, production Argon2id and a real join; run in release"]
 fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, victim_dir, mallory_dir) = (dir("anchor"), dir("victim"), dir("mallory"));
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
 
     // ---- staging, all through the shipped binary ----------------------------------------
     let mut anchor = VoxProc::spawn(
@@ -194,7 +199,7 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .unwrap()
+        .expect("APPARATUS: the line matched for the spec holds it")
         .to_owned();
 
     let victim_id = fingerprint(&victim_dir);
@@ -210,15 +215,15 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
         &["room", "create", "--name", "team"],
         ROOM_PASS,
     );
-    assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, list, _) = vox_once(&victim_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
         .next()
-        .expect("CANNOT MEASURE: the new room in `vox room list`")
+        .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
     let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "CANNOT MEASURE: room invite: {err}");
+    assert!(ok, "PRODUCT (staging): room invite: {err}");
     let link = link.trim().to_owned();
     let joined = (1..=6).any(|attempt| {
         let (ok, out, err) = vox_in(
@@ -232,7 +237,7 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
         }
         ok
     });
-    assert!(joined, "CANNOT MEASURE: mallory could not join the room");
+    assert!(joined, "PRODUCT (staging): mallory could not join the room");
 
     // Mallory's node goes; her identity stays, in the profile the binary wrote.
     stop(mallory);
@@ -242,7 +247,7 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
             .worker_threads(4)
             .enable_all()
             .build()
-            .unwrap(),
+            .expect("APPARATUS: start a runtime"),
     ));
     let _enter = rt.enter();
     let mallory_paths = Paths::resolve(
@@ -250,11 +255,17 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
         Some(&mallory_dir),
         Some(&mallory_dir.join("cfg")),
     )
-    .unwrap();
+    .expect("APPARATUS: resolve a profile's paths");
     let (_endpoint, conn) = rt.block_on(async {
         let endpoint = raw_sync::endpoint_as_member(&mallory_paths, IDENTITY.as_bytes()).await;
         let conn = endpoint
-            .connect(victim_listen.parse().unwrap(), victim_id, raw_sync::now())
+            .connect(
+                victim_listen
+                    .parse()
+                    .expect("PRODUCT (staging): vox printed a listen address that does not parse"),
+                victim_id,
+                raw_sync::now(),
+            )
             .await
             .expect("CANNOT MEASURE: mallory's identity did not connect to the victim");
         (endpoint, Arc::new(conn))
@@ -312,11 +323,13 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
                     } else {
                         let _ = send.finish();
                     }
-                    seen.lock().unwrap().push(Seen {
-                        at: t0.elapsed(),
-                        hello_first,
-                        key,
-                    });
+                    seen.lock()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
+                        .push(Seen {
+                            at: t0.elapsed(),
+                            hello_first,
+                            key,
+                        });
                 });
             }
         });
@@ -330,12 +343,12 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
     );
     assert!(
         ok,
-        "CANNOT MEASURE: the victim could not trust mallory: {out}\n{err}"
+        "PRODUCT (staging): the victim could not trust mallory: {out}\n{err}"
     );
 
     let keys = |seen: &Arc<Mutex<Vec<Seen>>>| -> Vec<Seen> {
         seen.lock()
-            .unwrap()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
             .iter()
             .filter(|s| s.key)
             .cloned()
@@ -350,7 +363,8 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
         panic!(
             "CANNOT MEASURE: no key reached mallory within {FIRST_KEY_WITHIN:?} of the victim \
              trusting her; streams seen: {:?}\nvictim:\n{}",
-            seen.lock().unwrap(),
+            seen.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned"),
             victim.transcript()
         );
     };
@@ -358,7 +372,8 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
         !first.hello_first,
         "CANNOT MEASURE: the first key already opened a fresh session (a hello first), so no \
          existing session was refused: {:?}",
-        seen.lock().unwrap()
+        seen.lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
     );
 
     // ---- after the refusal: a later key opens a fresh session ---------------------------
@@ -373,7 +388,10 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    let all = seen.lock().unwrap().clone();
+    let all = seen
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .clone();
     let later = keys(&seen).len().saturating_sub(1);
     println!(
         "[proof] first key at {:?} under the existing session, refused CannotOpen; {later} later \

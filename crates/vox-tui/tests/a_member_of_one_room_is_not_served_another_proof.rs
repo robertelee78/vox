@@ -317,7 +317,7 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
             loop {
                 if pushed
                     .lock()
-                    .unwrap()
+                    .expect("APPARATUS: a lock the proof holds was poisoned")
                     .iter()
                     .any(|(c, y)| *c == a && y.hello)
                 {
@@ -331,11 +331,11 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
             a_pushed.is_ok(),
             "CANNOT MEASURE: the push CONTROL failed: the victim never pushed alpha to its member \
              on a fresh connection, so a zero for bravo would prove nothing — {:?}\nvictim:\n{}",
-            pushed.lock().unwrap(),
+            pushed.lock().expect("APPARATUS: a lock the proof holds was poisoned"),
             victim.transcript()
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let got = pushed.lock().unwrap().clone();
+        let got = pushed.lock().expect("APPARATUS: a lock the proof holds was poisoned").clone();
         let b_sessions = got.iter().filter(|(c, y)| *c == b && y.hello).count();
         let b_entries: usize = got
             .iter()

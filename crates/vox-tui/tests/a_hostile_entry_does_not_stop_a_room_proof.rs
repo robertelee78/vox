@@ -274,7 +274,7 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     alice.post(&room, warm);
     assert!(
         arrives(&mallory, &room, warm).is_ok(),
-        "CANNOT MEASURE: alice's first post never reached mallory"
+        "PRODUCT (staging): alice's first post never reached mallory"
     );
     // Not a precondition: bob may take this one from mallory too, stripped.
     if let Err(e) = arrives(&bob, &room, warm) {
@@ -303,7 +303,7 @@ fn a_stripped_payload_is_refused_and_the_real_entry_arrives() {
     signal_took(&bob_d, "-CONT", "bob");
     if let Err(e) = held {
         panic!(
-            "CANNOT MEASURE: mallory never had alice's post, so bob could not get it from her: {e}"
+            "PRODUCT (staging): mallory never had alice's post, so bob could not get it from her: {e}"
         );
     }
     let refused = refused_by(&bob, Some(&mallory), since);
@@ -373,7 +373,7 @@ fn a_message_lost_to_the_old_row_ids_is_reported() {
     }
     for p in hers {
         if let Err(e) = arrives(&bob, &room, p) {
-            panic!("CANNOT MEASURE: bob never received {p:?}: {e}");
+            panic!("PRODUCT (staging): bob never received {p:?}: {e}");
         }
     }
     // ---- bob's store is damaged the old way: restart, post ---------------------------------

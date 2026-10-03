@@ -86,9 +86,9 @@ const REFUSED: &str = "would not take our address";
 /// A UDP port nobody holds right now.
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
+        .expect("APPARATUS: bind a socket")
         .local_addr()
-        .unwrap()
+        .expect("APPARATUS: read a socket the proof bound")
         .port()
 }
 
@@ -131,10 +131,10 @@ fn a_fresh_process_is_taken_by_its_board() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT PROVE: the guest could not join ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join ({took:?}).\n{out}\n{err}"
     );
     let (ok, guest_fp, err) = vox_once(&w.guest_dir, &args(&["id"]));
-    assert!(ok, "vox id (guest): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
     let guest: String = guest_fp.trim().chars().take(26).collect();
 
     let mut failures: Vec<String> = Vec::new();
@@ -242,6 +242,6 @@ fn a_fresh_process_is_taken_by_its_board() {
     );
     assert!(
         failures.is_empty(),
-        "a fresh process's address was not taken by its board: {failures:?}"
+        "PRODUCT: a fresh process's address was not taken by its board: {failures:?}"
     );
 }

@@ -76,7 +76,7 @@ fn drain(w: &Worker, r: &str, session: &str) -> String {
             "{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"{session}\"}}"
         )),
     );
-    assert!(o.ok, "a drain hook always exits 0: {o:?}");
+    assert!(o.ok, "PRODUCT: a drain hook always exits 0: {o:?}");
     o.stdout
 }
 
@@ -97,8 +97,8 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: start a runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let room = rt.block_on(support::room(tmp.path(), &["h", "h-prime"]));
     let (h, hp) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
@@ -123,25 +123,25 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
     let a = drain(h, r, "A");
     assert!(
         !a.contains("OWN-A-ON-H"),
-        "A's drain re-injected A's own post: {a}"
+        "PRODUCT: A's drain re-injected A's own post: {a}"
     );
     assert!(
         a.contains("SIBLING-B-ON-H"),
-        "A's drain dropped another session of the same harness: {a}"
+        "PRODUCT: A's drain dropped another session of the same harness: {a}"
     );
     assert!(
         a.contains("SAME-NAME-A-ON-H-PRIME"),
-        "A's drain dropped a DIFFERENT harness that uses the same session name: {a}"
+        "PRODUCT: A's drain dropped a DIFFERENT harness that uses the same session name: {a}"
     );
     let b = drain(h, r, "B");
     assert!(
         !b.contains("SIBLING-B-ON-H") && b.contains("OWN-A-ON-H"),
-        "B's drain: {b}"
+        "PRODUCT: B's drain: {b}"
     );
     let ap = drain(hp, r, "A");
     assert!(
         !ap.contains("SAME-NAME-A-ON-H-PRIME") && ap.contains("OWN-A-ON-H"),
-        "H′'s A drain: {ap}"
+        "PRODUCT: H′'s A drain: {ap}"
     );
 }
 
@@ -161,8 +161,8 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: start a runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let room = rt.block_on(support::room(tmp.path(), &["h", "h-prime"]));
     let (h, hp) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
@@ -186,15 +186,17 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
     let fixture = sb.root.join("fixture");
     let project = fixture.join("project");
     let oc_cfg = fixture.join("config");
-    std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
-    std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
+    std::fs::create_dir_all(project.join(".opencode/plugin"))
+        .expect("APPARATUS: create a staging directory");
+    std::fs::create_dir_all(oc_cfg.join("opencode"))
+        .expect("APPARATUS: create a staging directory");
     std::fs::write(
         project.join(".opencode/plugin/vox.js"),
         vox_tui::agent_hook::OPENCODE_PLUGIN,
     )
-    .unwrap();
+    .expect("APPARATUS: write a staging file");
     let bin_dir = fixture.join("bin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&bin_dir).expect("APPARATUS: create a staging directory");
     // **What the model's shell runs is recorded, with how `vox` answered it**, so a turn in
     // which the model never ran the operator's command (the apparatus) is told apart from one
     // in which Vox refused it (the product). The `vox` on the model's PATH is a recording
@@ -310,7 +312,7 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
     let mine = rows
         .iter()
         .find(|x| x["text"].as_str().is_some_and(|t| t.contains(&codeword)))
-        .unwrap();
+        .expect("PRODUCT: the session's own post is not in its room");
     let session = mine["envelope"]["from"].as_str().unwrap_or("").to_owned();
     assert!(
         session.starts_with("ses"),
@@ -329,10 +331,10 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
     let d = drain(h, r, &session);
     assert!(
         !d.contains(&codeword),
-        "the session's drain re-injected the model's own post: {d}"
+        "PRODUCT: the session's drain re-injected the model's own post: {d}"
     );
     assert!(
         d.contains("FROM-H-PRIME-AFTER"),
-        "the session's drain dropped another harness's message: {d}"
+        "PRODUCT: the session's drain dropped another harness's message: {d}"
     );
 }

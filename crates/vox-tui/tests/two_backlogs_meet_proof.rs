@@ -74,14 +74,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
+    let out = child.wait_with_output().expect("APPARATUS: vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -95,7 +95,7 @@ fn signal(p: &VoxProc, sig: &str) {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    assert!(ok, "kill {sig} {}", p.name);
+    assert!(ok, "APPARATUS: kill {sig} {}", p.name);
 }
 
 /// Stop a process by its PID with SIGTERM, so it closes its connections, and reap it.
@@ -113,9 +113,9 @@ fn stop(mut p: VoxProc) {
 
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
+        .expect("APPARATUS: bind a socket")
         .local_addr()
-        .unwrap()
+        .expect("APPARATUS: read a socket the proof bound")
         .port()
 }
 
@@ -130,7 +130,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -176,16 +178,16 @@ fn post_all(data: &Path, room: &str, who: &str) {
 fn two_backlogs_that_meet_both_cross() {
     // Two joins; 13 unlocks: three `vox id`s, six `trust add`s, three daemons and the room.
     watchdog::arm_for_setup(2, 13);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, alice_dir, bob_dir, carol_dir) =
         (dir("anchor"), dir("alice"), dir("bob"), dir("carol"));
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write a staging file");
 
     let port = free_udp_port();
     let listen = format!("127.0.0.1:{port}");
@@ -199,7 +201,7 @@ fn two_backlogs_that_meet_both_cross() {
 
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     };
     let members = [
@@ -212,7 +214,7 @@ fn two_backlogs_that_meet_both_cross() {
         for (j, (name, _)) in members.iter().enumerate() {
             if i != j {
                 let (ok, out, err) = vox_once(d, &args(&["trust", "add", &fps[j], "--name", name]));
-                assert!(ok, "vox trust add {name}: {out}{err}");
+                assert!(ok, "PRODUCT (staging): vox trust add {name}: {out}{err}");
             }
         }
     }
@@ -225,17 +227,17 @@ fn two_backlogs_that_meet_both_cross() {
         &["room", "create", "--name", "big"],
         "room pass",
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("big"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT: room not listed: {list}"))
         .to_owned();
     let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     for (name, d) in [("bob", &bob_dir), ("carol", &carol_dir)] {
         let (ok, out, err) = vox_in(
             d,

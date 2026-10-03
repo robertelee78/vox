@@ -762,8 +762,9 @@ pub fn model_shim(bin_dir: &std::path::Path, log: &std::path::Path) {
             vox = VOX
         ),
     )
-    .unwrap();
-    std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    .expect("APPARATUS: write a staging file");
+    std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("APPARATUS: set a staging file's mode");
 }
 
 /// One command a model's shell ran through [`model_shim`].

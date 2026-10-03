@@ -68,12 +68,16 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: start a runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Two workers: the harness proves a room readable by posts between its members.
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let alice = &room.workers[0];
-    let pass = alice.pass.to_str().unwrap().to_owned();
+    let pass = alice
+        .pass
+        .to_str()
+        .expect("APPARATUS: a path that is not UTF-8")
+        .to_owned();
 
     // Rooms: the harness made one; make the rest.
     let names: BTreeSet<String> = (1..ROOMS)
@@ -95,10 +99,12 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
                         &["room", "create", "--name", name],
                         Some("page room passphrase"),
                     );
-                    assert!(o.ok, "room create {name}: {o:?}");
+                    assert!(o.ok, "PRODUCT (staging): room create {name}: {o:?}");
                     let n = made.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     if n % 100 == 0 {
-                        let mut prev = last.lock().unwrap();
+                        let mut prev = last
+                            .lock()
+                            .expect("APPARATUS: a lock the proof holds was poisoned");
                         eprintln!(
                             "[progress] {n} rooms at {:.1}s; the last 100 took {:.1}s",
                             started.elapsed().as_secs_f64(),
@@ -132,7 +138,7 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
     );
     assert_eq!(
         listed, names,
-        "vox room list names every room, past one page"
+        "PRODUCT: vox room list names every room, past one page"
     );
 
     // Trusted identities: synthetic fingerprints, each distinct.
@@ -158,7 +164,7 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
                 &pass,
             ],
         );
-        assert!(o.ok, "trust add {fp}: {o:?}");
+        assert!(o.ok, "PRODUCT (staging): trust add {fp}: {o:?}");
         if (i + 1) % 50 == 0 {
             eprintln!(
                 "[progress] {} trusted at {:.1}s",
@@ -192,6 +198,6 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
     );
     assert_eq!(
         shown, fingerprints,
-        "vox trust list shows every trusted identity, past one page"
+        "PRODUCT: vox trust list shows every trusted identity, past one page"
     );
 }

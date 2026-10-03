@@ -137,7 +137,10 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     assert!(
         first.as_deref().is_ok_and(|b| b == b"before"),
         "PRODUCT (staging): no echo through the forward before the anchor went: {first:?}\n{}",
-        w.fwd.as_mut().unwrap().transcript()
+        w.fwd
+            .as_mut()
+            .expect("APPARATUS: a process the proof started")
+            .transcript()
     );
     w.expect_still_relayed();
     std::thread::sleep(KILL_AFTER.saturating_sub(started.elapsed()));

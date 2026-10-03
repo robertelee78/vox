@@ -90,27 +90,29 @@ fn profile() -> &'static str {
 fn a_join_outlives_its_displaced_path() {
     test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_SOLVE_AT_LEAST_MS"]);
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, host_dir, guest_dir) = (
         tmp.path().join("anchor"),
         tmp.path().join("host"),
         tmp.path().join("guest"),
     );
     for d in [&anchor_dir, &host_dir, &guest_dir] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let mut anchor = relay::Anchor::start(&anchor_dir);
     let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id (guest): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
     let (ok, _, err) = vox_once(&host_dir, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id (host): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (host): {err}");
     let (ok, out, err) = vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
     );
-    assert!(ok, "CANNOT MEASURE: trust add: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
 
-    let host_addr: SocketAddr = format!("127.0.0.1:{}", free_v4_udp_port()).parse().unwrap();
+    let host_addr: SocketAddr = format!("127.0.0.1:{}", free_v4_udp_port())
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
     let forward = PortForward::start(host_addr, false);
     let advertise = forward.public.to_string();
     let mut host = VoxProc::spawn_env(
@@ -166,12 +168,16 @@ fn a_join_outlives_its_displaced_path() {
     let relayed_at = t0.elapsed();
     forward.open();
     let status = loop {
-        if let Some(status) = guest.child.try_wait().unwrap() {
+        if let Some(status) = guest
+            .child
+            .try_wait()
+            .expect("APPARATUS: poll a child process")
+        {
             break status;
         }
         assert!(
             t0.elapsed() < JOIN_WITHIN,
-            "the guest's join had not ended after {JOIN_WITHIN:?}\nguest:\n{}\nhost:\n{}",
+            "PRODUCT: the guest's join had not ended after {JOIN_WITHIN:?}\nguest:\n{}\nhost:\n{}",
             guest.transcript(),
             host.transcript()
         );
@@ -261,7 +267,7 @@ fn a_join_outlives_its_displaced_path() {
     );
     assert!(
         !host_said.contains("a join did not complete"),
-        "the host reported a join that did not complete although the guest got in:\n{host_said}"
+        "PRODUCT: the host reported a join that did not complete although the guest got in:\n{host_said}"
     );
     eprintln!(
         "[proof] {} displaced-path join: 1/1 got in after its path was displaced, {:.1}s",

@@ -104,19 +104,19 @@ struct NatWorld {
 impl NatWorld {
     fn new(kind: Kind) -> Self {
         let started = Instant::now();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
         let (anchor_dir, host_dir, guest_dir) = (
             tmp.path().join("anchor"),
             tmp.path().join("host"),
             tmp.path().join("guest"),
         );
         for d in [&anchor_dir, &host_dir, &guest_dir] {
-            std::fs::create_dir_all(d.join("cfg")).unwrap();
+            std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         }
         let anchor_port = UdpSocket::bind("[::]:0")
-            .unwrap()
+            .expect("APPARATUS: bind a socket")
             .local_addr()
-            .unwrap()
+            .expect("APPARATUS: read a socket the proof bound")
             .port();
         let nats = TwoNats::start(kind, anchor_port);
         let advertise = format!("{},{}", nats.anchor_for_host, nats.anchor_for_guest);
@@ -134,19 +134,19 @@ impl NatWorld {
             })
             .trim()
             .to_owned();
-        let (fp, _) = spec.split_once('@').expect("fp@addr");
+        let (fp, _) = spec.split_once('@').expect("PRODUCT: fp@addr");
         let host_spec = format!("{fp}@/ip4/127.0.0.1/udp/{}", nats.anchor_for_host.port());
         let guest_spec = format!("{fp}@/ip6/::1/udp/{}", nats.anchor_for_guest.port());
 
         let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-        assert!(ok, "vox id (guest): {err}");
+        assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
         let (ok, _host_fp, err) = vox_once(&host_dir, &args(&["id"]));
-        assert!(ok, "vox id (host): {err}");
+        assert!(ok, "PRODUCT (staging): vox id (host): {err}");
         let (ok, out, err) = vox_once(
             &host_dir,
             &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
         );
-        assert!(ok, "trust add: {out}\n{err}");
+        assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
         let service_port = echo_service();
         let mut host = VoxProc::spawn(
             "host",
@@ -230,9 +230,9 @@ impl NatWorld {
         let bound = line
             .split_whitespace()
             .nth(3)
-            .expect("an address")
+            .expect("PRODUCT: an address")
             .parse()
-            .expect("a socket address");
+            .expect("PRODUCT: a socket address");
         (up, bound, ready)
     }
 
@@ -347,7 +347,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         let answered = Instant::now();
         let Some(first_direct) = first else {
             panic!(
-                "sample {i}: the first request to the host was not answered.\nup:\n{}",
+                "PRODUCT: sample {i}: the first request to the host was not answered.\nup:\n{}",
                 up.transcript()
             );
         };

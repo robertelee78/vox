@@ -167,7 +167,7 @@ fn every_member_is_back_after_an_anchor_restart() {
                     std::fs::create_dir_all(dir.join("cfg"))
                         .expect("APPARATUS: cannot make a profile directory");
                     let (ok, _, err) = vox_once(&dir, &args(&["id"]));
-                    assert!(ok, "CANNOT MEASURE: vox id (staging) failed: {err}");
+                    assert!(ok, "PRODUCT (staging): vox id (staging) failed: {err}");
                 })
             })
             .collect();
@@ -633,12 +633,16 @@ fn signal(sig: &str, p: &VoxProc) {
 /// A `vox daemon` for the profile at `dir`, pointed at the anchor `spec`.
 fn daemon(dir: &Path, spec: &str, pass_file: &Path) -> VoxProc {
     VoxProc::spawn(
-        &dir.file_name().unwrap().to_string_lossy(),
+        &dir.file_name()
+            .expect("APPARATUS: a path with no file name")
+            .to_string_lossy(),
         dir,
         &args(&[
             "daemon",
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
             "--anchor",
             spec,
             "--listen",
@@ -690,8 +694,8 @@ fn wait_for_peers(
 
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
+        .expect("APPARATUS: bind a socket")
         .local_addr()
-        .unwrap()
+        .expect("APPARATUS: read a socket the proof bound")
         .port()
 }

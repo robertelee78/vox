@@ -484,7 +484,7 @@ fn new_profile(dir: &Path, identity: &str) {
     let out = command(dir, &["id"], identity).output().staged();
     assert!(
         out.status.success(),
-        "CANNOT MEASURE (staging not achieved): `vox id` made no identity to stage with: {}",
+        "PRODUCT (staging): `vox id` made no identity to stage with: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -645,7 +645,10 @@ fn a_lock_waits_for_a_room_reopening_and_leaves_no_passphrase() {
             Some(&format!("{roompass}\n")),
         );
         let status = create.0.wait().staged();
-        assert!(status.success(), "CANNOT MEASURE: vox room create failed");
+        assert!(
+            status.success(),
+            "PRODUCT (staging): vox room create failed"
+        );
         tui.lock(false);
         tui.stop();
     }
@@ -737,7 +740,7 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     {
         assert!(
             t0.elapsed() < Duration::from_secs(120),
-            "CANNOT MEASURE: alice's daemon never answered"
+            "PRODUCT (staging): alice's daemon never answered"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -749,7 +752,7 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     );
     assert!(
         create.0.wait().staged().success(),
-        "CANNOT MEASURE: alice could not create the room"
+        "PRODUCT (staging): alice could not create the room"
     );
     let list = command(&alice, &["room", "list"], &alice_id)
         .output()
@@ -762,7 +765,7 @@ fn a_lock_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     let invite = command(&alice, &["room", "invite", &prefix], &alice_id)
         .output()
         .staged();
-    assert!(invite.status.success(), "CANNOT MEASURE: room invite");
+    assert!(invite.status.success(), "PRODUCT (staging): room invite");
     let link = String::from_utf8_lossy(&invite.stdout).trim().to_owned();
 
     // Bob's TUI, scanned, with his node's grind held long.

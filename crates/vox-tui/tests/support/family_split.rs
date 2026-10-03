@@ -24,7 +24,12 @@ pub fn assert_the_families_are_split() {
         s.set_read_timeout(Some(Duration::from_millis(300)))
             .expect("APPARATUS: set a read timeout");
     }
-    let (at4, at6) = (v4.local_addr().unwrap(), v6.local_addr().unwrap());
+    let (at4, at6) = (
+        v4.local_addr()
+            .expect("APPARATUS: read a socket the proof bound"),
+        v6.local_addr()
+            .expect("APPARATUS: read a socket the proof bound"),
+    );
     let mapped = SocketAddr::V6(SocketAddrV6::new(
         Ipv6Addr::from(0xffff_7f00_0001u128),
         at4.port(),
@@ -36,7 +41,11 @@ pub fn assert_the_families_are_split() {
         if from.send_to(b"split?", to).is_ok() {
             let mut buf = [0u8; 16];
             if to_s.recv_from(&mut buf).is_ok() {
-                crossed.push(format!("{} -> {to}", from.local_addr().unwrap()));
+                crossed.push(format!(
+                    "{} -> {to}",
+                    from.local_addr()
+                        .expect("APPARATUS: read a socket the proof bound")
+                ));
             }
         }
     }

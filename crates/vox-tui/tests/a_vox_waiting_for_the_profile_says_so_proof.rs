@@ -69,14 +69,14 @@ fn signal(pid: u32, sig: &str) {
         .args([sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill {sig} {pid}");
+    assert!(ok, "APPARATUS: kill {sig} {pid}");
 }
 
 /// Wait up to `within` for `p` to exit; its status, or `None` if it is still running.
 fn exited_within(p: &mut VoxProc, within: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + within;
     loop {
-        if let Some(s) = p.child.try_wait().unwrap() {
+        if let Some(s) = p.child.try_wait().expect("APPARATUS: poll a child process") {
             return Some(s);
         }
         if Instant::now() >= deadline {
@@ -116,7 +116,11 @@ fn arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str]) -> Vec<String
         }
     }
     std::thread::sleep(STOPPED_FOR);
-    let b_still_waiting = b.child.try_wait().unwrap().is_none();
+    let b_still_waiting = b
+        .child
+        .try_wait()
+        .expect("APPARATUS: poll a child process")
+        .is_none();
     let waited = t0.elapsed();
     signal(a_pid, "-CONT");
     let resumed = Instant::now();
@@ -182,10 +186,10 @@ fn a_vox_waiting_for_the_profile_says_so() {
     } else {
         600
     }));
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let mut red = Vec::new();
@@ -203,7 +207,7 @@ fn a_vox_waiting_for_the_profile_says_so() {
             .env("VOX_CONFIG_DIR", data.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
             .output()
-            .unwrap();
+            .expect("APPARATUS: run a process");
         assert!(
             out.status.success(),
             "CANNOT MEASURE: v0.2.9 `vox {argv:?}` failed: {}",

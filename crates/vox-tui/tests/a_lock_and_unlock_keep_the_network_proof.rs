@@ -77,17 +77,17 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -97,8 +97,10 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 
 /// Start `vox daemon` with the identity passphrase on stdin, its output to files by the profile.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: create a staging file");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: create a staging file");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -108,10 +110,11 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: spawn vox daemon");
     // Write, then close: the daemon reads stdin to EOF before it binds its socket.
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes()).unwrap();
+    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
     Daemon(child)
 }
@@ -129,7 +132,7 @@ fn attached(dir: &Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "CANNOT MEASURE: {tag}'s daemon never answered: {last}\nits stderr: {}",
+        "PRODUCT (staging): {tag}'s daemon never answered: {last}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
     );
 }
@@ -148,13 +151,13 @@ fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
     // One join, through the TUI; 6 unlocks: two `vox id`s, alice's daemon, the room, and the
     // TUI's unlock and unlock again.
     watchdog::arm_for_setup(1, 6);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     for d in [&alice, &bob] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         let (ok, _, err) = vox(d, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
     }
 
     let _alice_daemon = daemon(&alice, "alice");
@@ -164,14 +167,14 @@ fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
         &["room", "create", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "CANNOT MEASURE: vox room create: {err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let room = attached(&alice, "alice")
         .split_whitespace()
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .expect("the new room's id in `room list`")
+        .expect("PRODUCT: the new room's id in `room list`")
         .to_owned();
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "CANNOT MEASURE: vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
 
     let script = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -231,7 +234,7 @@ fn a_lock_and_unlock_back_to_back_leave_the_node_networked() {
     );
     assert!(
         said.contains("cargo join ok"),
-        "OFFLINE: after a lock and an unlock back to back, a join through the unlocked node failed \
+        "PRODUCT: after a lock and an unlock back to back, a join through the unlocked node failed \
          — the old network's late \"stopped\" took the new network down: {said}"
     );
 }

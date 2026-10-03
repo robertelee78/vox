@@ -262,7 +262,11 @@ fn a_relayed_pair_finds_a_direct_path_once_one_becomes_possible() {
         );
     };
     eprintln!("[proof] on the direct path {took:?} after it became possible");
-    assert!(took < UPGRADED_WITHIN);
+    assert!(
+        took < UPGRADED_WITHIN,
+        "PRODUCT: the pair moved to the direct path {took:?} after it became possible (bound \
+         {UPGRADED_WITHIN:?})"
+    );
     interrupt(&mut up, Duration::from_secs(15));
     drop(up);
 }

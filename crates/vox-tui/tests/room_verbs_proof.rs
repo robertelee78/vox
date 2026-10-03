@@ -322,19 +322,23 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
 fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
     // `vox id` and the daemon's unlock, and the room key's seal: three Argon2id runs.
     watchdog::arm_for_setup(0, 3);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
-    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::create_dir_all(&cfg).expect("APPARATUS: create a staging directory");
     let pass = tmp.path().join("identity.pass");
-    std::fs::write(&pass, "identity passphrase").unwrap();
+    std::fs::write(&pass, "identity passphrase").expect("APPARATUS: write a staging file");
     let (ok, _, err) = vox(
         &data,
         &cfg,
-        &["id", "--identity-passphrase-file", pass.to_str().unwrap()],
+        &[
+            "id",
+            "--identity-passphrase-file",
+            pass.to_str().expect("APPARATUS: a path that is not UTF-8"),
+        ],
         None,
     );
-    assert!(ok, "CANNOT MEASURE (staging not achieved): vox id: {err}");
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
     let daemon_err = tmp.path().join("daemon.err");
     let mut node = daemon(&data, &cfg, &pass, &daemon_err);
     let said = |what: &str| {

@@ -56,8 +56,12 @@ fn a_dial_that_reaches_another_node_names_who_answered() {
     let tmp = tempdir();
     let (_a, a_spec) = node(&tmp.path().join("a"), "node-a");
     let (_b, b_spec) = node(&tmp.path().join("b"), "node-b");
-    let (a_fp, _) = a_spec.split_once('@').unwrap();
-    let (b_fp, b_addr) = b_spec.split_once('@').unwrap();
+    let (a_fp, _) = a_spec
+        .split_once('@')
+        .expect("PRODUCT (staging): vox node printed a spec with no '@'");
+    let (b_fp, b_addr) = b_spec
+        .split_once('@')
+        .expect("PRODUCT (staging): vox node printed a spec with no '@'");
     // Told to reach A, at B's address.
     let wrong = format!("{a_fp}@{b_addr}");
     let host_dir = tmp.path().join("host");

@@ -688,7 +688,7 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
         ]),
     );
     let other_room = world::after_label(
-        &other.expect_staging("the other room", |l| l.starts_with("room ")),
+        &other.expect_line("the other room", |l| l.starts_with("room ")),
         "room",
     );
     assert_ne!(

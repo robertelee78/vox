@@ -102,9 +102,9 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     let out = child
         .wait_with_output()
         .expect("APPARATUS (harness): vox finished");
@@ -127,17 +127,19 @@ fn vox_timed(data: &Path, argv: &[&str], cap: Duration) -> (bool, Duration, Stri
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(&out_file).unwrap()))
+        .stdout(Stdio::from(
+            std::fs::File::create(&out_file).expect("APPARATUS: create a staging file"),
+        ))
         .stderr(Stdio::from(
             std::fs::OpenOptions::new()
                 .append(true)
                 .open(&out_file)
-                .unwrap(),
+                .expect("APPARATUS: open a log file"),
         ))
         .spawn()
         .expect("APPARATUS (harness): run vox");
     let ok = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.try_wait().expect("APPARATUS: poll a child process") {
             break status.success();
         }
         if t0.elapsed() >= cap {
@@ -166,7 +168,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
     );
     let deadline = Instant::now() + SETUP;
@@ -201,15 +205,15 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     } else {
         watchdog::arm();
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, host_dir, newcomer_dir) = (dir("anchor"), dir("host"), dir("newcomer"));
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
 
     // ---- staging, all through the shipped binary ----------------------------------------
     let mut anchor = VoxProc::spawn(
@@ -221,7 +225,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .unwrap()
+        .expect("APPARATUS: the line matched for the spec holds it")
         .to_owned();
     let host_fp = fingerprint(&host_dir);
     let newcomer_fp = fingerprint(&newcomer_dir);
@@ -322,7 +326,10 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
                 })
             })
             .collect();
-        flips.into_iter().map(|t| t.join().unwrap()).sum()
+        flips
+            .into_iter()
+            .map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .sum()
     });
     println!(
         "[proof] history: {entries} trust changes by {MEMBERS} members in {:?}",

@@ -86,7 +86,7 @@ fn a_room_of_many_members_syncs_without_holding_its_lock() {
         std::env::set_var("VOX_TEST_WATCHDOG_SECS", "1800");
     }
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let (_anchor, spec) = anchor(root);
     let host = Member::new(root, "host");
@@ -150,7 +150,9 @@ fn a_room_of_many_members_syncs_without_holding_its_lock() {
             std::thread::sleep(GAP);
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        pusher.join().unwrap()
+        pusher
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
     });
     let sessions = counter(&bob.status(), "opened", None).saturating_sub(opened_before);
     println!("[proof] meanwhile the host posted {host_posts} times and bob's node opened {sessions} session(s)");

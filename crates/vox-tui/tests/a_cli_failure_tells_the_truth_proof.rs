@@ -1095,7 +1095,7 @@ fn a_connect_stopped_by_a_signal_says_why() {
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
             .strip_prefix(label)
-            .unwrap()
+            .expect("APPARATUS: a line matched by its label strips it")
             .trim()
             .to_owned()
     };
@@ -1351,7 +1351,9 @@ impl OnTerminal {
                 if n == 0 {
                     break;
                 }
-                into.lock().unwrap().extend_from_slice(&buf[..n]);
+                into.lock()
+                    .expect("APPARATUS: a lock the proof holds was poisoned")
+                    .extend_from_slice(&buf[..n]);
             }
         });
         let (tx, stderr) = std::sync::mpsc::channel();
@@ -1374,7 +1376,13 @@ impl OnTerminal {
     }
 
     fn shown(&self) -> String {
-        String::from_utf8_lossy(&self.shown.lock().unwrap()).into_owned()
+        String::from_utf8_lossy(
+            &self
+                .shown
+                .lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned"),
+        )
+        .into_owned()
     }
 
     /// Wait until the connect shows `prompt` on its terminal. One that ends first, or never shows

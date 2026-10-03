@@ -175,7 +175,9 @@ struct Rt(Option<tokio::runtime::Runtime>);
 impl std::ops::Deref for Rt {
     type Target = tokio::runtime::Runtime;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
+        self.0
+            .as_ref()
+            .expect("APPARATUS: a process the proof started")
     }
 }
 

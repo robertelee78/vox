@@ -131,16 +131,16 @@ impl Member {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         if let Some(text) = stdin {
             child
                 .stdin
                 .take()
-                .unwrap()
+                .expect("APPARATUS: a piped stdio handle")
                 .write_all(text.as_bytes())
-                .unwrap();
+                .expect("PRODUCT (staging): vox exited without reading its stdin");
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child.wait_with_output().expect("APPARATUS: vox ran");
         let r = (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -170,7 +170,9 @@ impl Member {
                 "--name",
                 other.name,
                 "--identity-passphrase-file",
-                self.pass.to_str().unwrap(),
+                self.pass
+                    .to_str()
+                    .expect("APPARATUS: a path that is not UTF-8"),
             ],
             None,
         );
@@ -184,9 +186,9 @@ impl Member {
 
 fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
     let data = tmp.join(name);
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: create a staging directory");
     let pass = tmp.join(format!("{name}.pass"));
-    std::fs::write(&pass, ID_PASS).unwrap();
+    std::fs::write(&pass, ID_PASS).expect("APPARATUS: write a staging file");
     let mut m = Member {
         name,
         data,
@@ -196,7 +198,13 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         daemon: None,
     };
     let (ok, out, err) = m.vox(
-        &["id", "--identity-passphrase-file", m.pass.to_str().unwrap()],
+        &[
+            "id",
+            "--identity-passphrase-file",
+            m.pass
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
+        ],
         None,
     );
     assert!(
@@ -209,7 +217,7 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         52,
         "APPARATUS (staging not achieved): {name}: a fingerprint from vox id"
     );
-    let err = std::fs::File::create(&m.err).unwrap();
+    let err = std::fs::File::create(&m.err).expect("APPARATUS: create a staging file");
     let child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
@@ -221,7 +229,7 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         .stdout(Stdio::null())
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: spawn vox daemon");
     m.daemon = Some(Proc(child));
     let deadline = Instant::now() + Duration::from_secs(90);
     while !m.vox(&["room", "list"], None).0 {
@@ -236,17 +244,19 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
 
 fn anchor(tmp: &Path) -> (Proc, String) {
     let dir = tmp.join("anchor");
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: create a staging directory");
     let out = tmp.join("anchor.out");
     let p = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
-            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create(&out).expect("APPARATUS: create a staging file"),
+            ))
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: spawn vox node"),
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -297,7 +307,7 @@ fn posts_until_read(
 fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     watchdog::arm();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (_anchor, spec) = anchor(tmp.path());
     let mut alice = member(tmp.path(), "alice", &spec);
     let bob = member(tmp.path(), "bob", &spec);
@@ -314,7 +324,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         .1
         .split_whitespace()
         .next()
-        .expect("the new room in `vox room list`")
+        .expect("PRODUCT: the new room in `vox room list`")
         .to_owned();
     let (ok, link, e) = alice.vox(&["room", "invite", &room], None);
     assert!(ok, "APPARATUS (staging not achieved): invite: {e}");
@@ -357,7 +367,12 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     carol.trust(&bob);
 
     // ---- alice goes away: killed by PID and reaped ----
-    let alice_pid = alice.daemon.as_ref().unwrap().0.id();
+    let alice_pid = alice
+        .daemon
+        .as_ref()
+        .expect("APPARATUS: a process the proof started")
+        .0
+        .id();
     drop(alice.daemon.take());
     let still = Command::new("kill")
         .args(["-0", &alice_pid.to_string()])

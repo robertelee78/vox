@@ -123,7 +123,7 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
     let second = w.tmp.path().join("second");
     let third = w.tmp.path().join("third");
     for d in [&second, &third] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     // A peer holds a handshake open with the host; the joiners arrive while it does. Its
     // handshake is a fresh one straight after the first joiner, so the host must answer it

@@ -56,7 +56,7 @@ const AT_LEAST: usize = 20;
 fn a_slow_sender_still_delivers_what_arrived() {
     watchdog::arm();
     let sender = mutant_sender();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let alice = Member::new(root, "alice");
     let bob = Member::new(root, "bob");
@@ -73,7 +73,7 @@ fn a_slow_sender_still_delivers_what_arrived() {
     while !reader.has(cid, "hello from bob") {
         assert!(
             warm.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: alice never read bob's first post\nalice:\n{}\nbob:\n{}",
+            "PRODUCT (staging): alice never read bob's first post\nalice:\n{}\nbob:\n{}",
             alice_d.transcript(),
             bob_d.transcript()
         );
@@ -113,10 +113,10 @@ fn a_slow_sender_still_delivers_what_arrived() {
     assert!(
         said.iter()
             .any(|f| f.contains("did not all arrive within 30s")),
-        "alice's status never named the drain budget: {said:?}"
+        "PRODUCT: alice's status never named the drain budget: {said:?}"
     );
     assert!(
         !said.iter().any(|f| f.contains("sync mode unsupported")),
-        "alice's status still calls a slow peer a protocol mismatch: {said:?}"
+        "PRODUCT: alice's status still calls a slow peer a protocol mismatch: {said:?}"
     );
 }

@@ -142,7 +142,7 @@ fn a_burst_past_the_slot_cap_is_queued() {
     shown(&format!(
         "[proof] {PROFILE} build: bounds {BOUND:?} for the burst, {LATE_BOUND:?} for the late join"
     ));
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let alice = Member::new(root, "alice");
     let bob = Member::new(root, "bob");
@@ -243,7 +243,9 @@ fn a_burst_past_the_slot_cap_is_queued() {
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+        hs.into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
     });
     let met = |st: &serde_json::Value| {
         counter(st, "skipped_at_cap", Some(&bob.fp)) + counter(st, "queued", Some(&bob.fp))
@@ -381,7 +383,9 @@ fn a_burst_past_the_slot_cap_is_queued() {
                 }
                 std::thread::sleep(STAGE_EVERY);
             }
-            joining.join().unwrap();
+            joining
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e));
         });
         tries.push(format!(
             "{name}: {posts} posts, {}",

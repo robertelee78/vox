@@ -43,10 +43,12 @@ use std::time::{Duration, Instant};
 /// Write the room passphrase `pass` beside the profile at `dir`, for `--passphrase-file`: a
 /// room passphrase is never taken from argv or the environment (V210-72).
 fn room_pass_file(dir: &std::path::Path, pass: &str) -> String {
-    std::fs::create_dir_all(dir).unwrap();
+    std::fs::create_dir_all(dir).expect("APPARATUS: create a staging directory");
     let at = dir.join("room-passphrase");
-    std::fs::write(&at, pass).unwrap();
-    at.to_str().unwrap().to_owned()
+    std::fs::write(&at, pass).expect("APPARATUS: write a staging file");
+    at.to_str()
+        .expect("APPARATUS: a path that is not UTF-8")
+        .to_owned()
 }
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
@@ -103,7 +105,9 @@ fn collect(stream: impl Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            sink.lock().unwrap().push(line);
+            sink.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
+                .push(line);
         }
     });
     lines
@@ -121,12 +125,13 @@ impl Proc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(stdin.as_bytes()).expect("write stdin");
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn {name}: {e}"));
+        let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+        pipe.write_all(stdin.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(pipe);
-        let out = collect(child.stdout.take().expect("stdout"));
-        let err = collect(child.stderr.take().expect("stderr"));
+        let out = collect(child.stdout.take().expect("APPARATUS: stdout"));
+        let err = collect(child.stderr.take().expect("APPARATUS: stderr"));
         Self {
             name,
             child,
@@ -136,11 +141,17 @@ impl Proc {
     }
 
     fn stdout(&self) -> Vec<String> {
-        self.out.lock().unwrap().clone()
+        self.out
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .clone()
     }
 
     fn stderr(&self) -> String {
-        self.err.lock().unwrap().join("\n")
+        self.err
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .join("\n")
     }
 
     fn expect_out(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
@@ -195,24 +206,25 @@ fn vox(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
-    let mut pipe = child.stdin.take().expect("stdin");
-    pipe.write_all(stdin.as_bytes()).expect("write");
+        .expect("APPARATUS: spawn vox");
+    let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+    pipe.write_all(stdin.as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
-    let out = collect(child.stdout.take().expect("stdout"));
-    let err = collect(child.stderr.take().expect("stderr"));
+    let out = collect(child.stdout.take().expect("APPARATUS: stdout"));
+    let err = collect(child.stderr.take().expect("APPARATUS: stderr"));
     let status = loop {
-        if let Some(s) = child.try_wait().expect("wait") {
+        if let Some(s) = child.try_wait().expect("APPARATUS: wait") {
             break s;
         }
         if started.elapsed() > within {
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "`vox {}` took longer than {within:?} to report its failure; it had said:\n{}\n{}",
+                "PRODUCT: `vox {}` took longer than {within:?} to report its failure; it had said:\n{}\n{}",
                 args.join(" "),
-                out.lock().unwrap().join("\n"),
-                err.lock().unwrap().join("\n")
+                out.lock().expect("APPARATUS: a lock the proof holds was poisoned").join("\n"),
+                err.lock().expect("APPARATUS: a lock the proof holds was poisoned").join("\n")
             );
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -221,8 +233,12 @@ fn vox(
     std::thread::sleep(Duration::from_millis(100));
     let said = format!(
         "{}\n{}",
-        out.lock().unwrap().join("\n"),
-        err.lock().unwrap().join("\n")
+        out.lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .join("\n"),
+        err.lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .join("\n")
     );
     (status.success(), said, started.elapsed())
 }
@@ -244,9 +260,9 @@ fn assert_says(case: &str, said: &str, wants: &[&str]) {
 
 fn free_tcp_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
-        .unwrap()
+        .expect("APPARATUS: bind a socket")
         .local_addr()
-        .unwrap()
+        .expect("APPARATUS: read a socket the proof bound")
         .port()
 }
 
@@ -270,10 +286,10 @@ fn every_common_failure_names_its_cause() {
              with --features optional-proofs",
         );
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, host_dir, joiner_dir, guest_dir, spare_dir) = (
@@ -298,8 +314,11 @@ fn every_common_failure_names_its_cause() {
         };
 
     // A real service to offer: an echo server.
-    let service = TcpListener::bind("127.0.0.1:0").unwrap();
-    let service_port = service.local_addr().unwrap().port();
+    let service = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
+    let service_port = service
+        .local_addr()
+        .expect("APPARATUS: read a socket the proof bound")
+        .port();
     std::thread::spawn(move || {
         for s in service.incoming() {
             let Ok(mut s) = s else { continue };
@@ -331,7 +350,7 @@ fn every_common_failure_names_its_cause() {
     let mut fps = Vec::new();
     for d in [&host_dir, &joiner_dir, &guest_dir, &spare_dir] {
         let (ok, said, _) = vox(d, &["id"], "", quick);
-        assert!(ok, "vox id: {said}");
+        assert!(ok, "PRODUCT (staging): vox id: {said}");
         fps.push(said.trim().lines().next().unwrap_or_default().to_owned());
     }
     let (host_fp, joiner_fp) = (fps[0].clone(), fps[1].clone());
@@ -345,7 +364,7 @@ fn every_common_failure_names_its_cause() {
     let field = |label: &str| {
         host.expect_out(label, |l| l.starts_with(label))
             .strip_prefix(label)
-            .unwrap()
+            .expect("APPARATUS: a line matched by its label strips it")
             .trim()
             .to_owned()
     };
@@ -365,7 +384,7 @@ fn every_common_failure_names_its_cause() {
         "not the passphrase\n",
         join_quick,
     );
-    assert!(!ok, "a wrong passphrase must not join");
+    assert!(!ok, "PRODUCT: a wrong passphrase must not join");
     assert_says(
         "join, wrong passphrase",
         &said,
@@ -381,7 +400,7 @@ fn every_common_failure_names_its_cause() {
     );
     assert!(
         ok,
-        "CANNOT MEASURE (2): the right passphrase must join: {said}"
+        "PRODUCT (staging) (2): the right passphrase must join: {said}"
     );
     let (ok, said, _) = vox(
         &joiner_dir,
@@ -389,12 +408,15 @@ fn every_common_failure_names_its_cause() {
         &format!("{passphrase}\n"),
         join_quick,
     );
-    assert!(!ok, "joining a room already held must fail");
+    assert!(!ok, "PRODUCT: joining a room already held must fail");
     assert_says("join, already held", &said, &["already holds that room"]);
 
     // ---- (6) stop trusting someone never trusted, over the daemon's socket ----
     let (ok, said, _) = vox(&joiner_dir, &["trust", "remove", &host_fp], "", quick);
-    assert!(!ok, "removing a trust that does not exist must fail");
+    assert!(
+        !ok,
+        "PRODUCT: removing a trust that does not exist must fail"
+    );
     assert_says("trust remove, never trusted", &said, &["never trusted"]);
 
     if KEYRING_FILL {
@@ -434,7 +456,7 @@ fn every_common_failure_names_its_cause() {
                 .collect();
             let (mut refused, mut took) = (Vec::new(), Vec::new());
             for h in handles {
-                let (r, t) = h.join().unwrap();
+                let (r, t) = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
                 refused.extend(r);
                 took.extend(t);
             }
@@ -470,7 +492,10 @@ fn every_common_failure_names_its_cause() {
 
     // ---- (8) a room that is not there ----
     let (ok, said, _) = vox(&joiner_dir, &["room", "post", "zzzzzzzz", "hi"], "", quick);
-    assert!(!ok);
+    assert!(
+        !ok,
+        "PRODUCT: a post to a room that is not there succeeded: {said}"
+    );
     assert_says(
         "post, no such room",
         &said,
@@ -478,15 +503,18 @@ fn every_common_failure_names_its_cause() {
     );
 
     // ---- (3) the daemon's UDP port is taken ----
-    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let udp_addr = udp.local_addr().unwrap().to_string();
+    let udp = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
+    let udp_addr = udp
+        .local_addr()
+        .expect("APPARATUS: read a socket the proof bound")
+        .to_string();
     let (ok, said, _) = vox(
         &spare_dir,
         &["daemon", "--listen", &udp_addr],
         &format!("{IDPASS}\n"),
         quick,
     );
-    assert!(!ok, "a daemon whose port is taken must not start");
+    assert!(!ok, "PRODUCT: a daemon whose port is taken must not start");
     assert_says(
         "daemon, --listen port in use",
         &said,
@@ -513,11 +541,17 @@ fn every_common_failure_names_its_cause() {
         "",
         Duration::from_secs(180) + watchdog::debug_cost(1, 0),
     );
-    assert!(ok, "CANNOT MEASURE (4, 5, 7): vox connect failed: {said}");
+    assert!(
+        ok,
+        "PRODUCT (staging) (4, 5, 7): vox connect failed: {said}"
+    );
 
     // ---- (4) and (5): a local TCP port that is taken ----
-    let busy = TcpListener::bind("127.0.0.1:0").unwrap();
-    let busy_addr = busy.local_addr().unwrap().to_string();
+    let busy = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
+    let busy_addr = busy
+        .local_addr()
+        .expect("APPARATUS: read a socket the proof bound")
+        .to_string();
     let (ok, said, took) = vox(
         &guest_dir,
         &[
@@ -535,7 +569,7 @@ fn every_common_failure_names_its_cause() {
         "",
         quick,
     );
-    assert!(!ok, "vox up on a taken port must fail");
+    assert!(!ok, "PRODUCT: vox up on a taken port must fail");
     assert_says(
         "up, --bind port in use",
         &said,
@@ -563,7 +597,7 @@ fn every_common_failure_names_its_cause() {
         "",
         quick,
     );
-    assert!(!ok, "vox forward onto a taken port must fail");
+    assert!(!ok, "PRODUCT: vox forward onto a taken port must fail");
     assert_says(
         "forward, local port in use",
         &said,
@@ -619,7 +653,7 @@ fn every_common_failure_names_its_cause() {
     }
     assert!(
         refused,
-        "CANNOT MEASURE (7): the guest's forward never took a connection on {local} within 60 s"
+        "PRODUCT (staging) (7): the guest's forward never took a connection on {local} within 60 s"
     );
     // The guest's side: main says this through `up::refusal` (PRD-001 R23), in its own words.
     let guest_said = forward.expect_err("why the connection was refused", 30, |e| {

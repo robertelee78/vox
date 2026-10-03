@@ -174,7 +174,7 @@ impl Tracker {
     fn observe(&mut self, row: &serde_json::Value) {
         assert_eq!(
             row["schema"], "vox.room.row/1",
-            "the adapter refuses any other schema"
+            "PRODUCT: the adapter refuses any other schema"
         );
         self.cursor = row["entry_hash"].as_str().map(str::to_owned);
         self.rows_seen += 1;
@@ -250,18 +250,18 @@ impl Tracker {
     fn board(&mut self, board: &serde_json::Value) {
         assert_ne!(
             board["coordination"], "refused",
-            "the adapter records no owner under a refusal"
+            "PRODUCT: the adapter records no owner under a refusal"
         );
         for (work, item) in &mut self.items {
             let held = board["resources"]
                 .as_array()
-                .unwrap()
+                .expect("PRODUCT: vox room board's JSON has no resources list")
                 .iter()
                 .find(|r| r["resource"] == *work && r["state"] == "held");
             item.owner = held.map(|h| {
                 (
-                    h["owner_fp"].as_str().unwrap().to_owned(),
-                    h["owner_session"].as_str().unwrap().to_owned(),
+                    h["owner_fp"].as_str().expect("PRODUCT: a held resource in vox room board's JSON has no owner_fp").to_owned(),
+                    h["owner_session"].as_str().expect("PRODUCT: a held resource in vox room board's JSON has no owner_session").to_owned(),
                 )
             });
             if item.owner.is_none() && item.phase == Phase::Executing {
@@ -304,12 +304,18 @@ impl Adapter {
         for v in HARNESS_SESSION_VARS {
             cmd.env_remove(v);
         }
-        let mut child = cmd.spawn().expect("tail");
-        let out = child.stdout.take().unwrap();
+        let mut child = cmd.spawn().expect("APPARATUS: tail");
+        let out = child
+            .stdout
+            .take()
+            .expect("APPARATUS: a piped stdio handle");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for l in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                if tx.send(serde_json::from_str(&l).expect("row")).is_err() {
+                if tx
+                    .send(serde_json::from_str(&l).expect("PRODUCT: row"))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -382,7 +388,9 @@ impl Agent<'_> {
         if timed_out {
             let _ = child.kill(); // the worker dies mid-attempt, or the turn overran
         }
-        let out = child.wait_with_output().unwrap();
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: wait for a child process");
         if timed_out && kill_after.is_none() {
             eprintln!(
                 "[receipt] {} turn TIMED OUT after 240 s and was killed",
@@ -465,8 +473,8 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: start a runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.clone();
@@ -486,14 +494,16 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     let fixture = sb.root.join("fixture");
     let oc_cfg = fixture.join("config");
     let bin_dir = fixture.join("bin");
-    std::fs::create_dir_all(oc_cfg.join("opencode")).unwrap();
-    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(oc_cfg.join("opencode"))
+        .expect("APPARATUS: create a staging directory");
+    std::fs::create_dir_all(&bin_dir).expect("APPARATUS: create a staging directory");
     let calls = fixture.join("model-shell-calls.log");
     support::model_shim(&bin_dir, &calls);
     let mut agents = Vec::new();
     for (w, name) in [(alice, "w1"), (bob, "w2")] {
         let project = fixture.join(name);
-        std::fs::create_dir_all(project.join(".opencode/plugin")).unwrap();
+        std::fs::create_dir_all(project.join(".opencode/plugin"))
+            .expect("APPARATUS: create a staging directory");
         let plugin = project.join(".opencode/plugin/vox.js");
         // The mutation control: without the Vox plugin the room never reaches the model and
         // the model's shells carry no session, so the rehearsal must fail — or it was
@@ -503,7 +513,8 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         if std::env::var_os("VOX_PROOF_WITHOUT_PLUGIN").is_some() {
             let _ = std::fs::remove_file(&plugin);
         } else {
-            std::fs::write(&plugin, vox_tui::agent_hook::OPENCODE_PLUGIN).unwrap();
+            std::fs::write(&plugin, vox_tui::agent_hook::OPENCODE_PLUGIN)
+                .expect("APPARATUS: write a staging file");
         }
         agents.push(Agent {
             worker: w,
@@ -526,7 +537,12 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         .vox(None, &["room", "read", &r, "--json"])
         .ndjson()
         .last()
-        .map(|x| x["entry_hash"].as_str().unwrap().to_owned());
+        .map(|x| {
+            x["entry_hash"]
+                .as_str()
+                .expect("PRODUCT: a row of vox room read --json has no entry_hash")
+                .to_owned()
+        });
     for (item, to) in [(item1, "w1"), (item2, "w2")] {
         let o = bob.vox_in(
             Some("tracker"),
@@ -546,7 +562,7 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
             ],
             Some(&format!("please take {item}")),
         );
-        assert!(o.ok, "the tracker could not assign: {o:?}");
+        assert!(o.ok, "PRODUCT: the tracker could not assign: {o:?}");
     }
     support::arrives(
         alice,
@@ -557,7 +573,7 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     let start = start.unwrap_or_else(|| {
         bob.vox(None, &["room", "read", &r, "--json"]).ndjson()[0]["entry_hash"]
             .as_str()
-            .unwrap()
+            .expect("PRODUCT: a row of vox room read --json has no entry_hash")
             .to_owned()
     });
     let adapter = Adapter::start(bob, &r, &start);
@@ -586,9 +602,10 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         w1.session.as_deref().is_some_and(|s| s.starts_with("ses")),
         "PRODUCT: w1's claim must carry its OpenCode session: {w1_session}"
     );
-    let w1_acquisition = support::resource(&w1_session, item1).unwrap()["acquisition"]
+    let w1_acquisition = support::resource(&w1_session, item1)
+        .expect("PRODUCT: the board names no resource for w1's item")["acquisition"]
         .as_str()
-        .unwrap()
+        .expect("PRODUCT: w1's resource has no acquisition")
         .to_owned();
     adapter.pump(&mut tracker);
     tracker.board(&w1_session);
@@ -694,7 +711,10 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     eprintln!("[proof] checkpoint 1: {:?}", tracker.items);
 
     // ---- (6) the tracker goes away; work continues ----
-    let resume = tracker.cursor.clone().unwrap();
+    let resume = tracker
+        .cursor
+        .clone()
+        .expect("APPARATUS: the tracker kept a cursor");
     adapter.stop();
     w2.run(&oc_cfg, &bin_dir, &calls, &r, &[
         "vox room post \"$VOX_ROOM\" --type failed --work 'wl:rehearsal#2' --data '{\"reason\":\"the schema never came\"}' giving-up",
@@ -866,7 +886,9 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         x["envelope"]["data"]["work"].is_string() || x["envelope"]["data"]["resource"].is_string()
     }) {
         let (kind, from) = (
-            row["envelope"]["type"].as_str().unwrap(),
+            row["envelope"]["type"]
+                .as_str()
+                .expect("PRODUCT: a row of vox room read --json has no envelope type"),
             row["envelope"]["from"].as_str().unwrap_or(""),
         );
         if kind == "assign" {

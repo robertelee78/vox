@@ -361,7 +361,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         }
         assert!(
             start.elapsed() < Duration::from_secs(90),
-            "CANNOT MEASURE: the pair never read each other\nalice:\n{}\nbob:\n{}",
+            "PRODUCT (staging): the pair never read each other\nalice:\n{}\nbob:\n{}",
             alice_d.transcript(),
             bob_d.transcript()
         );
@@ -377,7 +377,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     ];
     assert!(
         control.iter().all(|m| m.is_some_and(|m| m <= BOUND)),
-        "CANNOT MEASURE: with no tunnel at all, a post was not read within {BOUND:?}"
+        "PRODUCT (staging): with no tunnel at all, a post was not read within {BOUND:?}"
     );
 
     // Alice offers a file far larger than a tunnel's window.
@@ -405,7 +405,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     while !rb.texts(cb).iter().any(|t| t.contains("big.bin")) {
         assert!(
             offered.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: Bob never read Alice's offer\nsend: {}\n{}",
+            "PRODUCT (staging): Bob never read Alice's offer\nsend: {}\n{}",
             std::fs::read_to_string(&send_out).unwrap_or_default(),
             std::fs::read_to_string(send_out.with_extension("err")).unwrap_or_default()
         );
@@ -436,7 +436,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         while collected(&dir) == 0 {
             assert!(
                 t0.elapsed() < Duration::from_secs(60),
-                "CANNOT MEASURE: collector {g} received nothing\n{}\n{}",
+                "PRODUCT (staging): collector {g} received nothing\n{}\n{}",
                 std::fs::read_to_string(&out).unwrap_or_default(),
                 std::fs::read_to_string(out.with_extension("err")).unwrap_or_default()
             );

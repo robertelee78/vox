@@ -260,8 +260,8 @@ impl Who {
             pass: tmp.join(format!("{name}.pass")),
             stranger: name.starts_with("stranger"),
         };
-        std::fs::create_dir_all(&w.cfg).unwrap();
-        std::fs::write(&w.pass, IDENTITY).unwrap();
+        std::fs::create_dir_all(&w.cfg).expect("APPARATUS: create a staging directory");
+        std::fs::write(&w.pass, IDENTITY).expect("APPARATUS: write a staging file");
         w
     }
 
@@ -288,12 +288,13 @@ impl Who {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         if let Some(text) = input {
-            let mut pipe = child.stdin.take().unwrap();
-            pipe.write_all(text.as_bytes()).unwrap();
+            let mut pipe = child.stdin.take().expect("APPARATUS: a piped stdio handle");
+            pipe.write_all(text.as_bytes())
+                .expect("PRODUCT (staging): vox exited without reading its stdin");
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child.wait_with_output().expect("APPARATUS: vox ran");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -310,7 +311,7 @@ impl Who {
                     .create(true)
                     .append(true)
                     .open(p)
-                    .unwrap(),
+                    .expect("APPARATUS: open a log file"),
             ),
             None => Stdio::null(),
         };
@@ -320,9 +321,10 @@ impl Who {
             .stdout(to())
             .stderr(to())
             .spawn()
-            .expect("spawn vox room join");
-        let mut pipe = child.stdin.take().unwrap();
-        pipe.write_all(ROOM_PASS.as_bytes()).unwrap();
+            .expect("APPARATUS: spawn vox room join");
+        let mut pipe = child.stdin.take().expect("APPARATUS: a piped stdio handle");
+        pipe.write_all(ROOM_PASS.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(pipe);
         Proc(child)
     }
@@ -337,11 +339,13 @@ impl Who {
             .env("VOX_CONFIG_DIR", &self.cfg)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(err).unwrap()));
+            .stderr(Stdio::from(
+                std::fs::File::create(err).expect("APPARATUS: create a staging file"),
+            ));
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let proc = Proc(cmd.spawn().expect("spawn vox daemon"));
+        let proc = Proc(cmd.spawn().expect("APPARATUS: spawn vox daemon"));
         let started = Instant::now();
         while !self.vox(&["room", "list"], None).0 {
             assert!(
@@ -424,10 +428,12 @@ fn stage(
             ])
             .env("VOX_DATA_DIR", &anchor_who.data)
             .env("VOX_CONFIG_DIR", &anchor_who.cfg)
-            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create(&out).expect("APPARATUS: create a staging file"),
+            ))
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: spawn vox node"),
     );
     let started = Instant::now();
     let (fp, port) = loop {
@@ -463,7 +469,7 @@ fn stage(
         Layout::TwoAddresses => {
             let port = std::net::UdpSocket::bind("[::]:0")
                 .and_then(|s| s.local_addr())
-                .expect("a free port")
+                .expect("APPARATUS: a free port")
                 .port();
             (
                 format!("[::]:{port}"),
@@ -497,7 +503,7 @@ fn stage(
                 .map(|&w| sc.spawn(move || w.vox(&["id"], None)))
                 .collect();
             for id in ids {
-                let (ok, out, err) = id.join().unwrap();
+                let (ok, out, err) = id.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
                 assert!(ok, "APPARATUS, CANNOT MEASURE: vox id failed: {out}{err}");
             }
         });
@@ -528,7 +534,10 @@ fn stage(
                     })
                 })
                 .collect();
-            running.into_iter().map(|d| d.join().unwrap()).collect()
+            running
+                .into_iter()
+                .map(|d| d.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                .collect()
         });
         daemons.extend(started);
     }
@@ -752,7 +761,9 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                 // Still running: holding a slot, or still being turned away. Either way it is
                 // kept, and what it said is read at the end.
                 if join.0.try_wait().ok().flatten().is_none() {
-                    kept.lock().unwrap().push(join);
+                    kept.lock()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
+                        .push(join);
                 } else if carol_done.load(Ordering::SeqCst)
                     && std::fs::read_to_string(&said)
                         .unwrap_or_default()
@@ -760,7 +771,10 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                 {
                     turned_after.fetch_add(1, Ordering::SeqCst);
                 }
-                said_to.lock().unwrap().push(said);
+                said_to
+                    .lock()
+                    .expect("APPARATUS: a lock the proof holds was poisoned")
+                    .push(said);
                 std::thread::sleep(CHURN_PAUSE);
             }
         });
@@ -862,7 +876,9 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
     // after a grace, so a refusal that took longer than `ARRIVAL` to be reported is counted too;
     // a join that is still holding a slot has said nothing. Only a refusal by alice herself is
     // counted: a join this daemon would not start (the room already being joined) never reached her.
-    let said_to = said_to.into_inner().unwrap();
+    let said_to = said_to
+        .into_inner()
+        .expect("APPARATUS: a lock the proof holds was poisoned");
     std::thread::sleep(TOLD_GRACE);
     let turned_away: Vec<String> = said_to
         .iter()
@@ -895,7 +911,9 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
         turned_away.join("\n---\n")
     );
     held.clear();
-    kept.lock().unwrap().clear();
+    kept.lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .clear();
     eprintln!(
         "[proof] {} {case}: 1/1 got in; {busy}/{} turned away at the cap were told why",
         profile(),
@@ -908,7 +926,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
 fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Rooms 0–15 are held; 16 and 17 are two more the stranger keeps arriving for.
     let s = stage(tmp.path(), SLOTS + 2, 1, Layout::OneAddress, &never());
     let holds: Vec<(usize, usize)> = (0..SLOTS).map(|room| (0, room)).collect();
@@ -920,7 +938,7 @@ fn one_identity_holding_every_slot_does_not_keep_a_joiner_out() {
 fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Four identities hold four rooms each; rooms 4 and 5 are two more the first keeps arriving
     // for.
     let s = stage(tmp.path(), 6, 4, Layout::OneAddress, &never());
@@ -935,7 +953,7 @@ fn a_handful_of_identities_holding_every_slot_do_not_keep_a_joiner_out() {
 fn one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Sixteen identities on 127.0.0.1 hold one slot each, of room 0, so by identity every hold
     // weighs what carol's does: only the address tells them apart. Carol joins from ::1. Rooms 1
     // and 2 are the ones the first stranger keeps arriving for.
@@ -949,7 +967,7 @@ fn one_address_holding_every_slot_does_not_keep_a_joiner_from_another_out() {
 fn a_relayed_flood_from_one_host_does_not_keep_a_relayed_joiner_from_another_out() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Sixteen stranger identities, every one of their joins relayed by the anchor from one host,
     // hold one slot each of room 0; carol's join is relayed by the same anchor from another
     // origin. Only the origin the relay says tells her from the flood.
@@ -973,7 +991,7 @@ const ENDED_TELL_PATIENCE: Duration = Duration::from_secs(180);
 fn a_join_ended_for_another_is_told_the_member_is_busy() {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let s = stage(
         tmp.path(),
         SLOTS + 1,
@@ -1104,7 +1122,7 @@ const RETRY_PAUSE: Duration = Duration::from_secs(1);
 fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
     let _one = one_at_a_time();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let s = stage(
         tmp.path(),
         SLOTS + 1,

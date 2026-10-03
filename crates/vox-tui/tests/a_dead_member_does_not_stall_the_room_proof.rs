@@ -92,7 +92,7 @@ impl Member {
             child
                 .stdin
                 .take()
-                .unwrap()
+                .expect("APPARATUS: a piped stdio handle")
                 .write_all(s.as_bytes())
                 .unwrap_or_else(|e| panic!("APPARATUS: write vox's stdin: {e}"));
         }

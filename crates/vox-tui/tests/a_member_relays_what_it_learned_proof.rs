@@ -208,7 +208,10 @@ fn a_member_relays_what_it_learned() {
         }
         (b_last, c_last) = (b, c);
     }
-    let ticks = [b_tick.unwrap(), c_tick.unwrap()];
+    let ticks = [
+        b_tick.expect("APPARATUS: set by the loop above"),
+        c_tick.expect("APPARATUS: set by the loop above"),
+    ];
     // The first tick of `seen`'s series at or after `t`.
     let next_tick = |seen: Instant, t: Instant| {
         let mut n = seen;
