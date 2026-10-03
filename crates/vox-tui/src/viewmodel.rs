@@ -28,13 +28,14 @@ pub enum Verification {
     KeyChanged,
 }
 
-/// Your **outbound** per-sender consent to a member (ADR-007): whether *they* may
-/// read *your* messages. Independent of verification and of inbound visibility.
+/// Whether a member may read *your* messages here: whether this node released it your key,
+/// which it does only to a member your trust keyring names (ADR-020 §3, V210-148). A mirror
+/// of trust, read off the room's log; nothing in the TUI sets it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutboundConsent {
-    /// You have consented; the member can read your messages.
+    /// You trust the member, and it holds your key: it can read your messages.
     Granted,
-    /// You have not consented (or revoked); the member cannot read your messages.
+    /// You do not trust the member (or no longer do): it cannot read what you write.
     Revoked,
 }
 
@@ -443,20 +444,6 @@ pub enum Command {
         channel_id: Digest32,
         /// The plaintext to send (becomes ciphertext in the core).
         text: String,
-    },
-    /// Grant outbound consent to a member.
-    GrantConsent {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to consent to.
-        member: Digest32,
-    },
-    /// Revoke outbound consent from a member.
-    RevokeConsent {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to revoke.
-        member: Digest32,
     },
     /// Set inbound visibility for a member.
     SetVisibility {

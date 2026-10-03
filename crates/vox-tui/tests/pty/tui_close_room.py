@@ -35,8 +35,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import STAGE, Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, TAG = sys.argv[1:7]
-# Optional: a member, by the first characters of its fingerprint, to consent to in this room with
-# `:consent grant` before the close: a per-room consent, which needs no trust (V210-118 c3).
+# Optional: a member, by the first characters of its fingerprint, to select in this room and type
+# `:consent grant` at before the close. There is no such command (V210-148): a key goes only to a
+# member the owner trusts. What the TUI answered, and the member's row after it, are printed for
+# the caller to judge; the close goes on either way, so the caller can also see what the node did.
 GRANT = sys.argv[7] if len(sys.argv) > 7 else None
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "180"))
 if pyte is None:
@@ -127,12 +129,35 @@ try:
             key("\x1b[B", 0.5)  # Down
         if not label_of(GRANT)[1]:
             give(1, f"RED: PRODUCT (staging): Down never put the marker on {GRANT}:\n{tui.text()}")
-        key(":consent grant\r", 2)
-        granted = tui.until(lambda: "consented" in (label_of(GRANT)[0] or ""), 60, 1)
+        # The TUI's node must be connected before the grant, or a grant that existed could fail for
+        # want of a session and the proof would show nothing: wait for the member it trusts to show
+        # trusted (its key went out, so sessions are up), then 15 s more (V29-19 measured a first
+        # grant failing for want of a session for up to 15 s after a room opened).
+        rows_all = lambda: "\n".join(members())
+        if not tui.until(lambda: "trusted" in rows_all(), 60, 1):
+            give(1, f"RED: PRODUCT (staging): the TUI's node never showed a trusted member, so it never connected:\n{tui.text()}")
+        tui.pump(15)
         gone_check()
-        if not granted:
-            give(1, f"RED: PRODUCT (staging): :consent grant never showed {GRANT} consented:\n{tui.text()}")
-        print(f"{TAG} the TUI consented to {GRANT}")
+        if "unknown command" in status():
+            give(2, f"APPARATUS: the status line says unknown command before :consent grant:\n{tui.text()}")
+        key(":consent grant\r", 2)
+        answer = status()
+        tui.pump(5)
+        gone_check()
+        row = label_of(GRANT)[0] or ""
+        print(f"{TAG} :consent grant answered {answer.strip()!r}; {GRANT}'s row then: {row.strip()!r}")
+        if "unknown command" in answer:
+            print(f"{TAG} :consent grant is not a command")
+        # Then a post from the composer, with the TUI's node up long enough to deliver it: what the
+        # caller reads of it shows what the node did with the grant, not only what the TUI drew.
+        stage("post after :consent grant")
+        key("\t", 0.5)  # members -> timeline
+        key("\t", 0.5)  # timeline -> composer
+        key("BOB-AFTER-GRANT\r", 1)
+        key("\t", 0.5)  # composer -> members, where `:` opens the command line again
+        tui.pump(20)
+        gone_check()
+        print(f"{TAG} posted BOB-AFTER-GRANT")
     before = tui.text()
     stage(":close")
     key(":zzz\r", 1.5)

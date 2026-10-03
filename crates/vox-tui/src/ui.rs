@@ -43,7 +43,7 @@ pub fn consent_label(m: &MemberView) -> &'static str {
         return "⊘ blocked";
     }
     match (m.outbound, m.inbound) {
-        (OutboundConsent::Granted, InboundVisibility::Visible) => "↔ consented",
+        (OutboundConsent::Granted, InboundVisibility::Visible) => "↔ trusted",
         (OutboundConsent::Granted, InboundVisibility::Hidden) => "→ out-only",
         (OutboundConsent::Revoked, InboundVisibility::Visible) => "← in-only",
         (OutboundConsent::Revoked, InboundVisibility::Hidden) => "· none",
@@ -357,7 +357,7 @@ fn render_hint_bar(frame: &mut Frame, area: Rect, ui: &UiState, vm: &ViewModel) 
             " ↑/↓ select · Enter open · :new <name> · :join · :unlock · :lock · Ctrl-C quit"
         }
         Screen::Channel => {
-            " Tab switch pane · Enter send · PgUp/PgDn scroll · :invite · :consent grant · : command · Esc back"
+            " Tab switch pane · Enter send · PgUp/PgDn scroll · :invite · : command · Esc back"
         }
     };
     frame.render_widget(Paragraph::new(hint), area);

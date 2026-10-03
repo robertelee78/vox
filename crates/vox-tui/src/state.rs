@@ -680,7 +680,7 @@ pub enum Parsed {
 /// - `open` / `back` / `focus` / `up` / `down` — navigation
 ///
 /// Channel-scoped verbs require an active channel:
-/// - `send <text…>`, `invite`, `consent grant|revoke`, `show` / `hide`,
+/// - `send <text…>`, `invite`, `show` / `hide`,
 ///   `block` / `unblock`, `verify` (acts on the selected member).
 ///
 /// **Create / join / unlock / init are not one-line palette commands.** They require
@@ -733,17 +733,6 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         // The link is public; it can be produced by a one-line command.
         "invite" => Command::Invite {
             channel_id: channel,
-        },
-        "consent" => match rest {
-            "grant" => Command::GrantConsent {
-                channel_id: channel,
-                member: ui.selected_member_id(vm)?,
-            },
-            "revoke" => Command::RevokeConsent {
-                channel_id: channel,
-                member: ui.selected_member_id(vm)?,
-            },
-            _ => return None,
         },
         "show" => Command::SetVisibility {
             channel_id: channel,
