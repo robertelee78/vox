@@ -416,7 +416,7 @@ impl SyncBook {
                 .and_then(std::sync::Weak::upgrade);
             manager
                 .map(|m| {
-                    m.held()
+                    m.held_connections()
                         .into_iter()
                         .map(|(peer, tag, path)| (peer, (tag, path)))
                         .collect()

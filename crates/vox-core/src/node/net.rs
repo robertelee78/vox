@@ -557,7 +557,7 @@ impl ConnectionManager {
     /// peer, the connection's tag (the first bytes of its TLS exporter, the same at both ends, as
     /// the connection notes name it) and its path. Only connections not yet closed.
     #[must_use]
-    pub fn held(&self) -> Vec<(Digest32, String, PathClass)> {
+    pub fn held_connections(&self) -> Vec<(Digest32, String, PathClass)> {
         let mut held: Vec<(Digest32, String, PathClass)> = lock(&self.conns)
             .iter()
             .filter(|(_, c)| is_live(c))
