@@ -330,7 +330,9 @@ async fn a_claim_replayed_on_another_connection_is_refused() {
 }
 
 /// Reflection (requirement 31): a `PROVE` fed back as a `CLAIM` is refused — both re-tagged as a
-/// `CLAIM` and sent as it came.
+/// `CLAIM` and sent as it came. Mutant (requirement 40): one shared label **and** `dialler_fp`
+/// dropped from what `CLAIM` signs — the two signed inputs are then the same bytes, and the
+/// re-tagged `PROVE` verifies. Either change alone leaves them different.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "in-process proof over a loopback quinn pair; run on demand"]
 async fn a_prove_fed_back_as_a_claim_is_refused() {

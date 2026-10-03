@@ -254,7 +254,9 @@ connection, bound to the TLS session by its exporter.
       SNI = fingerprint);
     - exporter binding: a `CLAIM` replayed onto another connection is refused, and a second `ASK` on
       one connection closes it (mutants: no exporter in the signature; no one-exchange rule);
-    - reflection: a `PROVE` fed back as a `CLAIM` is refused (mutant: one shared label);
+    - reflection: a `PROVE` fed back as a `CLAIM` is refused (mutant: one shared label **and**
+      `dialler_fp` dropped from what `CLAIM` signs; either alone leaves the two signed inputs
+      different, so the label is defence in depth beside the flights' shapes);
     - responder first: a fake listener at a node's address, without its key, never receives the
       dialler's `CLAIM` (mutant: `CLAIM` sent before `PROVE` is checked);
     - no further oracle: unknown and detached targets and a rate-limited source get byte-identical
