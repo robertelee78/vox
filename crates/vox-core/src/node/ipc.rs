@@ -2966,10 +2966,10 @@ async fn serve_account<D: Dispatch>(
             let mut events = dispatch.events();
             write_frame(&mut stream, &DaemonFrame::Ok.to_bytes()).await?;
             loop {
-                // A subscriber that hung up is let go at once, as in `pump`.
+                // Noticed even with no event to send (see `pump`).
                 let next = tokio::select! {
                     next = events.recv() => next,
-                    () = client_gone(&stream) => return Ok(()),
+                    () = subscriber_gone(&stream) => return Ok(()),
                 };
                 match next {
                     Ok(ev) => {
@@ -3907,9 +3907,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
 /// that died mid-stream shows up as `BrokenPipe` here (measured).
 async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
     loop {
+        // **A subscriber that hangs up is noticed on a quiet node too**: waiting only on events
+        // left its connection — and the hold it carries on its node (ADR-026 L-3) — open until
+        // the node next said something, which on a quiet node is never, so an auto-started daemon
+        // never reached its idle exit (L-8).
         let item = tokio::select! {
             item = events.next() => item,
-            () = client_gone(&stream) => return Ok(()),
+            () = subscriber_gone(&stream) => return Ok(()),
         };
         let Some(item) = item else {
             return Ok(());
@@ -3924,21 +3928,15 @@ async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
     }
 }
 
-/// Resolves once the client of a subscribed connection hangs up.
-///
-/// **A subscriber that went is noticed when it goes, not at the next event** (ADR-026 L-3, L-8).
-/// A subscribed connection is written to and never read, so a client that closed it was found only
-/// when an event was next written to it: on a quiet node, never. On the daemon's account socket
-/// such a connection kept holding its node, and kept an auto-started daemon from exiting, after
-/// its client had gone. A subscriber sends nothing after subscribing, so anything readable is the
-/// end of the stream (or bytes that are ignored, as before).
-async fn client_gone(stream: &UnixStream) {
-    let mut byte = [0u8; 1];
+/// Resolves once the client of a subscription has gone: its end of `stream` is closed or failed.
+/// A subscriber sends nothing after subscribing; anything it does send is read and dropped.
+pub(crate) async fn subscriber_gone(stream: &UnixStream) {
+    let mut buf = [0u8; 256];
     loop {
         if stream.readable().await.is_err() {
             return;
         }
-        match stream.try_read(&mut byte) {
+        match stream.try_read(&mut buf) {
             Ok(0) => return,
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
