@@ -163,7 +163,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     println!("[proof] the anchor's board serves the trusted room's genesis: {served:?}");
     assert!(
         served == Ok(true),
-        "a `--serve trusted` anchor does not keep the board of a room its operator's trusted \
+        "PRODUCT: a `--serve trusted` anchor does not keep the board of a room its operator's trusted \
          identity made ({served:?})"
     );
     let deadline = Instant::now() + CONTROL_PATIENCE;
@@ -178,7 +178,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     println!("[proof] bravo → charlie through the anchor: {control:?}, offered {control_offers}");
     assert!(
         control == CircuitAnswer::Opened && control_offers >= 1,
-        "a `--serve trusted` anchor would not relay between two members of a trusted room \
+        "PRODUCT: a `--serve trusted` anchor would not relay between two members of a trusted room \
          ({control:?}, {control_offers} offered)"
     );
 
@@ -239,7 +239,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     );
     assert!(
         published.is_err() && joined.is_err() && on_board == Ok(false),
-        "a `--serve trusted` anchor kept the board of a room a stranger made (genesis \
+        "PRODUCT: a `--serve trusted` anchor kept the board of a room a stranger made (genesis \
          {published:?}, bundle {joined:?}, served {on_board:?})"
     );
 
@@ -252,12 +252,12 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     );
     assert!(
         to_self != CircuitAnswer::Opened && got_self == 0,
-        "a `--serve trusted` anchor relayed between two identities of a stranger whose room it \
+        "PRODUCT: a `--serve trusted` anchor relayed between two identities of a stranger whose room it \
          should not serve ({to_self:?}, {got_self} offered)"
     );
     assert!(
         to_charlie != CircuitAnswer::Opened && got_charlie == 0,
-        "a `--serve trusted` anchor carried a stranger's circuit to a member ({to_charlie:?}, \
+        "PRODUCT: a `--serve trusted` anchor carried a stranger's circuit to a member ({to_charlie:?}, \
          {got_charlie} offered)"
     );
 }

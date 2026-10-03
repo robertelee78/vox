@@ -124,7 +124,7 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
 
     // Every room, by name.
     let list = alice.vox(None, &["room", "list"]);
-    assert!(list.ok, "{list:?}");
+    assert!(list.ok, "PRODUCT: `vox room list` failed: {list:?}");
     let listed: BTreeSet<String> = names
         .iter()
         .filter(|n| list.stdout.contains(n.as_str()))
@@ -185,7 +185,7 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
         None,
         &["trust", "list", "--identity-passphrase-file", &pass],
     );
-    assert!(trust.ok, "{trust:?}");
+    assert!(trust.ok, "PRODUCT: `vox trust list` failed: {trust:?}");
     let shown: BTreeSet<String> = fingerprints
         .iter()
         .filter(|fp| trust.stdout.contains(fp.as_str()))

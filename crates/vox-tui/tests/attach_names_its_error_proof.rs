@@ -81,7 +81,7 @@ fn serve_once(sock: &Path, answer: impl FnOnce(std::os::unix::net::UnixStream) +
 fn check(case: &str, dir: &Path, said: &[&str], unsaid: &[&str]) -> (usize, usize) {
     let (ok, err) = room_list(dir);
     eprintln!("[receipt] {case}: exit ok={ok}\n  stderr: {}", err.trim());
-    assert!(!ok, "{case}: `vox room list` must fail: {err}");
+    assert!(!ok, "PRODUCT: {case}: `vox room list` must fail: {err}");
     let hit = said.iter().filter(|w| err.contains(*w)).count();
     let avoided = unsaid.iter().filter(|w| !err.contains(*w)).count();
     eprintln!(
@@ -90,12 +90,12 @@ fn check(case: &str, dir: &Path, said: &[&str], unsaid: &[&str]) -> (usize, usiz
         unsaid.len()
     );
     for w in said {
-        assert!(err.contains(w), "{case}: the message must say {w:?}: {err}");
+        assert!(err.contains(w), "PRODUCT: {case}: the message must say {w:?}: {err}");
     }
     for w in unsaid {
         assert!(
             !err.contains(w),
-            "{case}: the message must not say {w:?}: {err}"
+            "PRODUCT: {case}: the message must not say {w:?}: {err}"
         );
     }
     (hit, avoided)

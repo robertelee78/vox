@@ -19,7 +19,7 @@
 //! 1. The escalation: mallory's `Pairwise` stream reaches the victim's pairwise handler — a key
 //!    frame for the room that does not open is answered with the handler's own reset code (no
 //!    session, or did not open), not refused at the stream-kind gate. If this fails the rest
-//!    would measure a refusal, so it is `CANNOT MEASURE`, never a pass.
+//!    would measure a refusal, so it is `PRODUCT (staging)`, never a pass.
 //! 2. While mallory holds silent `Pairwise` streams open (a new one every 2 s, none of which
 //!    ever carries a byte after its kind), **five `vox room post` on the victim, 2 s apart, each
 //!    return inside V210-08's bound of 500 ms**, and the victim's `vox room read` shows all five.
@@ -322,7 +322,7 @@ fn a_member_holding_silent_pairwise_streams_does_not_stop_the_node() {
                 raw_sync::now(),
             )
             .await
-            .expect("CANNOT MEASURE: mallory's identity did not connect to the victim");
+            .expect("PRODUCT (staging): the victim did not take a connection from mallory's identity");
         (endpoint, Arc::new(conn))
     });
     let _answered = raw_sync::answer_victim(Arc::clone(&conn));
@@ -356,7 +356,7 @@ fn a_member_holding_silent_pairwise_streams_does_not_stop_the_node() {
         }
     }
     let reached = reached.expect(
-        "CANNOT MEASURE: mallory's Pairwise stream never reached the victim's pairwise handler, \
+        "PRODUCT (staging): mallory's Pairwise stream never reached the victim's pairwise handler, \
          so a silent one would be refused at the stream-kind gate and this would measure a refusal",
     );
     println!("[proof] escalation: mallory's Pairwise key frame was read and answered: {reached}");
@@ -388,7 +388,7 @@ fn a_member_holding_silent_pairwise_streams_does_not_stop_the_node() {
     while opened.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         assert!(
             t0.elapsed() < Duration::from_secs(10),
-            "CANNOT MEASURE: no silent stream could be opened"
+            "PRODUCT (staging): the victim let no silent stream be opened"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -409,7 +409,7 @@ fn a_member_holding_silent_pairwise_streams_does_not_stop_the_node() {
         took.push(t);
         assert!(
             ok && t < PATIENCE,
-            "post {i} of {POSTS} on the victim took {t:?} (ok={ok}; bound {PATIENCE:?}) while a \
+            "PRODUCT: post {i} of {POSTS} on the victim took {t:?} (ok={ok}; bound {PATIENCE:?}) while a \
              member held silent Pairwise streams open — a stream carrying zero bytes stops the \
              node. It said: {said}"
         );
@@ -421,7 +421,7 @@ fn a_member_holding_silent_pairwise_streams_does_not_stop_the_node() {
     println!("[proof] read: ok={ok} in {t:?}, shows {shown}/{POSTS} posts");
     assert!(
         ok && t < PATIENCE && shown == POSTS,
-        "the victim's `vox room read` took {t:?} (ok={ok}) and showed {shown} of {POSTS} posts \
+        "PRODUCT: the victim's `vox room read` took {t:?} (ok={ok}) and showed {shown} of {POSTS} posts \
          made during the attack:\n{read}"
     );
 
@@ -444,17 +444,17 @@ fn a_member_holding_silent_pairwise_streams_does_not_stop_the_node() {
     });
     assert!(
         first_still_held,
-        "CANNOT MEASURE: the victim had already closed or refused the first silent stream, so \
+        "PRODUCT (staging): the victim had already closed or refused the first silent stream, so \
          the attack was not holding"
     );
     assert!(
         conn.quinn().close_reason().is_none(),
-        "CANNOT MEASURE: mallory's connection closed during the attack: {:?}",
+        "PRODUCT (staging): mallory's connection closed during the attack: {:?}",
         conn.quinn().close_reason()
     );
     assert!(
         streams >= 4,
-        "CANNOT MEASURE: only {streams} silent stream(s) were opened"
+        "PRODUCT (staging): the victim let only {streams} silent stream(s) were opened"
     );
     println!(
         "[proof] {POSTS} posts, slowest {:?}, while {streams} silent Pairwise streams were held",

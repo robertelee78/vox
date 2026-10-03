@@ -163,7 +163,7 @@ impl Proc {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!(
-            "{}: never printed {what}; stdout {:#?}\nstderr:\n{}",
+            "PRODUCT: {}: never printed {what}; stdout {:#?}\nstderr:\n{}",
             self.name,
             self.stdout(),
             self.stderr()
@@ -180,7 +180,7 @@ impl Proc {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!(
-            "{}: never said {what} on stderr; it said:\n{}",
+            "PRODUCT: {}: never said {what} on stderr; it said:\n{}",
             self.name,
             self.stderr()
         );
@@ -247,12 +247,12 @@ fn vox(
 fn assert_says(case: &str, said: &str, wants: &[&str]) {
     assert!(
         !said.contains("Failed("),
-        "{case}: an enum token reached the person instead of a cause:\n{said}"
+        "PRODUCT: {case}: an enum token reached the person instead of a cause:\n{said}"
     );
     for w in wants {
         assert!(
             said.contains(w),
-            "{case}: the message must name the cause ({w:?}); it said:\n{said}"
+            "PRODUCT: {case}: the message must name the cause ({w:?}); it said:\n{said}"
         );
     }
     eprintln!("[{case}] {}", said.trim().replace('\n', " / "));
@@ -474,12 +474,12 @@ fn every_common_failure_names_its_cause() {
         );
         assert!(
             trusted >= 1_000,
-            "only {trusted} identities were trusted before the refusals began; the keyring \
+            "PRODUCT (staging): only {trusted} identities were trusted before the refusals began; the keyring \
              cannot have been full"
         );
         assert!(
             !refusals.is_empty(),
-            "CANNOT MEASURE (9): {tried} identities were trusted and the keyring never filled"
+            "PRODUCT (staging) (9): {tried} identities were trusted and the keyring never filled"
         );
         for said in &refusals {
             assert_says(

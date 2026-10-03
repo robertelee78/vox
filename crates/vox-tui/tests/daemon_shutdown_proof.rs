@@ -40,7 +40,7 @@
 //! (`STOP_WORST_CASE`: 3 s for the tail, 2 × 0.4 s for the goodbye, 0.05 s for relayed closes'
 //! lead, 0.6 s for the closes to leave; 4.45 s against 5 s); this scene spends the tail's wait and,
 //! with Bob frozen, the goodbye's and the flush's too. Preconditions (else the
-//! attempt is staged again, up to [`ATTEMPTS`] times, then CANNOT MEASURE): Alice's
+//! attempt is staged again, up to [`ATTEMPTS`] times, then `PRODUCT (staging)`, since each is vox's doing): Alice's
 //! `vox room send` read the whole file (it closes the file once it has), the collector did
 //! not have it, and the stop took at least [`WAITED`] (a tail acknowledged before the stop
 //! makes it immediate). Mutations: `STOP_ACK_BOUND` back at 5 s — the daemon exits after about
@@ -54,7 +54,7 @@
 //! scene runs past the real patience (the stop is budgeted under it), so the proof shortens it with
 //! the test-only `VOX_TEST_SHUTDOWN_PATIENCE_MS` (the `test-knobs` feature) to [`SHORT_PATIENCE`],
 //! and stages the same unacknowledged tail, whose wait alone is longer. Staged when the stop took
-//! at least that patience (else again, up to [`ATTEMPTS`] times, then CANNOT MEASURE). Mutation: a
+//! at least that patience (else again, up to [`ATTEMPTS`] times, then `PRODUCT (staging)`). Mutation: a
 //! give-up that keeps saying "stopped by SIGINT" and exiting 0 — red, PRODUCT.
 
 #![cfg(unix)]
@@ -285,7 +285,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     eprintln!("[shutdown] SIGTERM -> exit in {took:?}; exit={exited:?}");
     assert!(
         exited.is_some() && took < STOP_WITHIN,
-        "a daemon must stop within {STOP_WITHIN:?} of SIGTERM; it took {took:?} (exited: \
+        "PRODUCT: a daemon must stop within {STOP_WITHIN:?} of SIGTERM; it took {took:?} (exited: \
          {exited:?}). stdout {:#?}\nstderr:\n{said}",
         daemon.stdout()
     );
@@ -300,7 +300,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     eprintln!("[shutdown] `vox trust list` right after the exit: opened={opened}");
     assert!(
         opened,
-        "the profile must be free the moment the daemon has exited; `vox trust list` said: \
+        "PRODUCT: the profile must be free the moment the daemon has exited; `vox trust list` said: \
          {said_after}"
     );
 
@@ -581,8 +581,8 @@ fn a_stop_waits_out_last_bytes_within_its_patience() {
         .find_map(|n| attempt(root, n, &[], WAITED))
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: none of {ATTEMPTS} attempts left a finished tunnel's tail \
-                 unacknowledged at the stop"
+                "PRODUCT (staging): in none of {ATTEMPTS} attempts did vox leave a finished tunnel's tail \
+                 unacknowledged at the stop (each attempt's own line says which step it missed)"
             )
         });
     let gave_up = said.lines().find(|l| l.contains(GAVE_UP));
@@ -615,7 +615,7 @@ fn a_stop_past_its_patience_says_it_did_not_finish() {
         .find_map(|n| attempt(root, n, &[(PATIENCE_KNOB, ms.as_str())], SHORT_PATIENCE))
         .unwrap_or_else(|| {
             panic!(
-                "CANNOT MEASURE: none of {ATTEMPTS} attempts left a finished tunnel's tail \
+                "PRODUCT (staging): in none of {ATTEMPTS} attempts did vox leave a finished tunnel's tail \
                  unacknowledged long enough to outlast a {SHORT_PATIENCE:?} patience"
             )
         });

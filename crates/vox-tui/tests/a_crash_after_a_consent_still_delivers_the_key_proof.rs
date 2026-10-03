@@ -26,7 +26,7 @@
 //!
 //! **Asserted,** with hard-coded bounds: in every trial, killed or not, `bob<k>` reads `post <k>`
 //! within [`BOUND`], and still reads no post made before alice trusted him [`HOLD`] later.
-//! Preconditions, or `CANNOT MEASURE`: every `bob<k>` is on alice's roster before she decides;
+//! Preconditions (a vox step that misses one is `PRODUCT (staging)`; too few kill points is `APPARATUS`): every `bob<k>` is on alice's roster before she decides;
 //! alice reads every post she made; at least [`MIN_KILLS`] kill points fell inside a consent; the
 //! sweep ended inside [`MAX_POINTS`]. Every trial prints whether the trust survived the crash.
 //!
@@ -279,7 +279,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         .count();
     assert!(
         opens > 0,
-        "CANNOT MEASURE: the syscall recorder (vox-test-interpose under DYLD_INSERT_LIBRARIES) \
+        "APPARATUS: the syscall recorder (vox-test-interpose under DYLD_INSERT_LIBRARIES) \
          recorded no `open` by alice's daemon in {}: it is not recording",
         log.display()
     );
@@ -340,7 +340,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         while since.elapsed() < QUIET {
             assert!(
                 t.elapsed() < Duration::from_secs(60),
-                "CANNOT MEASURE: alice's store never went quiet before kill point {k}"
+                "PRODUCT (staging): alice's daemon kept flushing its store; it never went quiet before kill point {k}"
             );
             std::thread::sleep(Duration::from_millis(200));
             let now = flushes();
@@ -428,7 +428,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         }
         assert!(
             got.is_some(),
-            "kill point {k}: bob{k} never read `{after}`, made after alice's restart {}— the \
+            "PRODUCT: kill point {k}: bob{k} never read `{after}`, made after alice's restart {}— the \
              restarted node did not deliver the key it had decided to release (alice's daemon {}). \
              His daemon said:\n{}\nalice's said:\n{}\nalice's status:\n{}\nhis status:\n{}",
             if retrusted.contains(&k) {
@@ -474,11 +474,11 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
     );
     assert!(
         ended_at.is_some(),
-        "CANNOT MEASURE: every one of {MAX_POINTS} kill points fell inside a consent"
+        "APPARATUS (precondition not met): every one of {MAX_POINTS} kill points fell inside a consent, and bob read the key after each, so the sweep is too short to reach the consent's end"
     );
     assert!(
         kills >= MIN_KILLS,
-        "CANNOT MEASURE: only {kills} kill point(s) fell inside a consent"
+        "APPARATUS (precondition not met): only {kills} kill point(s) fell inside a consent, and bob read the key after each: too few crashes to measure"
     );
     drop(alice_daemon);
 }

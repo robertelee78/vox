@@ -20,7 +20,7 @@
 //! the answer a session past `MAX_SKIP` produces, and records how each stream began.
 //!
 //! **Asserted.** After the first key is refused, a later stream from the victim carrying a key
-//! **opens a fresh session**: its first frame is a `Hello`. `CANNOT MEASURE` if no key reached
+//! **opens a fresh session**: its first frame is a `Hello`. `PRODUCT (staging)` if no key reached
 //! mallory at all (the consent never wrote one), or if none was sealed under an existing session
 //! to begin with (then the first stream already carries a hello, and nothing is measured).
 //!
@@ -267,7 +267,7 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
                 raw_sync::now(),
             )
             .await
-            .expect("CANNOT MEASURE: mallory's identity did not connect to the victim");
+            .expect("PRODUCT (staging): the victim did not take a connection from mallory's identity");
         (endpoint, Arc::new(conn))
     });
 
@@ -361,7 +361,7 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
     let first = keys(&seen).first().cloned();
     let Some(first) = first else {
         panic!(
-            "CANNOT MEASURE: no key reached mallory within {FIRST_KEY_WITHIN:?} of the victim \
+            "PRODUCT (staging): no key reached mallory within {FIRST_KEY_WITHIN:?} of the victim \
              trusting her; streams seen: {:?}\nvictim:\n{}",
             seen.lock()
                 .expect("APPARATUS: a lock the proof holds was poisoned"),
@@ -370,7 +370,7 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
     };
     assert!(
         !first.hello_first,
-        "CANNOT MEASURE: the first key already opened a fresh session (a hello first), so no \
+        "PRODUCT (staging): the victim's first key already opened a fresh session (a hello first), so no \
          existing session was refused: {:?}",
         seen.lock()
             .expect("APPARATUS: a lock the proof holds was poisoned")
@@ -401,7 +401,7 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
     );
     assert!(
         fresh.is_some(),
-        "the victim never offered mallory a fresh session in {FRESH_WITHIN:?} after she refused \
+        "PRODUCT: the victim never offered mallory a fresh session in {FRESH_WITHIN:?} after she refused \
          its key as not opening under the session it holds: {later} later key(s), each under the \
          same session, so she can never read it"
     );

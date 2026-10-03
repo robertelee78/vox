@@ -39,7 +39,7 @@
 //! A warm-up post that never reaches Bob once both joins succeeded is a product red (`PRODUCT:`),
 //! not a precondition: delivery is the product.
 //!
-//! ## Preconditions (else CANNOT MEASURE)
+//! ## Preconditions (else PRODUCT (staging): vox did not reach the state the claim needs)
 //! - The burst reached the slot cap: on Alice's `vox status --json`, `skipped_at_cap` rose (the
 //!   base) or `queued` rose (ADR-025). A burst that never met the cap proves nothing.
 //! - During the late join, Alice's `vox status --json` row for that room and Bob showed the
@@ -327,12 +327,12 @@ fn a_burst_past_the_slot_cap_is_queued() {
     // The burst's claim is settled before the late join is staged.
     assert!(
         skipped >= 1 || queued >= 1,
-        "CANNOT MEASURE: the burst never met the slot cap (skipped_at_cap {skipped}, queued \
+        "PRODUCT (staging): alice's own counters say the burst never met the slot cap (skipped_at_cap {skipped}, queued \
          {queued})"
     );
     assert!(
         late.is_empty(),
-        "{} of {ROOMS} posts took longer than {BOUND:?} to reach bob: {late:?}",
+        "PRODUCT: {} of {ROOMS} posts took longer than {BOUND:?} to reach bob: {late:?}",
         late.len()
     );
     // **V210-34, staged.** One more room, joined last, while Alice posts in it every
@@ -402,7 +402,7 @@ fn a_burst_past_the_slot_cap_is_queued() {
     println!("[proof] late joins: {tries:?}");
     let Some((lr, refusal)) = staged else {
         panic!(
-            "CANNOT MEASURE: in {STAGE_TRIES} late joins, no push of alice's was refused as epoch \
+            "PRODUCT (staging): in {STAGE_TRIES} late joins, no push of alice's was refused as epoch \
              mismatch into a policy backoff: {tries:?}"
         );
     };
@@ -431,7 +431,7 @@ fn a_burst_past_the_slot_cap_is_queued() {
         }
         assert!(
             synced.elapsed() < Duration::from_secs(20),
-            "CANNOT MEASURE: bob's sessions with alice in the late-joined room never ran and \
+            "PRODUCT (staging): bob's sessions with alice in the late-joined room never ran and \
              settled: {r}"
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -461,7 +461,7 @@ fn a_burst_past_the_slot_cap_is_queued() {
     );
     assert!(
         read_at.is_some_and(|t| t <= LATE_BOUND) && pushed_at.is_some_and(|t| t <= LATE_BOUND),
-        "in the room whose join refused alice's push, after bob had synced with her there, her \
+        "PRODUCT: in the room whose join refused alice's push, after bob had synced with her there, her \
          next post reached bob after {read_at:?} and her own push to him opened after \
          {pushed_at:?} (both at most {LATE_BOUND:?}; her backoff then {}): the 30 s policy \
          backoff was not released",

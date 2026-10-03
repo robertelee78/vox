@@ -157,13 +157,13 @@ fn a_guest_bound_to_v6_loopback_never_dials_an_ipv4_mapped_candidate() {
     );
     assert!(
         at_forward >= 1,
-        "CANNOT MEASURE: the `still relayed` report does not name the forward {} — it is not the \
+        "PRODUCT (staging): the `still relayed` report does not name the forward {} — it is not the \
          per-candidate report this proof reads.\n{line}",
         w.forward.public
     );
     assert!(
         unreachable.is_empty(),
-        "DIALLED UNREACHABLE (#222): the guest, bound to [::1], tried {} candidate(s) its socket \
+        "PRODUCT: DIALLED UNREACHABLE (#222): the guest, bound to [::1], tried {} candidate(s) its socket \
          cannot send to, each waiting out a timeout: {unreachable:?}\n{line}",
         unreachable.len()
     );
@@ -181,7 +181,7 @@ struct Trap {
 impl Trap {
     fn bind(at: SocketAddr) -> Self {
         let sock = UdpSocket::bind(at)
-            .unwrap_or_else(|e| panic!("CANNOT MEASURE: could not bind a trap at {at}: {e}"));
+            .unwrap_or_else(|e| panic!("APPARATUS: could not bind a trap at {at}: {e}"));
         sock.set_read_timeout(Some(Duration::from_millis(100)))
             .expect("APPARATUS: set a read timeout");
         let got = Arc::new(AtomicU64::new(0));
@@ -257,7 +257,7 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
     .collect();
     assert!(
         !routable.is_empty(),
-        "CANNOT MEASURE: this box has no routable address, so there is nothing a [::1] host could \
+        "APPARATUS (precondition not met): this box has no routable address, so there is nothing a [::1] host could \
          wrongly advertise"
     );
     let foreign: Vec<SocketAddr> = routable
@@ -315,7 +315,7 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
     );
     assert!(
         ok,
-        "CANNOT MEASURE: the guest could not join the host's room (after {:?}).\nstdout:\n{out}\n\
+        "PRODUCT (staging): the guest could not join the host's room (after {:?}).\nstdout:\n{out}\n\
          stderr:\n{err}\nhost:\n{}",
         t0.elapsed(),
         host.transcript()
@@ -394,13 +394,13 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
     );
     assert!(
         !relayed.is_empty(),
-        "CANNOT MEASURE: in {WATCH_223:?} `vox up` never reported a direct attempt at the host, so \
+        "PRODUCT (staging): in {WATCH_223:?} `vox up` never reported a direct attempt at the host, so \
          nothing shows which addresses it took from the board.\nup:\n{}",
         up.transcript()
     );
     assert!(
         got == 0 && named.is_empty(),
-        "ADVERTISED UNREACHABLE (#223): the guest dialled {got} datagram(s) at {} and its reports \
+        "PRODUCT: ADVERTISED UNREACHABLE (#223): the guest dialled {got} datagram(s) at {} and its reports \
          name {named:?} — addresses the [::1]-bound host published but does not listen on.\n{}",
         trap.at,
         relayed.join("\n")

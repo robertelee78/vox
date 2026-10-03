@@ -25,7 +25,8 @@
 //! 2. Her status names the stop: a sync failure reading "did not all arrive within 30s", and none
 //!    reading "sync mode unsupported".
 //!
-//! Precondition (else CANNOT MEASURE): Bob's daemon announced the mutant mode.
+//! Precondition (else `APPARATUS`: the mutant peer is the proof's own): Bob's daemon announced the
+//! mutant mode.
 //!
 //! ## Mutation
 //! Restore the early return in `frontier_session_room`'s drain (drop the staged entries, return
@@ -81,7 +82,7 @@ fn a_slow_sender_still_delivers_what_arrived() {
     }
     assert!(
         announced(&bob_d, MODE),
-        "CANNOT MEASURE: bob's daemon never announced the mutant mode {MODE:?}\nbob:\n{}",
+        "APPARATUS: the mutant sender (bob's daemon) never announced the mutant mode {MODE:?}\nbob:\n{}",
         bob_d.transcript()
     );
 
@@ -107,7 +108,7 @@ fn a_slow_sender_still_delivers_what_arrived() {
     );
     assert!(
         read >= AT_LEAST,
-        "alice read {read} of {POSTS} posts from a peer serving one a second (at least \
+        "PRODUCT: alice read {read} of {POSTS} posts from a peer serving one a second (at least \
          {AT_LEAST}): a drain past its budget dropped what it staged. Her sync failures: {said:?}"
     );
     assert!(

@@ -323,7 +323,10 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         None,
     );
     assert!(ok, "PRODUCT: bob claims: stdout={out:?} stderr={err:?}");
-    assert!(out.contains("you hold port-the-codec"), "{out:?}");
+    assert!(
+        out.contains("you hold port-the-codec"),
+        "PRODUCT: bob's claim did not say he holds it: {out:?}"
+    );
     until(
         &alice_dir,
         "bob's claim to reach alice",
@@ -386,7 +389,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     );
     if !ok {
         panic!(
-            "a file transfer across processes failed — {err}\n`vox room send|get` rides a \
+            "PRODUCT: a file transfer across processes failed — {err}\n`vox room send|get` rides a \
              room-bound service and a `Forward`\n--- alice's send ---\n{}\n--- alice's daemon \
              ---\n{}\n--- bob's daemon ---\n{}",
             offer.transcript(),
