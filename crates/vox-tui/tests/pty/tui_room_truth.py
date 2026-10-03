@@ -27,10 +27,14 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
 its slack; every other verb 120 s. A verb past its time is a named RED, not a hang.
 
-Exit 0 = pass, 1 = red, 2 = apparatus (CANNOT MEASURE). Every process is recorded and killed by
-PID. Bounded throughout (`vox_pty.py`, V210-54).
+Exit 0 = pass, 1 = red, 2 = apparatus (CANNOT MEASURE). A `vox` step on the way that fails (an
+identity, a daemon, create, invite, join, trust, a post, the roster, the TUI drawing the room or
+answering a command it supports) is the product's red: it prints `PRODUCT:` with what `vox` said
+and exits 1. An exception in the driver itself prints `APPARATUS: driver crashed` with its
+traceback and exits 2. Every process is recorded and killed by PID. Bounded throughout
+(`vox_pty.py`, V210-54).
 """
-import os, re, subprocess, sys, time
+import os, re, subprocess, sys, time, traceback
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -93,6 +97,12 @@ def apparatus(why):
 class Apparatus(Exception):
     pass
 
+def product(why):
+    raise Product(why)
+
+class Product(Exception):
+    pass
+
 tui = None
 code = 2
 results = {}
@@ -109,24 +119,33 @@ try:
         m = re.search(r"[a-z2-7]{52}@/ip4/127\.0\.0\.1/udp/\d+", open(f"{S}/anchor.out").read())
         spec = m.group(0) if m else None
         return spec
-    if not until(got_spec, 30): apparatus("anchor spec")
+    if not until(got_spec, 30):
+        product("the anchor `vox node` printed no spec within 30 s: " + open(f"{S}/anchor.err").read())
     stage("identities and daemons")
     fp = {}
     for w in WHO[1:]:
         r = run(w, "id", "--identity-passphrase-file", f"{S}/idpass")
-        if r.returncode != 0: apparatus(f"{w} id: {r.stderr}")
-        fp[w] = re.search(r"[a-z2-7]{52}", r.stdout).group(0)
+        if r.returncode != 0: product(f"{w}'s `vox id` failed: {r.stderr}")
+        m = re.search(r"[a-z2-7]{52}", r.stdout)
+        if m is None: product(f"{w}'s `vox id` printed no fingerprint: {r.stdout!r}")
+        fp[w] = m.group(0)
     daemons = {w: spawn(w, "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
                         "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol")}
     for w in daemons:
-        if not until(lambda: run(w, "room", "list").returncode == 0, 60): apparatus(f"{w} daemon")
+        if not until(lambda: run(w, "room", "list").returncode == 0, 60):
+            product(f"{w}'s daemon never answered `vox room list` within 60 s: " + open(f"{S}/{w}.err").read())
     stage("room create, invite, join, trust")
-    if run("alice", "room", "create", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
-    room = run("alice", "room", "list").stdout.split()[0]
-    link = run("alice", "room", "invite", room).stdout.strip()
-    # Bob and Carol join at once, as two people given the link might: so the budget holds two
-    # joins' worth of JOIN_SECS in a row (theirs, then Dave's), not three.
-    joins = {w: subprocess.Popen([VOX, "room", "join", link, "--name", "m"], env=env(w),
+    c = run("alice", "room", "create", "--passphrase-file", "-", "--name", "m", stdin="room pass")
+    if c.returncode != 0: product(f"alice's `vox room create` failed: {c.stderr.strip()}")
+    listed = run("alice", "room", "list")
+    if not listed.stdout.split(): product(f"alice's `vox room list` shows no room after create: {listed.stderr.strip()}")
+    room = listed.stdout.split()[0]
+    inv = run("alice", "room", "invite", room)
+    if inv.returncode != 0: product(f"alice's `vox room invite` failed: {inv.stderr.strip()}")
+    link = inv.stdout.strip()
+    # Bob and Carol join at once, as two people given the link might: so the budget holds one
+    # join's worth of JOIN_SECS, not two.
+    joins = {w: subprocess.Popen([VOX, "room", "join", "--passphrase-file", "-", link, "--name", "m"], env=env(w),
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True) for w in ("bob", "carol")}
     PROCS.extend(joins.values())
@@ -137,17 +156,17 @@ try:
         except subprocess.TimeoutExpired as t:
             t.cmd = [VOX, "room", "join"]
             raise
-        if p.returncode != 0: apparatus(f"{w} join: {err.strip()}")
+        if p.returncode != 0: product(f"{w}'s `vox room join` failed: {err.strip()}")
     print(f"{TAG} bob's and carol's joins took {time.time() - t_join:.1f} s")
-    # Carol trusts Bob, so what `delivers` and `revoke` measure is Bob's consent alone: a node reads
-    # only whom its owner trusts (V210-118).
+    # Carol trusts Bob, so what her label says is Bob's trust alone: a node reads only whom its
+    # owner trusts (V210-118).
     for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob"), ("carol", "bob", "bob")):
         t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
-        if t.returncode != 0: apparatus(f"{w} trust add: {t.stderr}")
+        if t.returncode != 0: product(f"{w}'s `vox trust add` failed: {t.stderr.strip()}")
     stage("alice posts")
     for i in range(1, POSTS + 1):
         p = run("alice", "room", "post", room, f"m-{i:03d}")
-        if p.returncode != 0: apparatus(f"post m-{i:03d}: {p.stderr.strip()}")
+        if p.returncode != 0: product(f"alice's `vox room post` of m-{i:03d} failed: {p.stderr.strip()}")
     stage("bob reads them and lists everyone")
     def bob_ready():
         r = run("bob", "room", "read", room, "--limit", "500")
@@ -155,7 +174,9 @@ try:
         return (r.returncode == 0 and f"m-{POSTS:03d}" in r.stdout and ro.returncode == 0
                 and fp["alice"] in ro.stdout and fp["carol"] in ro.stdout)
     if not until(bob_ready, 120, 1):
-        apparatus("bob never read m-%03d and listed alice and carol: %s" % (POSTS, run("bob", "room", "read", room, "--limit", "500").stdout[-300:]))
+        last = run("bob", "room", "roster", room)
+        product("bob's node never read m-%03d and listed alice and carol within 120 s: read %r; roster %r"
+                % (POSTS, run("bob", "room", "read", room, "--limit", "500").stdout[-300:], last.stdout + last.stderr))
     stop(daemons["bob"])
 
     stage("bob's tui: unlock and open the room")
@@ -170,7 +191,7 @@ try:
     timeline = lambda: "\n".join(row[:112] for row in tui.display())
     def has(text, s):
         return re.search(rf"(^|[^0-9]){re.escape(s)}([^0-9]|$)", text, re.M) is not None
-    if not tui.until(lambda: "m-0" in timeline(), 30, 1): apparatus("the room's timeline never drew a message")
+    if not tui.until(lambda: "m-0" in timeline(), 30, 1): product("bob's `vox tui` never drew a message in the room's timeline within 30 s of unlocking")
 
     stage("newest")
     newest = tui.until(lambda: has(timeline(), f"m-{POSTS:03d}"), 20, 1)
@@ -179,7 +200,8 @@ try:
           f"m-{POSTS:03d} shown: {has(t, f'm-{POSTS:03d}')}; m-001 shown: {has(t, 'm-001')}")
 
     stage("follows")
-    if run("alice", "room", "post", room, f"m-{POSTS + 1:03d}").returncode != 0: apparatus("post while open")
+    p = run("alice", "room", "post", room, f"m-{POSTS + 1:03d}")
+    if p.returncode != 0: product(f"alice's `vox room post` while bob's TUI is open failed: {p.stderr.strip()}")
     follows = tui.until(lambda: has(timeline(), f"m-{POSTS + 1:03d}"), 60, 1)
     claim("follows", follows, f"m-{POSTS + 1:03d} shown within 60 s: {follows}")
 
@@ -201,7 +223,8 @@ try:
     for _ in range((POSTS + 10) // 10):
         tui.key("\x1b[5~", 0.2)  # PageUp, well past the oldest line
     if not tui.until(lambda: first_shown() == 1, 5, 0.2):
-        apparatus(f"PageUp past the top did not show m-001 first (first shown: {first_shown()})")
+        product(f"bob's `vox tui`: PageUp past the top did not show m-001 first within 5 s "
+                f"(first shown: {first_shown()})")
     tui.key("\x1b[6~", 0)  # PageDown, once
     tui.until(lambda: first_shown() == 11, 3, 0.2)
     moved = first_shown()
@@ -228,10 +251,10 @@ try:
     # The pane's border is part of the row: the label is what sits between its edges.
     bare = lambda row: (row or "").strip().strip("│").strip()
     alice_ok = tui.until(lambda: bare(label_of("alice")[0]) == ALICE, 60, 1)
-    if label_of("carol")[0] is None: apparatus("carol is not in bob's members pane:\n" + "\n".join(pane()))
+    if label_of("carol")[0] is None: product("bob's node listed carol, and his `vox tui` members pane does not show her:\n" + "\n".join(pane()))
     if not alice_ok:
-        apparatus(f"bob's pane never showed alice {ALICE!r}, so carol's label shows nothing: "
-                  + repr(label_of("alice")[0]))
+        product(f"bob trusts alice, and his `vox tui` members pane never showed her {ALICE!r} "
+                "within 60 s: " + repr(label_of("alice")[0]))
     carol_label = label_of("carol")[0]
     claim("consent", bare(carol_label) == CAROL,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
@@ -246,7 +269,7 @@ try:
     for c in REMOVED:
         tui.key(":invite\r", 2)
         if "unknown command" in bottom():
-            apparatus(f":invite left the status line saying unknown command, so :{c}'s answer shows nothing:\n{bottom()}")
+            product(f"bob's `vox tui` answered :invite, a command it supports, with unknown command:\n{bottom()}")
         tui.key(f":{c}\r", 2)
         answers[c] = bottom().split("\n")[-1].strip()
     screen = "\n".join(tui.display())
@@ -298,6 +321,10 @@ try:
 except Apparatus as a:
     print(f"{TAG} APPARATUS: {a}")
     code = 2
+except Product as e:
+    print(f"{TAG} PRODUCT: {e}")
+    print(f"{TAG} RED")
+    code = 1
 except Hung as h:
     print(f"{TAG} HUNG at {h}")
     code = 1
@@ -305,6 +332,9 @@ except subprocess.TimeoutExpired as t:
     # A `vox` verb that never returned is a red of its own, named, not a driver with no verdict.
     print(f"{TAG} RED: `vox {' '.join(t.cmd[1:3])}` did not return within {t.timeout:.0f} s")
     code = 1
+except Exception:
+    print(f"{TAG} APPARATUS: driver crashed: {traceback.format_exc()}")
+    code = 2
 finally:
     disarm()
     stage("stopping every process")

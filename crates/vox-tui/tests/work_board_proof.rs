@@ -71,6 +71,18 @@ fn vox(w: &Worker, args: &[&str]) -> (bool, String, String) {
     (o.ok, o.stdout, o.stderr)
 }
 
+/// The wall clock in milliseconds — the clock a `--ttl` is measured against.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("APPARATUS: the system clock is before 1970")
+        .as_millis() as u64
+}
+
+/// How long `--ttl` gives the claim in (5). Bob must see it and be refused inside this,
+/// on the same clock; a runner too slow for that reads CANNOT MEASURE, not PRODUCT.
+const TTL_SECS: u64 = 5;
+
 #[test]
 #[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
 fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
@@ -78,8 +90,8 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
+        .expect("APPARATUS: could not build the test's tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temp dir");
     let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
     let room = r.id.clone();
@@ -88,10 +100,10 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
 
     // ---- (1) and (2): both claim the same thing; exactly one wins ----
     let (ok, out, err) = vox(alice, &["room", "claim", &room, "port-the-codec"]);
-    assert!(ok, "alice's claim failed: {err}");
+    assert!(ok, "PRODUCT: alice's claim failed: {err}");
     assert!(
         out.contains("you hold port-the-codec"),
-        "a winning claim must say so: {out:?}"
+        "PRODUCT: a winning claim must say so: {out:?}"
     );
 
     // Bob must see alice's claim before his own can lose to it.
@@ -106,28 +118,28 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
     let (ok, out, err) = vox(bob, &["room", "claim", &room, "port-the-codec"]);
     assert!(
         !ok,
-        "a losing claim must fail, not succeed quietly: stdout={out:?}"
+        "PRODUCT: a losing claim must fail, not succeed quietly: stdout={out:?}"
     );
     assert!(
         err.contains("is held by") && err.contains(&alice_short),
-        "the loser must be told who holds it: {err:?}"
+        "PRODUCT: the loser must be told who holds it: {err:?}"
     );
 
     // ---- (3) the board agrees from both sides, and each knows its own ----
     let alice_board = vox(alice, &["room", "board", &room]).1;
     assert!(
         alice_board.contains("port-the-codec") && alice_board.contains("(you)"),
-        "alice must see the resource as hers: {alice_board:?}"
+        "PRODUCT: alice must see the resource as hers: {alice_board:?}"
     );
     let bob_board = vox(bob, &["room", "board", &room]).1;
     assert!(
         bob_board.contains("port-the-codec") && !bob_board.contains("(you)"),
-        "bob must see it held by someone who is not him: {bob_board:?}"
+        "PRODUCT: bob must see it held by someone who is not him: {bob_board:?}"
     );
 
     // ---- (4) a release frees it, and the new claim succeeds ----
     let (ok, _, err) = vox(alice, &["room", "release", &room, "port-the-codec"]);
-    assert!(ok, "alice could not release: {err}");
+    assert!(ok, "PRODUCT: alice could not release: {err}");
     // What a release guarantees is that **the releaser stops holding it** — not
     // that the resource is unowned, because bob's earlier losing claim may sort
     // after the release and acquire it. See the header.
@@ -143,37 +155,84 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
         },
     );
     let (ok, out, err) = vox(bob, &["room", "claim", &room, "port-the-codec"]);
-    assert!(ok, "bob should hold it once alice released: {err}");
-    assert!(out.contains("you hold port-the-codec"), "{out:?}");
+    assert!(ok, "PRODUCT: bob should hold it once alice released: {err}");
+    assert!(
+        out.contains("you hold port-the-codec"),
+        "PRODUCT: bob's claim must say he holds it: {out:?}"
+    );
 
     // ---- (5) a lapsed ttl frees it with nobody acting ----
-    let (ok, out, err) = vox(alice, &["room", "claim", &room, "flaky-test", "--ttl", "2"]);
-    assert!(ok, "alice's ttl claim failed: {err}");
-    assert!(out.contains("you hold flaky-test"), "{out:?}");
-    until(
-        bob,
-        Some("bob"),
-        "the ttl claim to reach bob",
-        &["room", "board", &room],
-        |o| o.stdout.contains("flaky-test"),
+    // The expiry vox computed is read from its own answer, so every step below is timed
+    // against the same clock the claim lapses on.
+    let ttl = TTL_SECS.to_string();
+    let o = alice.vox(
+        Some(&alice.name),
+        &[
+            "room",
+            "claim",
+            &room,
+            "flaky-test",
+            "--ttl",
+            &ttl,
+            "--json",
+        ],
     );
+    assert!(o.ok, "PRODUCT: alice's ttl claim failed: {o:?}");
+    let expires = o.json()["state"]["expires_millis"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("PRODUCT: a --ttl claim must report its expiry: {o:?}"));
+    // Bob must have the live claim before his own can be bound by it. Seeing it is
+    // staging; if the claim lapses first, nothing about binding was tested.
+    loop {
+        let b = bob.vox(Some("bob"), &["room", "board", &room]);
+        let seen = now_ms();
+        if b.stdout.contains("flaky-test") {
+            break;
+        }
+        assert!(
+            seen < expires,
+            "APPARATUS, CANNOT MEASURE: the {TTL_SECS} s ttl claim had lapsed ({} ms past its expiry) \
+             before it reached bob's board, so whether a live ttl claim binds was never \
+             tested; last board: {b:?}",
+            seen - expires
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     // While the ttl runs, it binds bob like any claim.
-    let (ok, _, err) = vox(bob, &["room", "claim", &room, "flaky-test"]);
-    assert!(
-        !ok && err.contains("is held by"),
-        "a live ttl claim must still bind another agent: {err:?}"
-    );
+    let (ok, out, err) = vox(bob, &["room", "claim", &room, "flaky-test"]);
+    let done = now_ms();
+    if ok || !err.contains("is held by") {
+        // Bob's claim started after he saw the live claim; it is a product red only if it
+        // also finished before the claim lapsed.
+        assert!(
+            done >= expires,
+            "PRODUCT: a live ttl claim did not bind bob, {} ms before it lapsed: \
+             ok={ok} stdout={out:?} stderr={err:?}",
+            expires - done
+        );
+        panic!(
+            "APPARATUS, CANNOT MEASURE: bob's claim finished {} ms after the {TTL_SECS} s ttl lapsed, \
+             so whether a live ttl claim binds was never tested: ok={ok} stderr={err:?}",
+            done - expires
+        );
+    }
 
     // Nobody releases it. It lapses.
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    let wait = expires.saturating_sub(now_ms()) + 1_000;
+    std::thread::sleep(std::time::Duration::from_millis(wait));
     let (ok, out, err) = vox(bob, &["room", "claim", &room, "flaky-test"]);
     assert!(
         ok,
-        "a lapsed claim must free the resource with nobody acting: stdout={out:?} stderr={err:?}"
+        "PRODUCT: a claim {} ms past its ttl still holds the resource with nobody acting: \
+         stdout={out:?} stderr={err:?}",
+        now_ms() - expires
     );
-    assert!(out.contains("you hold flaky-test"), "{out:?}");
+    assert!(
+        out.contains("you hold flaky-test"),
+        "PRODUCT: bob's claim must say he holds it: {out:?}"
+    );
     println!(
         "[proof] contested claim: 1 winner, loser refused naming the holder; release freed it; \
-         a 2s ttl bound bob while live and freed itself after 3s"
+         a {TTL_SECS}s ttl bound bob while live and freed itself once it lapsed"
     );
 }

@@ -32,9 +32,11 @@
 //! trust was decided (`release_key_to` refusing any other room). The first room still works; the
 //! second does not, and the red says `PRODUCT`.
 //!
-//! **Every red names its side:** what the shipped binary does wrong is `PRODUCT:`, a step of the
-//! staging the shipped binary fails is `PRODUCT (staging):`, and a fault of this harness is
-//! `CANNOT MEASURE (harness error):`.
+//! **Every red names its side:** what the shipped binary does wrong is `PRODUCT:`; a step of the
+//! staging the shipped binary fails (an identity, trust, the anchor, a daemon, a room, a join, a
+//! post) is `PRODUCT (staging):`, quoting what `vox` said; only a fault of this proof's own
+//! machinery is `APPARATUS, CANNOT MEASURE:`. A join is made once, as a person makes it: a join
+//! turned away is a red of its own, never retried past.
 
 #![cfg(unix)]
 
@@ -53,9 +55,9 @@ const ROOM_PASS: &str = "the room passphrase";
 /// journeys hold a room's first read to.
 const ROOM_BOUND: u64 = 60;
 
-/// A harness step that must not fail, or the proof cannot measure anything.
+/// A step of this proof's own machinery that must not fail, or it cannot measure anything.
 fn harness<T, E: std::fmt::Debug>(r: Result<T, E>, what: &str) -> T {
-    r.unwrap_or_else(|e| panic!("CANNOT MEASURE (harness error): {what}: {e:?}"))
+    r.unwrap_or_else(|e| panic!("APPARATUS, CANNOT MEASURE: {what}: {e:?}"))
 }
 
 struct Proc(Child);
@@ -90,7 +92,7 @@ impl Member {
     fn pass_file(&self) -> &str {
         self.pass
             .to_str()
-            .unwrap_or_else(|| panic!("CANNOT MEASURE (harness error): a non-UTF-8 temp path"))
+            .unwrap_or_else(|| panic!("APPARATUS, CANNOT MEASURE: a non-UTF-8 temp path"))
     }
 
     fn vox(&self, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
@@ -114,8 +116,13 @@ impl Member {
             let mut pipe = child
                 .stdin
                 .take()
-                .unwrap_or_else(|| panic!("CANNOT MEASURE (harness error): no stdin pipe"));
-            harness(pipe.write_all(s.as_bytes()), "write vox's stdin");
+                .unwrap_or_else(|| panic!("APPARATUS, CANNOT MEASURE: no stdin pipe"));
+            pipe.write_all(s.as_bytes()).unwrap_or_else(|e| {
+                panic!(
+                    "PRODUCT (staging): `vox {}` exited without reading its stdin: {e}",
+                    args.join(" ")
+                )
+            });
         }
         let out = harness(child.wait_with_output(), "wait for vox");
         let r = (
@@ -138,7 +145,11 @@ impl Member {
             &["id", "--identity-passphrase-file", self.pass_file()],
             None,
         );
-        assert!(ok, "PRODUCT (staging): {} `vox id`: {err}", self.name);
+        assert!(
+            ok,
+            "PRODUCT (staging): {}'s `vox id` failed: {err}",
+            self.name
+        );
         out.trim().to_owned()
     }
 
@@ -186,11 +197,17 @@ impl Member {
             "spawn vox daemon",
         );
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !self.vox(&["room", "list"], None).0 {
+        loop {
+            let (ok, _, said) = self.vox(&["room", "list"], None);
+            if ok {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
-                "PRODUCT (staging): {}'s daemon never answered",
-                self.name
+                "PRODUCT (staging): {}'s daemon never answered `vox room list` in 60 s; the last \
+                 answer: {said}\nthe daemon's stderr:\n{}",
+                self.name,
+                std::fs::read_to_string(err).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -238,34 +255,27 @@ impl Member {
         (room, link.trim().to_owned())
     }
 
-    /// Join `link` as the room `name`. A set-up join is retried, as `support/room.rs` does, for
-    /// the separate known host-busy refusal.
-    fn join(&self, link: &str, name: &str) {
-        let mut last = String::new();
-        for attempt in 1..=6 {
-            let (ok, _, err) = self.vox(
-                &[
-                    "room",
-                    "join",
-                    "--passphrase-file",
-                    "-",
-                    link,
-                    "--name",
-                    name,
-                ],
-                Some(ROOM_PASS),
-            );
-            if ok {
-                eprintln!("[receipt] {} joined {name} on attempt {attempt}", self.name);
-                return;
-            }
-            last = err;
-            std::thread::sleep(Duration::from_secs(5));
-        }
-        panic!(
-            "PRODUCT (staging): {} never joined {name} — the join itself failed, which is not \
-             what this proves: {last}",
-            self.name
+    /// Join `link` as the room `name`, once, as a person does: a join turned away is a red of its
+    /// own, quoting the join and both daemons' logs (`logs`), never retried past.
+    fn join(&self, link: &str, name: &str, logs: &dyn Fn() -> String) {
+        let (ok, out, err) = self.vox(
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link,
+                "--name",
+                name,
+            ],
+            Some(ROOM_PASS),
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): {}'s `vox room join` of {name} failed.\nstdout:\n{out}\n\
+             stderr:\n{err}\n{}",
+            self.name,
+            logs()
         );
     }
 
@@ -278,16 +288,20 @@ impl Member {
         );
     }
 
-    fn reads(&self, room: &str, text: &str, secs: u64) -> bool {
+    /// Whether `vox room read` showed `text` within `secs`, and its last answer, so a red
+    /// quotes what the reader was shown (or why the read failed) rather than a bare `false`.
+    fn reads(&self, room: &str, text: &str, secs: u64) -> (bool, String) {
         let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut last = String::new();
         while Instant::now() < deadline {
-            let (_, out, _) = self.vox(&["room", "read", room], None);
+            let (ok, out, err) = self.vox(&["room", "read", room], None);
             if out.contains(text) {
-                return true;
+                return (true, out);
             }
+            last = if ok { out } else { format!("(failed) {err}") };
             std::thread::sleep(Duration::from_millis(500));
         }
-        false
+        (false, last)
     }
 }
 
@@ -295,7 +309,7 @@ impl Member {
 fn anchor(root: &Path) -> (Proc, String) {
     let (a_data, a_cfg) = (root.join("anchor/data"), root.join("anchor/cfg"));
     harness(std::fs::create_dir_all(&a_cfg), "make the anchor's config");
-    let anchor_out = root.join("anchor.out");
+    let (anchor_out, anchor_err) = (root.join("anchor.out"), root.join("anchor.err"));
     let proc = Proc(harness(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
@@ -305,7 +319,10 @@ fn anchor(root: &Path) -> (Proc, String) {
                 std::fs::File::create(&anchor_out),
                 "create the anchor's log",
             )))
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(harness(
+                std::fs::File::create(&anchor_err),
+                "create the anchor's error log",
+            )))
             .spawn(),
         "spawn vox node",
     ));
@@ -320,7 +337,8 @@ fn anchor(root: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): the anchor never printed its spec"
+            "PRODUCT (staging): the anchor printed no spec in 60 s.\nstdout:\n{text}\nstderr:\n{}",
+            std::fs::read_to_string(&anchor_err).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -361,20 +379,22 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
         .collect();
     let [alice, bob] = &members;
 
+    let logs = || logs(root, &members);
     let (room, link) = alice.create("mission");
-    bob.join(&link, "mission");
+    bob.join(&link, "mission", &logs);
 
     // The moment the join returns: this is the post that used to be lost for good.
     alice.post(&room, "warmup from alice");
     bob.post(&room, "warmup from bob");
-    let bob_reads_alice = bob.reads(&room, "warmup from alice", ROOM_BOUND);
-    let alice_reads_bob = alice.reads(&room, "warmup from bob", ROOM_BOUND);
+    let (bob_reads_alice, bob_saw) = bob.reads(&room, "warmup from alice", ROOM_BOUND);
+    let (alice_reads_bob, alice_saw) = alice.reads(&room, "warmup from bob", ROOM_BOUND);
     assert!(
         bob_reads_alice && alice_reads_bob,
         "PRODUCT: F12: a joiner trusted before the join must read what the host posts the moment \
          the join returns, and the host the joiner, within {ROOM_BOUND} s: bob reads alice = \
-         {bob_reads_alice}, alice reads bob = {alice_reads_bob}; daemon logs:\n{}",
-        logs(root, &members)
+         {bob_reads_alice}, alice reads bob = {alice_reads_bob}.\nbob's last `vox room read`:\n\
+         {bob_saw}\nalice's last `vox room read`:\n{alice_saw}\ndaemon logs:\n{}",
+        logs()
     );
 }
 
@@ -395,34 +415,36 @@ fn two_people_who_share_a_room_read_each_other_in_a_second_one_with_no_new_trust
         .map(|m| m.daemon(&spec, &root.join(format!("{}.err", m.name))))
         .collect();
     let [alice, bob] = &members;
+    let logs = || logs(root, &members);
     // 2.–5. Alice creates and invites; the link and passphrase are sent; bob joins.
     let (first, link) = alice.create("first");
-    bob.join(&link, "first");
+    bob.join(&link, "first", &logs);
     // 6. Each trusts the other.
     alice.trust(bob, &fps[1]);
     bob.trust(alice, &fps[0]);
     alice.post(&first, "alice in the first room");
     bob.post(&first, "bob in the first room");
-    let first_ab = bob.reads(&first, "alice in the first room", ROOM_BOUND);
-    let first_ba = alice.reads(&first, "bob in the first room", ROOM_BOUND);
+    let (first_ab, first_ab_saw) = bob.reads(&first, "alice in the first room", ROOM_BOUND);
+    let (first_ba, first_ba_saw) = alice.reads(&first, "bob in the first room", ROOM_BOUND);
     eprintln!("[proof] first room: bob reads alice {first_ab}, alice reads bob {first_ba}");
     assert!(
         first_ab && first_ba,
         "PRODUCT (staging): in the first room, after both trusted each other, bob reads alice = \
          {first_ab}, alice reads bob = {first_ba}: the first room never worked, so the second \
-         proves nothing; daemon logs:\n{}",
-        logs(root, &members)
+         proves nothing.\nbob's last `vox room read`:\n{first_ab_saw}\nalice's last `vox room \
+         read`:\n{first_ba_saw}\ndaemon logs:\n{}",
+        logs()
     );
 
     // ---- the second room: create, invite, send, join — no fingerprint swap, no trust ----
     let (second, link) = alice.create("second");
-    bob.join(&link, "second");
+    bob.join(&link, "second", &logs);
     let joined = Instant::now();
     // The moment the join returns, as people would.
     alice.post(&second, "alice in the second room");
     bob.post(&second, "bob in the second room");
-    let second_ab = bob.reads(&second, "alice in the second room", ROOM_BOUND);
-    let second_ba = alice.reads(&second, "bob in the second room", ROOM_BOUND);
+    let (second_ab, second_ab_saw) = bob.reads(&second, "alice in the second room", ROOM_BOUND);
+    let (second_ba, second_ba_saw) = alice.reads(&second, "bob in the second room", ROOM_BOUND);
     eprintln!(
         "[proof] second room, no trust step: bob reads alice {second_ab}, alice reads bob \
          {second_ba}, {} ms after the join returned",
@@ -432,7 +454,8 @@ fn two_people_who_share_a_room_read_each_other_in_a_second_one_with_no_new_trust
         second_ab && second_ba,
         "PRODUCT: two people who trust each other from their first room must read each other in a \
          second one with no new trust step, each within {ROOM_BOUND} s: bob reads alice = \
-         {second_ab}, alice reads bob = {second_ba}; daemon logs:\n{}",
-        logs(root, &members)
+         {second_ab}, alice reads bob = {second_ba}.\nbob's last `vox room read`:\n\
+         {second_ab_saw}\nalice's last `vox room read`:\n{second_ba_saw}\ndaemon logs:\n{}",
+        logs()
     );
 }
