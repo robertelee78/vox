@@ -102,19 +102,21 @@ pub struct RoomStatus {
     /// When a sync this node ran there last completed.
     pub last_sync: Option<u64>,
     /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
-    /// and the node's own (ADR-023 decision 2). `None` when the room was mid-session and could
-    /// not be read without waiting.
-    pub retention: Option<u64>,
+    /// and the node's own (ADR-023 decision 2).
+    ///
+    /// This and the three below come from the room as the node last published it, so they are
+    /// answered while a sync session holds the room. Read from the room itself they were `null`
+    /// for as long as a session ran: a person reading `vox status` saw no retention, "(busy)" for
+    /// the keys held and no frozen member, with no reason (#58, #59).
+    pub retention: u64,
     /// How many generations of this node's own sender key it still holds here (PRD-001
-    /// R14: one, unless a full-history grant is still owed). `None` when the room was
-    /// mid-session and could not be read without waiting.
-    pub key_generations: Option<usize>,
-    /// Authors this node froze here for signing two entries at one position (ADR-008). `None`
-    /// when the room was mid-session and could not be read without waiting.
-    pub frozen: Option<Vec<Digest32>>,
+    /// R14: one, unless a full-history grant is still owed).
+    pub key_generations: usize,
+    /// Authors this node froze here for signing two entries at one position (ADR-008).
+    pub frozen: Vec<Digest32>,
     /// Entries this node refused here as at or below their author's checkpoint since it opened
-    /// the room (ADR-023 decision 3). `None` as for `frozen`.
-    pub refused_below_checkpoint: Option<u64>,
+    /// the room (ADR-023 decision 3).
+    pub refused_below_checkpoint: u64,
     /// Its members.
     pub members: Vec<MemberStatus>,
 }
@@ -277,19 +279,17 @@ impl StatusReport {
                     opt(m.last_sync)
                 )
             });
+            let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"frozen\":{},\"refused_below_checkpoint\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
                 opt(r.last_sync),
-                opt(r.retention),
-                opt(r.key_generations.map(|n| n as u64)),
-                r.frozen.as_ref().map_or("null".into(), |f| format!(
-                    "[{}]",
-                    list(f.iter().map(|d| q(&b32_encode(d))))
-                )),
-                opt(r.refused_below_checkpoint),
+                r.retention,
+                r.key_generations,
+                frozen,
+                r.refused_below_checkpoint,
                 list(members)
             )
         });

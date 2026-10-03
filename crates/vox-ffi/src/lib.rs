@@ -51,7 +51,7 @@ fn failed(reason: impl Into<String>) -> VoxError {
 
 fn outcome(what: &str, out: Outcome) -> Result<(), VoxError> {
     match out {
-        Outcome::Done | Outcome::Bound(_) => Ok(()),
+        Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } => Ok(()),
         Outcome::Failed(f) => Err(failed(format!("{what}: {f:?}"))),
     }
 }

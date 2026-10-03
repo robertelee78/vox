@@ -85,6 +85,11 @@ pub fn shortest(a: u64, b: u64) -> u64 {
 /// ```
 ///
 /// A missing file is "no node policy" — the room's governs alone.
+///
+/// **A node may keep less than its room, never more** (V030-32): a value above the room's is
+/// ignored (the shorter wins) and the node says so once. A member writes a room's line with
+/// `vox room retention <room> <duration>` ([`RetentionConfig::write_room`]), which refuses a value
+/// above the room's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionConfig {
     /// For every room without a line of its own.
@@ -130,6 +135,60 @@ impl RetentionConfig {
             }
         }
         Ok(out)
+    }
+
+    /// Set this node's own retention for `channel_id` in the file at `path` (V030-32): a member's
+    /// `vox room retention` below the room's value lands here as `Some(secs)`, and one equal to the
+    /// room's as `None`, which clears the line so the node follows the room again. Every room line
+    /// whose prefix matches the room is removed, and `Some` adds one naming the room's whole id;
+    /// every other line, and every comment, is kept as it was. Written to a temporary file and
+    /// renamed, so a reader never sees half a file.
+    ///
+    /// # Errors
+    /// The file cannot be read (other than missing) or written.
+    pub fn write_room(
+        path: &Path,
+        channel_id: &Digest32,
+        secs: Option<u64>,
+    ) -> crate::error::Result<()> {
+        let id = crate::node::link::b32_encode(channel_id);
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return Err(crate::error::Error::Profile("retention file unreadable")),
+        };
+        let mut out = String::new();
+        for line in text.lines() {
+            let key = line
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .next();
+            let this_room = key
+                .is_some_and(|k| k != "default" && id.starts_with(k.to_ascii_lowercase().as_str()));
+            if !this_room {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        if let Some(secs) = secs {
+            let value = if secs == 0 {
+                "forever".to_owned()
+            } else {
+                secs.to_string()
+            };
+            out.push_str(&format!("{id} {value}\n"));
+        }
+        let tmp = path.with_extension("tmp");
+        let written = (|| {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&tmp, out.as_bytes())?;
+            std::fs::rename(&tmp, path)
+        })();
+        written.map_err(|_| crate::error::Error::Profile("retention file unwritable"))
     }
 
     /// This node's retention for `channel_id`: the first room line whose prefix matches its id as

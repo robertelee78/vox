@@ -2892,8 +2892,38 @@ pub async fn retention(
             }
             Ok(())
         }
-        // The node's own words (`Fault::explain`) say why — including a member who is not the
-        // room's admin, which has its own fault rather than a generic refusal.
+        // A member who is not the room's creator or an admin set only their own node's (V030-32).
+        Ok(Frame::OwnRetention { own, room }) => {
+            let say = |t: u64| match t {
+                0 => "forever".to_owned(),
+                t => format!("for {}", vox_core::node::retention::describe(t)),
+            };
+            if own == room {
+                println!(
+                    "vox: you follow the room's retention for {} again: this node keeps its \
+                     messages {}",
+                    short(&channel_id),
+                    say(own)
+                );
+            } else {
+                println!(
+                    "vox: set your own retention for {}: this node keeps its messages {}",
+                    short(&channel_id),
+                    say(own)
+                );
+            }
+            println!(
+                "     the room's is {}, and only its creator or an admin changes that; nothing \
+                 changed for anyone else",
+                match room {
+                    0 => "forever".to_owned(),
+                    t => vox_core::node::retention::describe(t),
+                }
+            );
+            Ok(())
+        }
+        // The node's own words (`Fault::explain`) say why — including a member asking to keep
+        // the room's messages longer than the room does, which has its own fault.
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("cannot set retention: {reason}")))
         }

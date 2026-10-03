@@ -8,17 +8,26 @@
 //!
 //! Real seconds, small durations, no faked clocks: the waits below are the durations themselves.
 //!
-//! **Proof 3 (retroactive):** 40 messages, a pause, 60 more; the admin sets the room to 30 s.
-//! On both members `vox room read` shows exactly the 60, their stores hold 60 plaintext cache rows
-//! and every skeleton, a restart still opens the room, and then the 60 go too.
+//! **Proof 3 (retroactive), and a node keeping more follows the room:** 40 messages, a pause, 60
+//! more; the admin sets the room to 30 s. bob's node keeps **a week** (the `retention` file in its
+//! config), longer than the room; a node may keep less than its room, never more (PRD-001 R9). On
+//! both members `vox room read` shows exactly the 60 (on bob too, though his node would keep a
+//! week), a restart still opens the room, and then the 60 go too.
 //!
 //! **Proof 4 (shortest wins) and a late arrival:** the room keeps a week, one member's node keeps
 //! a minute. That member's view empties at a minute while the other keeps everything. Then, with
 //! that node down, more is posted; it comes back after they are older than its minute, syncs them,
 //! and **never shows them** — polled tightly the whole way, so a render-then-prune would be seen.
 //!
+//! **A red names its side.** A claim's assertion is PRODUCT and quotes what `vox` showed. A `vox`
+//! command that fails, or a node that does not get there, while the scene is set (an identity, a
+//! trust, a daemon, a room, a join, a post, a first read) is the product failing: PRODUCT
+//! (staging); each wait says which it is. The test's own processes, files, ports, runtime and
+//! its subscriber on alice's socket are APPARATUS.
+//!
 //! Mutations (each run, each red): the sweep disabled; a reload that refuses a pruned entry; the
-//! node's own retention ignored; the arrival check removed.
+//! node's own retention ignored; the node's retention winning whenever it is set (so a node
+//! keeping more than its room keeps more); the arrival check removed.
 
 #![cfg(unix)]
 
@@ -29,8 +38,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-use vox_core::atrest::store::SegmentKind;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
@@ -60,17 +67,17 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: vox's stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: write to vox's stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -84,14 +91,19 @@ fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
 
 /// A free loopback UDP port, so a node can come back on the address its peers know.
 fn free_port() -> String {
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    format!("127.0.0.1:{}", s.local_addr().unwrap().port())
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: a free UDP port");
+    format!(
+        "127.0.0.1:{}",
+        s.local_addr().expect("APPARATUS: a free UDP port").port()
+    )
 }
 
 /// [`daemon`] listening on `listen`.
 fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: the daemon's output file");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: the daemon's output file");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", listen])
         .env("VOX_DATA_DIR", dir)
@@ -101,9 +113,10 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(stdin_lines.as_bytes()).unwrap();
+        .expect("APPARATUS: spawn vox daemon");
+    let mut pipe = child.stdin.take().expect("APPARATUS: the daemon's stdin");
+    pipe.write_all(stdin_lines.as_bytes())
+        .expect("APPARATUS: write the daemon's passphrases");
     drop(pipe);
     Daemon(child)
 }
@@ -121,7 +134,7 @@ fn attached(dir: &Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "{tag}'s daemon never answered: {last}\nits stderr: {}",
+        "PRODUCT (staging): {tag}'s daemon never answered: {last}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
     );
 }
@@ -129,7 +142,7 @@ fn attached(dir: &Path, tag: &str) -> String {
 /// The texts `vox room read` returns.
 fn read(dir: &Path, room: &str) -> Vec<String> {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
-    assert!(ok, "vox room read: {err}");
+    assert!(ok, "PRODUCT: vox room read: {err}");
     // `<entry-hash> <author-prefix> <text>`
     out.lines()
         .filter_map(|l| l.splitn(3, ' ').nth(2).map(str::to_owned))
@@ -140,7 +153,8 @@ fn count(texts: &[String], prefix: &str) -> usize {
     texts.iter().filter(|t| t.starts_with(prefix)).count()
 }
 
-/// Poll `vox room read` until `done`, or panic naming what it last saw.
+/// Poll `vox room read` until `done`, or panic naming what it last saw. `what` starts with its
+/// side: `PRODUCT:` for a claim, `PRODUCT (staging):` for the scene.
 fn until(dir: &Path, room: &str, what: &str, secs: u64, done: impl Fn(&[String]) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut last = Vec::new();
@@ -152,14 +166,61 @@ fn until(dir: &Path, room: &str, what: &str, secs: u64, done: impl Fn(&[String])
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "timed out waiting for {what}; `room read` shows {} rows",
+        "{what} — not within {secs} s; `vox room read` shows {} rows: {last:?}",
         last.len()
     );
 }
 
+/// What a stream of `vox status --json` reads on one node showed while it synced: how many reads
+/// listed a room, and the first room listed **without** its retention, keys held, frozen members
+/// or refusals below a checkpoint. A sync session holds a room's lock while it runs; a status read
+/// must answer for the room anyway, never with a `null` (#58).
+struct StatusWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<(usize, Option<String>)>,
+}
+
+impl StatusWatch {
+    fn start(dir: &Path) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (dir, flag) = (dir.to_path_buf(), std::sync::Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            let (mut listed, mut first_null) = (0usize, None);
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) && first_null.is_none() {
+                let (ok, out, _) = vox(&dir, &["status", "--json"], None);
+                let Some(v) = ok
+                    .then(|| serde_json::from_str::<serde_json::Value>(&out).ok())
+                    .flatten()
+                else {
+                    continue;
+                };
+                for room in v["rooms"].as_array().into_iter().flatten() {
+                    listed += 1;
+                    let whole = room["retention"].is_u64()
+                        && room["key_generations"].is_u64()
+                        && room["frozen"].is_array()
+                        && room["refused_below_checkpoint"].is_u64();
+                    if !whole {
+                        first_null = Some(room.to_string());
+                    }
+                }
+            }
+            (listed, first_null)
+        });
+        Self { stop, handle }
+    }
+
+    fn finish(self) -> (usize, Option<String>) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle
+            .join()
+            .expect("APPARATUS: the status watcher thread panicked")
+    }
+}
+
 fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
-    assert!(ok, "vox room post {text:?}: {err}");
+    assert!(ok, "PRODUCT (staging): vox room post {text:?}: {err}");
 }
 
 /// Two identities that trust each other, as fresh profiles.
@@ -167,17 +228,17 @@ fn pair(tmp: &Path) -> (PathBuf, PathBuf) {
     let a = tmp.join("a");
     let b = tmp.join("b");
     for d in [&a, &b] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: a profile directory");
     }
     let mut fps = Vec::new();
     for dir in [&a, &b] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         fps.push(out.trim().to_owned());
     }
     for (dir, fp) in [(&a, &fps[1]), (&b, &fps[0])] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", "peer"], None);
-        assert!(ok, "vox trust add: {err}");
+        assert!(ok, "PRODUCT (staging): vox trust add: {err}");
     }
     (a, b)
 }
@@ -189,20 +250,20 @@ fn room(creator: &Path, joiner: &Path) -> String {
         &["room", "create", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let room = attached(creator, "creator")
         .split_whitespace()
         .next()
-        .expect("a room id")
+        .expect("PRODUCT (staging): a room id in `vox room list`")
         .to_owned();
     let (ok, link, err) = vox(creator, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, _, err) = vox(
         joiner,
         &["room", "join", link.trim(), "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room join: {err}");
+    assert!(ok, "PRODUCT (staging): vox room join: {err}");
     // What a newcomer can read starts when the creator's key reaches it (history per grant is
     // ADR-023 decision 5, not built), so wait for that before anything is counted: the creator
     // posts a probe until the joiner shows one.
@@ -215,41 +276,22 @@ fn room(creator: &Path, joiner: &Path) -> String {
         }
         assert!(
             Instant::now() < deadline,
-            "the joiner never read the creator"
+            "PRODUCT (staging): the joiner never read the creator's probe within 90 s"
         );
     }
     room
-}
-
-/// `(plaintext cache rows, log pages)` in a stopped node's store.
-fn store_counts(dir: &Path) -> (usize, usize) {
-    let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let profile = loop {
-        match vox_core::node::profile::Profile::open(paths.clone()) {
-            Ok(p) => break p,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
-            Err(e) => panic!("the store did not open: {e:?}"),
-        }
-    };
-    let store = profile.store();
-    let cid = store.channels().unwrap()[0];
-    (
-        store
-            .segments(&cid, SegmentKind::PlaintextCache)
-            .unwrap()
-            .len(),
-        store.segments(&cid, SegmentKind::LogDb).unwrap().len(),
-    )
 }
 
 #[test]
 #[ignore = "real vox daemons and real seconds (about two minutes); CI runs it in release"]
 fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let (alice, bob) = pair(tmp.path());
+    // bob's node keeps a week: longer than the room will. A node may keep less than its room,
+    // never more, so bob must still follow the room's 30 s below (PRD-001 R9).
+    std::fs::write(bob.join("cfg").join("retention"), "default 1w\n")
+        .expect("APPARATUS: bob's node retention file");
     let alice_d = daemon(&alice, "alice", &format!("{IDENTITY}\n"));
     attached(&alice, "alice");
     let bob_d = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
@@ -260,26 +302,59 @@ fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
     for i in 1..=40 {
         post(&alice, &room, &format!("old {i}"));
     }
-    until(&bob, &room, "bob to read the 40", 60, |t| {
-        count(t, "old ") == 40
-    });
+    until(
+        &bob,
+        &room,
+        "PRODUCT (staging): bob to read the 40",
+        60,
+        |t| count(t, "old ") == 40,
+    );
     let old_done = Instant::now();
     std::thread::sleep(Duration::from_secs(45));
 
     // ---- 60 more, then 30 s retention: the 40 are 45 s old, the 60 a few seconds ------------
+    // bob's `vox status --json`, read over and over while these 60 sync to him: every read that
+    // lists the room must name its retention and the rest, sessions or not (#58).
+    let watch = StatusWatch::start(&bob);
     for i in 1..=60 {
         post(&alice, &room, &format!("new {i}"));
     }
-    until(&bob, &room, "bob to read all 100", 60, |t| {
-        count(t, "old ") + count(t, "new ") == 100
-    });
+    until(
+        &bob,
+        &room,
+        "PRODUCT (staging): bob to read all 100",
+        60,
+        |t| count(t, "old ") + count(t, "new ") == 100,
+    );
+    let (listed, first_null) = watch.finish();
+    println!(
+        "bob's `vox status --json` while the 60 synced: {listed} room readings; first blank: \
+         {first_null:?}"
+    );
+    assert!(
+        first_null.is_none(),
+        "PRODUCT: bob's `vox status --json`, read while the room synced, listed the room with a \
+         blank (null) retention, keys held, frozen members or refusals: {}",
+        first_null.unwrap_or_default()
+    );
+    assert!(
+        listed > 0,
+        "PRODUCT (staging): bob's `vox status --json` never listed the room while it synced"
+    );
     let (ok, out, err) = vox(&alice, &["room", "retention", &room, "30"], None);
-    assert!(ok, "vox room retention: {err}");
+    assert!(ok, "PRODUCT: the admin's vox room retention 30: {err}");
     println!("{}", out.trim());
     let set_at = Instant::now();
 
     for (dir, who) in [(&alice, "alice"), (&bob, "bob")] {
-        until(dir, &room, &format!("{who} to show only the 60"), 20, |t| {
+        let what = if who == "bob" {
+            "PRODUCT: bob, whose node would keep a week, must still follow the room's 30 s and show \
+             only the 60 newer"
+                .to_owned()
+        } else {
+            format!("PRODUCT: {who} must show only the 60 newer once the room keeps 30 s")
+        };
+        until(dir, &room, &what, 20, |t| {
             count(t, "old ") == 0 && count(t, "new ") == 60 && count(t, "probe") == 0
         });
         println!(
@@ -289,24 +364,10 @@ fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
             old_done.elapsed().as_secs()
         );
     }
-    // Both stopped before the 60 reach 30 s, so the stores are read at exactly this state.
+    // Both stopped before the 60 reach 30 s, so the restart below reopens a room that holds
+    // pruned entries next to live ones.
     drop(alice_d);
     drop(bob_d);
-    let (a_cache, a_log) = store_counts(&alice);
-    let (b_cache, b_log) = store_counts(&bob);
-    println!(
-        "stores {} s after: alice {a_cache} cache rows / {a_log} log pages, bob {b_cache} / {b_log}",
-        set_at.elapsed().as_secs()
-    );
-    assert_eq!(
-        (a_cache, b_cache),
-        (60, 60),
-        "the plaintext cache holds only the 60"
-    );
-    assert!(
-        a_log >= 100 && b_log >= 100,
-        "every skeleton is kept: alice {a_log}, bob {b_log} log pages for 100 messages"
-    );
 
     // ---- a restart still opens the room, and the 60 then go too ------------------------------
     let _alice_d = daemon(&alice, "alice-2", &format!("{IDENTITY}\n{ROOMPASS}\n"));
@@ -314,13 +375,13 @@ fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
     println!("after the restart: `room list` says {listed:?}");
     assert!(
         !listed.contains("[closed]"),
-        "a room holding pruned entries must reopen: {listed:?}\nalice's daemon said: {}",
+        "PRODUCT: a room holding pruned entries must reopen: {listed:?}\nalice's daemon said: {}",
         std::fs::read_to_string(alice.join("daemon-alice-2.err")).unwrap_or_default()
     );
     until(
         &alice,
         &room,
-        "the 60 to expire as well",
+        "PRODUCT: the 60 must expire as well once they pass 30 s",
         60,
         <[String]>::is_empty,
     );
@@ -334,10 +395,11 @@ fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
 #[ignore = "real vox daemons and real minutes (about three); CI runs it in release"]
 fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let (bob, alice) = pair(tmp.path());
     // Alice's node keeps a minute, whatever the room says.
-    std::fs::write(alice.join("cfg").join("retention"), "default 60\n").unwrap();
+    std::fs::write(alice.join("cfg").join("retention"), "default 60\n")
+        .expect("APPARATUS: alice's node retention file");
     // Fixed addresses, so both can be restarted and still find each other below.
     let (bob_at, alice_at) = (free_port(), free_port());
     let bob_d = daemon_on(&bob, "bob", &format!("{IDENTITY}\n"), &bob_at);
@@ -346,7 +408,7 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     attached(&alice, "alice");
     let room = room(&bob, &alice);
     let (ok, out, err) = vox(&bob, &["room", "retention", &room, "1w"], None);
-    assert!(ok, "vox room retention 1w: {err}");
+    assert!(ok, "PRODUCT (staging): vox room retention 1w: {err}");
     println!("{}", out.trim());
 
     // ---- proof 4: the node prunes at its minute; the other member keeps the week ----------
@@ -354,19 +416,30 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
         post(&bob, &room, &format!("early {i}"));
     }
     let posted = Instant::now();
-    until(&alice, &room, "alice to read the 10", 60, |t| {
-        count(t, "early ") == 10
-    });
-    until(&alice, &room, "alice's minute to pass", 90, |t| {
-        count(t, "early ") == 0
-    });
+    until(
+        &alice,
+        &room,
+        "PRODUCT (staging): alice to read the 10",
+        60,
+        |t| count(t, "early ") == 10,
+    );
+    until(
+        &alice,
+        &room,
+        "PRODUCT: alice's node keeps a minute, so the 10 must leave her view at her minute",
+        90,
+        |t| count(t, "early ") == 0,
+    );
     let gone = posted.elapsed().as_secs();
     let bob_keeps = count(&read(&bob, &room), "early ");
     println!("alice shows 0 of 10 after {gone} s; bob (a week) still shows {bob_keeps}");
-    assert!(gone >= 55, "alice pruned at {gone} s, before her minute");
+    assert!(
+        gone >= 55,
+        "PRODUCT: alice pruned at {gone} s, before her minute"
+    );
     assert_eq!(
         bob_keeps, 10,
-        "the room keeps a week: bob must still show all 10"
+        "PRODUCT: the room keeps a week: bob must still show all 10"
     );
 
     // ---- a late arrival of what is already expired here never shows ---------------------
@@ -395,18 +468,25 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     let first = {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let (ok, out, _) = vox(&alice, &["status", "--json"], None);
-            let v: serde_json::Value = if ok {
-                serde_json::from_str(&out).unwrap_or_default()
-            } else {
-                serde_json::Value::Null
-            };
-            if let Some(r) = v["rooms"][0]["retention"].as_u64() {
-                break r;
+            // The room may still be reopening, which lists no room yet; once it is listed it must
+            // name its retention, also while a session holds it (#58).
+            let (ok, out, err) = vox(&alice, &["status", "--json"], None);
+            assert!(ok, "PRODUCT: alice's `vox status --json` failed: {err}");
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| {
+                panic!("PRODUCT: alice's `vox status --json` did not parse ({e}): {out}")
+            });
+            if let Some(room) = v["rooms"].get(0) {
+                break room["retention"].as_u64().unwrap_or_else(|| {
+                    panic!(
+                        "PRODUCT: alice's `vox status --json` lists her reopened room with no \
+                         retention: {room}"
+                    )
+                });
             }
             assert!(
                 Instant::now() < deadline,
-                "alice's status never named a retention"
+                "PRODUCT (staging): alice's `vox status --json` listed no room within 30 s of her \
+                 restart"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -414,14 +494,15 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     println!("alice reopened: the first retention her status reports is {first} s");
     assert_eq!(
         first, 60,
-        "a reopened room must carry the node's own retention from the start, not the room's"
+        "PRODUCT: a reopened room must carry the node's own retention from the start, not the \
+         room's"
     );
     let sock = vox_core::node::paths::Paths::resolve(
         "default",
         Some(alice.as_path()),
         Some(&alice.join("cfg")),
     )
-    .unwrap()
+    .expect("APPARATUS: alice's profile paths")
     .socket_file();
     let rendered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -431,10 +512,16 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
+                .expect("APPARATUS: the subscriber's runtime");
             rt.block_on(async move {
-                let mut client = vox_core::node::ipc::IpcClient::open(&sock).await.unwrap();
-                client.subscribe().await.unwrap();
+                let mut client = vox_core::node::ipc::IpcClient::open(&sock)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("PRODUCT (staging): alice's node refused the subscriber: {e}")
+                    });
+                client.subscribe().await.unwrap_or_else(|e| {
+                    panic!("PRODUCT (staging): alice's node refused the event subscription: {e}")
+                });
                 let _ = ready_tx.send(());
                 while let Ok(Some(frame)) = client.next().await {
                     if let vox_core::node::ipc::Frame::Event(
@@ -449,7 +536,7 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     }
     ready_rx
         .recv_timeout(Duration::from_secs(30))
-        .expect("subscribed to alice's events");
+        .expect("PRODUCT (staging): the subscription to alice's events was not confirmed in 30 s");
     let _bob_d = daemon_on(&bob, "bob-2", &format!("{IDENTITY}\n{ROOMPASS}\n"), &bob_at);
     attached(&bob, "bob");
     post(&bob, &room, "fresh");
@@ -469,14 +556,18 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
         "alice: `fresh` shown {fresh}; the 5 late ones shown at most {late_seen} times over \
          {polls} reads; rows her syncs announced as rendered: {announced} (only `fresh` may be)"
     );
-    assert!(fresh, "alice never caught up with bob's feed");
+    assert!(
+        fresh,
+        "PRODUCT (staging): alice never showed bob's `fresh` within 90 s, so she never caught up \
+         with his feed"
+    );
     assert_eq!(
         late_seen, 0,
-        "a message that arrives already expired must never be shown"
+        "PRODUCT: a message that arrives already expired must never be shown"
     );
     assert_eq!(
         announced, 1,
-        "a message that arrives already expired must never be rendered: alice's syncs rendered \
-         {announced} rows where only `fresh` was live"
+        "PRODUCT: a message that arrives already expired must never be rendered: alice's syncs \
+         rendered {announced} rows where only `fresh` was live"
     );
 }

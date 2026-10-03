@@ -262,6 +262,17 @@ pub struct ChannelDetail {
     pub consented: Vec<Digest32>,
     /// The room's admins, its creator first (V030-08): who may end it.
     pub admins: Vec<Digest32>,
+    /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
+    /// and the node's own (ADR-023 decision 2). What `vox status` reports. Carried in the view
+    /// so a reader never has to take the room's lock, which a sync session holds while it runs.
+    pub retention: u64,
+    /// How many generations of this node's own sender key it still holds here (PRD-001 R14).
+    pub key_generations: usize,
+    /// Authors this node froze here for signing two entries at one position (ADR-008).
+    pub frozen: Vec<Digest32>,
+    /// Entries this node refused here as at or below their author's checkpoint since it opened
+    /// the room (ADR-023 decision 3).
+    pub refused_below_checkpoint: u64,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -750,6 +761,10 @@ pub enum Fault {
     /// The change is the room admin's to make — a holder of the `policy` capability — and
     /// this identity is not one (PRD-001 R7: setting a room's retention).
     NotAdmin,
+    /// A member who is not the room's creator or an admin asked to keep the room's messages
+    /// **longer** than the room does (V030-32). A member may set a shorter retention, which
+    /// governs only their own node; never a longer one.
+    AboveRoomRetention,
     /// The room is over: its creator ended it, or its idle end ran out (V030-08). It takes no
     /// new message.
     RoomEnded,
@@ -880,6 +895,9 @@ impl Fault {
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
             }
+            Fault::AboveRoomRetention => {
+                "a member may keep this room's messages for less time than the room does, never longer\n       ask the room's creator or an admin (`vox room admin list`) to change the room's retention"
+            }
             Fault::NotAdmin => {
                 "only the room's admin may change that, and this identity is not its admin\n       the room's creator and the admins it named are; `vox room admin list` shows who"
             }
@@ -993,6 +1011,7 @@ fault_names!(
     NotOffered,
     NoSuchForward,
     NotAdmin,
+    AboveRoomRetention,
     RoomFromBeforeV030,
     RoomEnded,
     LeftRoom,
@@ -1018,6 +1037,16 @@ pub enum Outcome {
     /// refused (`connecting to the forward: Connection refused`), while the other forward was
     /// never stopped at all.
     Bound(std::net::SocketAddr),
+    /// A member who is not the room's creator or an admin set their **own** node's retention
+    /// for a room, at or below the room's (V030-32): `own` seconds here, while the room keeps
+    /// `room` (`0` = forever). It changes nothing on any other node. `own == room` means the
+    /// member's own line was cleared: their node follows the room's retention again.
+    OwnRetention {
+        /// This node's retention for the room now, seconds.
+        own: u64,
+        /// The room's retention, seconds (`0` = forever).
+        room: u64,
+    },
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -1026,7 +1055,10 @@ impl Outcome {
     /// Whether the command succeeded.
     #[must_use]
     pub fn is_done(self) -> bool {
-        matches!(self, Outcome::Done | Outcome::Bound(_))
+        matches!(
+            self,
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. }
+        )
     }
 }
 
@@ -1035,6 +1067,10 @@ impl std::fmt::Display for Outcome {
         match self {
             Outcome::Done => f.write_str("done"),
             Outcome::Bound(local) => write!(f, "bound at {local}"),
+            Outcome::OwnRetention { own, room } => write!(
+                f,
+                "this node keeps the room's messages for {own} s; the room keeps them for {room} s"
+            ),
             Outcome::Failed(fault) => f.write_str(fault.explain()),
         }
     }
@@ -1193,6 +1229,17 @@ pub enum NodeEvent {
         channel_id: Digest32,
         /// Which record it was, and which board (`our address (board …)`).
         what: String,
+    },
+    /// This node's own `retention` file asks to keep a room's messages for longer than the room
+    /// does (V030-32). A node may keep less than its room, never more, so the room's value is the
+    /// one in force: said once, so its operator knows the file line has no effect.
+    RetentionAboveRoom {
+        /// The room.
+        channel_id: Digest32,
+        /// What the node's file asks for, seconds.
+        node: u64,
+        /// What the room keeps, seconds.
+        room: u64,
     },
     /// What happened to a connection to `peer`, said so a failure that recurs names itself (#229,
     /// after #232's CI reds): a newcomer that lost the one-connection-per-peer tie-break, a

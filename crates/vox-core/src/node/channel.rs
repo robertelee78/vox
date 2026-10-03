@@ -3545,6 +3545,15 @@ impl ChannelState {
         self.evaluator.policy().ttl
     }
 
+    /// Whether `member` sets this room's retention: its creator, or an admin it named — a holder
+    /// of the `policy` capability (V030-32). Anyone else sets only their own node's.
+    #[must_use]
+    pub fn governs_retention(&self, member: &Digest32) -> bool {
+        self.evaluator
+            .grants(member, &crate::governance::capability::Capability::Policy)
+            .is_granted()
+    }
+
     /// What this node's log has caught in the room: the authors it froze for a fork, and how
     /// many entries it refused as at or below their author's checkpoint (ADR-008, ADR-023
     /// decision 3). What `vox status` reports.
@@ -3720,9 +3729,7 @@ impl ChannelState {
             signer,
             &self.channel_id,
             self.epoch,
-            None,
-            Some(ttl),
-            None,
+            ttl,
         )?;
         self.append_governance(profile, &update.to_wire(), now_secs)?;
         Ok(())
@@ -5499,16 +5506,14 @@ impl ChannelState {
         self.append_governance(profile, &cert.to_wire(), now_secs)
     }
 
-    /// What a delegated admin holds (#319): ending the room, its policy (retention) and passphrase
-    /// rotation — **not** `delegate`. With `delegate` (which `admin` implies), an admin could name
-    /// further admins, every node would honour them, and "only the creator names admins" would be
-    /// the client's word alone.
+    /// What a delegated admin holds (#319): the room's policy, which is its retention — the one
+    /// thing room governance sets (V030-32) — and ending the room. **Not** `admin`: with `admin`,
+    /// an admin could name or revoke further admins, every node would honour them, and "only the
+    /// creator names admins" would be the client's word alone.
     #[must_use]
     pub fn delegated_admin_caps() -> crate::governance::capability::CapabilitySet {
-        use crate::governance::capability::Capability;
         crate::governance::capability::CapabilitySet::from_iter_caps([
-            Capability::Policy,
-            Capability::PassphraseRotate,
+            crate::governance::capability::Capability::Policy,
         ])
     }
 
