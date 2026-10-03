@@ -2099,9 +2099,10 @@ pub fn run() -> ExitCode {
         // **Ask the running node when there is one.** These three used to spawn a node of
         // their own, which redb refuses while a `vox daemon` holds the profile — so the
         // one command a person cannot skip, deciding who may read them, was unavailable
-        // exactly when they were setting up agent comms. Over the socket the request
-        // carries the identity passphrase and the node checks it, so an agent session
-        // that can reach the socket still cannot edit the keyring (ADR-020 §7).
+        // exactly when they were setting up agent comms. Over the socket the node decides:
+        // a read needs no passphrase, and a change needs it only once 30 minutes have
+        // passed since it was last entered, when this asks for it (V210-159). Whoever runs
+        // as this user is this user; the socket's file mode is the boundary.
         Cmd::Trust(sub) if trust_over_socket(&sub) => run_trust_over_socket(sub),
         // With no node running the keyring is read from the store, sealed under the identity, so
         // this one read needs the passphrase. Said as that, with the way to read it without one.

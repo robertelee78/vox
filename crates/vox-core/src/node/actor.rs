@@ -4034,7 +4034,10 @@ impl Node {
                 None => Outcome::Failed(Fault::NoIdentity),
                 Some(profile) => match profile.verify_passphrase(&passphrase) {
                     Ok(()) => {
-                        self.note_passphrase_entered();
+                        // An entry of it on a locked node starts no window: the unlock does.
+                        if profile.is_unlocked() {
+                            self.note_passphrase_entered();
+                        }
                         Outcome::Done
                     }
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
@@ -4076,8 +4079,11 @@ impl Node {
                     self.revoke(&channel_id, target).await
                 }
             }
+            // Only an unlocked node asks for the passphrase again. One with no identity or a
+            // locked one falls through, and says that: a passphrase would not make the change.
             NodeCommand::Trust { .. } | NodeCommand::Untrust { .. }
-                if !self.passphrase_entered_recently() =>
+                if self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                    && !self.passphrase_entered_recently() =>
             {
                 Outcome::Failed(Fault::PassphraseNeeded)
             }
@@ -10472,10 +10478,15 @@ impl Node {
             return;
         };
         let verifier = profile.passphrase_verifier();
+        // What the window stood at when the check began. A right passphrase restarts it only if
+        // nothing changed it meanwhile: a lock sets it to zero, and a check passing after that
+        // must not start a window on a locked node. While locked it is already zero, so nothing
+        // is recorded then either.
         let (entered_at, clock) = (
             Arc::clone(&self.passphrase_entered_at),
             Arc::clone(&self.clock),
         );
+        let entered_before = entered_at.load(std::sync::atomic::Ordering::Relaxed);
         let slots = Arc::clone(&self.verify_slots);
         let secret_work = Arc::clone(&self.secret_work);
         // Waiting for a slot happens here, off the actor; the check itself on a blocking
@@ -10495,7 +10506,14 @@ impl Node {
                 let _slot = slot;
                 match verifier.verify(&passphrase) {
                     Ok(()) => {
-                        entered_at.store(clock(), std::sync::atomic::Ordering::Relaxed);
+                        if entered_before != 0 {
+                            let _ = entered_at.compare_exchange(
+                                entered_before,
+                                clock().max(1),
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         Outcome::Done
                     }
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
