@@ -113,11 +113,7 @@ impl NatWorld {
         for d in [&anchor_dir, &host_dir, &guest_dir] {
             std::fs::create_dir_all(d.join("cfg")).unwrap();
         }
-        let anchor_port = UdpSocket::bind("[::]:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let anchor_port = free_in_both_families();
         let nats = TwoNats::start(kind, anchor_port);
         let advertise = format!("{},{}", nats.anchor_for_host, nats.anchor_for_guest);
         let mut anchor = VoxProc::spawn_env(
@@ -239,6 +235,27 @@ impl NatWorld {
     fn hostname(&self) -> String {
         format!("{}.vox", self.room)
     }
+}
+
+/// A UDP port for the anchor's `[::]:P` that no other program holds in either family.
+///
+/// On macOS a `[::]:0` bind is often handed a port another program already holds on IPv4, and
+/// the anchor's explicit `[::]:P` is then refused as in use. That is this test's choice of port,
+/// not the product: seen once under load as "PRODUCT: anchor exited … cannot listen on
+/// [::]:58911: another program already holds it".
+fn free_in_both_families() -> u16 {
+    for _ in 0..64 {
+        let port = UdpSocket::bind("[::]:0")
+            .and_then(|s| s.local_addr())
+            .unwrap_or_else(|e| panic!("APPARATUS: bind a UDP socket on [::]:0: {e}"))
+            .port();
+        if UdpSocket::bind(("127.0.0.1", port)).is_ok()
+            && UdpSocket::bind(("0.0.0.0", port)).is_ok()
+        {
+            return port;
+        }
+    }
+    panic!("APPARATUS: no UDP port was free in both families in 64 tries");
 }
 
 fn interrupt(p: &mut VoxProc) {
