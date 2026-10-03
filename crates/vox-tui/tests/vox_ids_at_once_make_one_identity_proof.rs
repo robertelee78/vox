@@ -87,21 +87,29 @@ fn leftovers(dir: &Path) -> Vec<String> {
 #[ignore = "real binaries and production Argon2id; the release gate runs it"]
 fn vox_ids_started_at_once_make_one_identity_and_report_only_it() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temporary directory");
     let (mut succeeded, mut concurrent, mut busy, mut unreadable) =
         (0usize, 0usize, 0usize, 0usize);
     let (mut wrong, mut unnamed, mut left_behind, mut none_made) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for trial in 1..=TRIALS {
         let data: PathBuf = tmp.path().join(format!("p{trial}"));
-        std::fs::create_dir_all(data.join("cfg")).unwrap();
+        std::fs::create_dir_all(data.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not make {}: {e}", data.display()));
         let mut runs: Vec<Proc> = (0..AT_ONCE)
-            .map(|_| Proc(Some(vox_id(&data).spawn().expect("spawn vox id"))))
+            .map(|_| {
+                Proc(Some(vox_id(&data).spawn().unwrap_or_else(|e| {
+                    panic!("APPARATUS: could not spawn {VOX} id: {e}")
+                })))
+            })
             .collect();
         let outs: Vec<(bool, String, String)> = runs
             .iter_mut()
             .map(|p| {
-                let out = p.0.take().unwrap().wait_with_output().expect("wait vox id");
+                let child = p.0.take().expect("APPARATUS: a run was reaped twice");
+                let out = child
+                    .wait_with_output()
+                    .unwrap_or_else(|e| panic!("APPARATUS: could not wait for a vox id: {e}"));
                 (
                     out.status.success(),
                     String::from_utf8_lossy(&out.stdout).trim().to_owned(),
@@ -109,7 +117,9 @@ fn vox_ids_started_at_once_make_one_identity_and_report_only_it() {
                 )
             })
             .collect();
-        let later = vox_id(&data).output().expect("run vox id");
+        let later = vox_id(&data)
+            .output()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not run the later vox id: {e}"));
         let held = String::from_utf8_lossy(&later.stdout).trim().to_owned();
         let left = leftovers(&data.join("default"));
         let oks = outs.iter().filter(|o| o.0).count();
@@ -166,18 +176,18 @@ fn vox_ids_started_at_once_make_one_identity_and_report_only_it() {
     // The claim first: a run that says "this is you" about a key the profile does not hold.
     assert!(
         wrong.is_empty(),
-        "`vox id` reported identities the profile does not hold: {wrong:#?}"
+        "PRODUCT: `vox id` reported identities the profile does not hold: {wrong:#?}"
     );
     assert!(
         none_made.is_empty(),
-        "no `vox id` of {AT_ONCE} made the profile's identity: {none_made:#?}"
+        "PRODUCT: no `vox id` of {AT_ONCE} made the profile's identity: {none_made:#?}"
     );
     assert!(
         left_behind.is_empty(),
-        "files left behind in the profile: {left_behind:#?}"
+        "PRODUCT: `vox id` left files behind in the profile: {left_behind:#?}"
     );
     assert!(
         unnamed.is_empty(),
-        "a failed `vox id` did not name the concurrent creation: {unnamed:#?}"
+        "PRODUCT: a failed `vox id` did not name the concurrent creation: {unnamed:#?}"
     );
 }

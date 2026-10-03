@@ -130,33 +130,31 @@ fn whatever_holds_a_profile_answers_for_it() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT PROVE: the guest could not join ({took:?}).\n{out}\n{err}"
+        "PRODUCT (staging): the guest could not join ({took:?}).\n{out}\n{err}"
     );
     w.forward();
     let room: String = w.room.chars().take(12).collect();
     // Someone to trust: a third profile's fingerprint, as `vox id` prints it.
     let third = w.tmp.path().join("third");
-    std::fs::create_dir_all(third.join("cfg")).unwrap();
+    std::fs::create_dir_all(third.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make {}: {e}", third.display()));
     let (ok, stranger, err) = vox_once(&third, &args(&["id"]));
-    assert!(ok, "CANNOT PROVE: vox id (third): {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox id` for a third profile failed: {err}"
+    );
     let stranger = stranger.trim().to_owned();
 
     let mut failures = Vec::new();
-    let mut checked = 0usize;
     for (holder, dir) in [
         ("vox serve", w.host_dir.clone()),
         ("vox forward", w.guest_dir.clone()),
     ] {
         check_holder(holder, &dir, &room, &stranger, &mut failures);
-        checked += 1;
     }
-    eprintln!(
-        "[proof] {checked} holders checked, {} failures",
-        failures.len()
-    );
-    assert_eq!(checked, 2);
+    eprintln!("[proof] 2 holders checked, {} failures", failures.len());
     assert!(
         failures.is_empty(),
-        "a profile's holder does not answer for it: {failures:#?}"
+        "PRODUCT: a profile's holder does not answer for it: {failures:#?}"
     );
 }
