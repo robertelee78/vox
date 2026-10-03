@@ -1,41 +1,30 @@
 //! Policy-update entries (ADR-007 §"Per-type body schemas", tag `0x0006`, domain
 //! `vox/policy-rotation/v1`).
 //!
-//! A policy-update, issued by a holder of the `policy` capability
-//! ([`crate::governance::capability::Capability::Policy`]), changes the channel's
-//! **history-mode and/or TTL** from its causal position forward. Body:
-//! `{ history_mode?, ttl? }` — both optional.
+//! A policy-update, issued by a holder of the `policy` capability — the room's creator or an
+//! admin (#319) — changes the room's **retention** (TTL) from its causal position forward.
 //!
-//! A policy-update carries only history mode and TTL. (It once had to be kept from changing
-//! the ADR-009 deniability axis; deniable rooms were removed, PRD-001 R43.)
+//! **Retention is the only governance a room has** (V030-32, the decider, 2026-10-02: "creator or
+//! admin"). The history-mode and suite-floor updates, which no command ever wrote, are removed:
+//! the wire layout keeps their presence flags, always written as absent, and an update that
+//! carries either is refused. Both stay as the genesis set them.
 //!
-//! The same domain label (`vox/policy-rotation/v1`) and tag (`0x0006`) cover both
-//! a policy-update and a passphrase-rotation entry (the M0 wire registry collapses
-//! them into one `PolicyRotation` tag); the two are distinguished by a leading
-//! *kind* discriminant in the body so neither can be reinterpreted as the other.
-//! The passphrase-rotation (epoch-bump) entry lives in
-//! [`crate::governance::rotation`].
+//! The tag (`0x0006`) and domain label are shared with the passphrase-rotation kind (body kind 2),
+//! which is removed too and reserved: a body of that kind is refused as the wrong kind.
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
-use crate::governance::genesis::HistoryMode;
 use crate::hash::{Digest32, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
-use crate::suite::suite_by_id;
 use crate::wire::{frame, parse_frame, signing_input, StructTag};
 
-/// Body kind discriminant distinguishing a policy-update from a
-/// passphrase-rotation under the shared `PolicyRotation` tag (`0x0006`).
+/// Body kind discriminant of a policy-update under the `PolicyRotation` tag (`0x0006`). Kind 2,
+/// the passphrase rotation, is reserved: never written, refused on decode (V030-32).
 pub(crate) const KIND_POLICY_UPDATE: u64 = 1;
-/// Body kind discriminant for a passphrase-rotation (epoch bump),
-/// [`crate::governance::rotation`].
-pub(crate) const KIND_PASSPHRASE_ROTATION: u64 = 2;
 
 /// The unsigned policy-update body (every field except the signature).
 ///
-/// Both `history_mode` and `ttl` are optional: `None` means "unchanged". A
-/// policy-update that changes *nothing* (both `None`) is structurally valid but
-/// inert; callers normally set at least one.
+/// `ttl` is optional: `None` means "unchanged", which is structurally valid but inert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyUpdateBody {
     /// The channel this update is valid in (ADR-005).
@@ -44,56 +33,39 @@ pub struct PolicyUpdateBody {
     pub epoch: u64,
     /// The issuing `policy`-holder's identity fingerprint.
     pub issuer_id: Digest32,
-    /// New history mode, or `None` to leave it unchanged.
-    pub history_mode: Option<HistoryMode>,
-    /// New payload TTL in seconds (`0` = never), or `None` to leave unchanged.
+    /// New retention in seconds (`0` = forever), or `None` to leave it unchanged.
     pub ttl: Option<u64>,
-    /// New minimum ciphersuite (ADR-003 floor), or `None` to leave unchanged.
-    /// The evaluator applies it **raise-only**: an update naming a suite ranked
-    /// below the current floor is ignored, so the floor never silently downgrades.
-    pub min_suite: Option<u16>,
+}
+
+/// The elements a body or wire array holds: kind, channel, epoch, issuer, the history flag
+/// (always 0), the ttl flag, the ttl if present, and the suite flag (always 0).
+fn arity_for(ttl_present: bool) -> usize {
+    7 + usize::from(ttl_present)
 }
 
 impl PolicyUpdateBody {
-    /// Canonical-CBOR body
-    /// `[kind, channelID, epoch, issuer_id, history_present, history_mode?,
-    ///   ttl_present, ttl?, suite_present, min_suite?]` where
-    /// `kind == KIND_POLICY_UPDATE`. An absent optional field omits its value
-    /// element (presence flag only), so two implementations encode the identical
-    /// bytes for the identical logical update.
+    /// Canonical-CBOR body `[kind, channelID, epoch, issuer_id, 0, ttl_present, ttl?, 0]`, where
+    /// `kind == KIND_POLICY_UPDATE` and the two zeros are the removed history-mode and suite
+    /// presence flags.
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
-        let hist_present = self.history_mode.is_some();
-        let ttl_present = self.ttl.is_some();
-        let suite_present = self.min_suite.is_some();
-        // Fixed leading fields: kind, channel, epoch, issuer, hist_present.
-        // Then optional history value, ttl_present, optional ttl value,
-        // suite_present, optional min_suite value.
-        let arity = 5
-            + usize::from(hist_present)
-            + 1
-            + usize::from(ttl_present)
-            + 1
-            + usize::from(suite_present);
         let mut e = Encoder::new();
-        e.array(arity)
-            .uint(KIND_POLICY_UPDATE)
+        e.array(arity_for(self.ttl.is_some()));
+        self.encode_fields(&mut e);
+        e.finish()
+    }
+
+    fn encode_fields(&self, e: &mut Encoder) {
+        e.uint(KIND_POLICY_UPDATE)
             .bytes(&self.channel_id)
             .uint(self.epoch)
             .bytes(&self.issuer_id)
-            .uint(u64::from(hist_present));
-        if let Some(hm) = self.history_mode {
-            e.uint(hm.as_u64());
-        }
-        e.uint(u64::from(ttl_present));
+            .uint(0)
+            .uint(u64::from(self.ttl.is_some()));
         if let Some(ttl) = self.ttl {
             e.uint(ttl);
         }
-        e.uint(u64::from(suite_present));
-        if let Some(id) = self.min_suite {
-            e.uint(u64::from(id));
-        }
-        e.finish()
+        e.uint(0);
     }
 
     /// The signing input: `vox/policy-rotation/v1 ‖ canonical_body` (ADR-008).
@@ -102,68 +74,32 @@ impl PolicyUpdateBody {
         signing_input(StructTag::PolicyRotation, &self.canonical_body())
     }
 
-    /// Decode a policy-update body. Rejects a wrong kind discriminant (so a
-    /// passphrase-rotation body cannot be parsed as a policy-update) and any
-    /// presence/arity inconsistency. There is no `deniability_mode` element to
-    /// decode — the genesis-immutability of that axis is enforced by the schema.
-    fn from_canonical_body(body: &[u8]) -> Result<Self> {
-        let mut d = Decoder::new(body);
-        let arity = d.array()?;
-        // The kind discriminant is checked first so a passphrase-rotation body
-        // (which shares tag 0x0006) is reported as the wrong kind, not as a
-        // wrong arity.
-        let kind = d.uint()?;
-        if kind != KIND_POLICY_UPDATE {
+    /// Decode the fields after the array header from `d`, which is positioned at the kind. A
+    /// wrong kind (the reserved rotation), a history-mode or suite-floor update, and any
+    /// presence or arity inconsistency are refused.
+    fn decode_fields(d: &mut Decoder<'_>, arity: usize) -> Result<Self> {
+        if d.uint()? != KIND_POLICY_UPDATE {
             return Err(Error::MalformedGovernance("policy-update wrong body kind"));
         }
-        // Min arity: kind, channel, epoch, issuer, hist_present, ttl_present,
-        // suite_present = 7; max 10 with all three values present.
-        if !(7..=10).contains(&arity) {
-            return Err(Error::MalformedGovernance("policy-update arity"));
-        }
-        let channel_id = take_digest(&mut d)?;
+        let channel_id = take_digest(d)?;
         let epoch = d.uint()?;
-        let issuer_id = take_digest(&mut d)?;
-        let hist_present = match d.uint()? {
-            0 => false,
-            1 => true,
-            _ => return Err(Error::MalformedGovernance("policy-update hist_present")),
-        };
-        let history_mode = if hist_present {
-            Some(HistoryMode::from_u64(d.uint()?)?)
-        } else {
-            None
-        };
-        let ttl_present = match d.uint()? {
-            0 => false,
-            1 => true,
+        let issuer_id = take_digest(d)?;
+        if d.uint()? != 0 {
+            return Err(Error::MalformedGovernance(
+                "a policy update may change only the retention (history mode was removed)",
+            ));
+        }
+        let ttl = match d.uint()? {
+            0 => None,
+            1 => Some(d.uint()?),
             _ => return Err(Error::MalformedGovernance("policy-update ttl_present")),
         };
-        let ttl = if ttl_present { Some(d.uint()?) } else { None };
-        let suite_present = match d.uint()? {
-            0 => false,
-            1 => true,
-            _ => return Err(Error::MalformedGovernance("policy-update suite_present")),
-        };
-        let min_suite = if suite_present {
-            let id = u16::try_from(d.uint()?)
-                .map_err(|_| Error::MalformedGovernance("policy-update min_suite range"))?;
-            // Must name a registered suite; an unknown id is malformed, not strong.
-            suite_by_id(id)?;
-            Some(id)
-        } else {
-            None
-        };
-        d.finish()?;
-
-        // Arity must exactly match the presence flags (no extra/missing elements).
-        let expected = 5
-            + usize::from(hist_present)
-            + 1
-            + usize::from(ttl_present)
-            + 1
-            + usize::from(suite_present);
-        if arity != expected {
+        if d.uint()? != 0 {
+            return Err(Error::MalformedGovernance(
+                "a policy update may change only the retention (the suite floor is the genesis's)",
+            ));
+        }
+        if arity != arity_for(ttl.is_some()) {
             return Err(Error::MalformedGovernance(
                 "policy-update presence/arity mismatch",
             ));
@@ -172,9 +108,7 @@ impl PolicyUpdateBody {
             channel_id,
             epoch,
             issuer_id,
-            history_mode,
             ttl,
-            min_suite,
         })
     }
 }
@@ -189,28 +123,19 @@ pub struct PolicyUpdate {
 }
 
 impl PolicyUpdate {
-    /// Build and root-sign a policy-update. At least one of
-    /// `history_mode`/`ttl`/`min_suite` is normally set; all `None` is permitted
-    /// but inert. (`deniability_mode` cannot be expressed — the struct has no such
-    /// field, ADR-007.) A `min_suite` must name a registered suite.
+    /// Build and root-sign a policy-update setting the room's retention to `ttl` seconds
+    /// (`0` = forever).
     pub fn build(
         issuer_root: &dyn RootSigner,
         channel_id: &Digest32,
         epoch: u64,
-        history_mode: Option<HistoryMode>,
-        ttl: Option<u64>,
-        min_suite: Option<u16>,
+        ttl: u64,
     ) -> Result<Self> {
-        if let Some(id) = min_suite {
-            suite_by_id(id)?;
-        }
         let body = PolicyUpdateBody {
             channel_id: *channel_id,
             epoch,
             issuer_id: issuer_root.fingerprint(),
-            history_mode,
-            ttl,
-            min_suite,
+            ttl: Some(ttl),
         };
         let signature = issuer_root.sign(&body.signing_input())?;
         Ok(Self { body, signature })
@@ -220,42 +145,14 @@ impl PolicyUpdate {
     /// composite signature appended as the final element.
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
-        let b = &self.body;
-        let hist_present = b.history_mode.is_some();
-        let ttl_present = b.ttl.is_some();
-        let suite_present = b.min_suite.is_some();
-        let signed_arity = 5
-            + usize::from(hist_present)
-            + 1
-            + usize::from(ttl_present)
-            + 1
-            + usize::from(suite_present);
         let mut e = Encoder::new();
-        e.array(signed_arity + 1)
-            .uint(KIND_POLICY_UPDATE)
-            .bytes(&b.channel_id)
-            .uint(b.epoch)
-            .bytes(&b.issuer_id)
-            .uint(u64::from(hist_present));
-        if let Some(hm) = b.history_mode {
-            e.uint(hm.as_u64());
-        }
-        e.uint(u64::from(ttl_present));
-        if let Some(ttl) = b.ttl {
-            e.uint(ttl);
-        }
-        e.uint(u64::from(suite_present));
-        if let Some(id) = b.min_suite {
-            e.uint(u64::from(id));
-        }
+        e.array(arity_for(self.body.ttl.is_some()) + 1);
+        self.body.encode_fields(&mut e);
         e.bytes(&self.signature.to_bytes());
         frame(StructTag::PolicyRotation, &e.finish())
     }
 
     /// Parse a framed policy-update (does NOT verify — call [`PolicyUpdate::verify`]).
-    ///
-    /// Rejects a frame whose body kind is a passphrase-rotation (wrong kind),
-    /// keeping the two `0x0006` structs unambiguous.
     pub fn from_wire(bytes: &[u8]) -> Result<Self> {
         let parsed = parse_frame(bytes)?;
         if parsed.tag != StructTag::PolicyRotation {
@@ -263,65 +160,12 @@ impl PolicyUpdate {
         }
         let mut d = Decoder::new(parsed.body);
         let wire_arity = d.array()?;
-        if !(8..=11).contains(&wire_arity) {
+        if !(8..=9).contains(&wire_arity) {
             return Err(Error::MalformedGovernance("policy-update wire arity"));
         }
-        // Read the leading kind to fail fast on a passphrase-rotation body.
-        let kind = d.uint()?;
-        if kind != KIND_POLICY_UPDATE {
-            return Err(Error::MalformedGovernance("policy-update wrong body kind"));
-        }
-        let channel_id = d.bytes()?.to_vec();
-        let epoch = d.uint()?;
-        let issuer_id = d.bytes()?.to_vec();
-        let hist_present = d.uint()?;
-        let history_mode = if hist_present == 1 {
-            Some(d.uint()?)
-        } else {
-            None
-        };
-        let ttl_present = d.uint()?;
-        let ttl = if ttl_present == 1 {
-            Some(d.uint()?)
-        } else {
-            None
-        };
-        let suite_present = d.uint()?;
-        let min_suite = if suite_present == 1 {
-            Some(d.uint()?)
-        } else {
-            None
-        };
-        let sig_bytes = d.bytes()?.to_vec();
+        let body = PolicyUpdateBody::decode_fields(&mut d, wire_arity - 1)?;
+        let signature = parse_sig(d.bytes()?)?;
         d.finish()?;
-
-        // Rebuild the signed body bytes and decode strictly.
-        let mut be = Encoder::new();
-        let signed_arity = 5
-            + usize::from(hist_present == 1)
-            + 1
-            + usize::from(ttl_present == 1)
-            + 1
-            + usize::from(suite_present == 1);
-        be.array(signed_arity)
-            .uint(KIND_POLICY_UPDATE)
-            .bytes(&channel_id)
-            .uint(epoch)
-            .bytes(&issuer_id)
-            .uint(hist_present);
-        if let Some(hm) = history_mode {
-            be.uint(hm);
-        }
-        be.uint(ttl_present);
-        if let Some(t) = ttl {
-            be.uint(t);
-        }
-        be.uint(suite_present);
-        if let Some(id) = min_suite {
-            be.uint(id);
-        }
-        let body = PolicyUpdateBody::from_canonical_body(&be.finish())?;
-        let signature = parse_sig(&sig_bytes)?;
         Ok(Self { body, signature })
     }
 

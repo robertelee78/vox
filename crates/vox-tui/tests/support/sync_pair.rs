@@ -576,7 +576,7 @@ impl Reader {
         match self.rt.block_on(self.client.rooms()) {
             Ok(Frame::Rooms { rooms }) => rooms
                 .iter()
-                .map(|(id, _, _)| *id)
+                .map(|(id, _, _, _)| *id)
                 .find(|id| vox_core::node::link::b32_encode(id).starts_with(prefix))
                 .unwrap_or_else(|| panic!("PRODUCT: room {prefix} is not on {}'s node", self.who)),
             Ok(other) => panic!(

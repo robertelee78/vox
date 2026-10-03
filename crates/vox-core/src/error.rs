@@ -427,6 +427,15 @@ pub enum Error {
     #[error("a member is busy answering other joins")]
     JoinResponderBusy,
 
+    /// The member that answered said the room has ended (V030-08): it takes nobody in. The
+    /// passphrase was never checked.
+    #[error("the room has ended")]
+    JoinRoomEnded,
+
+    /// The member that answered has left the room (V030-08), so it answers no join for it.
+    #[error("the member that answered has left the room")]
+    JoinResponderLeft,
+
     /// This node ended a join it was answering, to give its slot to a joiner from a lighter source
     /// (V210-92): every slot was held and this join's source was the heaviest. Its joiner is told
     /// the member is busy, as at the cap.

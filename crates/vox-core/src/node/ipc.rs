@@ -11,8 +11,8 @@
 //! ## What this is not
 //!
 //! It is deliberately **not** a mirror of [`NodeCommand`](super::api::NodeCommand). That enum carries
-//! [`Secret`](super::api::Secret) — passphrases — and reaches `CreateIdentity`,
-//! `Revoke` and `PassphraseRotate`. An agent session runs model-authored code and
+//! [`Secret`](super::api::Secret) — passphrases — and reaches `CreateIdentity` and
+//! `Revoke`. An agent session runs model-authored code and
 //! has no business issuing any of those, so the socket speaks its own narrow
 //! vocabulary and this milestone carries **events only**. Requests that let a
 //! client *act* arrive with the agent-comms protocol (ADR-020 §4), scoped to what
@@ -220,6 +220,8 @@ const T_SYNC_FAILED: u64 = 1720;
 /// [`NodeEvent::RoomNotRemembered`] (#208). Additive, and far from the other additive tags so a
 /// concurrently-developed branch that takes 1721 does not collide with it.
 const T_ROOM_NOT_REMEMBERED: u64 = 2081;
+/// `NodeEvent::RetentionAboveRoom` (V030-32): a node file value above the room's, ignored.
+const T_RETENTION_ABOVE_ROOM: u64 = 3803;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
@@ -227,6 +229,8 @@ const T_MEMBERS: u64 = 6;
 const T_ROOMS: u64 = 7;
 
 const T_BOUND: u64 = 8;
+/// `Frame::OwnRetention` (V030-32).
+const T_OWN_RETENTION: u64 = 3802;
 const T_LINK: u64 = 9;
 /// Protocol 5. 8 and 9 were taken (`T_BOUND`, `T_LINK`), which a first attempt at this
 /// collided with — the decoder then read a trusted list as a bound address and said
@@ -308,6 +312,17 @@ const T_SERVICES_REQ: u64 = 18;
 const T_AGREE: u64 = 123;
 /// [`Frame::Agreement`] (V210-168).
 const T_AGREEMENT: u64 = 1201;
+// A room's lifecycle (V030-08): forget, end, admins and the creator's idle end; a leave is
+// `T_LEAVE`. Not gated on the identity passphrase: tearing down a room the work is done in is
+// an agent's call to make.
+const T_FORGET: u64 = 31;
+const T_END: u64 = 32;
+const T_IDLE_END: u64 = 33;
+const T_SET_ADMIN: u64 = 34;
+const T_ADMINS: u64 = 35;
+/// `NodeEvent::RoomQuiet` and `NodeEvent::RoomForgotten` (V030-08). Additive.
+const T_ROOM_QUIET: u64 = 2440;
+const T_ROOM_FORGOTTEN: u64 = 2441;
 
 /// What a client sends.
 ///
@@ -434,8 +449,8 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
-    /// Leave a room (V210-164): the node says so in the room, and removes it once another
-    /// member has that. Answers [`Frame::Ok`] once it is removed.
+    /// Leave a room (V210-164, V030-08): append this identity's signed leave. The room stays here,
+    /// quiet and readable, until it is forgotten; the leave is passed on in the background.
     Leave {
         /// The room.
         channel_id: Digest32,
@@ -463,6 +478,37 @@ pub enum Request {
         ttl: u64,
         /// The identity passphrase, proving this is the operator and not an agent.
         identity_passphrase: String,
+    },
+    /// Forget a room (V030-08): answered once everything this node held of it is deleted.
+    Forget {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// End a room for everyone (V030-08); its creator only.
+    End {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Make a member an admin of a room, or take it back (V030-08); its creator only.
+    SetAdmin {
+        /// The room.
+        channel_id: Digest32,
+        /// The member.
+        member: Digest32,
+        /// `true` to add, `false` to remove.
+        admin: bool,
+    },
+    /// A room's admins, its creator first (V030-08): answered as [`Frame::Members`].
+    Admins {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Choose a room's idle end (V030-08); its creator only.
+    IdleEnd {
+        /// The room.
+        channel_id: Digest32,
+        /// Seconds with nothing said before it ends.
+        idle_secs: u64,
     },
     /// Remove an identity from the trust keyring. Needs the passphrase as [`Request::Trust`] does.
     Untrust {
@@ -694,6 +740,35 @@ impl Request {
             }
             Request::Leave { channel_id } => {
                 e.array(2).uint(T_LEAVE).bytes(channel_id);
+            }
+            Request::SetAdmin {
+                channel_id,
+                member,
+                admin,
+            } => {
+                e.array(4)
+                    .uint(T_SET_ADMIN)
+                    .bytes(channel_id)
+                    .bytes(member)
+                    .uint(u64::from(*admin));
+            }
+            Request::Admins { channel_id } => {
+                e.array(2).uint(T_ADMINS).bytes(channel_id);
+            }
+            Request::Forget { channel_id } => {
+                e.array(2).uint(T_FORGET).bytes(channel_id);
+            }
+            Request::End { channel_id } => {
+                e.array(2).uint(T_END).bytes(channel_id);
+            }
+            Request::IdleEnd {
+                channel_id,
+                idle_secs,
+            } => {
+                e.array(3)
+                    .uint(T_IDLE_END)
+                    .bytes(channel_id)
+                    .uint(*idle_secs);
             }
             Request::Trust {
                 target,
@@ -1052,11 +1127,43 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
             }
-            (T_LEAVE, 2) => {
+            (T_LEAVE | T_FORGET | T_END, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Leave { channel_id })
+                Ok(match tag {
+                    T_LEAVE => Request::Leave { channel_id },
+                    T_FORGET => Request::Forget { channel_id },
+                    _ => Request::End { channel_id },
+                })
+            }
+            (T_SET_ADMIN, 4) => {
+                let channel_id = digest(&mut d)?;
+                let member = digest(&mut d)?;
+                let admin = d.uint().map_err(|_| Error::MalformedIpc("ipc admin"))? != 0;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SetAdmin {
+                    channel_id,
+                    member,
+                    admin,
+                })
+            }
+            (T_ADMINS, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Admins { channel_id })
+            }
+            (T_IDLE_END, 3) => {
+                let channel_id = digest(&mut d)?;
+                let idle_secs = d.uint().map_err(|_| Error::MalformedIpc("ipc idle end"))?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::IdleEnd {
+                    channel_id,
+                    idle_secs,
+                })
             }
             _ => Err(Error::UnknownIpcRequest),
         }
@@ -1128,6 +1235,16 @@ pub enum Frame {
         /// Member fingerprints, in the order the node holds them.
         members: Vec<Digest32>,
     },
+    /// The answer to a [`Request::SetRetention`] from a member who is not the room's creator or
+    /// an admin (V030-32): it set **its own node's** retention for the room, `own` seconds, while
+    /// the room keeps `room` (`0` = forever). Its own frame, so the CLI says plainly that nothing
+    /// changed for anyone else.
+    OwnRetention {
+        /// This node's retention for the room now, seconds.
+        own: u64,
+        /// The room's retention, seconds.
+        room: u64,
+    },
     /// The address a [`Request::Forward`] actually bound.
     ///
     /// Its own frame rather than a reused `Ok`, because a forward asked for port
@@ -1151,8 +1268,9 @@ pub enum Frame {
     },
     /// The rooms a [`Request::Rooms`] asked for.
     Rooms {
-        /// `(channel_id, local name, open)` per room.
-        rooms: Vec<(Digest32, String, bool)>,
+        /// `(channel_id, local name, open, over)` per room; `over` says, in plain words, that
+        /// this identity left the room or it ended (V030-08), and is empty while it goes on.
+        rooms: Vec<(Digest32, String, bool, String)>,
     },
     /// The services a [`Request::Services`] asked for: the room's local name, and
     /// `(service tag, local address)` per service, as the node offers them.
@@ -1226,6 +1344,9 @@ impl Frame {
             Frame::Bound { local } => {
                 e.array(2).uint(T_BOUND).text(local);
             }
+            Frame::OwnRetention { own, room } => {
+                e.array(3).uint(T_OWN_RETENTION).uint(*own).uint(*room);
+            }
             Frame::Link { url, note } if note.is_empty() => {
                 e.array(2).uint(T_LINK).text(url);
             }
@@ -1234,8 +1355,17 @@ impl Frame {
             }
             Frame::Rooms { rooms } => {
                 e.array(2).uint(T_ROOMS).array(rooms.len());
-                for (id, name, open) in rooms {
-                    e.array(3).bytes(id).text(name).uint(u64::from(*open));
+                for (id, name, open, over) in rooms {
+                    // `over` only when there is one: additive, so an older client still decodes.
+                    if over.is_empty() {
+                        e.array(3).bytes(id).text(name).uint(u64::from(*open));
+                    } else {
+                        e.array(4)
+                            .bytes(id)
+                            .text(name)
+                            .uint(u64::from(*open))
+                            .text(over);
+                    }
                 }
             }
             Frame::Trusted { entries } => {
@@ -1404,6 +1534,31 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         }
         NodeEvent::NodeNote { note } => {
             e.array(2).uint(T_NODE_NOTE).text(note);
+        }
+        NodeEvent::RetentionAboveRoom {
+            channel_id,
+            node,
+            room,
+        } => {
+            e.array(4)
+                .uint(T_RETENTION_ABOVE_ROOM)
+                .bytes(channel_id)
+                .uint(*node)
+                .uint(*room);
+        }
+        NodeEvent::RoomQuiet {
+            channel_id,
+            handed,
+            members,
+        } => {
+            e.array(4)
+                .uint(T_ROOM_QUIET)
+                .bytes(channel_id)
+                .uint(*handed as u64)
+                .uint(*members as u64);
+        }
+        NodeEvent::RoomForgotten { channel_id } => {
+            e.array(2).uint(T_ROOM_FORGOTTEN).bytes(channel_id);
         }
         NodeEvent::HandshakesQueued {
             waited,
@@ -1633,6 +1788,16 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Members { members });
         }
+        (T_OWN_RETENTION, 3) => {
+            return Ok(Frame::OwnRetention {
+                own: d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc own retention"))?,
+                room: d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room retention"))?,
+            });
+        }
         (T_BOUND, 2) => {
             return Ok(Frame::Bound {
                 local: text(d, "ipc bound address")?,
@@ -1655,7 +1820,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rooms = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedIpc("ipc room"))?;
-                if arity != 3 {
+                if !(3..=4).contains(&arity) {
                     return Err(Error::MalformedIpc("ipc room arity"));
                 }
                 let id = digest(d)?;
@@ -1664,7 +1829,14 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc room name"))?
                     .to_owned();
                 let open = d.uint().map_err(|_| Error::MalformedIpc("ipc room open"))? != 0;
-                rooms.push((id, name, open));
+                let over = if arity == 4 {
+                    d.text()
+                        .map_err(|_| Error::MalformedIpc("ipc room over"))?
+                        .to_owned()
+                } else {
+                    String::new()
+                };
+                rooms.push((id, name, open, over));
             }
             return Ok(Frame::Rooms { rooms });
         }
@@ -1790,6 +1962,22 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedIpc("ipc room not remembered why"))?
                 .to_owned(),
         },
+        (T_ROOM_QUIET, 4) => NodeEvent::RoomQuiet {
+            channel_id: digest(d)?,
+            handed: usize::try_from(
+                d.uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room quiet"))?,
+            )
+            .unwrap_or(usize::MAX),
+            members: usize::try_from(
+                d.uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room quiet"))?,
+            )
+            .unwrap_or(usize::MAX),
+        },
+        (T_ROOM_FORGOTTEN, 2) => NodeEvent::RoomForgotten {
+            channel_id: digest(d)?,
+        },
         (T_HANDSHAKES_QUEUED, 6) => {
             let mut count = |what| {
                 d.uint()
@@ -1820,6 +2008,15 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc address withheld"))?
                 .to_owned(),
+        },
+        (T_RETENTION_ABOVE_ROOM, 4) => NodeEvent::RetentionAboveRoom {
+            channel_id: digest(d)?,
+            node: d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc retention node"))?,
+            room: d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc retention room"))?,
         },
         (T_CONNECTION_NOTE, 3) => NodeEvent::ConnectionNote {
             peer: digest(d)?,
@@ -2381,6 +2578,16 @@ async fn serve_requests(
     }
 }
 
+/// Apply `command` and answer `Ok`, or the outcome as an error.
+async fn plain(handle: &NodeHandle, command: crate::node::api::NodeCommand) -> Frame {
+    match handle.apply(command).await {
+        crate::node::api::Outcome::Done => Frame::Ok,
+        other => Frame::Error {
+            reason: other.to_string(),
+        },
+    }
+}
+
 /// Prove the caller holds the identity passphrase, or say why not. A right one is an entry of it,
 /// so the node's keyring window starts again (V210-159).
 async fn verify_operator(
@@ -2515,6 +2722,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
+                crate::node::api::Outcome::OwnRetention { own, room } => {
+                    Frame::OwnRetention { own, room }
+                }
                 other => Frame::Error {
                     reason: other.to_string(),
                 },
@@ -3048,15 +3258,109 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        Request::Leave { channel_id } => match handle
-            .apply(crate::node::api::NodeCommand::LeaveChannel { channel_id })
+        Request::Leave { channel_id } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::LeaveRoom { channel_id },
+            )
             .await
-        {
-            crate::node::api::Outcome::Done => Frame::Ok,
-            other => Frame::Error {
-                reason: other.to_string(),
-            },
-        },
+        }
+        Request::End { channel_id } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::EndRoom { channel_id },
+            )
+            .await
+        }
+        Request::SetAdmin {
+            channel_id,
+            member,
+            admin,
+        } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::SetAdmin {
+                    channel_id,
+                    member,
+                    admin,
+                },
+            )
+            .await
+        }
+        Request::Admins { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Members {
+                    members: detail.admins.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
+        Request::IdleEnd {
+            channel_id,
+            idle_secs,
+        } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::ChooseIdleEnd {
+                    channel_id,
+                    idle_secs,
+                },
+            )
+            .await
+        }
+        Request::Forget { channel_id } => {
+            // Subscribe before asking: a room still held is left first and forgotten once the
+            // leave is passed on, which the node says as an event.
+            let mut events = handle.subscribe();
+            let held = handle
+                .view()
+                .channels
+                .iter()
+                .any(|c| c.channel_id == channel_id && c.open);
+            match handle
+                .apply(crate::node::api::NodeCommand::ForgetRoom { channel_id })
+                .await
+            {
+                crate::node::api::Outcome::Done => {}
+                other => {
+                    return Frame::Error {
+                        reason: other.to_string(),
+                    }
+                }
+            }
+            if !held {
+                return Frame::Ok;
+            }
+            // Past the node's own wind-down bound, with margin: the node always ends it.
+            match tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                loop {
+                    match events.next().await {
+                        Some(EventStreamItem::Event(NodeEvent::RoomForgotten {
+                            channel_id: c,
+                        })) if c == channel_id => return true,
+                        Some(_) => {}
+                        None => return false,
+                    }
+                }
+            })
+            .await
+            {
+                Ok(true) => Frame::Ok,
+                Ok(false) => Frame::Error {
+                    reason: "the node stopped before it forgot the room".into(),
+                },
+                Err(_) => Frame::Error {
+                    reason: "the node left the room but has not forgotten it yet".into(),
+                },
+            }
+        }
         Request::Invite { channel_id } => {
             // Subscribe before asking: the link arrives as an event, and one emitted
             // between the command and the wait would be lost.
@@ -3141,11 +3445,14 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         c.channel_id,
                         c.local_name.clone().unwrap_or_default(),
                         c.open,
+                        c.over.clone().unwrap_or_default(),
                     )
                 })
                 .collect();
             Frame::Rooms {
-                rooms: page(rooms, after, |(id, name, _)| (*id, name.len())),
+                rooms: page(rooms, after, |(id, name, _, over)| {
+                    (*id, name.len() + over.len())
+                }),
             }
         }
     }

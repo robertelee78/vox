@@ -305,7 +305,7 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
     let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms
             .iter()
-            .map(|(id, _, _)| *id)
+            .map(|(id, _, _, _)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(&room))
             .expect("PRODUCT: the room on bob's node"),
         other => panic!("PRODUCT: rooms: {other:?}"),

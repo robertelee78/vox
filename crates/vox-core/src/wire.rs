@@ -75,9 +75,8 @@ pub enum StructTag {
     /// only on such evidence, which is what makes "no member can add another member"
     /// enforceable rather than merely intended.
     JoinWitness = 0x0014,
-    /// `0x0015` — presence (V210-164): a member's own signed statement that it has left the
-    /// room, or is back in it. The log's record of who is still in it.
-    Presence = 0x0015,
+    // `0x0015` is reserved: v0.2.10's presence statement (V210-164). v0.3.0 says a member left
+    // or came back with a room-lifecycle fact (`0x0018`), and refuses the old tag as unknown.
     /// `0x0016` — an author's checkpoint on its own feed (ADR-023 decision 3): below the
     /// named position its skeletons are past retention, and a node holding the checkpoint
     /// may drop their signatures.
@@ -86,11 +85,20 @@ pub enum StructTag {
     /// member and posted to the room's log, so any member that replicates the log carries it
     /// to a recipient who is never online with its sender.
     KeyPackage = 0x0017,
+    /// `0x0018` — room lifecycle (V030-08): a member leaving or coming back, the creator (or an
+    /// admin it named) ending the room for everyone, or the creator's chosen idle end.
+    RoomLifecycle = 0x0018,
+    /// `0x0019` — board withdraw (V030-14): takes a member's records, or a whole room, off a
+    /// rendezvous board at once.
+    BoardWithdraw = 0x0019,
+    /// `0x001A` — admin roster (V030-14): a room's current admins as its creator signed them, so
+    /// a board can tell a current admin's room withdraw from a removed admin's.
+    AdminRoster = 0x001A,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 23] = [
+    pub const ALL: [StructTag; 25] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -111,9 +119,11 @@ impl StructTag {
         StructTag::MemberBundleRecord,
         StructTag::ServiceGrantExclusion,
         StructTag::JoinWitness,
-        StructTag::Presence,
         StructTag::Checkpoint,
         StructTag::KeyPackage,
+        StructTag::RoomLifecycle,
+        StructTag::BoardWithdraw,
+        StructTag::AdminRoster,
     ];
 
     /// The 2-byte tag value.
@@ -124,7 +134,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 23-element table: trivial and avoids an
+        // Linear scan over a 25-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -158,9 +168,11 @@ impl StructTag {
             StructTag::SessionEstablishment => "vox/session-establishment/v1",
             StructTag::MemberBundleRecord => "vox/member-bundle-record/v1",
             StructTag::JoinWitness => "vox/join-witness/v1",
-            StructTag::Presence => "vox/presence/v1",
             StructTag::Checkpoint => "vox/checkpoint/v1",
             StructTag::KeyPackage => "vox/key-package/v1",
+            StructTag::RoomLifecycle => "vox/room-lifecycle/v1",
+            StructTag::BoardWithdraw => "vox/board-withdraw/v1",
+            StructTag::AdminRoster => "vox/admin-roster/v1",
         }
     }
 }

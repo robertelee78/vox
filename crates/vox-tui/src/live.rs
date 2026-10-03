@@ -139,14 +139,14 @@ impl LiveCore {
             }
         });
         match out {
-            Outcome::Done | Outcome::Bound(_) => CommandStatus::Done,
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } => CommandStatus::Done,
             Outcome::Failed(f) => CommandStatus::Failed(ui_error(f)),
         }
     }
 
     fn send(&self, cmd: NodeCommand) -> CommandStatus {
         match self.rt.block_on(self.node.apply(cmd)) {
-            Outcome::Done | Outcome::Bound(_) => CommandStatus::Done,
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } => CommandStatus::Done,
             Outcome::Failed(f) => CommandStatus::Failed(ui_error(f)),
         }
     }
@@ -428,12 +428,18 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::NotAdmittedAfterJoin => UiError::JoinNotAdmitted,
         Fault::Refused => UiError::Refused,
         Fault::NotAdmitted => UiError::NotAdmitted,
+        Fault::JoinedRoomEnded => UiError::RoomEnded,
+        Fault::ResponderLeft => UiError::Unreachable,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
         Fault::AddressInUse => UiError::AddressInUse,
         Fault::AddressNotHere => UiError::AddressNotHere,
         Fault::BindFailed => UiError::BindFailed,
         Fault::AlreadyMember => UiError::AlreadyMember,
+        Fault::RoomEnded => UiError::RoomEnded,
+        Fault::LeftRoom => UiError::LeftRoom,
+        Fault::NotCreator | Fault::NotRoomCreator => UiError::NotCreator,
+        Fault::RoomNotSynced => UiError::StillJoining,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
     }
@@ -519,6 +525,14 @@ impl CoreHandle for LiveCore {
                     self.active = None;
                 }
                 self.send(NodeCommand::CloseChannel { channel_id })
+            }
+            Command::LeaveRoom { channel_id } => self.send(NodeCommand::LeaveRoom { channel_id }),
+            Command::EndRoom { channel_id } => self.send(NodeCommand::EndRoom { channel_id }),
+            Command::ForgetRoom { channel_id } => {
+                if self.active == Some(channel_id) {
+                    self.active = None;
+                }
+                self.send(NodeCommand::ForgetRoom { channel_id })
             }
             Command::SelectChannel { channel_id } => {
                 self.active = channel_id;

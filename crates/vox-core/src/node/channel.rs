@@ -501,6 +501,31 @@ pub enum Accepted {
     Checkpoint,
 }
 
+/// Why a room is over (V030-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomEnd {
+    /// Its creator, or an admin the creator named, ended it for everyone.
+    ByCreator,
+    /// Nothing was said in it for the idle end its creator chose.
+    Idle {
+        /// The idle end, in seconds.
+        idle_secs: u64,
+    },
+}
+
+impl std::fmt::Display for RoomEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoomEnd::ByCreator => f.write_str("its creator or an admin ended it"),
+            RoomEnd::Idle { idle_secs } => write!(
+                f,
+                "nothing was said in it for {}, the idle end its creator chose",
+                crate::node::retention::describe(*idle_secs)
+            ),
+        }
+    }
+}
+
 /// A rendered (decrypted, render-gated) message in the timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
@@ -716,6 +741,10 @@ pub struct ChannelState {
     /// In memory; a restart resets it together with every sync port. Shared with the actor, which
     /// reads it without the room's lock; it only changes under the lock.
     gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Members that left and that this node let in again by answering their join (V030-08):
+    /// members here until their signed return reaches it, which it then carries to the others.
+    /// In memory: a join is answered again after a restart.
+    readmitted: BTreeSet<Digest32>,
 }
 
 impl std::fmt::Debug for ChannelState {
@@ -1387,6 +1416,7 @@ impl ChannelState {
             poisoned: false,
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            readmitted: BTreeSet::new(),
         })
     }
 
@@ -1842,6 +1872,7 @@ impl ChannelState {
             poisoned: false,
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            readmitted: BTreeSet::new(),
         })
     }
 
@@ -2135,6 +2166,7 @@ impl ChannelState {
             poisoned: false,
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            readmitted: BTreeSet::new(),
         })
     }
 
@@ -2500,6 +2532,9 @@ impl ChannelState {
                 "channel is poisoned after a failed persist; reopen it",
             ));
         }
+        if !self.settled {
+            return Err(Error::RoomNotSynced);
+        }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self.authors.contains_key(&me) {
@@ -2852,7 +2887,7 @@ impl ChannelState {
     /// starts at generation 0, and the other members still hold this identity's old key under
     /// that number. They refuse a second key for a generation they hold, so nothing it sent would
     /// ever read. Its feed, once synced, says what it used: each message's header names its
-    /// generation, a revocation the one it moved to, and a presence statement the one it was on.
+    /// generation, a revocation the one it moved to, and nothing else names one.
     pub fn catch_up_generation(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
         let me = self.me();
         let Some(feed) = self.dag.feed(&me).filter(|f| !f.is_empty()) else {
@@ -2869,7 +2904,6 @@ impl ChannelState {
                     .ok()
                     .map(|m| m.header.chain_id),
                 Ok(EntryKind::Governance) => match GovBody::parse_framed(payload) {
-                    Ok(GovBody::Presence(p)) => Some(p.body.chain_id),
                     Ok(GovBody::ConsentRevocation(r)) => Some(r.body.new_chain_id),
                     _ => None,
                 },
@@ -3064,9 +3098,9 @@ impl ChannelState {
             .keys()
             .copied()
             .filter(|a| *a != me)
+            .filter(|a| !self.has_left(a))
             .filter(|a| trusted.contains(a))
             .filter(|a| !already.contains(a))
-            .filter(|a| !self.has_left(a))
             .collect()
     }
 
@@ -3092,6 +3126,7 @@ impl ChannelState {
             .readers_of(&me)
             .into_iter()
             .filter(|t| *t != me)
+            .filter(|t| !self.has_left(t))
             .filter(|t| self.delivered.get(t).is_none_or(|d| *d < current))
             .filter(|t| !self.has_left(t))
             .collect()
@@ -3471,7 +3506,7 @@ impl ChannelState {
         let readers = MembershipView::new(&self.evaluator).readers_of(&me);
         self.history
             .iter()
-            .filter(|(t, _)| **t != me && readers.contains(*t))
+            .filter(|(t, _)| **t != me && readers.contains(*t) && !self.has_left(t))
             .map(|(t, f)| (*t, *f))
             .collect()
     }
@@ -3622,6 +3657,15 @@ impl ChannelState {
     #[must_use]
     pub fn room_retention(&self) -> u64 {
         self.evaluator.policy().ttl
+    }
+
+    /// Whether `member` sets this room's retention: its creator, or an admin it named — a holder
+    /// of the `policy` capability (V030-32). Anyone else sets only their own node's.
+    #[must_use]
+    pub fn governs_retention(&self, member: &Digest32) -> bool {
+        self.evaluator
+            .grants(member, &crate::governance::capability::Capability::Policy)
+            .is_granted()
     }
 
     /// What this node's log has caught in the room: the authors it froze for a fork, and how
@@ -3799,9 +3843,7 @@ impl ChannelState {
             signer,
             &self.channel_id,
             self.epoch,
-            None,
-            Some(ttl),
-            None,
+            ttl,
         )?;
         self.append_governance(profile, &update.to_wire(), now_secs)?;
         Ok(())
@@ -3925,6 +3967,9 @@ impl ChannelState {
     /// Append a control entry (a checkpoint) on this identity's own feed: signed and stored
     /// like governance, never folded into the ADR-007 evaluator, since it grants nothing.
     fn append_control(&mut self, profile: &Profile, payload: &[u8], now_secs: u64) -> Result<()> {
+        if !self.settled {
+            return Err(Error::RoomNotSynced);
+        }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         let skeleton = self.next_skeleton(&me, payload, now_secs.saturating_mul(1_000));
@@ -5301,6 +5346,14 @@ impl ChannelState {
                 "this identity is not an author of the channel",
             ));
         }
+        // An ended room takes no new message, and a member that left says nothing more
+        // (V030-08). The actor says which to the person; this is the backstop.
+        if self.ended(now_millis).is_some() {
+            return Err(Error::Profile("this room has ended"));
+        }
+        if self.has_left(&me) {
+            return Err(Error::Profile("this identity has left the room"));
+        }
         let (now_millis, skipped) = self.stamp_after_held(now_millis);
         let content = Content::text(now_millis, text)?;
         let plaintext = Zeroizing::new(content.to_canonical_vec());
@@ -5488,62 +5541,47 @@ impl ChannelState {
         &self.timeline
     }
 
-    /// The room's members, in fingerprint order: every admitted author but one that has left
-    /// (V210-164).
+    /// The room's members, in fingerprint order: its admitted authors, less every one that has
+    /// left (V030-08). A member that left stays an author — its entries are still the room's
+    /// history — but it is nobody this node syncs with, delivers to or dials.
     #[must_use]
     pub fn members(&self) -> Vec<Digest32> {
-        let left = self.left();
         self.authors
             .keys()
-            .filter(|a| !left.contains(*a))
+            .filter(|a| !self.has_left(a))
             .copied()
             .collect()
     }
 
-    /// Whether `author` has left the room: the last entry this node holds of its feed is its
-    /// own statement that it left. Anything it authored after one — it joined again — puts it
-    /// back.
+    /// Whether `fingerprint` is a member: an admitted author that has not left (V030-08).
     #[must_use]
-    pub fn has_left(&self, author: &Digest32) -> bool {
-        let Some(head) = self.dag.feed(author).map(|f| f.max_seq()) else {
-            return false;
-        };
-        self.gov_entries.iter().any(|g| {
-            g.author_id == *author
-                && g.seq == head
-                && matches!(&g.body, GovBody::Presence(p) if p.body.author_id == *author && !p.body.here)
-        })
+    pub fn is_member(&self, fingerprint: &Digest32) -> bool {
+        self.is_author(fingerprint) && !self.has_left(fingerprint)
     }
 
-    /// Every author that has left the room ([`Self::has_left`]), in one pass over the log's
-    /// governance entries: the roster is read on every view.
-    fn left(&self) -> BTreeSet<Digest32> {
-        self.gov_entries
+    /// The members' keys (see [`Self::members`]), in fingerprint order.
+    #[must_use]
+    pub fn member_keys(&self) -> Vec<CompositePublicKey> {
+        self.authors
             .iter()
-            .filter(|g| {
-                matches!(&g.body, GovBody::Presence(p) if p.body.author_id == g.author_id && !p.body.here)
-                    && self.dag.feed(&g.author_id).map(|f| f.max_seq()) == Some(g.seq)
-            })
-            .map(|g| g.author_id)
+            .filter(|(a, _)| !self.has_left(a))
+            .map(|(_, k)| k.clone())
             .collect()
     }
 
-    /// Write that this identity has left the room (`here` = false) or is back in it, unless its
-    /// feed already says so (V210-164). Returns whether an entry was written.
-    pub fn say_presence(&mut self, profile: &Profile, here: bool, now_secs: u64) -> Result<bool> {
-        let me = profile.signer()?.fingerprint();
-        if self.has_left(&me) != here {
-            return Ok(false);
+    /// Whether `who` has left this room, by its own signed leave (V030-08).
+    #[must_use]
+    pub fn has_left(&self, who: &Digest32) -> bool {
+        self.evaluator.lifecycle().departed.contains_key(who) && !self.readmitted.contains(who)
+    }
+
+    /// Let `who`, which left, back in on this node: it just proved the room's passphrase in a
+    /// join this node answered (V030-08). It is a member here until its own return reaches the
+    /// others through this node.
+    pub fn readmit(&mut self, who: Digest32) {
+        if self.evaluator.lifecycle().departed.contains_key(&who) {
+            self.readmitted.insert(who);
         }
-        let statement = crate::governance::presence::Presence::build(
-            profile.signer()?,
-            &self.channel_id,
-            self.epoch,
-            here,
-            self.sender.chain_id(),
-        )?;
-        self.append_governance(profile, &statement.to_wire(), now_secs)?;
-        Ok(true)
     }
 
     /// Whether this node may write in the room: see `settled`.
@@ -5561,6 +5599,237 @@ impl ChannelState {
         store.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?;
         self.settled = true;
         Ok(true)
+    }
+
+    /// Say this identity, which had left, is back (V030-08): it joined again. Nothing to say
+    /// when it had not left.
+    pub fn say_returned(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+        let signer = profile.signer()?;
+        if !self
+            .evaluator
+            .lifecycle()
+            .departed
+            .contains_key(&signer.fingerprint())
+        {
+            return Ok(false);
+        }
+        let fact = crate::governance::lifecycle::RoomLifecycle::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            crate::governance::lifecycle::LifecycleKind::Return,
+        )?;
+        self.append_governance(profile, &fact.to_wire(), now_secs)?;
+        Ok(true)
+    }
+
+    /// Whether this room is over, and why (V030-08): its creator ended it, or the idle end its
+    /// creator chose has run out — no entry for that long, by the room's own clock, at `now_ms`.
+    #[must_use]
+    pub fn ended(&self, now_ms: u64) -> Option<RoomEnd> {
+        let lifecycle = self.evaluator.lifecycle();
+        if lifecycle.ended_by.is_some() {
+            return Some(RoomEnd::ByCreator);
+        }
+        let idle = lifecycle.idle_end_secs?;
+        let last = self
+            .dag
+            .newest_clock()
+            .unwrap_or_else(|| self.created().saturating_mul(1_000));
+        let at = last.saturating_add(idle.saturating_mul(1_000));
+        (now_ms >= at).then_some(RoomEnd::Idle { idle_secs: idle })
+    }
+
+    /// The idle end this room's creator chose, in seconds, if any (V030-08).
+    #[must_use]
+    pub fn idle_end(&self) -> Option<u64> {
+        self.evaluator.lifecycle().idle_end_secs
+    }
+
+    /// Leave the room (V030-08): append this identity's signed leave. The other members stop
+    /// syncing with it and delivering to it once they hold it. Leaving twice is refused.
+    pub fn leave(&mut self, profile: &Profile, now_secs: u64) -> Result<Digest32> {
+        let signer = profile.signer()?;
+        if self.has_left(&signer.fingerprint()) {
+            return Err(Error::Profile("this identity has already left the room"));
+        }
+        let fact = crate::governance::lifecycle::RoomLifecycle::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            crate::governance::lifecycle::LifecycleKind::Leave,
+        )?;
+        self.append_governance(profile, &fact.to_wire(), now_secs)
+    }
+
+    /// End the room for everyone (V030-08). Only its creator, or an admin the creator delegated,
+    /// may: anyone else is refused here rather than writing an entry every other node would
+    /// ignore.
+    pub fn end(&mut self, profile: &Profile, now_secs: u64) -> Result<Digest32> {
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if me != self.evaluator.root_admin() && !self.evaluator.admins().contains(&me) {
+            return Err(Error::Profile(
+                "only the room's creator or an admin may end it",
+            ));
+        }
+        let fact = crate::governance::lifecycle::RoomLifecycle::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            crate::governance::lifecycle::LifecycleKind::End,
+        )?;
+        self.append_governance(profile, &fact.to_wire(), now_secs)
+    }
+
+    /// Make `member` an admin of the room (V030-08, the decider 2026-10-01): an admin
+    /// certificate from the creator, carrying what a delegated admin holds and never `delegate`
+    /// ([`Self::delegated_admin_caps`]). Only the creator may — not another admin —
+    /// and only for a member of the room.
+    pub fn add_admin(
+        &mut self,
+        profile: &Profile,
+        member: &Digest32,
+        now_secs: u64,
+    ) -> Result<Digest32> {
+        let signer = profile.signer()?;
+        // The client's own check. The room's is the certificate: it carries no `delegate`, so an
+        // admin's certificate for anyone else verifies nowhere (#319).
+        #[cfg(feature = "mutant-sender")]
+        let entitled = signer.fingerprint() == self.evaluator.root_admin()
+            || crate::log::sync::mutant::admins_unentitled();
+        #[cfg(not(feature = "mutant-sender"))]
+        let entitled = signer.fingerprint() == self.evaluator.root_admin();
+        if !entitled {
+            return Err(Error::Profile(
+                "only the room's creator may add or remove an admin",
+            ));
+        }
+        if *member == signer.fingerprint() {
+            return Err(Error::Profile("the room's creator is its admin already"));
+        }
+        if !self.is_member(member) {
+            return Err(Error::Profile("that identity is not a member of the room"));
+        }
+        let key = self
+            .authors
+            .get(member)
+            .cloned()
+            .ok_or(Error::Profile("that identity is not a member of the room"))?;
+        let cert = crate::governance::cert::AdminCert::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            key,
+            Self::delegated_admin_caps(),
+            0,
+        )?;
+        self.append_governance(profile, &cert.to_wire(), now_secs)
+    }
+
+    /// What a delegated admin holds (#319): the room's policy, which is its retention — the one
+    /// thing room governance sets (V030-32) — and ending the room. **Not** `admin`: with `admin`,
+    /// an admin could name or revoke further admins, every node would honour them, and "only the
+    /// creator names admins" would be the client's word alone.
+    #[must_use]
+    pub fn delegated_admin_caps() -> crate::governance::capability::CapabilitySet {
+        crate::governance::capability::CapabilitySet::from_iter_caps([
+            crate::governance::capability::Capability::Policy,
+        ])
+    }
+
+    /// Take `member`'s admin back (V030-08): revoke every admin certificate naming it, whoever
+    /// issued it. Only the creator may.
+    pub fn remove_admin(
+        &mut self,
+        profile: &Profile,
+        member: &Digest32,
+        now_secs: u64,
+    ) -> Result<usize> {
+        use crate::governance::entry::GovBody;
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if me != self.evaluator.root_admin() {
+            return Err(Error::Profile(
+                "only the room's creator may add or remove an admin",
+            ));
+        }
+        let revoked: BTreeSet<Digest32> = self
+            .gov_entries
+            .iter()
+            .filter_map(|e| match &e.body {
+                GovBody::AdminRevocation(r) => Some(r.body.revoked_delegation_hash),
+                _ => None,
+            })
+            .collect();
+        let certs: Vec<Digest32> = self
+            .gov_entries
+            .iter()
+            .filter(|e| {
+                matches!(&e.body, GovBody::AdminCert(c)
+                    if c.body.delegate_pubkey.fingerprint() == *member)
+            })
+            .map(|e| e.entry_hash)
+            .filter(|h| !revoked.contains(h))
+            .collect();
+        if certs.is_empty() {
+            return Err(Error::Profile("that member is not an admin of the room"));
+        }
+        for hash in &certs {
+            let rev = crate::governance::cert::AdminRevocation::build(
+                signer,
+                &self.channel_id,
+                self.epoch,
+                *hash,
+                crate::governance::cert::RevocationReason::NoLongerNeeded,
+            )?;
+            self.append_governance(profile, &rev.to_wire(), now_secs)?;
+        }
+        Ok(certs.len())
+    }
+
+    /// When the room's admins last changed, on the room's own clock (V030-14): the newest admin
+    /// certificate or revocation on the log. `None` when the room never had one.
+    #[must_use]
+    pub fn admin_change_clock(&self) -> Option<u64> {
+        use crate::governance::entry::GovBody;
+        self.gov_entries
+            .iter()
+            .filter(|e| matches!(e.body, GovBody::AdminCert(_) | GovBody::AdminRevocation(_)))
+            .filter_map(|e| self.dag.order_key(&e.entry_hash).map(|(c, _)| c))
+            .max()
+    }
+
+    /// The room's admins, the creator first (V030-08).
+    #[must_use]
+    pub fn admins(&self) -> Vec<Digest32> {
+        let root = self.evaluator.root_admin();
+        std::iter::once(root)
+            .chain(self.evaluator.admins().into_iter().filter(|a| *a != root))
+            .collect()
+    }
+
+    /// Choose the room's idle end (V030-08): it ends after `idle_secs` with nothing said in it.
+    /// Only its creator may, and `vox room create` is where it does.
+    pub fn choose_idle_end(
+        &mut self,
+        profile: &Profile,
+        idle_secs: u64,
+        now_secs: u64,
+    ) -> Result<Digest32> {
+        let signer = profile.signer()?;
+        if signer.fingerprint() != self.evaluator.root_admin() {
+            return Err(Error::Profile(
+                "only the room's creator may choose its idle end",
+            ));
+        }
+        let fact = crate::governance::lifecycle::RoomLifecycle::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            crate::governance::lifecycle::LifecycleKind::IdleEnd(idle_secs),
+        )?;
+        self.append_governance(profile, &fact.to_wire(), now_secs)
     }
 
     /// Number of accepted log entries.

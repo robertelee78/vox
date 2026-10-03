@@ -1139,6 +1139,21 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
             );
         }
         NodeEvent::NodeNote { note } => eprintln!("vox: {note}"),
+        NodeEvent::RetentionAboveRoom {
+            channel_id,
+            node,
+            room,
+        } => {
+            eprintln!(
+                "vox: warning: this node's retention file asks to keep room {} for {}, longer than \
+                 the room keeps it ({}); a member may keep less than the room, never more, so the \
+                 room's {} is in force",
+                short(channel_id),
+                vox_core::node::retention::describe(*node),
+                vox_core::node::retention::describe(*room),
+                vox_core::node::retention::describe(*room)
+            );
+        }
         _ => {}
     }
 }
@@ -1185,7 +1200,7 @@ async fn why_a_join_failed(node: &NodeHandle, out: Outcome) -> String {
     // at exactly the moment somebody is stuck.
     let fault = match out {
         Outcome::Failed(fault) => Some(fault),
-        Outcome::Done | Outcome::Bound(_) => None,
+        Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } => None,
     };
     let advice = join_advice_after(fault, &said.join("; "));
 

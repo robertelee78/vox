@@ -79,8 +79,10 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
     Ok(client)
 }
 
-/// Ask the node for its rooms, as `(id, local name, open)`.
-async fn rooms_of(client: &mut IpcClient) -> Result<Vec<(Digest32, String, bool)>, AppError> {
+/// Ask the node for its rooms, as `(id, local name, open, over)`.
+async fn rooms_of(
+    client: &mut IpcClient,
+) -> Result<Vec<(Digest32, String, bool, String)>, AppError> {
     match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
@@ -174,12 +176,12 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
             "this node holds no rooms yet — join or create one first".into(),
         ));
     }
-    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
+    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _)| *id).collect();
     let id = resolve_prefix(prefix, &ids)?;
     // A closed room's name is sealed in its manifest, so a node that has not opened it does
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
     // Named by the id the operator typed a prefix of, and by its name only when there is one.
-    if let Some((_, name, false)) = rooms.iter().find(|(r, _, _)| *r == id) {
+    if let Some((_, name, false, _)) = rooms.iter().find(|(r, _, _, _)| *r == id) {
         return Err(room_closed(&id, name));
     }
     Ok(id)
@@ -221,12 +223,17 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
         println!("no rooms");
         return Ok(());
     }
-    for (id, name, open) in rooms {
+    for (id, name, open, over) in rooms {
         println!(
-            "{}  {}{}",
+            "{}  {}{}{}",
             short(&id),
             if name.is_empty() { "(unnamed)" } else { &name },
-            if open { "" } else { "  [closed]" }
+            if open { "" } else { "  [closed]" },
+            if over.is_empty() {
+                String::new()
+            } else {
+                format!("  [{over}]")
+            }
         );
     }
     Ok(())
@@ -3275,15 +3282,17 @@ pub async fn join(
     passphrase_file: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    // A room this node holds open is not joined again: its address is taken as where the room's
-    // host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
+    // A room this node holds open, and has not left, is not joined again: its address is taken
+    // as where the room's host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
     // is used.
     let held = match vox_core::node::link::InviteLink::parse(link) {
         Ok(parsed) => rooms_of(&mut client)
             .await?
             .into_iter()
-            .find(|(id, _, open)| *id == parsed.channel_id && *open)
-            .map(|(id, name, _)| {
+            // A room this identity left is not: it is joined again, with its passphrase, from
+            // scratch (V030-08).
+            .find(|(id, _, open, over)| *id == parsed.channel_id && *open && over != "left")
+            .map(|(id, name, _, _)| {
                 if name.is_empty() {
                     b32_encode(&id)
                 } else {
@@ -3362,9 +3371,30 @@ pub async fn create(
     paths: &Paths,
     local_name: &str,
     passphrase_file: Option<&std::path::Path>,
+    idle_end: Option<&str>,
 ) -> Result<(), AppError> {
+    // Checked before anything is made: a typo must not leave a room with no idle end behind.
+    let idle_secs = match idle_end {
+        None => None,
+        Some(text) => match vox_core::node::retention::parse_duration(text) {
+            Some(s) if s > 0 => Some(s),
+            _ => {
+                return Err(AppError::Usage(format!(
+                    "{text:?} is not an idle end: use 1h, 1w, 1m (a month), or a number of seconds"
+                )))
+            }
+        },
+    };
     let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
     let mut client = attach(paths).await?;
+    let before: Vec<Digest32> = match idle_secs {
+        Some(_) => rooms_of(&mut client)
+            .await?
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect(),
+        None => Vec::new(),
+    };
     match client
         .request(&Request::Create {
             local_name: local_name.to_owned(),
@@ -3374,6 +3404,40 @@ pub async fn create(
     {
         Ok(Frame::Ok) => {
             println!("vox: created {local_name}");
+            if let Some(idle_secs) = idle_secs {
+                let made = rooms_of(&mut client)
+                    .await?
+                    .into_iter()
+                    .map(|(id, _, _, _)| id)
+                    .find(|id| !before.contains(id))
+                    .ok_or_else(|| {
+                        AppError::Usage(
+                            "the room was created, but this node does not list it, so its idle end was not set"
+                                .into(),
+                        )
+                    })?;
+                match client
+                    .request(&Request::IdleEnd {
+                        channel_id: made,
+                        idle_secs,
+                    })
+                    .await
+                {
+                    Ok(Frame::Ok) => println!(
+                        "     it ends by itself after {} with nothing said in it",
+                        vox_core::node::retention::describe(idle_secs)
+                    ),
+                    Ok(Frame::Error { reason }) => {
+                        return Err(AppError::Usage(format!(
+                            "the room was created, but its idle end was not set: {reason}"
+                        )))
+                    }
+                    Ok(other) => {
+                        return Err(AppError::Usage(format!("unexpected reply: {other:?}")))
+                    }
+                    Err(e) => return Err(AppError::Usage(e.to_string())),
+                }
+            }
             println!("     `vox room list` shows its id; that id is what agents pass as --room");
             Ok(())
         }
@@ -3429,57 +3493,40 @@ pub async fn retention(
             }
             Ok(())
         }
-        // The node's own words (`Fault::explain`) say why — including a member who is not the
-        // room's admin, which has its own fault rather than a generic refusal.
-        Ok(Frame::Error { reason }) => {
-            Err(AppError::Usage(format!("cannot set retention: {reason}")))
-        }
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
-        Err(e) => Err(AppError::Usage(e.to_string())),
-    }
-}
-
-/// `vox room leave` — leave a room (V210-164).
-///
-/// The node writes its departure into the room and answers once another member has it; then
-/// the room is gone from this node. The other members stop listing this identity in the
-/// room's roster.
-///
-/// # Errors
-/// If the node cannot be reached, the room is unknown or closed, or no other member could be
-/// told in time (the node then leaves as soon as one can be).
-pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
-    let mut client = attach(paths).await?;
-    let rooms = rooms_of(&mut client).await?;
-    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
-    if ids.is_empty() {
-        return Err(AppError::Usage("this node holds no rooms".into()));
-    }
-    let channel_id = resolve_prefix(room, &ids)?;
-    let name = rooms
-        .iter()
-        .find(|(r, _, _)| *r == channel_id)
-        .map(|(_, n, _)| n.clone())
-        .unwrap_or_default();
-    let which = if name.is_empty() {
-        format!("room {}", b32_encode(&channel_id))
-    } else {
-        format!("room {name:?} ({})", b32_encode(&channel_id))
-    };
-    if rooms.iter().any(|(r, _, open)| *r == channel_id && !open) {
-        return Err(AppError::Usage(format!(
-            "{which} is closed on this node, and leaving is said in the room\n       open it \
-             first: in `vox tui`, or a line with its passphrase to `vox daemon`"
-        )));
-    }
-    match client.request(&Request::Leave { channel_id }).await {
-        Ok(Frame::Ok) => {
-            println!("vox: left {which}");
-            println!("     its other members see that you left; this node no longer holds it");
+        // A member who is not the room's creator or an admin set only their own node's (V030-32).
+        Ok(Frame::OwnRetention { own, room }) => {
+            let say = |t: u64| match t {
+                0 => "forever".to_owned(),
+                t => format!("for {}", vox_core::node::retention::describe(t)),
+            };
+            if own == room {
+                println!(
+                    "vox: you follow the room's retention for {} again: this node keeps its \
+                     messages {}",
+                    short(&channel_id),
+                    say(own)
+                );
+            } else {
+                println!(
+                    "vox: set your own retention for {}: this node keeps its messages {}",
+                    short(&channel_id),
+                    say(own)
+                );
+            }
+            println!(
+                "     the room's is {}, and only its creator or an admin changes that; nothing \
+                 changed for anyone else",
+                match room {
+                    0 => "forever".to_owned(),
+                    t => vox_core::node::retention::describe(t),
+                }
+            );
             Ok(())
         }
+        // The node's own words (`Fault::explain`) say why — including a member asking to keep
+        // the room's messages longer than the room does, which has its own fault.
         Ok(Frame::Error { reason }) => {
-            Err(AppError::Usage(format!("{which} was not left: {reason}")))
+            Err(AppError::Usage(format!("cannot set retention: {reason}")))
         }
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
@@ -3711,4 +3758,196 @@ pub async fn print_identity(paths: &Paths) -> Result<(), AppError> {
     // The whole fingerprint, alone on the line, so it pipes and pastes without editing.
     println!("{}", vox_core::node::link::b32_encode(&me));
     Ok(())
+}
+
+/// Find a room by prefix among every room this node holds, closed ones too.
+async fn any_room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
+    let ids: Vec<Digest32> = rooms_of(client)
+        .await?
+        .into_iter()
+        .map(|(id, _, _, _)| id)
+        .collect();
+    if ids.is_empty() {
+        return Err(AppError::Usage("this node holds no rooms".into()));
+    }
+    resolve_prefix(prefix, &ids)
+}
+
+/// `vox room leave` — leave a room (V030-08).
+///
+/// # Errors
+/// An unreachable node, an unknown or closed room, or a room this identity already left.
+pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client.request(&Request::Leave { channel_id }).await {
+        Ok(Frame::Ok) => {
+            println!("vox: left {}", short(&channel_id));
+            println!(
+                "     the other members stop syncing with this node once they have it; this node \
+                 passes it on, then goes quiet in the room"
+            );
+            println!("     what was said stays readable here until `vox room forget`");
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot leave: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox room end` — end a room for everyone; its creator only (V030-08).
+///
+/// # Errors
+/// An unreachable node, an unknown or closed room, an ended room, or a caller who did not
+/// create it.
+pub async fn end(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client.request(&Request::End { channel_id }).await {
+        Ok(Frame::Ok) => {
+            println!("vox: ended {} for everyone", short(&channel_id));
+            println!(
+                "     every member's node takes no new message in it once it has this; what was \
+                 said stays readable until each forgets the room"
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot end: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox room forget` — delete everything this node holds of a room (V030-08), and the read
+/// cursors agent sessions kept for it here.
+///
+/// # Errors
+/// An unreachable node, an unknown room, or a closed room this identity has not left.
+pub async fn forget(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = any_room_of(&mut client, room).await?;
+    let name = rooms_of(&mut client)
+        .await?
+        .into_iter()
+        .find(|(id, _, _, _)| *id == channel_id)
+        .map(|(_, name, _, _)| name)
+        .unwrap_or_default();
+    match client.request(&Request::Forget { channel_id }).await {
+        Ok(Frame::Ok) => {
+            let cursors = forget_cursors(paths, &channel_id, &name);
+            println!("vox: forgot {}", short(&channel_id));
+            println!(
+                "     nothing of it is left on this node{}",
+                if cursors > 0 {
+                    format!(", and {cursors} read cursor(s) kept for it were deleted")
+                } else {
+                    String::new()
+                }
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot forget: {reason}"))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// Delete the read cursors (and held-claim records) agent sessions kept for a room: each is
+/// filed under the room as the session named it — its id, a prefix of it of 8 characters or
+/// more, or its local name. Returns how many went.
+fn forget_cursors(paths: &Paths, channel_id: &Digest32, name: &str) -> usize {
+    let id = b32_encode(channel_id);
+    let names_it = |file: &str| -> bool {
+        let Some((room, _session)) = file.split_once('-') else {
+            return false;
+        };
+        (room.len() >= 8 && id.starts_with(room))
+            || (!name.is_empty() && file.starts_with(&format!("{name}-")))
+    };
+    let mut gone = 0usize;
+    for dir in [paths.cursor_dir(), paths.cursor_dir().join("held")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let file = e.file_name().to_string_lossy().into_owned();
+            if e.path().is_file() && names_it(&file) && std::fs::remove_file(e.path()).is_ok() {
+                gone += 1;
+            }
+        }
+    }
+    gone
+}
+
+/// `vox room admin add|remove|list` — a room's admins (V030-08).
+///
+/// # Errors
+/// An unknown action, an unreachable node, an unknown or closed room, an unknown member, a
+/// caller who did not create the room, or a member who is not an admin (`remove`).
+pub async fn admin(
+    paths: &Paths,
+    action: &str,
+    room: &str,
+    member: Option<&str>,
+) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    if action == "list" {
+        return match client.request(&Request::Admins { channel_id }).await {
+            Ok(Frame::Members { members }) => {
+                for (i, m) in members.iter().enumerate() {
+                    println!("{}{}", id(m), if i == 0 { "  (creator)" } else { "" });
+                }
+                Ok(())
+            }
+            Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+            Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => Err(AppError::Usage(e.to_string())),
+        };
+    }
+    let add = match action {
+        "add" => true,
+        "remove" => false,
+        other => {
+            return Err(AppError::Usage(format!(
+                "{other:?} is not an admin action: use add, remove or list"
+            )))
+        }
+    };
+    let Some(member) = member else {
+        return Err(AppError::Usage(format!(
+            "`vox room admin {action}` needs the member's fingerprint (`vox room roster` lists them)"
+        )));
+    };
+    let members = match client.request(&Request::Roster { channel_id }).await {
+        Ok(Frame::Members { members }) => members,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let member = resolve_prefix(member, &members)?;
+    match client
+        .request(&Request::SetAdmin {
+            channel_id,
+            member,
+            admin: add,
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!(
+                "vox: {} is {} admin of {}",
+                short(&member),
+                if add { "now an" } else { "no longer an" },
+                short(&channel_id)
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+            "cannot {action} the admin: {reason}"
+        ))),
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
 }

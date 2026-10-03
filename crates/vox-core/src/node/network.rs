@@ -1894,6 +1894,26 @@ impl NodeNet {
         out
     }
 
+    /// Take a member that left off **this node's own** board (V030-14): its records go, and any
+    /// stamped no later than `at` are refused. This node's board is its own, so no signature is
+    /// needed — the leave on the room's log is the reason, and this node holds it.
+    pub fn forget_member_on_board(&self, channel_id: &Digest32, author: &Digest32, at: u64) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .withdraw_member(channel_id, author, at);
+    }
+
+    /// Take a room that ended off **this node's own** board (V030-14), for good.
+    pub fn forget_room_on_board(&self, channel_id: &Digest32) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .withdraw_room(channel_id, None);
+    }
+
     /// Put a framed record on **this node's own** board, without a network round
     /// trip. A node is its own first anchor, and it would be absurd to dial itself;
     /// the record still goes through the service's full policy, so a local publish
