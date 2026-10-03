@@ -261,7 +261,12 @@ impl DaemonCore {
         };
         let first = using(passphrase);
         let tx = self.tx.clone();
-        let events_use = using(None);
+        // The event stream does not hold the node: the request connection does, and a node is
+        // let go when that one closes, however the TUI ends.
+        let events_use = UseNode {
+            attach: AttachMode::No,
+            ..using(None)
+        };
         let opened = self.rt.block_on(async {
             let client = match IpcClient::open_node(&socket, first).await {
                 Ok(Ok(c)) => c,
@@ -269,7 +274,7 @@ impl DaemonCore {
                 Err(e) => return Err(e),
             };
             // The node's events, on a connection of their own: a subscribed connection serves no
-            // more requests. It holds the node too, so it is attached by now and needs nothing.
+            // more requests. The node is attached by now, so this one needs no passphrase.
             let mut events = match IpcClient::open_node(&socket, events_use).await? {
                 Ok(c) => c,
                 Err(refusal) => return Ok(Err(refusal)),
