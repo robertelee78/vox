@@ -34,8 +34,8 @@
 //!   `vox status --json` counts no circuit asked for to the host, by any `vox up` or by a
 //!   `vox forward`, which reaches the host the moment it starts over a direct path with 30 ms of
 //!   latency (the case R41's transcripts showed). In v0.2.10 the host's circuits to the guest,
-//!   which it cannot dial, were legitimate bridges (the decider, 2026-10-02); v0.3.0 asks the guest
-//!   to dial back instead, so they are asserted (V030-22, V030-27, below).
+//!   which it cannot dial, are legitimate: a relay-only pair takes its circuit at once and the
+//!   dial-back races it (the decider, 2026-10-02 and 2026-10-03), so they are printed, not asserted.
 //!
 //! Printed: min / median / p95 / max of both, how many first answers came over the circuit, and
 //! how many dials began before `vox up` said it was up.
@@ -44,23 +44,15 @@
 //! 2.5 s in `nat::reachability::connect_direct_within`. The first answer still comes fast, over the
 //! anchor's circuit, and the direct path lands only after 2.5 s — red on the direct bound.
 //!
-//! - **the anchor carries nothing for the pair** (V030-22): its own `circuit(s) carried` report
-//!   never goes above 0 for the whole run, the host's reaches for a guest it cannot dial included;
-//! - **the host asks a guest to dial back** (V030-22): a second test,
-//!   `the_host_asks_a_guest_to_dial_back`, stages it — carol joins from an anchor-only address and
-//!   comes online, so the host must reach a guest it cannot dial; she must be reached with no
-//!   circuit at all, the anchor carrying none (see `dial_back_is_asked_for`).
-//!
-//! - **the host asks for no circuit either** (V030-27): its own `vox status --json` counts 0
-//!   circuits asked to the guest for the whole run. Its mutant: the circuit's wait for the
-//!   dial-back's word removed from `NodeNet::reach_ladder` — the host asks 4–5 circuits a run, 0 ms
-//!   into each reach: red, as PRODUCT.
-//!
-//! For V030-22 the whole-run "anchor carried 0" assertion is supporting evidence only: it is red
-//! only in a run where the host happens to reach for a guest that is online but not connected to
-//! it. The discriminating arm is `the_host_asks_a_guest_to_dial_back`; its mutants are the
-//! dial-back rung removed from `NodeNet::reach_ladder`, and `NodeNet::member_endpoints` reading
-//! only this node's own board — each makes the anchor bridge the pair: red, as PRODUCT.
+//! - **the host asks a guest to dial back, racing its circuit** (V030-22, and the decider,
+//!   2026-10-03: a relay-only pair takes its relay circuit at once, the dial-back races it and
+//!   holds nothing back): a second test, `the_host_asks_a_guest_to_dial_back`, stages it — carol
+//!   joins from an anchor-only address and comes online, so the host must reach a guest it cannot
+//!   dial. Asserted: she answers the dial-back, the host asked for its circuit at once (under
+//!   `DIRECT_HEAD_START` into the reach), and the host ends on a direct path to her (see
+//!   `dial_back_is_asked_for`). Its mutants: the dial-back rung removed from
+//!   `NodeNet::reach_ladder` (no dial-back answered), and the circuit held for the dial-back's word
+//!   (asked late or never): each red, as PRODUCT.
 //!
 //! And for V210-122: `DIRECT_HEAD_START` set to 0, the old race. The guest's `vox forward` asks for
 //! a circuit through the anchor beside its direct dial over the 30 ms path, and the guest's status
@@ -98,6 +90,7 @@ mod port_forward;
 use std::time::{Duration, Instant};
 
 use port_forward::{echo_over, interrupt, ForwardedWorld};
+use vox_core::node::network::DIRECT_HEAD_START;
 use world::socks5_connect;
 
 /// PRD-001 R42. A number, not a product constant.
@@ -249,7 +242,7 @@ fn a_side_that_can_reach_directly_asks_for_no_circuit() {
     );
 }
 
-/// **The host asks a guest to dial back, and nothing bridges them** (V030-22, #335) — the claim's
+/// **The host asks a guest to dial back, racing its circuit** (V030-22, #335) — the claim's
 /// own arm. See [`dial_back_is_asked_for`] for the staging and what is asserted.
 #[test]
 #[ignore = "production Argon2id + a real PoW, a third member staged; run in release"]
@@ -277,10 +270,11 @@ fn the_host_asks_a_guest_to_dial_back() {
 /// and is said as such; a fresh guest is staged again. Any run that did stage decides: a PRODUCT
 /// red stops at once.
 ///
-/// Asserted, on the first run that stages (the host asked her to dial back and she answered, or the
-/// anchor carried something for them): she answered, and the anchor carried **no** circuit for the
-/// pair from the moment she came online. Circuits the host asked for and the anchor refused (to a
-/// process of hers that had already exited: "relay cannot reach the peer") carry nothing and are
+/// Asserted, on the first run that stages (the host asked her to dial back, or the anchor carried
+/// something for them): she answered the dial-back; the host asked for its circuit to her at once,
+/// under [`DIRECT_HEAD_START`] into each reach, never held for the dial-back (the decider,
+/// 2026-10-03: a relay-only pair takes its relay circuit at once); and 2 s on, the host's path to
+/// her is direct — the dial-back's connection replaced the relayed one. The anchor's count is
 /// printed, not asserted. Every run unstaged: `CANNOT MEASURE`.
 fn dial_back_is_asked_for(w: &mut ForwardedWorld) {
     let mut unstaged = Vec::new();
@@ -379,6 +373,7 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
         "[proof] staging {n}: the host's dial-backs asked {asked}, answered {answered}; circuits \
          asked {circuits}; the anchor carried up to {carried} since carol came online"
     );
+    let path = peer_path(&w.host_dir, &carol_fp, "the host");
     w.forward.set_delay(Duration::ZERO);
     let host = w.host.transcript();
     let said = up.transcript();
@@ -394,14 +389,45 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
              refused: {circuits}); carol reached the host herself, or the host did not need her"
         ));
     }
+    // **The dial-back races the circuit, and holds nothing back** (the decider, 2026-10-03): a pair
+    // the host can reach only through a relay takes its circuit at once, the dial-back answered
+    // beside it, and the direct connection the dial-back brings replaces the relayed one.
+    let short: String = carol_fp.chars().take(26).collect();
+    let circuit_at: Vec<u128> = host
+        .lines()
+        .filter(|l| l.contains(&format!("connection to {short}")))
+        .filter_map(|l| {
+            l.split(" for a circuit ")
+                .nth(1)?
+                .split(" ms into the reach")
+                .next()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .collect();
     assert!(
-        answered > 0 && carried == 0,
+        answered > 0,
         "PRODUCT: the host, which cannot dial carol, had to reach her while she could dial the \
-         host; it must ask her to dial back, and the anchor must carry nothing for them. \
-         Dial-backs asked: {asked}, answered: {answered}; circuits asked: {circuits}; the anchor \
-         carried up to \
-         {carried}.\nhost:\n{host}\ncarol:\n{said}\nanchor:\n{}",
+         host; it must ask her to dial back, and she must answer. Dial-backs asked: {asked}, \
+         answered: {answered}; circuits asked: {circuits}; the anchor carried up to {carried}.\nhost:\n\
+         {host}\ncarol:\n{said}\nanchor:\n{}",
         w.anchor.proc.transcript()
+    );
+    assert!(
+        circuits > 0
+            && !circuit_at.is_empty()
+            && circuit_at.iter().all(|ms| *ms < DIRECT_HEAD_START.as_millis()),
+        "PRODUCT: the host can reach carol only through a relay, so it must ask for its circuit at \
+         once, beside the dial-back, never held for it (the decider, 2026-10-03). Circuits asked: \
+         {circuits}, at {circuit_at:?} ms into their reaches (at once is under {DIRECT_HEAD_START:?}); \
+         dial-backs asked {asked}, answered {answered}.\nhost:\n{host}\ncarol:\n{said}"
+    );
+    assert!(
+        path == "direct",
+        "PRODUCT: carol answered the host's dial-back, yet the host's path to her is {path:?}, not \
+         direct: the connection the dial-back brought did not replace the relayed one.\nhost:\n\
+         {host}\ncarol:\n{said}"
     );
     Staging::Staged
 }
@@ -620,6 +646,27 @@ fn reach_count(dir: &std::path::Path, peer: &str, who: &str, field: &str) -> u64
         })
 }
 
+/// The `path` of `peer`'s row in the `peers` of the `vox status --json` of the node on `dir`
+/// (`direct` or `relayed`); `none` when it holds no connection to `peer`.
+fn peer_path(dir: &std::path::Path, peer: &str, who: &str) -> String {
+    let (ok, out, err) = world::vox_once(dir, &world::args(&["status", "--json"]));
+    assert!(
+        ok,
+        "PRODUCT (staging): {who}'s `vox status --json` did not answer, so its path to {peer} is \
+         unknown.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    let Some(peers) = out.split("\"peers\":[").nth(1) else {
+        panic!("PRODUCT (staging): {who}'s `vox status --json` has no `peers` section:\n{out}");
+    };
+    peers
+        .split("{\"id\":\"")
+        .find(|r| r.starts_with(peer))
+        .and_then(|r| r.split("\"path\":\"").nth(1))
+        .and_then(|p| p.split('"').next())
+        .unwrap_or("none")
+        .to_owned()
+}
+
 fn stats(label: &str, samples: &[Duration]) -> Duration {
     let mut s = samples.to_vec();
     s.sort();
@@ -797,28 +844,11 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         "[proof] the most circuits the anchor ever reported carrying: {ever}; the guest asked for \
          {guest_circuits} to the host; the host asked for {host_asked} to the guest"
     );
-    // **A pair that can reach each other directly costs the anchor nothing** (V030-22, #335): the
-    // anchor's own report never counts a circuit, at any point of the run, the host's reaches for
-    // a guest it cannot dial included — it asks the guest to dial back instead.
-    assert!(
-        ever == 0,
-        "PRODUCT: the guest can dial the host, yet the anchor reported carrying up to {ever} \
-         circuit(s) for the pair (the host asked for {host_asked}).\nhost:\n{}\nanchor:\n{}",
-        w.host.transcript(),
-        w.anchor.proc.transcript()
-    );
-    // **Nor does the host ask for one** (V030-27, #349): every reach the host makes for the guest
-    // it cannot dial asks the guest to dial back first, and a relay that could not reach the guest
-    // for that dial-back is not asked to carry a circuit to it either. Before, the host asked a
-    // circuit 0 ms into every such reach — 4 or 5 a run, refused only while the guest was not on
-    // the anchor; in 1 of 3 runs one was carried.
-    assert!(
-        host_asked == 0,
-        "PRODUCT: the guest can dial the host, yet the host asked the anchor for {host_asked} \
-         circuit(s) to the guest instead of waiting on its dial-back.\nhost:\n{}\nanchor:\n{}",
-        w.host.transcript(),
-        w.anchor.proc.transcript()
-    );
+    // **The host's circuits are not asserted** (the decider, 2026-10-03): the host cannot dial the
+    // guest at all, so a pair it reaches only through the anchor takes its circuit at once, with
+    // the dial-back racing it, and the direct connection the dial-back brings replaces it. The
+    // anchor's count and the host's are printed above; `the_host_asks_a_guest_to_dial_back`
+    // asserts that race. The guest, which can dial the host, still asks for none.
     assert!(
         guest_circuits == 0,
         "PRODUCT: the guest reached the host directly through the forward, yet it asked for \
