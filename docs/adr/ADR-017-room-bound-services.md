@@ -38,9 +38,9 @@ ADR-013 makes the overlay carry TCP and UDP between members. This ADR specifies 
 it: a person shares a local service with a room, and the people they trust in that room reach it with
 ordinary tools. The aim is to replace a Tor private service.
 
-The decider's rule: *"When I am approving someone to read my messages in a room I am also approving
-them to use any service that I have granted to that room."* And its converse: someone who joins and
-whom the host has not approved *"should not know about that service"*.
+The rule: approving someone to read your messages in a room also approves them to use every service
+you share with that room; and someone who joins and whom the host has not approved does not learn of
+that service.
 
 Joining a room is a passphrase and a proof of work, which is not a decision about a person. The
 approval to read is such a decision, already made per person. So reach rides on the approval to read.
@@ -294,24 +294,13 @@ Proved by `crates/vox-tui/tests/a_service_is_reached_only_by_its_address_proof.r
 - **13.3** An address MUST NOT be a capability. Holding a name MUST NOT be sufficient to connect.
 - **13.4** There MUST be no global namespace and no name resolution off the machine.
 
-## Fixed since
+### 14. Accepting joiners (M17.17)
 
-- **Join auto-consent** (`join` released the sender key to the responder): removed by M17.6. Proof:
-  `no_consent_without_a_ring_entry_proof.rs` (RP-28, #135).
-- **`bind:` left `vox serve` working only for a room's creator**: removed with M17.7.
-- **Stale output** (`vox serve` "anyone who joins with both may reach it"; `vox service add` "dark
-  until you `vox grant`"): replaced in M17.7.
-- **The first CONNECT refused before the board was read**: fixed by `up::reach_host_with_patience`
-  (5.6).
-- **Recomputes tore down live sessions** (unconditional `send_replace` on every accept): fixed by
-  `publish_reachers` (10.5).
-- **An anchor host name resolved once, at startup**: fixed by `ANCHOR_REFRESH` re-resolution (7.4).
-  Proof: `a_daemon_follows_its_anchor_proof.rs` (RP-32, #139).
-- **Open proof gap (M17.17): the accept loop serialised handshakes**, locking out a second joiner
-  for up to 30 s. Closed in v0.2.8: each handshake runs on its own task, bounded at
-  `HANDSHAKES_IN_FLIGHT` (64), with `retry()` or `refuse()` at the cap and never a queue, and the
-  duplicate-connection tie-break uses an order-independent TLS-exporter key (`tie_key`). Proof:
-  `a_second_joiner_is_not_locked_out.rs`.
+- **14.1** Each inbound handshake MUST run on its own task, bounded at `HANDSHAKES_IN_FLIGHT` (64).
+  At the cap the node MUST answer with `retry()` or `refuse()`, never a queue, so one slow joiner
+  cannot lock out another. Proof: `a_second_joiner_is_not_locked_out.rs`.
+- **14.2** The duplicate-connection tie-break MUST use an order-independent key derived from the TLS
+  exporter (`tie_key`).
 
 ## Consequences
 
