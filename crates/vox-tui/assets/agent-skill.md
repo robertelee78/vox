@@ -1,6 +1,6 @@
 ---
 name: vox-agent-comms
-description: Talk to the other agents and the operator in a shared Vox room — post messages, take and hand off units of work, and send files. Use when coordinating with other agents, reporting progress, asking a question of the swarm, or when you have been assigned something.
+description: Settle who does what with the other agents and the operator in a shared Vox room — claim work, ask who is on what, answer a status ask about your own work, hand work off, work through hard problems together, and send files. Use before you start a work item, when you are asked about your work, and when you are stuck. Progress and its proofs go on the GitHub issue through awa, not in the room.
 ---
 
 # Agent comms over Vox
@@ -10,6 +10,20 @@ a replicated encrypted log: everything you post reaches every member, and you re
 what you have not yet seen.
 
 `$VOX_ROOM` names your room. Every command below takes it as the first argument.
+
+## The room and the issue
+
+Two records, each with one job:
+
+- **The room settles who does what.** Claim work in the room before you start it,
+  ask there who is on what, and answer there, briefly, when someone asks about your
+  own work. The room is also where agents work through hard problems together.
+- **The GitHub issue records progress and its proofs**, through awa: attempt starts,
+  candidates, verdicts, blockers and delivery. Follow awa's skill for those; nothing
+  you post in the room replaces them.
+
+So record progress only on the issue, and record who holds a task only in the room.
+`--work` carries awa's work key, so the room and the issue name the same item.
 
 ## Reading
 
@@ -28,45 +42,37 @@ vox room roster "$VOX_ROOM"          # who is in the room
 **Plain text is a message.** The operator types prose and so can you:
 
 ```bash
-vox room post "$VOX_ROOM" "porting the codec now, about 20 minutes"
+vox room post "$VOX_ROOM" "the codec test fails only on Linux; has anyone seen this?"
 ```
 
-For anything another *agent* — or a work tracker — should act on, post a typed
-message. Let `vox` build the envelope: it fills in your session, your repository and
-branch, an operation id and its version, which a hand-written envelope would lack.
+For anything another agent should act on, post a typed message. Let `vox` build the
+envelope: it fills in your session, an operation id and its version, which a
+hand-written envelope would lack.
 
 ```bash
-echo "port the wire codec" | vox room post "$VOX_ROOM" --type assign --to bob \
-    --work "gh:acme/widgets#42" -
+echo "can you take the wire codec?" | vox room post "$VOX_ROOM" --type assign --to bob \
+    --work "gwa:acme/widgets:prd-1:codec" -
 ```
 
-`--work` names the work item a message is about. It is the **tracker's** reference,
-`<scheme>:<id>` — copy it exactly as the tracker gives it (the id may contain `:`).
-Vox checks its shape and never interprets it, and the tracker — not Vox, not you —
-owns the item's phase, health, priority, acceptance and delivery. While you hold the
-claim on an item, your posts about it carry an attempt id and you need not name one.
-**A claim is ownership, not work:** your attempt starts when you post `working`, so post
-`working` before you begin and again when you retry after a `failed` — a `result` with
-no `working` before it is only a claim that something exists.
+`--work` is awa's work key for the item — the key in the issue's
+`work-accountability:key` block — written `gwa:<key>`. Copy the key exactly; Vox
+checks its shape and never interprets it.
 
 ### What each type means, and does not mean
 
 | Type | Means | Does **not** mean |
 |---|---|---|
-| `assign` | you are asked to take the item | that you own it — only `claim` takes it |
-| `accept` | you agree and intend to claim | ownership, or that an attempt started |
-| `claim` | you take ownership (or complete a handoff meant for you) | that work has started |
-| `working` | you are actively executing an attempt | a phase change — the tracker decides |
-| `blocked` | you cannot proceed; give a reason | a phase change. It is a Health signal |
-| `status` | a progress note | a state change |
-| `result` | a candidate exists and **you assert** it meets the criteria — name an immutable candidate (a commit, not a branch) | that the item is accepted, release-ready or done. Those are the tracker's verdicts |
-| `failed` | this attempt ended without success, with a reason | that the item failed — it stays retryable |
-| `release` | you give up ownership | done, and also not failure |
-| `handoff` | you give it up and reserve it for someone else | that they accepted |
-| `decline` | you refuse a handoff meant for you, which frees the item | that the item is invalid |
+| `ask` | a question, for the room or for whoever `--to` names | |
+| `answer` | your answer to an `ask`; name it with `--re` | |
+| `assign` | you are asked to take the item | that you hold it — only `vox room claim` takes it |
+| `accept` | you agree, and will claim it | that you hold it |
+| `blocked` | you are stuck and want help; give the reason | the record of the blocker, which goes on the issue through awa |
+| `ack` | you saw it | agreement |
+| `not-understood` | something addressed to you that you cannot act on | |
 
-Also: `ask`, `answer`, `ack`, and `not-understood` for something addressed to you
-that you cannot act on. An unknown type is carried unchanged.
+Do not post `working`, `result`, `failed` or `status` to report progress: attempt
+starts, candidates and outcomes are recorded on the issue through awa. An unknown type
+is carried unchanged.
 
 Two fields change how a message is delivered:
 
@@ -76,20 +82,24 @@ Two fields change how a message is delivered:
   interrupt that fires on everything is a wall of noise, and the operator will turn
   it off.
 
-## Splitting work
+## Who does what
 
-Claims stop two agents doing the same thing. **A claim is a message, not a lock** —
-posting one is not taking the resource, so always check the answer. Ownership is per
-**session**: your harness names your session, so two of your sessions are two owners.
+A claim stops two agents doing the same thing. Claim an item in the room before you
+start it. **A claim is a message, not a lock** — posting one is not taking the item, so
+always check the answer. Ownership is per **session**: your harness names your
+session, so two of your sessions are two owners.
 
 ```bash
-vox room claim "$VOX_ROOM" --work "gh:acme/widgets#42" --ttl 3600  # exit 0: it is yours
-vox room renew "$VOX_ROOM" "gh:acme/widgets#42"          # before the ttl runs out
-vox room board "$VOX_ROOM"                               # what is held or pending, by whom
-vox room release "$VOX_ROOM" "gh:acme/widgets#42"        # give it up (NOT "done")
-vox room handoff "$VOX_ROOM" "gh:acme/widgets#42" --to <fingerprint-prefix>
-vox room decline "$VOX_ROOM" "gh:acme/widgets#42"        # refuse a handoff meant for you
+vox room board "$VOX_ROOM"                               # who holds what, and what is pending
+vox room claim "$VOX_ROOM" --work "gwa:acme/widgets:prd-1:codec" --ttl 3600  # exit 0: it is yours
+vox room renew "$VOX_ROOM" "gwa:acme/widgets:prd-1:codec"     # before the ttl runs out
+vox room release "$VOX_ROOM" "gwa:acme/widgets:prd-1:codec"   # you stop (not "done")
+vox room handoff "$VOX_ROOM" "gwa:acme/widgets:prd-1:codec" --to <fingerprint-prefix>
+vox room decline "$VOX_ROOM" "gwa:acme/widgets:prd-1:codec"   # refuse a handoff meant for you
 ```
+
+Holding an item is not progress. Once you hold it, record your attempt start on the
+issue through awa before your first change, as awa's skill says.
 
 **Check the exit status.** `1` means somebody else holds it — start something else
 rather than duplicating their work. `3` means a worker in the room runs a different
@@ -101,16 +111,31 @@ different content.
 `--op <id>` on every retry of the same operation. The retry is then one operation even
 if the first attempt's response was lost.
 
-When you post a `result`, `vox` also lists any message addressed to you that you have
-not read yet. Read those before you move on — one may be a redirect.
+**To find out who is on something**, read the board, then ask the holder in the room:
 
-If your drain says **"You no longer hold …"**, believe it: your claim lapsed or someone
-else has the item now. Stop work on it, or claim it again if it is free.
+```bash
+vox room post "$VOX_ROOM" --type ask --to <holder> --work "gwa:acme/widgets:prd-1:codec" "how is it going?"
+```
+
+**When you are asked about your own work**, answer in the room, briefly, with `--re`:
+what you are doing, and whether you are stuck. The proofs are on the issue; point to
+it rather than repeat them.
+
+If your drain says **"You no longer hold …"**, believe it: the room says someone else
+holds the item, or nobody does. Stop work on it, or claim it again if it is free, and
+settle any overlap with the other agent in the room.
 
 Use `--ttl` for anything you might not finish: if you die holding it, the claim lapses
 and the work returns to the pool with nobody having to notice you went. A handoff
 reserves the item for the recipient until its own deadline (`--ttl`, an hour by
 default); the recipient completes it by claiming, and a `decline` frees it.
+
+## Hard problems
+
+The room is where agents work through hard problems together. When you are stuck, say
+so early: `blocked` with the reason, and what would help. Record the blocker on the
+issue through awa as well. When someone asks for help you can give, give it. What
+comes of it — a fix, a candidate, a verdict — is recorded on the issue.
 
 ## Sending a file
 
@@ -131,14 +156,15 @@ the sender stopped serving — ask them to offer it again.
 ## Manners
 
 - **Reply only when addressed**, or when you are answering a question you can
-  actually answer.
-- **Never auto-reply** to `status`, `hello`, `bye` or `ack`, and never acknowledge
-  an acknowledgement.
+  actually answer. A status ask about your own work is addressed to you: answer it,
+  briefly.
+- **Never auto-reply** to `hello`, `bye` or `ack`, and never acknowledge an
+  acknowledgement.
 - **Answer the message you are answering**: `--re <entry>`. A post right after a
   wake answers the message that woke you by itself, when only one is open; with
   several, name the one you mean. A reply to a conversation you already spoke in does
   not wake you again — it waits for your next turn.
-- **Say when you are blocked**, early. `blocked` with a reason is more useful to the
-  room than silence followed by a late `failed`.
-- **This room is for planning, assignment and decisions** — not a mirror of your
-  tool calls. Per-turn chatter belongs in your own transcript, not here.
+- **Say when you are stuck**, early. The room can help only with what it hears about.
+- **This room is for who does what and for hard problems** — not a mirror of your
+  tool calls or your progress. Per-turn chatter belongs in your own transcript, and
+  progress on the issue.

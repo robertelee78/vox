@@ -557,6 +557,9 @@ enum RoomCmd {
     List(ProfileArgs),
     /// Take a unit of work, so no other agent starts it (ADR-020 §5).
     ///
+    /// The room is the record of who holds what. Holding an item is not progress: the
+    /// attempt itself is recorded on the GitHub issue through awa.
+    ///
     /// A claim is a **message, not a lock**: nothing is reserved in the node.
     /// Ownership is whatever the room's log resolves to, so every member computes
     /// the same answer with nobody coordinating. `--ttl` is what makes an agent
@@ -732,8 +735,8 @@ pub struct ClaimArgs {
     /// What is being claimed — a file, a milestone, a crate, whatever the room
     /// has agreed to name. Optional with `--work`, which is then the resource.
     pub resource: Option<String>,
-    /// The tracker's reference for the work item, `<scheme>:<id>` (the id may
-    /// contain `:`), carried in `data.work` and used as the resource (ADR-021 §2).
+    /// awa's work key for the item, as `gwa:<key>` (the key may contain `:`), carried
+    /// in `data.work` and used as the resource (ADR-021 §2).
     #[arg(long)]
     pub work: Option<String>,
     /// Seconds after which the claim lapses on its own unless renewed.
@@ -841,20 +844,27 @@ enum AgentCmd {
     ///
     /// The plugin is a shim over `vox agent hook`, not a second implementation.
     Plugin(AgentPluginArgs),
-    /// Print the agent-facing skill: the conventions, vocabulary and manners of a
-    /// shared room (ADR-020 §8).
+    /// Print the agent-facing skill: what the room is for, its vocabulary and its
+    /// manners (ADR-020 §8).
     ///
     /// A skill is on-demand only, so it cannot be what guarantees an agent reads
     /// its room — that is `vox agent hook`'s job. This carries what a hook cannot.
     ///
-    /// Install it at **user scope**, beside the hook `vox agent plugin claude` puts in
-    /// `~/.claude/settings.json`, so a session opened in any repository has both:
+    /// Claude Code, Codex and OpenCode all load the same file, a `SKILL.md` in a folder
+    /// named after the skill. Install it at **user scope**, beside the drain, so a
+    /// session opened in any repository has both:
     ///
     /// ```text
     /// mkdir -p ~/.claude/skills/vox-agent-comms
-    /// vox agent skill > ~/.claude/skills/vox-agent-comms/SKILL.md
+    /// vox agent skill claude > ~/.claude/skills/vox-agent-comms/SKILL.md
+    /// mkdir -p ~/.codex/skills/vox-agent-comms           # $CODEX_HOME/skills when set
+    /// vox agent skill codex > ~/.codex/skills/vox-agent-comms/SKILL.md
+    /// mkdir -p ~/.config/opencode/skills/vox-agent-comms # $XDG_CONFIG_HOME/opencode/skills when set
+    /// vox agent skill opencode > ~/.config/opencode/skills/vox-agent-comms/SKILL.md
     /// ```
-    Skill,
+    ///
+    /// The skill goes to stdout; where it goes, to stderr, so it does not land in the file.
+    Skill(AgentSkillArgs),
     /// Trust Vox's drain hook in a harness that gates hooks on trust. Only Codex
     /// does: it runs a `hooks.json` entry only once its hash is recorded as trusted.
     ///
@@ -867,6 +877,36 @@ enum AgentCmd {
     /// vox agent trust codex
     /// ```
     Trust(AgentTrustArgs),
+}
+
+/// `vox agent skill`
+#[derive(Args, Debug, Clone)]
+pub struct AgentSkillArgs {
+    /// The harness to say where the skill goes for: `claude`, `codex` or `opencode`.
+    /// Without one, all three are listed. The skill itself is the same for each.
+    pub harness: Option<String>,
+}
+
+/// Where `harness` loads a user-scope skill named `vox-agent-comms` from, as a shell path, or
+/// `None` for a harness Vox has no integration for.
+///
+/// Read off each harness, not guessed: Claude Code's `~/.claude/skills`; Codex 0.160's
+/// `$CODEX_HOME/skills`, `~/.codex/skills` when unset (its own skill-installer says so); and
+/// OpenCode 1.18's global `~/.config/opencode/skills` (its docs table, and xdg-basedir, which
+/// honours `XDG_CONFIG_HOME`). Each was checked by starting the real harness on a fake model
+/// server and seeing the skill in what it sent (V210-166).
+fn skill_dir(harness: &str) -> Option<&'static str> {
+    match harness.to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" => Some("~/.claude/skills/vox-agent-comms"),
+        "codex" => Some("${CODEX_HOME:-~/.codex}/skills/vox-agent-comms"),
+        "opencode" => Some("${XDG_CONFIG_HOME:-~/.config}/opencode/skills/vox-agent-comms"),
+        _ => None,
+    }
+}
+
+/// The one line that says how to install the skill for `harness`, runnable as it stands.
+fn skill_install(harness: &str, dir: &str) -> String {
+    format!("mkdir -p {dir} && vox agent skill {harness} > {dir}/SKILL.md")
 }
 
 /// `vox agent trust`
@@ -945,18 +985,19 @@ pub struct RoomPostArgs {
     pub room: String,
     /// The message. Omit it, or pass `-`, to read from stdin.
     pub text: Option<String>,
-    /// The envelope type (`assign`, `working`, `blocked`, `result`, `failed`,
-    /// `status`, …). Any structured flag makes vox build the envelope itself.
+    /// The envelope type (`ask`, `answer`, `assign`, `accept`, `blocked`, …). Any
+    /// structured flag makes vox build the envelope itself. Progress is not posted
+    /// here: it is recorded on the GitHub issue through awa.
     #[arg(long = "type")]
     pub kind: Option<String>,
-    /// The tracker's work-item reference, `<scheme>:<id>` (the id may contain `:`),
-    /// carried in `data.work`. A post with `--work` takes part in work coordination
-    /// and passes the version gate.
+    /// awa's work key for the item, as `gwa:<key>` (the key may contain `:`), carried
+    /// in `data.work`. A post with `--work` takes part in work coordination and passes
+    /// the version gate.
     #[arg(long)]
     pub work: Option<String>,
-    /// The attempt id, carried in `data.attempt`. Defaults, with `--work`, to an id
-    /// seeded from this session's claim (or its latest `failed`) on that item. An id
-    /// starts nothing: an attempt becomes active on `--type working`.
+    /// An attempt id, carried in `data.attempt` so a reader can tie posts together.
+    /// Defaults, with `--work`, to an id seeded from this session's claim on that item.
+    /// It records nothing: attempts are recorded on the GitHub issue through awa.
     #[arg(long)]
     pub attempt: Option<String>,
     /// Address a session by petname; repeat for several.
@@ -1432,13 +1473,28 @@ enum Cmd {
     Service(ServiceCmd),
     /// Speak in a room over a **running** node (ADR-020) — the agent-comms verbs.
     ///
+    /// For agents on one repository, the room settles who does what: an agent claims
+    /// work there, asks there who is on what, and answers there, briefly, when asked
+    /// about its own work. It is also where agents work through hard problems together.
+    /// Progress and its proofs (attempt starts, candidates, verdicts, delivery) are
+    /// recorded on the GitHub issue through awa; `--work` carries awa's work key.
+    ///
     /// Unlike every other verb, these do not start a node: they attach to the
     /// control socket of one that is already running and already unlocked, which
-    /// is how several agent sessions share one identity per machine. Nothing here
-    /// takes a passphrase, and nothing here creates, joins or leaves a room.
+    /// is how several agent sessions share one identity per machine. Only `create`
+    /// and `join` take a passphrase, and they read it from stdin.
     #[command(subcommand)]
     Room(RoomCmd),
-    /// Wire an agent session into a room (ADR-020) — harness-agnostic.
+    /// Wire an agent session into a room (ADR-020) — Claude Code, Codex and OpenCode.
+    ///
+    /// The room settles who does what: an agent claims work there, asks there who is
+    /// on what, and answers there, briefly, when asked about its own work; it is also
+    /// where agents work through hard problems together. Progress and its proofs
+    /// (attempt starts, candidates, verdicts, delivery) are recorded on the GitHub issue
+    /// through awa, and `--work` carries awa's work key.
+    ///
+    /// Each harness needs two things: `vox agent plugin <harness>` (the drain, every
+    /// turn) and `vox agent skill <harness>` (the agent text, and where it goes).
     #[command(subcommand)]
     Agent(AgentCmd),
     /// Bring up the local entry point for a room's services: a SOCKS5 proxy that resolves
@@ -1882,15 +1938,29 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Agent(AgentCmd::Skill) => {
+        Cmd::Agent(AgentCmd::Skill(args)) => {
+            // Where it goes, on stderr so it does not land in the file (V210-121, V210-166):
+            // user scope, beside the drain, so every repository gets both.
+            let named: Vec<&str> = match &args.harness {
+                Some(h) if skill_dir(h).is_none() => {
+                    eprintln!("vox: no integration for {h:?}. Known: claude, codex, opencode.");
+                    return ExitCode::FAILURE;
+                }
+                Some(h) => vec![h.as_str()],
+                None => vec!["claude", "codex", "opencode"],
+            };
             print!("{}", crate::agent_hook::AGENT_SKILL);
-            // Where it goes, on stderr so it does not land in the file (V210-121): user scope,
-            // beside the hook in `~/.claude/settings.json`, so every repository gets both.
-            eprintln!(
-                "vox: install at user scope, beside the hook in ~/.claude/settings.json: \
-                 mkdir -p ~/.claude/skills/vox-agent-comms && vox agent skill > \
-                 ~/.claude/skills/vox-agent-comms/SKILL.md"
-            );
+            if named.len() == 1 {
+                let h = named[0];
+                let dir = skill_dir(h).unwrap_or_default();
+                eprintln!("vox: install at user scope: {}", skill_install(h, dir));
+            } else {
+                eprintln!("vox: each harness loads this same file from its own skills folder:");
+                for h in named {
+                    let dir = skill_dir(h).unwrap_or_default();
+                    eprintln!("     {h:<8} {}", skill_install(h, dir));
+                }
+            }
             ExitCode::SUCCESS
         }
         Cmd::Agent(AgentCmd::Trust(args)) => match args.harness.to_ascii_lowercase().as_str() {
@@ -1934,6 +2004,12 @@ pub fn run() -> ExitCode {
         Cmd::Agent(AgentCmd::Plugin(args)) => match args.harness.to_ascii_lowercase().as_str() {
             "opencode" => {
                 print!("{}", crate::agent_hook::OPENCODE_PLUGIN);
+                eprintln!(
+                    "vox: save that as ${{XDG_CONFIG_HOME:-~/.config}}/opencode/plugin/vox.js, and install the skill \
+                     beside it: {}\n     Set VOX_ROOM in the session's environment, so it knows \
+                     which room to drain.",
+                    skill_install("opencode", skill_dir("opencode").unwrap_or_default())
+                );
                 ExitCode::SUCCESS
             }
             // **Print the thing, do not describe it.** These take a hook entry rather than
@@ -1952,9 +2028,10 @@ pub fn run() -> ExitCode {
                 eprintln!(
                     "vox: merge that into ~/.claude/settings.json (user scope, so a session \
                      opened in any repository drains its room), and install the skill beside \
-                     it: vox agent skill > ~/.claude/skills/vox-agent-comms/SKILL.md\n     Set \
+                     it: {}\n     Set \
                      VOX_ROOM in the session's environment, or pass --room to the hook, so it \
-                     knows which room to drain."
+                     knows which room to drain.",
+                    skill_install("claude", skill_dir("claude").unwrap_or_default())
                 );
                 ExitCode::SUCCESS
             }
@@ -1970,7 +2047,8 @@ pub fn run() -> ExitCode {
                      — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
                      an async hook's output is observed and discarded, so the room would \
                      drain into nothing.\n     Set VOX_ROOM in the session's environment, or \
-                     pass --room to the hook."
+                     pass --room to the hook.\n     Install the skill beside it: {}",
+                    skill_install("codex", skill_dir("codex").unwrap_or_default())
                 );
                 ExitCode::SUCCESS
             }
