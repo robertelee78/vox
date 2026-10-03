@@ -25,9 +25,18 @@
 //! (staging); each wait says which it is. The test's own processes, files, ports, runtime and
 //! its subscriber on alice's socket are APPARATUS.
 //!
+//! **Proof 5 (a late member, V210-138):** the room keeps 30 s; ten messages expire on both
+//! members, so every copy of them left is a skeleton. A third member then joins: it must read the
+//! author's next post within [`LATE_BOUND`] of its join, show none of the ten, and show nothing as
+//! not received yet — it waits on no body that no member can supply. Its feed of the author starts
+//! at those skeletons, so a node that sets a skeleton aside never gets past them. The other side
+//! of V210-138, a body stripped from a live entry still owed and asked for, is
+//! `a_hostile_entry_does_not_stop_a_room_proof`'s stripped arm.
+//!
 //! Mutations (each run, each red): the sweep disabled; a reload that refuses a pruned entry; the
 //! node's own retention ignored; the node's retention winning whenever it is set (so a node
-//! keeping more than its room keeps more); the arrival check removed.
+//! keeping more than its room keeps more); the arrival check removed; a payload-less entry set
+//! aside as v0.2.10 did (Withheld, still owed), which turns proof 5 red.
 
 #![cfg(unix)]
 
@@ -42,6 +51,8 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
+/// How long after its join a late member may take to read the author's next post (proof 5).
+const LATE_BOUND: Duration = Duration::from_secs(60);
 
 /// A `vox daemon`, killed by its own PID when dropped.
 struct Daemon(Child);
@@ -577,5 +588,123 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
         announced, 1,
         "PRODUCT: a message that arrives already expired must never be rendered: alice's syncs \
          rendered {announced} rows where only `fresh` was live"
+    );
+}
+
+#[test]
+#[ignore = "real vox daemons and real seconds (about two minutes); CI runs it in release"]
+fn a_member_who_joins_after_messages_expired_catches_up() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
+    let (alice, bob) = pair(tmp.path());
+    let _alice_d = daemon(&alice, "alice", &format!("{IDENTITY}\n"));
+    attached(&alice, "alice");
+    let _bob_d = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
+    attached(&bob, "bob");
+    let room = room(&alice, &bob);
+    let (ok, out, err) = vox(&alice, &["room", "retention", &room, "30"], None);
+    assert!(ok, "PRODUCT (staging): vox room retention 30: {err}");
+    println!("{}", out.trim());
+
+    // ---- ten messages expire on both members: what is left of them anywhere is a skeleton ----
+    for i in 1..=10 {
+        post(&alice, &room, &format!("old {i}"));
+    }
+    until(
+        &bob,
+        &room,
+        "PRODUCT (staging): bob to read the 10",
+        60,
+        |t| count(t, "old ") == 10,
+    );
+    let posted = Instant::now();
+    for (dir, who) in [(&alice, "alice"), (&bob, "bob")] {
+        until(
+            dir,
+            &room,
+            &format!("PRODUCT (staging): {who} to expire the 10"),
+            90,
+            |t| count(t, "old ") == 0,
+        );
+    }
+    println!(
+        "the 10 expired on alice and bob {} s after they were posted",
+        posted.elapsed().as_secs()
+    );
+
+    // ---- carol joins late ----------------------------------------------------------------
+    let carol = tmp.path().join("c");
+    std::fs::create_dir_all(carol.join("cfg")).expect("APPARATUS: carol's profile directory");
+    let fp = |dir: &Path| {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
+        out.trim().to_owned()
+    };
+    let (alice_fp, carol_fp) = (fp(&alice), fp(&carol));
+    for (dir, other, name) in [(&alice, &carol_fp, "carol"), (&carol, &alice_fp, "alice")] {
+        let (ok, _, err) = vox(dir, &["trust", "add", other, "--name", name], None);
+        assert!(ok, "PRODUCT (staging): vox trust add {name}: {err}");
+    }
+    let _carol_d = daemon(&carol, "carol", &format!("{IDENTITY}\n"));
+    attached(&carol, "carol");
+    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, _, err) = vox(
+        &carol,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "r",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): carol's late join failed: {err}");
+    let joined = Instant::now();
+
+    // ---- she reaches the author's next post, past the skeletons --------------------------
+    // Alice posts until carol reads one: what a newcomer can read starts when the author's key
+    // reaches her, and each post follows the ten in alice's feed.
+    let mut n = 0;
+    let caught_up = loop {
+        n += 1;
+        post(&alice, &room, &format!("fresh {n}"));
+        std::thread::sleep(Duration::from_millis(500));
+        if count(&read(&carol, &room), "fresh ") > 0 {
+            break Some(joined.elapsed());
+        }
+        if joined.elapsed() > LATE_BOUND {
+            break None;
+        }
+    };
+    let shown = read(&carol, &room);
+    let owed = shown
+        .iter()
+        .filter(|t| t.as_str() == vox_core::node::api::NOT_RECEIVED_YET)
+        .count();
+    println!(
+        "carol, joined after the 10 expired: reads alice's next post at {caught_up:?} after her \
+         join ({n} posted); shows {} of the 10, and {owed} rows as not received yet",
+        count(&shown, "old ")
+    );
+    assert!(
+        caught_up.is_some(),
+        "PRODUCT: carol never read alice's next post within {LATE_BOUND:?} of joining: a member \
+         who joins after messages expired is held at their skeletons. She shows {shown:?}\n\
+         carol's daemon said: {}",
+        std::fs::read_to_string(carol.join("daemon-carol.err")).unwrap_or_default()
+    );
+    assert_eq!(
+        count(&shown, "old "),
+        0,
+        "PRODUCT: carol shows messages that expired before she joined"
+    );
+    assert_eq!(
+        owed, 0,
+        "PRODUCT: carol shows {owed} expired messages as not received yet: she waits on bodies no \
+         member can supply"
     );
 }

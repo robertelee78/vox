@@ -452,6 +452,25 @@ fn notify_off_raises_nothing() {
             .expect("APPARATUS: write alice's config");
     });
     std::thread::sleep(Duration::from_secs(2));
+    // alice's status lines about bob, from her `vox status --json`.
+    let about_bob = || -> Vec<Value> {
+        status(&alice_dir)["unhealthy"]
+            .as_array()
+            .map(|u| {
+                u.iter()
+                    .filter(|l| l["key"].as_str().is_some_and(|k| k.contains(&bob_id)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // R35, as `ops_status_proof` asserted before it went in a1d01323 (#227): a peer that is up
+    // is not flagged, and a peer that died is flagged as unreachable.
+    let while_up = about_bob();
+    assert!(
+        while_up.is_empty(),
+        "PRODUCT: bob is up, so alice's status must not flag him: {while_up:?}"
+    );
     let _ = bob.child.kill();
     let _ = bob.child.wait();
     // Until the condition is certainly flagged — status shows it — and one check more.
@@ -459,12 +478,15 @@ fn notify_off_raises_nothing() {
     wait_until(
         "alice's status to flag bob",
         Duration::from_secs(150),
-        || {
-            status(&alice_dir)["unhealthy"].as_array().is_some_and(|u| {
-                u.iter()
-                    .any(|l| l["key"].as_str().is_some_and(|k| k.contains(&bob_id)))
-            })
-        },
+        || !about_bob().is_empty(),
+    );
+    let flagged = about_bob();
+    eprintln!("alice's status about bob once he died: {flagged:?}");
+    assert!(
+        flagged.iter().any(|l| l["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unreachable") && m.contains(&short))),
+        "PRODUCT: alice's status must say bob ({short}) is unreachable: {flagged:?}"
     );
     std::thread::sleep(Duration::from_secs(11));
     let lines = notes(&file);

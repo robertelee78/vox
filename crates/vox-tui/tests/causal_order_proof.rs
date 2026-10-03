@@ -18,18 +18,19 @@
 //! `VOX_TEST_CLOCK_SKEW_MS`, read by the shipped binary's millisecond clock). A member posts a
 //! question; the replier reads it and answers. On every node the answer is ordered after the
 //! question — although its claimed time is an hour earlier, which the gate reads back from the
-//! replier's own store so the skew is proven to have reached the entry.
+//! replier's own `vox room read --json` so the skew is proven to have reached the entry.
 //!
 //! **Proof 3 (a clock far ahead):** a member's clock is a day ahead. It posts; another member
 //! reads that post and then writes. The later post names the day-ahead one in `seen`, so without a
 //! cap it would be placed a day in the future, and so would everything after it. The gate reads
 //! each entry's placing clock from `vox room read --hashes`. It asserts the later post is placed
 //! less than 15 minutes ahead of when it was written, still after what it saw. It also reads the
-//! day-ahead claim back from the author's store.
+//! day-ahead claim back from `vox room read --json`.
 //!
 //! Mutations (each run, each red): `seen` ignored when ordering (proof 2); the cap removed
-//! (proof 3). Arrival order has no mutation of its own here: it was `one_order_gate`'s, an
-//! in-process gate deleted with the rest (#227).
+//! (proof 3); the order taken from arrival, the order each node stored the entries in (proof 1:
+//! the three nodes print three sequences). The last was `one_order_gate`'s, an in-process gate
+//! deleted with the rest (#227).
 //!
 //! **Proof 1 was intermittently red on v0.2.8, and not for the order** (#228). In about half of runs
 //! the second joiner of three daemons was cut off from the first post onward: 5 red of 9. Each red
@@ -109,39 +110,24 @@ fn stop_all(daemons: Vec<Daemon>) {
     assert_eq!(gone, n, "PRODUCT: a daemon outlived its test");
 }
 
-/// The claimed times of `question` and `answer` (entry hashes as `vox` prints them) as stored
-/// in a **stopped** node's own copy of the room — read back so the gate knows the skew reached
-/// the signed entry rather than assuming it did.
-fn claimed_times(dir: &Path, question: &str, answer: &str) -> (u64, u64) {
-    let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
-        .expect("APPARATUS: resolve the profile's paths");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut profile = loop {
-        match vox_core::node::profile::Profile::open(paths.clone()) {
-            Ok(p) => break p,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
-            Err(e) => panic!("PRODUCT (staging): the store did not open: {e:?}"),
-        }
-    };
-    profile
-        .unlock(IDENTITY.as_bytes())
-        .expect("PRODUCT (staging): unlock");
-    let cid = profile
-        .store()
-        .channels()
-        .expect("PRODUCT (staging): the stopped store lists no rooms")[0];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("APPARATUS: the system clock")
-        .as_secs();
-    let ch = vox_core::node::channel::ChannelState::open(&profile, &cid, ROOMPASS.as_bytes(), now)
-        .expect("PRODUCT (staging): open the room");
+/// The claimed times of `question` and `answer` (entry hashes as `vox` prints them), as the
+/// node in `dir` holds them: `created_millis` in its `vox room read --json` rows, read back so
+/// the gate knows the skew reached the signed entry rather than assuming it did.
+fn claimed_times(dir: &Path, room: &str, question: &str, answer: &str) -> (u64, u64) {
+    let (ok, out, err) = vox(dir, &["room", "read", room, "--json"], None);
+    assert!(ok, "PRODUCT (staging): vox room read --json: {err}");
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| {
+            serde_json::from_str(l)
+                .unwrap_or_else(|e| panic!("PRODUCT: a `vox room read --json` row ({e}): {l}"))
+        })
+        .collect();
     let find = |h: &str| {
-        ch.timeline()
-            .iter()
-            .find(|r| vox_core::node::link::b32_encode(&r.entry_hash) == h)
-            .unwrap_or_else(|| panic!("PRODUCT: the stopped store lacks {h}"))
-            .created_millis
+        rows.iter()
+            .find(|r| r["entry_hash"] == h)
+            .and_then(|r| r["created_millis"].as_u64())
+            .unwrap_or_else(|| panic!("PRODUCT: `vox room read --json` shows no {h} with its time"))
     };
     (find(question), find(answer))
 }
@@ -647,11 +633,11 @@ fn a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind() {
         }
     }
 
-    // The skew really reached the entry: read bob's own store, stopped, for both claimed times.
+    // The skew really reached the entry: bob's own node shows both claimed times.
+    let (q_ms, a_ms) = claimed_times(bob, &room, &q, &a);
     stop_all(vec![bob_d]);
-    let (q_ms, a_ms) = claimed_times(bob, &q, &a);
     println!(
-        "bob's store: the answer claims {} ms, the question {} ms: {} min earlier",
+        "bob's node: the answer claims {} ms, the question {} ms: {} min earlier",
         a_ms,
         q_ms,
         (q_ms as i64 - a_ms as i64) / 60_000
@@ -756,11 +742,11 @@ fn a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward() {
         );
     }
 
-    // The skew really reached the entry: bob's stored claimed time is a day ahead.
+    // The skew really reached the entry: the claimed time bob's node shows is a day ahead.
+    let (t_ms, a_ms) = claimed_times(bob, &room, &tomorrow, &after);
     stop_all(vec![bob_d]);
-    let (t_ms, a_ms) = claimed_times(bob, &tomorrow, &after);
     println!(
-        "bob's store: `from tomorrow` claims {} min from when `after it` was written, `after it` \
+        "bob's node: `from tomorrow` claims {} min from when `after it` was written, `after it` \
          {} min",
         minutes(t_ms),
         minutes(a_ms)
