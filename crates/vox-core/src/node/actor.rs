@@ -49,7 +49,7 @@ use crate::node::status::PublishCause;
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
-/// A pairwise session this node opened (ADR-021 F12).
+/// A pairwise session this node opened (ADR-004 O2, O3).
 #[derive(Debug, Clone)]
 struct Initiated {
     /// The hello that lets the peer accept it; `None` for a session opened on the join
@@ -61,7 +61,7 @@ struct Initiated {
     hello_delivered: bool,
 }
 
-/// **Which of two competing sessions for one pair both ends keep** (ADR-021 F12): the
+/// **Which of two competing sessions for one pair both ends keep** (ADR-004 O2): the
 /// one opened by the lower fingerprint. Two members that opened a session to each other
 /// at the same moment each hold their own; both apply this rule and so keep the same
 /// one. `existing_mine` says whether the session already held was opened by `me`; the
@@ -1009,7 +1009,7 @@ enum NetEvent {
         /// The member.
         peer: Digest32,
     },
-    /// A hello offered again with an `Open` behind it (ADR-021 F12) could not be written: it is
+    /// A hello offered again with an `Open` behind it (ADR-004 O3) could not be written: it is
     /// offered again.
     ReopenUndelivered {
         /// The room.
@@ -1743,7 +1743,7 @@ enum AfterWrite {
         /// The `Node::delivery_epoch` it was counted in flight in (V210-88).
         epoch: u64,
     },
-    /// The stream offered a hello again with an `Open` behind it (ADR-021 F12).
+    /// The stream offered a hello again with an `Open` behind it (ADR-004 O3).
     Reopen,
 }
 
@@ -3803,7 +3803,7 @@ pub struct Node {
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
     key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
-    /// Set when this node adopted a peer's session over its own (ADR-021 F12): what it owes that
+    /// Set when this node adopted a peer's session over its own (ADR-004 O3): what it owes that
     /// peer goes out as soon as the stream that carried the hello is answered, not on the tick.
     redeliver_now: bool,
     /// Per `(room, member)`: a member that has just handed over a generation new to us, so is
@@ -3834,7 +3834,7 @@ pub struct Node {
     /// re-establishes a session on the next join or key exchange.
     sessions: BTreeMap<(Digest32, Digest32), crate::pairwise::session::Session>,
     /// The sessions in [`Self::sessions`] that **this node opened**, and whether the
-    /// peer has been sent the hello that lets it accept them (ADR-021 F12).
+    /// peer has been sent the hello that lets it accept them (ADR-004 O2, O3).
     ///
     /// Two members can open a session to each other at the same moment — both
     /// auto-consent when they trust each other, and each finds no session and opens
@@ -7453,7 +7453,7 @@ impl Node {
         if let Some(net) = self.net.as_ref() {
             net.policy().forget_joiner(&peer);
         }
-        // **Consent at admission, not on the tick** (ADR-021 F12). A room is ForwardOnly:
+        // **Consent at admission, not on the tick** (ADR-007 G-15a). A room is ForwardOnly:
         // a newcomer reads only what is sealed after the key is released to it. With the
         // joiner already in this node's trust ring, leaving the release to the next tick
         // opened a window in which anything this node posted was unreadable to the
@@ -10881,7 +10881,7 @@ impl Node {
             if self.accepted_hello.get(&key) == Some(&hello_hash) {
                 return true;
             }
-            // **Two sessions for one pair** (ADR-021 F12). Keep the one both ends will
+            // **Two sessions for one pair** (ADR-004 O2). Keep the one both ends will
             // keep. It used to keep whichever it held, and so did the peer — each kept its
             // own, and neither could open the key the other sent.
             let me = self.profile.as_ref().map(|p| p.fingerprint());
@@ -10961,7 +10961,7 @@ impl Node {
     }
 
     /// Forget that `peer` holds this identity's current sender key in `channel_id`, so
-    /// the next re-key round delivers it again (ADR-021 F12).
+    /// the next re-key round delivers it again (ADR-004 O4).
     async fn forget_delivery(&mut self, channel_id: &Digest32, peer: &Digest32) {
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
@@ -10979,7 +10979,7 @@ impl Node {
 
     /// File the session a join just established — `mine` when this node was the joiner,
     /// which opened it — applying the same rule as [`Self::accept_hello`] when a session
-    /// for that pair already exists (ADR-021 F12).
+    /// for that pair already exists (ADR-004 O2).
     ///
     /// A join can race an auto-consent: the member answering a join may, on its own
     /// tick, have already opened a session to the joiner from its bundle record, because
@@ -11034,7 +11034,7 @@ impl Node {
     }
 
     /// Offer this node's hello again to every peer that kept a competing session
-    /// (ADR-021 F12), with the empty ratchet message behind it that gives the peer a
+    /// (ADR-004 O3), with the empty ratchet message behind it that gives the peer a
     /// sending direction — so it adopts the session both ends will keep even when this
     /// node owes it nothing else.
     async fn deliver_reopens(&mut self) {

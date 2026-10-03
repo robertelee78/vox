@@ -106,6 +106,9 @@ only room governance is who sets the room's retention. This builds on identity (
      empty plaintext, so the responder gains a sending chain and receives no key and no grant.
   3. Each member `A` decides whether `N` reads `A`, by trusting `N`. Until `A` does, `A`'s messages stay
      unreadable to `N`. `N`'s view fills in monotonically, per sender.
+- **G-15a. Release at admission.** When a joiner is already in a member's trust keyring, that member
+  MUST release its sender key to the joiner when it admits the join, not on a later tick: the room is
+  forward-only, so anything sealed before the release would stay unreadable to the joiner for good.
 - **G-16.** A grant MUST record what it released (`history_mode_at_grant`): the granting owner's choice
   per grant (ADR-006 S-18), never another member's history.
 - **G-17.** Log authorship and read authority MUST stay separate: `admit_author` records a verified key

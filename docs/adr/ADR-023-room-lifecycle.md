@@ -274,7 +274,7 @@ Each proof drives the shipped `vox` binary and has a mutation that turns it red 
    checkpoint follows a quiet room; an expired backlog is checkpointed without another prune.
    `crates/vox-tui/tests/checkpoint_proof.rs`.
 
-The F12 delivery proofs stay as proofs of the direct path:
+The ADR-004 O2–O4 delivery proofs stay as proofs of the direct path:
 `crates/vox-tui/tests/room_of_three_keys_proof.rs`, `cross_process_join_proof.rs`,
 `trust_before_join_proof.rs`.
 
