@@ -493,3 +493,125 @@ fn a_daemon_on_an_empty_root_starts_with_no_node() {
         said()
     );
 }
+
+/// ADR-026 L-3: a detach is done only when the node's keys are wiped and its directory let go.
+/// A room seal still working (staged to take 12 s) holds the node's stop; the last session's
+/// `SessionEnd`, which detaches the node, answers only after the seal ends, never at the daemon's
+/// 5 s stop patience, and the daemon answers other clients meanwhile.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release"]
+fn a_detach_answers_only_after_the_seal_in_flight_ends() {
+    const SEAL_MS: u64 = 12_000;
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("agent");
+    let knob = ("VOX_TEST_SECRET_WORK_DELAY_MS", SEAL_MS.to_string());
+    let run = |args: &[&str], stdin: &str| {
+        let mut child = a
+            .cmd(args)
+            .env(knob.0, &knob.1)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let hook = |event: &str| {
+        run(
+            &["agent", "hook", "--node", "agent"],
+            &format!(r#"{{"hook_event_name":"{event}","session_id":"s-1"}}"#),
+        )
+    };
+    // The session attaches the node (its unlock is held by the knob too).
+    let (ok, out, err) = hook("UserPromptSubmit");
+    assert!(
+        ok && !out.contains("could not read your rooms"),
+        "PRODUCT (staging): the hook did not attach its node: {out}{err}\nlog:\n{}",
+        a.log()
+    );
+    let pid = a
+        .lock_pid()
+        .expect("PRODUCT (staging): no daemon holds the lock");
+    std::thread::scope(|s| {
+        let seal = s.spawn(|| {
+            let r = run(
+                &[
+                    "room",
+                    "create",
+                    "--profile",
+                    "agent",
+                    "--passphrase-file",
+                    "-",
+                    "--name",
+                    "r",
+                ],
+                ROOM_PASS,
+            );
+            (r, Instant::now())
+        });
+        // The seal has started.
+        std::thread::sleep(Duration::from_secs(1));
+        let t0 = Instant::now();
+        let probe = s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(500));
+            let t = Instant::now();
+            let r = a.run(&["daemon", "--detach"], "");
+            (r, t.elapsed())
+        });
+        let end = hook("SessionEnd");
+        let ended_at = Instant::now();
+        let took = t0.elapsed();
+        let ((created, made_at), (probe_r, probe_took)) =
+            (seal.join().unwrap(), probe.join().unwrap());
+        eprintln!(
+            "[proof] SessionEnd (the detach) answered after {:.2} s; the seal's room create ok={}; \
+             a client probe answered in {:.3} s; the create said {:?}",
+            took.as_secs_f64(),
+            created.0,
+            probe_took.as_secs_f64(),
+            created.2.trim()
+        );
+        assert!(
+            end.0,
+            "PRODUCT (staging): the SessionEnd hook failed: {end:?}"
+        );
+        assert!(
+            took >= Duration::from_millis(SEAL_MS - 3_000) && made_at <= ended_at,
+            "PRODUCT: the detach answered after {:.2} s, before the {} s seal in flight ended \
+             (room create ok={}), so the room's passphrase could still be in the daemon's memory \
+             (ADR-026 L-3)\nlog:\n{}",
+            took.as_secs_f64(),
+            SEAL_MS / 1000,
+            created.0,
+            a.log()
+        );
+        assert!(
+            probe_r.0
+                && probe_r.1.contains("already running")
+                && probe_took < Duration::from_secs(3),
+            "PRODUCT: while a node detached, the daemon stopped answering other clients: \
+             {probe_r:?} after {probe_took:?}"
+        );
+    });
+    assert!(
+        a.log()
+            .lines()
+            .any(|l| l.starts_with("vox daemon: node agent detached (its last holder went)")),
+        "PRODUCT: the detach was not said\nlog:\n{}",
+        a.log()
+    );
+    // Idle now: the daemon the hook started leaves.
+    assert!(
+        wait_until(Duration::from_secs(10), || !alive(pid)),
+        "PRODUCT: the daemon did not leave once idle\nlog:\n{}",
+        a.log()
+    );
+}
