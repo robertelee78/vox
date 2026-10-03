@@ -109,7 +109,7 @@ try:
         if not until(lambda: run(w, "room", "list").returncode == 0, 60):
             product(f"{w}'s daemon never answered `vox room list` within 60 s: " + open(f"{S}/{w}.err").read())
     stage("room create, invite, join")
-    c = run("alice", "room", "create", "--name", "m", stdin="room pass")
+    c = run("alice", "room", "create", "--passphrase-file", "-", "--name", "m", stdin="room pass")
     if c.returncode != 0: product(f"alice's `vox room create` failed: {c.stderr.strip()}")
     listed = run("alice", "room", "list")
     if not listed.stdout.split(): product(f"alice's `vox room list` shows no room after create: {listed.stderr.strip()}")
@@ -118,7 +118,7 @@ try:
     if inv.returncode != 0: product(f"alice's `vox room invite` failed: {inv.stderr.strip()}")
     link = inv.stdout.strip()
     for w in ("bob", "carol"):
-        j = run(w, "room", "join", link, "--name", "m", stdin="room pass")
+        j = run(w, "room", "join", "--passphrase-file", "-", link, "--name", "m", stdin="room pass")
         if j.returncode != 0: product(f"{w}'s `vox room join` failed: {j.stderr.strip()}")
     t = run("bob", "trust", "add", fp["alice"], "--name", "alice", "--identity-passphrase-file", f"{S}/idpass")
     if t.returncode != 0: product(f"bob's `vox trust add` failed: {t.stderr.strip()}")
