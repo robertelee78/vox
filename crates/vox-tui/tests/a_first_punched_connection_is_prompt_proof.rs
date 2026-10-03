@@ -36,8 +36,11 @@
 //! answered, but not one payload byte peer to peer — or the emulator leaks and this proof reports
 //! APPARATUS.
 //!
-//! **The mutation that must turn it red:** drop the punch rung from `NodeNet::upgrade` (no
-//! coordinator is asked). The pair is answered over the circuit and never reaches a direct path.
+//! **The mutation that must turn it red:** no punch fires at all (`coordstream::execute_punch`
+//! returning at once). The pair is answered over the circuit and never reaches a direct path
+//! (measured: 10 of 10 never within 10 s, every request answered over the circuit in under
+//! 250 ms). Dropping only `NodeNet::upgrade`'s punch rung no longer does: the reach's own
+//! dial-back punch (`NodeNet::reach`) still takes the pair direct.
 //!
 //! **What it found.** On integrate/v0.2.10 39c3884 no sample ever punched: the anchor, on a
 //! dual-stack socket, reports the host's view of the guest as `::ffff:127.0.0.1:…`, and the host's
