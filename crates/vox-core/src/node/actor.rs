@@ -371,6 +371,7 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::OpenChannel { .. } => "opening a room",
         NodeCommand::SendText { .. } => "sending a message",
         NodeCommand::Sync { .. } => "syncing",
+        NodeCommand::Agree { .. } => "asking members to agree on a claim",
         NodeCommand::Consent { .. } => "consenting to a member",
         NodeCommand::Revoke { .. } => "revoking a member",
         NodeCommand::Serve { .. } => "publishing a service",
@@ -420,6 +421,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
         NetEvent::LockSettled => "answering a lock that has settled",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
+        NetEvent::AgreeAsk { .. } => "answering whether this node holds a member's claim",
+        NetEvent::AgreeFetch { .. } => "pulling what members hold for a claim's agreement",
         NetEvent::HandshakesQueued { .. } => "saying how a burst of connection attempts went",
         NetEvent::Stopped { .. } => "shutting the network down",
     }
@@ -1038,6 +1041,25 @@ enum NetEvent {
         /// sender answers too — the slot must never wait on an actor that has moved on.
         ack: tokio::sync::oneshot::Sender<()>,
     },
+    /// Another member asks whether this node holds a post it made, and which posts of some
+    /// `type`s this node holds (V210-168). The actor checks the room and the member at once; a
+    /// task waits for the post and answers.
+    AgreeAsk {
+        /// The member asking.
+        peer: Digest32,
+        /// Its question.
+        ask: crate::node::agreestream::Ask,
+        /// The stream's send half.
+        send: quinn::SendStream,
+    },
+    /// An agreement round needs posts these members hold and this node does not: sync the room
+    /// with them now (V210-168).
+    AgreeFetch {
+        /// The room.
+        channel_id: Digest32,
+        /// The members to sync with.
+        peers: Vec<Digest32>,
+    },
     /// A joiner's task dialled a peer: adopt the connection now, so its streams are served while
     /// the join is still running over it.
     Dialed {
@@ -1444,6 +1466,19 @@ async fn serve_typed(
                         recv,
                     })
                     .await;
+            });
+        }
+        // The question is read off the actor, like a sync preamble: answering needs the actor,
+        // waiting for a member that opened a stream and says nothing must not (V210-168).
+        Ok(Inbound::Agree { peer, send, recv }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok(ask) = crate::node::agreestream::read_ask(&mut recv).await else {
+                    return;
+                };
+                let _ = tx.send(NetEvent::AgreeAsk { peer, ask, send }).await;
             });
         }
         Ok(Inbound::Sync { peer, send, recv }) => {
@@ -3784,6 +3819,20 @@ impl Node {
                         self.note_if_stalled(name, started);
                         continue;
                     }
+                    // **An agreement is answered later too** (V210-168): it waits on every member
+                    // of the room, up to `agreestream::ASK_PATIENCE`, which the actor must not.
+                    if let NodeCommand::Agree {
+                        channel_id,
+                        entry,
+                        types,
+                        report,
+                    } = command
+                    {
+                        self.begin_agree(channel_id, entry, types, report, reply)
+                            .await;
+                        self.note_if_stalled(name, started);
+                        continue;
+                    }
                     // **A forward is answered later too** (#215): its first dial runs the whole
                     // ladder, and through a relay one rung waits out its 10 s direct-attempt timeout
                     // — on the actor, so the node answered nobody (`busy 10000ms — opening a
@@ -4080,6 +4129,8 @@ impl Node {
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
+            // Answered by `begin_agree`: the command loop takes it before it gets here.
+            NodeCommand::Agree { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::Shutdown | NodeCommand::Ping => Outcome::Done,
         }
     }
@@ -5377,6 +5428,10 @@ impl Node {
                     self.net = None;
                 }
             }
+            NetEvent::AgreeAsk { peer, ask, send } => self.answer_agree(peer, ask, send).await,
+            NetEvent::AgreeFetch { channel_id, peers } => {
+                self.sync_with(&channel_id, &peers).await;
+            }
             NetEvent::JoinRequest {
                 conn,
                 peer,
@@ -6248,6 +6303,10 @@ impl Node {
                     Inbound::Sync { .. } => {
                         // Unreachable: the stream loop converts these into
                         // `NetEvent::SyncRequest` once the preamble is read.
+                    }
+                    Inbound::Agree { .. } => {
+                        // Unreachable: the stream loop reads these and sends
+                        // `NetEvent::AgreeAsk` once the question is in hand.
                     }
                     Inbound::Punch {
                         peer,
@@ -9258,20 +9317,7 @@ impl Node {
         // A person's `vox room sync` raises a request on every port of the room and clears its
         // backoff (ADR-025 D2, D5). `Done` once a session runs or waits for its slot.
         let mut synced = 0usize;
-        for peer in peers {
-            if !self.ensure_port(channel_id, &peer).await {
-                continue;
-            }
-            if let Some(port) = self.ports.get_mut(&(*channel_id, peer)) {
-                port.raise();
-                port.clear_backoff();
-            }
-            crate::node::status::SyncBook::with(&self.sync_book, *channel_id, peer, |c| {
-                c.backoff = None;
-            });
-        }
-        self.sched_rooms.insert(*channel_id);
-        self.schedule().await;
+        self.sync_with(channel_id, &peers).await;
         for ((room, _), port) in &self.ports {
             if room == channel_id && (port.out.is_some() || port.queued) {
                 synced += 1;
@@ -9281,6 +9327,115 @@ impl Node {
             return Outcome::Failed(Fault::Unreachable);
         }
         Outcome::Done
+    }
+
+    /// Raise a sync request on the room's port to each of `peers`, clearing its backoff, and run
+    /// the schedule: what `vox room sync` does for every member, and an agreement round for the
+    /// members it needs posts from (V210-168).
+    async fn sync_with(&mut self, channel_id: &Digest32, peers: &[Digest32]) {
+        for peer in peers {
+            if !self.ensure_port(channel_id, peer).await {
+                continue;
+            }
+            if let Some(port) = self.ports.get_mut(&(*channel_id, *peer)) {
+                port.raise();
+                port.clear_backoff();
+            }
+            crate::node::status::SyncBook::with(&self.sync_book, *channel_id, *peer, |c| {
+                c.backoff = None;
+            });
+        }
+        self.sched_rooms.insert(*channel_id);
+        self.schedule().await;
+    }
+
+    /// **Ask every other member whether it holds this node's post** (V210-168,
+    /// [`NodeCommand::Agree`]): the room's members, and where the board says they are, are read
+    /// here; the asking runs on a task ([`agree_round`]), which sends the report and answers.
+    async fn begin_agree(
+        &mut self,
+        channel_id: Digest32,
+        entry: Digest32,
+        types: Vec<String>,
+        report: oneshot::Sender<crate::node::agreestream::Report>,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            return;
+        };
+        let (epoch, others) = {
+            let c = shared.lock().await;
+            let me = c.me();
+            let others: Vec<Digest32> = c.members().into_iter().filter(|m| *m != me).collect();
+            (c.epoch(), others)
+        };
+        let net = self.net.as_ref().map(Arc::clone);
+        let members: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = others
+            .into_iter()
+            .map(|m| {
+                let at = net
+                    .as_ref()
+                    .map(|n| n.board_endpoints(&channel_id, &m))
+                    .unwrap_or_default();
+                (m, at)
+            })
+            .collect();
+        let question = crate::node::agreestream::Ask {
+            channel_id,
+            epoch,
+            entry,
+            types,
+        };
+        let view = self.view_tx.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let r = agree_round(net, tx, view, question, members).await;
+            let _ = report.send(r);
+            let _ = reply.send(Outcome::Done);
+        });
+    }
+
+    /// **A member's answer to another member's [`crate::node::agreestream::Ask`]** (V210-168):
+    /// the room and the asker are checked here, at once; if the asked post has not reached this
+    /// node, a sync with the asker is raised to pull it; a task waits for it and answers.
+    async fn answer_agree(
+        &mut self,
+        peer: Digest32,
+        ask: crate::node::agreestream::Ask,
+        send: quinn::SendStream,
+    ) {
+        use crate::node::agreestream::{answer, Answer};
+        let member = match self.channels.get(&ask.channel_id).map(Arc::clone) {
+            Some(shared) => {
+                let c = shared.lock().await;
+                c.epoch() == ask.epoch && c.members().contains(&peer)
+            }
+            None => false,
+        };
+        if !member {
+            tokio::spawn(async move { answer(send, &Answer::NotHeld).await });
+            return;
+        }
+        let mut view = self.view_tx.subscribe();
+        let held = listed(&view.borrow_and_update(), &ask).is_some();
+        if !held {
+            self.sync_with(&ask.channel_id, &[peer]).await;
+        }
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + crate::node::agreestream::HOLD_PATIENCE;
+            let a = loop {
+                let now = listed(&view.borrow_and_update(), &ask);
+                if let Some(a) = now {
+                    break a;
+                }
+                match tokio::time::timeout_at(deadline, view.changed()).await {
+                    Ok(Ok(())) => {}
+                    _ => break Answer::NotReceived,
+                }
+            };
+            answer(send, &a).await;
+        });
     }
 
     /// Reconcile one channel's log with a peer over an inbound `sync` stream (ADR-008
@@ -11592,6 +11747,176 @@ async fn admit_board_records(
         }
     }
     admitted
+}
+
+/// The posts of `ask.types` this node's view of a room holds, once it holds `ask.entry`; `None`
+/// while it does not (V210-168).
+fn listed(
+    view: &crate::node::api::NodeView,
+    ask: &crate::node::agreestream::Ask,
+) -> Option<crate::node::agreestream::Answer> {
+    use crate::node::agreestream::{Answer, MAX_LISTED};
+    let d = view
+        .open_channels
+        .iter()
+        .find(|d| d.channel_id == ask.channel_id)?;
+    if !d.timeline.iter().rev().any(|r| r.entry_hash == ask.entry) {
+        return None;
+    }
+    let at = d.structured.positions(&ask.types, &[]);
+    if at.len() > MAX_LISTED {
+        return Some(Answer::TooMany);
+    }
+    Some(Answer::Holds(
+        at.iter()
+            .filter_map(|i| d.timeline.get(*i as usize).map(|r| r.entry_hash))
+            .collect(),
+    ))
+}
+
+/// The posts of `types` this node's view of a room holds.
+fn own_listed(
+    view: &crate::node::api::NodeView,
+    channel_id: &Digest32,
+    types: &[String],
+) -> Vec<Digest32> {
+    view.open_channels
+        .iter()
+        .find(|d| d.channel_id == *channel_id)
+        .map(|d| {
+            d.structured
+                .positions(types, &[])
+                .iter()
+                .filter_map(|i| d.timeline.get(*i as usize).map(|r| r.entry_hash))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// **One agreement round** (V210-168; see [`crate::node::agreestream`]): reach and ask every
+/// member at once, bounded by [`crate::node::agreestream::ASK_PATIENCE`]; pull what members hold
+/// that this node does not, bounded by [`crate::node::agreestream::FETCH_PATIENCE`]; and report
+/// where each member stands against this node's own posts.
+///
+/// **Reached is what this node can observe**: a member it holds a connection to, or reaches —
+/// directly or through a relay, which only carries the bytes — within
+/// [`crate::node::agreestream::REACH_PATIENCE`]. One it cannot is reported unreachable, and the
+/// claim is not called agreed.
+async fn agree_round(
+    net: Option<Arc<NodeNet>>,
+    tx: mpsc::Sender<NetEvent>,
+    mut view: watch::Receiver<crate::node::api::NodeView>,
+    question: crate::node::agreestream::Ask,
+    members: Vec<(Digest32, crate::nat::multiaddr::EndpointList)>,
+) -> crate::node::agreestream::Report {
+    use crate::node::agreestream::{self as agree, Agreement, Answer, Asking};
+    let deadline = tokio::time::Instant::now() + agree::ASK_PATIENCE;
+    let mut asking = tokio::task::JoinSet::new();
+    for (member, endpoints) in members {
+        let question = question.clone();
+        let net = net.clone();
+        let tx = tx.clone();
+        asking.spawn(async move {
+            let Some(net) = net else {
+                return (member, Asking::Gone);
+            };
+            let conn = if let Some(conn) = net.manager().existing(&member) {
+                conn
+            } else {
+                let by = std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + agree::REACH_PATIENCE,
+                );
+                match tokio::time::timeout_at(by, net.reach(member, &endpoints)).await {
+                    Ok(Ok(conn)) => {
+                        let _ = tx
+                            .send(NetEvent::Dialed {
+                                conn: Arc::clone(&conn),
+                                endpoints,
+                                board: false,
+                            })
+                            .await;
+                        conn
+                    }
+                    Ok(Err(e)) => {
+                        net.manager()
+                            .note(member, format!("not reached for a claim's agreement: {e}"));
+                        return (member, Asking::Gone);
+                    }
+                    Err(_) => {
+                        net.manager().note(
+                            member,
+                            "not reached for a claim's agreement within the bound".to_owned(),
+                        );
+                        return (member, Asking::Gone);
+                    }
+                }
+            };
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            (member, agree::ask(&conn, &question, left).await)
+        });
+    }
+    let mut asked: Vec<(Digest32, Asking)> = Vec::new();
+    while let Some(done) = asking.join_next().await {
+        if let Ok(a) = done {
+            asked.push(a);
+        }
+    }
+    asked.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // **Pull what members hold and this node does not**, so the client can fold their sets: a
+    // claim that crossed this one is usually exactly that.
+    let lacking = |view: &crate::node::api::NodeView| -> Vec<Digest32> {
+        let mine: BTreeSet<Digest32> = own_listed(view, &question.channel_id, &question.types)
+            .into_iter()
+            .collect();
+        asked
+            .iter()
+            .filter(|(_, a)| {
+                matches!(a, Asking::Answered(Answer::Holds(list))
+                    if list.iter().any(|h| !mine.contains(h)))
+            })
+            .map(|(m, _)| *m)
+            .collect()
+    };
+    let peers = lacking(&view.borrow_and_update());
+    if !peers.is_empty() {
+        let _ = tx
+            .send(NetEvent::AgreeFetch {
+                channel_id: question.channel_id,
+                peers,
+            })
+            .await;
+        let by = tokio::time::Instant::now() + agree::FETCH_PATIENCE;
+        while !lacking(&view.borrow_and_update()).is_empty() {
+            if !matches!(
+                tokio::time::timeout_at(by, view.changed()).await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+        }
+    }
+
+    let mine = own_listed(&view.borrow(), &question.channel_id, &question.types);
+    let members = asked
+        .into_iter()
+        .map(|(m, a)| {
+            let stands = match a {
+                Asking::Answered(Answer::Holds(list)) => agree::compare(&mine, &list),
+                Asking::Answered(Answer::NotReceived) => Agreement::NotReceived,
+                Asking::Answered(Answer::NotHeld) => Agreement::NotHeld,
+                Asking::Answered(Answer::TooMany) => Agreement::TooDifferent,
+                Asking::Gone => Agreement::Unreachable,
+                Asking::Unanswered => Agreement::Unanswered,
+            };
+            (m, stands)
+        })
+        .collect();
+    agree::Report {
+        mine: mine.len() as u64,
+        members,
+    }
 }
 
 fn fault_of(e: &Error) -> Fault {
