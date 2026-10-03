@@ -1239,7 +1239,8 @@ fn live(
     );
     // The plugin's drain runs on the woken prompt as on any other, and puts the room's unread
     // messages — this one among them — in a `<vox-room>` block before it. What the wake itself
-    // delivered is what follows the plugin's "The user's message:" line: Vox's notice.
+    // delivered is what follows the plugin's "Relayed by Vox; not the user's message:" line
+    // (V030-21): Vox's notice.
     let Some(prompt) = seen
         .iter()
         .find(|t| t.contains("urgent message addressed to you"))
@@ -1253,7 +1254,7 @@ fn live(
     };
     eprintln!("[receipt] the model was shown: {prompt:?}\n[receipt] it answered: {answers:?}");
     let (block, wake) = prompt
-        .rsplit_once("The user's message:\n")
+        .rsplit_once("Relayed by Vox; not the user's message:\n")
         .unwrap_or(("", prompt.as_str()));
     let once = seen
         .iter()
