@@ -492,7 +492,24 @@ impl Tui {
         }
     }
 
+    /// Wait until the passphrase is typed at the attach prompt, not yet submitted.
+    fn typed(&mut self) {
+        if cue(&self.cues.join("typed"), Duration::from_secs(120)) {
+            return;
+        }
+        std::fs::write(self.cues.join("stop"), b"").staged();
+        let said = self.said();
+        panic!(
+            "{}: {}'s TUI never asked for its node's passphrase; {said}",
+            driver_side(&said),
+            self.tag
+        );
+    }
+
+    /// Submit the passphrase typed at the attach prompt, and wait until the node shows attached.
     fn attached(&mut self) {
+        self.typed();
+        std::fs::write(self.cues.join("submit"), b"").staged();
         if cue(&self.cues.join("attached"), Duration::from_secs(120)) {
             return;
         }
@@ -931,12 +948,16 @@ fn an_attached_tui_holds_no_piece_of_the_identity_passphrase() {
     );
     tui.started();
     let before = scanner.scan();
+    // Typed and not yet submitted, the passphrase is in the prompt's field: the scan must see it
+    // there, or it could not see it anywhere.
+    tui.typed();
+    let during = scanner.until_more("identity", before.of("identity"));
     let asked = Instant::now();
     tui.attached();
     let took = asked.elapsed();
     let after = scanner.scan();
     tui.stop();
-    judge("attach", "TUI", &before, &before, &after, took);
+    judge("attach", "TUI", &before, &during, &after, took);
 }
 
 /// Which side a TUI driver that stopped early is on, from what it said. The driver prints
