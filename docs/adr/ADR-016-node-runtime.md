@@ -130,7 +130,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
   - An admitted author's entries MUST NOT render until both gates hold: the key is held and the author has consented.
   - When a sender key arrives, every stored entry from that author MUST be retried (backfill).
   - There MUST be no lobby step for a member to approve a join.
-- **NR-31.** The newcomer MUST broadcast its own sender key as part of joining, with a grant (ADR-007 step 2). Between the exchange and `JoinerDone`, a joiner MUST classify its responder as `JoinResponder`, which MAY open `pairwise`.
+- **NR-31.** As part of joining, the newcomer MUST open its session with `PairwiseFrame::Open` (an empty sealed message) and MUST NOT release its sender key; a key is released only to members its owner trusts (ADR-007 G-15 step 2, M17.6). Between the exchange and `JoinerDone`, a joiner MUST classify its responder as `JoinResponder`, which MAY open `pairwise`.
 - **NR-31a.** The join stream MUST give one opaque refusal reason. The responder MUST consume and persist the one-time prekey before the handshake completes.
 
 #### Answering a join runs off the actor

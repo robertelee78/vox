@@ -90,7 +90,7 @@ R-numbers are PRD-001's.
 
 - **AR-27 (R6).** A room's retention MUST default to forever.
 - **AR-28 (R7).** A room's retention MUST be its ADR-007 policy-update `ttl`, set with `vox room retention <room> 1h|1w|1m|<secs>|forever`.
-  - Only the room's creator, or an admin the creator delegated with `vox room admin`, MAY set it (ADR-007). **Planned:** `vox room admin` is V030-13 (#319), and on this tree the check is the `policy` capability, which V030-32 (#380) removes.
+  - Only the room's creator, or an admin the creator delegated with `vox room admin`, MAY set it (ADR-007). **Planned:** `vox room admin` is V030-13 (#319); on this tree the check is the `policy` capability, which V030-32 (#380) keeps only as far as admin and retention need.
   - A member MAY set a lower retention for its own node only (AR-29); it MUST NOT raise a room's retention for its node.
   - Over the control socket the request MUST be gated on the identity passphrase, because shortening it deletes history.
   - **Planned:** a genesis carries `ttl` 0 (forever) at creation; a room's retention is set only after it is created.
