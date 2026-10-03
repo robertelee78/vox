@@ -392,7 +392,26 @@ fn bind_udp(addr: SocketAddr) -> Result<std::net::UdpSocket> {
             .port();
         let missed = match hears_ipv4(&socket, port) {
             Ok(()) => return Ok(socket),
-            Err(missed) => missed,
+            Err(Missed::Routable(missed)) => {
+                // **Said as it was observed** (V030-33's finding): only the datagram to this
+                // machine's own routable address went missing. A program holding the port on
+                // `0.0.0.0` takes the loopback datagram too, and that one arrived; what stops only
+                // the routable one is, almost always, a firewall that filters this binary's incoming
+                // traffic (macOS's application firewall leaves loopback alone), or rarely a program
+                // bound to that one address. Both are named; another port would meet the same
+                // firewall, so none is tried.
+                return Err(Error::LocalBind {
+                    addr,
+                    cause: crate::error::BindCause::Other,
+                    reason: format!(
+                        "IPv4 traffic to this machine's own address on port {port} never reached                          this node, though traffic to 127.0.0.1 did ({missed}). Either this                          machine's firewall blocks incoming traffic to this vox (on macOS: System                          Settings › Network › Firewall › Options, allow {}), or another program                          holds port {port} on that address",
+                        std::env::current_exe()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "vox".to_owned())
+                    ),
+                });
+            }
+            Err(Missed::Loopback(missed)) => missed,
         };
         if addr.port() != 0 {
             return Err(Error::LocalBind {
@@ -440,7 +459,7 @@ fn routable_ipv4() -> Option<std::net::Ipv4Addr> {
 /// Whether a datagram sent over IPv4 to each address a node advertises — `127.0.0.1` and the
 /// routable IPv4 address — on `port` reaches `socket` (see [`bind_udp`]). Everything the test sent
 /// that arrived is drained, so none of it reaches QUIC.
-fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<(), String> {
+fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<(), Missed> {
     let started = std::time::Instant::now();
     let mut targets = vec![std::net::Ipv4Addr::LOCALHOST];
     targets.extend(routable_ipv4());
@@ -486,14 +505,29 @@ fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<()
     if owed.is_empty() {
         return Ok(());
     }
-    Err(format!(
+    let said = format!(
         "port {port}: nothing sent to {} arrived within {} ms",
         owed.iter()
             .map(|(at, _)| at.to_string())
             .collect::<Vec<_>>()
             .join(" or "),
         started.elapsed().as_millis()
-    ))
+    );
+    if owed.iter().any(|(at, _)| at.is_loopback()) {
+        Err(Missed::Loopback(said))
+    } else {
+        Err(Missed::Routable(said))
+    }
+}
+
+/// Which of [`hears_ipv4`]'s datagrams went missing, and what to say of it.
+enum Missed {
+    /// The one to `127.0.0.1`: another program holds the port on IPv4 (loopback is never
+    /// firewalled).
+    Loopback(String),
+    /// Only the one to this machine's routable address: a firewall filtering this binary, or a
+    /// program bound to that address alone.
+    Routable(String),
 }
 
 impl VoxEndpoint {
