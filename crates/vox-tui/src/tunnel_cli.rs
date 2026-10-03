@@ -828,6 +828,9 @@ fn ok_or(reply: vox_core::error::Result<Frame>, doing: &str) -> Result<(), AppEr
     match reply {
         Ok(Frame::Ok) => Ok(()),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("{doing}: {reason}"))),
+        Ok(Frame::NodeDetached { node }) => Err(AppError::Usage(format!(
+            "{doing}: node {node} was detached from the vox daemon while it waited"
+        ))),
         Ok(other) => Err(AppError::Usage(format!(
             "{doing}: unexpected reply {other:?}"
         ))),
