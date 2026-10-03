@@ -13,7 +13,6 @@
 //! (Migration through the daemon, proof 10, is the second test of
 //! `profiles_of_the_previous_release_become_nodes_proof.rs`.)
 
-
 #![allow(clippy::unwrap_used)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -216,7 +215,6 @@ fn make_room(a: &Account, node: &str) -> String {
         .find_map(|l| l.split_whitespace().next().map(str::to_owned))
         .unwrap_or_else(|| panic!("APPARATUS: no room listed on {node}: {list}"))
 }
-
 
 /// The addresses an invite link gives for identity `fp` (its `b=` values after `a=<fp>`).
 fn addresses_for(link: &str, fp: &str) -> Vec<String> {
@@ -438,10 +436,7 @@ fn nodes_attached_at_once_all_serve_at_one_address_each_as_itself() {
         for (n, r) in names.iter().zip(&rooms) {
             let (a, m) = (&a, &m);
             s.spawn(move || {
-                let _ = a.run(
-                    &["room", "post", "--node", n, r, &format!("from-{n}")],
-                    "",
-                );
+                let _ = a.run(&["room", "post", "--node", n, r, &format!("from-{n}")], "");
             });
             s.spawn(move || {
                 let _ = m.run(&["room", "post", r, &format!("to-{n}")], "");
