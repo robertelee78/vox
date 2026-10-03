@@ -30,10 +30,6 @@ relay circuit.
 
 ### The anchor principle (2026-10-01)
 
-These restate the design as it has been since 2026-06-19. In the decider's words: "anchors
-effectively bridge hosts that can't otherwise find each other"; "for all other use cases, direct is
-fine, sans anchor".
-
 - **N-1.** An anchor MUST be needed only to bridge two hosts that are both behind NAT and cannot
   otherwise find or reach each other.
 - **N-2.** Creating, serving, inviting, joining and connecting MUST NOT require an anchor. When the
@@ -327,15 +323,6 @@ fine, sans anchor".
 - **N-39.** A helper MUST already be connected to both peers. **Known limit:** it is found by trial
   over the node's current connections. `Multiaddr::Relay` hints in address records are not
   consulted, and there is no "who can reach X?" query.
-- **N-40. Known defect, SOCKS to a service (open finding 2026-09-22).** `vox up` → SOCKS5 → `.vox`
-  name failed roughly 40% of runs in `crates/vox-tui/tests/service_rehearsal_proof.rs`: the first
-  CONNECT refused (up to 314 s, past `up::HOST_PATIENCE`), or a mid-stream read failing 55–84 s in.
-  `NodeCommand::Forward` over the same overlay was reliable, so the defect was placed in the `vox up`
-  path (name resolution, `reach_host_with_patience`, or how the proxy establishes and holds the
-  stream). Re-measured 2026-10-02 in release: 5 of 5 runs passed on integrate/v0.2.10 `f47aafb3`,
-  and 30 of 30 on `10ff9310` (first CONNECT 642 µs–253 ms), so it does not reproduce on the current
-  tree. No fixing commit is identified, so it stays recorded here, tracked as V210-142 (#361).
-  `service_rehearsal_proof` is the blocking proof that guards it.
 
 ## Consequences
 

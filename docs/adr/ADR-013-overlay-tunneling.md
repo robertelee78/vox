@@ -82,7 +82,7 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   and re-publish its advertisement. Status: the struct and the sealing exist in `tunnel::service` with no caller. A
   member learns another's service tags out of band, and closing that is ADR-017 M17.4.
 - **T-9. Accountability.** Tunnel session establishment SHOULD be recorded as a signed event in
-  attributable rooms (ADR-009). Status: not built; no entry type exists.
+  rooms; every room is attributable, since every entry is composite-signed (ADR-008 LS-8). Status: not built; no entry type exists.
 - **T-10. SSH certificate authority, optional.** A Vox-issued OpenSSH certificate authority MAY be
   built later, under its own ADR. It is not a requirement here. `tunnel::sshca` is an unwired seam.
   "`ssh` over Vox" means forwarding to a real `sshd`, which authenticates its users as it always does.
@@ -148,9 +148,7 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
     restarts MUST reach the new process within V210-57's 10 s host-restart bound. Status: planned,
     until #360 (V210-141) and #321 merge. **Known limit until then:** the first connection after a
     host restart can wait out QUIC's idle timeout on the dialer's stale connection, about 60 s;
-    tracked as V210-141 (#360). Note: 1.25–1.26 s was measured on V210-141's unlanded branch
-    (`75e110d8`, on #321's unlanded `7fecc49d`), not on either integrate branch, with its proof
-    `tunnel_honesty_proof::a_restarted_host_is_reached_again_promptly_by_a_forward_and_by_a_proxy`.
+    tracked as V210-141 (#360).
 
 ### Loopback
 
@@ -246,7 +244,7 @@ proven when the decider runs `sudo scripts/family-lan-proof.sh`. Linux is not bu
 ## Related ADRs
 
 ADR-001 (scope), ADR-002 (identity), ADR-006 (sender keys), ADR-007 (consent), ADR-008 (log and
-tags), ADR-009 (attribution), ADR-011 (transport), ADR-012 (reachability), ADR-014 (macOS client),
+tags), ADR-008 (attribution: every entry signed), ADR-011 (transport), ADR-012 (reachability), ADR-014 (macOS client),
 ADR-017 (room-bound services), ADR-022 (datagram flows and the app API).
 
 ## Engineering Mantra
