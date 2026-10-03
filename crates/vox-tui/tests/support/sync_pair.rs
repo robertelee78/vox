@@ -26,6 +26,9 @@ use vox_core::node::ipc::{Frame, IpcClient, Request};
 
 #[path = "layout.rs"]
 mod layout;
+
+#[path = "attach.rs"]
+mod attach;
 #[allow(unused_imports)] // not every includer uses every item
 pub use layout::{node_dir, reap_daemon, DEFAULT_NODE};
 
@@ -293,8 +296,16 @@ impl Member {
         )
     }
 
+    /// `vox trust add` of `other`. With no daemon holding this member's node yet (a trust made
+    /// before its daemon starts), the node is attached for the verb and let go after (ADR-026 L-2).
     pub fn trust(&self, other: &Member) {
-        let (ok, out, err) = self.vox(&["trust", "add", &other.fp, "--name", other.name], None);
+        let run = || self.vox(&["trust", "add", &other.fp, "--name", other.name], None);
+        let root = attach::Root::at(&self.dir, ID_PASS);
+        let (ok, out, err) = if root.daemon_running() {
+            run()
+        } else {
+            root.attached(DEFAULT_NODE, run)
+        };
         assert!(
             ok,
             "PRODUCT: {}'s `vox trust add` of {} failed.\nstdout:\n{out}\nstderr:\n{err}",

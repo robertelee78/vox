@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use crate::world::{
     address_in, after_label, args, echo_service, fingerprint, mkdir, reap_daemon, room_pass_file,
-    tempdir, utf8, vox_once, VoxProc, IDENTITY,
+    tempdir, utf8, vox_once, vox_once_attached, VoxProc, IDENTITY,
 };
 
 /// Whether host and guest are split by address family.
@@ -386,7 +386,7 @@ impl RelayWorld {
 
         let guest_fp = fingerprint(&guest_dir, "guest");
         let host_fp = fingerprint(&host_dir, "host");
-        let (ok, out, err) = vox_once(
+        let (ok, out, err) = vox_once_attached(
             &host_dir,
             &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
         );

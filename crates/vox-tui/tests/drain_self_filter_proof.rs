@@ -85,7 +85,9 @@ fn drain(w: &Worker, r: &str, session: &str) -> String {
 fn post(w: &Worker, r: &str, session: &str, body: &str) {
     let o = w.vox_in(
         Some(session),
-        &["room", "post", r, "--type", "status", "-"],
+        // A plain message: a drain now folds other sessions' `status` posts into one "not
+        // shown" line (lean read), which would hide what this proof counts.
+        &["room", "post", r, "-"],
         Some(body),
     );
     assert!(o.ok, "PRODUCT (staging): {o:?}");

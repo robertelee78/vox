@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 
 #[path = "layout.rs"]
 mod layout;
+
+#[path = "attach.rs"]
+pub mod attach;
 #[allow(unused_imports)] // not every includer uses every item
 pub use layout::{daemon_lock, find_named, node_dir, reap_daemon, Reaper, DEFAULT_NODE};
 
@@ -307,6 +310,14 @@ impl Drop for VoxProc {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// [`vox_once`] for a one-shot verb that needs the default node attached (ADR-026 L-2), run
+/// before anything of the proof's own holds it: attached for the verb, then detached, and the
+/// daemon that attach started gone, so the proof's next `vox serve` or `vox daemon` starts the
+/// data root's daemon with its own `--listen` and `--anchor`.
+pub fn vox_once_attached(data: &Path, args: &[String]) -> (bool, String, String) {
+    attach::Root::at(data, IDENTITY).attached(DEFAULT_NODE, || vox_once(data, args))
 }
 
 /// Run a one-shot `vox` verb to completion.
@@ -763,7 +774,7 @@ impl World {
         let guest_fp = fingerprint(&guest_dir, "guest");
         let host_fp = fingerprint(&host_dir, "host");
         if trusted {
-            let (ok, out, err) = vox_once(
+            let (ok, out, err) = vox_once_attached(
                 &host_dir,
                 &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
             );

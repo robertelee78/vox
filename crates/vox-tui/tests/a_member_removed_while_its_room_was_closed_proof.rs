@@ -436,7 +436,9 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
             .any(|l| l
                 .rsplit("row then:")
                 .next()
-                .is_some_and(|row| row.contains("trusted"))),
+                // The row says "not trusted · …" for a member bob does not trust (the members
+                // pane's mark mirrors trust): only a "trusted" outside that phrase is a red.
+                .is_some_and(|row| row.replace("not trusted", "").contains("trusted"))),
         "PRODUCT: (d) after `:consent grant`, bob's TUI shows carol trusted: {said}"
     );
 }
