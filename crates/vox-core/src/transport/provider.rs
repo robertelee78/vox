@@ -44,6 +44,11 @@ pub const X25519MLKEM768_CODE_POINT: u16 = 0x11EC;
 /// happened to share the port.
 pub const VOX_ALPN: &[u8] = b"vox/1";
 
+/// The ALPN of the neutral handshake followed by the identity exchange (ADR-011 requirement
+/// 27). A `vox/1` peer, which expects its identity in the certificate, never completes a
+/// handshake with it. Replaces [`VOX_ALPN`] when the endpoint switches to the exchange.
+pub const VOX_ALPN_V2: &[u8] = b"vox/2";
+
 /// Build the Vox crypto provider: the `aws-lc-rs` provider with `kx_groups`
 /// restricted to exactly the X25519MLKEM768 hybrid group, so there is no classical
 /// downgrade target.
@@ -89,6 +94,32 @@ pub fn client_config(
     client_cert_chain: Vec<CertificateDer<'static>>,
     client_key: PrivateKeyDer<'static>,
 ) -> Result<ClientConfig> {
+    client_config_for(verifier, client_cert_chain, client_key, VOX_ALPN)
+}
+
+/// The client config of a **neutral** handshake (ADR-011 requirement 27): the daemon's neutral
+/// leaf offered as the client certificate, the server held only to a neutral leaf, ALPN
+/// [`VOX_ALPN_V2`]. Which node answers is proved afterwards by the identity exchange.
+pub fn neutral_client_config(
+    leaf: &crate::transport::identity_cert::NeutralLeaf,
+) -> Result<ClientConfig> {
+    let supported = vox_crypto_provider().signature_verification_algorithms;
+    client_config_for(
+        Arc::new(crate::transport::verifier::NeutralServerVerifier::new(
+            supported,
+        )),
+        leaf.cert_chain(),
+        leaf.private_key(),
+        VOX_ALPN_V2,
+    )
+}
+
+fn client_config_for(
+    verifier: Arc<dyn ServerCertVerifier>,
+    client_cert_chain: Vec<CertificateDer<'static>>,
+    client_key: PrivateKeyDer<'static>,
+    alpn: &[u8],
+) -> Result<ClientConfig> {
     let provider = vox_crypto_provider();
     assert_pq_only(&provider)?;
     let provider = Arc::new(provider);
@@ -98,7 +129,7 @@ pub fn client_config(
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_cert_resolver(single_cert_resolver(client_cert_chain, client_key)?);
-    cfg.alpn_protocols = vec![VOX_ALPN.to_vec()];
+    cfg.alpn_protocols = vec![alpn.to_vec()];
     // Never offer 0-RTT early data (ADR-011).
     cfg.enable_early_data = false;
     Ok(cfg)
@@ -115,6 +146,33 @@ pub fn server_config(
     server_cert_chain: Vec<CertificateDer<'static>>,
     server_key: PrivateKeyDer<'static>,
 ) -> Result<ServerConfig> {
+    server_config_for(verifier, server_cert_chain, server_key, VOX_ALPN)
+}
+
+/// The server config of a **neutral** handshake (ADR-011 requirement 27): the daemon's neutral
+/// leaf, a client certificate still mandatory but held only to a neutral leaf (the listener
+/// needs the dialler's leaf for its process identity), ALPN [`VOX_ALPN_V2`]. One config serves
+/// every connection of the daemon run: there is no per-connection verifier output any more.
+pub fn neutral_server_config(
+    leaf: &crate::transport::identity_cert::NeutralLeaf,
+) -> Result<ServerConfig> {
+    let supported = vox_crypto_provider().signature_verification_algorithms;
+    server_config_for(
+        Arc::new(crate::transport::verifier::NeutralClientVerifier::new(
+            supported,
+        )),
+        leaf.cert_chain(),
+        leaf.private_key(),
+        VOX_ALPN_V2,
+    )
+}
+
+fn server_config_for(
+    verifier: Arc<dyn ClientCertVerifier>,
+    server_cert_chain: Vec<CertificateDer<'static>>,
+    server_key: PrivateKeyDer<'static>,
+    alpn: &[u8],
+) -> Result<ServerConfig> {
     let provider = vox_crypto_provider();
     assert_pq_only(&provider)?;
     let provider = Arc::new(provider);
@@ -124,7 +182,7 @@ pub fn server_config(
         .with_client_cert_verifier(verifier)
         .with_single_cert(server_cert_chain, server_key)
         .map_err(|_| Error::MalformedBundle("tls server certificate setup"))?;
-    cfg.alpn_protocols = vec![VOX_ALPN.to_vec()];
+    cfg.alpn_protocols = vec![alpn.to_vec()];
     // Belt-and-suspenders 0-RTT disable: no early data, and issue no resumption
     // tickets at all (a ticket is a prerequisite for 0-RTT) — ADR-011.
     cfg.max_early_data_size = 0;
