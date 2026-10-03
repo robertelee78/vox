@@ -1,7 +1,13 @@
 # Architecture Decision Records
 
-This directory records the architectural decisions for Vox. **Build order is the topological order
-of the `Depends on` column** (a partial order); each ADR is buildable once its dependencies are
+This directory records the architectural decisions for Vox. Each ADR is a set of normative
+requirements: the key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD
+NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in these documents are to be interpreted
+as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as
+shown here. An ADR states current decided behaviour; GitHub history and the issues keep how it got
+there. Review transcripts, run logs and analyses of an ADR MUST NOT be committed here.
+
+**Build order is the topological order of the `Depends on` column** (a partial order); each ADR is buildable once its dependencies are
 done. ADR numbering largely follows that order, with one deliberate exception: ADR-008 (the log
 primitive) precedes ADR-007 (consent, which is stored on the log) in build order. Start with ADR-001.
 
@@ -15,7 +21,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [006](ADR-006-group-messaging-sender-keys.md) | Group Messaging — Sender Keys | 003, 004 |
 | [008](ADR-008-replicated-authenticated-log-and-sync.md) | Replicated Authenticated Log & Sync | 002, 006 |
 | [007](ADR-007-membership-consent-and-admin-governance.md) | Membership, Per-Sender Consent & Admin Governance | 002, 005, 006, 008 |
-| [009](ADR-009-deniability-mode.md) | Deniability Mode (per-channel) | 002, 003, 006, 007, 008 |
+| [009](ADR-009-deniability-mode.md) | Deniability Mode (per-channel) — **withdrawn** (R43) | 002, 003, 006, 007, 008 |
 | [010](ADR-010-at-rest-storage-and-retention.md) | At-Rest Storage & Retention | 002, 007, 008 |
 | [011](ADR-011-transport-substrate.md) | Transport Substrate (QUIC) | 002, 004, 008 |
 | [012](ADR-012-nat-traversal-and-reachability.md) | NAT Traversal, Bootstrap & Reachability | 005, 011 |
@@ -38,95 +44,69 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 - **Tier 0 — Foundation:** 001
 - **Tier 1 — Cross-cutting policy:** 002, 003
 - **Tier 2 — Crypto core:** 004, 005, 006
-- **Tier 3 — Differentiator + data:** 008, 007, 009, 010 (log before consent)
+- **Tier 3 — Differentiator + data:** 008, 007, 010 (log before consent); 009 is withdrawn
 - **Tier 4 — Network & overlay:** 011, 012, 013
 - **Tier 5 — App / platform:** 014, 015
 - **Tier 6 — Integration:** 016 (the runtime that composes Tiers 1–5 into a running node)
 - **Tier 7 — Product surface:** 017 (what a person actually does with the overlay), 018 (how a
   capability is proved to work)
-- **Tier 8 — Applications on the layer:** 020 (agent comms), and 021 (the work-item interop contract an
-  external tracker consumes). 020 is the first ADR in the app tier: chat's
-  semantics still live inside `vox-core`, and extracting them into a sibling `vox-chat` crate is the
-  follow-on this tier anticipates.
+- **Tier 8 — Applications on the layer:** 020 (agent comms), 021 (the work-item interop contract an
+  external tracker consumes), 022 (datagram flows and the app API).
+- **Tier 9 — Behaviour under load:** 023 (room lifecycle), 024 (congestion control), 025 (sync
+  scheduling).
 
-## Status (2026-10-01, integrate/v0.2.10)
+## Status (integrate/v0.3.0)
 
-Each ADR's `Status` line is authoritative; this is the roll-up. Every ADR is grounded in a multi-pass
-research effort (Signal/PQXDH, Sender Keys/Megolm, MLS, SSB/Hypercore/Merkle-DAG, CPace/PAKE,
-QUIC/DCUtR, NAT/IPv6, deniable authentication).
+Each ADR's own `Status` line is authoritative, and marks per requirement what is built and what is
+planned. This is the roll-up.
 
-| ADR | Status | Where |
-|---|---|---|
-| 001 | accepted (governs) | M0 foundation in `vox-core/src/{cbor,wire,suite,hash}.rs` |
-| 002 | implemented | M1 `identity/` |
-| 003 | implemented | registry `suite.rs`; floor in genesis policy, enforced in PQXDH + join |
-| 004 | implemented | M2 `pairwise/` |
-| 005 | implemented | M3 `join/` (pure-Rust bucket-sorted Equihash solver, `(200,9)` ≈ 1.1 s / 245 MB) |
-| 006 | implemented | M4 `group/` |
-| 007 | implemented | M6 `governance/` |
-| 008 | implemented | M5 `log/` |
-| 009 | implemented, **not enabled** | M7 `deniable/` — formal analysis + `0x000B` wire codec outstanding |
-| 010 | implemented | M8 `atrest/` (codecs/mechanisms; no persistence layer yet) |
-| 011 | implemented | M9 `transport/` |
-| 012 | implemented | M10 `nat/`, composed into the ladder by ADR-016 M14.8–M14.10 + M15.1c (pinhole → UPnP-IGD → hole punch → anchor relay); real-router UPnP validation still pending |
-| 013 | implemented | M11 `tunnel/`; CLI surface landed with M16.1 (`vox service`, `vox grant`, `vox forward`) |
-| 014 | proposed — not started | native macOS GUI |
-| 015 | implemented | M12 + M13.5 `vox-tui/` — embedded node, network verbs wired; §Distribution's install/update model landed 2026-09-21 (`install.sh`, `vox update`, three targets, macOS signed + notarized) |
-| 016 | implemented (M13–M15) | node runtime: M13 single device ✓, M14 two machines over the real network ✓, M15 anchors + headless anchor ✓ |
-| 017 | implemented (M17.1–M17.3) | room-bound services: genesis service grant, `vox serve`/`vox connect`, `.vox` names resolved by the `vox up` SOCKS5 entry point |
-| 018 | accepted — **in force** | quality bar: unit tests removed (M18.2 ✓), distribution proved as built (M18.2a ✓), the node/edge/journey harness outstanding (M18.3) |
-| 019 | proposed — not started | pure-Rust TLS crypto provider |
-| 020 | partly implemented | agent comms: `crates/vox-agentcomms` over the `vox-core` IPC/event fan-out and the trust keyring; M19.1–M19.11 built and on `main` (M19.10–M19.11 through PR #14, released in v0.2.9), M19.12 a text correction; a trusted Codex hook firing in a live turn is not yet proved (M19.11-live, #169). Its claim protocol is corrected by ADR-021. Of the defects recorded there, F15 is fixed (#16); F12 is fixed (on `main` since v0.2.9) and proved by `room_of_three_keys_proof`, its story not yet accepted (#11); F17, OpenCode delivery, is fixed for v0.2.10, its story not yet accepted (#28). No wire change. |
-| 021 | implemented (M21.1–M21.10), on `main` since v0.2.9 (PR #14) | work-item interop: session-scoped claims, pending handoffs, bound renewals, op ids, the exact-version gate, a gapless `tail --json`, `board --json`, structured `post`. Vox holds no work state; an external tracker owns it. No wire change. Open for v0.2.10: proof gaps in M21.1, M21.2, M21.6 and M21.8 found by mutation (2026-10-01; the product passed), and defects F18 (#163), F19 (#165) and F20 (#166). |
-| 022 | accepted — not on `main` or integrate/v0.2.10 | datagram flows: M22.1–M22.5 built and gated on `prd1/*` feature branches; to ship in v0.3.0 |
-| 023 | accepted — not on `main` or integrate/v0.2.10 | room lifecycle: M23.1 (retention) and M23.2 (one order) built on `prd1/*` feature branches, M23.3–M23.6 in progress; to ship in v0.3.0 |
-| 024 | accepted — being built | tapered congestion control: M24.1–M24.5 (#154–#158) are in v0.2.10 by the decider's ruling of 2026-10-01; none is on integrate/v0.2.10 yet |
+| ADR | Status |
+|---|---|
+| 001 | accepted; governs every later ADR |
+| 002 | accepted; built (`identity/`, `node::prekeys`) except where marked |
+| 003 | accepted; built (`suite.rs`, the floor in genesis policy) |
+| 004 | accepted; built (`pairwise/`) |
+| 005 | accepted; built (`join/`, `node::joinstream`) except where marked |
+| 006 | accepted; built (`group/`) except the known gaps it lists |
+| 007 | accepted; cut to V030-32: only the creator or an admin sets the room's retention; the rest of the governance is removed, its code removal pending (#380, #94) |
+| 008 | accepted; built (`log/`); range reconciliation over the network and the self-channel are planned; golden vectors are open |
+| 009 | **withdrawn** (R43); the deniable code is removed (b0f82185) |
+| 010 | accepted; built (`atrest/`, `node/`) except where marked planned |
+| 011 | built (`transport/`); the PEN, the observed group (#382) and the interop matrix are not |
+| 012 | accepted; all four rungs built, a relay-only pair taking its circuit at once |
+| 013 | accepted; built except where marked |
+| 014 | proposed; only the embedded node over FFI (`crates/vox-ffi`) is built |
+| 015 | implemented in part (`crates/vox-tui`), each requirement marked |
+| 016 | accepted; M13–M15.2c and M18.1 built; open defects listed in the ADR |
+| 017 | accepted; `service.node.room.vox` addressing is being built (#339) |
+| 018 | accepted, in force: only real use of the shipped binary proves a claim; tests run on demand |
+| 019 | proposed; nothing built |
+| 020 | accepted; built (`vox-agentcomms`, the hook, wake and claims) except where marked |
+| 021 | accepted; M21.1–M21.10 built |
+| 022 | accepted; M22.1–M22.5 built; calls are an app |
+| 023 | accepted; M23.1–M23.6 built except where marked |
+| 024 | accepted, speed only; M24.1–M24.5 built, the taper is the default controller |
+| 025 | accepted; built as V210-34 (#209) |
 
-**The node runtime that composes the layers is in.** ADR-016 landed through M15 — join, per-sender
-consent and log sync run between separate hosts over QUIC, through the full NAT ladder: directly where
-either host can be reached, and, where both are behind NAT, bridged by an anchor you run yourself — and ADR-017 landed through M17.3, so a room-bound TCP service is reachable
-by its `.vox` name through a loopback SOCKS5 proxy. **What is missing** is the proof harness that will
-qualify releases (ADR-018 M18.3), golden **wire-byte** vectors for the ADR-008 struct tags (see the
-gates below; `v0.1.0`'s bytes are now what `v0.2.0` must not break), re-keying for a member first met
-off the join path, and the native macOS client (ADR-014, not started). Later capabilities
-(voice/video, iOS, metadata/traffic-analysis resistance, PQ post-compromise security) are **distinct
-named capabilities** with their own ADRs — not deferred increments of the ones here (ADR-003 §Scope).
+## Conformance-vector obligations
 
-## Release gates & test-vector obligations (consolidated)
+These obligations come from the ADRs named. None is a release gate: tests are real use of the
+shipped binary, run on demand (ADR-018). Whether each is kept as a real-binary check or dropped is
+open with the decider (V030-29 questions 12, 19, 30 and 32).
 
-"Ship complete" (the mantra) means a release MUST satisfy every gate below; this is the single
-auditable list so none is missed. Status is recorded per gate so the list is honest, not
-aspirational.
-
-**`v0.1.0` was cut on 2026-09-21 with the canonical-serialization gate still UNMET.** That is stated
-here rather than quietly carried: from `v0.1.0` on, these bytes are what a later version must not
-break, so the golden wire-byte vectors stop being a future obligation and become a compatibility
-debt with a known start date.
-
-- **Canonical serialization (ADR-008):** golden vectors for every struct tag `0x0001–0x0012`; two
-  independent implementations must produce byte-identical canonical CBOR. — **UNMET**: only the
-  log-entry skeleton is byte-pinned; CBOR primitives have RFC-8949 vectors; no per-tag fixtures.
-- **Identity (ADR-002):** test vectors for composite pubkey/sig byte layout and the ML-DSA binding statement.
-  — **PARTIAL**: layout asserted structurally with a fixed-seed signer; no pinned known-answer bytes.
-- **PQXDH/ratchet (ADR-004):** KDF + AAD test vectors (PQXDH itself is formally verified upstream).
-  — **PARTIAL**: one pinned `derive_sk` KAT; ratchet KDFs and AAD constructions have structural tests only.
-- **CPace (ADR-005):** Ristretto255+SHA-512 test vectors; Equihash PoW solve/verify vectors. —
-  **MET / PARTIAL**: the CFRG Appendix-B CPace vectors are pinned; Equihash is covered by
-  solve→verify round-trips against the librustzcash verifier at `(48,5)`, `(96,5)` and the real
-  `(200,9)` (CI, release) rather than by published known-answer bytes.
-- **Governance (ADR-007):** the deterministic-evaluator golden-vector suite (valid chains,
-  over-attenuation, expiry, revoked links, concurrent-conflict + tie-break) — bit-for-bit agreement gate.
-  — **MET in-process**: 28+ vectors incl. order-invariance and exact `DenyReason`s; they are Rust
-  assertions, not language-neutral fixtures with pinned hashes, which the "two implementations" reading needs.
-- **Deniability (ADR-009):** **formal analysis of the DGKA+DSKE construction before shipping**; K-derivation
-  and transcript test vectors. — **UNMET** (both); deniable mode is not enabled for shipping.
-- **Transport (ADR-011):** cross-version interop matrix (handshake + identity-PoP) as a hard gate. —
-  **UNMET**: no second implementation, no matrix, no CI job.
-- **Sync (ADR-008):** frontier + Negentropy-v1 interop vectors; the wire error-code table is honored. —
-  **PARTIAL**: every wire error code `0x01–0x09` is asserted end-to-end (`0x09 TransportFailed` was added
-  2026-09-20 — a transport failure used to be reported as a protocol-version mismatch); frames and
-  Negentropy messages are round-trip-tested only, with no interop bytes against a reference. Range mode
-  itself is tested in memory and **never runs over a transport** — ADR-008's own first known gap.
+- **Canonical serialization (ADR-008):** golden vectors for every struct tag `0x0001`–`0x0017`. No
+  per-tag fixture exists.
+- **Identity (ADR-002):** composite public key and signature layout, and the ML-DSA binding statement.
+  No pinned known-answer bytes exist.
+- **PQXDH and ratchet (ADR-004):** KDF and AAD vectors. No pinned known-answer bytes exist.
+- **CPace (ADR-005):** the CFRG Ristretto255+SHA-512 vectors and Equihash solve/verify vectors. No
+  real-binary proof exists.
+- **Governance (ADR-007):** the deterministic-evaluator vector suite. None exists since the unit
+  tests were deleted (df850734).
+- **Transport (ADR-011):** a cross-version interop matrix (handshake and identity proof of
+  possession). No second implementation, matrix or job exists.
+- **Sync (ADR-008):** frontier and Negentropy-v1 interop vectors. Range mode never runs over a
+  transport.
 
 ## Engineering Mantra
 

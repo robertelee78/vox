@@ -211,6 +211,21 @@ impl Member {
         })
     }
 
+    /// The node's datagram counters from `vox status --json`, summed over every connection:
+    /// `(sent, delivered)`.
+    fn datagrams(&self) -> (u64, u64) {
+        let v = self.status();
+        let n = |k: &str| {
+            v["datagrams"][k].as_u64().unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: {}'s `vox status --json` has no datagrams.{k}: {v}",
+                    self.name
+                )
+            })
+        };
+        (n("sent"), n("delivered"))
+    }
+
     /// The app layer's counters from `vox status --json`.
     fn app(&self) -> App {
         App(self.status()["app"].clone())
@@ -519,6 +534,11 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
             }
         });
     }
+    // What the nodes' datagram counters say before, so the lines can be shown to have
+    // crossed **as datagrams**: a node that quietly carried `--datagrams` lines on the
+    // flow's stream would deliver every one of them and move neither counter.
+    let (bob_sent_before, _) = s.bob.datagrams();
+    let (_, alice_delivered_before) = s.alice.datagrams();
     let mut open = s
         .bob
         .vox(&["app", "open", &s.room, &s.alice.fp, LABEL, "--datagrams"]);
@@ -579,6 +599,21 @@ fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
         (distinct.len(), intact),
         (1000, 1000),
         "PRODUCT: all 1000 datagrams must arrive, each intact"
+    );
+    let ((bob_sent, _), (_, alice_delivered)) = (s.bob.datagrams(), s.alice.datagrams());
+    let (sent, delivered) = (
+        bob_sent.saturating_sub(bob_sent_before),
+        alice_delivered.saturating_sub(alice_delivered_before),
+    );
+    eprintln!(
+        "datagrams: while the 1000 lines crossed, bob's node sent {sent} datagram(s) and \
+         alice's delivered {delivered}"
+    );
+    assert!(
+        sent >= 1000 && delivered >= 1000,
+        "PRODUCT: the 1000 `--datagrams` lines arrived, but not as datagrams: bob's node sent \
+         {sent} and alice's delivered {delivered} while they crossed, fewer than 1000 — they \
+         went some other way, such as the flow's stream"
     );
 }
 
