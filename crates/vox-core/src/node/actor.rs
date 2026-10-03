@@ -425,6 +425,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinerDone { .. } => "finishing a join",
         NetEvent::ForwardDialed { .. } => "binding a forward whose dial landed",
         NetEvent::Heard { .. } => "dialling a member heard nearby",
+        NetEvent::AddressReached { .. } => "keeping a room address whose host answered",
         NetEvent::Reopened { .. } => "holding a room that reopened",
         NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
@@ -774,13 +775,23 @@ async fn run_session_worker(
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
+    /// A held room's address was given again and a member it names answered there (V210-167):
+    /// keep what it names as the room's, dial its anchors, and answer the join.
+    AddressReached {
+        /// The room.
+        room: Digest32,
+        /// Every node the address names but this one.
+        named: BootstrapSet,
+        /// The join's answer.
+        reply: oneshot::Sender<Outcome>,
+    },
     /// A node on this computer or the local network said where it listens, naming members by
-    /// `node::nearby::tag` (V210-167).
+    /// `node::nearby::entry` (V210-167).
     Heard {
-        /// Where it listens.
-        at: std::net::SocketAddr,
-        /// The members it named.
-        tags: Vec<crate::node::nearby::Tag>,
+        /// The address it was heard from.
+        from: std::net::IpAddr,
+        /// The members it named, and their ports.
+        entries: Vec<crate::node::nearby::Entry>,
     },
     /// The ladder's publish side finished: this node now knows what to advertise, and
     /// which mappings a gateway granted (each of which will need renewing).
@@ -4225,13 +4236,14 @@ impl Node {
             return Ok(());
         }
         // The identity to network as: the unlocked vault's, or the headless one.
-        let endpoint = Arc::new(match (self.headless.as_ref(), self.profile.as_ref()) {
+        let (endpoint, moved) = match (self.headless.as_ref(), self.profile.as_ref()) {
             (Some(signer), _) => self.bind_endpoint(&**signer, bind)?,
             (None, Some(profile)) => self.bind_endpoint(profile.signer()?, bind)?,
             (None, None) => {
                 return Err(crate::error::Error::Profile("no identity in this profile"))
             }
-        });
+        };
+        let endpoint = Arc::new(endpoint);
         let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
         // narrows that to rooms its operator's trust list created (V210-70).
@@ -4314,16 +4326,31 @@ impl Node {
                 let nearby = Arc::new(nearby);
                 let (hear, tx) = (Arc::clone(&nearby), self.net_tx.clone());
                 let task = tokio::spawn(async move {
-                    while let Ok((at, tags)) = hear.hear().await {
+                    while let Ok((from, entries)) = hear.hear().await {
                         // Dropped when the actor is behind: the next one is said within
                         // `NEARBY_EVERY_SECS`.
-                        let _ = tx.try_send(NetEvent::Heard { at, tags });
+                        let _ = tx.try_send(NetEvent::Heard { from, entries });
                     }
                 });
                 self.nearby = Some(nearby);
                 self.nearby_task = Some(task.abort_handle());
                 self.nearby_rooms = 0;
             }
+        }
+        // Who finds a node whose port moved depends on whether it says where it listens nearby,
+        // so the note waits until that is known.
+        if let Some(moved) = moved {
+            let who = if self.nearby.is_some() {
+                "members on this computer or the local network find it here, others through an \
+                 anchor or when it reaches them"
+            } else if self.headless.is_some() {
+                "anyone given its old address needs the new one"
+            } else {
+                "members find it only through an anchor or when it reaches them"
+            };
+            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                note: format!("{moved}; {who}"),
+            });
         }
         Ok(())
     }
@@ -4335,22 +4362,28 @@ impl Node {
     /// anchor to carry a new record, two members that both restarted dialled each other's dead
     /// ports for ever. So the port a node first binds is written to the profile ([`PORT_FILE`])
     /// and bound again on every start. If another program holds it now, the node binds another
-    /// for this run and says so; the file keeps the first, which the next start tries again. A
-    /// port given explicitly is bound as given and not recorded.
+    /// for this run, and the second value is what to say about it; the file keeps the first,
+    /// which the next start tries again. A port given explicitly is bound as given and not
+    /// recorded.
     ///
     /// [`PORT_FILE`]: crate::node::paths::PORT_FILE
     fn bind_endpoint<S: crate::identity::composite::RootSigner>(
         &self,
         signer: &S,
         bind: &Bind,
-    ) -> crate::error::Result<crate::transport::quic::VoxEndpoint> {
+    ) -> crate::error::Result<(crate::transport::quic::VoxEndpoint, Option<String>)> {
         use crate::transport::quic::VoxEndpoint;
         let addr = match bind {
             Bind::Addr(addr) => *addr,
-            Bind::Socket(socket) => return VoxEndpoint::bind_abstract(signer, Arc::clone(socket)),
+            Bind::Socket(socket) => {
+                return Ok((
+                    VoxEndpoint::bind_abstract(signer, Arc::clone(socket))?,
+                    None,
+                ))
+            }
         };
         if addr.port() != 0 {
-            return VoxEndpoint::bind(signer, addr);
+            return Ok((VoxEndpoint::bind(signer, addr)?, None));
         }
         let file = self.paths.port_file();
         let kept = std::fs::read_to_string(&file)
@@ -4365,10 +4398,10 @@ impl Node {
                     format!("{}\n", at.port()).as_bytes(),
                 );
             }
-            return Ok(endpoint);
+            return Ok((endpoint, None));
         };
         let why = match VoxEndpoint::bind(signer, std::net::SocketAddr::new(addr.ip(), port)) {
-            Ok(endpoint) => return Ok(endpoint),
+            Ok(endpoint) => return Ok((endpoint, None)),
             Err(crate::error::Error::LocalBind {
                 cause: crate::error::BindCause::InUse,
                 ..
@@ -4379,14 +4412,12 @@ impl Node {
         let now = endpoint
             .local_addr()
             .map_or_else(|_| "another".to_owned(), |a| a.port().to_string());
-        let _ = self.event_tx.send(NodeEvent::NodeNote {
-            note: format!(
-                "this node's port {port} is not free ({why}), so it listens on port {now} this \
-                 run; members on this computer or the local network find it here, others through \
-                 an anchor or when it reaches them"
-            ),
-        });
-        Ok(endpoint)
+        Ok((
+            endpoint,
+            Some(format!(
+                "this node's port {port} is not free ({why}), so it listens on port {now} this run"
+            )),
+        ))
     }
 
     /// Tear the network down: close every connection and the endpoint, so a locked
@@ -5415,7 +5446,10 @@ impl Node {
     /// [`Self::handle_net`], unboxed: see [`Boxed`].
     async fn handle_net_unboxed(&mut self, event: NetEvent) {
         match event {
-            NetEvent::Heard { at, tags } => self.heard_nearby(at, &tags).await,
+            NetEvent::Heard { from, entries } => self.heard_nearby(from, &entries).await,
+            NetEvent::AddressReached { room, named, reply } => {
+                self.keep_room_address(room, &named, reply).await;
+            }
             NetEvent::Reopened {
                 channel_id,
                 channel,
@@ -7267,10 +7301,12 @@ impl Node {
 
     /// A room's address given for a room this node already holds: **the address is where its host
     /// is now** (V210-167). It was refused ("already holds that room"), so a member whose host
-    /// had moved had no way to say where it went. Every node the address names is kept as the
-    /// room's at that address, which is where the next start dials it too, and dialled now;
-    /// answered `Done` once a member it names is reached, or with no member to reach, and
-    /// `Unreachable` (said with why) when none is.
+    /// had moved had no way to say where it went. The members it names are dialled there; once
+    /// one answers, everything the address names is kept as the room's (`keep_room_address`), so
+    /// the next start dials it there too. An address nobody answers at changes nothing: a stale
+    /// one from chat history must not overwrite where the room's members really are. `Done` once
+    /// a member answered; `Unreachable` (said with why) when none did; `BadLink` when the address
+    /// names no other member of the room, which is so when this node is its host.
     async fn reach_by_address(
         &mut self,
         parsed: &crate::node::link::InviteLink,
@@ -7284,35 +7320,25 @@ impl Node {
             let _ = named.add(a.clone());
         }
         let mut members: Vec<(Digest32, Vec<std::net::SocketAddr>)> = Vec::new();
-        let mut anchors: Vec<(Digest32, Vec<std::net::SocketAddr>)> = Vec::new();
         if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
-            let mut channel = shared.lock().await;
-            if let Some(profile) = self.profile.as_ref() {
-                let _ = channel.add_anchors(profile.store(), &named);
-            }
-            let mut own = BootstrapSet::new();
-            for n in channel.anchors().nodes() {
-                if !channel.is_author(&n.id) {
-                    let _ = own.add(n.clone());
-                }
-            }
-            self.room_anchors.insert(room, own);
+            let channel = shared.lock().await;
             for n in named.nodes() {
-                let at = (n.id, n.endpoints.direct_candidates());
                 if channel.is_author(&n.id) {
-                    members.push(at);
-                } else {
-                    anchors.push(at);
+                    members.push((n.id, n.endpoints.direct_candidates()));
                 }
             }
-        }
-        // The anchors it names are dialled as anchors are; a member is reached here.
-        for (id, candidates) in anchors {
-            self.anchor_ids.insert(id);
-            self.dial_anchor(&net, id, candidates);
         }
         if members.is_empty() {
-            let _ = reply.send(Outcome::Done);
+            let why = if parsed.anchors.iter().any(|a| a.id == me) {
+                "the address names this node as the room's host, and no other member, so there \
+                 is nobody to reach"
+            } else {
+                "the address names no member of this room, so there is nobody to reach"
+            };
+            let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                reason: why.to_owned(),
+            });
+            let _ = reply.send(Outcome::Failed(Fault::BadLink));
             return;
         }
         let tx = self.net_tx.clone();
@@ -7345,29 +7371,64 @@ impl Node {
                             .await;
                     }
                     Err(e) => {
-                        missed.push(format!("{} — {e}", crate::node::network::short_id(peer)))
+                        missed.push(format!("{} — {e}", crate::node::network::short_id(peer)));
                     }
                 }
             }
             if reached {
-                let _ = events.send(NodeEvent::NodeNote {
-                    note: format!(
-                        "room {}: its host was reached at the address given, and is dialled \
-                         there from now on",
-                        crate::node::network::short_id(room)
-                    ),
-                });
+                let _ = tx
+                    .send(NetEvent::AddressReached { room, named, reply })
+                    .await;
             } else {
                 let _ = events.send(NodeEvent::JoinFailed {
                     reason: format!("nobody answered at that address: {}", missed.join("; ")),
                 });
+                let _ = reply.send(Outcome::Failed(Fault::Unreachable));
             }
-            let _ = reply.send(if reached {
-                Outcome::Done
-            } else {
-                Outcome::Failed(Fault::Unreachable)
-            });
         });
+    }
+
+    /// A held room's address that a member answered at: keep every node it names as the room's
+    /// at that address, dial the anchors it names, and answer the join `Done` (V210-167).
+    async fn keep_room_address(
+        &mut self,
+        room: Digest32,
+        named: &BootstrapSet,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let mut anchors: Vec<(Digest32, Vec<std::net::SocketAddr>)> = Vec::new();
+        if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
+            let mut channel = shared.lock().await;
+            if let Some(profile) = self.profile.as_ref() {
+                let _ = channel.add_anchors(profile.store(), named);
+            }
+            let mut own = BootstrapSet::new();
+            for n in channel.anchors().nodes() {
+                if !channel.is_author(&n.id) {
+                    let _ = own.add(n.clone());
+                }
+            }
+            self.room_anchors.insert(room, own);
+            for n in named.nodes() {
+                if !channel.is_author(&n.id) {
+                    anchors.push((n.id, n.endpoints.direct_candidates()));
+                }
+            }
+        }
+        if let Some(net) = self.net.clone() {
+            for (id, candidates) in anchors {
+                self.anchor_ids.insert(id);
+                self.dial_anchor(&net, id, candidates);
+            }
+        }
+        let _ = self.event_tx.send(NodeEvent::NodeNote {
+            note: format!(
+                "room {}: a member answered at the address given, which is kept as the room's \
+                 from now on",
+                crate::node::network::short_id(room)
+            ),
+        });
+        let _ = reply.send(Outcome::Done);
     }
 
     /// Everything after the join exchange: make the room from the sealed key, record how this
@@ -10088,10 +10149,13 @@ impl Node {
         }
         self.nearby_due = now + NEARBY_EVERY_SECS;
         let me = net.local_id();
-        let mut tags = Vec::with_capacity(rooms);
+        let Ok(at) = net.manager().endpoint().local_addr() else {
+            return;
+        };
+        let mut entries = Vec::with_capacity(rooms);
         let mut missing = false;
         for (room, channel) in &self.channels {
-            tags.push(crate::node::nearby::tag(room, &me));
+            entries.push(crate::node::nearby::entry(room, &me, at.port(), now));
             if !missing {
                 missing = channel
                     .lock()
@@ -10101,35 +10165,36 @@ impl Node {
                     .any(|m| *m != me && net.manager().existing(m).is_none());
             }
         }
-        let Ok(at) = net.manager().endpoint().local_addr() else {
-            return;
-        };
         if missing {
-            nearby.say(at.port(), &tags);
+            nearby.say(&entries);
         }
     }
 
-    /// A node at `at` named `tags`: dial every member of a held room it names that this node is
-    /// not connected to, there (`node::nearby`). The dial is authenticated as that member, so a
-    /// datagram that lies costs one failed dial.
-    async fn heard_nearby(&mut self, at: std::net::SocketAddr, tags: &[crate::node::nearby::Tag]) {
+    /// A node at `from` named `entries`: dial every member of a held room it names that this node
+    /// is not connected to, at the port it gave (`node::nearby`). The dial is authenticated as
+    /// that member, so a datagram that lies costs one failed dial.
+    async fn heard_nearby(
+        &mut self,
+        from: std::net::IpAddr,
+        entries: &[crate::node::nearby::Entry],
+    ) {
         let Some(net) = self.net.clone() else {
             return;
         };
         let me = net.local_id();
-        let mut found: BTreeSet<Digest32> = BTreeSet::new();
+        let now = self.now();
+        let mut found: BTreeMap<Digest32, u16> = BTreeMap::new();
         for (room, channel) in &self.channels {
             for m in channel.lock().await.members() {
-                if m != me
-                    && net.manager().existing(&m).is_none()
-                    && tags.contains(&crate::node::nearby::tag(room, &m))
-                {
-                    found.insert(m);
+                if m == me || found.contains_key(&m) || net.manager().existing(&m).is_some() {
+                    continue;
+                }
+                if let Some(port) = crate::node::nearby::port_of(entries, room, &m, now) {
+                    found.insert(m, port);
                 }
             }
         }
-        let now = self.now();
-        for peer in found {
+        for (peer, port) in found {
             if self
                 .nearby_dialed
                 .get(&peer)
@@ -10138,6 +10203,7 @@ impl Node {
                 continue;
             }
             self.nearby_dialed.insert(peer, now);
+            let at = std::net::SocketAddr::new(from, port);
             let candidates = crate::node::nearby::dial_at(at);
             let Ok(endpoints) = crate::nat::multiaddr::EndpointList::new(
                 candidates.iter().copied().map(Into::into).collect(),

@@ -2658,10 +2658,10 @@ fn passphrase_from_stdin(what: &str) -> Result<String, AppError> {
 /// reported as the node gave it, because `Unreachable` and a wrong passphrase need
 /// completely different responses from whoever holds the link.
 pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), AppError> {
-    let passphrase = passphrase_from_stdin("the room's passphrase")?;
     let mut client = attach(paths).await?;
     // A room this node holds open is not joined again: its address is taken as where the room's
-    // host is now, and the host is dialled there (V210-167).
+    // host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
+    // is used.
     let held = match vox_core::node::link::InviteLink::parse(link) {
         Ok(parsed) => rooms_of(&mut client)
             .await?
@@ -2681,25 +2681,33 @@ pub async fn join(paths: &Paths, link: &str, local_name: &str) -> Result<(), App
             .request(&Request::Join {
                 link: link.to_owned(),
                 local_name: local_name.to_owned(),
-                passphrase,
+                passphrase: String::new(),
             })
             .await
         {
             Ok(Frame::Ok) => {
                 println!(
-                    "vox: this node already holds {name}; it took the address as where the \
-                     room's host is now, and reached the host there"
+                    "vox: this node already holds {name}; a member answered at the address \
+                     given, so it is kept as where the room's host is now"
                 );
                 Ok(())
             }
+            Ok(Frame::Error { reason }) if reason.starts_with("Failed(Unreachable)") => {
+                Err(AppError::Usage(format!(
+                    "this node already holds {name}, and nobody answered at the address given; \
+                     nothing was changed{}",
+                    crate::tunnel_cli::join_detail(&reason)
+                )))
+            }
             Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
-                "this node already holds {name}, and nobody answered at the address given{}",
+                "this node already holds {name}; nothing was changed{}",
                 crate::tunnel_cli::join_detail(&reason)
             ))),
             Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
             Err(e) => Err(AppError::Usage(e.to_string())),
         };
     }
+    let passphrase = passphrase_from_stdin("the room's passphrase")?;
     match client
         .request(&Request::Join {
             link: link.to_owned(),

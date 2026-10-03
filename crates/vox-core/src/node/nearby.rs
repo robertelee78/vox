@@ -10,13 +10,22 @@
 //! So a node that holds a room in which some member is not connected says where it listens, to
 //! an IPv4 multicast group that does not leave the local network (TTL 1), and to the same group
 //! on the loopback interface, which reaches nodes on this computer with no network at all. A
-//! node that hears it dials whichever of its rooms' unconnected members it names. The datagram
-//! names members only as `tag(room, member)` — a hash nobody without the room's id can match —
-//! and a dial is authenticated as the member it is for, so a forged or replayed datagram costs
-//! a failed dial and nothing more.
+//! node that hears it dials whichever of its rooms' unconnected members it names. A dial is
+//! authenticated as the member it is for, so a forged or replayed datagram costs a failed dial
+//! and nothing more.
 //!
-//! Datagram: [`MAGIC`], the sender's port (u16, big-endian), then up to [`TAGS_PER_DATAGRAM`]
-//! tags of [`TAG_LEN`] bytes.
+//! **What a listener learns.** Each member is named by an [`Entry`]: a tag, `H(room, member,
+//! window)`, and its port masked by more of the same hash. The window is [`WINDOW_SECS`] of
+//! wall-clock time, so the tag changes with it, and the port — which a node keeps across restarts
+//! and networks — is never sent in the clear. Without the room's id, a listener cannot tell
+//! which rooms or members a datagram names, nor link one window's datagrams to the next by their
+//! contents. It does see the marker, the group, the sender's IP address, and how many entries
+//! there are: that a vox node is on this network, and roughly how many rooms it holds.
+//!
+//! A hearer accepts the window before and after its own as well, so clocks a little apart still
+//! match.
+//!
+//! Datagram: [`MAGIC`], then up to [`ENTRIES_PER_DATAGRAM`] entries of [`ENTRY_LEN`] bytes.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -28,25 +37,59 @@ pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 86, 88);
 /// The UDP port every node listens for the group on (shared, `SO_REUSEPORT`).
 pub const PORT: u16 = 7392;
 /// What every datagram starts with.
-const MAGIC: &[u8] = b"vox-here/1";
+const MAGIC: &[u8] = b"vox-here/2";
 /// Bytes of a tag.
-pub const TAG_LEN: usize = 16;
-/// The most tags one datagram carries (it stays under 1,100 bytes).
-const TAGS_PER_DATAGRAM: usize = 64;
+const TAG_LEN: usize = 16;
+/// Bytes of an entry: the tag, then the masked port.
+pub const ENTRY_LEN: usize = TAG_LEN + 2;
+/// The most entries one datagram carries (it stays under 1,200 bytes).
+const ENTRIES_PER_DATAGRAM: usize = 64;
+/// How long a tag stays the same.
+pub const WINDOW_SECS: u64 = 600;
 
-/// A member of a room, as a datagram names it.
-pub type Tag = [u8; TAG_LEN];
+/// A member of a room listening on a port, as a datagram names it.
+pub type Entry = [u8; ENTRY_LEN];
 
-/// How `member` of `room` is named in a datagram.
-#[must_use]
-pub fn tag(room: &Digest32, member: &Digest32) -> Tag {
-    let mut data = [0u8; 64];
+/// The hash an entry for `member` of `room` in `window` is made from.
+fn key(room: &Digest32, member: &Digest32, window: u64) -> Digest32 {
+    let mut data = [0u8; 72];
     data[..32].copy_from_slice(room);
-    data[32..].copy_from_slice(member);
-    let h = crate::hash::domain_hash("vox/nearby/v1", &data);
-    let mut t = [0u8; TAG_LEN];
-    t.copy_from_slice(&h[..TAG_LEN]);
-    t
+    data[32..64].copy_from_slice(member);
+    data[64..].copy_from_slice(&window.to_be_bytes());
+    crate::hash::domain_hash("vox/nearby/v2", &data)
+}
+
+/// The window `now` (Unix seconds) falls in.
+#[must_use]
+pub fn window(now: u64) -> u64 {
+    now / WINDOW_SECS
+}
+
+/// How `member` of `room`, listening on `port`, is named in a datagram sent at `now`.
+#[must_use]
+pub fn entry(room: &Digest32, member: &Digest32, port: u16, now: u64) -> Entry {
+    let h = key(room, member, window(now));
+    let mut e = [0u8; ENTRY_LEN];
+    e[..TAG_LEN].copy_from_slice(&h[..TAG_LEN]);
+    let masked = port ^ u16::from_be_bytes([h[TAG_LEN], h[TAG_LEN + 1]]);
+    e[TAG_LEN..].copy_from_slice(&masked.to_be_bytes());
+    e
+}
+
+/// The port of whichever of `entries` names `member` of `room`, heard at `now`: its window, or
+/// the one either side.
+#[must_use]
+pub fn port_of(entries: &[Entry], room: &Digest32, member: &Digest32, now: u64) -> Option<u16> {
+    let w = window(now);
+    for w in [w, w.saturating_sub(1), w + 1] {
+        let h = key(room, member, w);
+        if let Some(e) = entries.iter().find(|e| e[..TAG_LEN] == h[..TAG_LEN]) {
+            let masked = u16::from_be_bytes([e[TAG_LEN], e[TAG_LEN + 1]]);
+            let port = masked ^ u16::from_be_bytes([h[TAG_LEN], h[TAG_LEN + 1]]);
+            return (port != 0).then_some(port);
+        }
+    }
+    None
 }
 
 /// The socket a node says where it listens on, and hears others on.
@@ -83,16 +126,15 @@ impl Nearby {
         })
     }
 
-    /// Say that this node listens on `port` and holds the rooms `tags` name, on the default
-    /// interface and on loopback. Best effort: a datagram that cannot leave is not retried here.
-    pub fn say(&self, port: u16, tags: &[Tag]) {
+    /// Say `entries` (this node's, from [`entry`]) on the default interface and on loopback.
+    /// Best effort: a datagram that cannot leave is not retried here.
+    pub fn say(&self, entries: &[Entry]) {
         let sock = socket2::SockRef::from(&self.socket);
-        for chunk in tags.chunks(TAGS_PER_DATAGRAM) {
-            let mut d = Vec::with_capacity(MAGIC.len() + 2 + chunk.len() * TAG_LEN);
+        for chunk in entries.chunks(ENTRIES_PER_DATAGRAM) {
+            let mut d = Vec::with_capacity(MAGIC.len() + chunk.len() * ENTRY_LEN);
             d.extend_from_slice(MAGIC);
-            d.extend_from_slice(&port.to_be_bytes());
-            for t in chunk {
-                d.extend_from_slice(t);
+            for e in chunk {
+                d.extend_from_slice(e);
             }
             for via in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST] {
                 if sock.set_multicast_if_v4(&via).is_ok() {
@@ -102,33 +144,31 @@ impl Nearby {
         }
     }
 
-    /// The next datagram heard: where its sender listens, and the tags it names. Anything that
-    /// is not one is skipped.
-    pub async fn hear(&self) -> std::io::Result<(SocketAddr, Vec<Tag>)> {
+    /// The next datagram heard: the address it came from, and its entries. Anything that is not
+    /// one is skipped.
+    pub async fn hear(&self) -> std::io::Result<(IpAddr, Vec<Entry>)> {
         let mut buf = [0u8; 2048];
         loop {
             let (n, from) = self.socket.recv_from(&mut buf).await?;
-            if let Some(heard) = parse(&buf[..n], from.ip()) {
-                return Ok(heard);
+            if let Some(entries) = parse(&buf[..n]) {
+                return Ok((from.ip(), entries));
             }
         }
     }
 }
 
-/// A datagram from `ip`: the address its sender listens on, and its tags.
-fn parse(d: &[u8], ip: IpAddr) -> Option<(SocketAddr, Vec<Tag>)> {
+/// A datagram's entries.
+fn parse(d: &[u8]) -> Option<Vec<Entry>> {
     let rest = d.strip_prefix(MAGIC)?;
-    let (port, tags) = rest.split_first_chunk::<2>()?;
-    let port = u16::from_be_bytes(*port);
-    if port == 0 || tags.is_empty() || tags.len() % TAG_LEN != 0 {
+    if rest.is_empty() || rest.len() % ENTRY_LEN != 0 {
         return None;
     }
-    let tags = tags
-        .chunks_exact(TAG_LEN)
-        .filter_map(|c| <Tag>::try_from(c).ok())
-        .take(TAGS_PER_DATAGRAM)
-        .collect();
-    Some((SocketAddr::new(ip, port), tags))
+    Some(
+        rest.chunks_exact(ENTRY_LEN)
+            .filter_map(|c| <Entry>::try_from(c).ok())
+            .take(ENTRIES_PER_DATAGRAM)
+            .collect(),
+    )
 }
 
 /// Where to dial a node heard at `at`: there, and on loopback too when `at` is an address of

@@ -15,7 +15,7 @@
 //! 1. `vox room join` with the wrong room passphrase → the member refused, and the likely cause
 //!    is the passphrase;
 //! 2. `vox room join` of a room already held → not a failure: it says the room is already held,
-//!    takes the address as where the host is now, and reaches the host there (V210-167);
+//!    reaches a member at the address, and keeps it as where the host is now (V210-167);
 //! 3. `vox daemon --listen` on a UDP port something else holds → that port, in use;
 //! 4. `vox up --bind` on a TCP port something else holds → that address, in use — promptly;
 //! 5. `vox forward` onto a local port something else holds → that address, in use — promptly,
@@ -397,7 +397,7 @@ fn every_common_failure_names_its_cause() {
     assert_says(
         "join, already held",
         &said,
-        &["already holds", "reached the host there"],
+        &["already holds", "a member answered at the address"],
     );
 
     // ---- (6) stop trusting someone never trusted, over the daemon's socket ----
